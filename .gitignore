@@ -1,0 +1,16 @@
+# Go
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+bench/csrbench/csrbench
+
+# Benchmark and render scratch
+.bench/
+*.png
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
