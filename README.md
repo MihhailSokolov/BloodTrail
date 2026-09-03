@@ -5,8 +5,8 @@ packaged as a [DAWGS](https://github.com/SpecterOps/DAWGS) driver, so that attac
 analysis and every other graph query stay fast on large Active Directory environments
 and ordinary hardware.
 
-**Status:** early development. The driver does not exist yet; this repository currently
-holds the project scaffolding and a traversal benchmark.
+**Status:** milestone 1 (packaging). The driver delegates every operation to PostgreSQL;
+no acceleration yet.
 
 ## Why
 
@@ -36,6 +36,33 @@ arrays, and a single CPU core sweeps every edge in under a second. See
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   two-file change, and an installer that upgrades an existing BloodHound CE deployment
   with backup and rollback.
+
+## Installing on an existing BloodHound CE deployment
+
+BloodTrail ships as a patched BloodHound image plus an installer. On the host that runs
+the compose deployment:
+
+    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
+
+Until the first release is published, build the CLI with `go build ./cmd/bloodtrail`
+instead; the one-liner above describes the intended installation once a release exists.
+On macOS, where `sha256sum` is absent, `shasum -a 256` is the equivalent for checking
+the release checksums by hand (the installer script targets Linux deployment hosts).
+
+The installer inventories the deployment, backs up the application database and the
+compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
+if needed (using BloodHound's own migrator), switches the `bloodhound` service to the
+BloodTrail image through a compose override file, and verifies the result. Pass
+`--admin-password` to also run an ingest-and-search smoke test.
+
+To undo everything:
+
+    bloodtrail rollback
+
+Supported upstream releases will be the tags published at
+`ghcr.io/mihhailsokolov/bloodhound-bloodtrail`; the first supported upstream release is
+v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
+(`patches/bloodhound-driver.patch`).
 
 ## Roadmap
 
