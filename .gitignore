@@ -14,3 +14,8 @@ bench/csrbench/csrbench
 .DS_Store
 .idea/
 .vscode/
+
+# Build workspaces and installer state
+.build/
+.bloodtrail/
+dist/
