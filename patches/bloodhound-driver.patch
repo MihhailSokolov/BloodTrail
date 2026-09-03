@@ -1,0 +1,28 @@
+diff --git a/cmd/api/src/bootstrap/util.go b/cmd/api/src/bootstrap/util.go
+index dffab65..2c76fcc 100644
+--- a/cmd/api/src/bootstrap/util.go
++++ b/cmd/api/src/bootstrap/util.go
+@@ -22,6 +22,7 @@ import (
+ 	"log/slog"
+ 	"os"
+ 
++	bloodtrail "github.com/MihhailSokolov/BloodTrail"
+ 	"github.com/jackc/pgx/v5/pgxpool"
+ 	"github.com/specterops/bloodhound/cmd/api/src/api/dbpool"
+ 	"github.com/specterops/bloodhound/cmd/api/src/api/tools"
+@@ -138,6 +139,15 @@ func ConnectGraph(ctx context.Context, cfg config.Configuration) (*graph.Databas
+ 			return nil, err
+ 		}
+ 
++	case bloodtrail.DriverName:
++		slog.InfoContext(ctx, "Connecting to graph using BloodTrail")
++		connectionString = cfg.Database.PostgreSQLConnectionString()
++
++		pool, err = dbpool.NewDawgsPool(cfg.Database)
++		if err != nil {
++			return nil, err
++		}
++
+ 	default:
+ 		return nil, fmt.Errorf("unknown graphdb driver name: %s", driverName)
+ 	}
