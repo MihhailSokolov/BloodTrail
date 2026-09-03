@@ -62,3 +62,20 @@ func TestCopyFilesSkipsMissing(t *testing.T) {
 		t.Fatalf("copy failed: %v %q", err, data)
 	}
 }
+
+func TestCopyFilesUsesRestrictivePermissions(t *testing.T) {
+	src := t.TempDir()
+	srcFile := filepath.Join(src, "credentials.env")
+	_ = os.WriteFile(srcFile, []byte("SECRET=value"), 0o644)
+	dest := t.TempDir()
+	if err := CopyFiles(dest, srcFile); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(dest, "credentials.env"))
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("permissions = %#o, want 0600", st.Mode().Perm())
+	}
+}

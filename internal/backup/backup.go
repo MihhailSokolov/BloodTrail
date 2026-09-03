@@ -48,12 +48,13 @@ func CopyFiles(destDir string, paths ...string) error {
 			continue
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("opening %s: %w", p, err)
 		}
-		out, err := os.Create(filepath.Join(destDir, filepath.Base(p)))
+		dest := filepath.Join(destDir, filepath.Base(p))
+		out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
 			_ = in.Close()
-			return err
+			return fmt.Errorf("creating %s: %w", dest, err)
 		}
 		_, copyErr := io.Copy(out, in)
 		_ = in.Close()
