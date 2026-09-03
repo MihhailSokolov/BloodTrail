@@ -26,6 +26,22 @@ func setSQL(driver string) string {
 		"delete from database_switch; insert into database_switch (driver) values ('" + driver + "')"
 }
 
+// isMissingRelation checks if an error is specifically about a missing relation (table).
+// It returns true only for errors matching `relation "<name>" does not exist` where
+// name is one of the provided relation names (case-sensitive).
+func isMissingRelation(err error, relations ...string) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	for _, rel := range relations {
+		if strings.Contains(errStr, fmt.Sprintf(`relation "%s" does not exist`, rel)) {
+			return true
+		}
+	}
+	return false
+}
+
 // Store runs psql inside the application database container.
 type Store struct {
 	Compose  dockerx.Compose
@@ -43,7 +59,7 @@ func (s Store) psql(ctx context.Context, sql string) ([]byte, error) {
 func (s Store) Read(ctx context.Context) (string, bool, error) {
 	out, err := s.psql(ctx, readSQL)
 	if err != nil {
-		if strings.Contains(err.Error(), "does not exist") {
+		if isMissingRelation(err, "database_switch") {
 			return "", false, nil
 		}
 		return "", false, err
@@ -64,7 +80,7 @@ func (s Store) Set(ctx context.Context, driver string) error {
 // Delete removes the row so BloodHound falls back to bhe_graph_driver.
 func (s Store) Delete(ctx context.Context) error {
 	_, err := s.psql(ctx, "delete from database_switch")
-	if err != nil && strings.Contains(err.Error(), "does not exist") {
+	if isMissingRelation(err, "database_switch") {
 		return nil
 	}
 	return err
@@ -75,7 +91,7 @@ func (s Store) Delete(ctx context.Context) error {
 func (s Store) CountGraph(ctx context.Context) (int64, int64, error) {
 	out, err := s.psql(ctx, countSQL)
 	if err != nil {
-		if strings.Contains(err.Error(), "does not exist") {
+		if isMissingRelation(err, "node", "edge") {
 			return 0, 0, nil
 		}
 		return 0, 0, err

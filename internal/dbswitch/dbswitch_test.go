@@ -43,6 +43,12 @@ func TestReadAbsentRowAndMissingTable(t *testing.T) {
 	if _, present, err := newStore(fake).Read(context.Background()); err != nil || present {
 		t.Fatalf("missing table should mean absent: present=%v err=%v", present, err)
 	}
+	fake = &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + readSQL: errors.New(`FATAL:  database "bhdb" does not exist`),
+	}}
+	if _, present, err := newStore(fake).Read(context.Background()); err == nil {
+		t.Fatalf("database not found should propagate error, got present=%v", present)
+	}
 }
 
 func TestSetUpserts(t *testing.T) {
@@ -70,5 +76,40 @@ func TestCountGraph(t *testing.T) {
 	nodes, edges, err := newStore(fake).CountGraph(context.Background())
 	if err != nil || nodes != 1234 || edges != 56789 {
 		t.Fatalf("got %d %d %v", nodes, edges, err)
+	}
+}
+
+func TestDeleteTolerantOfMissingTable(t *testing.T) {
+	fake := &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + "delete from database_switch": errors.New(`ERROR:  relation "database_switch" does not exist`),
+	}}
+	if err := newStore(fake).Delete(context.Background()); err != nil {
+		t.Fatalf("missing table should not error: %v", err)
+	}
+	fake = &dockerx.FakeRunner{Outputs: map[string][]byte{
+		prefix + "delete from database_switch": []byte("DELETE 1\n"),
+	}}
+	if err := newStore(fake).Delete(context.Background()); err != nil {
+		t.Fatalf("successful delete should not error: %v", err)
+	}
+}
+
+func TestCountGraphMissingTableIsZero(t *testing.T) {
+	fake := &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + countSQL: errors.New(`ERROR:  relation "node" does not exist`),
+	}}
+	nodes, edges, err := newStore(fake).CountGraph(context.Background())
+	if err != nil || nodes != 0 || edges != 0 {
+		t.Fatalf("missing table should return 0,0,nil got %d %d %v", nodes, edges, err)
+	}
+}
+
+func TestCountGraphOtherErrorsPropagate(t *testing.T) {
+	fake := &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + countSQL: errors.New(`FATAL:  role "bh" does not exist`),
+	}}
+	_, _, err := newStore(fake).CountGraph(context.Background())
+	if err == nil {
+		t.Fatal("role not found should propagate error")
 	}
 }
