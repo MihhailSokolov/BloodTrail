@@ -27,6 +27,10 @@ trap 'rm -rf "$TMP"' EXIT
 echo "Downloading $ASSET from $BASE" >&2
 curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET"
 curl -fsSL "$BASE/checksums.txt" -o "$TMP/checksums.txt"
-(cd "$TMP" && grep " $ASSET\$" checksums.txt | sha256sum -c - >/dev/null) || { echo "checksum verification failed" >&2; exit 1; }
+(cd "$TMP" && grep -F " $ASSET" checksums.txt | sha256sum -c - >/dev/null) || { echo "checksum verification failed" >&2; exit 1; }
 tar -xzf "$TMP/$ASSET" -C "$TMP"
-exec "$TMP/bloodtrail" "$@"
+set +e
+"$TMP/bloodtrail" "$@"
+rc=$?
+set -e
+exit "$rc"
