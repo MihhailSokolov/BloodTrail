@@ -61,7 +61,7 @@ func (s *Smoke) Run(ctx context.Context, timeout time.Duration) error {
 	if err := s.waitForDatapipeIdle(ctx, timeout); err != nil {
 		return err
 	}
-	return s.search(ctx)
+	return s.search(ctx, timeout)
 }
 
 func (s *Smoke) call(ctx context.Context, method, path, contentType string, body io.Reader, headers ...string) ([]byte, error) {
@@ -148,39 +148,50 @@ func (s *Smoke) uploadFixture(ctx context.Context, jobID int64) error {
 	return nil
 }
 
+// waitForJob polls the ingest job status until it reaches a terminal state.
+// A transient error from s.call (e.g. the server briefly returning 5xx) does
+// not fail the wait immediately; polling continues until timeout, at which
+// point the last such error is returned wrapped with context. Login, start,
+// upload and end remain fail-fast and are not affected by this tolerance.
 func (s *Smoke) waitForJob(ctx context.Context, jobID int64, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for {
 		data, err := s.call(ctx, http.MethodGet, "/api/v2/file-upload", "", nil)
 		if err != nil {
-			return err
-		}
-		var resp struct {
-			Data []struct {
-				ID            int64  `json:"id"`
-				Status        int    `json:"status"`
-				StatusMessage string `json:"status_message"`
-				FailedFiles   int    `json:"failed_files"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(data, &resp); err != nil {
-			return fmt.Errorf("decoding ingest jobs: %w", err)
-		}
-		for _, job := range resp.Data {
-			if job.ID != jobID {
-				continue
+			lastErr = err
+		} else {
+			lastErr = nil
+			var resp struct {
+				Data []struct {
+					ID            int64  `json:"id"`
+					Status        int    `json:"status"`
+					StatusMessage string `json:"status_message"`
+					FailedFiles   int    `json:"failed_files"`
+				} `json:"data"`
 			}
-			switch job.Status {
-			case jobStatusComplete, jobStatusPartiallyComplete:
-				if job.FailedFiles > 0 {
-					return fmt.Errorf("ingest job %d finished with %d failed files: %s", jobID, job.FailedFiles, job.StatusMessage)
+			if err := json.Unmarshal(data, &resp); err != nil {
+				return fmt.Errorf("decoding ingest jobs: %w", err)
+			}
+			for _, job := range resp.Data {
+				if job.ID != jobID {
+					continue
 				}
-				return nil
-			case jobStatusFailed:
-				return fmt.Errorf("ingest job %d failed: %s", jobID, job.StatusMessage)
+				switch job.Status {
+				case jobStatusComplete, jobStatusPartiallyComplete:
+					if job.FailedFiles > 0 {
+						return fmt.Errorf("ingest job %d finished with %d failed files: %s", jobID, job.FailedFiles, job.StatusMessage)
+					}
+					return nil
+				case jobStatusFailed:
+					return fmt.Errorf("ingest job %d failed: %s", jobID, job.StatusMessage)
+				}
 			}
 		}
 		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("waiting for ingest job %d: %w", jobID, lastErr)
+			}
 			return fmt.Errorf("ingest job %d not complete after %s", jobID, timeout)
 		}
 		select {
@@ -191,26 +202,37 @@ func (s *Smoke) waitForJob(ctx context.Context, jobID int64, timeout time.Durati
 	}
 }
 
+// waitForDatapipeIdle polls the datapipe status until it reports idle. As in
+// waitForJob, a transient error from s.call keeps polling instead of failing
+// immediately; on timeout the last such error is returned wrapped with context.
 func (s *Smoke) waitForDatapipeIdle(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lastErr error
+	lastStatus := ""
 	for {
 		data, err := s.call(ctx, http.MethodGet, "/api/v2/datapipe/status", "", nil)
 		if err != nil {
-			return err
-		}
-		var resp struct {
-			Data struct {
-				Status string `json:"status"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(data, &resp); err != nil {
-			return fmt.Errorf("decoding datapipe status: %w", err)
-		}
-		if resp.Data.Status == "idle" {
-			return nil
+			lastErr = err
+		} else {
+			lastErr = nil
+			var resp struct {
+				Data struct {
+					Status string `json:"status"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(data, &resp); err != nil {
+				return fmt.Errorf("decoding datapipe status: %w", err)
+			}
+			if resp.Data.Status == "idle" {
+				return nil
+			}
+			lastStatus = resp.Data.Status
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("datapipe still %q after %s", resp.Data.Status, timeout)
+			if lastErr != nil {
+				return fmt.Errorf("waiting for datapipe idle: %w", lastErr)
+			}
+			return fmt.Errorf("datapipe still %q after %s", lastStatus, timeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -220,10 +242,37 @@ func (s *Smoke) waitForDatapipeIdle(ctx context.Context, timeout time.Duration) 
 	}
 }
 
-func (s *Smoke) search(ctx context.Context) error {
+// search polls GET /api/v2/search until the fixture domain node appears or
+// timeout passes. The datapipe reporting idle does not guarantee the graph
+// has been updated yet, so a single-shot search can spuriously report the
+// node missing; polling here closes that gap.
+func (s *Smoke) search(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		found, err := s.searchOnce(ctx)
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("search for %s returned no matching node; ingest did not reach the graph", fixtureDomain)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.Poll):
+		}
+	}
+}
+
+// searchOnce issues a single GET /api/v2/search request and reports whether
+// the fixture domain node was found among the results.
+func (s *Smoke) searchOnce(ctx context.Context) (bool, error) {
 	data, err := s.call(ctx, http.MethodGet, "/api/v2/search?q="+url.QueryEscape(fixtureDomain), "", nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var resp struct {
 		Data []struct {
@@ -231,12 +280,12 @@ func (s *Smoke) search(ctx context.Context) error {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return fmt.Errorf("decoding search: %w", err)
+		return false, fmt.Errorf("decoding search: %w", err)
 	}
 	for _, r := range resp.Data {
 		if strings.EqualFold(r.Name, fixtureDomain) {
-			return nil
+			return true, nil
 		}
 	}
-	return fmt.Errorf("search for %s returned no matching node; ingest did not reach the graph", fixtureDomain)
+	return false, nil
 }
