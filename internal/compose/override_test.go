@@ -12,8 +12,8 @@ func TestOverrideRender(t *testing.T) {
 		Service: "bloodhound",
 		Image:   "ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0-bt0.1.0",
 		Environment: map[string]string{
-			"bhe_graph_driver":      "bloodtrail",
-			"BLOODTRAIL_LOG_LEVEL":  "info",
+			"bhe_graph_driver":     "bloodtrail",
+			"BLOODTRAIL_LOG_LEVEL": "info",
 		},
 	}
 	got := o.Render()

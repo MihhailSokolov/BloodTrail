@@ -2,7 +2,10 @@
 
 package compose
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestAddComposeFileToEmptyEnv(t *testing.T) {
 	got := AddComposeFile("", "docker-compose.yml", OverrideFileName)
@@ -39,5 +42,39 @@ func TestRemoveComposeFile(t *testing.T) {
 	}
 	if got := RemoveComposeFile("A=b\n", OverrideFileName); got != "A=b\n" {
 		t.Fatalf("untouched file changed: %q", got)
+	}
+}
+
+func TestAddComposeFileCRLFIdempotent(t *testing.T) {
+	env := "A=b\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n"
+	got := AddComposeFile(env, "docker-compose.yml", OverrideFileName)
+	if got != env {
+		t.Fatalf("idempotency failed on CRLF file: got %q want %q", got, env)
+	}
+	if strings.Contains(got, "\r:") || strings.Contains(got, ":\r") {
+		t.Fatalf("CRLF corruption: %q", got)
+	}
+}
+
+func TestAddComposeFileToEmptyEnvCRLF(t *testing.T) {
+	got := AddComposeFile("A=b\r\n", "docker-compose.yml", OverrideFileName)
+	want := "A=b\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if strings.Contains(got, "\r:") || strings.Contains(got, ":\r") {
+		t.Fatalf("CRLF corruption: %q", got)
+	}
+}
+
+func TestRemoveComposeFileCRLF(t *testing.T) {
+	env := "A=b\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n"
+	got := RemoveComposeFile(env, OverrideFileName)
+	want := "A=b\r\nCOMPOSE_FILE=docker-compose.yml\r\n"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if !strings.Contains(got, "\r\n") {
+		t.Fatalf("CRLF lost: %q", got)
 	}
 }
