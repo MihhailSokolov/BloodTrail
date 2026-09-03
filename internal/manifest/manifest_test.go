@@ -22,6 +22,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		OverrideFile:      filepath.Join(dir, "docker-compose.bloodtrail.yml"),
 		TargetImage:       "ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0-bt0.1.0",
 		UpstreamTag:       "v9.6.0",
+		PGUser:            "bloodhound",
+		PGDatabase:        "bloodhound",
 	}
 	if Exists(dir) {
 		t.Fatal("manifest should not exist yet")

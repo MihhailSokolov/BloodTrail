@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -28,6 +29,10 @@ Usage:
 
 Run "bloodtrail <command> -h" for the flags of a command.
 `
+
+// errUsage signals a flag-parsing failure that the flag package has already
+// reported on stderr; main exits 2 without printing it a second time.
+var errUsage = errors.New("usage error")
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -60,6 +65,9 @@ func main() {
 	}
 
 	if err != nil {
+		if errors.Is(err, errUsage) {
+			os.Exit(2)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -79,7 +87,10 @@ func run(ctx context.Context, args []string, cmd func(context.Context, installer
 	fs.DurationVar(&opts.MigrationTimeout, "migration-timeout", 6*time.Hour, "how long to wait for the Neo4j to PostgreSQL migration")
 	fs.DurationVar(&opts.VerifyTimeout, "verify-timeout", 20*time.Minute, "how long to wait for the API and the smoke test")
 	if err := fs.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return errUsage
 	}
 	if opts.AdminPassword == "" {
 		opts.AdminPassword = os.Getenv("BLOODTRAIL_ADMIN_PASSWORD")

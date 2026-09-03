@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,9 +37,17 @@ func composeConfigJSON(image, driver string) []byte {
 }
 
 // fakeToolAPI answers the migrator endpoints: one "migrating" poll, then idle.
-func fakeToolAPI(t *testing.T) *httptest.Server {
+// *manifestExistsAtFirstCall records whether the install manifest already
+// existed by the time the very first tool-API request arrived, proving the
+// manifest is saved before migration begins.
+func fakeToolAPI(t *testing.T, dir string, manifestExistsAtFirstCall *bool) *httptest.Server {
 	polls := 0
+	first := true
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if first {
+			*manifestExistsAtFirstCall = manifest.Exists(dir)
+			first = false
+		}
 		switch r.Method + " " + r.URL.Path {
 		case "PUT /pg-migration/neo-to-pg", "PUT /graph-db/switch/pg":
 			w.WriteHeader(200)
@@ -62,28 +71,35 @@ func setupProject(t *testing.T) (string, string) {
 	return dir, composeFile
 }
 
+// setRowSQL is the exact statement dbswitch.Store.Set sends to switch the
+// active driver to "bloodtrail".
+const setRowSQL = "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('bloodtrail')"
+
 func TestInstallOnNeo4jDeployment(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
 	defer api.Close()
-	tool := fakeToolAPI(t)
+	var manifestExistsBeforeMigration bool
+	tool := fakeToolAPI(t, dir, &manifestExistsBeforeMigration)
 	defer tool.Close()
 
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
 	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
 	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
 			base + "logs --no-color bloodhound":                             []byte("BloodTrail driver active version=test\n"),
+			"docker image inspect " + image:                                 []byte(""),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
 		},
-		Errors: map[string]error{},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":         []byte("10|20\n"),
-			psql + "create table if not exists database_switch": []byte("INSERT 0 1\n"),
-			base + "exec -T graph-db cypher-shell":              []byte("count\n10\n"),
-			"docker compose --project-directory " + dir + " -f " + composeFile + " -f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " up -d": nil,
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+			base + "exec -T graph-db cypher-shell":      []byte("count\n10\n"),
 		},
 	}
 	var out bytes.Buffer
@@ -99,16 +115,20 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			return rewriteTransport{base: tool.URL, client: tool.Client()}
 		},
 	}
-	opts := Options{ComposeFile: composeFile, Image: "ghcr.io/x/bt:v9.6.0-bt0.1.0", APIURL: api.URL, Yes: true,
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		MigrationTimeout: time.Second, VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 
 	if err := Install(context.Background(), deps, opts); err != nil {
 		t.Fatalf("install failed: %v\noutput:\n%s", err, out.String())
 	}
 
+	if !manifestExistsBeforeMigration {
+		t.Fatal("manifest must be saved before migration begins, so a failed migration can still be rolled back")
+	}
+
 	// Override file and .env
 	override, err := os.ReadFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"))
-	if err != nil || !strings.Contains(string(override), "image: ghcr.io/x/bt:v9.6.0-bt0.1.0") || !strings.Contains(string(override), "bhe_graph_driver=bloodtrail") {
+	if err != nil || !strings.Contains(string(override), "image: "+image) || !strings.Contains(string(override), "bhe_graph_driver=bloodtrail") {
 		t.Fatalf("override not written correctly: %v\n%s", err, override)
 	}
 	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
@@ -120,10 +140,13 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	if err != nil || m.OriginalImage != upstreamImage || m.OriginalDriverRow != nil || m.UpstreamTag != "v9.6.0" {
 		t.Fatalf("manifest = %+v err=%v", m, err)
 	}
+	if m.PGUser != "bloodhound" || m.PGDatabase != "bloodhound" {
+		t.Fatalf("manifest PG credentials = %+v", m)
+	}
 	if _, err := os.Stat(filepath.Join(m.BackupDir, "app-db.dump")); err != nil {
 		t.Fatalf("backup dump missing: %v", err)
 	}
-	// Order: backup before migration, migration before driver row, row before up
+	// Order: backup before driver row, row before up; logs last.
 	idx := func(prefix string) int {
 		for i, c := range fake.Calls {
 			if strings.HasPrefix(c, prefix) {
@@ -133,7 +156,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 		return -1
 	}
 	backupIdx := idx(base + "exec -T app-db pg_dump")
-	driverRowIdx := idx(psql + "create table if not exists database_switch")
+	driverRowIdx := idx(psql + setRowSQL)
 	upIdx := idx("docker compose --project-directory " + dir + " -f " + composeFile + " -f ")
 	if backupIdx >= driverRowIdx || driverRowIdx >= upIdx {
 		t.Fatalf("unexpected call order:\n%s", strings.Join(fake.Calls, "\n"))
@@ -143,11 +166,81 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	}
 }
 
+func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+	tool := fakeToolAPI(t, dir, new(bool))
+	defer tool.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
+			psql + "select driver from database_switch limit 1":             []byte(""),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker image inspect " + image:                                 []byte(""),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("0|0\n"),
+			base + "exec -T graph-db cypher-shell":      []byte("count\n10\n"),
+		},
+	}
+	deps := Deps{
+		Runner: fake,
+		HTTP:   api.Client(),
+		Out:    &bytes.Buffer{},
+		NewToolAPITransport: func(network string) toolapi.Transport {
+			return rewriteTransport{base: tool.URL, client: tool.Client()}
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		MigrationTimeout: time.Second, VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	err := Install(context.Background(), deps, opts)
+	if err == nil || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected an error mentioning rollback, got %v", err)
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("manifest should still exist so `bloodtrail rollback` can undo the partial install")
+	}
+}
+
+func TestInstallRefusesUnknownImage(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                       composeConfigJSON(upstreamImage, "neo4j"),
+			psql + "select driver from database_switch limit 1": []byte(""),
+		},
+		Errors: map[string]error{
+			"docker image inspect " + image:    errors.New("no such image"),
+			"docker manifest inspect " + image: errors.New("no such manifest"),
+		},
+		Prefixes: map[string][]byte{
+			base + "exec -T graph-db cypher-shell": []byte("count\n10\n"),
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, Yes: true}
+	err := Install(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, opts)
+	if err == nil || !strings.Contains(err.Error(), "neither present locally nor in a registry") {
+		t.Fatalf("expected an unknown-image error, got %v", err)
+	}
+	if fake.Called(base + "exec -T app-db pg_dump") {
+		t.Fatalf("pg_dump should not run before the image availability check: %v", fake.Calls)
+	}
+}
+
 func TestInstallRefusesWhenAlreadyInstalled(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	_ = manifest.Manifest{ProjectDir: dir}.Save(dir)
 	err := Install(context.Background(), Deps{Runner: &dockerx.FakeRunner{}, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true})
-	if err == nil || !strings.Contains(err.Error(), "already installed") {
+	if err == nil || !strings.Contains(err.Error(), "did not complete or is still installed") {
 		t.Fatalf("expected already-installed error, got %v", err)
 	}
 }
@@ -158,7 +251,7 @@ func TestRollbackRestoresEverything(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"), 0o644)
 	row := "neo4j"
 	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
-		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml")}.Save(dir)
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound"}.Save(dir)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	defer api.Close()
 
@@ -166,13 +259,8 @@ func TestRollbackRestoresEverything(t *testing.T) {
 	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
 	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
-			base + "config --format json":                       composeConfigJSON(upstreamImage, "neo4j"),
-			base + "up -d --remove-orphans":                     nil,
-			psql + "select driver from database_switch limit 1": []byte("bloodtrail\n"),
-		},
-		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":         []byte("10|20\n"),
-			psql + "create table if not exists database_switch": []byte("INSERT 0 1\n"),
+			base + "up -d --remove-orphans": nil,
+			psql + "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')": []byte("INSERT 0 1\n"),
 		},
 	}
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
@@ -190,6 +278,43 @@ func TestRollbackRestoresEverything(t *testing.T) {
 	}
 	if !fake.Called(psql + "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')") {
 		t.Fatalf("driver row not restored:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+}
+
+func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	_ = os.WriteFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound"}.Save(dir)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer api.Close()
+
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "up -d --remove-orphans":      nil,
+			psql + "delete from database_switch": nil,
+		},
+	}
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.Called(psql + "delete from database_switch") {
+		t.Fatalf("expected the row to be deleted:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	deleteIdx, upIdx := -1, -1
+	for i, c := range fake.Calls {
+		if strings.HasPrefix(c, psql+"delete from database_switch") && deleteIdx == -1 {
+			deleteIdx = i
+		}
+		if strings.HasPrefix(c, base+"up -d") && upIdx == -1 {
+			upIdx = i
+		}
+	}
+	if deleteIdx == -1 || upIdx == -1 || deleteIdx >= upIdx {
+		t.Fatalf("expected the driver row to be deleted before `up`, got calls:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 }
 

@@ -28,6 +28,8 @@ type Manifest struct {
 	OverrideFile      string  `json:"override_file"`
 	TargetImage       string  `json:"target_image"`
 	UpstreamTag       string  `json:"upstream_tag"`
+	PGUser            string  `json:"pg_user"`
+	PGDatabase        string  `json:"pg_database"`
 }
 
 // Path returns the manifest location for a compose project directory.

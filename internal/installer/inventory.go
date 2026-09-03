@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,11 +24,38 @@ const (
 	defaultPGDatabase = "bloodhound"
 )
 
+// upstreamTagPattern matches a plausible Docker image tag.
+var upstreamTagPattern = regexp.MustCompile(`^v?[0-9A-Za-z._-]+$`)
+
+// upstreamTagFromImage derives the version tag BloodTrail images are built
+// against from the final path segment of image (so a registry host:port
+// prefix is never mistaken for a tag). It refuses digest references ("@")
+// and untagged images, returning "" so the caller requires --image instead
+// of guessing.
+func upstreamTagFromImage(image string) string {
+	seg := image
+	if i := strings.LastIndex(image, "/"); i >= 0 {
+		seg = image[i+1:]
+	}
+	if strings.Contains(seg, "@") {
+		return ""
+	}
+	i := strings.LastIndex(seg, ":")
+	if i < 0 {
+		return ""
+	}
+	tag := seg[i+1:]
+	if !upstreamTagPattern.MatchString(tag) {
+		return ""
+	}
+	return tag
+}
+
 // inventory is everything Install learns before changing anything.
 type inventory struct {
 	Config        compose.Config
 	Image         string // current bloodhound image
-	UpstreamTag   string // part after the last ':' of Image
+	UpstreamTag   string // derived from the last path segment of Image
 	DriverRow     *string
 	ActiveDriver  string // row if present, else bhe_graph_driver, else "neo4j"
 	PGUser, PGDB  string
@@ -53,9 +81,9 @@ func takeInventory(ctx context.Context, c dockerx.Compose) (inventory, dbswitch.
 		return inventory{}, dbswitch.Store{}, fmt.Errorf("compose project %q has no %q service", cfg.Name, appDBService)
 	}
 
-	inv := inventory{Config: cfg, Image: svc.Image, PGUser: defaultPGUser, PGDB: defaultPGDatabase, Nodes: -1, Edges: -1, CountSource: "unknown"}
-	if i := strings.LastIndex(svc.Image, ":"); i >= 0 {
-		inv.UpstreamTag = svc.Image[i+1:]
+	inv := inventory{
+		Config: cfg, Image: svc.Image, UpstreamTag: upstreamTagFromImage(svc.Image),
+		PGUser: defaultPGUser, PGDB: defaultPGDatabase, Nodes: -1, Edges: -1, CountSource: "unknown",
 	}
 	if u := cfg.Services[appDBService].Environment["POSTGRES_USER"]; u != "" {
 		inv.PGUser = u
