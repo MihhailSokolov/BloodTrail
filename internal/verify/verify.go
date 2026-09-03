@@ -20,7 +20,12 @@ const DriverActiveMarker = "BloodTrail driver active"
 // apiPollInterval is the delay between GET /api/version retries in WaitForAPI.
 const apiPollInterval = 500 * time.Millisecond
 
-// WaitForAPI polls GET /api/version until it returns 200 or timeout passes.
+// WaitForAPI polls GET /api/version until the server answers with 200 (OK) or
+// 401 (Unauthorized) or timeout passes. BloodHound registers /api/version
+// behind RequireAuth, so an unauthenticated request against a live server
+// normally gets a 401; that still proves the API is up and routing, so it
+// counts as ready. Any other outcome — 5xx, other 4xx, or a connection error
+// — keeps polling until the deadline.
 func WaitForAPI(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	url := strings.TrimRight(baseURL, "/") + "/api/version"
@@ -32,7 +37,7 @@ func WaitForAPI(ctx context.Context, client *http.Client, baseURL string, timeou
 		resp, err := client.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusUnauthorized {
 				return nil
 			}
 		}

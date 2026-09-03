@@ -13,7 +13,7 @@ import (
 	"github.com/MihhailSokolov/BloodTrail/internal/dockerx"
 )
 
-func TestWaitForAPIRetriesUntil200(t *testing.T) {
+func TestWaitForAPIRetriesUntilServerAnswers(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/version" {
@@ -23,7 +23,7 @@ func TestWaitForAPIRetriesUntil200(t *testing.T) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		_, _ = w.Write([]byte(`{"data":{"API":{"current_version":"v2"}}}`))
+		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
 	if err := WaitForAPI(context.Background(), srv.Client(), srv.URL, 2*time.Second); err != nil {
@@ -39,6 +39,16 @@ func TestWaitForAPITimesOut(t *testing.T) {
 	defer srv.Close()
 	if err := WaitForAPI(context.Background(), srv.Client(), srv.URL, 50*time.Millisecond); err == nil {
 		t.Fatal("expected timeout")
+	}
+}
+
+func TestWaitForAPIAccepts200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"API":{"current_version":"v2"}}}`))
+	}))
+	defer srv.Close()
+	if err := WaitForAPI(context.Background(), srv.Client(), srv.URL, 2*time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 
