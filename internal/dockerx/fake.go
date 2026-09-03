@@ -12,9 +12,10 @@ import (
 // FakeRunner scripts command outputs for tests. Keys are the full command line
 // joined by single spaces, e.g. "docker compose -f x up -d".
 type FakeRunner struct {
-	Calls   []string
-	Outputs map[string][]byte
-	Errors  map[string]error
+	Calls    []string
+	Outputs  map[string][]byte
+	Errors   map[string]error
+	Prefixes map[string][]byte // fallback when no exact Outputs/Errors key matches
 }
 
 func (s *FakeRunner) Run(_ context.Context, _ io.Reader, name string, args ...string) ([]byte, error) {
@@ -25,6 +26,15 @@ func (s *FakeRunner) Run(_ context.Context, _ io.Reader, name string, args ...st
 	}
 	if out, ok := s.Outputs[line]; ok {
 		return out, nil
+	}
+	best := ""
+	for prefix := range s.Prefixes {
+		if strings.HasPrefix(line, prefix) && len(prefix) > len(best) {
+			best = prefix
+		}
+	}
+	if best != "" {
+		return s.Prefixes[best], nil
 	}
 	return nil, fmt.Errorf("fake runner: unscripted command %q", line)
 }
