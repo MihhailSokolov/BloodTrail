@@ -1,0 +1,1 @@
+These SharpHound v6 JSON files are copied from github.com/SpecterOps/BloodHound (cmd/api/src/test/fixtures/fixtures/v6/ingest) at tag v9.6.0, Apache-2.0, for use as a smoke-test fixture. They describe the fictional domain TESTLAB.LOCAL.
