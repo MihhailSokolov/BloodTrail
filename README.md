@@ -34,8 +34,9 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   applied to the replica on commit; on startup the replica is loaded from PostgreSQL or
   from a snapshot file.
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
-  two-file change, and an installer that upgrades an existing BloodHound CE deployment
-  with backup and rollback.
+  one-file patch (the build script also adds the driver module to `go.mod`), and an
+  installer that upgrades an existing BloodHound CE deployment with backup and
+  rollback.
 
 ## Installing on an existing BloodHound CE deployment
 
@@ -46,8 +47,9 @@ the compose deployment:
 
 Until the first release is published, build the CLI with `go build ./cmd/bloodtrail`
 instead; the one-liner above describes the intended installation once a release exists.
-On macOS, where `sha256sum` is absent, `shasum -a 256` is the equivalent for checking
-the release checksums by hand (the installer script targets Linux deployment hosts).
+On macOS the bootstrap script's checksum step needs `sha256sum`, which stock macOS
+lacks; verify the release checksum by hand with `shasum -a 256` instead, or install the
+CLI from the release archive directly.
 
 The installer inventories the deployment, backs up the application database and the
 compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
