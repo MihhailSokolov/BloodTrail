@@ -1,0 +1,22 @@
+version: 2
+project_name: bloodtrail
+builds:
+  - id: bloodtrail
+    main: ./cmd/bloodtrail
+    binary: bloodtrail
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+checksum:
+  name_template: checksums.txt
+release:
+  extra_files:
+    - glob: scripts/install.sh
+changelog:
+  use: github
