@@ -5,6 +5,7 @@ package bloodtrail
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 
@@ -111,6 +112,10 @@ func ParseSize(text string) (size.Size, error) {
 	factor, ok := sizeUnits[unit]
 	if !ok {
 		return 0, fmt.Errorf("size %q has unknown unit %q", text, unit)
+	}
+
+	if value > math.MaxInt64/int64(factor) {
+		return 0, fmt.Errorf("size %q is too large", text)
 	}
 
 	return size.Size(value) * factor, nil

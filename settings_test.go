@@ -84,7 +84,7 @@ func TestParseSize(t *testing.T) {
 			t.Errorf("ParseSize(%q) = %d, want %d", c.in, got, c.want)
 		}
 	}
-	for _, bad := range []string{"", "-1", "1.5GiB", "GiB", "12XB"} {
+	for _, bad := range []string{"", "-1", "1.5GiB", "GiB", "12XB", "9000000000000TiB"} {
 		if _, err := ParseSize(bad); err == nil {
 			t.Errorf("ParseSize(%q) expected error", bad)
 		}
