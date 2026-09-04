@@ -279,6 +279,99 @@ func TestInstallAbortsWhenMigratedCountsDoNotMatchNeo4j(t *testing.T) {
 	}
 }
 
+// TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory
+// covers BloodHound continuing to ingest into Neo4j between the inventory
+// read (taken before the confirmation prompt and the backup) and the
+// migration: comparing what arrived in PostgreSQL against that stale
+// inventory count would refuse a clean migration just because Neo4j kept
+// growing in the meantime, so the installer must re-read Neo4j immediately
+// before migrating (a second, distinctly scripted cypher-shell call here)
+// and compare against that instead.
+func TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
+			psql + "select driver from database_switch limit 1":             []byte(""),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			base + "logs --no-color bloodhound":                             []byte(""),
+			base + "-f " + overridePath + " logs --no-color bloodhound":     []byte("BloodTrail driver active version=test\n"),
+			"docker image inspect " + image:                                 []byte(""),
+			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
+			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d": nil,
+		},
+		Sequences: map[string][][]byte{
+			psql + "select (select count(*) from node)": {[]byte("0|0\n")},
+			// Neo4j gained 2 nodes and 5 edges between the inventory read
+			// and the migration; PostgreSQL ends up with exactly what
+			// Neo4j held right before the migration (12|25), which does
+			// not match the stale inventory count (10|20) an equality
+			// check against inv.Nodes/inv.Edges would have demanded.
+			base + neo4jNodeCount: {[]byte("count\n10\n"), []byte("count\n12\n")},
+			base + neo4jEdgeCount: {[]byte("count\n20\n"), []byte("count\n25\n")},
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("12|25\n"),
+		},
+	}
+	tool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /pg-migration/neo-to-pg", "PUT /graph-db/switch/pg":
+			w.WriteHeader(200)
+		case "GET /pg-migration/status":
+			_, _ = w.Write([]byte(`{"state":"idle"}`))
+		default:
+			t.Errorf("unexpected tool API call %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer tool.Close()
+
+	deps := Deps{
+		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
+		NewToolAPITransport: func(string) toolapi.Transport {
+			return rewriteTransport{base: tool.URL, client: tool.Client()}
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		MigrationTimeout: time.Second, VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	if err := Install(context.Background(), deps, opts); err != nil {
+		t.Fatalf("install should succeed once PostgreSQL meets the fresh Neo4j count, even though it differs from the stale inventory count: %v", err)
+	}
+}
+
+// TestInstallRefusesWhenPostgresFallsBelowFreshNeo4jCounts is the other side
+// of the same fix: exceeding the stale inventory count is not proof the
+// migration is complete once Neo4j kept ingesting past it.
+func TestInstallRefusesWhenPostgresFallsBelowFreshNeo4jCounts(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	// PostgreSQL (15|25) clears the stale inventory count (10|20) but falls
+	// short of what Neo4j holds right before the migration (15|30).
+	fake := migrationFake(dir, composeFile, image, "10", "20", "15|25", "", "")
+	delete(fake.Outputs, base+neo4jNodeCount)
+	delete(fake.Outputs, base+neo4jEdgeCount)
+	fake.Sequences[base+neo4jNodeCount] = [][]byte{[]byte("count\n10\n"), []byte("count\n15\n")}
+	fake.Sequences[base+neo4jEdgeCount] = [][]byte{[]byte("count\n20\n"), []byte("count\n30\n")}
+
+	err := runMigrationInstall(t, dir, composeFile, image, fake)
+	if err == nil || !strings.Contains(err.Error(), "15 nodes and 25 edges") || !strings.Contains(err.Error(), "15 nodes and 30 edges") {
+		t.Fatalf("expected an error naming both the migrated and the fresh Neo4j counts, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected the rollback hint, got %v", err)
+	}
+}
+
 func TestInstallAbortsWhenTheMigratorLogsAFailure(t *testing.T) {
 	for _, marker := range []string{"Failed importing", "Unable to migrate", "Unable to assert"} {
 		t.Run(marker, func(t *testing.T) {

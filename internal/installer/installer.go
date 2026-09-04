@@ -298,6 +298,12 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		if err != nil {
 			return fmt.Errorf("reading %s logs before the migration: %w; %s", bloodhoundService, err, rollbackHint)
 		}
+		// BloodHound keeps ingesting into Neo4j while the operator confirms
+		// and the backup runs, so the counts taken during inventory can
+		// already be stale by the time the migration starts. Read Neo4j
+		// again right before it, best effort like the inventory read, and
+		// compare the migrated counts against these instead.
+		freshNodes, freshEdges, freshErr := neo4jCounts(ctx, c, inv.Config)
 		client := toolapi.Client{BaseURL: toolAPIBaseURL, Transport: deps.NewToolAPITransport(inv.Config.DefaultNetworkName())}
 		if err := client.MigrateNeoToPG(ctx, migrationPoll, opts.MigrationTimeout); err != nil {
 			return fmt.Errorf("the migration reported an error: %w; BloodHound's migrator may already have switched the active driver to pg; %s", err, rollbackHint)
@@ -309,12 +315,12 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		// The migrator reports per-object failures to the server log only and
 		// still returns to idle, so a run that imported the nodes but dropped
 		// every edge looks identical to a clean one from the API. Check what
-		// arrived against what Neo4j held, then read the log.
+		// arrived against what Neo4j holds now, then read the log.
 		switch {
-		case inv.CountSource == "neo4j" && (nodes != inv.Nodes || edges != inv.Edges):
-			return fmt.Errorf("the migration moved %d nodes and %d edges into PostgreSQL but Neo4j holds %d nodes and %d edges; "+
-				"BloodHound's migrator reports failures to its log only; %s", nodes, edges, inv.Nodes, inv.Edges, rollbackHint)
-		case inv.CountSource != "neo4j" && nodes == 0:
+		case freshErr == nil && (nodes < freshNodes || edges < freshEdges):
+			return fmt.Errorf("the migration moved %d nodes and %d edges into PostgreSQL but Neo4j now holds %d nodes and %d edges; "+
+				"BloodHound's migrator reports failures to its log only; %s", nodes, edges, freshNodes, freshEdges, rollbackHint)
+		case freshErr != nil && nodes == 0:
 			return fmt.Errorf("the migration finished with zero nodes in PostgreSQL; BloodHound's migrator may already have switched the active driver to pg; %s", rollbackHint)
 		}
 		if line, err := migratorFailureInLogs(ctx, c, len(preLogs)); err != nil {
