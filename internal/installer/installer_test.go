@@ -195,8 +195,11 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 
 // migrationFake scripts a Neo4j deployment through a migration that the tool
 // API reports as clean. neo4j and pg are the "nodes|edges" the two databases
-// report afterwards, and logs is what the bloodhound service printed.
-func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, logs string) *dockerx.FakeRunner {
+// report afterwards. preLogs and postLogs are what the bloodhound service's
+// log held before and after the migration: the installer reads it once
+// immediately before starting the migration and again afterwards, so both
+// have to be scripted even when a test does not care about either.
+func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, preLogs, postLogs string) *dockerx.FakeRunner {
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
 	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
 	return &dockerx.FakeRunner{
@@ -204,7 +207,6 @@ func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, logs str
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-			base + "logs --no-color bloodhound":                             []byte(logs),
 			"docker image inspect " + image:                                 []byte(""),
 			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 			base + neo4jNodeCount:                                           []byte("count\n" + neo4jNodes + "\n"),
@@ -212,6 +214,7 @@ func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, logs str
 		},
 		Sequences: map[string][][]byte{
 			psql + "select (select count(*) from node)": {[]byte("0|0\n")},
+			base + "logs --no-color bloodhound":         {[]byte(preLogs), []byte(postLogs)},
 		},
 		Prefixes: map[string][]byte{
 			psql + "select (select count(*) from node)": []byte(pg + "\n"),
@@ -247,7 +250,7 @@ func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
 	// Without a usable Neo4j count there is nothing to compare against, so an
 	// empty PostgreSQL graph is the only evidence the migration failed.
-	fake := migrationFake(dir, composeFile, image, "10", "20", "0|0", "")
+	fake := migrationFake(dir, composeFile, image, "10", "20", "0|0", "", "")
 	delete(fake.Outputs, base+neo4jNodeCount)
 	delete(fake.Outputs, base+neo4jEdgeCount)
 
@@ -265,7 +268,7 @@ func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
 func TestInstallAbortsWhenMigratedCountsDoNotMatchNeo4j(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
-	fake := migrationFake(dir, composeFile, image, "10", "20", "10|0", "")
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|0", "", "")
 
 	err := runMigrationInstall(t, dir, composeFile, image, fake)
 	if err == nil || !strings.Contains(err.Error(), "10 nodes and 0 edges") || !strings.Contains(err.Error(), "10 nodes and 20 edges") {
@@ -281,8 +284,10 @@ func TestInstallAbortsWhenTheMigratorLogsAFailure(t *testing.T) {
 		t.Run(marker, func(t *testing.T) {
 			dir, composeFile := setupProject(t)
 			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
-			logs := "starting migration\n" + marker + " node objectid=S-1-5-21: duplicate key value\ndone\n"
-			fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", logs)
+			postLogs := "starting migration\n" + marker + " node objectid=S-1-5-21: duplicate key value\ndone\n"
+			// The log holds nothing before the migration, so the whole marker
+			// line is new; the installer must catch it.
+			fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "", postLogs)
 
 			err := runMigrationInstall(t, dir, composeFile, image, fake)
 			if err == nil || !strings.Contains(err.Error(), marker) {
@@ -295,6 +300,73 @@ func TestInstallAbortsWhenTheMigratorLogsAFailure(t *testing.T) {
 				t.Fatalf("the image must not be swapped in after a failed migration:\n%s", strings.Join(fake.Calls, "\n"))
 			}
 		})
+	}
+}
+
+// TestInstallIgnoresAPreExistingMigratorFailureLog covers the case
+// migratorFailureInLogs exists to avoid: the bloodhound service is not
+// recreated by a failed install followed by a rollback, so its log can still
+// carry a failure line from an earlier attempt when a later install runs the
+// migration again. That earlier line must not block an install whose own
+// migration logged nothing new.
+func TestInstallIgnoresAPreExistingMigratorFailureLog(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	preLogs := "starting up\nFailed importing node objectid=OLD: duplicate key value\nready\n"
+	postLogs := preLogs + "migration progressing\nmigration complete\n"
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
+			psql + "select driver from database_switch limit 1":             []byte(""),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			base + "-f " + overridePath + " logs --no-color bloodhound":     []byte("BloodTrail driver active version=test\n"),
+			"docker image inspect " + image:                                 []byte(""),
+			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
+			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d": nil,
+			base + neo4jNodeCount:                  []byte("count\n10\n"),
+			base + neo4jEdgeCount:                  []byte("count\n20\n"),
+		},
+		Sequences: map[string][][]byte{
+			// PostgreSQL holds no graph before the migration (so the
+			// pre-existing log line is the only thing that could wrongly
+			// block this install) and everything Neo4j held after it.
+			psql + "select (select count(*) from node)": {[]byte("0|0\n")},
+			base + "logs --no-color bloodhound":         {[]byte(preLogs), []byte(postLogs)},
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+		},
+	}
+	tool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /pg-migration/neo-to-pg", "PUT /graph-db/switch/pg":
+			w.WriteHeader(200)
+		case "GET /pg-migration/status":
+			_, _ = w.Write([]byte(`{"state":"idle"}`))
+		default:
+			t.Errorf("unexpected tool API call %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer tool.Close()
+
+	deps := Deps{
+		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
+		NewToolAPITransport: func(string) toolapi.Transport {
+			return rewriteTransport{base: tool.URL, client: tool.Client()}
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		MigrationTimeout: time.Second, VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	if err := Install(context.Background(), deps, opts); err != nil {
+		t.Fatalf("a failure line already present before the migration must not block this install: %v", err)
 	}
 }
 
@@ -551,7 +623,7 @@ func TestInstallRefusesWhenTheCurlImageIsUnavailable(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
-	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "")
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "", "")
 	delete(fake.Outputs, "docker image inspect "+toolapi.CurlImage)
 	fake.Errors = map[string]error{
 		"docker image inspect " + toolapi.CurlImage: errors.New("no such image"),

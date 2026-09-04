@@ -290,6 +290,14 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 			return err
 		}
 		say("==> Migrating graph from Neo4j to PostgreSQL")
+		// The bloodhound service is not recreated by a failed install followed
+		// by a rollback, so its log can already carry a failure line from an
+		// earlier attempt; remember how much log there was before this
+		// migration so only what it appends gets scanned for one.
+		preLogs, err := c.Logs(ctx, bloodhoundService)
+		if err != nil {
+			return fmt.Errorf("reading %s logs before the migration: %w; %s", bloodhoundService, err, rollbackHint)
+		}
 		client := toolapi.Client{BaseURL: toolAPIBaseURL, Transport: deps.NewToolAPITransport(inv.Config.DefaultNetworkName())}
 		if err := client.MigrateNeoToPG(ctx, migrationPoll, opts.MigrationTimeout); err != nil {
 			return fmt.Errorf("the migration reported an error: %w; BloodHound's migrator may already have switched the active driver to pg; %s", err, rollbackHint)
@@ -309,7 +317,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		case inv.CountSource != "neo4j" && nodes == 0:
 			return fmt.Errorf("the migration finished with zero nodes in PostgreSQL; BloodHound's migrator may already have switched the active driver to pg; %s", rollbackHint)
 		}
-		if line, err := migratorFailureInLogs(ctx, c); err != nil {
+		if line, err := migratorFailureInLogs(ctx, c, len(preLogs)); err != nil {
 			return fmt.Errorf("reading %s logs after the migration: %w; %s", bloodhoundService, err, rollbackHint)
 		} else if line != "" {
 			return fmt.Errorf("the migration logged a failure: %q; %s", line, rollbackHint)
@@ -352,13 +360,22 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 var migratorFailureMarkers = []string{"Failed importing", "Unable to migrate", "Unable to assert"}
 
 // migratorFailureInLogs returns the first log line reporting a migration
-// failure, or "" when there is none.
-func migratorFailureInLogs(ctx context.Context, c dockerx.Compose) (string, error) {
+// failure among the bytes the bloodhound service's log gained since preLen,
+// or "" when there is none. The bloodhound container is not recreated by a
+// failed install followed by a rollback, so its log can carry a failure line
+// from an earlier migration attempt; scanning only what was appended keeps
+// that stale line from blocking every later install. A log shorter than
+// preLen means the container was recreated after all (nothing here
+// guarantees it will not be), so the whole thing is scanned in that case.
+func migratorFailureInLogs(ctx context.Context, c dockerx.Compose, preLen int) (string, error) {
 	logs, err := c.Logs(ctx, bloodhoundService)
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(string(logs), "\n") {
+	if preLen > len(logs) {
+		preLen = 0
+	}
+	for _, line := range strings.Split(string(logs[preLen:]), "\n") {
 		for _, marker := range migratorFailureMarkers {
 			if strings.Contains(line, marker) {
 				return strings.TrimSpace(line), nil
