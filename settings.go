@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/specterops/dawgs/util/size"
 )
@@ -18,7 +19,20 @@ const (
 	EnvSnapshotDir = "BLOODTRAIL_SNAPSHOT_DIR"
 	EnvMemoryLimit = "BLOODTRAIL_MEMORY_LIMIT"
 	EnvLogLevel    = "BLOODTRAIL_LOG_LEVEL"
+	// EnvEngine toggles the in-memory path engine on or off. Accepts "on"
+	// (default) or "off", as well as true/false/1/0 (case-insensitive).
+	// When off, every read is delegated to PostgreSQL exactly as in the
+	// pre-engine driver.
+	EnvEngine = "BLOODTRAIL_ENGINE"
+	// EnvEnginePollInterval sets the poller's rebuild cadence, parsed with
+	// time.ParseDuration. Defaults to 5s; the value must be strictly
+	// positive.
+	EnvEnginePollInterval = "BLOODTRAIL_ENGINE_POLL_INTERVAL"
 )
+
+// defaultEnginePollInterval is EnginePollInterval's value when
+// EnvEnginePollInterval is unset.
+const defaultEnginePollInterval = 5 * time.Second
 
 // Settings holds the driver's own configuration.
 type Settings struct {
@@ -29,13 +43,23 @@ type Settings struct {
 	MemoryLimit size.Size
 	// LogLevel for the driver's own logging.
 	LogLevel slog.Level
+	// Engine gates whether the in-memory path engine ever attempts to serve
+	// a query. Defaults to true (on); EnvEngine can turn it off.
+	Engine bool
+	// EnginePollInterval is the engine poller's rebuild cadence. Defaults to
+	// defaultEnginePollInterval.
+	EnginePollInterval time.Duration
 }
 
 // SettingsFromEnv builds Settings from an environment lookup function
 // (normally os.LookupEnv). Missing variables take defaults; malformed values
 // are errors so a misconfiguration fails at startup, not later.
 func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
-	settings := Settings{LogLevel: slog.LevelInfo}
+	settings := Settings{
+		LogLevel:           slog.LevelInfo,
+		Engine:             true,
+		EnginePollInterval: defaultEnginePollInterval,
+	}
 
 	if v, ok := lookup(EnvSnapshotDir); ok {
 		settings.SnapshotDir = strings.TrimSpace(v)
@@ -57,7 +81,39 @@ func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 		settings.LogLevel = level
 	}
 
+	if v, ok := lookup(EnvEngine); ok {
+		enabled, err := parseEngineToggle(v)
+		if err != nil {
+			return Settings{}, fmt.Errorf("%s: %w", EnvEngine, err)
+		}
+		settings.Engine = enabled
+	}
+
+	if v, ok := lookup(EnvEnginePollInterval); ok {
+		interval, err := time.ParseDuration(strings.TrimSpace(v))
+		if err != nil {
+			return Settings{}, fmt.Errorf("%s: %w", EnvEnginePollInterval, err)
+		}
+		if interval <= 0 {
+			return Settings{}, fmt.Errorf("%s: must be > 0, got %s", EnvEnginePollInterval, interval)
+		}
+		settings.EnginePollInterval = interval
+	}
+
 	return settings, nil
+}
+
+// parseEngineToggle parses EnvEngine's value: "on"/"off", or true/false/1/0,
+// case-insensitively, with surrounding whitespace trimmed.
+func parseEngineToggle(text string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "on", "true", "1":
+		return true, nil
+	case "off", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unknown value %q (want on, off, true, false, 1 or 0)", text)
+	}
 }
 
 func parseLogLevel(text string) (slog.Level, error) {
