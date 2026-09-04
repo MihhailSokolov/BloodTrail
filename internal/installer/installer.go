@@ -168,6 +168,17 @@ func resolveImage(ctx context.Context, deps Deps, target, alias string) (string,
 	return "", fmt.Errorf("target image %s is neither present locally nor in a registry; build or pull it first", target)
 }
 
+// untouchedGraph names the copy of the graph a rollback returns to. Only a
+// deployment that was on Neo4j has one to return to: an install that started
+// on PostgreSQL never migrated anything, so the graph it goes back to is the
+// PostgreSQL one it has been using all along.
+func untouchedGraph(originalDriver string) string {
+	if originalDriver == "neo4j" {
+		return "the Neo4j graph this install migrates from stays as it is"
+	}
+	return "the PostgreSQL graph is not touched"
+}
+
 // ensureCurlImage puts the throwaway container the tool API is reached through
 // on the host before anything is changed. It is otherwise pulled in the middle
 // of the install, so a host without registry access finds out only once the
@@ -264,7 +275,8 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err := m.Save(opts.ProjectDir); err != nil {
 		return fmt.Errorf("saving manifest: %w", err)
 	}
-	rollbackHint := fmt.Sprintf("run `bloodtrail rollback` to restore the original driver and image (Neo4j data is intact); backup in %s", backupDir)
+	rollbackHint := fmt.Sprintf("run `bloodtrail rollback` to restore the original driver and image (%s); backup in %s",
+		untouchedGraph(inv.ActiveDriver), backupDir)
 
 	if inv.ActiveDriver == "neo4j" {
 		// BloodHound's migrator only inserts: run against a PostgreSQL graph
@@ -464,13 +476,16 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 
 	say("==> Restarting with the original image %s", m.OriginalImage)
-	// The override is gone from disk and from COMPOSE_FILE, so the project is
-	// re-read from what is left.
+	// Everything that makes the deployment BloodTrail is undone by this point,
+	// so a failure from here on is about the deployment coming back up, not
+	// about the rollback being incomplete. Say so: the manifest is still
+	// there, and rerunning rollback picks up where this left off.
+	restored := "the driver row and the compose files are already restored; rerun `bloodtrail rollback` once the deployment can start"
 	if err := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir).Up(ctx); err != nil {
-		return err
+		return fmt.Errorf("restarting with the original image: %w (%s)", err, restored)
 	}
 	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
-		return err
+		return fmt.Errorf("waiting for the API after the restart: %w (%s; check the %s logs)", err, restored, bloodhoundService)
 	}
 	if err := os.Remove(manifest.Path(m.ProjectDir)); err != nil {
 		return err

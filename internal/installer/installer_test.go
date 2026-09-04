@@ -650,6 +650,49 @@ func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
 	}
 }
 
+func TestRollbackSaysWhatIsAlreadyRestoredWhenTheRestartFails(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	_ = os.WriteFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound"}.Save(dir)
+
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc delete from database_switch": nil,
+		},
+		Errors: map[string]error{base + "up -d": errors.New("port is already allocated")},
+	}
+	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, VerifyTimeout: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "already restored") {
+		t.Fatalf("expected an error saying what is already restored, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "rerun `bloodtrail rollback`") {
+		t.Fatalf("expected the error to say how to finish, got %v", err)
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive a failed restart so the rerun finds the installation")
+	}
+}
+
+func TestInstallRollbackHintNamesTheGraphThatStays(t *testing.T) {
+	for _, c := range []struct{ driver, want string }{
+		{"neo4j", "Neo4j"},
+		{"pg", "PostgreSQL"},
+	} {
+		t.Run(c.driver, func(t *testing.T) {
+			if got := untouchedGraph(c.driver); !strings.Contains(got, c.want) {
+				t.Fatalf("untouchedGraph(%q) = %q, want it to name %s", c.driver, got, c.want)
+			}
+		})
+	}
+	if strings.Contains(untouchedGraph("pg"), "Neo4j") {
+		t.Fatal("a deployment that was already on PostgreSQL has no Neo4j graph to promise")
+	}
+}
+
 func TestStatusReportsRunningImage(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
