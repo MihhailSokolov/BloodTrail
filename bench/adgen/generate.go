@@ -69,6 +69,34 @@ var (
 // 50k users, minimum one domain.
 const usersPerDomainCap = 50_000
 
+// Edge-density budgets. These are deliberately linear in Users/Computers
+// (never the product of two counts that both grow with -users, which would
+// make large runs quadratic and computationally infeasible -- see the
+// AdminTo design note below) but are sized so that a default run (no flags
+// beyond -users) lands close to the milestone's ~10-edges-per-node design
+// point -- see Generate's doc comment and README.md for the worked
+// numbers. Raised from an earlier, much sparser pass (extraMemberOfPerUser
+// 3, aclDensityPerUser 1.5, adminToCoverage 0.3, hasSessionCoverage 0.1)
+// that only reached ~3.4 edges/node.
+const (
+	// extraMemberOfPerUser is the number of additional MemberOf edges each
+	// user gets to random groups, on top of the one guaranteed MemberOf
+	// edge to the domain's Domain Users hub.
+	extraMemberOfPerUser = 8
+
+	// adminToCoverage is the fraction of a domain's computers that receive
+	// an AdminTo edge from the domain's admin-group pool.
+	adminToCoverage = 0.5
+
+	// hasSessionCoverage is the fraction of a domain's computers that get
+	// a HasSession edge to a random user.
+	hasSessionCoverage = 0.3
+
+	// aclDensityPerUser is the number of ACL edges (GenericAll, WriteDacl,
+	// AddMember) generated per user in the domain.
+	aclDensityPerUser = 8.0
+)
+
 // domainCount returns the number of domains Generate splits users users
 // across for the given Spec.Users value: floor(users/50000), minimum 1.
 func domainCount(users int) int {
@@ -125,15 +153,26 @@ type domain struct {
 //   - every user MemberOf the domain's Domain Users hub.
 //   - groups nest into an earlier group in the same domain with p=0.3,
 //     capped at nesting depth 5.
-//   - every user gets 3 extra MemberOf edges to random groups.
+//   - every user gets extraMemberOfPerUser (8) extra MemberOf edges to
+//     random groups.
 //   - a small set of "admin groups" (~2% of a domain's non-special groups)
-//     hold AdminTo over ~30% of the domain's computers.
-//   - ~10% of computers HasSession to a random user.
+//     hold AdminTo over adminToCoverage (50%) of the domain's computers.
+//   - hasSessionCoverage (30%) of computers HasSession to a random user.
 //   - ACL edges (GenericAll, WriteDacl, AddMember) run from random
-//     users/groups to random groups, combined density ~1.5 per user, with
-//     one edge pair per domain deliberately chained (User
-//     -GenericAll-> group -AddMember-> Domain Admins) so a multi-hop path
-//     to Domain Admins always exists.
+//     users/groups to random groups, combined density aclDensityPerUser
+//     (8.0) per user, with one edge pair per domain deliberately chained
+//     (User -GenericAll-> group -AddMember-> Domain Admins) so a
+//     multi-hop path to Domain Admins always exists.
+//
+// These per-user/per-computer budgets are deliberately kept linear in
+// Users (see the AdminTo/HasSession design note below) but were sized so
+// that a *default* run (no flags beyond -users) lands close to the
+// milestone's ~10-edges-per-node design point: at Users=100000 (2
+// domains) this produces a ~10.3 edges/node graph (see
+// TestGenerateDefaultEdgeDensityNear10), and the same per-domain
+// proportions carry through to -users 2800000 (56 domains of 50,000
+// users each) -- see README.md for the worked-out formula numbers at
+// that scale.
 //
 // Node kinds are always ["Base", <User|Computer|Group>]; properties are
 // always {"objectid": <ObjectID>, "name": <display name>}.
@@ -280,17 +319,20 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 		depth[gi] = depth[cand] + 1
 	}
 
-	// 3. ~3 extra MemberOf per user, to a random group in the domain.
+	// 3. extraMemberOfPerUser extra MemberOf per user, to a random group in
+	// the domain.
 	for _, u := range users {
-		for k := 0; k < 3; k++ {
+		for k := 0; k < extraMemberOfPerUser; k++ {
 			target := groups[rng.Intn(len(groups))]
 			edges = append(edges, Edge{StartIdx: u, EndIdx: target, Kind: EdgeMemberOf})
 		}
 	}
 
 	// 4. AdminTo: ~2% of the domain's non-special groups act as "admin
-	// groups"; together they hold AdminTo over ~30% of the domain's
-	// computers (one admin group per targeted computer).
+	// groups"; together they hold AdminTo over adminToCoverage of the
+	// domain's computers (one admin group per targeted computer -- see the
+	// package doc's AdminTo design note for why this isn't the full
+	// admins x computers cross product).
 	if len(extraGroups) > 0 && len(comps) > 0 {
 		adminCount := round(0.02 * float64(len(extraGroups)))
 		if adminCount < 1 {
@@ -305,7 +347,7 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 			adminPool[i] = extraGroups[adminPerm[i]]
 		}
 
-		targetCount := round(0.3 * float64(len(comps)))
+		targetCount := round(adminToCoverage * float64(len(comps)))
 		if targetCount > len(comps) {
 			targetCount = len(comps)
 		}
@@ -317,10 +359,10 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 		}
 	}
 
-	// 5. HasSession: ~10% of computers each have a session of a random
-	// user.
+	// 5. HasSession: hasSessionCoverage of computers each have a session of
+	// a random user.
 	if len(comps) > 0 && len(users) > 0 {
-		sessionCount := round(0.1 * float64(len(comps)))
+		sessionCount := round(hasSessionCoverage * float64(len(comps)))
 		if sessionCount > len(comps) {
 			sessionCount = len(comps)
 		}
@@ -332,11 +374,11 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 		}
 	}
 
-	// 6. ACL edges: combined density ~1.5 per user, source is a random user
-	// or group, target is a random group, kind is one of GenericAll,
-	// WriteDacl, AddMember.
+	// 6. ACL edges: combined density aclDensityPerUser per user, source is
+	// a random user or group, target is a random group, kind is one of
+	// GenericAll, WriteDacl, AddMember.
 	aclKinds := [...]string{EdgeGenericAll, EdgeWriteDacl, EdgeAddMember}
-	aclCount := round(1.5 * float64(len(users)))
+	aclCount := round(aclDensityPerUser * float64(len(users)))
 	for i := 0; i < aclCount; i++ {
 		var src int
 		if len(users) > 0 && rng.Intn(2) == 0 {

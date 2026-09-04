@@ -19,21 +19,49 @@ The shape is driven entirely by `-users`:
   `-512`) and one **Domain Users** hub (objectid suffix `-513`), following
   real AD's well-known RIDs. Every other principal gets a synthetic
   domain-scoped RID starting at 1000.
-- Every **User** is a member of the domain's Domain Users hub, plus ~3 extra
+- Every **User** is a member of the domain's Domain Users hub, plus 8 extra
   `MemberOf` edges to random groups.
 - **Groups nest**: each non-well-known group has a 30% chance of being a
   member of an earlier group in the same domain, capped at nesting depth 5.
-- A small set (~2%) of a domain's groups hold **AdminTo** over ~30% of the
+- A small set (~2%) of a domain's groups hold **AdminTo** over 50% of the
   domain's computers.
-- ~10% of **Computers** have a session (`HasSession`) of a random user.
+- 30% of **Computers** have a session (`HasSession`) of a random user.
 - **ACL edges** (`GenericAll`, `WriteDacl`, `AddMember`) run from random
-  users/groups to random groups, combined density ~1.5 edges per user. One
+  users/groups to random groups, combined density 8 edges per user. One
   explicit chain per domain (a user, a `GenericAll` edge to a group, an
   `AddMember` edge from that group to Domain Admins) is always added on top
   of the random ACL noise, guaranteeing at least one multi-hop path from a
   user to Domain Admins in every generated graph.
 - Every node carries kinds `["Base", <User|Computer|Group>]` and properties
   `{"objectid": ..., "name": ...}`.
+
+### Edge density: ~10 edges per node, by default
+
+The milestone's path-engine performance targets are defined at ~5M nodes /
+~50M edges, i.e. **~10 edges per node**. `adgen`'s per-user/per-computer
+budgets above (8 extra `MemberOf`, 8 ACL edges, 50%/30% `AdminTo`/
+`HasSession` computer coverage) were sized so that a plain default run (no
+flags beyond `-users`) lands on that design point without needing a
+separate density knob:
+
+| `-users`  | domains | nodes (exact)     | edges (measured)  | edges/node |
+|-----------|---------|--------------------|--------------------|------------|
+| 1,000     | 1       | 1,700              | 17,197             | 10.12      |
+| 2,000     | 1       | 3,400              | 34,663             | 10.20      |
+| 100,000   | 2       | 170,000            | 1,745,527          | 10.27      |
+| 2,800,000 | 56      | 4,760,000 (exact)  | ≈48,900,000 (formula estimate) | ≈10.3 |
+
+The `-users 2800000` row is not run in practice (see "At large scale" below
+for why) -- it's derived from the same per-domain formulas as every other
+row: 56 domains of exactly 50,000 users each (the same per-domain size as
+the measured `-users 100000` row above, which has 2 such domains), so
+`4,760,000` nodes is exact arithmetic and `≈48.9M` edges is that row's
+measured per-domain edge count (872,763.5 edges/domain) extrapolated to 56
+domains -- consistent with the milestone's ~50M-edge target at ~5M nodes.
+`TestGenerateDefaultEdgeDensityNear10` in `generate_test.go` pins this down
+with a generous [8, 12] edges/node tolerance band at `-users 100000` (fast,
+no database needed) rather than asserting an exact ratio, since the ACL/
+nesting categories are randomized.
 
 Generation is a pure, deterministic function of `Spec{Users, Seed}`
 (`generate.go`'s `Generate`): the same `-users`/`-seed` pair always produces
@@ -49,15 +77,14 @@ are deduplicated before the graph is returned, since the database enforces
 
 ### The `-users` knob and scale
 
-Node/edge counts scale roughly linearly with `-users`; at `-users 1000` this
-generates ~1,700 nodes and a few thousand edges. As a rough sizing
-reference from the graph engine's benchmark target: `-users 2800000`
-generates on the order of several million nodes. Precision here is
-intentionally not tuned to hit an exact edges-per-node ratio -- the
-generator favors formulas that stay linear in `-users` (no term scales with
-the product of two counts that both grow with `-users`) so that large runs
-stay tractable; treat the exact totals `adgen` prints to stderr as the
-source of truth for a given run rather than this approximation.
+Node/edge counts scale roughly linearly with `-users` (see the table
+above). The generator favors formulas that stay linear in `-users` (no
+term scales with the product of two counts that both grow with `-users`,
+e.g. `AdminTo` targets a share of computers rather than the full
+admin-groups-by-computers cross product) so that large runs stay
+tractable; precision against the table above is intentionally loose --
+treat the exact totals `adgen` prints to stderr as the source of truth for
+a given run.
 
 At large scale, `Generate` builds the entire graph in memory before writing
 anything (its signature returns a whole `Graph`), so peak memory scales with
@@ -94,6 +121,15 @@ below the driver's usual write API. **Do not point `-dsn` at a production
 database** -- `adgen` is a bench/dev tool for a disposable or test database
 only, and `-wipe` truncates the `node`/`edge` tables for *every* graph in
 the database, not just the one it is about to load.
+
+The entire load (both `CopyFrom` calls plus the sequence fixups) runs
+inside a **single database transaction with no checkpointing or resume
+support**: if it fails or is interrupted partway (network blip, OOM,
+`Ctrl-C`), the whole transaction rolls back and nothing is left partially
+loaded -- but there is no way to resume from where it left off. Re-run the
+whole command from scratch (after fixing whatever caused the failure). At
+large `-users` values this means a failure late in a multi-minute run costs
+the entire run, not just the remainder.
 
 ## Flags
 
