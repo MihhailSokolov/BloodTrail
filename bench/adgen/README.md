@@ -8,6 +8,9 @@ tables, for benchmarking and manual testing of the path engine at scale.
 go run ./bench/adgen -dsn <pg dsn> -users 1000 -seed 1 [-wipe]
 ```
 
+Once a graph is loaded, see [`bench/pathbench`](../pathbench) to actually
+benchmark the path engine against it (`make bench-path`).
+
 ## What it generates
 
 The shape is driven entirely by `-users`:

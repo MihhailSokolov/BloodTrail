@@ -4,6 +4,7 @@
 *.out
 /bin/
 /dist/
+/pathbench
 bench/csrbench/csrbench
 
 # Benchmark and render scratch

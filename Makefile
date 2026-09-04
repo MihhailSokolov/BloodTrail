@@ -1,4 +1,4 @@
-.PHONY: test lint integration build-image tidy
+.PHONY: test lint integration build-image tidy bench-path
 
 test:
 	go test ./...
@@ -13,6 +13,12 @@ integration:
 
 tidy:
 	go mod tidy
+
+# Requires a PostgreSQL reachable at BLOODTRAIL_TEST_PG, already loaded with a
+# graph (see bench/adgen). -enforce fails the build if the path engine misses
+# its latency targets; never pass -enforce in CI (see bench/pathbench).
+bench-path: ## run the path-engine benchmark against BLOODTRAIL_TEST_PG
+	go run ./bench/pathbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
 
 # Usage: make build-image UPSTREAM_TAG=v9.6.0
 UPSTREAM_TAG ?= v9.6.0
