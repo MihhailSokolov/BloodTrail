@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -104,12 +105,33 @@ func run(ctx context.Context, args []string, cmd func(context.Context, installer
 	deps := installer.Deps{
 		Out:              os.Stdout,
 		InstallerVersion: version,
-		Confirm: func(prompt string) bool {
-			fmt.Printf("%s [y/N] ", prompt)
-			var answer string
-			_, _ = fmt.Scanln(&answer)
-			return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes")
-		},
+		Confirm:          confirm,
 	}
 	return cmd(ctx, deps, opts)
+}
+
+// confirm asks the question on stderr and reads the answer from the terminal.
+// The usual way to run this is `curl … | sh -s -- install`, where stdin is the
+// pipe the shell is reading the script from: reading the answer from there
+// consumes the script and never sees the operator. /dev/tty is the terminal
+// whatever stdin happens to be, and stderr keeps the prompt out of anything
+// that pipes the installer's output. Both fall back when they are not there,
+// so a truly non-interactive run still gets a "no" rather than a hang; --yes
+// is the way to say yes without a terminal.
+func confirm(prompt string) bool {
+	in := io.Reader(os.Stdin)
+	if tty, err := os.Open("/dev/tty"); err == nil {
+		defer func() { _ = tty.Close() }()
+		in = tty
+	}
+	return confirmFrom(in, os.Stderr, prompt)
+}
+
+func confirmFrom(in io.Reader, out io.Writer, prompt string) bool {
+	_, _ = fmt.Fprintf(out, "%s [y/N] ", prompt)
+	var answer string
+	if _, err := fmt.Fscanln(in, &answer); err != nil {
+		return false
+	}
+	return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes")
 }
