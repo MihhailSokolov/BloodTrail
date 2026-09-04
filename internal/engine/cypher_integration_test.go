@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/specterops/dawgs/graph"
 	"github.com/specterops/dawgs/ops"
@@ -194,7 +195,7 @@ func TestTryCypherDifferential(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -278,7 +279,7 @@ func TestTryCypherRejectsNonShortestPath(t *testing.T) {
 	graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -308,7 +309,7 @@ func TestTryCypherParams(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 

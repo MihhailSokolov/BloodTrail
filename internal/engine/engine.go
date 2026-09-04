@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -63,9 +64,19 @@ type Engine struct {
 
 	// overBudget records whether the most recent RebuildNow refused to
 	// adopt its freshly loaded snapshot because ApproxBytes() exceeded
-	// cfg.MemoryLimit. A future poller task reads this to decide whether/how
-	// to keep retrying; Engine itself never reads it back.
+	// cfg.MemoryLimit. The poller (poller.go) reads this after every
+	// RebuildNow call to decide whether to remember the refusal.
 	overBudget atomic.Bool
+
+	// pollStop and pollDone coordinate Start/Stop's poller goroutine
+	// lifecycle (poller.go): Stop closes pollStop to signal the goroutine to
+	// exit, and waits on pollDone, which the goroutine closes as it returns.
+	// Both are nil until Start actually launches the goroutine (Start is a
+	// no-op when !cfg.Enabled); pollStopOnce makes Stop idempotent and safe
+	// to call even then.
+	pollStop     chan struct{}
+	pollDone     chan struct{}
+	pollStopOnce sync.Once
 }
 
 // New constructs an Engine bound to pgDriver/pool. It does not load a
@@ -120,15 +131,21 @@ func (e *Engine) snapshotStillCurrent(snap *snapshot.Snapshot) bool {
 	return snap.Generation == e.generation.Load()
 }
 
-// rebuildTrigger is logged on every successful rebuild. RebuildNow's
-// signature carries no trigger parameter (that is a poller-task concern), so
-// this stands in for now: every call this milestone makes is, definitionally,
-// a manual one.
-const rebuildTrigger = "manual"
-
 // RebuildNow loads a fresh snapshot.Snapshot from PostgreSQL and, if its
 // approximate size fits within cfg.MemoryLimit, adopts it atomically as the
 // engine's current snapshot.
+//
+// trigger names why this call is happening (triggerStartup, triggerAnalysis,
+// triggerIdleStale from the poller, or triggerManual for every other
+// caller); it is logged verbatim in the "trigger" attr on both the success
+// and memory-limit-refusal log lines below, so log consumers can tell a
+// poller-driven rebuild from a manual one. analysisStamp is stamped onto the
+// snapshot's AnalysisStamp field before the memory-limit check (so it is set
+// whether or not the snapshot is actually adopted -- irrelevant either way
+// for a dropped snapshot, but keeping the assignment unconditional avoids a
+// second, easy-to-forget branch); callers with no meaningful reading (every
+// caller but the poller) pass the zero time.Time, leaving AnalysisStamp
+// zero, same as before this parameter existed.
 //
 // The new snapshot's Generation is stamped with the write-generation
 // counter's value as read at the very start of this call, before
@@ -140,10 +157,10 @@ const rebuildTrigger = "manual"
 // A snapshot whose ApproxBytes() exceeds a nonzero cfg.MemoryLimit is
 // dropped rather than adopted: whatever snapshot was previously current (nil
 // or otherwise) stays current, a warning is logged, and the refusal is
-// remembered for a future poller task to act on. This is not treated as a
-// RebuildNow failure -- the load itself succeeded -- so the error return
-// stays nil.
-func (e *Engine) RebuildNow(ctx context.Context) error {
+// remembered via overBudget for the poller (poller.go) to act on. This is
+// not treated as a RebuildNow failure -- the load itself succeeded -- so the
+// error return stays nil.
+func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp time.Time) error {
 	start := time.Now()
 	generation := e.generation.Load()
 
@@ -152,6 +169,7 @@ func (e *Engine) RebuildNow(ctx context.Context) error {
 		return fmt.Errorf("engine: RebuildNow: %w", err)
 	}
 	snap.Generation = generation
+	snap.AnalysisStamp = analysisStamp
 
 	approxBytes := snap.ApproxBytes()
 	if e.cfg.MemoryLimit > 0 && approxBytes > uint64(e.cfg.MemoryLimit) {
@@ -161,6 +179,7 @@ func (e *Engine) RebuildNow(ctx context.Context) error {
 			slog.Int("edges", snap.EdgeCount()),
 			slog.Uint64("bytes", approxBytes),
 			slog.Uint64("limit", uint64(e.cfg.MemoryLimit)),
+			slog.String("trigger", trigger),
 		)
 		return nil
 	}
@@ -173,7 +192,7 @@ func (e *Engine) RebuildNow(ctx context.Context) error {
 		slog.Int("edges", snap.EdgeCount()),
 		slog.Uint64("bytes", approxBytes),
 		slog.Duration("duration", time.Since(start)),
-		slog.String("trigger", rebuildTrigger),
+		slog.String("trigger", trigger),
 	)
 	return nil
 }

@@ -14,6 +14,7 @@ import (
 	"slices"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
@@ -72,7 +73,7 @@ func TestTryAllShortestPathsDifferential(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -245,7 +246,7 @@ func TestTryAllShortestPathsStale(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
