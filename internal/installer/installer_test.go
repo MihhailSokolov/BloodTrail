@@ -335,8 +335,11 @@ func TestInstallRefusesMigrationIntoPopulatedPostgres(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "refusing") {
 		t.Fatalf("expected a refusal, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "--replace-postgres-graph") {
-		t.Fatalf("the refusal must name the way out, got %v", err)
+	// Install itself refuses to run again while this install's manifest is
+	// still on disk, so the way out has to start with a rollback, not a
+	// straight rerun with --replace-postgres-graph.
+	if !strings.Contains(err.Error(), "rollback") || !strings.Contains(err.Error(), "--replace-postgres-graph") {
+		t.Fatalf("the refusal must tell the operator to roll back before replacing the graph, got %v", err)
 	}
 	if fake.Called(psql + "truncate") {
 		t.Fatalf("nothing may be cleared without --replace-postgres-graph:\n%s", strings.Join(fake.Calls, "\n"))

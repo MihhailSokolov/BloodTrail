@@ -286,7 +286,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		// so without this check the installer would happily switch the
 		// deployment onto a stale graph and lose everything ingested into
 		// Neo4j since.
-		if err := checkPostgresGraphEmpty(ctx, deps, opts, store, backupDir); err != nil {
+		if err := checkPostgresGraphEmpty(ctx, deps, opts, store, backupDir, rollbackHint); err != nil {
 			return err
 		}
 		say("==> Migrating graph from Neo4j to PostgreSQL")
@@ -369,23 +369,27 @@ func migratorFailureInLogs(ctx context.Context, c dockerx.Compose) (string, erro
 }
 
 // checkPostgresGraphEmpty refuses to start a migration when PostgreSQL already
-// holds a graph, unless the caller asked for that graph to be replaced.
-func checkPostgresGraphEmpty(ctx context.Context, deps Deps, opts Options, store dbswitch.Store, backupDir string) error {
+// holds a graph, unless the caller asked for that graph to be replaced. Install
+// refuses to run at all while a manifest from this install already sits in
+// opts.ProjectDir, so an operator who hits the refusal below cannot simply
+// rerun with --replace-postgres-graph: they have to roll back the install
+// that saved it first.
+func checkPostgresGraphEmpty(ctx context.Context, deps Deps, opts Options, store dbswitch.Store, backupDir, rollbackHint string) error {
 	nodes, edges, err := store.CountGraph(ctx)
 	if err != nil {
-		return fmt.Errorf("counting the PostgreSQL graph before migrating: %w", err)
+		return fmt.Errorf("counting the PostgreSQL graph before migrating: %w; %s", err, rollbackHint)
 	}
 	if nodes == 0 {
 		return nil
 	}
 	if !opts.ReplacePostgresGraph {
 		return fmt.Errorf("PostgreSQL already holds %d nodes and %d edges from an earlier migration or install; "+
-			"refusing to migrate on top of them. Rerun with --replace-postgres-graph to clear them first "+
-			"(the backup in %s holds the current state)", nodes, edges, backupDir)
+			"refusing to migrate on top of them; run `bloodtrail rollback` first, then rerun with --replace-postgres-graph "+
+			"to clear them (the backup in %s holds the current state)", nodes, edges, backupDir)
 	}
 	_, _ = fmt.Fprintf(deps.Out, "    clearing %d nodes and %d edges left in PostgreSQL by an earlier migration\n", nodes, edges)
 	if err := store.ClearGraph(ctx); err != nil {
-		return fmt.Errorf("clearing the PostgreSQL graph: %w", err)
+		return fmt.Errorf("clearing the PostgreSQL graph: %w; %s", err, rollbackHint)
 	}
 	return nil
 }
