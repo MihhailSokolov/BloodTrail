@@ -225,17 +225,36 @@ func AllShortestPaths(s *snapshot.Snapshot, q Query) ([]Path, error) {
 	}
 }
 
-// remainingCap returns the per-call cap to pass so cumulative output never
-// exceeds limit (limit<=0: unbounded, returns 0), and whether limit has
-// already been reached given have paths collected so far.
-func remainingCap(limit, have int) (cap int, done bool) {
-	if limit <= 0 {
-		return 0, false
-	}
-	if have >= limit {
+// pathCap returns the cap to pass to pairPaths/enumerate for their next
+// call, and whether limit is already satisfied (in which case the caller
+// should stop iterating entirely — no further calls for any remaining
+// pair/root/terminal).
+//
+// pairEnumerate and enumerate's shared stop condition is len(out) == cap,
+// checked against out's cumulative length across every pair or BFS element
+// a strategy merges — not a per-call counter. So cap must be an absolute
+// target ("stop once total output reaches N"), never a delta relative to
+// this call ("N more from here"): a delta compared against a cumulative
+// counter either overruns (the delta is counted from 0 while out already
+// holds prior pairs' paths) or, once have exceeds limit/2, never fires at
+// all, letting a call run unbounded.
+//
+// limit<=0 means the query has no Limit. oneMore restricts the upcoming
+// call to contribute at most one additional path — ModeOne's "one path per
+// pair/root" — expressed as have+1 (not a bare 1) so it composes with
+// output already collected by earlier pairs/elements; when limit is also
+// set, the tighter of the two absolute targets wins.
+func pathCap(limit, have int, oneMore bool) (cap int, done bool) {
+	if limit > 0 && have >= limit {
 		return 0, true
 	}
-	return limit - have, false
+	cap = limit
+	if oneMore {
+		if next := have + 1; cap <= 0 || next < cap {
+			cap = next
+		}
+	}
+	return cap, false
 }
 
 // strategyPairs implements strategy A: iterate every (root, terminal) pair
@@ -244,6 +263,7 @@ func remainingCap(limit, have int) (cap int, done bool) {
 func strategyPairs(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget) ([]Path, error) {
 	n := s.NodeCount()
 	scF, scT, scTmp := newScratch(n), newScratch(n), newScratch(n)
+	oneMore := q.Mode == ModeOne
 
 	var out []Path
 	var callErr error
@@ -254,13 +274,13 @@ func strategyPairs(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, maxD
 			if q.ExcludeSelf && r == t {
 				return true
 			}
-			cap, done := remainingCap(q.Limit, len(out))
+			cap, done := pathCap(q.Limit, len(out), oneMore)
 			if done {
 				stopOuter = true
 				return false
 			}
 			var err error
-			out, err = pairPaths(s, r, t, kinds, maxDepth, cap, q.Mode, budget, scF, scT, scTmp, out)
+			out, err = pairPaths(s, r, t, kinds, maxDepth, cap, budget, scF, scT, scTmp, out)
 			if err != nil {
 				callErr = err
 				stopOuter = true
@@ -373,6 +393,7 @@ func strategySmallSide(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, 
 // and reversed into a root-to-terminal Path.
 func mergeSmallRoots(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	n := s.NodeCount()
+	oneMore := q.Mode == ModeOne
 	var out []Path
 	var callErr error
 
@@ -386,13 +407,10 @@ func mergeSmallRoots(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, bu
 			if _, reached := sc.get(t); !reached {
 				return true
 			}
-			cap, done := remainingCap(q.Limit, len(out))
+			cap, done := pathCap(q.Limit, len(out), oneMore)
 			if done {
 				stop = true
 				return false
-			}
-			if q.Mode == ModeOne {
-				cap = 1
 			}
 			var err error
 			out, err = enumerate(s, t, sc, kinds, cap, budget, out, false)
@@ -424,6 +442,7 @@ func mergeSmallRoots(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, bu
 // the Out-CSR (enumerate's forward=true), Task 3's original direction.
 func mergeSmallTerminals(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	n := s.NodeCount()
+	oneMore := q.Mode == ModeOne
 	var out []Path
 	var callErr error
 
@@ -436,12 +455,9 @@ func mergeSmallTerminals(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask
 			if _, reached := sc.get(r); !reached {
 				continue
 			}
-			cap, done := remainingCap(q.Limit, len(out))
+			cap, done := pathCap(q.Limit, len(out), oneMore)
 			if done {
 				return false
-			}
-			if q.Mode == ModeOne {
-				cap = 1
 			}
 			var err error
 			out, err = enumerate(s, r, sc, kinds, cap, budget, out, true)

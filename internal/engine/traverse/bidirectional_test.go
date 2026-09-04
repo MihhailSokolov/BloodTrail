@@ -106,13 +106,13 @@ func TestPairShortest(t *testing.T) {
 }
 
 func TestPairPaths(t *testing.T) {
-	t.Run("mode-all returns both diamond paths", func(t *testing.T) {
+	t.Run("cap=0 (unbounded) returns both diamond paths", func(t *testing.T) {
 		s := buildFixture(t)
 		kinds := maskOf(3, 1, 2)
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, ModeAll, budget, scF, scT, scTmp, nil)
+		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -128,13 +128,13 @@ func TestPairPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("mode-one returns exactly one valid 2-hop path", func(t *testing.T) {
+	t.Run("cap=1 (ModeOne's per-pair cap) returns exactly one valid 2-hop path", func(t *testing.T) {
 		s := buildFixture(t)
 		kinds := maskOf(3, 1, 2)
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, ModeOne, budget, scF, scT, scTmp, nil)
+		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 1, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -168,7 +168,7 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 9, kinds, MaxDepth, 0, ModeAll, budget, scF, scT, scTmp, nil)
+		out, err := pairPaths(s, 0, 9, kinds, MaxDepth, 0, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -204,7 +204,7 @@ func TestPairPathsCrossCheck(t *testing.T) {
 		scTmp := newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		got, err := pairPaths(s, r, tgt, kinds, MaxDepth, 0, ModeAll, budget, scF, scT, scTmp, nil)
+		got, err := pairPaths(s, r, tgt, kinds, MaxDepth, 0, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("seed %d: pairPaths: %v", seed, err)
 		}

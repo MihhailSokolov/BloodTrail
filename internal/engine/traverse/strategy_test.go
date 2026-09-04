@@ -317,3 +317,152 @@ func TestAllShortestPaths(t *testing.T) {
 		}
 	})
 }
+
+// buildCapFixture builds a graph purpose-built for exercising Limit and
+// ModeOne truncation across more than one pair or BFS element: three roots
+// (0, 1, 7), each with two co-minimal 2-hop paths to a shared terminal (2)
+// through its own pair of intermediates, all edges kind 1. Roots sit at the
+// lowest dense ids (0, 1) or are otherwise reached only after Limit has
+// already been exhausted in every test below (7), and every intermediate
+// (3-6, 8-9) has a higher dense id than the root whose truncation it is
+// meant to interrupt — so even though an unconstrained Roots endpoint would
+// eventually visit intermediates too (each has its own direct, 1-hop edge
+// into the terminal), Limit always stops dense iteration before it gets
+// there.
+func buildCapFixture(t *testing.T) *snapshot.Snapshot {
+	t.Helper()
+	b := snapshot.NewBuilder(1)
+	for i := uint64(0); i < 10; i++ {
+		if err := b.AddNode(i, []snapshot.KindID{1}); err != nil {
+			t.Fatalf("AddNode(%d): %v", i, err)
+		}
+	}
+	type edge struct{ start, end uint64 }
+	for _, e := range []edge{
+		{0, 3}, {3, 2}, {0, 4}, {4, 2}, // root 0: two co-minimal paths via 3, 4
+		{1, 5}, {5, 2}, {1, 6}, {6, 2}, // root 1: two co-minimal paths via 5, 6
+		{7, 8}, {8, 2}, {7, 9}, {9, 2}, // root 7: two co-minimal paths via 8, 9
+	} {
+		b.AddEdge(e.start, e.end, 1)
+	}
+	s, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return s
+}
+
+// TestCapTruncation is a permanent regression suite for a review finding on
+// commit f996be2: Limit and ModeOne truncation compared a relative
+// "remaining budget" against enumerate/pairEnumerate's cumulative len(out)
+// counter, which is checked across every pair or BFS element a strategy
+// merges, not reset per call. A delta compared against a cumulative counter
+// either overran (once a later pair's call restarted counting from a
+// nonzero out) or, for ModeOne once out already held half of Limit or more,
+// never fired at all. The fix (traverse.go's pathCap) always passes
+// pairPaths/enumerate an absolute target instead.
+func TestCapTruncation(t *testing.T) {
+	kinds := maskOf(1, 1)
+
+	root0Paths := []Path{
+		{Nodes: []snapshot.NodeID{0, 3, 2}, Kinds: []snapshot.KindID{1, 1}},
+		{Nodes: []snapshot.NodeID{0, 4, 2}, Kinds: []snapshot.KindID{1, 1}},
+	}
+	root1Options := map[string]bool{
+		pathKey(Path{Nodes: []snapshot.NodeID{1, 5, 2}, Kinds: []snapshot.KindID{1, 1}}): true,
+		pathKey(Path{Nodes: []snapshot.NodeID{1, 6, 2}, Kinds: []snapshot.KindID{1, 1}}): true,
+	}
+
+	t.Run("strategy A: Limit is an absolute target across pairs, not a per-pair delta", func(t *testing.T) {
+		s := buildCapFixture(t)
+		q := Query{
+			Roots:     Endpoint{IDs: []snapshot.NodeID{0, 1}},
+			Terminals: Endpoint{IDs: []snapshot.NodeID{2}},
+			Kinds:     kinds,
+			Mode:      ModeAll,
+			Limit:     3,
+		}
+		got, err := AllShortestPaths(s, q)
+		if err != nil {
+			t.Fatalf("AllShortestPaths: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len(got) = %d, want exactly 3\ngot: %+v", len(got), got)
+		}
+		assertPathSet(t, got[:2], root0Paths)
+		if !root1Options[pathKey(got[2])] {
+			t.Fatalf("3rd path %+v is not one of root 1's two co-minimal paths", got[2])
+		}
+	})
+
+	t.Run("strategy B: Limit is an absolute target across BFS elements, not a per-element delta", func(t *testing.T) {
+		s := buildCapFixture(t)
+		q := Query{
+			Roots:     Endpoint{}, // unconstrained -> small side = terminals
+			Terminals: Endpoint{IDs: []snapshot.NodeID{2}},
+			Kinds:     kinds,
+			Mode:      ModeAll,
+			Limit:     3,
+		}
+		got, err := AllShortestPaths(s, q)
+		if err != nil {
+			t.Fatalf("AllShortestPaths: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len(got) = %d, want exactly 3\ngot: %+v", len(got), got)
+		}
+		assertPathSet(t, got[:2], root0Paths)
+		if !root1Options[pathKey(got[2])] {
+			t.Fatalf("3rd path %+v is not one of root 1's two co-minimal paths", got[2])
+		}
+	})
+
+	t.Run("ModeOne returns exactly one path per pair across multiple pairs", func(t *testing.T) {
+		s := buildCapFixture(t)
+		q := Query{
+			Roots:     Endpoint{IDs: []snapshot.NodeID{0, 1}},
+			Terminals: Endpoint{IDs: []snapshot.NodeID{2}},
+			Kinds:     kinds,
+			Mode:      ModeOne,
+		}
+		got, err := AllShortestPaths(s, q)
+		if err != nil {
+			t.Fatalf("AllShortestPaths: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("len(got) = %d, want exactly 2 (one per pair)\ngot: %+v", len(got), got)
+		}
+		root0Options := map[string]bool{pathKey(root0Paths[0]): true, pathKey(root0Paths[1]): true}
+		if !root0Options[pathKey(got[0])] {
+			t.Fatalf("1st path %+v is not one of root 0's two co-minimal paths", got[0])
+		}
+		if !root1Options[pathKey(got[1])] {
+			t.Fatalf("2nd path %+v is not one of root 1's two co-minimal paths", got[1])
+		}
+	})
+
+	t.Run("ModeOne + Limit combined: Limit stops iteration before a 3rd pair is even started", func(t *testing.T) {
+		s := buildCapFixture(t)
+		q := Query{
+			Roots:     Endpoint{IDs: []snapshot.NodeID{0, 1, 7}},
+			Terminals: Endpoint{IDs: []snapshot.NodeID{2}},
+			Kinds:     kinds,
+			Mode:      ModeOne,
+			Limit:     2,
+		}
+		got, err := AllShortestPaths(s, q)
+		if err != nil {
+			t.Fatalf("AllShortestPaths: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("len(got) = %d, want exactly 2 (Limit=2 over 3 pairs, one path per pair)\ngot: %+v", len(got), got)
+		}
+		root0Options := map[string]bool{pathKey(root0Paths[0]): true, pathKey(root0Paths[1]): true}
+		if !root0Options[pathKey(got[0])] {
+			t.Fatalf("1st path %+v is not one of root 0's two co-minimal paths", got[0])
+		}
+		if !root1Options[pathKey(got[1])] {
+			t.Fatalf("2nd path %+v (want a root 1 path; root 7 must never be reached once Limit=2 is hit)", got[1])
+		}
+	})
+}

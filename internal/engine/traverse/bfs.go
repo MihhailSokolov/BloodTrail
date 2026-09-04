@@ -270,20 +270,18 @@ func pairShortest(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.Ki
 	return D
 }
 
-// pairPaths returns all (mode == ModeAll, capped at capPerPair; capPerPair
-// <= 0 is unbounded) or one (mode == ModeOne) shortest r->t paths. It runs
-// pairShortest to find D and populate scF/scT, then hands off to
-// pairEnumerate; if no path exists within maxDepth, out is returned
-// unchanged and no error is produced (absence of a path is not a failure).
-func pairPaths(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, capPerPair int, mode Mode, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
+// pairPaths returns r->t shortest paths, appending to out and stopping once
+// len(out) reaches cap (cap<=0: unbounded). cap is an absolute target
+// against out's cumulative length, not a per-call delta — see pathCap,
+// which callers use to compute it (accounting for both Query.Limit and
+// ModeOne's "one path per pair"). It runs pairShortest to find D and
+// populate scF/scT, then hands off to pairEnumerate; if no path exists
+// within maxDepth, out is returned unchanged and no error is produced
+// (absence of a path is not a failure).
+func pairPaths(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, cap int, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
 	D := pairShortest(s, r, t, kinds, maxDepth, scF, scT, scTmp)
 	if D < 0 {
 		return out, nil
-	}
-
-	cap := capPerPair
-	if mode == ModeOne {
-		cap = 1
 	}
 
 	return pairEnumerate(s, r, t, D, kinds, cap, budget, scF, scT, out)
