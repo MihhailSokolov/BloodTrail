@@ -68,6 +68,21 @@ type Engine struct {
 	// RebuildNow call to decide whether to remember the refusal.
 	overBudget atomic.Bool
 
+	// refusalLastLoggedNano rate-limits RebuildNow's "snapshot rebuild
+	// refused" warning (shouldLogRefusal), stored as UnixNano so it can be
+	// read/written with a plain atomic rather than a mutex-guarded
+	// time.Time; 0 means "never logged", so the very first refusal always
+	// logs.
+	refusalLastLoggedNano atomic.Int64
+
+	// rebuildAttempts counts every RebuildNow call that actually reached
+	// LoadSnapshot, refused or not. Nothing in production reads it; it
+	// exists purely for white-box test observability (poller_integration_
+	// test.go) of the poller's retry-suppression fix, which the "refusal
+	// warning" log alone cannot distinguish from a repeated LoadSnapshot
+	// attempt whose warning happened to be rate-limited (refusalLogInterval).
+	rebuildAttempts atomic.Uint64
+
 	// pollStop and pollDone coordinate Start/Stop's poller goroutine
 	// lifecycle (poller.go): Stop closes pollStop to signal the goroutine to
 	// exit, and waits on pollDone, which the goroutine closes as it returns.
@@ -156,13 +171,29 @@ func (e *Engine) snapshotStillCurrent(snap *snapshot.Snapshot) bool {
 //
 // A snapshot whose ApproxBytes() exceeds a nonzero cfg.MemoryLimit is
 // dropped rather than adopted: whatever snapshot was previously current (nil
-// or otherwise) stays current, a warning is logged, and the refusal is
-// remembered via overBudget for the poller (poller.go) to act on. This is
-// not treated as a RebuildNow failure -- the load itself succeeded -- so the
-// error return stays nil.
+// or otherwise) stays current, and the refusal is remembered via overBudget
+// for the poller (poller.go) to act on. This is not treated as a RebuildNow
+// failure -- the load itself succeeded -- so the error return stays nil.
+//
+// The refusal warning itself is rate-limited (shouldLogRefusal), the same
+// way the poller's own query-error warning is (queryErrorLogInterval): the
+// very first refusal always logs, and any later refusal logs again only if
+// at least refusalLogInterval has passed since the last one logged --
+// regardless of whether the calls in between were the poller retrying the
+// exact same reading or genuinely new attempts (e.g. rule (c) retrying
+// after a new write lands while a prior refusal is still in effect). This
+// caps log volume for a sustained over-budget condition without depending
+// on decideRebuild's own retry gating to do it alone.
 func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp time.Time) error {
 	start := time.Now()
 	generation := e.generation.Load()
+	// Deferred (not incremented up front) so that by the time a test
+	// observes rebuildAttempts advance, this call's logging decision
+	// (shouldLogRefusal or the InfoContext below) has already run --
+	// otherwise a test polling rebuildAttempts could race ahead of a still
+	// in-flight LoadSnapshot and observe the count before the corresponding
+	// log line (if any) was actually emitted.
+	defer e.rebuildAttempts.Add(1)
 
 	snap, err := LoadSnapshot(ctx, e.pgDriver, e.pool)
 	if err != nil {
@@ -174,13 +205,15 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 	approxBytes := snap.ApproxBytes()
 	if e.cfg.MemoryLimit > 0 && approxBytes > uint64(e.cfg.MemoryLimit) {
 		e.overBudget.Store(true)
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot rebuild refused: exceeds memory limit",
-			slog.Int("nodes", snap.NodeCount()),
-			slog.Int("edges", snap.EdgeCount()),
-			slog.Uint64("bytes", approxBytes),
-			slog.Uint64("limit", uint64(e.cfg.MemoryLimit)),
-			slog.String("trigger", trigger),
-		)
+		if e.shouldLogRefusal() {
+			e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot rebuild refused: exceeds memory limit",
+				slog.Int("nodes", snap.NodeCount()),
+				slog.Int("edges", snap.EdgeCount()),
+				slog.Uint64("bytes", approxBytes),
+				slog.Uint64("limit", uint64(e.cfg.MemoryLimit)),
+				slog.String("trigger", trigger),
+			)
+		}
 		return nil
 	}
 	e.overBudget.Store(false)
@@ -195,6 +228,28 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 		slog.String("trigger", trigger),
 	)
 	return nil
+}
+
+// refusalLogInterval rate-limits RebuildNow's "snapshot rebuild refused"
+// warning (shouldLogRefusal): a sustained over-budget condition should not
+// spam the log once per PollInterval. Matches the poller's own
+// queryErrorLogInterval (poller.go).
+const refusalLogInterval = 10 * time.Minute
+
+// shouldLogRefusal reports whether RebuildNow's memory-limit refusal warning
+// should be logged now: true the very first time it is ever called (the
+// zero value of refusalLastLoggedNano means "never logged"), then at most
+// once per refusalLogInterval after that, regardless of how many refused
+// RebuildNow calls happen in between -- a pure sliding window, mirroring
+// the poller's own queryErrorLogInterval check, with no notion of a
+// successful rebuild "resetting" the window.
+func (e *Engine) shouldLogRefusal() bool {
+	now := time.Now()
+	if last := e.refusalLastLoggedNano.Load(); last != 0 && now.Sub(time.Unix(0, last)) < refusalLogInterval {
+		return false
+	}
+	e.refusalLastLoggedNano.Store(now.UnixNano())
+	return true
 }
 
 // Decline reasons TryAllShortestPaths and TryCypher log at Debug under the

@@ -32,30 +32,37 @@ const queryErrorLogInterval = 10 * time.Minute
 // pollState is the poller's memory carried between ticks. The zero value is
 // ready to use.
 type pollState struct {
-	// lastStamp and refused together remember a RebuildNow attempt that was
-	// refused for exceeding cfg.MemoryLimit (Engine.overBudget): lastStamp is
-	// the last_complete_analysis_at reading that attempt was made for, and
-	// refused records that the refusal happened. decideRebuild consults both
-	// (never lastStamp alone -- a genuinely NULL last_complete_analysis_at
-	// reads back as the zero time.Time, which must not be confused with "no
-	// refusal has ever happened") to avoid retrying rule (a) or (b) every
-	// tick against an unchanged reading: nothing has changed since the
-	// refusal, so retrying would just repeat it, and its warning log, every
-	// PollInterval forever. Both are cleared -- refused back to false -- the
-	// moment a rebuild actually succeeds, and the gate itself lifts as soon
-	// as a genuinely newer stamp is observed (see remembered).
+	// lastStamp, refusedGeneration and refused together remember a
+	// RebuildNow attempt that was refused for exceeding cfg.MemoryLimit
+	// (Engine.overBudget): lastStamp is the last_complete_analysis_at
+	// reading that attempt was made for, refusedGeneration is the engine's
+	// write-generation counter as observed at that same tick, and refused
+	// records that the refusal happened. decideRebuild never reads lastStamp
+	// or refusedGeneration alone -- a genuinely NULL last_complete_analysis_at
+	// reads back as the zero time.Time, and generation 0 is a real value a
+	// brand-new Engine starts at, so either alone is indistinguishable from
+	// "no refusal has ever happened" without the refused flag.
 	//
-	// Rule (c) is deliberately not gated by this memory: it is driven by
-	// staleness + idle status, not by stamp, and this milestone does not
-	// track enough history (prior status, prior generation) to recognize
-	// when *that* trigger condition has "changed" versus merely persisted.
-	// A memory-limit refusal while rule (c) applies therefore does retry
-	// every tick -- a known, deliberate simplification (see the task
-	// report); this is not the common case (rule (c) fires only right after
-	// a write while the pipeline happens to be idle) and each retry is still
-	// cheap relative to a full poll cycle.
-	lastStamp time.Time
-	refused   bool
+	// Rules (a) and (b) are both driven by the stamp reading, so a
+	// remembered refusal suppresses both until stamp itself advances past
+	// lastStamp (see remembered): nothing about *that* trigger condition has
+	// changed since the refusal, so retrying would just repeat it, and its
+	// warning log, every PollInterval forever.
+	//
+	// Rule (c) is driven by staleness (write-generation, not stamp) + idle
+	// status instead, so it is gated on refusedGeneration rather than
+	// lastStamp: a remembered refusal suppresses rule (c) only until a *new*
+	// write lands (the live write-generation counter advances past
+	// refusedGeneration) or stamp itself advances -- either means the
+	// condition that would justify retrying has actually changed, rather
+	// than the poller just observing the same still-refused state again
+	// (see refusalLifted).
+	//
+	// All three fields are cleared -- refused back to false -- the moment a
+	// rebuild actually succeeds.
+	lastStamp         time.Time
+	refusedGeneration uint64
+	refused           bool
 
 	// lastFailureLogged is the last time the poller logged a
 	// "query datapipe_status failed" warning, rate-limited to
@@ -70,11 +77,24 @@ func remembered(st *pollState, stamp time.Time) bool {
 	return st.refused && !stamp.After(st.lastStamp)
 }
 
+// refusalLifted reports whether a remembered memory-limit refusal (see
+// pollState) no longer blocks rule (c) from retrying at generation: either
+// no refusal is remembered (or stamp has already advanced past it -- the
+// same condition that lifts rules (a)/(b), see remembered), or a new write
+// has landed since the refusal was recorded (generation has advanced past
+// the value observed at refusal time). A refusal that still applies to both
+// stamp and generation means nothing rule (c) cares about has changed since
+// the refusal, so retrying would just repeat it.
+func refusalLifted(st *pollState, stamp time.Time, generation uint64) bool {
+	return !remembered(st, stamp) || generation > st.refusedGeneration
+}
+
 // decideRebuild is the poller's tick decision, extracted as a pure function
 // for unit testing (side-effect-free: it only reads st, never writes it).
 // status and stamp are this tick's datapipe_status.status and
 // .last_complete_analysis_at reading; snap and fresh are the engine's
-// current Fresh() result.
+// current Fresh() result; generation is the engine's live write-generation
+// counter (Engine.generation) as observed this tick.
 //
 // Rebuild when:
 //
@@ -87,15 +107,19 @@ func remembered(st *pollState, stamp time.Time) bool {
 //
 // Rules (a) and (b) are both driven by the same stamp reading, so a
 // remembered memory-limit refusal (see pollState) suppresses both until
-// stamp itself advances past it. Rule (c) is independent of both and is
-// never suppressed by a remembered refusal (see pollState's doc).
-func decideRebuild(st *pollState, status string, stamp time.Time, snap *snapshot.Snapshot, fresh bool) bool {
+// stamp itself advances past it. Rule (c) is driven by write-generation
+// staleness instead, so a remembered refusal suppresses it separately, until
+// either stamp advances or a new write lands (refusalLifted) -- without this
+// gate, a refusal recorded while rule (c) applies would otherwise retry
+// (and, absent the RebuildNow-side rate limit, re-warn) every tick forever,
+// since !fresh stays true until a rebuild actually succeeds.
+func decideRebuild(st *pollState, status string, stamp time.Time, snap *snapshot.Snapshot, fresh bool, generation uint64) bool {
 	if snap == nil {
 		return !remembered(st, stamp)
 	}
 
 	ruleB := stamp.After(snap.AnalysisStamp) && !remembered(st, stamp)
-	ruleC := !fresh && status == "idle"
+	ruleC := !fresh && status == "idle" && refusalLifted(st, stamp, generation)
 
 	return ruleB || ruleC
 }
@@ -106,6 +130,12 @@ func decideRebuild(st *pollState, status string, stamp time.Time, snap *snapshot
 // suppression of rule (b): if a remembered refusal means (b)'s bare
 // condition no longer counts, a rebuild can still be happening (via (c)),
 // and the label must say idle_stale in that case, not analysis.
+//
+// It does not need generation (unlike decideRebuild): the default case
+// already means "decideRebuild returned true and it wasn't rule (a) or
+// rule (b)", which -- by construction, since decideRebuild only ever
+// returns true for (a), (b), or (c) -- can only be rule (c), regardless of
+// which part of refusalLifted's gate let it through.
 func pickTrigger(st *pollState, stamp time.Time, snap *snapshot.Snapshot) string {
 	switch {
 	case snap == nil:
@@ -179,8 +209,10 @@ func (e *Engine) runPoller(ctx context.Context) {
 // poller keeps ticking (st is otherwise untouched, so the next tick tries
 // again immediately). A RebuildNow error is logged every time it happens and
 // the poller retries next tick -- unlike a memory-limit refusal (returned as
-// success, e.overBudget = true), which tick remembers in st so decideRebuild
-// stops retrying the same reading.
+// success, e.overBudget = true), which tick remembers in st (both the stamp
+// and the write-generation counter as observed this tick) so decideRebuild
+// stops retrying rules (a)/(b) against the same stamp and rule (c) against
+// the same write-generation, until either actually moves.
 func (e *Engine) tick(ctx context.Context, st *pollState) {
 	var (
 		status   string
@@ -201,7 +233,8 @@ func (e *Engine) tick(ctx context.Context, st *pollState) {
 	}
 
 	snap, fresh := e.Fresh()
-	if !decideRebuild(st, status, stamp, snap, fresh) {
+	generation := e.generation.Load()
+	if !decideRebuild(st, status, stamp, snap, fresh, generation) {
 		return
 	}
 
@@ -214,6 +247,7 @@ func (e *Engine) tick(ctx context.Context, st *pollState) {
 
 	if e.overBudget.Load() {
 		st.lastStamp = stamp
+		st.refusedGeneration = generation
 		st.refused = true
 	} else {
 		st.refused = false

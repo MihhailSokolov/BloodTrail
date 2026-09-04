@@ -96,3 +96,32 @@ func TestTryAllShortestPathsDeclinesWithNoSnapshot(t *testing.T) {
 		t.Fatalf("TryAllShortestPaths served before RebuildNow ever ran")
 	}
 }
+
+// TestShouldLogRefusal exercises RebuildNow's refusal-warning rate limit in
+// isolation from RebuildNow itself (which needs a live PostgreSQL pool via
+// LoadSnapshot): the very first call always logs, and immediately-following
+// calls within refusalLogInterval do not -- deterministic without a fake
+// clock, since "immediately after" is trivially still within a 10-minute
+// window. refusalLastLoggedNano's zero value means "never logged"; storing
+// it back to zero directly (nothing in production does this -- there is no
+// "reset on success", matching queryErrorLogInterval's own plain sliding
+// window) exercises that same boundary condition again on demand, without
+// waiting out a real refusalLogInterval.
+func TestShouldLogRefusal(t *testing.T) {
+	e := New(nil, nil, Config{})
+
+	if !e.shouldLogRefusal() {
+		t.Fatalf("shouldLogRefusal() = false on the first call, want true (the very first refusal always logs)")
+	}
+	if e.shouldLogRefusal() {
+		t.Fatalf("shouldLogRefusal() = true on an immediate second call, want false (rate-limited within refusalLogInterval)")
+	}
+	if e.shouldLogRefusal() {
+		t.Fatalf("shouldLogRefusal() = true on a third call, want false (still rate-limited)")
+	}
+
+	e.refusalLastLoggedNano.Store(0)
+	if !e.shouldLogRefusal() {
+		t.Fatalf("shouldLogRefusal() = false immediately after refusalLastLoggedNano is reset to zero, want true (0 always means \"never logged\")")
+	}
+}
