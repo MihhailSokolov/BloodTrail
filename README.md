@@ -45,6 +45,9 @@ the compose deployment:
 
     curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
 
+The installer asks for confirmation before it changes anything, reading the answer from
+the terminal; add `--yes` to run it unattended.
+
 Until the first release is published, build the CLI with `go build ./cmd/bloodtrail`
 instead; the one-liner above describes the intended installation once a release exists.
 On macOS the bootstrap script's checksum step needs `sha256sum`, which stock macOS
@@ -54,8 +57,13 @@ CLI from the release archive directly.
 The installer inventories the deployment, backs up the application database and the
 compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
 if needed (using BloodHound's own migrator), switches the `bloodhound` service to the
-BloodTrail image through a compose override file, and verifies the result. Pass
-`--admin-password` to also run an ingest-and-search smoke test.
+BloodTrail image through a compose override file, and verifies the result.
+
+Passing `--admin-password` (or setting `BLOODTRAIL_ADMIN_PASSWORD`) adds an
+ingest-and-search smoke test to that verification. **It is for test and staging
+deployments only**: it permanently ingests a fictional `TESTLAB.LOCAL` domain into the
+graph and triggers a full analysis, which on a production-sized graph can run longer
+than `--verify-timeout` and leaves the fixture objects behind afterwards.
 
 To undo everything:
 
@@ -65,6 +73,26 @@ Supported upstream releases will be the tags published at
 `ghcr.io/mihhailsokolov/bloodhound-bloodtrail`; the first supported upstream release is
 v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
 (`patches/bloodhound-driver.patch`).
+
+### Operating notes
+
+- The installer adds its override file to `COMPOSE_FILE` in `.env`, so a plain
+  `docker compose up -d` keeps it. Automation that names files explicitly
+  (`docker compose -f docker-compose.yml up -d`) makes docker compose ignore
+  `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail` driver setting
+  and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or drop the
+  explicit `-f` and let `.env` decide.
+- `bloodtrail rollback` returns the deployment to the graph it had before the install.
+  On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
+  ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
+  to the restored deployment. Re-ingest it, or reinstall with
+  `--replace-postgres-graph` to migrate the current Neo4j graph again.
+- A second install after a rollback is refused while the earlier migration's graph is
+  still in PostgreSQL, because BloodHound's migrator would layer the new graph on top of
+  the old one instead of replacing it. `--replace-postgres-graph` clears it first; the
+  backup taken at the start of that install holds the state it replaced.
+- `bloodtrail status` prints both the image the compose files name and the image the
+  container is actually running, which differ while an install or rollback is half done.
 
 ## Roadmap
 
