@@ -9,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/query"
 )
 
 // prebuiltShortestPathQuery mirrors one entry of testdata/prebuilt_shortest_path.json.
@@ -38,22 +40,30 @@ type wantPrebuilt struct {
 // objects to Tier Zero" -- is entirely commented out in the source as a
 // disabled many-to-many example).
 //
-// Of the 12, 9 match FromCypher's accepted shape and 3 do not:
-//   - "Shortest paths to Domain Admins from Kerberoastable users" uses
-//     "AND NOT ... ENDS WITH" and "NOT COALESCE(...) = true" in its WHERE,
-//     both outside the accepted grammar (NOT is explicitly a reject case).
+// Of the 12, 11 match FromCypher's accepted shape and 1 does not:
 //   - "Shortest paths from Owned objects to Tier Zero" is the commented-out
 //     placeholder above; its "cypher" text is Cypher line-comments only, so
 //     it fails to parse into a queryable statement at all.
+//
+// Two entries only became accepts with the endpoint-predicate-lifting
+// extension (see cypher.go's FromCypher doc, case 4) -- before it, both were
+// principled rejects, since the original grammar's WHERE clause recognized
+// only a closed set of shapes:
+//   - "Shortest paths to Domain Admins from Kerberoastable users" uses
+//     "AND NOT s.objectid ENDS WITH ..." and "AND NOT COALESCE(...) = true"
+//     in its WHERE; each NOT/COALESCE conjunct is scoped to the single
+//     variable s alone, so it lifts onto Start.Criteria. It has no s<>t
+//     conjunct at all, so ExcludeSelf is false for this entry (unlike every
+//     other accepted prebuilt query).
 //   - "Shortest paths to privileged roles" matches its target's name with
-//     "=~" (regex match), an operator outside the accepted WHERE grammar
-//     (only "=" and "ENDS WITH" are accepted).
+//     "=~" (regex match); that Comparison is scoped to t alone and lifts
+//     onto End.Criteria.
 //
 // This is a deliberate, principled split rather than a blanket "every entry
-// recognizes": the accepted-shape paragraph is normative, and each of these
-// three prebuilt queries genuinely falls outside it. Extraction fidelity
-// (all 12 present, verbatim apart from interpolation expansion) is what's
-// exhaustive here, not recognizability.
+// recognizes": the accepted-shape paragraph is normative, and the one
+// excluded prebuilt query genuinely falls outside it (it isn't parseable
+// Cypher at all). Extraction fidelity (all 12 present, verbatim apart from
+// interpolation expansion) is what's exhaustive here, not recognizability.
 var wantPrebuiltQueries = map[string]wantPrebuilt{
 	"Paths from Domain Users to Tier Zero / High Value targets": {
 		ok: true, limit: 1000,
@@ -68,7 +78,15 @@ var wantPrebuiltQueries = map[string]wantPrebuilt{
 		excludeSelf: true,
 	},
 	"Shortest paths to Domain Admins from Kerberoastable users": {
-		ok: false,
+		// WHERE has no s<>t conjunct at all -- ExcludeSelf is false, unlike
+		// every other accepted prebuilt query. s carries four lifted
+		// conjuncts (hasspn=true, enabled=true, NOT ... ENDS WITH '-502',
+		// two NOT COALESCE(...) = true); t carries one (objectid ENDS WITH
+		// '-512').
+		ok: true, limit: 1000,
+		startKind: "User", endKind: "Group",
+		startCriteria: true, endCriteria: true,
+		excludeSelf: false,
 	},
 	"Shortest paths to Tier Zero / High Value targets": {
 		ok: true, limit: 1000,
@@ -109,7 +127,12 @@ var wantPrebuiltQueries = map[string]wantPrebuilt{
 		excludeSelf: true,
 	},
 	"Shortest paths to privileged roles": {
-		ok: false,
+		// t.name =~ '(?i)...' lifts onto End.Criteria; s only appears in
+		// s<>t.
+		ok: true, limit: 1000,
+		startKind: "AZBase", endKind: "AZRole",
+		startCriteria: false, endCriteria: true,
+		excludeSelf: true,
 	},
 	"Shortest paths from Azure Applications to Tier Zero / High Value targets": {
 		ok: true, limit: 1000,
@@ -319,9 +342,194 @@ func TestFromCypher_Accepts(t *testing.T) {
 	}
 }
 
-// TestFromCypher_Rejects covers the ten hand-written shapes FromCypher must
-// refuse without panicking, each falling outside the accepted shape for a
-// distinct reason.
+// conjunctionCriteria asserts criteria is a non-nil *cypher.Conjunction --
+// the shape endpointAccumulator.criteria always builds via query.And -- and
+// returns it, failing the test otherwise.
+func conjunctionCriteria(t *testing.T, criteria graph.Criteria) *cypher.Conjunction {
+	t.Helper()
+
+	conjunction, isConjunction := criteria.(*cypher.Conjunction)
+	if !isConjunction || conjunction == nil {
+		t.Fatalf("Criteria = %#v (%T), want *cypher.Conjunction", criteria, criteria)
+	}
+	return conjunction
+}
+
+// TestFromCypher_LiftsNegatedPredicate asserts the shape of a lifted NOT
+// conjunct (the endpoint-predicate-lifting extension's case 4): a
+// WHERE NOT <var>.prop ENDS WITH <string> conjunct scoped to a single
+// endpoint variable lifts as a *cypher.Negation wrapping the original
+// *cypher.Comparison, with the PropertyLookup's variable rewritten from the
+// endpoint's parse-time symbol ("s") to the dawgs query-builder's node
+// symbol (query.NodeSymbol, "n") -- exactly what query.Node() returns.
+func TestFromCypher_LiftsNegatedPredicate(t *testing.T) {
+	got, ok := FromCypher(`MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE NOT s.objectid ENDS WITH '-502' RETURN p`)
+	if !ok {
+		t.Fatal("FromCypher() ok = false, want true")
+	}
+	if got.End.Criteria != nil {
+		t.Errorf("End.Criteria = %#v, want nil (WHERE only touches s)", got.End.Criteria)
+	}
+
+	conjunction := conjunctionCriteria(t, got.Start.Criteria)
+	exprs := conjunction.GetAll()
+	if len(exprs) == 0 {
+		t.Fatal("Start.Criteria conjunction has no expressions")
+	}
+
+	negation, isNegation := exprs[len(exprs)-1].(*cypher.Negation)
+	if !isNegation || negation == nil {
+		t.Fatalf("lifted expression = %#v (%T), want *cypher.Negation", exprs[len(exprs)-1], exprs[len(exprs)-1])
+	}
+
+	cmp, isComparison := negation.Expression.(*cypher.Comparison)
+	if !isComparison || cmp == nil {
+		t.Fatalf("Negation.Expression = %#v (%T), want *cypher.Comparison", negation.Expression, negation.Expression)
+	}
+	if len(cmp.Partials) != 1 || cmp.Partials[0] == nil || cmp.Partials[0].Operator != cypher.OperatorEndsWith {
+		t.Fatalf("Comparison.Partials = %#v, want a single ENDS WITH partial", cmp.Partials)
+	}
+
+	lookup, isLookup := cmp.Left.(*cypher.PropertyLookup)
+	if !isLookup || lookup == nil {
+		t.Fatalf("Comparison.Left = %#v (%T), want *cypher.PropertyLookup", cmp.Left, cmp.Left)
+	}
+	if lookup.Symbol != "objectid" {
+		t.Errorf("PropertyLookup.Symbol = %q, want %q", lookup.Symbol, "objectid")
+	}
+
+	variable, isVariable := lookup.Atom.(*cypher.Variable)
+	if !isVariable || variable == nil {
+		t.Fatalf("PropertyLookup.Atom = %#v (%T), want *cypher.Variable", lookup.Atom, lookup.Atom)
+	}
+	if variable.Symbol != query.NodeSymbol {
+		t.Errorf("PropertyLookup.Atom.Symbol = %q, want %q (rewritten to the query-builder node symbol)", variable.Symbol, query.NodeSymbol)
+	}
+}
+
+// TestFromCypher_LiftsRegexPredicate asserts the shape of a lifted regex
+// (=~) conjunct: a *cypher.Comparison whose operator is unchanged
+// (OperatorRegexMatch) and whose PropertyLookup variable is rewritten to
+// the query-builder node symbol, same as any other lifted comparison.
+func TestFromCypher_LiftsRegexPredicate(t *testing.T) {
+	got, ok := FromCypher(`MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE t.name =~ '(?i)^admin.*$' RETURN p`)
+	if !ok {
+		t.Fatal("FromCypher() ok = false, want true")
+	}
+	if got.Start.Criteria != nil {
+		t.Errorf("Start.Criteria = %#v, want nil (WHERE only touches t)", got.Start.Criteria)
+	}
+
+	conjunction := conjunctionCriteria(t, got.End.Criteria)
+	exprs := conjunction.GetAll()
+	if len(exprs) == 0 {
+		t.Fatal("End.Criteria conjunction has no expressions")
+	}
+
+	cmp, isComparison := exprs[len(exprs)-1].(*cypher.Comparison)
+	if !isComparison || cmp == nil {
+		t.Fatalf("lifted expression = %#v (%T), want *cypher.Comparison", exprs[len(exprs)-1], exprs[len(exprs)-1])
+	}
+	if len(cmp.Partials) != 1 || cmp.Partials[0] == nil || cmp.Partials[0].Operator != cypher.OperatorRegexMatch {
+		t.Fatalf("Comparison.Partials = %#v, want a single =~ partial", cmp.Partials)
+	}
+
+	lookup, isLookup := cmp.Left.(*cypher.PropertyLookup)
+	if !isLookup || lookup == nil {
+		t.Fatalf("Comparison.Left = %#v (%T), want *cypher.PropertyLookup", cmp.Left, cmp.Left)
+	}
+	if lookup.Symbol != "name" {
+		t.Errorf("PropertyLookup.Symbol = %q, want %q", lookup.Symbol, "name")
+	}
+
+	variable, isVariable := lookup.Atom.(*cypher.Variable)
+	if !isVariable || variable == nil {
+		t.Fatalf("PropertyLookup.Atom = %#v (%T), want *cypher.Variable", lookup.Atom, lookup.Atom)
+	}
+	if variable.Symbol != query.NodeSymbol {
+		t.Errorf("PropertyLookup.Atom.Symbol = %q, want %q (rewritten to the query-builder node symbol)", variable.Symbol, query.NodeSymbol)
+	}
+}
+
+// TestFromCypher_LiftsEndpointScopedOr covers the re-expressed "WHERE with
+// OR" case: a parenthesized Disjunction whose variable references are
+// scoped to a single endpoint variable (here, both sides of the OR touch s
+// alone) is a single conjunct under classifyConjunct's flattening rule, and
+// since it isn't one of the three special-cased shapes it lifts like any
+// other single-variable expression -- unlike the pre-extension grammar,
+// where OR was an unconditional reject. The Parenthetical wrapper from the
+// source is preserved in the lifted copy (flattenConjuncts only unwraps
+// Parenthetical-wrapping-Conjunction, never Parenthetical-wrapping-
+// Disjunction) so the OR's grouping survives being embedded as one conjunct
+// among others in Endpoint.Criteria's own query.And(...).
+func TestFromCypher_LiftsEndpointScopedOr(t *testing.T) {
+	got, ok := FromCypher(`MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE (s.a = 1 OR s.b = 2) RETURN p`)
+	if !ok {
+		t.Fatal("FromCypher() ok = false, want true")
+	}
+	if got.End.Criteria != nil {
+		t.Errorf("End.Criteria = %#v, want nil (WHERE only touches s)", got.End.Criteria)
+	}
+
+	conjunction := conjunctionCriteria(t, got.Start.Criteria)
+	exprs := conjunction.GetAll()
+	if len(exprs) == 0 {
+		t.Fatal("Start.Criteria conjunction has no expressions")
+	}
+
+	paren, isParenthetical := exprs[len(exprs)-1].(*cypher.Parenthetical)
+	if !isParenthetical || paren == nil {
+		t.Fatalf("lifted expression = %#v (%T), want *cypher.Parenthetical", exprs[len(exprs)-1], exprs[len(exprs)-1])
+	}
+
+	disjunction, isDisjunction := paren.Expression.(*cypher.Disjunction)
+	if !isDisjunction || disjunction == nil {
+		t.Fatalf("Parenthetical.Expression = %#v (%T), want *cypher.Disjunction", paren.Expression, paren.Expression)
+	}
+	if got := disjunction.GetAll(); len(got) != 2 {
+		t.Fatalf("Disjunction has %d expressions, want 2", len(got))
+	}
+}
+
+// TestFromCypher_LiftsArithmeticAndListPredicates exercises two lifted
+// shapes beyond the brief's two required examples: an arithmetic expression
+// on the left of a comparison (s.a + 1 = 2, *cypher.ArithmeticExpression)
+// and a list membership test (s.b IN [1,2,3], *cypher.ListLiteral on the
+// right of the comparison) -- both still scoped to the single variable s,
+// so both lift onto Start.Criteria as two separate conjuncts.
+func TestFromCypher_LiftsArithmeticAndListPredicates(t *testing.T) {
+	got, ok := FromCypher(`MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE s.a + 1 = 2 AND s.b IN [1,2,3] RETURN p`)
+	if !ok {
+		t.Fatal("FromCypher() ok = false, want true")
+	}
+	if got.End.Criteria != nil {
+		t.Errorf("End.Criteria = %#v, want nil (WHERE only touches s)", got.End.Criteria)
+	}
+
+	conjunction := conjunctionCriteria(t, got.Start.Criteria)
+	exprs := conjunction.GetAll()
+	if len(exprs) != 2 {
+		t.Fatalf("Start.Criteria has %d lifted expressions, want 2", len(exprs))
+	}
+
+	for _, expr := range exprs {
+		if _, isComparison := expr.(*cypher.Comparison); !isComparison {
+			t.Errorf("lifted expression = %#v (%T), want *cypher.Comparison", expr, expr)
+		}
+	}
+}
+
+// TestFromCypher_Rejects covers hand-written shapes FromCypher must refuse
+// without panicking, each falling outside the accepted shape for a distinct
+// reason. Two entries -- "WHERE with OR" and "WHERE with NOT" in the
+// original (pre-endpoint-predicate-lifting) version of this test -- no
+// longer hold as blanket rejects: an OR/NOT conjunct scoped to a single
+// endpoint variable is now liftable (see TestFromCypher_LiftsEndpointScopedOr
+// and TestFromCypher_LiftsNegatedPredicate). They're replaced here with the
+// shapes that do still reject under the wider grammar: a conjunct spanning
+// both endpoint variables (whether via OR or a bare comparison), one scoped
+// to the relationship variable, one scoped to the path variable, and one
+// containing a $parameter.
 func TestFromCypher_Rejects(t *testing.T) {
 	tests := []struct {
 		name string
@@ -356,12 +564,24 @@ func TestFromCypher_Rejects(t *testing.T) {
 			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) MATCH (x) WHERE s<>t RETURN p`,
 		},
 		{
-			name: "WHERE with OR",
-			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE s<>t OR s.name = 'x' RETURN p`,
+			name: "WHERE with cross-variable OR",
+			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE s.a = 1 OR t.b = 2 RETURN p`,
 		},
 		{
-			name: "WHERE with NOT",
-			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE s<>t AND NOT s.name = 'x' RETURN p`,
+			name: "WHERE predicate referencing both endpoint variables",
+			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE s.a = t.b RETURN p`,
+		},
+		{
+			name: "WHERE predicate on the relationship variable",
+			text: `MATCH p=shortestPath((s)-[r:A*1..]->(t)) WHERE r.prop = 1 RETURN p`,
+		},
+		{
+			name: "WHERE predicate containing a $parameter",
+			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE s.a = $x RETURN p`,
+		},
+		{
+			name: "WHERE predicate on the path variable",
+			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE length(p) > 2 RETURN p`,
 		},
 		{
 			name: "unparseable text",

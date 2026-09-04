@@ -3,9 +3,6 @@
 package recognize
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/specterops/dawgs/cypher/frontend"
 	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/graph"
@@ -26,9 +23,31 @@ import (
 // paths, and any upper bound is rejected); endpoint kind labels come from
 // the node patterns, edge kinds from the relationship pattern (empty means
 // "all kinds"). WHERE, if present, must be a conjunction (possibly nested in
-// parentheses) of: <var>.prop = <literal>, <var>.prop ENDS WITH <string>,
-// id(<var>) = <literal>, <var> <> <var> naming the two pattern variables
-// (ExcludeSelf), and <var>:Kind. RETURN must project exactly the path
+// parentheses) of conjuncts, each classified as one of:
+//
+//  1. <var> <> <var> naming the two pattern variables (ExcludeSelf).
+//  2. id(<var>) = <literal> (Endpoint.IDs).
+//  3. <var>:Kind, a kind-label matcher on one pattern variable
+//     (Endpoint.Kinds, merged with that node's pattern-declared kinds).
+//  4. Endpoint predicate lifting: any other expression whose variable
+//     references are exactly one pattern variable (start or end) is
+//     deep-copied, every reference to that variable is rewritten to the
+//     dawgs query-builder's node symbol ("n", what query.Node() returns),
+//     and the result is appended to that endpoint's Endpoint.Criteria
+//     (query.And(kindIn, lifted...) -- kinds first, then lifted predicates
+//     in source order). This subsumes what used to be closed-form
+//     <var>.prop = <literal> / <var>.prop ENDS WITH <string> handling --
+//     those are just ordinary Comparisons under the same lifting rule now
+//     -- and extends to NOT, OR/AND, regex (=~), and function calls
+//     (COALESCE, ...) as long as the whole conjunct stays scoped to a
+//     single pattern variable.
+//  5. Anything else rejects the whole query: a conjunct naming both
+//     pattern variables (other than case 1), the path variable, the
+//     relationship variable, an unknown variable, no variable at all, a
+//     $parameter anywhere in the conjunct, or a node shape this walker
+//     doesn't recognize.
+//
+// RETURN must project exactly the path
 // variable with an optional LIMIT; SKIP, ORDER BY, DISTINCT, and any other
 // projection shape are rejected. For a pattern written with a `<-` arrow the
 // element order is reversed from the traversal direction, so FromCypher
@@ -217,28 +236,31 @@ func matchRange(r *cypher.PatternRange) bool {
 // endpointAccumulator collects, per pattern endpoint variable, the facts
 // matchWhere discovers while walking the WHERE conjunction: explicit ids
 // (from id(<var>) = <literal>), kind labels added via a <var>:Kind
-// predicate (on top of the node pattern's own kind labels), and property
-// comparisons (already built as graph.Criteria via the dawgs query
-// package). criteria() assembles the final Endpoint.Criteria from these,
-// matching FromCypher's documented contract: nil unless WHERE actually
-// constrains this endpoint beyond its plain kind labels.
+// predicate (on top of the node pattern's own kind labels), and lifted
+// predicates -- deep-copied WHERE conjuncts scoped to this endpoint alone,
+// with every reference to its parse-time variable symbol rewritten to the
+// dawgs query-builder's node symbol (see liftConjunct). criteria()
+// assembles the final Endpoint.Criteria from these, matching FromCypher's
+// documented contract: nil unless WHERE actually constrains this endpoint
+// beyond its plain kind labels.
 type endpointAccumulator struct {
 	symbol       string
 	patternKinds graph.Kinds
 	extraKinds   graph.Kinds
-	properties   []graph.Criteria
+	lifted       []graph.Criteria
 	ids          []graph.ID
 }
 
 // touched reports whether WHERE contributed anything -- a kind predicate or
-// a property comparison -- targeting this endpoint.
+// a lifted predicate -- targeting this endpoint.
 func (e *endpointAccumulator) touched() bool {
-	return len(e.extraKinds) > 0 || len(e.properties) > 0
+	return len(e.extraKinds) > 0 || len(e.lifted) > 0
 }
 
 // criteria builds this endpoint's graph.Criteria, or nil if WHERE never
 // touched it (an endpoint with only pattern kind labels gets Kinds
-// populated and nil Criteria, per FromCypher's contract).
+// populated and nil Criteria, per FromCypher's contract). Kinds come first,
+// then lifted predicates in the source order matchWhere encountered them.
 func (e *endpointAccumulator) criteria() graph.Criteria {
 	if !e.touched() {
 		return nil
@@ -246,78 +268,446 @@ func (e *endpointAccumulator) criteria() graph.Criteria {
 
 	kinds := append(append(graph.Kinds{}, e.patternKinds...), e.extraKinds...)
 
-	parts := make([]graph.Criteria, 0, len(e.properties)+1)
+	parts := make([]graph.Criteria, 0, len(e.lifted)+1)
 	if len(kinds) > 0 {
 		parts = append(parts, query.KindIn(query.Node(), kinds...))
 	}
-	parts = append(parts, e.properties...)
+	parts = append(parts, e.lifted...)
 
 	return query.And(parts...)
 }
 
 // matchWhere walks where's conjunction (nil means "no WHERE clause", which
-// is accepted trivially) recognizing exactly the predicate shapes described
-// in FromCypher's doc, feeding endpoint-specific facts into start/end and
-// reporting whether an s<>t (ExcludeSelf) predicate over the two endpoint
-// variables was present. Any predicate that doesn't match one of the
-// accepted shapes, or that names a variable other than start/end's symbols,
-// fails the whole match.
+// is accepted trivially): it flattens the top-level AND structure into a
+// flat list of conjuncts (flattenConjuncts), classifies each one
+// (classifyConjunct), and aggregates whether an s<>t (ExcludeSelf)
+// predicate over the two endpoint variables was present. Any conjunct that
+// doesn't classify -- see FromCypher's doc for the five cases -- fails the
+// whole match.
 func matchWhere(where *cypher.Where, start, end *endpointAccumulator) (excludeSelf, ok bool) {
 	if where == nil {
 		return false, true
 	}
 
-	return matchConjuncts(where.GetAll(), start, end)
+	conjuncts, ok := flattenConjuncts(where.GetAll())
+	if !ok {
+		return false, false
+	}
+
+	for _, expr := range conjuncts {
+		conjunctExcludeSelf, matched := classifyConjunct(expr, start, end)
+		if !matched {
+			return false, false
+		}
+		excludeSelf = excludeSelf || conjunctExcludeSelf
+	}
+
+	return excludeSelf, true
 }
 
-// matchConjuncts recognizes each expression in exprs as one accepted WHERE
-// predicate shape (recursing into nested Parenthetical/Conjunction nodes to
-// flatten "possibly nested/parenthesized" conjunctions), aggregating
-// ExcludeSelf across all of them. It fails on the first expression that
-// doesn't match an accepted shape.
-func matchConjuncts(exprs []cypher.Expression, start, end *endpointAccumulator) (excludeSelf, ok bool) {
+// flattenConjuncts expands exprs into a flat list of WHERE conjuncts,
+// recursively unwrapping *cypher.Conjunction nodes -- bare, or wrapped in a
+// *cypher.Parenthetical -- so a query written with nested "AND"s and/or
+// parentheses around them produces the same flat conjunct list as one
+// written without. Only AND-conjunctions unwrap this way: a Parenthetical
+// wrapping anything else (a Disjunction, a Negation, a bare comparison, ...)
+// is left exactly as parsed and becomes a single conjunct -- that's the
+// scope endpoint-predicate lifting (classifyConjunct's case 4) treats as a
+// unit, and keeping its Parenthetical intact preserves the source's
+// grouping in whatever gets lifted, rather than risking an operator's
+// precedence changing once it's embedded as one conjunct among several in
+// Endpoint.Criteria's own query.And(...).
+func flattenConjuncts(exprs []cypher.Expression) ([]cypher.Expression, bool) {
+	flat := make([]cypher.Expression, 0, len(exprs))
+
 	for _, expr := range exprs {
 		switch typed := expr.(type) {
 		case *cypher.Conjunction:
 			if typed == nil {
-				return false, false
+				return nil, false
 			}
-			nestedExcludeSelf, matched := matchConjuncts(typed.GetAll(), start, end)
-			if !matched {
-				return false, false
+			nested, ok := flattenConjuncts(typed.GetAll())
+			if !ok {
+				return nil, false
 			}
-			excludeSelf = excludeSelf || nestedExcludeSelf
+			flat = append(flat, nested...)
 
 		case *cypher.Parenthetical:
 			if typed == nil || typed.Expression == nil {
-				return false, false
+				return nil, false
 			}
-			nestedExcludeSelf, matched := matchConjuncts([]cypher.Expression{typed.Expression}, start, end)
-			if !matched {
-				return false, false
+			if _, isConjunction := typed.Expression.(*cypher.Conjunction); isConjunction {
+				nested, ok := flattenConjuncts([]cypher.Expression{typed.Expression})
+				if !ok {
+					return nil, false
+				}
+				flat = append(flat, nested...)
+			} else {
+				flat = append(flat, expr)
 			}
-			excludeSelf = excludeSelf || nestedExcludeSelf
-
-		case *cypher.KindMatcher:
-			if !matchKindPredicate(typed, start, end) {
-				return false, false
-			}
-
-		case *cypher.Comparison:
-			nestedExcludeSelf, matched := matchComparisonPredicate(typed, start, end)
-			if !matched {
-				return false, false
-			}
-			excludeSelf = excludeSelf || nestedExcludeSelf
 
 		default:
-			// Negation (NOT), Disjunction (OR), ExclusiveDisjunction (XOR),
-			// and anything else outside the accepted shape.
-			return false, false
+			flat = append(flat, expr)
 		}
 	}
 
-	return excludeSelf, true
+	return flat, true
+}
+
+// classifyConjunct recognizes expr as one of the five WHERE conjunct shapes
+// documented on FromCypher. It peels away any number of leading
+// *cypher.Parenthetical layers (defensively -- "possibly nested/
+// parenthesized", same as flattenConjuncts) purely to _look for_ the three
+// special shapes (ExcludeSelf, id() equals, kind matcher), none of which
+// produce a Criteria subtree, so discarding their parentheses is harmless.
+// Anything that doesn't match one of those three falls through to
+// liftConjunct with the *original*, still-possibly-parenthesized expr, so a
+// lifted predicate's own parenthetical grouping (if the source had one) is
+// preserved.
+func classifyConjunct(expr cypher.Expression, start, end *endpointAccumulator) (excludeSelf, ok bool) {
+	shape := expr
+	for {
+		paren, isParenthetical := shape.(*cypher.Parenthetical)
+		if !isParenthetical || paren == nil || paren.Expression == nil {
+			break
+		}
+		shape = paren.Expression
+	}
+
+	switch typed := shape.(type) {
+	case *cypher.Comparison:
+		if excl, matched := matchExcludeSelfComparison(typed, start, end); matched {
+			return excl, true
+		}
+		if symbol, id, matched := matchIDEquals(typed); matched {
+			switch symbol {
+			case start.symbol:
+				start.ids = append(start.ids, id)
+				return false, true
+			case end.symbol:
+				end.ids = append(end.ids, id)
+				return false, true
+			default:
+				// id(<var>) = <literal> for a variable that's neither
+				// pattern endpoint (the path or relationship variable, or
+				// an unknown symbol): not a shape liftConjunct would ever
+				// accept either (it references exactly one variable, but
+				// not a pattern endpoint), so reject outright rather than
+				// re-deriving the same answer through the generic path.
+				return false, false
+			}
+		}
+
+	case *cypher.KindMatcher:
+		if matchKindPredicate(typed, start, end) {
+			return false, true
+		}
+	}
+
+	return liftConjunct(expr, start, end)
+}
+
+// matchExcludeSelfComparison recognizes cmp as the s<>t ExcludeSelf shape: a
+// single-partial "<>" comparison whose both sides are bare Variables naming
+// exactly start and end's symbols (in either order).
+func matchExcludeSelfComparison(cmp *cypher.Comparison, start, end *endpointAccumulator) (excludeSelf, matched bool) {
+	if cmp == nil || len(cmp.Partials) != 1 {
+		return false, false
+	}
+
+	partial := cmp.Partials[0]
+	if partial == nil || partial.Operator != cypher.OperatorNotEquals {
+		return false, false
+	}
+
+	leftVariable, isLeftVariable := cmp.Left.(*cypher.Variable)
+	rightVariable, isRightVariable := partial.Right.(*cypher.Variable)
+	if !isLeftVariable || !isRightVariable || leftVariable == nil || rightVariable == nil {
+		return false, false
+	}
+
+	symbols := map[string]bool{leftVariable.Symbol: true, rightVariable.Symbol: true}
+	if len(symbols) == 2 && symbols[start.symbol] && symbols[end.symbol] {
+		return true, true
+	}
+
+	return false, false
+}
+
+// liftConjunct implements classifyConjunct's case 4/5: it determines
+// whether expr's variable references are scoped to exactly one of the two
+// pattern endpoints (scanExpression), and if so deep-copies expr
+// (cypher.Copy, the dawgs model's own recursive copy support -- criteria
+// outlive the parse, so the original AST node can never be reused
+// directly), rewrites every reference to that endpoint's parse-time symbol
+// to the dawgs query-builder's node symbol (query.NodeSymbol, what
+// query.Node() returns), and appends the result to that endpoint's lifted
+// predicates. Anything else -- both endpoints referenced, the path or
+// relationship variable, an unknown variable, no variable at all, a
+// $parameter anywhere in expr, or a node shape scanExpression doesn't
+// recognize -- fails the whole match (case 5): FromCypher never guesses at
+// a shape it can't fully account for.
+func liftConjunct(expr cypher.Expression, start, end *endpointAccumulator) (excludeSelf, ok bool) {
+	symbols := make(map[string]bool)
+	if !scanExpression(expr, symbols) || len(symbols) != 1 {
+		return false, false
+	}
+
+	var targetSymbol string
+	for symbol := range symbols {
+		targetSymbol = symbol
+	}
+
+	var target *endpointAccumulator
+	switch targetSymbol {
+	case start.symbol:
+		target = start
+	case end.symbol:
+		target = end
+	default:
+		return false, false
+	}
+
+	copied := cypher.Copy[cypher.Expression](expr)
+	rewriteVariableSymbol(copied, targetSymbol, query.NodeSymbol)
+	target.lifted = append(target.lifted, copied)
+
+	return false, true
+}
+
+// scanExpression recursively walks expr and every child Expression node it
+// contains, recording every *cypher.Variable symbol reached into symbols.
+// It reports ok=false -- meaning liftConjunct must reject the whole query
+// rather than risk mis-scoping a predicate -- if it finds a *cypher.
+// Parameter anywhere in the subtree (a $parameter's value isn't known at
+// recognition time, so it can never be safely lifted) or a node type this
+// walker doesn't specifically know how to see through. That conservative
+// default only affects less-common constructs (list comprehensions,
+// pattern predicates, map literals, ...); every shape FromCypher's brief
+// calls out explicitly -- comparisons of every operator, NOT, AND/OR/XOR,
+// parentheses, function calls (COALESCE, id(), ...), property lookups,
+// arithmetic, and list literals -- is covered below.
+func scanExpression(expr cypher.Expression, symbols map[string]bool) bool {
+	switch typed := expr.(type) {
+	case nil:
+		return true
+
+	case *cypher.Variable:
+		if typed == nil {
+			return true
+		}
+		symbols[typed.Symbol] = true
+		return true
+
+	case *cypher.Literal:
+		return true
+
+	case *cypher.Parameter:
+		return false
+
+	case *cypher.PropertyLookup:
+		if typed == nil {
+			return true
+		}
+		return scanExpression(typed.Atom, symbols)
+
+	case *cypher.KindMatcher:
+		if typed == nil {
+			return true
+		}
+		return scanExpression(typed.Reference, symbols)
+
+	case *cypher.Negation:
+		if typed == nil {
+			return true
+		}
+		return scanExpression(typed.Expression, symbols)
+
+	case *cypher.Parenthetical:
+		if typed == nil {
+			return true
+		}
+		return scanExpression(typed.Expression, symbols)
+
+	case *cypher.Comparison:
+		if typed == nil {
+			return true
+		}
+		if !scanExpression(typed.Left, symbols) {
+			return false
+		}
+		for _, partial := range typed.Partials {
+			if partial == nil || !scanExpression(partial.Right, symbols) {
+				return false
+			}
+		}
+		return true
+
+	case *cypher.Conjunction:
+		if typed == nil {
+			return true
+		}
+		return scanExpressionList(typed.GetAll(), symbols)
+
+	case *cypher.Disjunction:
+		if typed == nil {
+			return true
+		}
+		return scanExpressionList(typed.GetAll(), symbols)
+
+	case *cypher.ExclusiveDisjunction:
+		if typed == nil {
+			return true
+		}
+		return scanExpressionList(typed.GetAll(), symbols)
+
+	case *cypher.FunctionInvocation:
+		if typed == nil {
+			return true
+		}
+		return scanExpressionList(typed.Arguments, symbols)
+
+	case *cypher.ArithmeticExpression:
+		if typed == nil {
+			return true
+		}
+		if !scanExpression(typed.Left, symbols) {
+			return false
+		}
+		for _, partial := range typed.Partials {
+			if partial == nil || !scanExpression(partial.Right, symbols) {
+				return false
+			}
+		}
+		return true
+
+	case *cypher.UnaryAddOrSubtractExpression:
+		if typed == nil {
+			return true
+		}
+		return scanExpression(typed.Right, symbols)
+
+	case *cypher.ListLiteral:
+		if typed == nil {
+			return true
+		}
+		return scanExpressionList(*typed, symbols)
+
+	default:
+		return false
+	}
+}
+
+// scanExpressionList runs scanExpression over every element of exprs,
+// failing (and short-circuiting) on the first one it doesn't recognize.
+func scanExpressionList(exprs []cypher.Expression, symbols map[string]bool) bool {
+	for _, expr := range exprs {
+		if !scanExpression(expr, symbols) {
+			return false
+		}
+	}
+	return true
+}
+
+// rewriteVariableSymbol mutates every *cypher.Variable reachable from expr
+// -- via the same node shapes scanExpression recognizes -- whose Symbol
+// equals from, setting it to to. It's only ever called on a fresh
+// cypher.Copy of a scanExpression-approved subtree (liftConjunct), so it
+// never touches the original parsed AST, and every reachable Variable is
+// already known (scanExpression already verified it) to carry exactly the
+// symbol being rewritten.
+func rewriteVariableSymbol(expr cypher.Expression, from, to string) {
+	switch typed := expr.(type) {
+	case *cypher.Variable:
+		if typed != nil && typed.Symbol == from {
+			typed.Symbol = to
+		}
+
+	case *cypher.PropertyLookup:
+		if typed != nil {
+			rewriteVariableSymbol(typed.Atom, from, to)
+		}
+
+	case *cypher.KindMatcher:
+		if typed != nil {
+			rewriteVariableSymbol(typed.Reference, from, to)
+		}
+
+	case *cypher.Negation:
+		if typed != nil {
+			rewriteVariableSymbol(typed.Expression, from, to)
+		}
+
+	case *cypher.Parenthetical:
+		if typed != nil {
+			rewriteVariableSymbol(typed.Expression, from, to)
+		}
+
+	case *cypher.Comparison:
+		if typed == nil {
+			return
+		}
+		rewriteVariableSymbol(typed.Left, from, to)
+		for _, partial := range typed.Partials {
+			if partial != nil {
+				rewriteVariableSymbol(partial.Right, from, to)
+			}
+		}
+
+	case *cypher.Conjunction:
+		if typed != nil {
+			for _, e := range typed.GetAll() {
+				rewriteVariableSymbol(e, from, to)
+			}
+		}
+
+	case *cypher.Disjunction:
+		if typed != nil {
+			for _, e := range typed.GetAll() {
+				rewriteVariableSymbol(e, from, to)
+			}
+		}
+
+	case *cypher.ExclusiveDisjunction:
+		if typed != nil {
+			for _, e := range typed.GetAll() {
+				rewriteVariableSymbol(e, from, to)
+			}
+		}
+
+	case *cypher.FunctionInvocation:
+		if typed != nil {
+			for _, arg := range typed.Arguments {
+				rewriteVariableSymbol(arg, from, to)
+			}
+		}
+
+	case *cypher.ArithmeticExpression:
+		if typed == nil {
+			return
+		}
+		rewriteVariableSymbol(typed.Left, from, to)
+		for _, partial := range typed.Partials {
+			if partial != nil {
+				rewriteVariableSymbol(partial.Right, from, to)
+			}
+		}
+
+	case *cypher.UnaryAddOrSubtractExpression:
+		if typed != nil {
+			rewriteVariableSymbol(typed.Right, from, to)
+		}
+
+	case *cypher.ListLiteral:
+		if typed != nil {
+			for _, e := range *typed {
+				rewriteVariableSymbol(e, from, to)
+			}
+		}
+	}
+	// *cypher.Literal, *cypher.Parameter (scanExpression already rejects
+	// any subtree containing one), nil, and any node type scanExpression
+	// doesn't recognize (also already rejected): nothing to rewrite.
 }
 
 // matchKindPredicate recognizes km as a <var>:Kind predicate over one of
@@ -344,104 +734,6 @@ func matchKindPredicate(km *cypher.KindMatcher, start, end *endpointAccumulator)
 	default:
 		return false
 	}
-}
-
-// matchComparisonPredicate recognizes cmp as one of the three accepted
-// comparison shapes -- id(<var>) = <literal>, <var> <> <var> naming the two
-// endpoints (reported back as excludeSelf), or <var>.prop {=|ENDS WITH}
-// <literal> -- feeding the result into start/end. Any other comparison
-// shape, operator, or variable reference fails.
-func matchComparisonPredicate(cmp *cypher.Comparison, start, end *endpointAccumulator) (excludeSelf, ok bool) {
-	if symbol, id, matched := matchIDEquals(cmp); matched {
-		switch symbol {
-		case start.symbol:
-			start.ids = append(start.ids, id)
-			return false, true
-		case end.symbol:
-			end.ids = append(end.ids, id)
-			return false, true
-		default:
-			return false, false
-		}
-	}
-
-	if cmp == nil || len(cmp.Partials) != 1 {
-		return false, false
-	}
-
-	partial := cmp.Partials[0]
-	if partial == nil {
-		return false, false
-	}
-
-	if partial.Operator == cypher.OperatorNotEquals {
-		return matchExcludeSelf(cmp.Left, partial.Right, start, end)
-	}
-
-	if partial.Operator != cypher.OperatorEquals && partial.Operator != cypher.OperatorEndsWith {
-		return false, false
-	}
-
-	lookup, isLookup := cmp.Left.(*cypher.PropertyLookup)
-	if !isLookup || lookup == nil {
-		return false, false
-	}
-
-	variable, isVariable := lookup.Atom.(*cypher.Variable)
-	if !isVariable || variable == nil {
-		return false, false
-	}
-
-	literal, isLiteral := partial.Right.(*cypher.Literal)
-	if !isLiteral || literal == nil {
-		return false, false
-	}
-
-	value, decoded := decodeLiteralValue(literal)
-	if !decoded {
-		return false, false
-	}
-
-	var criterion graph.Criteria
-
-	if partial.Operator == cypher.OperatorEquals {
-		criterion = query.Equals(query.NodeProperty(lookup.Symbol), value)
-	} else {
-		stringValue, isString := value.(string)
-		if !isString {
-			return false, false
-		}
-		criterion = query.StringEndsWith(query.NodeProperty(lookup.Symbol), stringValue)
-	}
-
-	switch variable.Symbol {
-	case start.symbol:
-		start.properties = append(start.properties, criterion)
-		return false, true
-	case end.symbol:
-		end.properties = append(end.properties, criterion)
-		return false, true
-	default:
-		return false, false
-	}
-}
-
-// matchExcludeSelf recognizes left <> right as the ExcludeSelf predicate:
-// both sides bare variables, naming exactly start and end's symbols (in
-// either order).
-func matchExcludeSelf(left, right cypher.Expression, start, end *endpointAccumulator) (excludeSelf, ok bool) {
-	leftVariable, isLeftVariable := left.(*cypher.Variable)
-	rightVariable, isRightVariable := right.(*cypher.Variable)
-	if !isLeftVariable || !isRightVariable || leftVariable == nil || rightVariable == nil {
-		return false, false
-	}
-
-	symbols := map[string]bool{leftVariable.Symbol: true, rightVariable.Symbol: true}
-	if len(symbols) == 2 && symbols[start.symbol] && symbols[end.symbol] {
-		return true, true
-	}
-
-	return false, false
 }
 
 // matchReturn recognizes ret as projecting exactly the path variable
@@ -489,87 +781,4 @@ func matchReturn(ret *cypher.Return, pathSymbol string) (limit int, ok bool) {
 	default:
 		return 0, false
 	}
-}
-
-// decodeLiteralValue unwraps lit into the plain Go value it represents: the
-// parser already decodes integer, double, and boolean literals into
-// int64/uint64, float64, and bool, but a string literal's Value is left in
-// Cypher source form (quotes and escapes intact, per *cypher.Literal's
-// documented contract) and needs decodeCypherString to recover the actual
-// string. A null literal, or a literal wrapping any other Go type (a list
-// or map literal, notably), fails.
-func decodeLiteralValue(lit *cypher.Literal) (any, bool) {
-	if lit == nil || lit.Null {
-		return nil, false
-	}
-
-	switch value := lit.Value.(type) {
-	case string:
-		decoded, err := decodeCypherString(value)
-		if err != nil {
-			return nil, false
-		}
-		return decoded, true
-	case int64, uint64, float64, bool:
-		return value, true
-	default:
-		return nil, false
-	}
-}
-
-// decodeCypherString decodes raw -- a string literal's source-form token as
-// produced by the dawgs Cypher parser (surrounding ' or " quotes intact,
-// escape sequences un-decoded) -- into the string it represents. Recognizes
-// the same escapes the Cypher grammar defines: \\, \', \", \b, \f, \n, \r,
-// \t.
-func decodeCypherString(raw string) (string, error) {
-	if len(raw) < 2 {
-		return "", fmt.Errorf("invalid cypher string literal: %q", raw)
-	}
-
-	quote := raw[0]
-	if (quote != '\'' && quote != '"') || raw[len(raw)-1] != quote {
-		return "", fmt.Errorf("invalid cypher string literal: missing or mismatched surrounding quotes: %q", raw)
-	}
-
-	body := raw[1 : len(raw)-1]
-
-	var b strings.Builder
-	b.Grow(len(body))
-
-	for i := 0; i < len(body); i++ {
-		if body[i] != '\\' {
-			b.WriteByte(body[i])
-			continue
-		}
-
-		if i+1 >= len(body) {
-			return "", fmt.Errorf("dangling escape in string literal")
-		}
-
-		switch c := body[i+1]; c {
-		case '\\', '\'', '"':
-			b.WriteByte(c)
-			i++
-		case 'b', 'B':
-			b.WriteByte('\b')
-			i++
-		case 'f', 'F':
-			b.WriteByte('\f')
-			i++
-		case 'n', 'N':
-			b.WriteByte('\n')
-			i++
-		case 'r', 'R':
-			b.WriteByte('\r')
-			i++
-		case 't', 'T':
-			b.WriteByte('\t')
-			i++
-		default:
-			return "", fmt.Errorf("invalid escape \\%c", c)
-		}
-	}
-
-	return b.String(), nil
 }
