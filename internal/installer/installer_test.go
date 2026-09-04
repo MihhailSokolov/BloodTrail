@@ -101,12 +101,15 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-			base + "logs --no-color bloodhound":                             []byte("BloodTrail driver active version=test\n"),
-			"docker image inspect " + image:                                 []byte(""),
-			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
-			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
-			base + neo4jNodeCount:                                           []byte("count\n10\n"),
-			base + neo4jEdgeCount:                                           []byte("count\n20\n"),
+			// Read once for migrator failures, before the override exists,
+			// and again through the whole project when verifying.
+			base + "logs --no-color bloodhound":                         []byte("BloodTrail driver active version=test\n"),
+			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
+			"docker image inspect " + image:                             []byte(""),
+			psql + setRowSQL:                                            []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d":                      nil,
+			base + neo4jNodeCount:                                       []byte("count\n10\n"),
+			base + neo4jEdgeCount:                                       []byte("count\n20\n"),
 		},
 		Sequences: map[string][][]byte{
 			// PostgreSQL holds no graph before the migration and everything
@@ -346,13 +349,16 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-			base + "logs --no-color bloodhound":                             []byte("BloodTrail driver active version=test\n"),
-			psql + "truncate table edge, node":                              []byte("TRUNCATE TABLE\n"),
-			"docker image inspect " + image:                                 []byte(""),
-			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
-			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
-			base + neo4jNodeCount:                                           []byte("count\n10\n"),
-			base + neo4jEdgeCount:                                           []byte("count\n20\n"),
+			// Read once for migrator failures, before the override exists,
+			// and again through the whole project when verifying.
+			base + "logs --no-color bloodhound":                         []byte("BloodTrail driver active version=test\n"),
+			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
+			psql + "truncate table edge, node":                          []byte("TRUNCATE TABLE\n"),
+			"docker image inspect " + image:                             []byte(""),
+			psql + setRowSQL:                                            []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d":                      nil,
+			base + neo4jNodeCount:                                       []byte("count\n10\n"),
+			base + neo4jEdgeCount:                                       []byte("count\n20\n"),
 		},
 		Prefixes: map[string][]byte{
 			// Populated before the migration (which is what triggers the
@@ -394,6 +400,56 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 	}
 	if !clearedBeforeMigration {
 		t.Fatalf("the stale graph must be cleared before the migration starts:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// TestInstallKeepsTheOperatorsComposeFiles guards the fact that naming a file
+// with -f makes docker compose ignore COMPOSE_FILE: every file the operator
+// configured has to be named again or the installer reads, restarts and
+// verifies a different project than the one that is running.
+func TestInstallKeepsTheOperatorsComposeFiles(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	extra := filepath.Join(dir, "extra.yml")
+	_ = os.WriteFile(extra, []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:extra.yml\n"), 0o644)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " -f " + extra + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	withOverride := base + "-f " + overridePath + " "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+			psql + "select driver from database_switch limit 1":             []byte("pg\n"),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker image inspect " + image:                                 []byte(""),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+			withOverride + "up -d":                                          nil,
+			withOverride + "logs --no-color bloodhound":                     []byte("BloodTrail driver active version=test\n"),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	for _, call := range fake.Calls {
+		if strings.HasPrefix(call, "docker compose") && !strings.Contains(call, " -f "+extra+" ") {
+			t.Fatalf("a compose call dropped the operator's own file: %s", call)
+		}
+	}
+	if !fake.Called(withOverride + "up -d") {
+		t.Fatalf("the restart must merge the override last:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	if strings.TrimSpace(string(env)) != "COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml" {
+		t.Fatalf(".env = %q", env)
 	}
 }
 
@@ -445,10 +501,13 @@ func TestRollbackRestoresEverything(t *testing.T) {
 	defer api.Close()
 
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
-	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	// While the installation stands, COMPOSE_FILE still lists the override, so
+	// the project is addressed with both files; the restart afterwards is not.
+	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	psql := installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
 	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
-			base + "up -d --remove-orphans": nil,
+			base + "up -d": nil,
 			psql + "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')": []byte("INSERT 0 1\n"),
 		},
 	}
@@ -480,10 +539,11 @@ func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
 	defer api.Close()
 
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
-	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	psql := installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
 	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
-			base + "up -d --remove-orphans":      nil,
+			base + "up -d":                       nil,
 			psql + "delete from database_switch": nil,
 		},
 	}

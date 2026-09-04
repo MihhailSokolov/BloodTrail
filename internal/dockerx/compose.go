@@ -8,16 +8,38 @@ import (
 )
 
 // Compose addresses one compose project by file and project directory.
+// ExtraFiles are the further files the project is made of, in the order they
+// must be merged after File: an explicit -f drops whatever COMPOSE_FILE says,
+// so every file the operator configured has to be named again.
 type Compose struct {
 	Runner     Runner
 	File       string
 	ProjectDir string
+	ExtraFiles []string
 }
 
 // Args builds the docker compose argument list for a subcommand.
 func (s Compose) Args(sub ...string) []string {
 	args := []string{"compose", "--project-directory", s.ProjectDir, "-f", s.File}
+	for _, f := range s.ExtraFiles {
+		args = append(args, "-f", f)
+	}
 	return append(args, sub...)
+}
+
+// WithExtraFile returns a copy of s that also merges file, unless it is
+// already part of the project.
+func (s Compose) WithExtraFile(file string) Compose {
+	if file == s.File {
+		return s
+	}
+	for _, f := range s.ExtraFiles {
+		if f == file {
+			return s
+		}
+	}
+	s.ExtraFiles = append(append([]string(nil), s.ExtraFiles...), file)
+	return s
 }
 
 func (s Compose) run(ctx context.Context, stdin io.Reader, sub ...string) ([]byte, error) {
@@ -29,9 +51,12 @@ func (s Compose) ConfigJSON(ctx context.Context) ([]byte, error) {
 	return s.run(ctx, nil, "config", "--format", "json")
 }
 
-// Up starts or updates the project in the background.
+// Up starts or updates the project in the background. It deliberately does not
+// pass --remove-orphans: the file list may not name every service the operator
+// runs in this project, and removing what it does not know about is not the
+// installer's business.
 func (s Compose) Up(ctx context.Context) error {
-	_, err := s.run(ctx, nil, "up", "-d", "--remove-orphans")
+	_, err := s.run(ctx, nil, "up", "-d")
 	return err
 }
 

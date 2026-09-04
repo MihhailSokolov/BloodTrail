@@ -116,7 +116,26 @@ func (d *Deps) defaults() {
 }
 
 func (o Options) compose(runner dockerx.Runner) dockerx.Compose {
-	return dockerx.Compose{Runner: runner, File: o.ComposeFile, ProjectDir: o.ProjectDir}
+	return composeHandle(runner, o.ComposeFile, o.ProjectDir)
+}
+
+// composeHandle addresses the project as the operator configured it. Naming a
+// file with -f makes docker compose ignore COMPOSE_FILE entirely, so the other
+// files that variable lists have to be passed along too or the project the
+// installer reads and restarts is not the project the operator runs.
+func composeHandle(runner dockerx.Runner, composeFile, projectDir string) dockerx.Compose {
+	c := dockerx.Compose{Runner: runner, File: composeFile, ProjectDir: projectDir}
+	envData, err := os.ReadFile(filepath.Join(projectDir, ".env"))
+	if err != nil {
+		return c
+	}
+	for _, f := range compose.ComposeFiles(string(envData)) {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(projectDir, f)
+		}
+		c = c.WithExtraFile(f)
+	}
+	return c
 }
 
 // checkImageAvailable confirms the target image can be found locally or in a
@@ -265,8 +284,8 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err := store.Set(ctx, driverName); err != nil {
 		return fmt.Errorf("setting database_switch: %w; %s", err, rollbackHint)
 	}
-	if _, err := deps.Runner.Run(ctx, nil, "docker", "compose", "--project-directory", opts.ProjectDir,
-		"-f", opts.ComposeFile, "-f", overridePath, "up", "-d", "--remove-orphans"); err != nil {
+	c = c.WithExtraFile(overridePath)
+	if err := c.Up(ctx); err != nil {
 		return fmt.Errorf("docker compose up: %w; %s", err, rollbackHint)
 	}
 
@@ -367,7 +386,7 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("no BloodTrail installation found in %s: %w", opts.ProjectDir, err)
 	}
-	c := dockerx.Compose{Runner: deps.Runner, File: m.ComposeFile, ProjectDir: m.ProjectDir}
+	c := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir)
 	store := dbswitch.Store{Compose: c, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 
 	say("==> Restoring the graph driver setting")
@@ -395,7 +414,9 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 
 	say("==> Restarting with the original image %s", m.OriginalImage)
-	if err := c.Up(ctx); err != nil {
+	// The override is gone from disk and from COMPOSE_FILE, so the project is
+	// re-read from what is left.
+	if err := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir).Up(ctx); err != nil {
 		return err
 	}
 	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {

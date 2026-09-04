@@ -6,6 +6,27 @@ import "strings"
 
 const composeFileKey = "COMPOSE_FILE="
 
+// ComposeFiles returns the files listed in the .env contents' COMPOSE_FILE
+// entry, in order, or nil when there is no such line. Paths are returned as
+// written, so relative entries still have to be resolved against the compose
+// project directory.
+func ComposeFiles(env string) []string {
+	lines, _ := splitLines(env)
+	for _, line := range lines {
+		if !strings.HasPrefix(line, composeFileKey) {
+			continue
+		}
+		var files []string
+		for _, f := range strings.Split(strings.TrimPrefix(line, composeFileKey), ":") {
+			if f = strings.TrimSpace(stripCR(f)); f != "" {
+				files = append(files, f)
+			}
+		}
+		return files
+	}
+	return nil
+}
+
 // AddComposeFile ensures the .env contents make docker compose load the
 // override after the base file, so a plain `docker compose up -d` keeps it.
 func AddComposeFile(env, baseFile, overrideFile string) string {

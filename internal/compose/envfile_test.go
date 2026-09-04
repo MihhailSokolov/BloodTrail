@@ -31,6 +31,27 @@ func TestAddComposeFileIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestComposeFiles(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want string
+	}{
+		{"absent", "A=b\n", ""},
+		{"single", "COMPOSE_FILE=docker-compose.yml\n", "docker-compose.yml"},
+		{"several", "A=b\nCOMPOSE_FILE=docker-compose.yml:extra.yml:/srv/abs.yml\n", "docker-compose.yml,extra.yml,/srv/abs.yml"},
+		{"crlf", "COMPOSE_FILE=docker-compose.yml:extra.yml\r\n", "docker-compose.yml,extra.yml"},
+		{"empty entries dropped", "COMPOSE_FILE=docker-compose.yml::\n", "docker-compose.yml"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := strings.Join(ComposeFiles(c.env), ","); got != c.want {
+				t.Fatalf("ComposeFiles(%q) = %q, want %q", c.env, got, c.want)
+			}
+		})
+	}
+}
+
 func TestRemoveComposeFile(t *testing.T) {
 	env := "A=b\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"
 	if got := RemoveComposeFile(env, OverrideFileName); got != "A=b\nCOMPOSE_FILE=docker-compose.yml\n" {
