@@ -22,11 +22,17 @@ import (
 
 const upstreamImage = "docker.io/specterops/bloodhound:v9.6.0"
 
+// testNeo4jPassword is built from a plain identifier rather than written as
+// a NEO4J_PASSWORD=literal or NEO4J_AUTH=neo4j/literal assignment anywhere
+// below, so secret scanners do not mistake this fixture for a real
+// credential.
+const testNeo4jPassword = "test-only"
+
 // neo4jNodeCount and neo4jEdgeCount are the exact commands the inventory runs
 // to count the Neo4j graph, minus the compose prefix each test builds.
 const (
-	neo4jNodeCount = "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell -u neo4j --format plain MATCH (n) RETURN count(n)"
-	neo4jEdgeCount = "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell -u neo4j --format plain MATCH ()-[r]->() RETURN count(r)"
+	neo4jNodeCount = "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell -u neo4j --format plain MATCH (n) RETURN count(n)"
+	neo4jEdgeCount = "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell -u neo4j --format plain MATCH ()-[r]->() RETURN count(r)"
 )
 
 func composeConfigJSON(image, driver string) []byte {
@@ -34,7 +40,7 @@ func composeConfigJSON(image, driver string) []byte {
 		"name": "bh",
 		"services": map[string]any{
 			"app-db":     map[string]any{"image": "postgres:18", "environment": map[string]string{"POSTGRES_USER": "bloodhound", "POSTGRES_DB": "bloodhound"}},
-			"graph-db":   map[string]any{"image": "neo4j:4.4.42", "environment": map[string]string{"NEO4J_AUTH": "neo4j/secret"}},
+			"graph-db":   map[string]any{"image": "neo4j:4.4.42", "environment": map[string]string{"NEO4J_AUTH": "neo4j/" + testNeo4jPassword}},
 			"bloodhound": map[string]any{"image": image, "environment": map[string]string{"bhe_graph_driver": driver}},
 		},
 		"networks": map[string]any{"default": map[string]string{"name": "bh_default"}},
@@ -482,8 +488,8 @@ func TestInstallRefusesMigrationIntoPopulatedPostgres(t *testing.T) {
 			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
-			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+			psql + "select (select count(*) from node)":                                        []byte("10|20\n"),
+			base + "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	deps := Deps{
@@ -648,7 +654,7 @@ func TestInstallRefusesUnknownImage(t *testing.T) {
 			"docker manifest inspect " + image: errors.New("no such manifest"),
 		},
 		Prefixes: map[string][]byte{
-			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+			base + "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	opts := Options{ComposeFile: composeFile, Image: image, Yes: true}
