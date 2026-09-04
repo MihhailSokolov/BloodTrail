@@ -97,6 +97,11 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
 			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
 		},
+		Sequences: map[string][][]byte{
+			// PostgreSQL holds no graph before the migration and the whole
+			// graph after it.
+			psql + "select (select count(*) from node)": {[]byte("0|0\n")},
+		},
 		Prefixes: map[string][]byte{
 			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
 			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
@@ -205,6 +210,115 @@ func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
 	}
 	if !manifest.Exists(dir) {
 		t.Fatal("manifest should still exist so `bloodtrail rollback` can undo the partial install")
+	}
+}
+
+// TestInstallRefusesMigrationIntoPopulatedPostgres covers the case that makes
+// a second install after a rollback dangerous: the graph an earlier migration
+// left in PostgreSQL is still there, BloodHound's migrator would not replace
+// it, and the installer would otherwise switch the deployment onto that stale
+// copy.
+func TestInstallRefusesMigrationIntoPopulatedPostgres(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
+			psql + "select driver from database_switch limit 1":             []byte(""),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker image inspect " + image:                                 []byte(""),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
+			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+		},
+	}
+	deps := Deps{
+		Runner: fake, Out: &bytes.Buffer{},
+		NewToolAPITransport: func(string) toolapi.Transport {
+			t.Fatal("the migration must not be started when PostgreSQL already holds a graph")
+			return nil
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, Yes: true,
+		Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	err := Install(context.Background(), deps, opts)
+	if err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("expected a refusal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "--replace-postgres-graph") {
+		t.Fatalf("the refusal must name the way out, got %v", err)
+	}
+	if fake.Called(psql + "truncate") {
+		t.Fatalf("nothing may be cleared without --replace-postgres-graph:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive so `bloodtrail rollback` can clear the backup this install took")
+	}
+}
+
+func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
+			psql + "select driver from database_switch limit 1":             []byte(""),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			base + "logs --no-color bloodhound":                             []byte("BloodTrail driver active version=test\n"),
+			psql + "truncate table edge, node":                              []byte("TRUNCATE TABLE\n"),
+			"docker image inspect " + image:                                 []byte(""),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
+			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+		},
+	}
+
+	// The migrator must only be started once the stale graph is gone.
+	clearedBeforeMigration := false
+	firstToolCall := true
+	tool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if firstToolCall {
+			clearedBeforeMigration = fake.Called(psql + "truncate table edge, node")
+			firstToolCall = false
+		}
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /pg-migration/neo-to-pg", "PUT /graph-db/switch/pg":
+			w.WriteHeader(200)
+		case "GET /pg-migration/status":
+			_, _ = w.Write([]byte(`{"state":"idle"}`))
+		default:
+			t.Errorf("unexpected tool API call %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer tool.Close()
+
+	deps := Deps{
+		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
+		NewToolAPITransport: func(string) toolapi.Transport {
+			return rewriteTransport{base: tool.URL, client: tool.Client()}
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true, ReplacePostgresGraph: true,
+		MigrationTimeout: time.Second, VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	if err := Install(context.Background(), deps, opts); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	if !clearedBeforeMigration {
+		t.Fatalf("the stale graph must be cleared before the migration starts:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 }
 

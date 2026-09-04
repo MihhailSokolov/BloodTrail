@@ -50,3 +50,21 @@ func TestFakeRunnerFailsOnUnexpectedCommand(t *testing.T) {
 		t.Fatal("expected an error for an unscripted command")
 	}
 }
+
+func TestFakeRunnerSequencesThenFallsBack(t *testing.T) {
+	fake := &FakeRunner{
+		Sequences: map[string][][]byte{"docker count": {[]byte("0"), []byte("7")}},
+		Prefixes:  map[string][]byte{"docker count": []byte("last")},
+	}
+	var got []string
+	for range 3 {
+		out, err := fake.Run(context.Background(), nil, "docker", "count", "nodes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, string(out))
+	}
+	if strings.Join(got, ",") != "0,7,last" {
+		t.Fatalf("got %v", got)
+	}
+}

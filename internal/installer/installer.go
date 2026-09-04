@@ -35,18 +35,19 @@ const (
 
 // Options are the user-facing knobs; zero values take the defaults above.
 type Options struct {
-	ComposeFile      string
-	ProjectDir       string
-	Image            string
-	ImageRepo        string
-	DriverVersion    string
-	APIURL           string
-	AdminUser        string
-	AdminPassword    string
-	Yes              bool
-	MigrationTimeout time.Duration
-	VerifyTimeout    time.Duration
-	Now              func() time.Time
+	ComposeFile          string
+	ProjectDir           string
+	Image                string
+	ImageRepo            string
+	DriverVersion        string
+	APIURL               string
+	AdminUser            string
+	AdminPassword        string
+	Yes                  bool
+	ReplacePostgresGraph bool
+	MigrationTimeout     time.Duration
+	VerifyTimeout        time.Duration
+	Now                  func() time.Time
 }
 
 // Deps are the side-effecting collaborators, replaceable in tests.
@@ -208,6 +209,16 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	rollbackHint := fmt.Sprintf("run `bloodtrail rollback` to restore the original driver and image (Neo4j data is intact); backup in %s", backupDir)
 
 	if inv.ActiveDriver == "neo4j" {
+		// BloodHound's migrator only inserts: run against a PostgreSQL graph
+		// an earlier migration already filled, it collides with the unique
+		// object id index at the first node, logs the failure and returns to
+		// idle. The node count would still be non-zero from that earlier run,
+		// so without this check the installer would happily switch the
+		// deployment onto a stale graph and lose everything ingested into
+		// Neo4j since.
+		if err := checkPostgresGraphEmpty(ctx, deps, opts, store, backupDir); err != nil {
+			return err
+		}
 		say("==> Migrating graph from Neo4j to PostgreSQL")
 		client := toolapi.Client{BaseURL: toolAPIBaseURL, Transport: deps.NewToolAPITransport(inv.Config.DefaultNetworkName())}
 		if err := client.MigrateNeoToPG(ctx, migrationPoll, opts.MigrationTimeout); err != nil {
@@ -248,6 +259,28 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	say("==> Verifying")
 	if err := runVerification(ctx, deps, opts, c); err != nil {
 		return fmt.Errorf("the image and driver switch completed, but verification failed: %w; run `bloodtrail rollback` to revert if needed", err)
+	}
+	return nil
+}
+
+// checkPostgresGraphEmpty refuses to start a migration when PostgreSQL already
+// holds a graph, unless the caller asked for that graph to be replaced.
+func checkPostgresGraphEmpty(ctx context.Context, deps Deps, opts Options, store dbswitch.Store, backupDir string) error {
+	nodes, edges, err := store.CountGraph(ctx)
+	if err != nil {
+		return fmt.Errorf("counting the PostgreSQL graph before migrating: %w", err)
+	}
+	if nodes == 0 {
+		return nil
+	}
+	if !opts.ReplacePostgresGraph {
+		return fmt.Errorf("PostgreSQL already holds %d nodes and %d edges from an earlier migration or install; "+
+			"refusing to migrate on top of them. Rerun with --replace-postgres-graph to clear them first "+
+			"(the backup in %s holds the current state)", nodes, edges, backupDir)
+	}
+	_, _ = fmt.Fprintf(deps.Out, "    clearing %d nodes and %d edges left in PostgreSQL by an earlier migration\n", nodes, edges)
+	if err := store.ClearGraph(ctx); err != nil {
+		return fmt.Errorf("clearing the PostgreSQL graph: %w", err)
 	}
 	return nil
 }

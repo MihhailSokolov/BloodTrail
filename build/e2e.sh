@@ -43,4 +43,28 @@ echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"
 api_ready
+
+# A rollback leaves the migrated graph in PostgreSQL: BloodHound's migrator
+# only inserts, so a second install would silently switch onto that stale copy
+# instead of migrating whatever Neo4j holds now.
+echo "==> Refusing a second install onto the graph the first one left in PostgreSQL"
+if (cd "$ROOT" && go run ./cmd/bloodtrail install --compose-file "$WORK/docker-compose.yml" --image "$IMAGE" --migration-timeout 30m --yes) > "$WORK/second-install.log" 2>&1; then
+  echo "the second install should have refused to migrate onto the existing PostgreSQL graph" >&2
+  cat "$WORK/second-install.log" >&2
+  exit 1
+fi
+grep -q "refusing to migrate on top of them" "$WORK/second-install.log"
+# The refused install took a backup and wrote its manifest before finding the
+# stale graph; rollback clears both without touching the deployment.
+(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
+
+echo "==> Reinstalling with --replace-postgres-graph"
+(cd "$ROOT" && go run ./cmd/bloodtrail install --compose-file "$WORK/docker-compose.yml" --image "$IMAGE" --migration-timeout 30m --replace-postgres-graph --yes)
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "$IMAGE"
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T app-db psql -U bloodhound -d bloodhound -tAc 'select driver from database_switch' | grep -qx bloodtrail
+
+echo "==> Rolling back again"
+(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"
+api_ready
 echo "==> e2e passed"

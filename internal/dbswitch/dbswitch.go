@@ -17,6 +17,7 @@ import (
 const (
 	readSQL  = "select driver from database_switch limit 1"
 	countSQL = "select (select count(*) from node) || '|' || (select count(*) from edge)"
+	clearSQL = "truncate table edge, node"
 )
 
 var driverNamePattern = regexp.MustCompile(`^[a-z0-9+_-]{1,32}$`)
@@ -106,4 +107,17 @@ func (s Store) CountGraph(ctx context.Context) (int64, int64, error) {
 		return 0, 0, fmt.Errorf("unexpected count output %q", out)
 	}
 	return nodes, edges, nil
+}
+
+// ClearGraph empties the PostgreSQL graph tables. BloodHound's migrator only
+// inserts, so a second migration into a graph an earlier one already filled
+// collides with the unique object id index; clearing first is the only way to
+// replace the graph rather than layer on top of it. Absent tables mean there
+// is no PostgreSQL graph yet, which is already the wanted state.
+func (s Store) ClearGraph(ctx context.Context) error {
+	_, err := s.psql(ctx, clearSQL)
+	if isMissingRelation(err, "node", "edge") {
+		return nil
+	}
+	return err
 }

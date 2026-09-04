@@ -84,6 +84,8 @@ func run(ctx context.Context, args []string, cmd func(context.Context, installer
 	fs.StringVar(&opts.AdminUser, "admin-user", installer.DefaultAdminUser, "admin user for the authenticated smoke test")
 	fs.StringVar(&opts.AdminPassword, "admin-password", "", "admin password; enables the ingest-and-search smoke test (or set BLOODTRAIL_ADMIN_PASSWORD)")
 	fs.BoolVar(&opts.Yes, "yes", false, "do not ask for confirmation")
+	fs.BoolVar(&opts.ReplacePostgresGraph, "replace-postgres-graph", false,
+		"clear a graph an earlier migration left in PostgreSQL instead of refusing to migrate on top of it")
 	fs.DurationVar(&opts.MigrationTimeout, "migration-timeout", 6*time.Hour, "how long to wait for the Neo4j to PostgreSQL migration")
 	fs.DurationVar(&opts.VerifyTimeout, "verify-timeout", 20*time.Minute, "how long to wait for the API and the smoke test")
 	if err := fs.Parse(args); err != nil {

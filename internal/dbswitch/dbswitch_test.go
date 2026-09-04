@@ -104,6 +104,33 @@ func TestCountGraphMissingTableIsZero(t *testing.T) {
 	}
 }
 
+func TestClearGraphTruncatesBothTables(t *testing.T) {
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+		prefix + clearSQL: []byte("TRUNCATE TABLE\n"),
+	}}
+	if err := newStore(fake).ClearGraph(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(clearSQL, "edge") || !strings.Contains(clearSQL, "node") {
+		t.Fatalf("both graph tables must be truncated together: %s", clearSQL)
+	}
+}
+
+func TestClearGraphTolerantOfMissingTables(t *testing.T) {
+	fake := &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + clearSQL: errors.New(`ERROR:  relation "node" does not exist`),
+	}}
+	if err := newStore(fake).ClearGraph(context.Background()); err != nil {
+		t.Fatalf("missing tables should not error: %v", err)
+	}
+	fake = &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + clearSQL: errors.New(`ERROR:  permission denied for table node`),
+	}}
+	if err := newStore(fake).ClearGraph(context.Background()); err == nil {
+		t.Fatal("other failures must propagate")
+	}
+}
+
 func TestCountGraphOtherErrorsPropagate(t *testing.T) {
 	fake := &dockerx.FakeRunner{Errors: map[string]error{
 		prefix + countSQL: errors.New(`FATAL:  role "bh" does not exist`),
