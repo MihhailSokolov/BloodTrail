@@ -81,3 +81,10 @@ func (s Compose) ExecEnv(ctx context.Context, service string, env []string, stdi
 func (s Compose) Logs(ctx context.Context, service string) ([]byte, error) {
 	return s.run(ctx, nil, "logs", "--no-color", service)
 }
+
+// PS returns `docker compose ps` output for one service as JSON: one object
+// per running container, either as a JSON array or as newline-delimited
+// objects depending on the compose version.
+func (s Compose) PS(ctx context.Context, service string) ([]byte, error) {
+	return s.run(ctx, nil, "ps", "--format", "json", service)
+}

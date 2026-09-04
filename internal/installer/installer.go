@@ -5,7 +5,9 @@
 package installer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -376,8 +378,17 @@ func checkPostgresGraphEmpty(ctx context.Context, deps Deps, opts Options, store
 	return nil
 }
 
+// runVerification checks the cheap and decisive things first: the driver log
+// line says the right image booted with the right driver, and it appears
+// within seconds. The smoke test goes last because it ingests a fixture and
+// triggers a full analysis, which on a real graph can run for a long time —
+// there is no sense paying for it to learn what the log already said.
 func runVerification(ctx context.Context, deps Deps, opts Options, c dockerx.Compose) error {
 	say := func(format string, a ...any) { _, _ = fmt.Fprintf(deps.Out, format+"\n", a...) }
+	if err := waitForDriverLogLine(ctx, c); err != nil {
+		return err
+	}
+	say("    driver log line present: %q", verify.DriverActiveMarker)
 	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
 		return err
 	}
@@ -389,13 +400,16 @@ func runVerification(ctx context.Context, deps Deps, opts Options, c dockerx.Com
 		}
 		say("    fixture ingested, analysed and found through the search API")
 	}
+	return nil
+}
+
+func waitForDriverLogLine(ctx context.Context, c dockerx.Compose) error {
 	for attempt := 0; attempt < logMarkerAttempts; attempt++ {
 		ok, err := verify.LogsContain(ctx, c, bloodhoundService, verify.DriverActiveMarker)
 		if err != nil {
 			return err
 		}
 		if ok {
-			say("    driver log line present: %q", verify.DriverActiveMarker)
 			return nil
 		}
 		select {
@@ -465,6 +479,34 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	return nil
 }
 
+// runningImage reports the image of the service's container. The two answers
+// differ whenever the compose files on disk have moved on from what is running
+// — which is exactly the state a half-finished install or rollback leaves — so
+// status has to read the container, not just the files.
+func runningImage(ctx context.Context, c dockerx.Compose, service string) string {
+	out, err := c.PS(ctx, service)
+	if err != nil {
+		return "not running"
+	}
+	// Compose v2 prints a JSON array in recent versions and one object per
+	// line in older ones. A decoder reading the stream handles both: it takes
+	// the first value, array or object, and an array's first element after
+	// stepping past the bracket.
+	dec := json.NewDecoder(bytes.NewReader(out))
+	if tok, err := dec.Token(); err != nil {
+		return "not running"
+	} else if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+		dec = json.NewDecoder(bytes.NewReader(out))
+	}
+	var container struct {
+		Image string `json:"Image"`
+	}
+	if err := dec.Decode(&container); err != nil || container.Image == "" {
+		return "not running"
+	}
+	return container.Image
+}
+
 // Status prints the manifest, the driver row and the running image.
 func Status(ctx context.Context, deps Deps, opts Options) error {
 	if err := opts.defaults(); err != nil {
@@ -476,7 +518,8 @@ func Status(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(deps.Out, "project:       %s\nconfigured:    %s\nactive driver: %s\n", inv.Config.Name, inv.Image, inv.ActiveDriver)
+	_, _ = fmt.Fprintf(deps.Out, "project:       %s\nconfigured:    %s\nrunning:       %s\nactive driver: %s\n",
+		inv.Config.Name, inv.Image, runningImage(ctx, c, bloodhoundService), inv.ActiveDriver)
 	if m, err := manifest.Load(opts.ProjectDir); err == nil {
 		_, _ = fmt.Fprintf(deps.Out, "bloodtrail:    installed %s, image %s, backups %s\n", m.InstalledAt, m.TargetImage, m.BackupDir)
 	} else {

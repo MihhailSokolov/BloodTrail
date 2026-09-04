@@ -650,6 +650,87 @@ func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
 	}
 }
 
+func TestStatusReportsRunningImage(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	running := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+
+	// A container still running the old image while the files already name the
+	// new one is exactly what a half-finished install or rollback leaves.
+	for _, c := range []struct {
+		name, psOutput, want string
+	}{
+		{"array", `[{"Service":"bloodhound","Image":"` + running + `","State":"running"}]`, running},
+		{"newline delimited", `{"Service":"bloodhound","Image":"` + running + `","State":"running"}` + "\n", running},
+		{"nothing running", "[]\n", "not running"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &dockerx.FakeRunner{
+				Outputs: map[string][]byte{
+					base + "config --format json":                       composeConfigJSON(upstreamImage, "bloodtrail"),
+					psql + "select driver from database_switch limit 1": []byte("bloodtrail\n"),
+					base + "ps --format json bloodhound":                []byte(c.psOutput),
+				},
+				Prefixes: map[string][]byte{
+					psql + "select (select count(*) from node)": []byte("10|20\n"),
+				},
+			}
+			var out bytes.Buffer
+			if err := Status(context.Background(), Deps{Runner: fake, Out: &out}, Options{ComposeFile: composeFile}); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), "configured:    "+upstreamImage) {
+				t.Fatalf("configured image missing from:\n%s", out.String())
+			}
+			if !strings.Contains(out.String(), "running:       "+c.want) {
+				t.Fatalf("running image %q missing from:\n%s", c.want, out.String())
+			}
+		})
+	}
+}
+
+func TestVerifyRunsChecks(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	var apiHits int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiHits++
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer api.Close()
+
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "logs --no-color bloodhound": []byte("boot\nBloodTrail driver active version=0.1.0 mode=delegate backend=pg\n"),
+	}}
+	var out bytes.Buffer
+	opts := Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}
+	if err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, opts); err != nil {
+		t.Fatalf("verify failed: %v\n%s", err, out.String())
+	}
+	if apiHits == 0 || !fake.Called(base+"logs --no-color bloodhound") {
+		t.Fatalf("both checks must run: apiHits=%d calls=%v", apiHits, fake.Calls)
+	}
+	if !strings.Contains(out.String(), "driver log line present") || !strings.Contains(out.String(), "API answers at") {
+		t.Fatalf("both checks must be reported:\n%s", out.String())
+	}
+
+	// The log line is the decisive check and the cheap one, so it comes first:
+	// a missing driver must be reported without waiting on the API.
+	fake = &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "logs --no-color bloodhound": []byte("boot\nready\n"),
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	unreachable := Options{ComposeFile: composeFile, APIURL: "http://127.0.0.1:1", VerifyTimeout: time.Second}
+	if err := Verify(ctx, Deps{Runner: fake, Out: &bytes.Buffer{}}, unreachable); err == nil {
+		t.Fatal("expected verification to fail when the driver never logged")
+	}
+	if fake.Calls == nil {
+		t.Fatal("the log check must run before the API wait")
+	}
+}
+
 // rewriteTransport sends tool API calls meant for http://bloodhound:2112 to the test server.
 type rewriteTransport struct {
 	base   string

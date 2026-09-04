@@ -38,6 +38,7 @@ echo "==> Installing BloodTrail"
 (cd "$ROOT" && go run ./cmd/bloodtrail install --compose-file "$WORK/docker-compose.yml" --image "$IMAGE" --admin-password "$PASSWORD" --migration-timeout 30m --yes)
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "$IMAGE"
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T app-db psql -U bloodhound -d bloodhound -tAc 'select driver from database_switch' | grep -qx bloodtrail
+(cd "$ROOT" && go run ./cmd/bloodtrail status --compose-file "$WORK/docker-compose.yml") | grep -q "running:.*$IMAGE"
 
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
