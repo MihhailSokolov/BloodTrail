@@ -37,7 +37,19 @@ func (s Compose) Up(ctx context.Context) error {
 
 // Exec runs a command inside a running service container without a TTY.
 func (s Compose) Exec(ctx context.Context, service string, stdin io.Reader, args ...string) ([]byte, error) {
-	return s.run(ctx, stdin, append([]string{"exec", "-T", service}, args...)...)
+	return s.ExecEnv(ctx, service, nil, stdin, args...)
+}
+
+// ExecEnv is Exec with extra "NAME=value" environment entries set for the
+// command inside the container, which keeps secrets off the command line of
+// the process that reads them.
+func (s Compose) ExecEnv(ctx context.Context, service string, env []string, stdin io.Reader, args ...string) ([]byte, error) {
+	sub := []string{"exec", "-T"}
+	for _, e := range env {
+		sub = append(sub, "-e", e)
+	}
+	sub = append(sub, service)
+	return s.run(ctx, stdin, append(sub, args...)...)
 }
 
 // Logs returns the service's logs.

@@ -98,8 +98,8 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)": []byte("10|20\n"),
-			base + "exec -T graph-db cypher-shell":      []byte("count\n10\n"),
+			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
+			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	var out bytes.Buffer
@@ -184,8 +184,8 @@ func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
 			"docker image inspect " + image:                                 []byte(""),
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)": []byte("0|0\n"),
-			base + "exec -T graph-db cypher-shell":      []byte("count\n10\n"),
+			psql + "select (select count(*) from node)":                     []byte("0|0\n"),
+			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	deps := Deps{
@@ -223,7 +223,7 @@ func TestInstallRefusesUnknownImage(t *testing.T) {
 			"docker manifest inspect " + image: errors.New("no such manifest"),
 		},
 		Prefixes: map[string][]byte{
-			base + "exec -T graph-db cypher-shell": []byte("count\n10\n"),
+			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	opts := Options{ComposeFile: composeFile, Image: image, Yes: true}

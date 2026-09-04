@@ -141,7 +141,10 @@ func neo4jCounts(ctx context.Context, c dockerx.Compose, cfg compose.Config) (in
 		return 0, 0, fmt.Errorf("NEO4J_AUTH not set on %s", graphDBService)
 	}
 	count := func(query string) (int64, error) {
-		out, err := c.Exec(ctx, graphDBService, nil, "cypher-shell", "-u", user, "-p", pass, "--format", "plain", query)
+		// cypher-shell reads NEO4J_PASSWORD, so the password never reaches
+		// the argument list of the process inside the container.
+		out, err := c.ExecEnv(ctx, graphDBService, []string{"NEO4J_PASSWORD=" + pass}, nil,
+			"cypher-shell", "-u", user, "--format", "plain", query)
 		if err != nil {
 			return 0, err
 		}

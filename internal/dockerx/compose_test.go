@@ -34,6 +34,16 @@ func TestComposeExecUsesFakeRunner(t *testing.T) {
 	}
 }
 
+func TestComposeExecEnvPassesEnvironmentBeforeTheService(t *testing.T) {
+	fake := &FakeRunner{Outputs: map[string][]byte{
+		"docker compose --project-directory /srv/bh -f /srv/bh/docker-compose.yml exec -T -e NEO4J_PASSWORD=s3cret graph-db cypher-shell -u neo4j": []byte("ok\n"),
+	}}
+	c := Compose{Runner: fake, File: "/srv/bh/docker-compose.yml", ProjectDir: "/srv/bh"}
+	if _, err := c.ExecEnv(context.Background(), "graph-db", []string{"NEO4J_PASSWORD=s3cret"}, nil, "cypher-shell", "-u", "neo4j"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestFakeRunnerFailsOnUnexpectedCommand(t *testing.T) {
 	fake := &FakeRunner{}
 	if _, err := fake.Run(context.Background(), nil, "docker", "nope"); err == nil {
