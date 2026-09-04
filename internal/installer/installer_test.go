@@ -22,6 +22,13 @@ import (
 
 const upstreamImage = "docker.io/specterops/bloodhound:v9.6.0"
 
+// neo4jNodeCount and neo4jEdgeCount are the exact commands the inventory runs
+// to count the Neo4j graph, minus the compose prefix each test builds.
+const (
+	neo4jNodeCount = "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell -u neo4j --format plain MATCH (n) RETURN count(n)"
+	neo4jEdgeCount = "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell -u neo4j --format plain MATCH ()-[r]->() RETURN count(r)"
+)
+
 func composeConfigJSON(image, driver string) []byte {
 	cfg := map[string]any{
 		"name": "bh",
@@ -36,11 +43,13 @@ func composeConfigJSON(image, driver string) []byte {
 	return data
 }
 
-// fakeToolAPI answers the migrator endpoints: one "migrating" poll, then idle.
-// *manifestExistsAtFirstCall records whether the install manifest already
-// existed by the time the very first tool-API request arrived, proving the
-// manifest is saved before migration begins.
-func fakeToolAPI(t *testing.T, dir string, manifestExistsAtFirstCall *bool) *httptest.Server {
+// fakeToolAPI answers the migrator endpoints, reporting "migrating" for the
+// first migratingPolls status calls and idle after that. Each such poll costs
+// a real migrationPoll wait, so only the test that has to prove the installer
+// waits asks for one. *manifestExistsAtFirstCall records whether the install
+// manifest already existed by the time the very first tool-API request
+// arrived, proving the manifest is saved before migration begins.
+func fakeToolAPI(t *testing.T, dir string, manifestExistsAtFirstCall *bool, migratingPolls int) *httptest.Server {
 	polls := 0
 	first := true
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +62,7 @@ func fakeToolAPI(t *testing.T, dir string, manifestExistsAtFirstCall *bool) *htt
 			w.WriteHeader(200)
 		case "GET /pg-migration/status":
 			polls++
-			if polls == 1 {
+			if polls <= migratingPolls {
 				_, _ = w.Write([]byte(`{"state":"migrating"}`))
 			} else {
 				_, _ = w.Write([]byte(`{"state":"idle"}`))
@@ -80,7 +89,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
 	defer api.Close()
 	var manifestExistsBeforeMigration bool
-	tool := fakeToolAPI(t, dir, &manifestExistsBeforeMigration)
+	tool := fakeToolAPI(t, dir, &manifestExistsBeforeMigration, 1)
 	defer tool.Close()
 
 	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
@@ -96,15 +105,16 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			"docker image inspect " + image:                                 []byte(""),
 			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
 			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
+			base + neo4jNodeCount:                                           []byte("count\n10\n"),
+			base + neo4jEdgeCount:                                           []byte("count\n20\n"),
 		},
 		Sequences: map[string][][]byte{
-			// PostgreSQL holds no graph before the migration and the whole
-			// graph after it.
+			// PostgreSQL holds no graph before the migration and everything
+			// Neo4j held after it.
 			psql + "select (select count(*) from node)": {[]byte("0|0\n")},
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
-			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
 	var out bytes.Buffer
@@ -171,45 +181,107 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	}
 }
 
-func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
-	dir, composeFile := setupProject(t)
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
-	defer api.Close()
-	tool := fakeToolAPI(t, dir, new(bool))
-	defer tool.Close()
-
-	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+// migrationFake scripts a Neo4j deployment through a migration that the tool
+// API reports as clean. neo4j and pg are the "nodes|edges" the two databases
+// report afterwards, and logs is what the bloodhound service printed.
+func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, logs string) *dockerx.FakeRunner {
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
 	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
-	fake := &dockerx.FakeRunner{
+	return &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			base + "logs --no-color bloodhound":                             []byte(logs),
 			"docker image inspect " + image:                                 []byte(""),
+			base + neo4jNodeCount:                                           []byte("count\n" + neo4jNodes + "\n"),
+			base + neo4jEdgeCount:                                           []byte("count\n" + neo4jEdges + "\n"),
+		},
+		Sequences: map[string][][]byte{
+			psql + "select (select count(*) from node)": {[]byte("0|0\n")},
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":                     []byte("0|0\n"),
-			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+			psql + "select (select count(*) from node)": []byte(pg + "\n"),
 		},
 	}
+}
+
+// runMigrationInstall drives Install through the migration with fake and
+// returns whatever it failed with.
+func runMigrationInstall(t *testing.T, dir, composeFile, image string, fake *dockerx.FakeRunner) error {
+	t.Helper()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+	tool := fakeToolAPI(t, dir, new(bool), 0)
+	defer tool.Close()
+
 	deps := Deps{
 		Runner: fake,
 		HTTP:   api.Client(),
 		Out:    &bytes.Buffer{},
-		NewToolAPITransport: func(network string) toolapi.Transport {
+		NewToolAPITransport: func(string) toolapi.Transport {
 			return rewriteTransport{base: tool.URL, client: tool.Client()}
 		},
 	}
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		MigrationTimeout: time.Second, VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	return Install(context.Background(), deps, opts)
+}
 
-	err := Install(context.Background(), deps, opts)
-	if err == nil || !strings.Contains(err.Error(), "rollback") {
-		t.Fatalf("expected an error mentioning rollback, got %v", err)
+func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	// Without a usable Neo4j count there is nothing to compare against, so an
+	// empty PostgreSQL graph is the only evidence the migration failed.
+	fake := migrationFake(dir, composeFile, image, "10", "20", "0|0", "")
+	delete(fake.Outputs, base+neo4jNodeCount)
+	delete(fake.Outputs, base+neo4jEdgeCount)
+
+	err := runMigrationInstall(t, dir, composeFile, image, fake)
+	if err == nil || !strings.Contains(err.Error(), "zero nodes") || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected a zero-node error mentioning rollback, got %v", err)
 	}
 	if !manifest.Exists(dir) {
 		t.Fatal("manifest should still exist so `bloodtrail rollback` can undo the partial install")
+	}
+}
+
+// TestInstallAbortsWhenMigratedCountsDoNotMatchNeo4j covers the failure the
+// zero-node check misses: the nodes arrive but the edges do not.
+func TestInstallAbortsWhenMigratedCountsDoNotMatchNeo4j(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|0", "")
+
+	err := runMigrationInstall(t, dir, composeFile, image, fake)
+	if err == nil || !strings.Contains(err.Error(), "10 nodes and 0 edges") || !strings.Contains(err.Error(), "10 nodes and 20 edges") {
+		t.Fatalf("expected an error naming both counts, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected the rollback hint, got %v", err)
+	}
+}
+
+func TestInstallAbortsWhenTheMigratorLogsAFailure(t *testing.T) {
+	for _, marker := range []string{"Failed importing", "Unable to migrate", "Unable to assert"} {
+		t.Run(marker, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			logs := "starting migration\n" + marker + " node objectid=S-1-5-21: duplicate key value\ndone\n"
+			fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", logs)
+
+			err := runMigrationInstall(t, dir, composeFile, image, fake)
+			if err == nil || !strings.Contains(err.Error(), marker) {
+				t.Fatalf("expected the offending log line in the error, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "rollback") {
+				t.Fatalf("expected the rollback hint, got %v", err)
+			}
+			if fake.Called("docker compose --project-directory " + dir + " -f " + composeFile + " -f ") {
+				t.Fatalf("the image must not be swapped in after a failed migration:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+		})
 	}
 }
 
@@ -279,10 +351,13 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 			"docker image inspect " + image:                                 []byte(""),
 			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
 			base + "-f " + overridePath + " up -d --remove-orphans":         nil,
+			base + neo4jNodeCount:                                           []byte("count\n10\n"),
+			base + neo4jEdgeCount:                                           []byte("count\n20\n"),
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
-			base + "exec -T -e NEO4J_PASSWORD=secret graph-db cypher-shell": []byte("count\n10\n"),
+			// Populated before the migration (which is what triggers the
+			// clear) and holding the same graph again afterwards.
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
 

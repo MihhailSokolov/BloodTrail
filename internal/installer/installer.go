@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/backup"
@@ -228,8 +229,21 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		if err != nil {
 			return fmt.Errorf("counting migrated graph: %w; %s", err, rollbackHint)
 		}
-		if nodes == 0 {
+		// The migrator reports per-object failures to the server log only and
+		// still returns to idle, so a run that imported the nodes but dropped
+		// every edge looks identical to a clean one from the API. Check what
+		// arrived against what Neo4j held, then read the log.
+		switch {
+		case inv.CountSource == "neo4j" && (nodes != inv.Nodes || edges != inv.Edges):
+			return fmt.Errorf("the migration moved %d nodes and %d edges into PostgreSQL but Neo4j holds %d nodes and %d edges; "+
+				"BloodHound's migrator reports failures to its log only; %s", nodes, edges, inv.Nodes, inv.Edges, rollbackHint)
+		case inv.CountSource != "neo4j" && nodes == 0:
 			return fmt.Errorf("the migration finished with zero nodes in PostgreSQL; BloodHound's migrator may already have switched the active driver to pg; %s", rollbackHint)
+		}
+		if line, err := migratorFailureInLogs(ctx, c); err != nil {
+			return fmt.Errorf("reading %s logs after the migration: %w; %s", bloodhoundService, err, rollbackHint)
+		} else if line != "" {
+			return fmt.Errorf("the migration logged a failure: %q; %s", line, rollbackHint)
 		}
 		say("    PostgreSQL now holds %d nodes and %d edges", nodes, edges)
 	}
@@ -261,6 +275,28 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf("the image and driver switch completed, but verification failed: %w; run `bloodtrail rollback` to revert if needed", err)
 	}
 	return nil
+}
+
+// migratorFailureMarkers are the phrases BloodHound's migrator logs when it
+// cannot import an object, migrate a batch or assert a kind. It carries on and
+// still returns to idle afterwards, so the log is the only evidence.
+var migratorFailureMarkers = []string{"Failed importing", "Unable to migrate", "Unable to assert"}
+
+// migratorFailureInLogs returns the first log line reporting a migration
+// failure, or "" when there is none.
+func migratorFailureInLogs(ctx context.Context, c dockerx.Compose) (string, error) {
+	logs, err := c.Logs(ctx, bloodhoundService)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(logs), "\n") {
+		for _, marker := range migratorFailureMarkers {
+			if strings.Contains(line, marker) {
+				return strings.TrimSpace(line), nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // checkPostgresGraphEmpty refuses to start a migration when PostgreSQL already
