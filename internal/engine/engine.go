@@ -178,7 +178,8 @@ func (e *Engine) RebuildNow(ctx context.Context) error {
 	return nil
 }
 
-// Decline reasons TryAllShortestPaths logs at Debug under the "reason" attr.
+// Decline reasons TryAllShortestPaths and TryCypher log at Debug under the
+// "reason" attr.
 const (
 	reasonDisabled     = "disabled"
 	reasonNoSnapshot   = "no_snapshot"
@@ -188,6 +189,15 @@ const (
 	reasonMemoryLimit  = "memory_limit"
 	reasonHydration    = "hydration"
 	reasonError        = "error"
+	// reasonParams is TryCypher-only: a non-empty params map means the
+	// caller intends to bind $parameters, which recognize.FromCypher never
+	// produces (its accepted shape rejects any conjunct containing a
+	// $parameter), so the engine cannot know it would honor them correctly.
+	reasonParams = "params"
+	// reasonUnrecognized is TryCypher-only: recognize.FromCypher did not
+	// recognize text as one of the accepted shortestPath/allShortestPaths
+	// shapes.
+	reasonUnrecognized = "unrecognized"
 )
 
 // TryAllShortestPaths attempts to serve pq entirely from the engine's
@@ -197,11 +207,91 @@ const (
 // decline is logged at Debug with a "reason" attr (see the reason* consts
 // above); a successful serve is logged at Info.
 //
+// The actual pipeline lives in servePathQuery, shared with TryCypher; see
+// its doc for the six numbered steps.
+func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
+	start := time.Now()
+
+	hydrated, served := e.servePathQuery(ctx, tx, pq)
+	if !served {
+		return nil, false
+	}
+
+	e.cfg.Log.InfoContext(ctx, "bloodtrail: path engine served",
+		slog.String("mode", modeLabel(pq.Mode)),
+		slog.Int("paths", len(hydrated)),
+		slog.Duration("duration", time.Since(start)),
+	)
+
+	return hydrated, true
+}
+
+// TryCypher attempts to serve text (a Cypher query string, as sent to
+// BloodHound's cypher endpoint) entirely from the engine's current snapshot,
+// returning (result, true) on success. It returns (nil, false) whenever the
+// engine cannot, or chooses not to, serve the query itself, in which case
+// the caller must delegate to PostgreSQL.
+//
+// params must be empty (nil or a zero-length map) to be served: BloodHound's
+// cypher endpoint calls ops.FetchByQuery, which always calls
+// tx.Query(query, map[string]any{}) -- an empty, non-nil map -- so a
+// non-empty params map can only mean a caller bound $parameters the engine
+// has no way to honor (recognize.FromCypher's accepted shape rejects any
+// $parameter reference outright), and is declined (reason "params") without
+// even attempting to recognize text.
+//
+// text must recognize.FromCypher into a recognize.PathQuery (decline reason
+// "unrecognized" otherwise); the recognized query is then served by the same
+// servePathQuery pipeline TryAllShortestPaths uses, and the resulting
+// graph.PathSet is wrapped in a newPathResult so the caller can drain it
+// exactly as it would drain a live database Result (see ops.FetchByQuery,
+// the real consumer this is modeled on). A successful serve is logged at
+// Info with query="cypher" (TryAllShortestPaths' equivalent log line carries
+// no such field, so the two entry points' served events stay distinguishable
+// in the log).
+func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text string, params map[string]any) (graph.Result, bool) {
+	start := time.Now()
+
+	if len(params) > 0 {
+		e.decline(ctx, reasonParams, nil)
+		return nil, false
+	}
+
+	pq, ok := recognize.FromCypher(text)
+	if !ok {
+		e.decline(ctx, reasonUnrecognized, nil)
+		return nil, false
+	}
+
+	hydrated, served := e.servePathQuery(ctx, tx, pq)
+	if !served {
+		return nil, false
+	}
+
+	e.cfg.Log.InfoContext(ctx, "bloodtrail: path engine served",
+		slog.String("query", "cypher"),
+		slog.String("mode", modeLabel(pq.Mode)),
+		slog.Int("paths", len(hydrated)),
+		slog.Duration("duration", time.Since(start)),
+	)
+
+	return newPathResult(hydrated), true
+}
+
+// servePathQuery is the pipeline TryAllShortestPaths and TryCypher both
+// serve a recognized recognize.PathQuery through, returning (paths, true) on
+// success and (nil, false) the instant any step declines (each decline
+// already logged at Debug by the failing step; callers add nothing further
+// on the false path).
+//
 // Pipeline:
-//  1. Fresh() or decline (no_snapshot / stale).
-//  2. Resolve pq.Start/pq.End into traverse.Endpoint values.
+//  1. cfg.Enabled, then Fresh() -- decline "disabled" / "no_snapshot" /
+//     "stale".
+//  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
+//     "unresolvable" on error).
 //  3. Build the edge KindMask from pq.EdgeKinds.
-//  4. traverse.AllShortestPaths.
+//  4. traverse.AllShortestPaths (decline "too_large" / "memory_limit" /
+//     "error").
 //  5. Hydrate the resulting dense paths into graph.Path values (decline
 //     "hydration" on error).
 //  6. Re-check that the exact snapshot captured at step 1 is still current
@@ -211,9 +301,7 @@ const (
 //     the whole call even though the work already completed -- even if a
 //     concurrent RebuildNow has since adopted a newer snapshot that itself
 //     reports fresh.
-func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
-	start := time.Now()
-
+func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
 	if !e.cfg.Enabled {
 		e.decline(ctx, reasonDisabled, nil)
 		return nil, false
@@ -279,12 +367,6 @@ func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, 
 		e.decline(ctx, reasonStale, nil)
 		return nil, false
 	}
-
-	e.cfg.Log.InfoContext(ctx, "bloodtrail: path engine served",
-		slog.String("mode", modeLabel(pq.Mode)),
-		slog.Int("paths", len(hydrated)),
-		slog.Duration("duration", time.Since(start)),
-	)
 
 	return hydrated, true
 }
