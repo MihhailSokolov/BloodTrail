@@ -14,11 +14,21 @@ jobs:
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
+      # `docker manifest inspect` below decides whether a tag still needs
+      # building. Without credentials a private package looks like a missing
+      # one, so every run would rebuild everything.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: pick
-        env: { GH_TOKEN: "${{ github.token }}" }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
         run: |
-          if [ -n "${{ inputs.upstream_tag }}" ]; then
-            echo "tags=[\"${{ inputs.upstream_tag }}\"]" >> "$GITHUB_OUTPUT"; exit 0
+          if [ -n "$UPSTREAM_TAG" ]; then
+            echo "tags=[\"$UPSTREAM_TAG\"]" >> "$GITHUB_OUTPUT"; exit 0
           fi
           # Latest stable (non-rc) upstream releases not yet in GHCR for this repo.
           latest=$(gh release list -R SpecterOps/BloodHound --limit 20 --json tagName,isPrerelease \
@@ -49,4 +59,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push
-        run: ./build/build-image.sh "${{ matrix.upstream_tag }}" "$(git describe --tags --always)" --push --platform linux/amd64,linux/arm64
+        env:
+          UPSTREAM_TAG: ${{ matrix.upstream_tag }}
+        run: ./build/build-image.sh "$UPSTREAM_TAG" "$(git describe --tags --always)" --push --platform linux/amd64,linux/arm64
