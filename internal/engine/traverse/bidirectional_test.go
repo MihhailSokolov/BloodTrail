@@ -112,7 +112,7 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, modeAll, budget, scF, scT, scTmp, nil)
+		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, ModeAll, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -134,7 +134,7 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, modeOne, budget, scF, scT, scTmp, nil)
+		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, ModeOne, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -168,7 +168,7 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 9, kinds, MaxDepth, 0, modeAll, budget, scF, scT, scTmp, nil)
+		out, err := pairPaths(s, 0, 9, kinds, MaxDepth, 0, ModeAll, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -178,7 +178,7 @@ func TestPairPaths(t *testing.T) {
 	})
 }
 
-// TestPairPathsCrossCheck cross-checks pairPaths(modeAll) against a
+// TestPairPathsCrossCheck cross-checks pairPaths(ModeAll) against a
 // reference computed purely with Task 3 primitives (a full reverse
 // bfsFrom(t) followed by enumerate(r)) on 50 seeded random graphs. The two
 // approaches share no code path beyond bfsFrom itself, so agreement here is
@@ -204,7 +204,7 @@ func TestPairPathsCrossCheck(t *testing.T) {
 		scTmp := newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		got, err := pairPaths(s, r, tgt, kinds, MaxDepth, 0, modeAll, budget, scF, scT, scTmp, nil)
+		got, err := pairPaths(s, r, tgt, kinds, MaxDepth, 0, ModeAll, budget, scF, scT, scTmp, nil)
 		if err != nil {
 			t.Fatalf("seed %d: pairPaths: %v", seed, err)
 		}
@@ -212,7 +212,7 @@ func TestPairPathsCrossCheck(t *testing.T) {
 		refSc := newScratch(s.NodeCount())
 		bfsFrom(s, tgt, false, kinds, MaxDepth, refSc)
 		refBudget := &memBudget{}
-		want, err := enumerate(s, r, refSc, kinds, 0, refBudget, nil)
+		want, err := enumerate(s, r, refSc, kinds, 0, refBudget, nil, true)
 		if err != nil {
 			t.Fatalf("seed %d: enumerate (reference): %v", seed, err)
 		}

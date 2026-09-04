@@ -53,19 +53,34 @@ type pathState struct {
 	kinds []snapshot.KindID
 }
 
-// enumerate collects every path from `from` whose every hop (u -> w, kind
-// allowed) satisfies distTo.get(w) == distTo.get(u)-1, ending at distance 0.
-// distTo must hold distances TO the destination (i.e. produced by a reverse
-// bfsFrom over the In-CSR when enumerating forward paths). Appends to out,
-// stopping when len(out) == cap (cap<=0: unbounded) or budget.add fails.
+// enumerate collects every path whose every hop satisfies the strictly-
+// decreasing distance requirement against distBuf, ending at distance 0.
+// Direction is controlled by forward:
 //
-// It walks forward over Out-adjacency with an explicit stack in place of
+//   - forward == true: `from` is the path's root. distBuf must hold
+//     distances TO the destination (produced by a reverse bfsFrom over the
+//     In-CSR). The walk follows Out-adjacency from `from`, requiring
+//     distBuf.get(w) == distBuf.get(u)-1 at each hop u -> w, so nodes are
+//     visited in root-to-destination order and appended to the output
+//     as-is.
+//   - forward == false: `from` is the path's destination. distBuf must hold
+//     distances FROM the root (produced by a forward bfsFrom over the
+//     Out-CSR). The walk follows In-adjacency from `from` — i.e. it walks
+//     the graph's real edges backward, from destination toward root — so
+//     nodes are visited in destination-to-root order; each candidate stack
+//     entry is reversed before being appended to the output so the emitted
+//     Path is always root-to-destination.
+//
+// Appends to out, stopping when len(out) == cap (cap<=0: unbounded) or
+// budget.add fails.
+//
+// It walks the chosen adjacency with an explicit stack in place of
 // recursion; the strictly-decreasing distance requirement makes the
 // explored state space acyclic even when the underlying graph has cycles,
 // so no separate visited-set is needed. Parallel edges admitted under
 // different allowed kinds are pushed as distinct stack entries and so
 // produce distinct output paths.
-func enumerate(s *snapshot.Snapshot, from snapshot.NodeID, distTo *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path) ([]Path, error) {
+func enumerate(s *snapshot.Snapshot, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path, forward bool) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{from}}}
 
 	for len(stack) > 0 {
@@ -73,36 +88,45 @@ func enumerate(s *snapshot.Snapshot, from snapshot.NodeID, distTo *scratch, kind
 		stack = stack[:len(stack)-1]
 
 		u := cur.nodes[len(cur.nodes)-1]
-		du, ok := distTo.get(u)
+		du, ok := distBuf.get(u)
 		if !ok {
 			continue
 		}
 
 		if du == 0 {
 			if len(cur.nodes) < 2 {
-				// from == destination: no zero-length path is produced.
+				// from == the other endpoint: no zero-length path is produced.
 				continue
 			}
-			if err := budget.add(uint64(len(cur.nodes))*12 + 48); err != nil {
+			nodes := append([]snapshot.NodeID(nil), cur.nodes...)
+			pathKinds := append([]snapshot.KindID(nil), cur.kinds...)
+			if !forward {
+				reverseNodes(nodes)
+				reverseKinds(pathKinds)
+			}
+			if err := budget.add(uint64(len(nodes))*12 + 48); err != nil {
 				return out, err
 			}
-			out = append(out, Path{
-				Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
-				Kinds: append([]snapshot.KindID(nil), cur.kinds...),
-			})
+			out = append(out, Path{Nodes: nodes, Kinds: pathKinds})
 			if cap > 0 && len(out) == cap {
 				return out, nil
 			}
 			continue
 		}
 
-		targets, edgeKinds := s.Out(u)
+		var targets []snapshot.NodeID
+		var edgeKinds []snapshot.KindID
+		if forward {
+			targets, edgeKinds = s.Out(u)
+		} else {
+			targets, edgeKinds = s.In(u)
+		}
 		for i, w := range targets {
 			k := edgeKinds[i]
 			if !kinds.Has(k) {
 				continue
 			}
-			dw, ok := distTo.get(w)
+			dw, ok := distBuf.get(w)
 			if !ok || dw != du-1 {
 				continue
 			}
@@ -121,17 +145,19 @@ func enumerate(s *snapshot.Snapshot, from snapshot.NodeID, distTo *scratch, kind
 	return out, nil
 }
 
-// pathMode selects how many shortest paths pairPaths returns. A later task
-// exposes an equivalent exported Mode type; this stays internal until a
-// caller outside the package needs it.
-type pathMode int
+// reverseNodes reverses ns in place.
+func reverseNodes(ns []snapshot.NodeID) {
+	for i, j := 0, len(ns)-1; i < j; i, j = i+1, j-1 {
+		ns[i], ns[j] = ns[j], ns[i]
+	}
+}
 
-const (
-	// modeAll returns every shortest r->t path, capped at capPerPair.
-	modeAll pathMode = iota
-	// modeOne returns a single shortest r->t path.
-	modeOne
-)
+// reverseKinds reverses ks in place.
+func reverseKinds(ks []snapshot.KindID) {
+	for i, j := 0, len(ks)-1; i < j; i, j = i+1, j-1 {
+		ks[i], ks[j] = ks[j], ks[i]
+	}
+}
 
 // pairShortest finds D = length of the shortest r->t path (kind-filtered),
 // or -1 if none exists within maxDepth. r == t always yields -1: like
@@ -244,19 +270,19 @@ func pairShortest(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.Ki
 	return D
 }
 
-// pairPaths returns all (mode == modeAll, capped at capPerPair; capPerPair
-// <= 0 is unbounded) or one (mode == modeOne) shortest r->t paths. It runs
+// pairPaths returns all (mode == ModeAll, capped at capPerPair; capPerPair
+// <= 0 is unbounded) or one (mode == ModeOne) shortest r->t paths. It runs
 // pairShortest to find D and populate scF/scT, then hands off to
 // pairEnumerate; if no path exists within maxDepth, out is returned
 // unchanged and no error is produced (absence of a path is not a failure).
-func pairPaths(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, capPerPair int, mode pathMode, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
+func pairPaths(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, capPerPair int, mode Mode, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
 	D := pairShortest(s, r, t, kinds, maxDepth, scF, scT, scTmp)
 	if D < 0 {
 		return out, nil
 	}
 
 	cap := capPerPair
-	if mode == modeOne {
+	if mode == ModeOne {
 		cap = 1
 	}
 
