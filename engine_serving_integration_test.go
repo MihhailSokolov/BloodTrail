@@ -9,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -484,5 +485,107 @@ func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
 	})
 	if len(got) != 0 {
 		t.Fatalf("post-rebuild query on a wiped graph returned paths: %v", got)
+	}
+}
+
+// TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly is Finding
+// 2's regression test: recordingRelationshipQuery.FetchAllShortestPaths
+// (relationship_query.go) must close the graph.Cursor[graph.Path] it hands
+// to delegate itself -- provider-closes, the same convention the pg
+// driver's own FetchAllShortestPaths follows (drivers/pg/relationship.go:
+// `cursor := ...; defer cursor.Close(); return delegate(cursor)`) -- rather
+// than leaving the cursor for delegate to close. Before the fix, a delegate
+// that returned without draining Chan() at all left the cursor's feeder
+// goroutine (internal/engine/result.go's pathCursor.feed) blocked forever on
+// an unbuffered channel send: only Close() cancels the context that
+// unblocks it.
+//
+// This needs a live, actually-serving engine (not a mock): the served
+// branch inside FetchAllShortestPaths -- the only branch that constructs an
+// engine.NewPathCursor at all -- is only reached once
+// engine.TryAllShortestPaths itself succeeds, which requires a real
+// snapshot built from PostgreSQL. A query that instead fell through to the
+// pg driver's own FetchAllShortestPaths would exercise that driver's
+// already-correct cursor and prove nothing about this fix.
+func TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly(t *testing.T) {
+	dsn := os.Getenv(testPGEnv)
+	if dsn == "" {
+		t.Skipf("%s not set", testPGEnv)
+	}
+
+	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+	pool := openPool(t, ctx, dsn)
+	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
+
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	schema := schemaFromDatasets(t)
+	if err := bt.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	ids := loadDatasets(t, ctx, bt)
+
+	createDatapipeStatusTable(t, pool)
+	defer dropDatapipeStatusTable(t, pool)
+
+	insertDatapipeStatus(t, pool, "running", time.Now().UTC().Truncate(time.Microsecond))
+
+	// Warm the engine: this both builds the initial snapshot and confirms
+	// the query is actually served (not delegated) before moving on.
+	waitForEngineServe(t, buf, 0, 5*time.Second, func() []string {
+		return shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"])
+	})
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	// Repeat the served call several times, each with a delegate that
+	// returns immediately without draining Chan() at all -- the exact shape
+	// that leaked one feeder goroutine per call before the fix. Repeating
+	// amplifies a real leak into an unmistakable signal well above any
+	// incidental goroutine-count jitter (e.g. pool housekeeping).
+	const attempts = 20
+	for i := 0; i < attempts; i++ {
+		err := bt.ReadTransaction(ctx, func(tx graph.Transaction) error {
+			criteria := query.And(
+				query.Equals(query.StartID(), ids["c0"]),
+				query.Equals(query.EndID(), ids["c10"]),
+			)
+			return tx.Relationships().Filter(criteria).FetchAllShortestPaths(func(graph.Cursor[graph.Path]) error {
+				return nil
+			})
+		})
+		if err != nil {
+			t.Fatalf("FetchAllShortestPaths (attempt %d): %v", i, err)
+		}
+	}
+
+	if !strings.Contains(buf.String(), servedMarker) {
+		t.Fatalf("expected at least one of these queries to have been served by the engine\nlog:\n%s", buf.String())
+	}
+
+	// The feeder goroutines should unblock and exit promptly once Close()
+	// cancels their context; poll with a generous deadline rather than
+	// asserting immediately; allow a small amount of slack over the
+	// baseline for incidental, unrelated goroutine churn.
+	const slack = 3
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		runtime.GC()
+		after := runtime.NumGoroutine()
+		if after <= before+slack {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("feeder goroutines leaked: goroutines before=%d after=%d (delta %d over %d attempts)", before, after, after-before, attempts)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

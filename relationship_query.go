@@ -106,11 +106,21 @@ func (r *recordingRelationshipQuery) Delete() error {
 // delegate returns is propagated unchanged. Every other case (tainted,
 // declined, criteria count != 1, unrecognized shape, or the engine itself
 // declining) falls through to the inner query's own FetchAllShortestPaths.
+//
+// The cursor is closed by this method (not by delegate), matching the pg
+// driver's own convention (drivers/pg/relationship.go's
+// FetchAllShortestPaths: `cursor := ...; defer cursor.Close(); return
+// delegate(cursor)`): a delegate that returns early without fully draining
+// Chan() would otherwise leak the feeder goroutine, which blocks forever on
+// an unbuffered send until something cancels its context -- only Close()
+// does that.
 func (r *recordingRelationshipQuery) FetchAllShortestPaths(delegate func(cursor graph.Cursor[graph.Path]) error) error {
 	if !r.tainted && !r.tx.declined && len(r.criteria) == 1 {
 		if pq, ok := recognize.FromCriteria(r.criteria[0]); ok {
 			if paths, served := r.tx.engine.TryAllShortestPaths(context.Background(), r.tx, pq); served {
-				return delegate(engine.NewPathCursor(context.Background(), paths))
+				cursor := engine.NewPathCursor(context.Background(), paths)
+				defer cursor.Close()
+				return delegate(cursor)
 			}
 		}
 	}
