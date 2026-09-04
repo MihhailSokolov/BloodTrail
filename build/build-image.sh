@@ -14,8 +14,15 @@ set -euo pipefail
 usage() { sed -n '2,12p' "$0"; exit 2; }
 
 TAG="${1:-}"; [[ -n "$TAG" ]] || usage; shift
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 DRIVER_VERSION="${1:-}"
-if [[ -n "$DRIVER_VERSION" && "$DRIVER_VERSION" != --* ]]; then shift; else DRIVER_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"; fi
+# `git describe` has to run inside this repository: the working directory when
+# the script is invoked is not necessarily it.
+if [[ -n "$DRIVER_VERSION" && "$DRIVER_VERSION" != --* ]]; then shift; else DRIVER_VERSION="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"; fi
+# The image tag and the version stamped into the driver are the same string,
+# without the "v" a git tag carries.
+DRIVER_VERSION="${DRIVER_VERSION#v}"
 PUSH=""; PLATFORM="linux/amd64"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,10 +32,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$REPO_ROOT/.build/upstream-$TAG"
 IMAGE_REPO="${IMAGE_REPO:-ghcr.io/mihhailsokolov/bloodhound-bloodtrail}"
-IMAGE="$IMAGE_REPO:$TAG-bt${DRIVER_VERSION#v}"
+IMAGE="$IMAGE_REPO:$TAG-bt$DRIVER_VERSION"
 ALIAS="$IMAGE_REPO:$TAG"
 MODULE="github.com/MihhailSokolov/BloodTrail"
 VENDOR_DIR="packages/go/bloodtrail"
@@ -56,10 +62,11 @@ echo "==> Wiring go.mod"
 rm -f "$WORK/bhapi"
 
 echo "==> Building $IMAGE"
+# No --build-arg version: the v9.6.0 Dockerfile declares no such ARG, and
+# buildx warns about (and ignores) one that is not declared.
 docker buildx build \
   -f "$WORK/dockerfiles/bloodhound.Dockerfile" \
   --platform "$PLATFORM" \
-  --build-arg "version=$TAG-bt${DRIVER_VERSION#v}" \
   -t "$IMAGE" -t "$ALIAS" \
   ${PUSH:---load} \
   "$WORK"
