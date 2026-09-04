@@ -12,6 +12,7 @@ package graphtest
 
 import (
 	"context"
+	"math/rand"
 	"os"
 	"testing"
 
@@ -98,6 +99,109 @@ func LoadDataset(t *testing.T, d *pg.Driver, path string) opengraph.IDMap {
 	ids, err := opengraph.Load(context.Background(), d, f)
 	if err != nil {
 		t.Fatalf("graphtest: load %s: %v", path, err)
+	}
+
+	return ids
+}
+
+// RandomNodeKindCount and RandomEdgeKindCount size the kind alphabets
+// LoadRandom draws from -- 5 node kinds (A..E), 6 edge kinds (R1..R6) -- and
+// are exported so callers building queries against a LoadRandom graph (e.g.
+// a random edge-kind subset) can stay in sync without hardcoding the counts
+// twice.
+const (
+	RandomNodeKindCount = 5
+	RandomEdgeKindCount = 6
+)
+
+// RandomNodeKinds and RandomEdgeKinds are the fixed kind alphabets LoadRandom
+// assigns nodes and edges from, exposed so callers can build queries (e.g. a
+// random EdgeKinds subset) against exactly the kinds a LoadRandom graph uses.
+var (
+	RandomNodeKinds = randomKinds("A", "B", "C", "D", "E")
+	RandomEdgeKinds = randomKinds("R1", "R2", "R3", "R4", "R5", "R6")
+)
+
+func randomKinds(names ...string) graph.Kinds {
+	kinds := make(graph.Kinds, len(names))
+	for i, name := range names {
+		kinds[i] = graph.StringKind(name)
+	}
+	return kinds
+}
+
+// LoadRandom generates a pseudo-random graph from seed -- 60 nodes drawn
+// from RandomNodeKinds, 180 edges drawn from RandomEdgeKinds -- and loads it
+// into d's default graph through the pg driver's write/batch APIs (nodes via
+// a write transaction, so their assigned ids are available for edges; edges
+// via BatchOperation, matching the bulk-load path production code uses).
+// Edges are chosen independently and uniformly over the node list on both
+// ends, so self-loops and parallel edges (including same-kind parallel
+// edges, which the pg driver's batch insert merges into a single stored
+// edge -- see drivers/pg/batch.go's relationshipCreateBatchBuilder) both
+// occur naturally.
+//
+// The returned slice holds the database ids assigned to the 60 generated
+// nodes, in generation order. Calling LoadRandom with the same seed against
+// a freshly wiped graph reproduces the same graph shape every time, since
+// rand.New(rand.NewSource(seed)) is deterministic and the node ids a fresh
+// sequence assigns are stable.
+func LoadRandom(t *testing.T, d *pg.Driver, seed int64) []graph.ID {
+	t.Helper()
+	ctx := context.Background()
+
+	const (
+		numNodes = 60
+		numEdges = 180
+	)
+
+	rng := rand.New(rand.NewSource(seed))
+
+	// Edge kinds must exist in the driver's kind catalog before
+	// CreateRelationshipByIDs's batch path will accept them: unlike node
+	// creation (tx.CreateNode calls AssertKinds, which defines missing kinds
+	// lazily), the batch relationship path only maps existing kind ids
+	// (SchemaManager.MapKind) and errors on an unknown one. AssertSchema only
+	// reads kinds off schema.Graphs (a Schema's DefaultGraph field is used
+	// for partition/index bookkeeping, not kind definition), so the kinds
+	// must be declared there. Node kinds don't strictly need this
+	// pre-assertion (CreateNode already lazily defines them), but asserting
+	// both here keeps LoadRandom idempotent about kind declaration
+	// regardless of driver behavior changes.
+	schema := graph.Schema{Graphs: []graph.Graph{{Name: GraphName, Nodes: RandomNodeKinds, Edges: RandomEdgeKinds}}}
+	if err := d.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("graphtest: LoadRandom(seed=%d): assert schema: %v", seed, err)
+	}
+
+	ids := make([]graph.ID, numNodes)
+	if err := d.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		for i := 0; i < numNodes; i++ {
+			kind := RandomNodeKinds[rng.Intn(len(RandomNodeKinds))]
+
+			node, err := tx.CreateNode(graph.NewProperties(), kind)
+			if err != nil {
+				return err
+			}
+			ids[i] = node.ID
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("graphtest: LoadRandom(seed=%d): create nodes: %v", seed, err)
+	}
+
+	if err := d.BatchOperation(ctx, func(batch graph.Batch) error {
+		for i := 0; i < numEdges; i++ {
+			start := ids[rng.Intn(numNodes)]
+			end := ids[rng.Intn(numNodes)]
+			kind := RandomEdgeKinds[rng.Intn(len(RandomEdgeKinds))]
+
+			if err := batch.CreateRelationshipByIDs(start, end, kind, graph.NewProperties()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("graphtest: LoadRandom(seed=%d): create edges: %v", seed, err)
 	}
 
 	return ids
