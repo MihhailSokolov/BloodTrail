@@ -273,6 +273,13 @@ const (
 	reasonMemoryLimit  = "memory_limit"
 	reasonHydration    = "hydration"
 	reasonError        = "error"
+	// reasonSelfEndpoint fires when the resolved roots and terminals share a
+	// node and pq.ExcludeSelf is false: PostgreSQL's own shortest-path query
+	// aborts entirely the instant a root that is also a terminal has an
+	// outgoing edge (see traverse.SelfEndpointConflict's doc for the underlying
+	// SQL guard), so the engine declines outright rather than risk serving
+	// an answer PostgreSQL itself cannot produce for the same request.
+	reasonSelfEndpoint = "self_endpoint"
 	// reasonParams is TryCypher-only: a non-empty params map means the
 	// caller intends to bind $parameters, which recognize.FromCypher never
 	// produces (its accepted shape rejects any conjunct containing a
@@ -373,14 +380,19 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 //     "stale".
 //  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
 //     "unresolvable" on error).
-//  3. Build the edge KindMask from pq.EdgeKinds.
-//  4. traverse.AllShortestPaths (decline "too_large" / "memory_limit" /
+//  3. Unless pq.ExcludeSelf, decline "self_endpoint" if the resolved roots
+//     and terminals share a node with an outgoing edge
+//     (traverse.SelfEndpointConflict): PostgreSQL's own shortest-path query
+//     cannot serve that request either, so the engine defers rather than
+//     risk an answer PostgreSQL itself would refuse.
+//  4. Build the edge KindMask from pq.EdgeKinds.
+//  5. traverse.AllShortestPaths (decline "too_large" / "memory_limit" /
 //     "error").
-//  5. Hydrate the resulting dense paths into graph.Path values (decline
+//  6. Hydrate the resulting dense paths into graph.Path values (decline
 //     "hydration" on error).
-//  6. Re-check that the exact snapshot captured at step 1 is still current
+//  7. Re-check that the exact snapshot captured at step 1 is still current
 //     (snapshotStillCurrent(snap), not a fresh Fresh() call): a write that
-//     landed while steps 2-5 ran could mean the served result mixes two
+//     landed while steps 2-6 ran could mean the served result mixes two
 //     generations, so a generation change on that specific snapshot declines
 //     the whole call even though the work already completed -- even if a
 //     concurrent RebuildNow has since adopted a newer snapshot that itself
@@ -411,6 +423,11 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 	terminals, err := resolveEndpoint(ctx, tx, kindMapper, snap, pq.End)
 	if err != nil {
 		e.decline(ctx, reasonUnresolvable, err)
+		return nil, false
+	}
+
+	if !pq.ExcludeSelf && traverse.SelfEndpointConflict(snap, roots, terminals) {
+		e.decline(ctx, reasonSelfEndpoint, nil)
 		return nil, false
 	}
 

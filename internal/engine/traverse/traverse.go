@@ -10,6 +10,7 @@ package traverse
 import (
 	"errors"
 	"runtime"
+	"sort"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -160,6 +161,80 @@ func (e Endpoint) Iterate(total int, fn func(snapshot.NodeID) bool) {
 			}
 		}
 	}
+}
+
+// Has reports whether e matches id. IDs is documented as ascending, so the
+// IDs branch binary-searches rather than scanning; the Bits branch defers to
+// snapshot.Bitset.Has (O(1)); the unconstrained default matches every id.
+func (e Endpoint) Has(id snapshot.NodeID) bool {
+	switch {
+	case e.IDs != nil:
+		i := sort.Search(len(e.IDs), func(i int) bool { return e.IDs[i] >= id })
+		return i < len(e.IDs) && e.IDs[i] == id
+	case e.Bits != nil:
+		return e.Bits.Has(id)
+	default:
+		return true
+	}
+}
+
+// SelfEndpointConflict reports whether roots and terminals share a dense id
+// that has at least one outgoing edge in s (of any kind, not just those the
+// query's own KindMask allows -- see below for why). It iterates whichever
+// side Count(s.NodeCount()) reports as smaller and probes it against the
+// other via Has, checking s.Out only for an id that is actually a member of
+// both sides, so the cost is bounded by the smaller side's size plus one
+// Out lookup per overlapping id.
+//
+// This exists to let servePathQuery match a real constraint of PostgreSQL's
+// own shortest-path implementation: a root node that is also a terminal
+// aborts its recursive seed query the moment that node has an outgoing edge
+// (shortest_path_self_endpoint_error, raised from the very first BFS hop --
+// see dawgs's cypher/models/pgsql/test/translation_cases/shortest_paths.sql
+// and drivers/pg/query/sql/schema_up.sql). That failure is unconditional
+// for the whole query, not scoped to the offending pair, and it fires for
+// both FetchAllShortestPaths's single-pair shape and a Cypher
+// shortestPath()/allShortestPaths() form with no explicit `n <> m` filter
+// (Query.ExcludeSelf false) -- exactly the two shapes this engine serves.
+//
+// The check deliberately ignores the query's edge-kind restriction even
+// though PostgreSQL's own trigger may well be scoped to it (the seed join's
+// WHERE clause could short-circuit the self-check away for a row a kind
+// filter already excludes -- the translation this project can inspect
+// doesn't settle it either way for every query shape). Any-kind out-degree
+// is a superset of kind-restricted out-degree, so this can only make the
+// engine decline in strictly more cases than a kind-scoped check would,
+// never fewer: if PostgreSQL's trigger does turn out to be kind-scoped, the
+// worst outcome is an unnecessary decline (a query PostgreSQL would have
+// served itself falls back to it and gets the same right answer); the
+// alternative -- a kind-scoped check that turns out too narrow -- would let
+// the exact bug this function exists to close back in, silently serving an
+// answer for a request PostgreSQL cannot. Callers should decline outright
+// whenever SelfEndpointConflict is true and ExcludeSelf is false, rather
+// than trying to reproduce PostgreSQL's trigger any more precisely:
+// declining is always at least as correct, since PostgreSQL is the fallback
+// either way and returns the same answer (error or otherwise) whether or
+// not the engine attempted the query first.
+func SelfEndpointConflict(s *snapshot.Snapshot, roots, terminals Endpoint) bool {
+	total := s.NodeCount()
+
+	small, big := roots, terminals
+	if terminals.Count(total) < roots.Count(total) {
+		small, big = terminals, roots
+	}
+
+	conflict := false
+	small.Iterate(total, func(id snapshot.NodeID) bool {
+		if !big.Has(id) {
+			return true
+		}
+		if targets, _ := s.Out(id); len(targets) > 0 {
+			conflict = true
+			return false
+		}
+		return true
+	})
+	return conflict
 }
 
 // Query describes an AllShortestPaths request.

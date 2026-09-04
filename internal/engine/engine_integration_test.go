@@ -270,6 +270,113 @@ func TestTryAllShortestPathsStale(t *testing.T) {
 	}
 }
 
+// TestTryAllShortestPathsDeclinesSelfEndpoint is a targeted regression test
+// for a mismatch Task 14's randomized differential suite surfaced: querying
+// a node against itself (Start and End both resolving to c0, which has an
+// outgoing edge in traversal_shapes.json's chain) is a request PostgreSQL's
+// own shortest-path implementation cannot serve at all -- it raises
+// SQLSTATE 22023 ("shortest path endpoints must not resolve to the same
+// node") from the very first BFS hop rather than returning an empty result
+// (see traverse.SelfEndpointConflict's doc for the underlying SQL). Before
+// this fix the engine had no equivalent guard: traverse.AllShortestPaths
+// happily searched for a nontrivial cycle back to c0 and TryAllShortestPaths
+// served whatever it found, silently answering a request the live system
+// has always refused. The engine must now decline (reasonSelfEndpoint) so
+// the caller falls back to PostgreSQL and gets the same refusal it always
+// has.
+//
+// The second case checks the escape hatch stays open: with ExcludeSelf set
+// (the shape a Cypher `n <> m` predicate produces), traverse's own
+// strategyPairs/strategySmallSide already skip r==t pairs cleanly with no
+// PostgreSQL-side error to match, so the engine must still serve -- here,
+// trivially empty, since c0's only pair is excluded.
+//
+// The third case checks the complementary, degree-dependent half of
+// reasonSelfEndpoint's condition: c10 (the chain's terminal node, with no
+// outgoing edge of its own) queried against itself must still be served,
+// not declined -- PostgreSQL's guard only fires once a matching root's
+// outgoing-edge join actually produces a row, so a sink node querying
+// itself never reaches it and completes normally with zero paths (no edge
+// can originate a path back to c10 from itself, trivial or otherwise). An
+// engine that declined unconditionally on any same-node query, without
+// checking for an outgoing edge, would diverge from PostgreSQL here in the
+// opposite direction: needlessly falling back for a request it could have
+// served correctly itself.
+func TestTryAllShortestPathsDeclinesSelfEndpoint(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	selfPQ := recognize.PathQuery{
+		Start: recognize.Endpoint{IDs: []graph.ID{ids["c0"]}},
+		End:   recognize.Endpoint{IDs: []graph.ID{ids["c0"]}},
+		Mode:  recognize.ModeAll,
+	}
+
+	var served bool
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		_, served = eng.TryAllShortestPaths(ctx, tx, selfPQ)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+	if served {
+		t.Fatalf("TryAllShortestPaths served a same-node query (c0, c0), want declined -- PostgreSQL cannot serve this shape")
+	}
+
+	excludeSelfPQ := selfPQ
+	excludeSelfPQ.ExcludeSelf = true
+
+	var (
+		excludeSelfOut    graph.PathSet
+		excludeSelfServed bool
+	)
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		excludeSelfOut, excludeSelfServed = eng.TryAllShortestPaths(ctx, tx, excludeSelfPQ)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+	if !excludeSelfServed {
+		t.Fatalf("TryAllShortestPaths declined a same-node query with ExcludeSelf set, want served (traverse already skips r==t pairs)")
+	}
+	if len(excludeSelfOut) != 0 {
+		t.Fatalf("TryAllShortestPaths(ExcludeSelf) for (c0, c0) returned %d paths, want 0", len(excludeSelfOut))
+	}
+
+	sinkSelfPQ := recognize.PathQuery{
+		Start: recognize.Endpoint{IDs: []graph.ID{ids["c10"]}},
+		End:   recognize.Endpoint{IDs: []graph.ID{ids["c10"]}},
+		Mode:  recognize.ModeAll,
+	}
+
+	var (
+		sinkSelfOut    graph.PathSet
+		sinkSelfServed bool
+	)
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		sinkSelfOut, sinkSelfServed = eng.TryAllShortestPaths(ctx, tx, sinkSelfPQ)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+	if !sinkSelfServed {
+		t.Fatalf("TryAllShortestPaths declined a same-node query on a sink node (c10, c10), want served -- PostgreSQL's guard never fires when the shared node has no outgoing edge")
+	}
+	if len(sinkSelfOut) != 0 {
+		t.Fatalf("TryAllShortestPaths(c10, c10) returned %d paths, want 0", len(sinkSelfOut))
+	}
+}
+
 // oracleEndpointIDs independently resolves ep to the database ids it
 // matches, entirely through the plain dawgs query layer against pgDriver --
 // never touching the engine's snapshot/bitmap machinery -- so it serves as
