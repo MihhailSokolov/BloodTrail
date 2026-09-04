@@ -38,7 +38,11 @@ echo "==> Installing BloodTrail"
 (cd "$ROOT" && go run ./cmd/bloodtrail install --compose-file "$WORK/docker-compose.yml" --image "$IMAGE" --admin-password "$PASSWORD" --migration-timeout 30m --yes)
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "$IMAGE"
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T app-db psql -U bloodhound -d bloodhound -tAc 'select driver from database_switch' | grep -qx bloodtrail
-(cd "$ROOT" && go run ./cmd/bloodtrail status --compose-file "$WORK/docker-compose.yml") | grep -q "running:.*$IMAGE"
+# Written to a file rather than piped into grep: `grep -q` exits at the first
+# match and the writer then dies of SIGPIPE, which `go run` reports as a
+# failure.
+(cd "$ROOT" && go run ./cmd/bloodtrail status --compose-file "$WORK/docker-compose.yml") > "$WORK/status.txt"
+grep -q "running:.*$IMAGE" "$WORK/status.txt"
 
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
