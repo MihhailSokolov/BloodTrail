@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package engine
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/specterops/dawgs/drivers/pg"
+	"github.com/specterops/dawgs/graph"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/traverse"
+)
+
+// edgeBatchSize caps how many (start_id, end_id, kind_id) triples one
+// VALUES-list edge query carries. 500 triples is 1500 bound parameters,
+// comfortably inside PostgreSQL's per-statement parameter limit while
+// keeping each round trip large.
+const edgeBatchSize = 500
+
+// edgeKey identifies one edge by the (start, end, kind) triple the edge
+// table's unique constraint enforces, using database node ids rather than
+// dense snapshot.NodeIDs.
+type edgeKey struct {
+	start, end uint64
+	kind       snapshot.KindID
+}
+
+// hydratePaths maps dense paths to graph.Path values with full nodes and
+// relationships fetched from PostgreSQL. Node and edge kinds are resolved
+// through kindMapper and jsonb property columns are carried through as
+// map[string]any, matching what the pg driver itself returns for the same
+// entities.
+//
+// A node or edge that paths reference but that no longer exists in the
+// database (deleted between the snapshot's load and this call) is reported
+// as an error rather than silently dropped or substituted.
+func hydratePaths(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMapper, snap *snapshot.Snapshot, paths []traverse.Path) (graph.PathSet, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+
+	nodeIDs, edgeKeys := hydrationKeys(snap, paths)
+
+	nodes, err := hydrateNodes(ctx, pool, kindMapper, snap.GraphID, nodeIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	edges, err := hydrateEdges(ctx, pool, kindMapper, snap.GraphID, edgeKeys)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(graph.PathSet, len(paths))
+	for i, p := range paths {
+		gp, err := assemblePath(snap, p, nodes, edges)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = gp
+	}
+
+	return out, nil
+}
+
+// hydrationKeys collects every database node id and (start, end, kind) edge
+// triple that paths reference, each deduplicated across all of paths and
+// returned in first-seen order.
+func hydrationKeys(snap *snapshot.Snapshot, paths []traverse.Path) ([]uint64, []edgeKey) {
+	seenNodes := make(map[uint64]struct{})
+	var nodeIDs []uint64
+
+	seenEdges := make(map[edgeKey]struct{})
+	var edgeKeys []edgeKey
+
+	for _, p := range paths {
+		for _, dense := range p.Nodes {
+			id := snap.GraphIDs[dense]
+			if _, ok := seenNodes[id]; !ok {
+				seenNodes[id] = struct{}{}
+				nodeIDs = append(nodeIDs, id)
+			}
+		}
+
+		for i, kind := range p.Kinds {
+			key := edgeKey{start: snap.GraphIDs[p.Nodes[i]], end: snap.GraphIDs[p.Nodes[i+1]], kind: kind}
+			if _, ok := seenEdges[key]; !ok {
+				seenEdges[key] = struct{}{}
+				edgeKeys = append(edgeKeys, key)
+			}
+		}
+	}
+
+	return nodeIDs, edgeKeys
+}
+
+// hydrateNodes fetches every node in ids from graphID in one query, keyed by
+// database id, erroring if any requested id is missing from the result.
+func hydrateNodes(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMapper, graphID int32, ids []uint64) (map[uint64]*graph.Node, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	queryIDs := make([]int64, len(ids))
+	for i, id := range ids {
+		queryIDs[i] = int64(id)
+	}
+
+	rows, err := pool.Query(ctx, "SELECT id, kind_ids, properties FROM node WHERE graph_id = $1 AND id = ANY($2)", graphID, queryIDs)
+	if err != nil {
+		return nil, fmt.Errorf("engine: hydratePaths: query nodes: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[uint64]*graph.Node, len(ids))
+	for rows.Next() {
+		var (
+			id         int64
+			kindIDs    []int16
+			properties map[string]any
+		)
+		if err := rows.Scan(&id, &kindIDs, &properties); err != nil {
+			return nil, fmt.Errorf("engine: hydratePaths: scan node: %w", err)
+		}
+
+		kinds, err := kindMapper.MapKindIDs(ctx, kindIDs)
+		if err != nil {
+			return nil, fmt.Errorf("engine: hydratePaths: map kinds for node %d: %w", id, err)
+		}
+
+		out[uint64(id)] = graph.NewNode(graph.ID(uint64(id)), graph.AsProperties(properties), kinds...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("engine: hydratePaths: node rows: %w", err)
+	}
+
+	if len(out) != len(ids) {
+		return nil, fmt.Errorf("engine: hydratePaths: %d of %d requested nodes not found in the database (deleted since the snapshot was loaded)", len(ids)-len(out), len(ids))
+	}
+
+	return out, nil
+}
+
+// hydrateEdges fetches every edge in keys from graphID, in batches of at
+// most edgeBatchSize triples, keyed by (start, end, kind). It errors if any
+// requested triple is missing from the result.
+func hydrateEdges(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMapper, graphID int32, keys []edgeKey) (map[edgeKey]*graph.Relationship, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	out := make(map[edgeKey]*graph.Relationship, len(keys))
+
+	for lo := 0; lo < len(keys); lo += edgeBatchSize {
+		hi := lo + edgeBatchSize
+		if hi > len(keys) {
+			hi = len(keys)
+		}
+
+		if err := hydrateEdgeBatch(ctx, pool, kindMapper, graphID, keys[lo:hi], out); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(out) != len(keys) {
+		return nil, fmt.Errorf("engine: hydratePaths: %d of %d requested edges not found in the database (deleted since the snapshot was loaded)", len(keys)-len(out), len(keys))
+	}
+
+	return out, nil
+}
+
+// hydrateEdgeBatch runs one edge query over a single batch (at most
+// edgeBatchSize triples), writing results into out.
+func hydrateEdgeBatch(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMapper, graphID int32, batch []edgeKey, out map[edgeKey]*graph.Relationship) error {
+	sql, args := edgeBatchQuery(graphID, batch)
+
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		return fmt.Errorf("engine: hydratePaths: query edges: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id, start, end int64
+			kind           snapshot.KindID
+			properties     map[string]any
+		)
+		if err := rows.Scan(&id, &start, &end, &kind, &properties); err != nil {
+			return fmt.Errorf("engine: hydratePaths: scan edge: %w", err)
+		}
+
+		mappedKind, err := kindMapper.MapKindID(ctx, kind)
+		if err != nil {
+			return fmt.Errorf("engine: hydratePaths: map kind for edge %d: %w", id, err)
+		}
+
+		key := edgeKey{start: uint64(start), end: uint64(end), kind: kind}
+		out[key] = graph.NewRelationship(graph.ID(uint64(id)), graph.ID(uint64(start)), graph.ID(uint64(end)), graph.AsProperties(properties), mappedKind)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("engine: hydratePaths: edge rows: %w", err)
+	}
+
+	return nil
+}
+
+// edgeBatchQuery builds the parameterized SELECT ... WHERE (start_id,
+// end_id, kind_id) IN (VALUES ...) statement for one batch, along with its
+// positional arguments ($1 = graphID, the rest batch's triples in order).
+// Explicit casts on each VALUES tuple pin pgx's inferred parameter types
+// (bigint, bigint, smallint) so the IN comparison type-checks against the
+// edge table's columns.
+func edgeBatchQuery(graphID int32, batch []edgeKey) (string, []any) {
+	var sql strings.Builder
+	sql.WriteString("SELECT id, start_id, end_id, kind_id, properties FROM edge WHERE graph_id = $1 AND (start_id, end_id, kind_id) IN (VALUES ")
+
+	args := make([]any, 0, 1+len(batch)*3)
+	args = append(args, graphID)
+
+	for i, key := range batch {
+		if i > 0 {
+			sql.WriteString(", ")
+		}
+		n := len(args)
+		fmt.Fprintf(&sql, "($%d::bigint, $%d::bigint, $%d::smallint)", n+1, n+2, n+3)
+		args = append(args, int64(key.start), int64(key.end), key.kind)
+	}
+
+	sql.WriteString(")")
+
+	return sql.String(), args
+}
+
+// assemblePath builds one graph.Path from p, looking node and edge pointers
+// up in the already-hydrated nodes/edges maps by database id / edge key.
+// hydrateNodes and hydrateEdges already error out on any globally missing
+// entity, so a lookup miss here would indicate an internal bug rather than
+// a real deletion; the check stays as cheap insurance against a nil-pointer
+// panic.
+func assemblePath(snap *snapshot.Snapshot, p traverse.Path, nodes map[uint64]*graph.Node, edges map[edgeKey]*graph.Relationship) (graph.Path, error) {
+	gp := graph.Path{
+		Nodes: make([]*graph.Node, len(p.Nodes)),
+		Edges: make([]*graph.Relationship, len(p.Kinds)),
+	}
+
+	for i, dense := range p.Nodes {
+		id := snap.GraphIDs[dense]
+		node, ok := nodes[id]
+		if !ok {
+			return graph.Path{}, fmt.Errorf("engine: hydratePaths: node %d missing from hydrated set", id)
+		}
+		gp.Nodes[i] = node
+	}
+
+	for i, kind := range p.Kinds {
+		key := edgeKey{start: snap.GraphIDs[p.Nodes[i]], end: snap.GraphIDs[p.Nodes[i+1]], kind: kind}
+		edge, ok := edges[key]
+		if !ok {
+			return graph.Path{}, fmt.Errorf("engine: hydratePaths: edge (%d, %d, kind %d) missing from hydrated set", key.start, key.end, key.kind)
+		}
+		gp.Edges[i] = edge
+	}
+
+	return gp, nil
+}
