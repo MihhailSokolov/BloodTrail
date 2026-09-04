@@ -151,7 +151,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	target := opts.Image
 	if target == "" {
 		if inv.UpstreamTag == "" {
-			return fmt.Errorf("cannot derive the upstream tag from image %q; pass --image", inv.Image)
+			return fmt.Errorf("the deployment runs an unpinned or unrecognised image tag %q; set BLOODHOUND_TAG in .env or pass --image", inv.Image)
 		}
 		if opts.DriverVersion == "" {
 			target = opts.ImageRepo + ":" + inv.UpstreamTag

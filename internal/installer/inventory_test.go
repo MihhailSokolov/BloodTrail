@@ -10,6 +10,13 @@ func TestUpstreamTagFromImage(t *testing.T) {
 		want  string
 	}{
 		{"docker.io/specterops/bloodhound:v9.6.0", "v9.6.0"},
+		// Docker Hub publishes the application image without the "v" of the
+		// GitHub source tag; BloodTrail images carry the "v", so the bare
+		// number has to be normalised.
+		{"docker.io/specterops/bloodhound:9.6.0", "v9.6.0"},
+		{"docker.io/specterops/bloodhound:9.6.0-rc1", "v9.6.0-rc1"},
+		// A moving tag names no particular release: refuse to guess.
+		{"docker.io/specterops/bloodhound:latest", ""},
 		{"registry.internal:5000/bloodhound", ""},
 		{"repo@sha256:abc", ""},
 		{"bloodhound", ""},

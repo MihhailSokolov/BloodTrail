@@ -27,11 +27,18 @@ const (
 // upstreamTagPattern matches a plausible Docker image tag.
 var upstreamTagPattern = regexp.MustCompile(`^v?[0-9A-Za-z._-]+$`)
 
+// versionTagPattern matches a tag that starts with a bare release number.
+// SpecterOps publishes the application image on Docker Hub without the "v"
+// of the GitHub source tag ("9.6.0"), while BloodTrail images are tagged
+// after the source tag ("v9.6.0", "v9.6.0-bt0.1.0"), so a derived tag has to
+// be normalised back to the "v" form before it names a BloodTrail image.
+var versionTagPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+`)
+
 // upstreamTagFromImage derives the version tag BloodTrail images are built
 // against from the final path segment of image (so a registry host:port
-// prefix is never mistaken for a tag). It refuses digest references ("@")
-// and untagged images, returning "" so the caller requires --image instead
-// of guessing.
+// prefix is never mistaken for a tag). It refuses digest references ("@"),
+// untagged images and the moving "latest" tag, returning "" so the caller
+// requires --image instead of guessing.
 func upstreamTagFromImage(image string) string {
 	seg := image
 	if i := strings.LastIndex(image, "/"); i >= 0 {
@@ -45,8 +52,14 @@ func upstreamTagFromImage(image string) string {
 		return ""
 	}
 	tag := seg[i+1:]
+	if tag == "" || tag == "latest" {
+		return ""
+	}
 	if !upstreamTagPattern.MatchString(tag) {
 		return ""
+	}
+	if versionTagPattern.MatchString(tag) {
+		return "v" + tag
 	}
 	return tag
 }
