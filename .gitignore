@@ -19,3 +19,6 @@ bench/csrbench/csrbench
 .build/
 .bloodtrail/
 dist/
+
+# Agent working files
+.superpowers/
