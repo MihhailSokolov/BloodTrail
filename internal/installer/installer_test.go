@@ -110,6 +110,12 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			base + "-f " + overridePath + " up -d":                      nil,
 			base + neo4jNodeCount:                                       []byte("count\n10\n"),
 			base + neo4jEdgeCount:                                       []byte("count\n20\n"),
+			// The migration reaches the tool API through a curl container,
+			// which is fetched before anything is changed.
+			"docker pull " + toolapi.CurlImage: nil,
+		},
+		Errors: map[string]error{
+			"docker image inspect " + toolapi.CurlImage: errors.New("no such image"),
 		},
 		Sequences: map[string][][]byte{
 			// PostgreSQL holds no graph before the migration and everything
@@ -173,6 +179,9 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 		}
 		return -1
 	}
+	if curlIdx, backupIdx := idx("docker pull "+toolapi.CurlImage), idx(base+"exec -T app-db pg_dump"); curlIdx == -1 || curlIdx >= backupIdx {
+		t.Fatalf("the curl image must be fetched before the backup:\n%s", strings.Join(fake.Calls, "\n"))
+	}
 	backupIdx := idx(base + "exec -T app-db pg_dump")
 	driverRowIdx := idx(psql + setRowSQL)
 	upIdx := idx("docker compose --project-directory " + dir + " -f " + composeFile + " -f ")
@@ -197,6 +206,7 @@ func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, logs str
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
 			base + "logs --no-color bloodhound":                             []byte(logs),
 			"docker image inspect " + image:                                 []byte(""),
+			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 			base + neo4jNodeCount:                                           []byte("count\n" + neo4jNodes + "\n"),
 			base + neo4jEdgeCount:                                           []byte("count\n" + neo4jEdges + "\n"),
 		},
@@ -304,6 +314,7 @@ func TestInstallRefusesMigrationIntoPopulatedPostgres(t *testing.T) {
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
 			"docker image inspect " + image:                                 []byte(""),
+			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 		},
 		Prefixes: map[string][]byte{
 			psql + "select (select count(*) from node)":                     []byte("10|20\n"),
@@ -355,10 +366,11 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
 			psql + "truncate table edge, node":                          []byte("TRUNCATE TABLE\n"),
 			"docker image inspect " + image:                             []byte(""),
-			psql + setRowSQL:                                            []byte("INSERT 0 1\n"),
-			base + "-f " + overridePath + " up -d":                      nil,
-			base + neo4jNodeCount:                                       []byte("count\n10\n"),
-			base + neo4jEdgeCount:                                       []byte("count\n20\n"),
+			"docker image inspect " + toolapi.CurlImage:                 []byte(""),
+			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d": nil,
+			base + neo4jNodeCount:                  []byte("count\n10\n"),
+			base + neo4jEdgeCount:                  []byte("count\n20\n"),
 		},
 		Prefixes: map[string][]byte{
 			// Populated before the migration (which is what triggers the
@@ -478,6 +490,77 @@ func TestInstallRefusesUnknownImage(t *testing.T) {
 	}
 	if fake.Called(base + "exec -T app-db pg_dump") {
 		t.Fatalf("pg_dump should not run before the image availability check: %v", fake.Calls)
+	}
+}
+
+// TestInstallFallsBackToTheImageAlias covers a released CLI meeting a registry
+// where the image for its own version has not been built yet: the moving alias
+// for the same upstream release is the closest published thing.
+func TestInstallFallsBackToTheImageAlias(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	repo := "ghcr.io/x/bt"
+	versioned, alias := repo+":v9.6.0-bt0.2.0", repo+":v9.6.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+			psql + "select driver from database_switch limit 1":             []byte("pg\n"),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker manifest inspect " + alias:                              []byte("{}"),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d":                          nil,
+			base + "-f " + overridePath + " logs --no-color bloodhound":     []byte("BloodTrail driver active version=test\n"),
+		},
+		Errors: map[string]error{
+			"docker image inspect " + versioned:    errors.New("no such image"),
+			"docker manifest inspect " + versioned: errors.New("manifest unknown"),
+			"docker image inspect " + alias:        errors.New("no such image"),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+		},
+	}
+	var out bytes.Buffer
+	opts := Options{ComposeFile: composeFile, ImageRepo: repo, DriverVersion: "0.2.0", APIURL: api.URL, Yes: true,
+		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, opts); err != nil {
+		t.Fatalf("install failed: %v\noutput:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "falling back to "+alias) {
+		t.Fatalf("the fallback must be reported:\n%s", out.String())
+	}
+	override, _ := os.ReadFile(overridePath)
+	if !strings.Contains(string(override), "image: "+alias) {
+		t.Fatalf("override should install the alias, got %s", override)
+	}
+	m, err := manifest.Load(dir)
+	if err != nil || m.TargetImage != alias {
+		t.Fatalf("the manifest must record the image actually installed: %+v err=%v", m, err)
+	}
+}
+
+func TestInstallRefusesWhenTheCurlImageIsUnavailable(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "")
+	delete(fake.Outputs, "docker image inspect "+toolapi.CurlImage)
+	fake.Errors = map[string]error{
+		"docker image inspect " + toolapi.CurlImage: errors.New("no such image"),
+		"docker pull " + toolapi.CurlImage:          errors.New("no route to host"),
+	}
+
+	err := runMigrationInstall(t, dir, composeFile, image, fake)
+	if err == nil || !strings.Contains(err.Error(), toolapi.CurlImage) {
+		t.Fatalf("expected an error naming the curl image, got %v", err)
+	}
+	if fake.Called(base + "exec -T app-db pg_dump") {
+		t.Fatalf("nothing should be changed before the helper image is available:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 }
 

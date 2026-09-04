@@ -138,17 +138,46 @@ func composeHandle(runner dockerx.Runner, composeFile, projectDir string) docker
 	return c
 }
 
-// checkImageAvailable confirms the target image can be found locally or in a
-// registry without changing anything, so the check can run before the
-// backup. It discards both commands' stdout; only success/failure matters.
-func checkImageAvailable(ctx context.Context, runner dockerx.Runner, image string) error {
+// imageExists reports whether the image can be found locally or in a registry
+// without changing anything, so the check can run before the backup. It
+// discards both commands' stdout; only success/failure matters.
+func imageExists(ctx context.Context, runner dockerx.Runner, image string) bool {
 	if _, err := runner.Run(ctx, nil, "docker", "image", "inspect", image); err == nil {
+		return true
+	}
+	_, err := runner.Run(ctx, nil, "docker", "manifest", "inspect", image)
+	return err == nil
+}
+
+// resolveImage confirms the target image exists, falling back to the moving
+// alias for the same upstream release when the version-stamped tag is not
+// published. A CLI release always names an image built for its own version,
+// but the images are built on their own schedule, so that tag can lag behind.
+// The alias carries the newest driver build for the upstream release, which is
+// the closest thing to what was asked for.
+func resolveImage(ctx context.Context, deps Deps, target, alias string) (string, error) {
+	if imageExists(ctx, deps.Runner, target) {
+		return target, nil
+	}
+	if alias != "" && alias != target && imageExists(ctx, deps.Runner, alias) {
+		_, _ = fmt.Fprintf(deps.Out, "    %s is not published; falling back to %s, which holds the newest driver build for this release\n", target, alias)
+		return alias, nil
+	}
+	return "", fmt.Errorf("target image %s is neither present locally nor in a registry; build or pull it first", target)
+}
+
+// ensureCurlImage puts the throwaway container the tool API is reached through
+// on the host before anything is changed. It is otherwise pulled in the middle
+// of the install, so a host without registry access finds out only once the
+// migration is due, with the backup already taken.
+func ensureCurlImage(ctx context.Context, runner dockerx.Runner) error {
+	if _, err := runner.Run(ctx, nil, "docker", "image", "inspect", toolapi.CurlImage); err == nil {
 		return nil
 	}
-	if _, err := runner.Run(ctx, nil, "docker", "manifest", "inspect", image); err == nil {
-		return nil
+	if _, err := runner.Run(ctx, nil, "docker", "pull", toolapi.CurlImage); err != nil {
+		return fmt.Errorf("the migration reaches BloodHound's tool API through %s, which is not on this host and could not be pulled: %w", toolapi.CurlImage, err)
 	}
-	return fmt.Errorf("target image %s is neither present locally nor in a registry; build or pull it first", image)
+	return nil
 }
 
 // Install performs inventory, backup, migration if needed, image swap, driver switch and verification.
@@ -169,15 +198,17 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return err
 	}
-	target := opts.Image
+	// alias is the moving tag for this upstream release, used only as a
+	// fallback for a derived target: an explicit --image is taken literally.
+	target, alias := opts.Image, ""
 	if target == "" {
 		if inv.UpstreamTag == "" {
 			return fmt.Errorf("the deployment runs an unpinned or unrecognised image tag %q; set BLOODHOUND_TAG in .env or pass --image", inv.Image)
 		}
-		if opts.DriverVersion == "" {
-			target = opts.ImageRepo + ":" + inv.UpstreamTag
-		} else {
-			target = opts.ImageRepo + ":" + inv.UpstreamTag + "-bt" + opts.DriverVersion
+		alias = opts.ImageRepo + ":" + inv.UpstreamTag
+		target = alias
+		if opts.DriverVersion != "" {
+			target = alias + "-bt" + opts.DriverVersion
 		}
 	}
 	say("    project:        %s", inv.Config.Name)
@@ -194,8 +225,13 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	}
 
 	say("==> Checking target image availability")
-	if err := checkImageAvailable(ctx, deps.Runner, target); err != nil {
+	if target, err = resolveImage(ctx, deps, target, alias); err != nil {
 		return err
+	}
+	if inv.ActiveDriver == "neo4j" {
+		if err := ensureCurlImage(ctx, deps.Runner); err != nil {
+			return err
+		}
 	}
 
 	say("==> Backup")
