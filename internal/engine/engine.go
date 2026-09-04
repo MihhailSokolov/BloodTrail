@@ -112,6 +112,16 @@ func (e *Engine) NoteWrite() {
 	e.generation.Add(1)
 }
 
+// Generation returns the engine's current write-generation counter, the same
+// value NoteWrite advances and snapshotStillCurrent compares snapshots
+// against. It exists purely for test observability (the root package's
+// driver tests assert a mutating capability method bumps this on success and
+// leaves it unchanged on error) -- nothing in the engine's own serving path
+// needs to read it from outside the package.
+func (e *Engine) Generation() uint64 {
+	return e.generation.Load()
+}
+
 // Fresh returns the engine's current snapshot and whether it is fresh:
 // non-nil and stamped with the write-generation counter's current value.
 //

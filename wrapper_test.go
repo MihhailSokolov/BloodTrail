@@ -3,8 +3,12 @@
 package bloodtrail
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
 	"github.com/specterops/dawgs/util/size"
 
@@ -462,5 +466,101 @@ func TestWrappedTransactionRelationshipsReturnsRecordingWrapper(t *testing.T) {
 	}
 	if rrq.tx != tx {
 		t.Fatalf("recordingRelationshipQuery.tx = %p, want %p", rrq.tx, tx)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Driver: Run/WipeGraph/DeleteNodesByKinds/DeleteRelationshipsByKinds
+// -----------------------------------------------------------------------
+//
+// These four capability methods are promoted from *pg.Driver unmodified by
+// plain embedding, but embedding has no virtual dispatch: pg.Driver.Run and
+// pg.Driver.WipeGraph both call the *pg.Driver's own WriteTransaction
+// internally (a concrete, same-package call), and DeleteNodesByKinds /
+// DeleteRelationshipsByKinds use a raw pooled connection -- none of the four
+// ever reaches this package's own WriteTransaction override, so each is
+// overridden separately on *Driver (driver.go) to call engine.NoteWrite()
+// itself after a nil-error return.
+//
+// A live *pg.Driver is unavoidable here (Driver embeds the concrete type,
+// not an interface), so the success path -- NoteWrite() actually firing --
+// is not covered by these unit tests; it is covered by the engine-serving
+// integration suite instead (engine_serving_integration_test.go's
+// TestWipeGraphInvalidatesEngineSnapshot). What *is* cleanly testable
+// without a live database is the error path: unreachablePGDriver points at
+// an address nothing listens on, so every one of the four calls fails
+// quickly (observed at single-digit milliseconds; connection refused, not a
+// timeout) with a clean error rather than a panic, and NoteWrite() must not
+// fire when the embedded call itself failed.
+
+// unreachablePGDriver returns a *pg.Driver backed by a pool pointed at
+// 127.0.0.1 on a low port nothing listens on, so pool.Acquire (and
+// everything built on it) fails fast with "connection refused" -- no live
+// database required, and no risk of hanging the test suite.
+func unreachablePGDriver(t *testing.T) *pg.Driver {
+	t.Helper()
+
+	pool, err := pgxpool.New(context.Background(), "postgres://bloodtrail:bloodtrail@127.0.0.1:1/bloodtrail")
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	return pg.NewDriver(size.Gibibyte, pool)
+}
+
+// newDriverWithUnreachablePG returns a *Driver embedding unreachablePGDriver
+// and a disabledEngine, plus that same engine for the test to inspect via
+// its exported Generation() (added purely for this kind of test
+// observability -- see its doc comment).
+func newDriverWithUnreachablePG(t *testing.T) (*Driver, *engine.Engine) {
+	t.Helper()
+	eng := disabledEngine()
+	return &Driver{Driver: unreachablePGDriver(t), engine: eng}, eng
+}
+
+func TestDriverMutatingCapabilityMethodsDoNotBumpGenerationOnError(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(ctx context.Context, d *Driver) error
+	}{
+		{"Run", func(ctx context.Context, d *Driver) error {
+			return d.Run(ctx, "MATCH (n) RETURN n", nil)
+		}},
+		{"WipeGraph", func(ctx context.Context, d *Driver) error {
+			return d.WipeGraph(ctx, nil)
+		}},
+		{"DeleteNodesByKinds", func(ctx context.Context, d *Driver) error {
+			// Both kind sets empty still reaches execDelete (a genuine
+			// "delete every node" statement), which acquires a pooled
+			// connection -- so this still exercises a real network failure,
+			// not a short-circuited no-op.
+			return d.DeleteNodesByKinds(ctx, nil, nil)
+		}},
+		{"DeleteRelationshipsByKinds", func(ctx context.Context, d *Driver) error {
+			// A non-empty kind is required: DeleteRelationshipsByKinds
+			// short-circuits to a nil-error no-op for an empty kind slice
+			// without ever touching the pool, which would prove nothing
+			// about the error path.
+			return d.DeleteRelationshipsByKinds(ctx, graph.Kinds{graph.StringKind("Probe")})
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, eng := newDriverWithUnreachablePG(t)
+			before := eng.Generation()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if err := tc.call(ctx, d); err == nil {
+				t.Fatalf("%s against an unreachable PostgreSQL: expected an error, got nil", tc.name)
+			}
+
+			if after := eng.Generation(); after != before {
+				t.Fatalf("%s: generation changed from %d to %d after a failed call, want unchanged", tc.name, before, after)
+			}
+		})
 	}
 }

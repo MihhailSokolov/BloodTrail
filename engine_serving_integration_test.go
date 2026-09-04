@@ -388,3 +388,101 @@ func TestEngineOffDelegatesEverythingAndNeverServes(t *testing.T) {
 		t.Fatalf("engine served %d time(s) with %s=off, want 0\nlog:\n%s", n, bloodtrail.EnvEngine, buf.String())
 	}
 }
+
+// TestWipeGraphInvalidatesEngineSnapshot is Finding 1's integration
+// evidence: WipeGraph -- BloodHound's "clear database" action -- reaches
+// PostgreSQL through the embedded *pg.Driver's own internal WriteTransaction
+// call, never through Driver's own WriteTransaction override (embedding has
+// no virtual dispatch), so without Driver's own WipeGraph override
+// (driver.go) the engine would keep serving the pre-wipe snapshot
+// indefinitely. This mirrors TestEngineServesFromLiveDriver's phase 3 (a
+// plain WriteTransaction write) but for WipeGraph specifically: a query the
+// engine was serving before the wipe must not serve again (no new
+// servedMarker line) until the datapipe stamp advances and the poller
+// rebuilds, and the post-wipe result must be correct (empty) throughout.
+func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
+	dsn := os.Getenv(testPGEnv)
+	if dsn == "" {
+		t.Skipf("%s not set", testPGEnv)
+	}
+
+	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+	pool := openPool(t, ctx, dsn)
+	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
+
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	driver, ok := bt.(*bloodtrail.Driver)
+	if !ok {
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
+	}
+
+	schema := schemaFromDatasets(t)
+	if err := bt.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	ids := loadDatasets(t, ctx, bt)
+
+	createDatapipeStatusTable(t, pool)
+	// Registered after the bt Close defer above, so LIFO ordering runs this
+	// drop first -- while the pool is still open. See
+	// createDatapipeStatusTable's doc.
+	defer dropDatapipeStatusTable(t, pool)
+
+	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
+	// "running", not "idle": decideRebuild's rule (c) opportunistically
+	// rebuilds any stale snapshot whenever status == "idle", which would
+	// make the "no premature rebuild" assertion below vacuous.
+	insertDatapipeStatus(t, pool, "running", stamp1)
+
+	// Build the initial snapshot and confirm it actually serves before the
+	// wipe -- otherwise this test would prove nothing about invalidation.
+	waitForEngineServe(t, buf, 0, 5*time.Second, func() []string {
+		return shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"])
+	})
+
+	servedBefore := strings.Count(buf.String(), servedMarker)
+
+	if err := driver.WipeGraph(ctx, nil); err != nil {
+		t.Fatalf("WipeGraph: %v", err)
+	}
+
+	// Several poll intervals' worth of headroom for the poller to
+	// (incorrectly) rebuild if WipeGraph's NoteWrite override were missing
+	// or broken; status stays "running" so rule (c) must not fire on its
+	// own, and no query has been issued yet to reach TryAllShortestPaths at
+	// all -- this alone must not produce a new served line.
+	time.Sleep(10 * 50 * time.Millisecond)
+	if servedAfter := strings.Count(buf.String(), servedMarker); servedAfter != servedBefore {
+		t.Fatalf("served line count changed from %d to %d after WipeGraph with no datapipe stamp advance", servedBefore, servedAfter)
+	}
+
+	// A query issued now must fall through to PostgreSQL -- correctly empty,
+	// the graph having just been wiped -- rather than serve the stale
+	// pre-wipe snapshot, and must not itself log a new served line.
+	if got := shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"]); len(got) != 0 {
+		t.Fatalf("post-wipe query returned paths from a wiped graph: %v", got)
+	}
+	if servedAfter := strings.Count(buf.String(), servedMarker); servedAfter != servedBefore {
+		t.Fatalf("served line count changed from %d to %d after querying a post-wipe, still-stale snapshot", servedBefore, servedAfter)
+	}
+
+	// Advancing the stamp lets the poller rebuild against the now-empty
+	// graph; the engine resumes serving, correctly reporting zero paths.
+	stamp2 := stamp1.Add(time.Hour)
+	updateDatapipeStamp(t, pool, stamp2)
+
+	got := waitForEngineServe(t, buf, servedBefore, 5*time.Second, func() []string {
+		return shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"])
+	})
+	if len(got) != 0 {
+		t.Fatalf("post-rebuild query on a wiped graph returned paths: %v", got)
+	}
+}

@@ -31,12 +31,21 @@ const DriverName = "bloodtrail"
 // Version is stamped by the image build (see build/build-image.sh).
 var Version = "dev"
 
-// Driver wraps the PostgreSQL driver. Embedding the concrete type promotes every
-// method, including the capability methods BloodHound discovers through
-// graph.AsDriver (WipeGraph, DeleteNodesByKinds, DeleteRelationshipsByKinds,
-// KindMapper, OptimizeStorage). ReadTransaction, WriteTransaction,
-// BatchOperation and Close are overridden below to wire the in-memory engine
-// into the read/write/lifecycle path.
+// Driver wraps the PostgreSQL driver. Embedding the concrete type promotes
+// every method, including the capability methods BloodHound discovers
+// through graph.AsDriver (KindMapper, OptimizeStorage, and the four
+// overridden below). ReadTransaction, WriteTransaction, BatchOperation and
+// Close are overridden to wire the in-memory engine into the
+// read/write/lifecycle path; Run, WipeGraph, DeleteNodesByKinds and
+// DeleteRelationshipsByKinds are overridden separately because embedding has
+// no virtual dispatch -- each of those, called on the embedded *pg.Driver,
+// resolves internally to the *pg.Driver's own WriteTransaction (Run,
+// WipeGraph) or a raw pooled connection (the two Delete* methods), never to
+// this package's own WriteTransaction override, so without an explicit
+// override here none of the four would ever reach engine.NoteWrite().
+// OptimizeStorage and AssertSchema/kind assertion are deliberately left
+// promoted unmodified: neither one changes graph data the engine's snapshot
+// could go stale over.
 type Driver struct {
 	*pg.Driver
 	settings Settings
@@ -139,4 +148,57 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 func (d *Driver) Close(ctx context.Context) error {
 	d.engine.Stop()
 	return d.Driver.Close(ctx)
+}
+
+// Run executes query against the embedded PostgreSQL driver and notifies the
+// engine of the write once it completes successfully, the same way
+// WriteTransaction does. This override exists because embedding has no
+// virtual dispatch: pg.Driver.Run calls its own WriteTransaction internally
+// (a concrete, same-package call), which would never reach Driver's override
+// above and so would never invalidate the engine's snapshot without this.
+func (d *Driver) Run(ctx context.Context, query string, parameters map[string]any) error {
+	if err := d.Driver.Run(ctx, query, parameters); err != nil {
+		return err
+	}
+	d.engine.NoteWrite()
+	return nil
+}
+
+// WipeGraph truncates the graph through the embedded PostgreSQL driver and
+// notifies the engine of the write once it completes successfully. Without
+// this override -- BloodHound's "clear database" action -- the engine would
+// keep serving shortest paths through data PostgreSQL no longer has, until
+// an unrelated write or analysis run happened to advance the write
+// generation. See Run's doc for why an override is needed at all.
+func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
+	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
+		return err
+	}
+	d.engine.NoteWrite()
+	return nil
+}
+
+// DeleteNodesByKinds deletes nodes through the embedded PostgreSQL driver
+// (a raw pooled connection, not a WriteTransaction/BatchOperation call) and
+// notifies the engine of the write once it completes successfully. See
+// Run's doc for why an override is needed at all.
+func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
+	if err := d.Driver.DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
+		return err
+	}
+	d.engine.NoteWrite()
+	return nil
+}
+
+// DeleteRelationshipsByKinds deletes relationships through the embedded
+// PostgreSQL driver (a raw pooled connection, not a
+// WriteTransaction/BatchOperation call) and notifies the engine of the write
+// once it completes successfully. See Run's doc for why an override is
+// needed at all.
+func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kinds) error {
+	if err := d.Driver.DeleteRelationshipsByKinds(ctx, kinds); err != nil {
+		return err
+	}
+	d.engine.NoteWrite()
+	return nil
 }
