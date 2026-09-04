@@ -98,7 +98,26 @@ func (e *Engine) Fresh() (*snapshot.Snapshot, bool) {
 	if snap == nil {
 		return nil, false
 	}
-	return snap, snap.Generation == e.generation.Load()
+	return snap, e.snapshotStillCurrent(snap)
+}
+
+// snapshotStillCurrent reports whether snap's own Generation still matches
+// the engine's live write-generation counter.
+//
+// This is the predicate both Fresh (for whatever snapshot e.snap currently
+// holds) and TryAllShortestPaths' step-6 recheck (for the specific snapshot
+// pointer captured at step 1 and used for the entire computation) need --
+// and they are not interchangeable via a second Fresh() call: Fresh() reads
+// e.snap.Load() itself, so after a concurrent RebuildNow adopts a new
+// snapshot, a second Fresh() call judges that *different*, newly-adopted
+// snapshot instead of the one the caller actually served results from. A
+// new snapshot's Generation can coincidentally match the live counter (e.g.
+// generation 5->6, then RebuildNow adopts a snapshot stamped 6) even though
+// the original snap is now stale -- exactly the "results may mix two eras"
+// case the step-6 check exists to catch. Passing the captured snap
+// explicitly, rather than re-deriving it, is what makes the check correct.
+func (e *Engine) snapshotStillCurrent(snap *snapshot.Snapshot) bool {
+	return snap.Generation == e.generation.Load()
 }
 
 // rebuildTrigger is logged on every successful rebuild. RebuildNow's
@@ -185,9 +204,13 @@ const (
 //  4. traverse.AllShortestPaths.
 //  5. Hydrate the resulting dense paths into graph.Path values (decline
 //     "hydration" on error).
-//  6. Re-check freshness: a write that landed while steps 2-5 ran could mean
-//     the served result mixes two generations, so a generation change here
-//     declines the whole call even though the work already completed.
+//  6. Re-check that the exact snapshot captured at step 1 is still current
+//     (snapshotStillCurrent(snap), not a fresh Fresh() call): a write that
+//     landed while steps 2-5 ran could mean the served result mixes two
+//     generations, so a generation change on that specific snapshot declines
+//     the whole call even though the work already completed -- even if a
+//     concurrent RebuildNow has since adopted a newer snapshot that itself
+//     reports fresh.
 func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
 	start := time.Now()
 
@@ -252,7 +275,7 @@ func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, 
 		return nil, false
 	}
 
-	if _, stillFresh := e.Fresh(); !stillFresh {
+	if !e.snapshotStillCurrent(snap) {
 		e.decline(ctx, reasonStale, nil)
 		return nil, false
 	}
