@@ -32,6 +32,16 @@ import (
 // this test needs to recognize it in captured log output.
 const servedMarker = "bloodtrail: path engine served"
 
+// builderServedMarker is the exact message engine.TryNodeCount/
+// TryNodeFetchIDs/TryNodeFetchKinds (internal/engine/serve_builder.go's
+// servedOp) log at Debug whenever they serve a structural node query from
+// the in-memory snapshot -- duplicated here for the same reason servedMarker
+// is (only this test needs to recognize it in captured log output). It is
+// deliberately Debug, not Info, unlike servedMarker (servedOp's own doc), so
+// installLogCapture must enable Debug-level capture for this marker to ever
+// appear in buf.
+const builderServedMarker = "bloodtrail: builder engine served"
+
 // lockedBuffer is a bytes.Buffer safe for concurrent writes from the
 // engine's poller/serving goroutines and reads from the test goroutine.
 type lockedBuffer struct {
@@ -57,12 +67,18 @@ func (b *lockedBuffer) String() string {
 // Open reads slog.Default() exactly once, at construction time, to build
 // the engine's own Config.Log, so installing the capture afterward would
 // miss every line the engine itself logs.
+//
+// The handler is configured at Debug level (rather than the text handler's
+// own Info default) so builderServedMarker -- logged via DebugContext by the
+// structural node/relationship query path (servedOp's doc) -- is captured
+// alongside servedMarker's Info-level line; every existing caller that only
+// ever greps for servedMarker is unaffected by the extra Debug output.
 func installLogCapture(t *testing.T) *lockedBuffer {
 	t.Helper()
 
 	buf := &lockedBuffer{}
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
 	return buf
@@ -202,6 +218,72 @@ func waitForEngineServe(t *testing.T, buf *lockedBuffer, baseline int, deadline 
 	}
 	t.Fatalf("timed out after %s waiting for a new %q log line (count stayed at or below %d)\nlog:\n%s", deadline, servedMarker, baseline, buf.String())
 	return nil
+}
+
+// waitForBuilderServe is waitForEngineServe's counterpart for the
+// builder-serving path (Task 8's Nodes() wiring): it repeatedly calls query
+// until buf's captured log shows more builderServedMarker lines than
+// baseline, up to deadline, returning the result from the exact call that
+// observed a new marker. Generic over query's return type so it serves both
+// nodeCountByKind (int64) and nodeIDsByKind ([]graph.ID) callers without a
+// separate helper for each.
+func waitForBuilderServe[T any](t *testing.T, buf *lockedBuffer, baseline int, deadline time.Duration, query func() T) T {
+	t.Helper()
+
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		got := query()
+		if strings.Count(buf.String(), builderServedMarker) > baseline {
+			return got
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var zero T
+	t.Fatalf("timed out after %s waiting for a new %q log line (count stayed at or below %d)\nlog:\n%s", deadline, builderServedMarker, baseline, buf.String())
+	return zero
+}
+
+// nodeCountByKind runs tx.Nodes().Filter(query.Kind(query.Node(), kind)).
+// Count() -- the exact shape recordingNodeQuery.Count (node_query.go)
+// recognizes and may serve from the engine -- through db, returning the
+// result.
+func nodeCountByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) int64 {
+	t.Helper()
+
+	var count int64
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.Nodes().Filter(query.Kind(query.Node(), kind)).Count()
+		count = n
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Nodes().Filter(Kind(%s)).Count(): %v", kind, err)
+	}
+	return count
+}
+
+// nodeIDsByKind runs tx.Nodes().Filter(query.Kind(query.Node(), kind)).
+// FetchIDs() through db, returning the matching ids sorted ascending so two
+// calls' results (e.g. bt vs. the pg oracle) are directly comparable as
+// sets, matching TryNodeFetchIDs' own documented "compare as sets, not
+// sequences" contract (internal/engine/serve_builder.go).
+func nodeIDsByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) []graph.ID {
+	t.Helper()
+
+	var ids []graph.ID
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		return tx.Nodes().Filter(query.Kind(query.Node(), kind)).FetchIDs(func(cursor graph.Cursor[graph.ID]) error {
+			for id := range cursor.Chan() {
+				ids = append(ids, id)
+			}
+			return cursor.Error()
+		})
+	})
+	if err != nil {
+		t.Fatalf("Nodes().Filter(Kind(%s)).FetchIDs(): %v", kind, err)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // TestEngineServesFromLiveDriver is Task 13's core evidence: opened through
@@ -587,5 +669,110 @@ func TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly(t *testing.T)
 			t.Fatalf("feeder goroutines leaked: goroutines before=%d after=%d (delta %d over %d attempts)", before, after, after-before, attempts)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestNodeQueryServesFromLiveDriver is Task 8's core evidence: opened
+// through dawgs.Open exactly like TestEngineServesFromLiveDriver, a
+// structural Nodes() query -- the shape BloodHound's builder queries use for
+// e.g. FetchNodeIDsByKind, Filter(query.Kind(query.Node(), kind)) -- must be
+// served from the in-memory engine (recordingNodeQuery, node_query.go) once
+// a snapshot exists, agree with the pg-driver oracle on both Count() and the
+// FetchIDs() set, and a query recognize.FromNodeCriteria rejects outright
+// (a property lookup, never a shape FromNodeCriteria models -- see its own
+// doc) must still delegate transparently to PostgreSQL and answer correctly.
+func TestNodeQueryServesFromLiveDriver(t *testing.T) {
+	dsn := os.Getenv(testPGEnv)
+	if dsn == "" {
+		t.Skipf("%s not set", testPGEnv)
+	}
+
+	// Must be set before dawgs.Open: SettingsFromEnv and the engine's
+	// captured Config.Log are both read exactly once, at Open() time.
+	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+	pool := openPool(t, ctx, dsn)
+	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
+
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	schema := schemaFromDatasets(t)
+	if err := bt.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	loadDatasets(t, ctx, bt)
+
+	// A plain pg driver on the same pool and data is the oracle.
+	oracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = oracle.Close(ctx) }()
+	if err := oracle.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema on pg: %v", err)
+	}
+
+	createDatapipeStatusTable(t, pool)
+	// Registered after the bt/oracle Close defers above, so LIFO ordering
+	// runs this drop first -- while the pool they share is still open. See
+	// createDatapipeStatusTable's doc.
+	defer dropDatapipeStatusTable(t, pool)
+
+	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
+	insertDatapipeStatus(t, pool, "running", stamp1)
+
+	// TraversalNode is carried by every one of traversal_shapes.json's 45
+	// nodes (testdata/dawgs/traversal_shapes.json), so a bare kind filter
+	// against it gives an unambiguous, easy-to-verify answer.
+	kind := graph.StringKind("TraversalNode")
+
+	// --- Phase 1: Count(), waiting for the engine's first build.
+	gotCount := waitForBuilderServe(t, buf, 0, 5*time.Second, func() int64 {
+		return nodeCountByKind(t, ctx, bt, kind)
+	})
+	wantCount := nodeCountByKind(t, ctx, oracle, kind)
+	if wantCount == 0 {
+		t.Fatalf("oracle returned zero nodes for kind %s; the fixture or kind name is wrong", kind)
+	}
+	if gotCount != wantCount {
+		t.Fatalf("Count() = %d, want %d (oracle)", gotCount, wantCount)
+	}
+
+	// --- Phase 2: FetchIDs() set-equality (order is not a shared contract;
+	// see TryNodeFetchIDs' doc).
+	gotIDs := nodeIDsByKind(t, ctx, bt, kind)
+	wantIDs := nodeIDsByKind(t, ctx, oracle, kind)
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("FetchIDs() returned %d ids, want %d\n got: %v\nwant: %v", len(gotIDs), len(wantIDs), gotIDs, wantIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("FetchIDs() sets differ\n got: %v\nwant: %v", gotIDs, wantIDs)
+		}
+	}
+
+	// --- Phase 3: a property-filtered query -- recognize.FromNodeCriteria
+	// always rejects a PropertyLookup conjunct (its doc) -- must still
+	// delegate transparently through recordingNodeQuery.Count to PostgreSQL
+	// and answer correctly, proving Filter's recording never interferes with
+	// an unrecognized shape. adcs_fanout.json's Group node "n" is the only
+	// node in either fixture carrying an "objectid" property.
+	const wantObjectID = "S-1-5-21-2643190041-1319121918-239771340-513"
+	var gotObjectIDCount int64
+	if err := bt.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.Nodes().Filter(query.Equals(query.NodeProperty("objectid"), wantObjectID)).Count()
+		gotObjectIDCount = n
+		return err
+	}); err != nil {
+		t.Fatalf("property-filtered Count(): %v", err)
+	}
+	if gotObjectIDCount != 1 {
+		t.Fatalf("property-filtered Count() = %d, want 1", gotObjectIDCount)
 	}
 }

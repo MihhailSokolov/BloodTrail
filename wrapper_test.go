@@ -32,11 +32,13 @@ type mockQueryCall struct {
 }
 
 // mockTransaction is a minimal graph.Transaction whose Relationships()
-// returns a configurable mockRelationshipQuery and whose Query records every
-// call and returns a fixed result, so wrapper_test.go can assert on both
-// without a live database.
+// returns a configurable mockRelationshipQuery, whose Nodes() returns a
+// configurable mockNodeQuery, and whose Query records every call and returns
+// a fixed result, so wrapper_test.go can assert on all three without a live
+// database.
 type mockTransaction struct {
-	relQuery *mockRelationshipQuery
+	relQuery  *mockRelationshipQuery
+	nodeQuery *mockNodeQuery
 
 	queryCalls  []mockQueryCall
 	queryResult graph.Result
@@ -58,7 +60,7 @@ func (m *mockTransaction) UpdateNode(*graph.Node) error {
 }
 
 func (m *mockTransaction) Nodes() graph.NodeQuery {
-	panic("mockTransaction: Nodes not implemented")
+	return m.nodeQuery
 }
 
 func (m *mockTransaction) CreateRelationshipByIDs(graph.ID, graph.ID, graph.Kind, *graph.Properties) (*graph.Relationship, error) {
@@ -196,6 +198,120 @@ func (m *mockRelationshipQuery) FetchKinds(func(cursor graph.Cursor[graph.Relati
 }
 
 var _ graph.RelationshipQuery = (*mockRelationshipQuery)(nil)
+
+// emptyIDCursor is a graph.Cursor[graph.ID] with nothing to yield, used as
+// the cursor mockNodeQuery.FetchIDs hands to its delegate -- these tests only
+// care that the inner FetchIDs was reached, not about the ids it would
+// report (mirrors emptyPathCursor).
+type emptyIDCursor struct{}
+
+func (emptyIDCursor) Error() error { return nil }
+func (emptyIDCursor) Close()       {}
+func (emptyIDCursor) Chan() chan graph.ID {
+	ch := make(chan graph.ID)
+	close(ch)
+	return ch
+}
+
+var _ graph.Cursor[graph.ID] = emptyIDCursor{}
+
+// emptyKindsCursor is a graph.Cursor[graph.KindsResult] with nothing to
+// yield, used as the cursor mockNodeQuery.FetchKinds hands to its delegate
+// (mirrors emptyPathCursor/emptyIDCursor).
+type emptyKindsCursor struct{}
+
+func (emptyKindsCursor) Error() error { return nil }
+func (emptyKindsCursor) Close()       {}
+func (emptyKindsCursor) Chan() chan graph.KindsResult {
+	ch := make(chan graph.KindsResult)
+	close(ch)
+	return ch
+}
+
+var _ graph.Cursor[graph.KindsResult] = emptyKindsCursor{}
+
+// mockNodeQuery is a minimal graph.NodeQuery recording every call
+// recordingNodeQuery might delegate to (mirrors mockRelationshipQuery).
+type mockNodeQuery struct {
+	filterCalls  []graph.Criteria
+	filterfCalls int
+	orderByCalls int
+	offsetCalls  int
+	limitCalls   int
+	updateCalls  int
+	deleteCalls  int
+	queryCalls   int
+
+	countCalls      int
+	fetchIDsCalls   int
+	fetchKindsCalls int
+}
+
+func (m *mockNodeQuery) Filter(criteria graph.Criteria) graph.NodeQuery {
+	m.filterCalls = append(m.filterCalls, criteria)
+	return m
+}
+
+func (m *mockNodeQuery) Filterf(criteriaDelegate graph.CriteriaProvider) graph.NodeQuery {
+	m.filterfCalls++
+	m.filterCalls = append(m.filterCalls, criteriaDelegate())
+	return m
+}
+
+func (m *mockNodeQuery) Query(func(graph.Result) error, ...graph.Criteria) error {
+	m.queryCalls++
+	return nil
+}
+
+func (m *mockNodeQuery) Delete() error {
+	m.deleteCalls++
+	return nil
+}
+
+func (m *mockNodeQuery) Update(*graph.Properties) error {
+	m.updateCalls++
+	return nil
+}
+
+func (m *mockNodeQuery) OrderBy(...graph.Criteria) graph.NodeQuery {
+	m.orderByCalls++
+	return m
+}
+
+func (m *mockNodeQuery) Offset(int) graph.NodeQuery {
+	m.offsetCalls++
+	return m
+}
+
+func (m *mockNodeQuery) Limit(int) graph.NodeQuery {
+	m.limitCalls++
+	return m
+}
+
+func (m *mockNodeQuery) Count() (int64, error) {
+	m.countCalls++
+	return 0, nil
+}
+
+func (m *mockNodeQuery) First() (*graph.Node, error) {
+	panic("mockNodeQuery: First not implemented")
+}
+
+func (m *mockNodeQuery) Fetch(func(graph.Cursor[*graph.Node]) error, ...graph.Criteria) error {
+	panic("mockNodeQuery: Fetch not implemented")
+}
+
+func (m *mockNodeQuery) FetchIDs(delegate func(cursor graph.Cursor[graph.ID]) error) error {
+	m.fetchIDsCalls++
+	return delegate(emptyIDCursor{})
+}
+
+func (m *mockNodeQuery) FetchKinds(delegate func(cursor graph.Cursor[graph.KindsResult]) error) error {
+	m.fetchKindsCalls++
+	return delegate(emptyKindsCursor{})
+}
+
+var _ graph.NodeQuery = (*mockNodeQuery)(nil)
 
 // -----------------------------------------------------------------------
 // Test helpers
@@ -466,6 +582,261 @@ func TestWrappedTransactionRelationshipsReturnsRecordingWrapper(t *testing.T) {
 	}
 	if rrq.tx != tx {
 		t.Fatalf("recordingRelationshipQuery.tx = %p, want %p", rrq.tx, tx)
+	}
+}
+
+// -----------------------------------------------------------------------
+// recordingNodeQuery
+// -----------------------------------------------------------------------
+
+func TestRecordingNodeQueryFilterRecordsAndDelegates(t *testing.T) {
+	innerNode := &mockNodeQuery{}
+	tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+
+	criteria := graph.Criteria("kind-equals")
+	got := tx.Nodes().Filter(criteria)
+
+	rnq, ok := got.(*recordingNodeQuery)
+	if !ok {
+		t.Fatalf("Filter returned %T, want *recordingNodeQuery", got)
+	}
+	if len(rnq.criteria) != 1 || rnq.criteria[0] != criteria {
+		t.Fatalf("recorded criteria = %v, want [%v]", rnq.criteria, criteria)
+	}
+	if len(innerNode.filterCalls) != 1 || innerNode.filterCalls[0] != criteria {
+		t.Fatalf("Filter did not delegate to the inner query: %v", innerNode.filterCalls)
+	}
+}
+
+func TestRecordingNodeQueryFilterfRecordsAndPassesProviderThrough(t *testing.T) {
+	innerNode := &mockNodeQuery{}
+	tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+
+	criteria := graph.Criteria("id-in")
+	providerCalls := 0
+	provider := func() graph.Criteria {
+		providerCalls++
+		return criteria
+	}
+
+	got := tx.Nodes().Filterf(provider)
+
+	rnq, ok := got.(*recordingNodeQuery)
+	if !ok {
+		t.Fatalf("Filterf returned %T, want *recordingNodeQuery", got)
+	}
+	if len(rnq.criteria) != 1 || rnq.criteria[0] != criteria {
+		t.Fatalf("recorded criteria = %v, want [%v]", rnq.criteria, criteria)
+	}
+	if innerNode.filterfCalls != 1 {
+		t.Fatalf("Filterf did not delegate to the inner query: filterfCalls = %d", innerNode.filterfCalls)
+	}
+	// Called once by recordingNodeQuery.Filterf itself (to record the
+	// result) and once more inside the inner mock's own Filterf (which also
+	// calls the delegate it was handed) -- proving the *same* provider was
+	// passed through rather than a closure wrapping the already-observed
+	// value.
+	if providerCalls != 2 {
+		t.Fatalf("provider called %d times, want exactly 2 (record + inner delegate)", providerCalls)
+	}
+}
+
+func TestRecordingNodeQueryOrderByOffsetLimitTaintAndDelegate(t *testing.T) {
+	cases := []struct {
+		name  string
+		apply func(graph.NodeQuery) graph.NodeQuery
+		check func(*mockNodeQuery) int
+	}{
+		{"OrderBy", func(nq graph.NodeQuery) graph.NodeQuery { return nq.OrderBy(graph.Criteria("x")) }, func(m *mockNodeQuery) int { return m.orderByCalls }},
+		{"Offset", func(nq graph.NodeQuery) graph.NodeQuery { return nq.Offset(5) }, func(m *mockNodeQuery) int { return m.offsetCalls }},
+		{"Limit", func(nq graph.NodeQuery) graph.NodeQuery { return nq.Limit(5) }, func(m *mockNodeQuery) int { return m.limitCalls }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			innerNode := &mockNodeQuery{}
+			tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+
+			// A single recognizable-shaped criteria recorded first, so that
+			// absent tainting, Count/FetchIDs/FetchKinds would at least
+			// attempt to consult the engine.
+			nq := tx.Nodes().Filter(graph.Criteria("kind-equals"))
+			nq = tc.apply(nq)
+
+			rnq, ok := nq.(*recordingNodeQuery)
+			if !ok {
+				t.Fatalf("%s returned %T, want *recordingNodeQuery", tc.name, nq)
+			}
+			if !rnq.tainted {
+				t.Fatalf("%s did not taint the query", tc.name)
+			}
+			if got := tc.check(innerNode); got != 1 {
+				t.Fatalf("%s did not delegate to the inner query (calls = %d)", tc.name, got)
+			}
+
+			// Count/FetchIDs/FetchKinds must go straight to the inner query
+			// once tainted, regardless of the recorded criteria.
+			if _, err := nq.Count(); err != nil {
+				t.Fatalf("Count: unexpected error: %v", err)
+			}
+			if innerNode.countCalls != 1 {
+				t.Fatalf("Count did not delegate to the inner query after tainting")
+			}
+			if err := nq.FetchIDs(func(graph.Cursor[graph.ID]) error { return nil }); err != nil {
+				t.Fatalf("FetchIDs: unexpected error: %v", err)
+			}
+			if innerNode.fetchIDsCalls != 1 {
+				t.Fatalf("FetchIDs did not delegate to the inner query after tainting")
+			}
+			if err := nq.FetchKinds(func(graph.Cursor[graph.KindsResult]) error { return nil }); err != nil {
+				t.Fatalf("FetchKinds: unexpected error: %v", err)
+			}
+			if innerNode.fetchKindsCalls != 1 {
+				t.Fatalf("FetchKinds did not delegate to the inner query after tainting")
+			}
+		})
+	}
+}
+
+func TestRecordingNodeQueryUpdateDeleteQueryTaint(t *testing.T) {
+	t.Run("Update", func(t *testing.T) {
+		innerNode := &mockNodeQuery{}
+		tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+		nq := tx.Nodes()
+		if err := nq.Update(graph.NewProperties()); err != nil {
+			t.Fatalf("Update: unexpected error: %v", err)
+		}
+		rnq := nq.(*recordingNodeQuery)
+		if !rnq.tainted {
+			t.Fatalf("Update did not taint the query")
+		}
+		if innerNode.updateCalls != 1 {
+			t.Fatalf("Update did not delegate to the inner query")
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		innerNode := &mockNodeQuery{}
+		tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+		nq := tx.Nodes()
+		if err := nq.Delete(); err != nil {
+			t.Fatalf("Delete: unexpected error: %v", err)
+		}
+		rnq := nq.(*recordingNodeQuery)
+		if !rnq.tainted {
+			t.Fatalf("Delete did not taint the query")
+		}
+		if innerNode.deleteCalls != 1 {
+			t.Fatalf("Delete did not delegate to the inner query")
+		}
+	})
+
+	t.Run("Query", func(t *testing.T) {
+		innerNode := &mockNodeQuery{}
+		tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+		nq := tx.Nodes()
+		if err := nq.Query(func(graph.Result) error { return nil }); err != nil {
+			t.Fatalf("Query: unexpected error: %v", err)
+		}
+		rnq := nq.(*recordingNodeQuery)
+		if !rnq.tainted {
+			t.Fatalf("Query did not taint the query")
+		}
+		if innerNode.queryCalls != 1 {
+			t.Fatalf("Query did not delegate to the inner query")
+		}
+	})
+}
+
+func TestRecordingNodeQueryCountFetchIDsFetchKindsFallThroughWithoutASingleRecognizedCriteria(t *testing.T) {
+	t.Run("no criteria", func(t *testing.T) {
+		innerNode := &mockNodeQuery{}
+		tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+		if _, err := tx.Nodes().Count(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if innerNode.countCalls != 1 {
+			t.Fatalf("expected the inner query's Count to run")
+		}
+	})
+
+	t.Run("more than one criteria", func(t *testing.T) {
+		innerNode := &mockNodeQuery{}
+		tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+		nq := tx.Nodes().Filter(graph.Criteria("a")).Filter(graph.Criteria("b"))
+		if _, err := nq.Count(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if innerNode.countCalls != 1 {
+			t.Fatalf("expected the inner query's Count to run")
+		}
+	})
+
+	t.Run("unrecognized single criteria", func(t *testing.T) {
+		innerNode := &mockNodeQuery{}
+		tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+		// A plain string never satisfies recognize.FromNodeCriteria's type
+		// assertion against cypher.Expression.
+		nq := tx.Nodes().Filter(graph.Criteria("not-an-expression"))
+		if _, err := nq.Count(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if innerNode.countCalls != 1 {
+			t.Fatalf("expected the inner query's Count to run")
+		}
+	})
+}
+
+func TestRecordingNodeQueryFetchIDsFetchKindsDeclinedByEngineFallThrough(t *testing.T) {
+	// A single criteria value the engine would decline (disabledEngine always
+	// declines) still must fall through cleanly to the inner query.
+	innerNode := &mockNodeQuery{}
+	tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+	nq := tx.Nodes().Filter(graph.Criteria("kind-equals"))
+
+	if err := nq.FetchIDs(func(graph.Cursor[graph.ID]) error { return nil }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if innerNode.fetchIDsCalls != 1 {
+		t.Fatalf("expected the inner query's FetchIDs to run when the engine declines")
+	}
+
+	if err := nq.FetchKinds(func(graph.Cursor[graph.KindsResult]) error { return nil }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if innerNode.fetchKindsCalls != 1 {
+		t.Fatalf("expected the inner query's FetchKinds to run when the engine declines")
+	}
+}
+
+func TestRecordingNodeQueryDeclinedTransactionFallsThrough(t *testing.T) {
+	// A declined transaction (WithGraph's contract; see wrappedTransaction's
+	// own doc) must skip the engine even for an otherwise-recognizable,
+	// untainted, single-criteria query.
+	innerNode := &mockNodeQuery{}
+	tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+	retargeted := tx.WithGraph(graph.Graph{Name: "other"}).(*wrappedTransaction)
+
+	nq := retargeted.Nodes().Filter(graph.Criteria("kind-equals"))
+	if _, err := nq.Count(); err != nil {
+		t.Fatalf("Count: unexpected error: %v", err)
+	}
+	if innerNode.countCalls != 1 {
+		t.Fatalf("expected the inner query's Count to run on a declined transaction")
+	}
+}
+
+func TestWrappedTransactionNodesReturnsRecordingWrapper(t *testing.T) {
+	innerNode := &mockNodeQuery{}
+	tx := newWrappedTransaction(&mockTransaction{nodeQuery: innerNode})
+
+	nq := tx.Nodes()
+	rnq, ok := nq.(*recordingNodeQuery)
+	if !ok {
+		t.Fatalf("Nodes() returned %T, want *recordingNodeQuery", nq)
+	}
+	if rnq.tx != tx {
+		t.Fatalf("recordingNodeQuery.tx = %p, want %p", rnq.tx, tx)
 	}
 }
 

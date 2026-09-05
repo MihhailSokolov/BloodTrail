@@ -15,8 +15,8 @@ import (
 // of PostgreSQL, wherever engine.TryCypher/TryAllShortestPaths recognizes
 // and can serve the shape.
 //
-// graph.Transaction is embedded, so the eight methods this file does not
-// override (CreateNode, UpdateNode, Nodes, CreateRelationshipByIDs,
+// graph.Transaction is embedded, so the seven methods this file does not
+// override (CreateNode, UpdateNode, CreateRelationshipByIDs,
 // UpdateRelationship, Raw, Commit, GraphQueryMemoryLimit) are promoted
 // straight through to the inner transaction unchanged.
 //
@@ -57,6 +57,16 @@ func (t *wrappedTransaction) Relationships() graph.RelationshipQuery {
 	return &recordingRelationshipQuery{
 		RelationshipQuery: t.Transaction.Relationships(),
 		tx:                t,
+	}
+}
+
+// Nodes returns a recordingNodeQuery wrapping the inner transaction's own
+// NodeQuery, so a subsequent Count, FetchIDs, or FetchKinds call has a chance
+// to be served from the engine.
+func (t *wrappedTransaction) Nodes() graph.NodeQuery {
+	return &recordingNodeQuery{
+		NodeQuery: t.Transaction.Nodes(),
+		tx:        t,
 	}
 }
 
