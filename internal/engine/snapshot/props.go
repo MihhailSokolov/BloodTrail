@@ -119,7 +119,8 @@ func (p *PropStore) NodeMap(n NodeID) map[string]any {
 // NodeByObjectID returns the node whose `objectid` property has the exact
 // string value v, and whether one was found. Only nodes whose objectid
 // value is a JSON string are indexed; a numeric or otherwise non-string
-// objectid never matches.
+// objectid never matches. When multiple nodes carry the same string objectid,
+// the one with the highest NodeID (the later-inserted node) wins the index.
 func (p *PropStore) NodeByObjectID(v string) (NodeID, bool) {
 	id, ok := p.objectIndex[v]
 	return id, ok

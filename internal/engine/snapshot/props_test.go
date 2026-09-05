@@ -193,3 +193,27 @@ func TestPropStoreNodeByObjectIDIgnoresNonStringValues(t *testing.T) {
 		t.Fatal(`NodeByObjectID("12345") found for a numeric objectid, want not found`)
 	}
 }
+
+// TestPropStoreNodeByObjectIDDuplicateTieBreak checks that when two nodes
+// share the same string objectid value, the index resolves to the node with
+// the higher NodeID (the later-inserted node), per the strict ascending-id
+// contract of AddNode and the single-assignment-wins semantics of the
+// objectIndex map during buildPropStore's iteration.
+func TestPropStoreNodeByObjectIDDuplicateTieBreak(t *testing.T) {
+	b := NewBuilder(1)
+	// Both nodes get the same objectid string value
+	mustAddNodeJSON(t, b, 10, []KindID{1}, `{"objectid":"shared-id"}`)
+	mustAddNodeJSON(t, b, 20, []KindID{1}, `{"objectid":"shared-id"}`)
+	s, err := b.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The later-inserted node (NodeID 1, database ID 20) should win
+	id, ok := s.Props.NodeByObjectID("shared-id")
+	if !ok {
+		t.Fatal(`NodeByObjectID("shared-id") not found, want found`)
+	}
+	if id != 1 {
+		t.Fatalf(`NodeByObjectID("shared-id") = %d, want 1 (the later-inserted node)`, id)
+	}
+}
