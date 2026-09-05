@@ -132,20 +132,29 @@ func TestPollerAnalyzingPhaseRebuild(t *testing.T) {
 		t.Fatalf("Fresh() reports stale right after the startup build")
 	}
 
-	// A write invalidates the snapshot the poller just adopted, and the
-	// datapipe status flips to analyzing.
-	eng.NoteWrite(nil)
+	// The datapipe status flips to analyzing, and a write invalidates the
+	// snapshot the poller just adopted. The status flip runs FIRST (a
+	// synchronous Exec) and only then the write: a poller tick landing
+	// between the two statements then observes status=="analyzing" with the
+	// snapshot still fresh -- a combination no decideRebuild rule fires on --
+	// rather than the transient "still-idle + already-stale" state that would
+	// let rule (c) (idle_stale) consume this rebuild under the wrong trigger
+	// label. This is the same ordering the sibling TestPollerAnalyzingCapAndReset
+	// relies on; reversing it reintroduces that race.
 	if _, err := pool.Exec(ctx,
 		`UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`,
 	); err != nil {
 		t.Fatalf("update datapipe_status: %v", err)
 	}
+	eng.NoteWrite(nil)
 
 	// Rule (d) must fire even though the datapipe is analyzing rather than
-	// idle: wait for a second real LoadSnapshot attempt, then confirm both
-	// that the snapshot is fresh again and that the rebuild which got us
-	// there was actually labeled triggerAnalyzing.
-	waitForAttempts(t, eng, 2, 2*time.Second)
+	// idle: wait for the triggerAnalyzing rebuild itself (keyed off the same
+	// per-trigger observable the assertion below checks, not the coarser
+	// rebuildAttempts count -- see TestPollerAnalyzingCapAndReset for why
+	// waiting on the exact trigger avoids observing a rebuild fired under a
+	// different rule), then confirm the snapshot is fresh again.
+	waitForTriggerCount(t, handler, triggerAnalyzing, 1, 2*time.Second)
 	if _, fresh := eng.Fresh(); !fresh {
 		t.Fatalf("Fresh() reports stale after rule (d) should have rebuilt during analyzing")
 	}
