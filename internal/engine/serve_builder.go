@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/specterops/dawgs/graph"
@@ -18,16 +19,21 @@ import (
 // 7's rel-query siblings), alongside the reason* consts declared in
 // engine.go, which TryAllShortestPaths/TryCypher continue to use unchanged.
 const (
-	// reasonNoKindConstraint fires when a recognize.NodeSpec (or RelSpec)
-	// carries zero kind constraints -- including one that constrains only
-	// by id(): a spec's kind-scoped staleness proof (see resolveNodeSpec's
-	// doc) is built entirely from ConstraintKinds(), so a spec with no
-	// constraints at all has nothing to check freshness against and is
-	// declined outright rather than served on a freshness guarantee that
-	// cannot be established. An id-only node query is expected to be rare
-	// enough in practice (BloodHound's builder queries always pair id()
-	// filters with a kind filter) that delegating it to PostgreSQL costs
-	// little.
+	// reasonNoKindConstraint fires when a recognize.NodeSpec carries zero
+	// kind constraints -- including one that constrains only by id(): a
+	// spec's kind-scoped staleness proof (see resolveNodeSpec's doc) is
+	// built entirely from ConstraintKinds(), so a spec with no constraints
+	// at all has nothing to check freshness against and is declined
+	// outright rather than served on a freshness guarantee that cannot be
+	// established. An id-only node query is expected to be rare enough in
+	// practice (BloodHound's builder queries always pair id() filters with a
+	// kind filter) that delegating it to PostgreSQL costs little.
+	//
+	// recognize.RelSpec has no equivalent minimum (see resolveRelSpec's
+	// doc): a RelSpec's freshness proof falls back to "every recorded kind
+	// entry must be clean" whenever a dimension is left unconstrained
+	// (edgeKindsClean/nodeKindsClean's own empty-kinds contract), which is
+	// always establishable, so this reason never fires for one.
 	reasonNoKindConstraint = "no_kind_constraint"
 
 	// reasonKindStale fires when a spec's own constrained kinds are not
@@ -36,14 +42,41 @@ const (
 	// landed, after the snapshot was built, that touched a kind this spec's
 	// answer depends on.
 	reasonKindStale = "kind_stale"
+
+	// reasonUnsupportedOrder is TryRelQueryRows-only: orderByEdgeID was
+	// requested but spec anchors neither endpoint (spec.StartIDs and
+	// spec.EndIDs both nil), so there is no anchored scan to gather and sort
+	// -- see resolveRelSpec/TryRelQueryRows' doc for why ordering is only
+	// offered for an anchored scan (a full scan's match set can be the
+	// entire edge set, which upstream never asks to sort this way; see
+	// recognize.OrderIsEdgeIDAscending's callers).
+	reasonUnsupportedOrder = "unsupported_order"
+
+	// reasonProjectionMismatch is TryRelQueryRows-only: proj names a
+	// direction (recognize.ProjectionStepOutbound/StepInbound) whose
+	// anchored side isn't actually anchored by spec -- ProjectionStepOutbound
+	// requires spec.StartIDs non-nil (the far/varying side is the end), and
+	// ProjectionStepInbound requires spec.EndIDs non-nil (the far side is
+	// the start). Both real upstream callers (shallowFetchRelationships)
+	// only ever build a step projection from a single known segment.Node,
+	// which always compiles to exactly one endpoint's id() being fixed, so
+	// this should never fire against a genuinely upstream-shaped query --
+	// it exists as a defensive decline for a RelSpec that doesn't match that
+	// assumption, rather than emitting rows keyed off the wrong endpoint.
+	reasonProjectionMismatch = "projection_mismatch"
 )
 
 // Operation names for the builder-serving path's "op" attr, shared by both
 // servedOp's success log line and declineOp's failure one.
 const (
-	opNodeCount = "node_count"
-	opNodeIDs   = "node_ids"
-	opNodeKinds = "node_kinds"
+	opNodeCount  = "node_count"
+	opNodeIDs    = "node_ids"
+	opNodeKinds  = "node_kinds"
+	opRelCount   = "rel_count"
+	opRelIDs     = "rel_ids"
+	opRelTriples = "rel_triples"
+	opRelKinds   = "rel_kinds"
+	opRelRows    = "rel_rows"
 )
 
 // declineOp is decline's builder-serving counterpart: TryNodeCount,
@@ -171,24 +204,18 @@ func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.
 		return nil, nil, false
 	}
 
-	constraintBitmaps := make([]*snapshot.Bitset, 0, len(spec.Constraints))
-	for _, constraint := range spec.Constraints {
-		bm, err := matchConstraint(ctx, e.mapKind, snap, constraint)
-		if err != nil {
-			e.declineOp(ctx, op, reasonError, err)
-			return nil, nil, false
-		}
-		constraintBitmaps = append(constraintBitmaps, bm)
+	// spec.Constraints is already known non-empty (checked above), so
+	// resolveConstraintBitmaps' nil-means-unconstrained result never applies
+	// here -- matches is always a real bitmap, never "everything passes".
+	matches, err := e.resolveConstraintBitmaps(ctx, snap, spec.Constraints)
+	if err != nil {
+		e.declineOp(ctx, op, reasonError, err)
+		return nil, nil, false
 	}
 
 	if !e.allNodesClean(snap.Generation) || !e.nodeKindsClean(snap.Generation, spec.ConstraintKinds()) {
 		e.declineOp(ctx, op, reasonKindStale, nil)
 		return nil, nil, false
-	}
-
-	matches := constraintBitmaps[0]
-	if len(constraintBitmaps) > 1 {
-		matches = intersectBitmaps(snap.NodeCount(), constraintBitmaps)
 	}
 
 	if spec.IDs != nil {
@@ -234,6 +261,42 @@ func matchConstraint(ctx context.Context, mapKind func(context.Context, graph.Ki
 	default:
 		return unionBitmaps(snap.NodeCount(), bitmaps), nil
 	}
+}
+
+// resolveConstraintBitmaps maps every recognize.KindConstraint in constraints
+// to its own bitmap via matchConstraint and intersects them together --
+// Cypher's AND semantics for multiple conjuncts naming the same variable
+// (resolveNodeSpec's step 5 doc, generalized). It is the shared
+// constraint-resolution step behind resolveNodeSpec (Task 6, one endpoint:
+// the bare node variable "n") and resolveRelSpec (Task 7, two independent
+// endpoints: "s" and "e", each calling this once with its own Start/
+// EndConstraints).
+//
+// A nil result (with nil error) means constraints itself was empty -- "this
+// endpoint carries no kind constraint at all". Every caller must treat that
+// as "everything passes" when combining it with other filters, never as
+// "matches nothing" the way an actual zero-bit bitmap would; resolveNodeSpec
+// never sees this case (it declines reasonNoKindConstraint before calling in
+// first place when spec.Constraints is empty), but resolveRelSpec relies on
+// it directly, since RelSpec's Start/EndConstraints are allowed to be empty.
+func (e *Engine) resolveConstraintBitmaps(ctx context.Context, snap *snapshot.Snapshot, constraints []recognize.KindConstraint) (*snapshot.Bitset, error) {
+	if len(constraints) == 0 {
+		return nil, nil
+	}
+
+	bitmaps := make([]*snapshot.Bitset, 0, len(constraints))
+	for _, constraint := range constraints {
+		bm, err := matchConstraint(ctx, e.mapKind, snap, constraint)
+		if err != nil {
+			return nil, err
+		}
+		bitmaps = append(bitmaps, bm)
+	}
+
+	if len(bitmaps) == 1 {
+		return bitmaps[0], nil
+	}
+	return intersectBitmaps(snap.NodeCount(), bitmaps), nil
 }
 
 // denseIDBitmap builds a bitset of the dense NodeIDs corresponding to ids,
@@ -401,16 +464,32 @@ func resolveMatchingKindNames(snap *snapshot.Snapshot, matches *snapshot.Bitset,
 		return true
 	})
 
+	return resolveKindNameMap(ids, resolve)
+}
+
+// resolveKindNameMap is resolveMatchingKindNames'/TryRelFetchKinds'/
+// TryRelQueryRows' shared resolve+validate+map-build tail: it calls resolve
+// once with the full ids batch, checks the result is the same length back
+// (a length mismatch means resolve itself is misbehaving -- not a case any
+// production KindMapper is expected to hit, but cheap to guard against
+// rather than silently misaligning ids[i] with kinds[j]), and builds the
+// KindID->graph.Kind map every caller then indexes per row with no further
+// resolution or error handling once streaming begins.
+//
+// A nil or empty ids returns an empty, non-nil map without calling resolve
+// at all -- there is nothing to look up, and a production KindMapper is
+// under no obligation to handle an empty batch gracefully.
+func resolveKindNameMap(ids []snapshot.KindID, resolve func([]snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
 	if len(ids) == 0 {
 		return map[snapshot.KindID]graph.Kind{}, nil
 	}
 
 	kinds, err := resolve(ids)
 	if err != nil {
-		return nil, fmt.Errorf("engine: resolveMatchingKindNames: %w", err)
+		return nil, fmt.Errorf("engine: resolveKindNameMap: %w", err)
 	}
 	if len(kinds) != len(ids) {
-		return nil, fmt.Errorf("engine: resolveMatchingKindNames: resolve returned %d kinds for %d ids", len(kinds), len(ids))
+		return nil, fmt.Errorf("engine: resolveKindNameMap: resolve returned %d kinds for %d ids", len(kinds), len(ids))
 	}
 
 	byID := make(map[snapshot.KindID]graph.Kind, len(ids))
@@ -418,4 +497,700 @@ func resolveMatchingKindNames(snap *snapshot.Snapshot, matches *snapshot.Bitset,
 		byID[id] = kinds[i]
 	}
 	return byID, nil
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: relationship-query serving.
+//
+// TryRelCount, TryRelFetchIDs, TryRelFetchTriples, TryRelFetchKinds, and
+// TryRelQueryRows all serve a recognize.RelSpec entirely from the current
+// snapshot's CSR arrays, sharing one gate (resolveRelSpec) and one scan
+// (relScanIter) the same way TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds
+// share resolveNodeSpec above. Unlike the node-spec side, a RelSpec needs no
+// constraint minimum: a fully unconstrained relationship query (nil
+// StartIDs/EndIDs, empty EdgeKinds, no endpoint kind constraints) is
+// servable whenever the snapshot is clean, since edgeKindsClean/
+// allNodeKindsClean's empty-kinds case already means "every recorded kind
+// entry must be clean" -- there is no analogue to resolveNodeSpec's
+// reasonNoKindConstraint decline here.
+// ---------------------------------------------------------------------------
+
+// relEdge is one matching relationship produced by relScanIter/sliceRelIter:
+// dense start/end NodeIDs, the relationship's own database id, and its
+// KindID -- everything every TryRel* entry point needs to render its own
+// row shape (a bare id, a triple, a kind-annotated triple, or a
+// recognize.RowProjection row) without re-deriving anything from the
+// snapshot's CSR arrays a second time.
+type relEdge struct {
+	start, end snapshot.NodeID
+	edgeID     uint64
+	kind       snapshot.KindID
+}
+
+// relIterator is the pull-style contract every TryRel* entry point drains,
+// implemented by relScanIter (a live scan over the snapshot's CSR arrays)
+// and sliceRelIter (a pre-sorted []relEdge, for TryRelQueryRows'
+// orderByEdgeID case). next returns ok=false once exhausted, exactly like a
+// Go 1.23 range-over-func iterator's pull adapter, but written out by hand
+// here since rowResult (rowresult.go) needs to drive it from its own Next()
+// method with no goroutine in between.
+type relIterator interface {
+	next() (relEdge, bool)
+}
+
+// relPlan is resolveRelSpec's result: everything a relIterator needs to
+// walk the snapshot's edges according to spec, computed once, after the
+// freshness gate has already passed. Every TryRel* entry point builds
+// exactly one relIterator from a relPlan via newRelScanIter.
+type relPlan struct {
+	snap *snapshot.Snapshot
+
+	// kindMask is spec.EdgeKinds mapped to a snapshot.KindMask via
+	// buildKindMaskSeam -- SetAll when spec.EdgeKinds is empty ("every kind
+	// allowed"), matching buildKindMask's own contract on the path-query
+	// side (engine.go).
+	kindMask *snapshot.KindMask
+
+	// startBits/endBits are spec.StartConstraints/EndConstraints resolved
+	// via resolveConstraintBitmaps: nil means that endpoint carries no kind
+	// constraint at all ("everything passes"), never "matches nothing".
+	startBits, endBits *snapshot.Bitset
+
+	// startAnchor/endAnchor are non-nil iff spec.StartIDs/EndIDs is non-nil
+	// -- the Dense-mapped id() bitmap that endpoint's id constraint narrows
+	// the scan to (denseIDBitmap), which may itself be the empty bitset
+	// ("matches nothing", from a non-nil empty StartIDs/EndIDs), but is
+	// never nil unless the corresponding spec field itself was nil
+	// ("unconstrained by id"). This nil-vs-empty distinction is exactly
+	// RelSpec.StartIDs/EndIDs' own documented contract, preserved all the
+	// way through to scan-strategy selection (newRelScanIter).
+	startAnchor, endAnchor *snapshot.Bitset
+}
+
+// resolveRelSpec runs the shared gate and per-query setup behind every
+// TryRel* entry point:
+//
+//  1. serveGate: cfg.Enabled, then a non-nil snapshot (same as
+//     resolveNodeSpec's step 1).
+//  2. spec.EdgeKinds mapped to a snapshot.KindMask via buildKindMaskSeam;
+//     spec.StartConstraints and spec.EndConstraints each mapped to a bitmap
+//     via resolveConstraintBitmaps (shared with resolveNodeSpec). Any
+//     mapKind failure along the way declines reasonError, exactly like
+//     resolveNodeSpec's step 3 -- an unmappable kind is never silently
+//     treated as "matches nothing" (see matchConstraint's doc).
+//  3. Freshness, checked only after every kind name above has resolved
+//     successfully (so an unknown kind always declines reasonError rather
+//     than reasonKindStale, even against a snapshot that also happens to be
+//     stale -- resolveNodeSpec's step 4 makes the same ordering choice):
+//     allEdgesClean(g) && edgeKindsClean(g, spec.EdgeKinds) always, plus --
+//     only if spec.StartConstraints or spec.EndConstraints is non-empty --
+//     allNodesClean(g) && nodeKindsClean(g, spec.NodeConstraintKinds()). g
+//     is snap.Generation. Unlike servePathQuery, there is no post-execution
+//     recheck: see serveGate's doc for why a builder-serving answer, once
+//     computed from fields already frozen on one immutable snapshot
+//     instance, can never be corrupted by a write that lands after this
+//     check -- the same argument applies unchanged to a relationship scan.
+//  4. spec.StartIDs/EndIDs Dense-mapped into startAnchor/endAnchor via
+//     denseIDBitmap, preserving the nil ("unconstrained")-vs-non-nil
+//     ("anchored, possibly to zero ids") distinction (relPlan's own doc).
+//
+// op names the specific entry point, threaded through to serveGate/
+// declineOp exactly like resolveNodeSpec's op parameter.
+func (e *Engine) resolveRelSpec(ctx context.Context, op string, spec recognize.RelSpec) (*relPlan, bool) {
+	snap, ok := e.serveGate(ctx, op)
+	if !ok {
+		return nil, false
+	}
+
+	kindMask, err := buildKindMaskSeam(ctx, e.mapKind, snap.MaxKindID, spec.EdgeKinds)
+	if err != nil {
+		e.declineOp(ctx, op, reasonError, err)
+		return nil, false
+	}
+
+	startBits, err := e.resolveConstraintBitmaps(ctx, snap, spec.StartConstraints)
+	if err != nil {
+		e.declineOp(ctx, op, reasonError, err)
+		return nil, false
+	}
+	endBits, err := e.resolveConstraintBitmaps(ctx, snap, spec.EndConstraints)
+	if err != nil {
+		e.declineOp(ctx, op, reasonError, err)
+		return nil, false
+	}
+
+	if !e.allEdgesClean(snap.Generation) || !e.edgeKindsClean(snap.Generation, spec.EdgeKinds) {
+		e.declineOp(ctx, op, reasonKindStale, nil)
+		return nil, false
+	}
+	if len(spec.StartConstraints) > 0 || len(spec.EndConstraints) > 0 {
+		if !e.allNodesClean(snap.Generation) || !e.nodeKindsClean(snap.Generation, spec.NodeConstraintKinds()) {
+			e.declineOp(ctx, op, reasonKindStale, nil)
+			return nil, false
+		}
+	}
+
+	var startAnchor, endAnchor *snapshot.Bitset
+	if spec.StartIDs != nil {
+		startAnchor = denseIDBitmap(snap, spec.StartIDs)
+	}
+	if spec.EndIDs != nil {
+		endAnchor = denseIDBitmap(snap, spec.EndIDs)
+	}
+
+	return &relPlan{
+		snap:        snap,
+		kindMask:    kindMask,
+		startBits:   startBits,
+		endBits:     endBits,
+		startAnchor: startAnchor,
+		endAnchor:   endAnchor,
+	}, true
+}
+
+// buildKindMaskSeam is buildKindMask (engine.go) adapted to the mapKind seam
+// (a plain function value) instead of a live pg.KindMapper, for the same
+// reason resolveNodeSpec/matchConstraint go through e.mapKind rather than
+// e.pgDriver.KindMapper() directly: it lets this file's unit tests fake kind
+// resolution without a live PostgreSQL connection. Semantics are unchanged
+// from buildKindMask: an empty edgeKinds means "every kind allowed"
+// (SetAll); otherwise every kind must map successfully via mapKind, or the
+// whole call fails -- servePathQuery's own buildKindMask call site is left
+// untouched, exactly like every other seam this file introduces.
+func buildKindMaskSeam(ctx context.Context, mapKind func(context.Context, graph.Kind) (int16, error), maxKindID snapshot.KindID, edgeKinds graph.Kinds) (*snapshot.KindMask, error) {
+	mask := snapshot.NewKindMask(maxKindID)
+
+	if len(edgeKinds) == 0 {
+		mask.SetAll()
+		return mask, nil
+	}
+
+	for _, kind := range edgeKinds {
+		kindID, err := mapKind(ctx, kind)
+		if err != nil {
+			return nil, fmt.Errorf("engine: buildKindMaskSeam: map kind %s: %w", kind, err)
+		}
+		mask.Set(kindID)
+	}
+
+	return mask, nil
+}
+
+// relScanIter is the one live-scan relIterator every TryRel* entry point's
+// default (non-ordered) path builds from a relPlan, via newRelScanIter. It
+// unifies all three scan strategies resolveRelSpec's doc enumerates
+// (start-anchored, end-anchored, and full scan) into a single walk over two
+// nested cursors:
+//
+//   - An outer sequence of "near" dense node ids to visit, ascending: either
+//     an anchor bitmap's own members (materialized once via materializeBitset
+//     -- bounded by the anchor set's size, not the edge count), or, for a
+//     full scan, implicitly every dense NodeID 0..NodeCount()-1 (outer nil,
+//     nodeCount driving the loop directly instead, so a full scan never
+//     materializes anything edge- or even node-count sized up front).
+//   - For each near node, a forward (Out) or reverse (In) CSR segment,
+//     walked slot by slot.
+//
+// forward selects Out-based iteration for a start-anchored or full scan (the
+// near node is the start, the far node read off OutTargets is the end);
+// false selects In-based iteration for an end-anchored scan (the near node
+// is the end, the far node read off InTargets is the start, and the edge id
+// is looked up one indirection away via InEdgeIdx into OutEdgeIDs, exactly
+// as Snapshot.InEdgeIdx's own doc describes).
+//
+// nearBits is the near side's own kind-constraint bitmap, tested once per
+// near node in advanceNear rather than once per slot -- correct because
+// every edge in one near node's segment shares that same near node, so a
+// per-node test is exactly equivalent to (but cheaper than) testing it on
+// every one of that node's slots individually. farBits is the opposite
+// side's kind-constraint bitmap, tested per slot in next, since the far
+// node varies slot to slot. farAnchor is the opposite side's id() anchor
+// bitmap (nil unless both endpoints are anchored, i.e. the "both anchors
+// non-nil" case in resolveRelSpec's doc), also tested per slot. nearBits,
+// farBits, and farAnchor are all nil-means-"unconstrained", never
+// nil-means-"matches nothing" -- see relPlan's own doc for why.
+type relScanIter struct {
+	outer     []snapshot.NodeID // nil for a full scan
+	nodeCount int               // used only when outer == nil
+	outerPos  int               // next unread index into outer, or next full-scan node id
+
+	forward bool
+	snap    *snapshot.Snapshot
+
+	kindMask  *snapshot.KindMask
+	nearBits  *snapshot.Bitset
+	farBits   *snapshot.Bitset
+	farAnchor *snapshot.Bitset
+
+	curNear  snapshot.NodeID
+	slot, hi uint64
+}
+
+// newRelScanIter builds the relScanIter for plan, choosing among the four
+// scan strategies resolveRelSpec's doc documents:
+//
+//   - Both startAnchor and endAnchor non-nil: anchor on whichever bitmap has
+//     fewer set bits (Bitset.Count()), membership-testing the other side per
+//     slot via farAnchor -- the cheaper of the two anchored scans is always
+//     preferred, since both would produce the same match set.
+//   - Only startAnchor non-nil: start-anchored (forward/Out) scan.
+//   - Only endAnchor non-nil: end-anchored (reverse/In) scan.
+//   - Neither: full forward scan over every dense node id.
+func newRelScanIter(plan *relPlan) *relScanIter {
+	switch {
+	case plan.startAnchor != nil && plan.endAnchor != nil:
+		if plan.startAnchor.Count() <= plan.endAnchor.Count() {
+			return &relScanIter{
+				outer: materializeBitset(plan.startAnchor), forward: true, snap: plan.snap,
+				kindMask: plan.kindMask, nearBits: plan.startBits, farBits: plan.endBits, farAnchor: plan.endAnchor,
+			}
+		}
+		return &relScanIter{
+			outer: materializeBitset(plan.endAnchor), forward: false, snap: plan.snap,
+			kindMask: plan.kindMask, nearBits: plan.endBits, farBits: plan.startBits, farAnchor: plan.startAnchor,
+		}
+
+	case plan.startAnchor != nil:
+		return &relScanIter{
+			outer: materializeBitset(plan.startAnchor), forward: true, snap: plan.snap,
+			kindMask: plan.kindMask, nearBits: plan.startBits, farBits: plan.endBits,
+		}
+
+	case plan.endAnchor != nil:
+		return &relScanIter{
+			outer: materializeBitset(plan.endAnchor), forward: false, snap: plan.snap,
+			kindMask: plan.kindMask, nearBits: plan.endBits, farBits: plan.startBits,
+		}
+
+	default:
+		return &relScanIter{
+			nodeCount: plan.snap.NodeCount(), forward: true, snap: plan.snap,
+			kindMask: plan.kindMask, nearBits: plan.startBits, farBits: plan.endBits,
+		}
+	}
+}
+
+// next advances the scan by one matching edge, applying kindMask, farAnchor,
+// and farBits to every candidate slot (see relScanIter's doc for why nearBits
+// is instead applied once per near node, in advanceNear). ok is false once
+// every near node's segment has been exhausted.
+func (it *relScanIter) next() (relEdge, bool) {
+	for {
+		for it.slot < it.hi {
+			slot := it.slot
+			it.slot++
+
+			var far snapshot.NodeID
+			var kind snapshot.KindID
+			var edgeID uint64
+			if it.forward {
+				far = it.snap.OutTargets[slot]
+				kind = it.snap.OutKinds[slot]
+				edgeID = it.snap.OutEdgeIDs[slot]
+			} else {
+				far = it.snap.InTargets[slot]
+				kind = it.snap.InKinds[slot]
+				edgeID = it.snap.OutEdgeIDs[it.snap.InEdgeIdx[slot]]
+			}
+
+			if !it.kindMask.Has(kind) {
+				continue
+			}
+			if it.farAnchor != nil && !it.farAnchor.Has(far) {
+				continue
+			}
+			if it.farBits != nil && !it.farBits.Has(far) {
+				continue
+			}
+
+			if it.forward {
+				return relEdge{start: it.curNear, end: far, edgeID: edgeID, kind: kind}, true
+			}
+			return relEdge{start: far, end: it.curNear, edgeID: edgeID, kind: kind}, true
+		}
+
+		if !it.advanceNear() {
+			return relEdge{}, false
+		}
+	}
+}
+
+// advanceNear moves to the next near node with a non-empty, nearBits-passing
+// CSR segment, setting curNear/slot/hi to it and reporting true, or reports
+// false once outer (or, for a full scan, 0..nodeCount-1) is exhausted.
+func (it *relScanIter) advanceNear() bool {
+	for {
+		var node snapshot.NodeID
+		if it.outer != nil {
+			if it.outerPos >= len(it.outer) {
+				return false
+			}
+			node = it.outer[it.outerPos]
+			it.outerPos++
+		} else {
+			if it.outerPos >= it.nodeCount {
+				return false
+			}
+			node = snapshot.NodeID(it.outerPos)
+			it.outerPos++
+		}
+
+		if it.nearBits != nil && !it.nearBits.Has(node) {
+			continue
+		}
+
+		var lo, hi uint64
+		if it.forward {
+			lo, hi = it.snap.OutOffsets[node], it.snap.OutOffsets[node+1]
+		} else {
+			lo, hi = it.snap.InOffsets[node], it.snap.InOffsets[node+1]
+		}
+		if lo == hi {
+			continue
+		}
+
+		it.curNear, it.slot, it.hi = node, lo, hi
+		return true
+	}
+}
+
+// materializeBitset collects bm's set bits into an ascending []snapshot.
+// NodeID slice, once -- the anchor-set materialization newRelScanIter uses
+// to turn a Bitset's push-style Iterate into the ascending, resumable outer
+// sequence relScanIter.advanceNear needs. Cost is bounded by the anchor
+// set's own size (how many ids a query's id() constraint named), never by
+// the snapshot's total node or edge count.
+func materializeBitset(bm *snapshot.Bitset) []snapshot.NodeID {
+	ids := make([]snapshot.NodeID, 0, bm.Count())
+	bm.Iterate(func(id snapshot.NodeID) bool {
+		ids = append(ids, id)
+		return true
+	})
+	return ids
+}
+
+// sliceRelIter is relIterator's other implementation: a plain, already-
+// materialized []relEdge walked in order. TryRelQueryRows builds one from
+// drainRelIter's output, after sorting it ascending by edge id, to serve
+// orderByEdgeID -- the one case where every TryRel* entry point's shared
+// relScanIter isn't enough on its own, since sorting requires the full match
+// set in hand before the first row can be emitted.
+type sliceRelIter struct {
+	edges []relEdge
+	pos   int
+}
+
+func (it *sliceRelIter) next() (relEdge, bool) {
+	if it.pos >= len(it.edges) {
+		return relEdge{}, false
+	}
+	edge := it.edges[it.pos]
+	it.pos++
+	return edge, true
+}
+
+// drainRelIter pulls it to exhaustion into a plain []relEdge, in scan order.
+// Used only by TryRelQueryRows' orderByEdgeID path (gather-then-sort-then-
+// emit); every other TryRel* entry point streams relScanIter's output
+// directly instead of gathering it first.
+func drainRelIter(it relIterator) []relEdge {
+	var edges []relEdge
+	for {
+		edge, ok := it.next()
+		if !ok {
+			return edges
+		}
+		edges = append(edges, edge)
+	}
+}
+
+// selectKindIDs returns every KindID in [1, maxKindID] for which allow
+// reports true, in ascending order -- a candidate list bounded by the
+// schema's own (typically small) total kind count, never by how much data
+// carries any given kind. TryRelFetchKinds passes kindMask.Has, resolving
+// names only for the kinds spec.EdgeKinds actually allows; TryRelQueryRows'
+// step projections pass an always-true predicate, since a far node's
+// carried kinds are never filtered by spec.EdgeKinds (that mask constrains
+// only the traversed relationship's own kind). Either way, resolving the
+// whole allowed set eagerly, once, up front costs one bounded batch resolve
+// call regardless of how many rows the scan itself goes on to produce --
+// see TryRelFetchKinds' doc for why this is preferred over collecting the
+// distinct kinds actually encountered mid-scan, which would need a second
+// pass over the same data.
+//
+// The range starts at 1, not 0: dawgs' pg.SchemaManager/InMemoryKindMapper
+// both hand out KindIDs starting at 1 (nextKindID: int16(1)) and never
+// assign 0 to any real kind, so 0 can never appear in a snapshot's OutKinds/
+// InKinds/NodeKinds either. A snapshot.KindMask's SetAll (buildKindMaskSeam,
+// for an empty spec.EdgeKinds) sets bit 0 anyway -- it is a plain 0-based bit
+// vector with no notion of which indices are real KindIDs -- so this
+// function, not kindMask.Has, is what keeps kind id 0 out of the batch and
+// out of a real e.mapKindNames call, which would otherwise fail resolving an
+// id no KindMapper ever assigned.
+func selectKindIDs(maxKindID snapshot.KindID, allow func(snapshot.KindID) bool) []snapshot.KindID {
+	var ids []snapshot.KindID
+	for k := snapshot.KindID(1); k <= maxKindID; k++ {
+		if allow(k) {
+			ids = append(ids, k)
+		}
+	}
+	return ids
+}
+
+// TryRelCount attempts to serve spec's matching relationship count entirely
+// from the engine's current snapshot, returning (count, true) on success. It
+// returns (0, false) whenever the engine cannot, or chooses not to, serve
+// the query itself (see resolveRelSpec's doc for the full gate).
+//
+// Unlike TryNodeCount (a Bitset.Count() over an already-computed bitmap, so
+// O(words)), there is no equivalent precomputed structure to count for a
+// relationship query: relScanIter must actually visit every candidate slot
+// the scan strategy selects, so this runs in time proportional to the
+// matching (or anchor-adjacent, for an anchored scan) edges, not to the
+// answer alone. It still runs inline, with no feeder goroutine -- there is
+// nothing to stream, only a running total.
+func (e *Engine) TryRelCount(ctx context.Context, spec recognize.RelSpec) (int64, bool) {
+	start := time.Now()
+
+	plan, ok := e.resolveRelSpec(ctx, opRelCount, spec)
+	if !ok {
+		return 0, false
+	}
+
+	it := newRelScanIter(plan)
+	var count int64
+	for {
+		if _, ok := it.next(); !ok {
+			break
+		}
+		count++
+	}
+
+	e.servedOp(ctx, opRelCount, start, slog.Int64("count", count))
+	return count, true
+}
+
+// TryRelFetchIDs attempts to serve spec's matching relationships' own
+// database ids entirely from the engine's current snapshot, returning
+// (cursor, true) on success. It returns (nil, false) under the same
+// conditions as TryRelCount (see resolveRelSpec's doc).
+//
+// Unlike TryNodeFetchIDs (which fully computes its bitset before streaming,
+// since a Bitset is cheap to materialize in full), this streams relScanIter's
+// output directly through newFeedCursor's feeder goroutine as the scan
+// itself runs: gathering every matching edge into a slice first, purely to
+// mirror TryNodeFetchIDs' "answer fully known before the cursor exists"
+// shape, would cost an extra full materialization for no benefit here, since
+// nothing about rendering a bare edge id can fail mid-scan the way
+// TryRelFetchKinds' kind-name resolution can. Emission order is scan order,
+// documented as unspecified (see relScanIter's doc) except when the caller
+// needs otherwise, which is what TryRelQueryRows' orderByEdgeID is for.
+func (e *Engine) TryRelFetchIDs(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.ID], bool) {
+	start := time.Now()
+
+	plan, ok := e.resolveRelSpec(ctx, opRelIDs, spec)
+	if !ok {
+		return nil, false
+	}
+
+	it := newRelScanIter(plan)
+	cursor := newFeedCursor(ctx, func(yield func(graph.ID) bool) {
+		for {
+			edge, ok := it.next()
+			if !ok {
+				return
+			}
+			if !yield(graph.ID(edge.edgeID)) {
+				return
+			}
+		}
+	})
+
+	e.servedOp(ctx, opRelIDs, start)
+	return cursor, true
+}
+
+// TryRelFetchTriples attempts to serve spec's matching relationships' own
+// id plus their endpoints' database ids (graph.RelationshipTripleResult)
+// entirely from the engine's current snapshot, returning (cursor, true) on
+// success. It returns (nil, false) under the same conditions as TryRelCount.
+// See TryRelFetchIDs' doc for why this streams directly rather than fully
+// materializing first.
+func (e *Engine) TryRelFetchTriples(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.RelationshipTripleResult], bool) {
+	start := time.Now()
+
+	plan, ok := e.resolveRelSpec(ctx, opRelTriples, spec)
+	if !ok {
+		return nil, false
+	}
+
+	snap := plan.snap
+	it := newRelScanIter(plan)
+	cursor := newFeedCursor(ctx, func(yield func(graph.RelationshipTripleResult) bool) {
+		for {
+			edge, ok := it.next()
+			if !ok {
+				return
+			}
+			row := graph.RelationshipTripleResult{
+				ID:      graph.ID(edge.edgeID),
+				StartID: graph.ID(snap.GraphIDs[edge.start]),
+				EndID:   graph.ID(snap.GraphIDs[edge.end]),
+			}
+			if !yield(row) {
+				return
+			}
+		}
+	})
+
+	e.servedOp(ctx, opRelTriples, start)
+	return cursor, true
+}
+
+// TryRelFetchKinds attempts to serve spec's matching relationships' triples
+// plus each one's own graph.Kind entirely from the engine's current
+// snapshot, returning (cursor, true) on success. It returns (nil, false)
+// under the same conditions as TryRelCount, plus one more: failing to
+// resolve the KindIDs spec.EdgeKinds' mask allows back to their graph.Kind
+// names declines reasonError.
+//
+// Every KindID plan.kindMask allows (selectKindIDs(plan.snap.MaxKindID,
+// plan.kindMask.Has)) is resolved to its graph.Kind name via one batched
+// e.mapKindNames call, made eagerly before the cursor is even constructed --
+// not lazily as it streams, and not by collecting the distinct kinds
+// actually encountered mid-scan either, which would need a second full pass
+// over the same edges (selectKindIDs' doc). This keeps the same guarantee
+// TryNodeFetchKinds already has: a caller that gets (cursor, true) back is
+// holding a fully-determined, already error-free answer, with no possibility
+// of a resolution failure surfacing mid-stream.
+func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.RelationshipKindsResult], bool) {
+	start := time.Now()
+
+	plan, ok := e.resolveRelSpec(ctx, opRelKinds, spec)
+	if !ok {
+		return nil, false
+	}
+
+	kindNames, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID, plan.kindMask.Has), e.mapKindNames)
+	if err != nil {
+		e.declineOp(ctx, opRelKinds, reasonError, err)
+		return nil, false
+	}
+
+	snap := plan.snap
+	it := newRelScanIter(plan)
+	cursor := newFeedCursor(ctx, func(yield func(graph.RelationshipKindsResult) bool) {
+		for {
+			edge, ok := it.next()
+			if !ok {
+				return
+			}
+			row := graph.RelationshipKindsResult{
+				RelationshipTripleResult: graph.RelationshipTripleResult{
+					ID:      graph.ID(edge.edgeID),
+					StartID: graph.ID(snap.GraphIDs[edge.start]),
+					EndID:   graph.ID(snap.GraphIDs[edge.end]),
+				},
+				Kind: kindNames[edge.kind],
+			}
+			if !yield(row) {
+				return
+			}
+		}
+	})
+
+	e.servedOp(ctx, opRelKinds, start)
+	return cursor, true
+}
+
+// TryRelQueryRows attempts to serve spec's matching relationships as rows
+// shaped by proj (recognize.RowProjection) entirely from the engine's
+// current snapshot, returning a pull-based graph.Result (rowResult,
+// rowresult.go) on success. It returns (nil, false) under the same
+// conditions as TryRelCount, plus two more, both checked only after
+// resolveRelSpec's gate has already passed (so cfg.Enabled/no-snapshot/
+// unmappable-kind/kind-stale declines always take priority, mirroring every
+// other TryRel* entry point's decline ordering):
+//
+//   - Projection/anchor direction mismatch (reasonProjectionMismatch):
+//     recognize.ProjectionStepOutbound requires spec.StartIDs non-nil (the
+//     row's far/varying side is the end), and ProjectionStepInbound requires
+//     spec.EndIDs non-nil (the far side is the start) -- see
+//     reasonProjectionMismatch's doc for why a real upstream caller should
+//     never actually hit this.
+//   - orderByEdgeID requested with neither endpoint anchored
+//     (reasonUnsupportedOrder): ordering needs a bounded match set to gather
+//     and sort ahead of emitting the first row, which only an anchored scan
+//     (start- or end-anchored, or both) guarantees; a full scan's match set
+//     can be the entire edge set, which the real upstream orderByEdgeID
+//     callers (traversal's paging order) never ask a full-scan query for
+//     anyway.
+//
+// When orderByEdgeID is honored, newRelScanIter's relIterator is fully
+// drained (drainRelIter) and sorted ascending by edge id before rowResult is
+// constructed, exactly mirroring resolveRelSpec's "gather matching slots,
+// sort by edge id, then emit" doc; otherwise rowResult drives the live
+// relScanIter directly, one relEdge per Next() call, with no goroutine and
+// no prior materialization -- see TryRelFetchIDs' doc for why streaming
+// directly is preferred whenever nothing about rendering a row can fail
+// mid-scan.
+//
+// For a step projection (ProjectionStepOutbound/StepInbound), the far
+// node's kinds column needs every possible node KindID resolved to its
+// graph.Kind name up front, for the same reason TryRelFetchKinds resolves
+// its edge-kind names eagerly: so a resolution failure declines reasonError
+// here, before rowResult is ever constructed, rather than surfacing from
+// inside a Values() call with no clean way to report it (rowResult.Error()
+// always returns nil; see its own doc). Unlike TryRelFetchKinds, every
+// KindID 1..snap.MaxKindID is resolved regardless of plan.kindMask, since a
+// far node's own carried kinds are never filtered by spec.EdgeKinds; for
+// ProjectionStartEnd, no kind names are needed at all (the row is a bare id
+// pair), so this resolution is skipped entirely.
+func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, proj recognize.RowProjection, orderByEdgeID bool) (graph.Result, bool) {
+	start := time.Now()
+
+	plan, ok := e.resolveRelSpec(ctx, opRelRows, spec)
+	if !ok {
+		return nil, false
+	}
+
+	switch proj {
+	case recognize.ProjectionStepOutbound:
+		if spec.StartIDs == nil {
+			e.declineOp(ctx, opRelRows, reasonProjectionMismatch, nil)
+			return nil, false
+		}
+	case recognize.ProjectionStepInbound:
+		if spec.EndIDs == nil {
+			e.declineOp(ctx, opRelRows, reasonProjectionMismatch, nil)
+			return nil, false
+		}
+	}
+
+	if orderByEdgeID && spec.StartIDs == nil && spec.EndIDs == nil {
+		e.declineOp(ctx, opRelRows, reasonUnsupportedOrder, nil)
+		return nil, false
+	}
+
+	var kindNames map[snapshot.KindID]graph.Kind
+	if proj != recognize.ProjectionStartEnd {
+		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID, func(snapshot.KindID) bool { return true }), e.mapKindNames)
+		if err != nil {
+			e.declineOp(ctx, opRelRows, reasonError, err)
+			return nil, false
+		}
+		kindNames = resolved
+	}
+
+	var it relIterator = newRelScanIter(plan)
+	if orderByEdgeID {
+		edges := drainRelIter(it)
+		sort.Slice(edges, func(i, j int) bool { return edges[i].edgeID < edges[j].edgeID })
+		it = &sliceRelIter{edges: edges}
+	}
+
+	result := newRowResult(plan.snap, it, proj, kindNames)
+
+	e.servedOp(ctx, opRelRows, start)
+	return result, true
 }
