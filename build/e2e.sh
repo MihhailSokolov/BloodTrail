@@ -44,19 +44,30 @@ docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T
 (cd "$ROOT" && go run ./cmd/bloodtrail status --compose-file "$WORK/docker-compose.yml") > "$WORK/status.txt"
 grep -q "running:.*$IMAGE" "$WORK/status.txt"
 
-echo "==> Waiting for the path engine's snapshot to build from the ingested fixture"
+echo "==> Waiting for the path engine's snapshot to rebuild from the ingested fixture"
 # Written to a file rather than piped into grep, for the same reason as the
 # status check above: `docker compose logs` keeps writing after `grep -q`
 # finds its match and closes the pipe, dies of SIGPIPE, and (with pipefail)
 # turns a successful match into a failed pipeline.
+#
+# "snapshot rebuilt" alone also matches the startup-triggered rebuild, which
+# runs against the pre-ingest 1-node graph before the fixture is loaded --
+# that line appears in the logs almost immediately and would let the loop
+# fall through while the snapshot is still stale, so the GET below would hit
+# a declining engine and PostgreSQL would answer instead (see
+# internal/engine/engine.go's "bloodtrail: snapshot rebuilt" log call and
+# internal/engine/poller.go's triggerStartup/triggerAnalysis constants). Wait
+# specifically for the analysis-triggered rebuild, which fires once the
+# fixture's ingest+analysis run completes and is the one that reflects the
+# ingested graph.
 bh_logs() { docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" logs bloodhound > "$WORK/bloodhound-logs.txt" 2>&1; }
 snapshot_rebuilt=false
 for _ in $(seq 1 24); do
   bh_logs
-  if grep -q "snapshot rebuilt" "$WORK/bloodhound-logs.txt"; then snapshot_rebuilt=true; break; fi
+  if grep "snapshot rebuilt" "$WORK/bloodhound-logs.txt" | grep -q '"trigger":"analysis"'; then snapshot_rebuilt=true; break; fi
   sleep 5
 done
-[ "$snapshot_rebuilt" = true ] || { echo "the path engine never logged a rebuilt snapshot within 120s" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+[ "$snapshot_rebuilt" = true ] || { echo "the path engine never logged an analysis-triggered rebuilt snapshot within 120s" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
 
 echo "==> Querying the path engine directly"
 # The fixture's built-in Administrator (RID 500) is a direct MemberOf member
