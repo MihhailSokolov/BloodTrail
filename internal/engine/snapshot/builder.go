@@ -30,6 +30,8 @@ type Builder struct {
 	kindOffsets []uint32 // len(ids)+1, into kindsFlat
 
 	edges []stagedEdge
+
+	kindTable map[KindID]string // set via SetKinds; nil until then
 }
 
 // NewBuilder creates an empty Builder for the given graph id.
@@ -61,6 +63,16 @@ func (b *Builder) AddNode(databaseID uint64, kinds []KindID) error {
 // not-yet-staged id will be added later.
 func (b *Builder) AddEdge(id, startID, endID uint64, kind KindID) {
 	b.edges = append(b.edges, stagedEdge{id: id, start: startID, end: endID, kind: kind})
+}
+
+// SetKinds registers the database's complete kind id<->name table, to be
+// exposed on the built Snapshot as Kinds. It is independent of AddNode's
+// per-node kind lists: pairs is the global `kind` table's entire contents,
+// not just the kinds this graph's nodes and edges happen to use. Call it at
+// most once, before Build; if never called, Build produces an empty (but
+// non-nil) KindTable.
+func (b *Builder) SetKinds(pairs map[KindID]string) {
+	b.kindTable = pairs
 }
 
 // denseEdge is a staged edge with endpoints resolved to dense NodeIDs.
@@ -161,6 +173,7 @@ func (b *Builder) Build() (*Snapshot, error) {
 		KindOffsets:  kindOffsets,
 		NodeKinds:    nodeKinds,
 		MaxKindID:    maxKind,
+		Kinds:        NewKindTable(b.kindTable),
 		DroppedEdges: dropped,
 		BuiltAt:      time.Now(),
 		idIndex:      idIndex,

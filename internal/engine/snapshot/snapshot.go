@@ -32,6 +32,12 @@ type Snapshot struct {
 
 	MaxKindID KindID
 
+	// Kinds is the snapshot-owned id<->name table for every kind registered
+	// in the database's global `kind` table (see LoadSnapshot), independent
+	// of which kinds this particular graph's nodes and edges actually carry.
+	// Set once via Builder.SetKinds before Build; never nil after Build.
+	Kinds *KindTable
+
 	// DroppedEdges counts edges dropped at build time because one or both
 	// endpoints did not resolve to a staged node. See Builder.Build.
 	DroppedEdges int
@@ -145,6 +151,10 @@ func (s *Snapshot) ApproxBytes() uint64 {
 	for _, bm := range s.kindBitmaps {
 		total += approxKindBitmapEntryBytes
 		total += uint64(len(bm.words)) * bytesPerUint64
+	}
+
+	if s.Kinds != nil {
+		total += s.Kinds.ApproxBytes()
 	}
 
 	return total

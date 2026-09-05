@@ -21,11 +21,11 @@ import (
 //
 // It resolves the default graph via the driver's SchemaManager (returning an
 // error if none is set), then runs a single repeatable-read, read-only
-// transaction that streams every node ordered by id followed by every edge,
-// feeding both into a snapshot.Builder. Build assigns dense NodeIDs in the
-// node scan's ascending order and stamps the snapshot's BuiltAt;
-// Generation and AnalysisStamp are left zero for the engine and poller
-// (Tasks 10 and 12) to set later.
+// transaction that scans the global kind id/name table, then streams every
+// node ordered by id, then every edge, feeding all three into a
+// snapshot.Builder. Build assigns dense NodeIDs in the node scan's ascending
+// order and stamps the snapshot's BuiltAt; Generation and AnalysisStamp are
+// left zero for the engine and poller (Tasks 10 and 12) to set later.
 func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) (*snapshot.Snapshot, error) {
 	graphModel, ok := pgDriver.DefaultGraph()
 	if !ok {
@@ -40,6 +40,9 @@ func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) 
 
 	builder := snapshot.NewBuilder(graphModel.ID)
 
+	if err := loadKinds(ctx, tx, builder); err != nil {
+		return nil, err
+	}
 	if err := loadNodes(ctx, tx, graphModel.ID, builder); err != nil {
 		return nil, err
 	}
@@ -53,6 +56,36 @@ func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) 
 	}
 
 	return snap, nil
+}
+
+// loadKinds scans the entire `kind` table -- global, not scoped to any one
+// graph_id -- into builder via Builder.SetKinds. It runs before loadNodes so
+// the resulting Snapshot's Kinds table is populated regardless of which
+// kinds this particular graph's nodes and edges use.
+func loadKinds(ctx context.Context, tx pgx.Tx, builder *snapshot.Builder) error {
+	rows, err := tx.Query(ctx, "SELECT id, name FROM kind")
+	if err != nil {
+		return fmt.Errorf("engine: LoadSnapshot: query kinds: %w", err)
+	}
+	defer rows.Close()
+
+	pairs := make(map[snapshot.KindID]string)
+	for rows.Next() {
+		var (
+			id   snapshot.KindID
+			name string
+		)
+		if err := rows.Scan(&id, &name); err != nil {
+			return fmt.Errorf("engine: LoadSnapshot: scan kind: %w", err)
+		}
+		pairs[id] = name
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("engine: LoadSnapshot: kind rows: %w", err)
+	}
+
+	builder.SetKinds(pairs)
+	return nil
 }
 
 // loadNodes streams every node of graphID, ordered by id, into builder. The

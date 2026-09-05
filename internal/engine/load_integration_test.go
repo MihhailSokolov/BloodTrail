@@ -88,6 +88,18 @@ func TestLoadSnapshot(t *testing.T) {
 			t.Fatalf("GraphIDs not strictly ascending at index %d: %d >= %d", i, snap.GraphIDs[i-1], snap.GraphIDs[i])
 		}
 	}
+
+	// The kind table is global (not graph-scoped): a kind every node in the
+	// traversal_shapes fixture carries must resolve, and round-trip back
+	// through Name.
+	const wantKind = "TraversalNode"
+	kindID, ok := snap.Kinds.ID(wantKind)
+	if !ok {
+		t.Fatalf("Kinds.ID(%q): not found", wantKind)
+	}
+	if name, ok := snap.Kinds.Name(kindID); !ok || name != wantKind {
+		t.Fatalf("Kinds.Name(%d) = (%q, %v), want (%q, true)", kindID, name, ok, wantKind)
+	}
 }
 
 // TestLoadSnapshotResolvesEdgeID checks that an edge's real database id
