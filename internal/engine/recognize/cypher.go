@@ -26,7 +26,11 @@ import (
 // parentheses) of conjuncts, each classified as one of:
 //
 //  1. <var> <> <var> naming the two pattern variables (ExcludeSelf).
-//  2. id(<var>) = <literal> (Endpoint.IDs).
+//  2. id(<var>) = <literal> (Endpoint.IDs). A second id() conjunct for the
+//     same variable is accepted only if it repeats the same value
+//     (deduped); one with a different value rejects the whole query (case
+//     5) rather than silently unioning the two ids together, which would
+//     get Cypher's AND semantics for two point-equalities backwards.
 //  3. <var>:Kind, a kind-label matcher on one pattern variable
 //     (Endpoint.Kinds, merged with that node's pattern-declared kinds).
 //  4. Endpoint predicate lifting: any other expression whose variable
@@ -34,8 +38,10 @@ import (
 //     deep-copied, every reference to that variable is rewritten to the
 //     dawgs query-builder's node symbol ("n", what query.Node() returns),
 //     and the result is appended to that endpoint's Endpoint.Criteria
-//     (query.And(kindIn, lifted...) -- kinds first, then lifted predicates
-//     in source order). This subsumes what used to be closed-form
+//     (query.And(kind, kind, ..., lifted...) -- one single-kind
+//     query.Kind(query.Node(), k) conjunct per kind so multiple labels AND
+//     together as Cypher's (n:A:B) requires, then lifted predicates in
+//     source order). This subsumes what used to be closed-form
 //     <var>.prop = <literal> / <var>.prop ENDS WITH <string> handling --
 //     those are just ordinary Comparisons under the same lifting rule now
 //     -- and extends to NOT, OR/AND, regex (=~), and function calls
@@ -46,6 +52,13 @@ import (
 //     relationship variable, an unknown variable, no variable at all, a
 //     $parameter anywhere in the conjunct, or a node shape this walker
 //     doesn't recognize.
+//
+// An endpoint that ends up with both explicit ids (case 2) and a label or
+// property constraint (pattern-declared kinds, case 3, or case 4) is
+// rejected outright (see mixedEndpoint's doc): the engine's resolveEndpoint
+// (engine.go) resolves an endpoint with IDs set purely by looking those ids
+// up, silently ignoring Kinds/Criteria, so serving that shape would drop a
+// constraint the query actually asked for.
 //
 // RETURN must project exactly the path
 // variable with an optional LIMIT; SKIP, ORDER BY, DISTINCT, and any other
@@ -96,6 +109,10 @@ func FromCypher(text string) (result PathQuery, ok bool) {
 
 	excludeSelf, ok := matchWhere(readingClause.Match.Where, start, end)
 	if !ok {
+		return PathQuery{}, false
+	}
+
+	if mixedEndpoint(start) || mixedEndpoint(end) {
 		return PathQuery{}, false
 	}
 
@@ -268,13 +285,39 @@ func (e *endpointAccumulator) criteria() graph.Criteria {
 
 	kinds := append(append(graph.Kinds{}, e.patternKinds...), e.extraKinds...)
 
-	parts := make([]graph.Criteria, 0, len(e.lifted)+1)
-	if len(kinds) > 0 {
-		parts = append(parts, query.KindIn(query.Node(), kinds...))
+	parts := make([]graph.Criteria, 0, len(kinds)+len(e.lifted))
+	for _, kind := range kinds {
+		// One query.Kind(query.Node(), k) conjunct per kind, not a single
+		// query.KindIn(query.Node(), kinds...) call: dawgs' PostgreSQL
+		// translator compiles a multi-kind KindMatcher as an array-overlap
+		// test (ANY of these kinds), but a Cypher pattern like (n:A:B)
+		// requires ALL of its labels at once. AND-ing one single-kind
+		// KindMatcher per label here reproduces that conjunctive semantics;
+		// the bitmap path (resolveKindsEndpoint, engine.go, for an endpoint
+		// with Kinds but no Criteria) already intersects per-kind bitmaps
+		// correctly and is unaffected by this.
+		parts = append(parts, query.Kind(query.Node(), kind))
 	}
 	parts = append(parts, e.lifted...)
 
 	return query.And(parts...)
+}
+
+// mixedEndpoint reports whether acc's endpoint carries both explicit ids
+// (from one or more id(<var>) = <literal> WHERE conjuncts) and a label or
+// property constraint -- either the node pattern's own kind labels, a
+// WHERE-contributed <var>:Kind predicate, or a lifted predicate. FromCypher
+// rejects the whole query when this holds for either endpoint: the engine's
+// resolveEndpoint (engine.go) follows an IDs-over-Criteria-over-Kinds
+// priority order, so an endpoint with IDs set resolves purely by looking
+// those ids up and never consults Kinds or Criteria at all -- silently
+// dropping a constraint like (s:User) or a lifted predicate that WHERE
+// id(s) = 1 AND ... actually asked for, and serving PostgreSQL's fallback
+// answer's shape instead. Declining here, rather than resolving the
+// ambiguity one way or the other, keeps the engine's answer for this shape
+// identical to today's PostgreSQL-only behavior.
+func mixedEndpoint(acc *endpointAccumulator) bool {
+	return len(acc.ids) > 0 && (len(acc.patternKinds) > 0 || acc.criteria() != nil)
 }
 
 // matchWhere walks where's conjunction (nil means "no WHERE clause", which
@@ -382,11 +425,9 @@ func classifyConjunct(expr cypher.Expression, start, end *endpointAccumulator) (
 		if symbol, id, matched := matchIDEquals(typed); matched {
 			switch symbol {
 			case start.symbol:
-				start.ids = append(start.ids, id)
-				return false, true
+				return false, mergeIDConjunct(start, id)
 			case end.symbol:
-				end.ids = append(end.ids, id)
-				return false, true
+				return false, mergeIDConjunct(end, id)
 			default:
 				// id(<var>) = <literal> for a variable that's neither
 				// pattern endpoint (the path or relationship variable, or
@@ -405,6 +446,25 @@ func classifyConjunct(expr cypher.Expression, start, end *endpointAccumulator) (
 	}
 
 	return liftConjunct(expr, start, end)
+}
+
+// mergeIDConjunct records an id(<var>) = <literal> conjunct discovered for
+// target, matching Cypher's AND semantics for two such conjuncts naming the
+// same endpoint: a second id() conjunct repeating the SAME value as one
+// already recorded is a harmless duplicate (deduped, not appended again),
+// but a second id() conjunct with a DIFFERENT value ANDs together two
+// disjoint point-equalities, which can never match anything. Accepting the
+// latter used to append both ids into a single-endpoint IDs slice --
+// resolveIDEndpoint (engine.go) then unions them, matching EITHER id,
+// exactly backwards from what WHERE id(s)=1 AND id(s)=2 actually means. So
+// FromCypher rejects the whole query (ok=false) rather than serving that
+// wrong answer.
+func mergeIDConjunct(target *endpointAccumulator, id graph.ID) bool {
+	if len(target.ids) == 0 {
+		target.ids = append(target.ids, id)
+		return true
+	}
+	return target.ids[0] == id
 }
 
 // matchExcludeSelfComparison recognizes cmp as the s<>t ExcludeSelf shape: a

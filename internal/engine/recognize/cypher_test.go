@@ -519,6 +519,63 @@ func TestFromCypher_LiftsArithmeticAndListPredicates(t *testing.T) {
 	}
 }
 
+// TestFromCypher_DedupsIdenticalIDConjunct is the accepting half of Critical
+// finding 1b: a second id() conjunct for the same endpoint repeating the
+// exact same value as the first is a harmless duplicate (Cypher's AND of two
+// identical point-equalities matches exactly what either one alone would),
+// so it must be deduped rather than rejected outright, and Start.IDs must
+// end up with the single value once, not twice.
+func TestFromCypher_DedupsIdenticalIDConjunct(t *testing.T) {
+	got, ok := FromCypher(`MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE id(s) = 1 AND id(s) = 1 RETURN p`)
+	if !ok {
+		t.Fatal("FromCypher() ok = false, want true (duplicate id() conjuncts with the SAME value should dedup, not reject)")
+	}
+	if len(got.Start.IDs) != 1 || got.Start.IDs[0] != 1 {
+		t.Errorf("Start.IDs = %v, want [1] (deduped, not doubled)", got.Start.IDs)
+	}
+}
+
+// TestFromCypher_MultiKindCriteriaIsConjunctive is Critical finding 1c's
+// required coverage: a multi-label pattern endpoint ((s:A:B)) whose Criteria
+// path is exercised (WHERE also touches s with a lifted predicate, forcing
+// endpointAccumulator.touched()) must AND its kind labels together -- one
+// query.Kind(query.Node(), k) conjunct per kind, each carrying exactly one
+// kind -- rather than a single multi-kind KindMatcher, which dawgs' pg
+// translator would compile as an array-overlap ("matches ANY of A, B") test
+// instead of Cypher's actual "matches ALL of A, B" semantics for (s:A:B).
+func TestFromCypher_MultiKindCriteriaIsConjunctive(t *testing.T) {
+	got, ok := FromCypher(`MATCH p=shortestPath((s:A:B)-[:R*1..]->(t)) WHERE s.name = 'x' RETURN p`)
+	if !ok {
+		t.Fatal("FromCypher() ok = false, want true")
+	}
+
+	conjunction := conjunctionCriteria(t, got.Start.Criteria)
+	exprs := conjunction.GetAll()
+
+	var kindMatchers []*cypher.KindMatcher
+	for _, expr := range exprs {
+		if km, isKindMatcher := expr.(*cypher.KindMatcher); isKindMatcher {
+			kindMatchers = append(kindMatchers, km)
+		}
+	}
+
+	if len(kindMatchers) != 2 {
+		t.Fatalf("Start.Criteria has %d *cypher.KindMatcher conjuncts, want 2 (one per label, AND'd together); got exprs = %#v", len(kindMatchers), exprs)
+	}
+
+	seen := map[string]bool{}
+	for _, km := range kindMatchers {
+		if len(km.Kinds) != 1 {
+			t.Errorf("KindMatcher.Kinds = %v, want exactly 1 kind per conjunct (conjunctive, not a combined array-overlap matcher)", km.Kinds)
+			continue
+		}
+		seen[km.Kinds[0].String()] = true
+	}
+	if !seen["A"] || !seen["B"] {
+		t.Errorf("KindMatcher kinds = %v, want both %q and %q as separate conjuncts", seen, "A", "B")
+	}
+}
+
 // TestFromCypher_Rejects covers hand-written shapes FromCypher must refuse
 // without panicking, each falling outside the accepted shape for a distinct
 // reason. Two entries -- "WHERE with OR" and "WHERE with NOT" in the
@@ -586,6 +643,34 @@ func TestFromCypher_Rejects(t *testing.T) {
 		{
 			name: "unparseable text",
 			text: `this is not cypher at all {{{`,
+		},
+		{
+			// Critical finding 1a: id(s)=1 together with the node pattern's
+			// own kind label (s:User). resolveEndpoint (engine.go) resolves
+			// an endpoint with IDs set purely by looking those ids up,
+			// silently ignoring Kinds -- serving this would drop the :User
+			// constraint the query actually asked for -- so FromCypher must
+			// decline the whole query instead of guessing.
+			name: "id() endpoint mixed with a pattern kind label",
+			text: `MATCH p=shortestPath((s:User)-[:A*1..]->(t)) WHERE id(s) = 1 RETURN p`,
+		},
+		{
+			// Critical finding 1a's other shape: id(s)=1 together with a
+			// lifted property predicate (s.name = 'x') on the same
+			// endpoint. Same reasoning as above, but via Endpoint.Criteria
+			// (case 4) rather than a pattern-declared kind label.
+			name: "id() endpoint mixed with a lifted predicate",
+			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE id(s) = 1 AND s.name = 'x' RETURN p`,
+		},
+		{
+			// Critical finding 1b: two id() conjuncts for the same endpoint
+			// with DIFFERENT values. Cypher ANDs id(s)=1 with id(s)=2, which
+			// can never match anything; the old behavior appended both ids
+			// into Start.IDs, which resolveIDEndpoint then treats as
+			// "matches id 1 OR id 2" -- backwards from AND semantics -- so
+			// FromCypher must reject rather than serve that wrong answer.
+			name: "duplicate id() conjuncts with different values",
+			text: `MATCH p=shortestPath((s)-[:A*1..]->(t)) WHERE id(s) = 1 AND id(s) = 2 RETURN p`,
 		},
 	}
 

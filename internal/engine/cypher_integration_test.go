@@ -142,9 +142,28 @@ func TestTryCypherDifferential(t *testing.T) {
 	propEdgeKind := graph.StringKind("PropEdge")
 	propNodeKind := graph.StringKind("PropNode")
 
+	// Critical finding 1c's required differential coverage: a multi-label
+	// pattern endpoint ((s:MultiA:MultiB)) combined with a lifted predicate
+	// (forcing the Criteria path rather than the already-correct bitmap
+	// path) must AND its labels together, matching Cypher's real semantics,
+	// which the pg oracle enforces natively. multiKindEdge links two
+	// candidate starts to the same end at equal (one-hop) distance:
+	// multiMatchStart carries BOTH labels and must be the only start the
+	// engine considers; multiDecoyStart carries only one of the two labels
+	// and must be excluded. Before the fix, the engine's criteria() merged
+	// both labels into a single array-overlap KindMatcher (OR semantics),
+	// which would have wrongly admitted multiDecoyStart too -- since its
+	// path to the end ties multiMatchStart's in length, that bug would have
+	// produced a second, spurious allShortestPaths result the pg oracle
+	// (real Cypher AND semantics) never returns.
+	multiKindA := graph.StringKind("MultiKindA")
+	multiKindB := graph.StringKind("MultiKindB")
+	multiKindEdge := graph.StringKind("MultiKindEdge")
+
 	var (
 		notCoalesceEndID graph.ID
 		regexStartID     graph.ID
+		multiKindEndID   graph.ID
 	)
 	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		// NOT + COALESCE case: two candidate starts, one filtered out.
@@ -188,6 +207,29 @@ func TestTryCypherDifferential(t *testing.T) {
 			return err
 		}
 		regexStartID = startNode.ID
+
+		// Multi-label AND-semantics case: two candidate starts tied at
+		// distance 1 from the end, differing only in which labels they
+		// carry.
+		multiMatchStart, err := tx.CreateNode(graph.NewProperties().Set("name", "alice"), multiKindA, multiKindB)
+		if err != nil {
+			return err
+		}
+		multiDecoyStart, err := tx.CreateNode(graph.NewProperties().Set("name", "alice"), multiKindA)
+		if err != nil {
+			return err
+		}
+		multiEndNode, err := tx.CreateNode(graph.NewProperties(), propNodeKind)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(multiMatchStart.ID, multiEndNode.ID, multiKindEdge, graph.NewProperties()); err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(multiDecoyStart.ID, multiEndNode.ID, multiKindEdge, graph.NewProperties()); err != nil {
+			return err
+		}
+		multiKindEndID = multiEndNode.ID
 
 		return nil
 	}); err != nil {
@@ -233,6 +275,15 @@ func TestTryCypherDifferential(t *testing.T) {
 			// operatorNode must not appear as an end.
 			name: "regex endpoint predicate",
 			text: fmt.Sprintf(`MATCH p = shortestPath((s)-[:PropEdge*1..]->(e)) WHERE id(s) = %d AND e.name =~ '(?i)^admin.*$' RETURN p`, regexStartID),
+		},
+		{
+			// Critical finding 1c: a multi-label endpoint ((s:MultiKindA:
+			// MultiKindB)) whose Criteria path is exercised via a lifted
+			// predicate (s.name = 'alice') must require BOTH labels (AND),
+			// matching the pg oracle exactly -- excluding multiDecoyStart,
+			// which carries only MultiKindA.
+			name: "multi-label endpoint ANDs its kinds via the Criteria path",
+			text: fmt.Sprintf(`MATCH p = allShortestPaths((s:MultiKindA:MultiKindB)-[:MultiKindEdge*1..]->(e)) WHERE id(e) = %d AND s.name = 'alice' RETURN p`, multiKindEndID),
 		},
 	}
 
