@@ -17,7 +17,7 @@ func buildRandomGraph(t *testing.T, rng *rand.Rand, numNodes, numEdges int, maxK
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := 0; i < numNodes; i++ {
-		if err := b.AddNode(uint64(i), []snapshot.KindID{1}); err != nil {
+		if err := b.AddNode(uint64(i), []snapshot.KindID{1}, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}

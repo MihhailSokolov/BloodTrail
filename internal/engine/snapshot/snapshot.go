@@ -38,6 +38,12 @@ type Snapshot struct {
 	// Set once via Builder.SetKinds before Build; never nil after Build.
 	Kinds *KindTable
 
+	// Props holds every node's property bag (see props.go), plus the
+	// exact-match `objectid` index Cypher predicate evaluation looks nodes
+	// up by. Populated from each Builder.AddNode call's propsJSON; never nil
+	// after Build.
+	Props *PropStore
+
 	// DroppedEdges counts edges dropped at build time because one or both
 	// endpoints did not resolve to a staged node. See Builder.Build.
 	DroppedEdges int
@@ -155,6 +161,9 @@ func (s *Snapshot) ApproxBytes() uint64 {
 
 	if s.Kinds != nil {
 		total += s.Kinds.ApproxBytes()
+	}
+	if s.Props != nil {
+		total += s.Props.ApproxBytes()
 	}
 
 	return total

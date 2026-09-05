@@ -20,10 +20,10 @@ func buildTwoNodeSnapshot(t *testing.T, edgeID uint64, edgeKind snapshot.KindID)
 	t.Helper()
 
 	b := snapshot.NewBuilder(1)
-	if err := b.AddNode(1, []snapshot.KindID{100}); err != nil {
+	if err := b.AddNode(1, []snapshot.KindID{100}, nil); err != nil {
 		t.Fatalf("AddNode(1): %v", err)
 	}
-	if err := b.AddNode(2, []snapshot.KindID{200}); err != nil {
+	if err := b.AddNode(2, []snapshot.KindID{200}, nil); err != nil {
 		t.Fatalf("AddNode(2): %v", err)
 	}
 	b.AddEdge(edgeID, 1, 2, edgeKind)

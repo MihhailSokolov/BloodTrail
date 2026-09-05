@@ -29,6 +29,17 @@ type Builder struct {
 	kindsFlat   []KindID
 	kindOffsets []uint32 // len(ids)+1, into kindsFlat
 
+	// Per-node property bag staging (see props.go): propNames/propIDs intern
+	// property names Builder-wide; propEntries/propOffsets mirror
+	// kindsFlat/kindOffsets's flat-array-plus-offsets shape, one entry per
+	// node property; propArena is the shared byte arena that string and
+	// array/object property values are appended to.
+	propNames   []string
+	propIDs     map[string]PropID
+	propEntries []propEntry
+	propOffsets []uint32 // len(ids)+1, into propEntries
+	propArena   []byte
+
 	edges []stagedEdge
 
 	kindTable map[KindID]string // set via SetKinds; nil until then
@@ -39,19 +50,31 @@ func NewBuilder(graphID int32) *Builder {
 	return &Builder{
 		graphID:     graphID,
 		kindOffsets: []uint32{0},
+		propOffsets: []uint32{0},
 	}
 }
 
 // AddNode stages a node. databaseID must be strictly greater than every
 // previously added node's databaseID; otherwise AddNode returns an error and
 // the node is not staged.
-func (b *Builder) AddNode(databaseID uint64, kinds []KindID) error {
+//
+// propsJSON is the node's jsonb property bag as raw bytes (nil or empty,
+// i.e. "{}", means no properties); it is parsed and validated before any
+// Builder state is mutated, so a decode error (see parseNodeProps) also
+// leaves the node unstaged, exactly like the ascending-id check above.
+func (b *Builder) AddNode(databaseID uint64, kinds []KindID, propsJSON []byte) error {
 	if n := len(b.ids); n > 0 && databaseID <= b.ids[n-1] {
 		return fmt.Errorf("snapshot: AddNode: databaseID %d is not strictly greater than previous %d", databaseID, b.ids[n-1])
 	}
+	parsed, err := parseNodeProps(propsJSON)
+	if err != nil {
+		return fmt.Errorf("snapshot: AddNode: databaseID %d: %w", databaseID, err)
+	}
+
 	b.ids = append(b.ids, databaseID)
 	b.kindsFlat = append(b.kindsFlat, kinds...)
 	b.kindOffsets = append(b.kindOffsets, uint32(len(b.kindsFlat)))
+	b.commitNodeProps(parsed)
 	return nil
 }
 
@@ -174,6 +197,7 @@ func (b *Builder) Build() (*Snapshot, error) {
 		NodeKinds:    nodeKinds,
 		MaxKindID:    maxKind,
 		Kinds:        NewKindTable(b.kindTable),
+		Props:        b.buildPropStore(n),
 		DroppedEdges: dropped,
 		BuiltAt:      time.Now(),
 		idIndex:      idIndex,

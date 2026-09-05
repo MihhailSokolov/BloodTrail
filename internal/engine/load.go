@@ -106,7 +106,7 @@ func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 		if err := rows.Scan(&id, &kindIDs); err != nil {
 			return fmt.Errorf("engine: LoadSnapshot: scan node: %w", err)
 		}
-		if err := builder.AddNode(uint64(id), kindIDs); err != nil {
+		if err := builder.AddNode(uint64(id), kindIDs, nil); err != nil {
 			return fmt.Errorf("engine: LoadSnapshot: add node: %w", err)
 		}
 	}

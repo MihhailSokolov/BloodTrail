@@ -25,7 +25,7 @@ func buildFixture(t *testing.T) *snapshot.Snapshot {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := uint64(0); i < 10; i++ {
-		if err := b.AddNode(i, []snapshot.KindID{1}); err != nil {
+		if err := b.AddNode(i, []snapshot.KindID{1}, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}

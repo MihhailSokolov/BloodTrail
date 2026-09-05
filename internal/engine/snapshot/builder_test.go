@@ -16,7 +16,7 @@ func TestBuilderBuildsSnapshot(t *testing.T) {
 	}{
 		{100, []KindID{1}}, {200, []KindID{1, 2}}, {300, []KindID{2}}, {400, []KindID{1}},
 	} {
-		if err := b.AddNode(n.id, n.kinds); err != nil {
+		if err := b.AddNode(n.id, n.kinds, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -108,13 +108,13 @@ func TestBuilderBuildsSnapshot(t *testing.T) {
 
 func TestAddNodeOutOfOrder(t *testing.T) {
 	b := NewBuilder(1)
-	if err := b.AddNode(100, []KindID{1}); err != nil {
+	if err := b.AddNode(100, []KindID{1}, nil); err != nil {
 		t.Fatalf("AddNode(100) unexpected error: %v", err)
 	}
-	if err := b.AddNode(100, []KindID{1}); err == nil {
+	if err := b.AddNode(100, []KindID{1}, nil); err == nil {
 		t.Fatal("AddNode(100) again: want error for non-ascending id, got nil")
 	}
-	if err := b.AddNode(50, []KindID{1}); err == nil {
+	if err := b.AddNode(50, []KindID{1}, nil); err == nil {
 		t.Fatal("AddNode(50) after 100: want error for non-ascending id, got nil")
 	}
 }
@@ -124,7 +124,7 @@ func TestAddNodeOutOfOrder(t *testing.T) {
 // sequence of calls rather than a chain of if-err checks.
 func mustAddNode(t *testing.T, b *Builder, databaseID uint64, kinds []KindID) {
 	t.Helper()
-	if err := b.AddNode(databaseID, kinds); err != nil {
+	if err := b.AddNode(databaseID, kinds, nil); err != nil {
 		t.Fatalf("AddNode(%d): %v", databaseID, err)
 	}
 }

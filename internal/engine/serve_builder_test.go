@@ -85,7 +85,7 @@ func buildNodeSpecSnapshot(t *testing.T) *snapshot.Snapshot {
 		{5, []snapshot.KindID{kindUser, kindGroup}},
 	}
 	for _, n := range nodes {
-		if err := b.AddNode(n.id, n.kinds); err != nil {
+		if err := b.AddNode(n.id, n.kinds, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", n.id, err)
 		}
 	}
@@ -533,7 +533,7 @@ func TestTryNodeFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 
 	b := snapshot.NewBuilder(1)
 	for i := uint64(1); i <= nodeCount; i++ {
-		if err := b.AddNode(i, []snapshot.KindID{kindUser}); err != nil {
+		if err := b.AddNode(i, []snapshot.KindID{kindUser}, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}
@@ -745,7 +745,7 @@ func buildRelSpecSnapshot(t *testing.T) *snapshot.Snapshot {
 		{5, []snapshot.KindID{kindGroup}},
 	}
 	for _, n := range nodes {
-		if err := b.AddNode(n.id, n.kinds); err != nil {
+		if err := b.AddNode(n.id, n.kinds, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", n.id, err)
 		}
 	}
@@ -1528,7 +1528,7 @@ func TestTryRelFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 
 	b := snapshot.NewBuilder(1)
 	for i := uint64(1); i <= edgeCount+1; i++ {
-		if err := b.AddNode(i, []snapshot.KindID{kindUser}); err != nil {
+		if err := b.AddNode(i, []snapshot.KindID{kindUser}, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}

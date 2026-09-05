@@ -38,12 +38,12 @@ func buildStrategyFixture(t *testing.T) *snapshot.Snapshot {
 		if i == 6 {
 			kinds = append(kinds, node6MarkerKind)
 		}
-		if err := b.AddNode(i, kinds); err != nil {
+		if err := b.AddNode(i, kinds, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}
 	for i := uint64(10); i < uint64(10+SideBudget+1); i++ {
-		if err := b.AddNode(i, []snapshot.KindID{isolatedKind}); err != nil {
+		if err := b.AddNode(i, []snapshot.KindID{isolatedKind}, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}
@@ -333,7 +333,7 @@ func buildCapFixture(t *testing.T) *snapshot.Snapshot {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := uint64(0); i < 10; i++ {
-		if err := b.AddNode(i, []snapshot.KindID{1}); err != nil {
+		if err := b.AddNode(i, []snapshot.KindID{1}, nil); err != nil {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}
