@@ -185,3 +185,60 @@ func TestBuildDropsDanglingEdges(t *testing.T) {
 		t.Fatalf("EdgeCount=%d DroppedEdges=%d, want 0 and 2", s.EdgeCount(), s.DroppedEdges)
 	}
 }
+
+// TestBuildEdgeIDsWithSegmentReorder exercises a forward segment sort that
+// actually reorders elements (performs real Swaps) while verifying that
+// OutEdgeIDs remain correctly aligned with OutTargets. This test would fail
+// if forwardSegment.Swap forgot to swap the edgeIDs slice.
+func TestBuildEdgeIDsWithSegmentReorder(t *testing.T) {
+	b := NewBuilder(1)
+	mustAddNode(t, b, 10, []KindID{1})
+	mustAddNode(t, b, 20, []KindID{1})
+	mustAddNode(t, b, 30, []KindID{1})
+	// Add edges from node 10 in OUT-OF-ORDER fashion (by target density):
+	// Dense node IDs: 10->0, 20->1, 30->2
+	// Edges added: target=2, then target=1 (descending, will be reordered by sort)
+	b.AddEdge(400, 10, 30, 5) // 10->30 (target dense id 2)
+	b.AddEdge(401, 10, 20, 5) // 10->20 (target dense id 1)
+	// After sort by (target, kind), should be ordered as:
+	// edge 401->20, edge 400->30
+
+	s, err := b.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that the forward segment for node 10 (dense 0) is sorted by target.
+	targets, kinds := s.Out(0)
+	if !reflect.DeepEqual(targets, []NodeID{1, 2}) {
+		t.Fatalf("Out(0) targets = %v, want [1 2]", targets)
+	}
+	if !reflect.DeepEqual(kinds, []KindID{5, 5}) {
+		t.Fatalf("Out(0) kinds = %v, want [5 5]", kinds)
+	}
+
+	// Verify that OutEdgeIDs are correctly aligned with targets.
+	// After the segment sort reordered the (target, kind, edgeID) triplets,
+	// the edgeID should still correspond to the correct target.
+	outLo, outHi := s.OutOffsets[0], s.OutOffsets[1]
+	if outHi-outLo != 2 {
+		t.Fatalf("Out(0) has %d edges, want 2", outHi-outLo)
+	}
+	// outLo+0 should be edge 401 (target 1, i.e., node 20)
+	// outLo+1 should be edge 400 (target 2, i.e., node 30)
+	if s.OutEdgeIDs[outLo] != 401 || s.OutEdgeIDs[outLo+1] != 400 {
+		t.Fatalf("OutEdgeIDs for node 10 = [%d, %d], want [401, 400]", s.OutEdgeIDs[outLo], s.OutEdgeIDs[outLo+1])
+	}
+
+	// Verify EdgeByID can find both edges.
+	for id, wantTarget := range map[uint64]NodeID{401: 1, 400: 2} {
+		fwd, ok := s.EdgeByID(id)
+		if !ok {
+			t.Fatalf("EdgeByID(%d) not found", id)
+		}
+		gotTarget := s.OutTargets[fwd]
+		if gotTarget != wantTarget {
+			t.Fatalf("EdgeByID(%d) points to target %d, want %d", id, gotTarget, wantTarget)
+		}
+	}
+}
