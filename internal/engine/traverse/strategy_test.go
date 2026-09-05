@@ -51,13 +51,13 @@ func buildStrategyFixture(t *testing.T) *snapshot.Snapshot {
 		start, end uint64
 		kind       snapshot.KindID
 	}
-	for _, e := range []edge{
+	for i, e := range []edge{
 		{0, 1, 1}, {1, 2, 1}, {2, 3, 2},
 		{0, 4, 1}, {0, 5, 2}, {4, 6, 1}, {5, 6, 1},
 		{0, 6, 3},
 		{7, 8, 1}, {8, 7, 1}, {7, 9, 1},
 	} {
-		b.AddEdge(e.start, e.end, e.kind)
+		b.AddEdge(uint64(i), e.start, e.end, e.kind)
 	}
 	s, err := b.Build()
 	if err != nil {
@@ -338,12 +338,12 @@ func buildCapFixture(t *testing.T) *snapshot.Snapshot {
 		}
 	}
 	type edge struct{ start, end uint64 }
-	for _, e := range []edge{
+	for i, e := range []edge{
 		{0, 3}, {3, 2}, {0, 4}, {4, 2}, // root 0: two co-minimal paths via 3, 4
 		{1, 5}, {5, 2}, {1, 6}, {6, 2}, // root 1: two co-minimal paths via 5, 6
 		{7, 8}, {8, 2}, {7, 9}, {9, 2}, // root 7: two co-minimal paths via 8, 9
 	} {
-		b.AddEdge(e.start, e.end, 1)
+		b.AddEdge(uint64(i), e.start, e.end, 1)
 	}
 	s, err := b.Build()
 	if err != nil {

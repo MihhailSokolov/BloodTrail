@@ -20,11 +20,11 @@ func TestBuilderBuildsSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	b.AddEdge(100, 300, 11)
-	b.AddEdge(400, 100, 10)
-	b.AddEdge(100, 200, 10)
-	b.AddEdge(200, 300, 10)
-	b.AddEdge(100, 200, 11)
+	b.AddEdge(1, 100, 300, 11)
+	b.AddEdge(2, 400, 100, 10)
+	b.AddEdge(3, 100, 200, 10)
+	b.AddEdge(4, 200, 300, 10)
+	b.AddEdge(5, 100, 200, 11)
 	s, err := b.Build()
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
@@ -119,13 +119,69 @@ func TestAddNodeOutOfOrder(t *testing.T) {
 	}
 }
 
-func TestBuildUnknownEdgeEndpoint(t *testing.T) {
+// mustAddNode stages a node via AddNode and fails the test immediately if
+// staging it errors, so fixture setup in the tests below reads as a flat
+// sequence of calls rather than a chain of if-err checks.
+func mustAddNode(t *testing.T, b *Builder, databaseID uint64, kinds []KindID) {
+	t.Helper()
+	if err := b.AddNode(databaseID, kinds); err != nil {
+		t.Fatalf("AddNode(%d): %v", databaseID, err)
+	}
+}
+
+// TestBuildCarriesEdgeIDs checks that each edge's database id survives Build
+// aligned with its forward-CSR slot (OutEdgeIDs), and that a reverse-CSR
+// slot's InEdgeIdx resolves back to the correct forward slot (and therefore
+// the correct id) -- not just that the ids appear somewhere in the
+// snapshot. It also exercises EdgeByID end to end, including the
+// not-found case.
+func TestBuildCarriesEdgeIDs(t *testing.T) {
 	b := NewBuilder(1)
-	if err := b.AddNode(100, []KindID{1}); err != nil {
+	mustAddNode(t, b, 10, []KindID{1})
+	mustAddNode(t, b, 20, []KindID{1})
+	mustAddNode(t, b, 30, []KindID{2})
+	b.AddEdge(100, 10, 20, 5)
+	b.AddEdge(101, 10, 30, 6)
+	b.AddEdge(102, 30, 10, 5)
+
+	s, err := b.Build()
+	if err != nil {
 		t.Fatal(err)
 	}
-	b.AddEdge(100, 999, 10)
-	if _, err := b.Build(); err == nil {
-		t.Fatal("Build() with unknown endpoint: want error, got nil")
+	// Forward slots aligned: node 10's out edges sorted by (target, kind).
+	targets, kinds := s.Out(0)
+	if len(targets) != 2 || s.OutEdgeIDs[s.OutOffsets[0]] != 100 || s.OutEdgeIDs[s.OutOffsets[0]+1] != 101 {
+		t.Fatalf("forward edge ids misaligned: targets=%v kinds=%v ids=%v", targets, kinds, s.OutEdgeIDs)
+	}
+	// Reverse slot for node 10 (dense 0) points back at edge 102's forward slot.
+	inLo := s.InOffsets[0]
+	if got := s.OutEdgeIDs[s.InEdgeIdx[inLo]]; got != 102 {
+		t.Fatalf("reverse slot resolves edge id %d, want 102", got)
+	}
+	// EdgeByID finds every edge and rejects unknowns.
+	for _, id := range []uint64{100, 101, 102} {
+		if fwd, ok := s.EdgeByID(id); !ok || s.OutEdgeIDs[fwd] != id {
+			t.Fatalf("EdgeByID(%d) = (%d, %v)", id, fwd, ok)
+		}
+	}
+	if _, ok := s.EdgeByID(999); ok {
+		t.Fatal("EdgeByID(999) should not resolve")
+	}
+}
+
+// TestBuildDropsDanglingEdges checks that Build tolerates edges referencing
+// an unstaged node id -- on either end -- by dropping them and counting
+// them in DroppedEdges, rather than failing the whole build.
+func TestBuildDropsDanglingEdges(t *testing.T) {
+	b := NewBuilder(1)
+	mustAddNode(t, b, 10, []KindID{1})
+	b.AddEdge(100, 10, 999, 5) // end node never added
+	b.AddEdge(101, 999, 10, 5) // start node never added
+	s, err := b.Build()
+	if err != nil {
+		t.Fatalf("dangling edges must be dropped, not fail the build: %v", err)
+	}
+	if s.EdgeCount() != 0 || s.DroppedEdges != 2 {
+		t.Fatalf("EdgeCount=%d DroppedEdges=%d, want 0 and 2", s.EdgeCount(), s.DroppedEdges)
 	}
 }

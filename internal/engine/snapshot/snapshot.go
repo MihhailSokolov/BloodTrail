@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 package snapshot
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // Snapshot is an immutable, point-in-time copy of a graph laid out as
 // compressed sparse row (CSR) arrays for cache-friendly traversal.
@@ -17,15 +20,21 @@ type Snapshot struct {
 	OutOffsets []uint64 // len N+1
 	OutTargets []NodeID
 	OutKinds   []KindID
+	OutEdgeIDs []uint64 // database edge id per forward-CSR slot, aligned with OutTargets/OutKinds
 
 	InOffsets []uint64 // len N+1
 	InTargets []NodeID
 	InKinds   []KindID
+	InEdgeIdx []uint32 // per reverse-CSR slot, index of the same edge in the forward arrays: InTargets[i]'s edge is OutEdgeIDs[InEdgeIdx[i]], kind OutKinds[InEdgeIdx[i]]
 
 	KindOffsets []uint32 // len N+1, into NodeKinds
 	NodeKinds   []KindID
 
 	MaxKindID KindID
+
+	// DroppedEdges counts edges dropped at build time because one or both
+	// endpoints did not resolve to a staged node. See Builder.Build.
+	DroppedEdges int
 
 	BuiltAt time.Time
 
@@ -34,6 +43,11 @@ type Snapshot struct {
 
 	idIndex     map[uint64]NodeID
 	kindBitmaps map[KindID]*Bitset
+
+	// edgeIDPerm holds forward-CSR indices 0..EdgeCount()-1 permuted into
+	// ascending OutEdgeIDs order, letting EdgeByID binary-search by database
+	// edge id without a separate id->index map.
+	edgeIDPerm []uint32
 }
 
 // NodeCount returns the number of nodes in the snapshot.
@@ -64,6 +78,23 @@ func (s *Snapshot) Out(n NodeID) ([]NodeID, []KindID) {
 func (s *Snapshot) In(n NodeID) ([]NodeID, []KindID) {
 	lo, hi := s.InOffsets[n], s.InOffsets[n+1]
 	return s.InTargets[lo:hi], s.InKinds[lo:hi]
+}
+
+// EdgeByID looks up the forward-CSR slot of the edge with the given database
+// id via binary search over edgeIDPerm, a permutation of forward indices
+// sorted ascending by OutEdgeIDs and built once at Build time. If found, the
+// edge's target and kind are OutTargets[fwdIdx] and OutKinds[fwdIdx]
+// (OutEdgeIDs[fwdIdx] == id, by construction). ok is false if no edge in the
+// snapshot carries id.
+func (s *Snapshot) EdgeByID(id uint64) (fwdIdx uint64, ok bool) {
+	n := len(s.edgeIDPerm)
+	i := sort.Search(n, func(i int) bool {
+		return s.OutEdgeIDs[s.edgeIDPerm[i]] >= id
+	})
+	if i < n && s.OutEdgeIDs[s.edgeIDPerm[i]] == id {
+		return uint64(s.edgeIDPerm[i]), true
+	}
+	return 0, false
 }
 
 // NodesOfKind returns the bitset of dense NodeIDs carrying kind k. It is
@@ -100,11 +131,14 @@ func (s *Snapshot) ApproxBytes() uint64 {
 	total += uint64(len(s.OutOffsets)) * bytesPerUint64
 	total += uint64(len(s.OutTargets)) * bytesPerNodeID
 	total += uint64(len(s.OutKinds)) * bytesPerKindID
+	total += uint64(len(s.OutEdgeIDs)) * bytesPerUint64
 	total += uint64(len(s.InOffsets)) * bytesPerUint64
 	total += uint64(len(s.InTargets)) * bytesPerNodeID
 	total += uint64(len(s.InKinds)) * bytesPerKindID
+	total += uint64(len(s.InEdgeIdx)) * bytesPerUint32
 	total += uint64(len(s.KindOffsets)) * bytesPerUint32
 	total += uint64(len(s.NodeKinds)) * bytesPerKindID
+	total += uint64(len(s.edgeIDPerm)) * bytesPerUint32
 
 	total += uint64(len(s.idIndex)) * approxIdIndexEntryBytes
 

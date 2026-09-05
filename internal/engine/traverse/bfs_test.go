@@ -33,13 +33,13 @@ func buildFixture(t *testing.T) *snapshot.Snapshot {
 		start, end uint64
 		kind       snapshot.KindID
 	}
-	for _, e := range []edge{
+	for i, e := range []edge{
 		{0, 1, 1}, {1, 2, 1}, {2, 3, 2},
 		{0, 4, 1}, {0, 5, 2}, {4, 6, 1}, {5, 6, 1},
 		{0, 6, 3},
 		{7, 8, 1}, {8, 7, 1}, {7, 9, 1},
 	} {
-		b.AddEdge(e.start, e.end, e.kind)
+		b.AddEdge(uint64(i), e.start, e.end, e.kind)
 	}
 	s, err := b.Build()
 	if err != nil {

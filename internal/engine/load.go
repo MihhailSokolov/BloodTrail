@@ -85,9 +85,11 @@ func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 }
 
 // loadEdges streams every edge of graphID into builder. Edges may arrive in
-// any order; the Builder resolves and sorts them at Build time.
+// any order; the Builder resolves and sorts them at Build time, dropping
+// (and counting in the resulting Snapshot's DroppedEdges) any edge whose
+// endpoint doesn't resolve to a node loadNodes staged.
 func loadEdges(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.Builder) error {
-	rows, err := tx.Query(ctx, "SELECT start_id, end_id, kind_id FROM edge WHERE graph_id = $1", graphID)
+	rows, err := tx.Query(ctx, "SELECT id, start_id, end_id, kind_id FROM edge WHERE graph_id = $1", graphID)
 	if err != nil {
 		return fmt.Errorf("engine: LoadSnapshot: query edges: %w", err)
 	}
@@ -95,13 +97,13 @@ func loadEdges(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 
 	for rows.Next() {
 		var (
-			start, end int64
-			kind       snapshot.KindID
+			id, start, end int64
+			kind           snapshot.KindID
 		)
-		if err := rows.Scan(&start, &end, &kind); err != nil {
+		if err := rows.Scan(&id, &start, &end, &kind); err != nil {
 			return fmt.Errorf("engine: LoadSnapshot: scan edge: %w", err)
 		}
-		builder.AddEdge(uint64(start), uint64(end), kind)
+		builder.AddEdge(uint64(id), uint64(start), uint64(end), kind)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("engine: LoadSnapshot: edge rows: %w", err)

@@ -90,8 +90,8 @@ func buildSelfConflictFixture(t *testing.T) *snapshot.Snapshot {
 			t.Fatalf("AddNode(%d): %v", i, err)
 		}
 	}
-	b.AddEdge(0, 1, 1)
-	b.AddEdge(3, 4, 1)
+	b.AddEdge(1, 0, 1, 1)
+	b.AddEdge(2, 3, 4, 1)
 	s, err := b.Build()
 	if err != nil {
 		t.Fatalf("Build: %v", err)

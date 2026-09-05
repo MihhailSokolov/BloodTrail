@@ -25,7 +25,7 @@ func buildRandomGraph(t *testing.T, rng *rand.Rand, numNodes, numEdges int, maxK
 		start := uint64(rng.Intn(numNodes))
 		end := uint64(rng.Intn(numNodes))
 		kind := snapshot.KindID(1 + rng.Intn(int(maxKind)))
-		b.AddEdge(start, end, kind)
+		b.AddEdge(uint64(i), start, end, kind)
 	}
 	s, err := b.Build()
 	if err != nil {
