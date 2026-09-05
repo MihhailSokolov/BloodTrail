@@ -124,14 +124,14 @@ it, BloodTrail answers it from memory instead of PostgreSQL:
 - **Node queries** -- count, fetch ids, or fetch id-plus-kind listings -- for any query
   constrained by at least one node-kind filter. An `id()`-only filter has no kind to
   check freshness against, so it always delegates.
-- **Relationship queries** -- count, fetch ids, fetch (start, end) id pairs, and fetch
+- **Relationship queries** -- count, fetch ids, fetch (id, start, end) triples, and fetch
   id-plus-kind-annotated triples -- for any combination of an edge-kind filter and
   endpoint id/kind filters.
-- **Two row projections** that BloodHound's own traversal driver issues while walking
-  the graph: a bare (start, end) pair per edge, and a single traversal step's far
-  endpoint (id and kinds) alongside the traversed edge's own id and kind. Both can honor
-  the ascending-by-edge-id ordering that driver's paging relies on, whenever the scan is
-  anchored to one endpoint's id.
+- **Two row projections**: a bare (start, end) pair per edge from DAWGS's bulk directed-graph
+  fetch, and a single traversal step's far endpoint (id and kinds) alongside the traversed
+  edge's own id and kind, from BloodHound's own traversal driver. Both can honor the
+  ascending-by-edge-id ordering that driver's paging relies on, whenever the scan is anchored
+  to one endpoint's id.
 
 Property predicates -- anything that filters or projects a node or relationship's
 *property* rather than its id or kind -- always go to PostgreSQL: the replica holds no
@@ -157,7 +157,7 @@ always answers correctly" contract the path engine already has.
   topology: each edge's own database id (~8 bytes), a reverse-index pointer back to it
   (~4 bytes), and a small permutation array to look an edge up by that id (~4 bytes) --
   roughly 16 bytes per edge on top of milestone 2's layout. At 5 million nodes and 50
-  million edges, budget about 1.6 GB resident, against milestone 2's 0.6 GB.
+  million edges, budget about 1.7 GB resident, up from milestone 2's ~0.9 GB.
   `BLOODTRAIL_MEMORY_LIMIT` (see Configuration above) caps this the same way it always
   has: a rebuild that would exceed it is refused, and the engine keeps serving (or
   falling back from) whatever snapshot it already had.
