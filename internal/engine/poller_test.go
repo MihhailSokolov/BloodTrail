@@ -12,16 +12,20 @@ import (
 
 // TestDecideRebuild is the poller's truth table: every rule from the task
 // brief ((a) no snapshot yet, (b) a newer analysis stamp, (c) stale +
-// idle), the no-op case (fresh snapshot, unchanged stamp), a case where the
-// snapshot is stale but the datapipe is still busy (so (c) must not fire),
-// and the memory-limit-refusal-remembered interaction: a remembered refusal
-// suppresses retrying rules (a)/(b) against the same stamp, retrying resumes
-// once the stamp itself advances, and -- the fix for the "retries every tick
-// under a remembered refusal" finding -- a remembered refusal *also*
-// suppresses rule (c) until either the stamp advances or a new write lands
-// (the live write-generation counter advances past the generation the
-// refusal was recorded at): (i) same generation, no rebuild; (ii) generation
-// advanced, rebuild; (iii) stamp advanced, rebuild (generation unchanged).
+// idle, (d) stale + analyzing, capped per episode), the no-op case (fresh
+// snapshot, unchanged stamp), a case where the snapshot is stale but the
+// datapipe is still busy (so (c) must not fire), the no-ingest re-analysis
+// case (analyzing but still fresh, so (d) must not fire), rule (d)'s
+// per-episode cap, and the memory-limit-refusal-remembered interaction: a
+// remembered refusal suppresses retrying rules (a)/(b) against the same
+// stamp, retrying resumes once the stamp itself advances, and -- the fix for
+// the "retries every tick under a remembered refusal" finding -- a
+// remembered refusal *also* suppresses rules (c) and (d) until either the
+// stamp advances or a new write lands (the live write-generation counter
+// advances past the generation the refusal was recorded at): for rule (c),
+// (i) same generation, no rebuild; (ii) generation advanced, rebuild; (iii)
+// stamp advanced, rebuild (generation unchanged); rule (d) mirrors the same
+// three cases as (iv)-(vi).
 func TestDecideRebuild(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	t1 := t0.Add(time.Hour)
@@ -74,9 +78,16 @@ func TestDecideRebuild(t *testing.T) {
 			want:   false,
 		},
 		{
-			name:   "stale but not idle: datapipe still busy, (c) must not fire",
+			// status is "ingesting" here rather than "analyzing" precisely
+			// because "analyzing" is no longer a generic stand-in for "any
+			// non-idle status" now that rule (d) exists for it -- this case
+			// is about a status that is neither rule (c)'s idle nor rule
+			// (d)'s analyzing, so neither may fire; see "rule (d): stale
+			// snapshot, datapipe analyzing" below for the analyzing case,
+			// which now legitimately does rebuild.
+			name:   "stale but not idle or analyzing: datapipe still busy, neither (c) nor (d) fires",
 			st:     &pollState{},
-			status: "analyzing",
+			status: "ingesting",
 			stamp:  t0,
 			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
 			fresh:  false,
@@ -147,6 +158,96 @@ func TestDecideRebuild(t *testing.T) {
 			generation: 7,
 			want:       true,
 		},
+		{
+			// rule (d): the snapshot went stale while the datapipe is
+			// analyzing (not idle, so (c) does not apply). st is a fresh
+			// pollState -- analyzingRebuilds at its zero value, exactly what
+			// tick's resetAnalyzingRebuilds would leave behind either at the
+			// very start of a new analyzing episode, or once a prior episode
+			// has ended and a new one begun.
+			name:   "rule (d): stale snapshot, datapipe analyzing",
+			st:     &pollState{},
+			status: "analyzing",
+			stamp:  t0,
+			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			fresh:  false,
+			want:   true,
+		},
+		{
+			// The no-ingest re-analysis case: analysis re-ran without any
+			// ingest happening first, so nothing wrote and the snapshot
+			// stayed generation-fresh throughout. Rule (d) must not fire --
+			// there is nothing to catch up on -- and the snapshot already
+			// being served just keeps serving.
+			name:   "no-op: datapipe analyzing but snapshot still fresh (no-ingest re-analysis)",
+			st:     &pollState{},
+			status: "analyzing",
+			stamp:  t0,
+			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			fresh:  true,
+			want:   false,
+		},
+		{
+			// The cap: this episode has already used up both of its rule
+			// (d) rebuilds (maxAnalyzingRebuilds == 2), so a third stale
+			// reading during the same analyzing episode must not trigger
+			// another one -- otherwise derived-kind writes advancing the
+			// generation every tick for the rest of analysis would rebuild
+			// in a loop.
+			name:   "rule (d) capped: episode already used its two rebuilds",
+			st:     &pollState{analyzingRebuilds: maxAnalyzingRebuilds},
+			status: "analyzing",
+			stamp:  t0,
+			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			fresh:  false,
+			want:   false,
+		},
+		{
+			// (iv): rule (d)'s own memory-refusal interplay, mirroring (i)
+			// above but for status "analyzing" instead of "idle": a refusal
+			// recorded while rule (d) applied, with nothing changed since
+			// (same stamp, same generation), must stay suppressed.
+			// snap.AnalysisStamp == t0 < stamp keeps rule (b) textually
+			// true, but remembered(st, stamp) suppresses it too, isolating
+			// that this case is purely about rule (d).
+			name:       "(iv) remembered refusal during analyzing, no new writes: rule (d) suppressed",
+			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
+			status:     "analyzing",
+			stamp:      t1,
+			snap:       &snapshot.Snapshot{AnalysisStamp: t0},
+			fresh:      false,
+			generation: 7,
+			want:       false,
+		},
+		{
+			// (v): same remembered refusal as (iv), but a new write landed
+			// (generation advanced past refusedGeneration) -- rule (d)
+			// retries, mirroring rule (c)'s (ii).
+			name:       "(v) remembered refusal during analyzing, generation advanced: rule (d) retries",
+			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
+			status:     "analyzing",
+			stamp:      t1,
+			snap:       &snapshot.Snapshot{AnalysisStamp: t0},
+			fresh:      false,
+			generation: 8,
+			want:       true,
+		},
+		{
+			// (vi): same remembered refusal, generation unchanged, but the
+			// stamp itself advanced -- rule (d) retries via the
+			// stamp-advance half of refusalLifted, mirroring rule (c)'s
+			// (iii). snap.AnalysisStamp is set to the same new stamp so rule
+			// (b)'s own bare condition is false too, isolating that it is
+			// rule (d) unblocking this, not rule (b).
+			name:       "(vi) remembered refusal during analyzing, stamp advanced: rule (d) retries",
+			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
+			status:     "analyzing",
+			stamp:      t2,
+			snap:       &snapshot.Snapshot{AnalysisStamp: t2},
+			fresh:      false,
+			generation: 7,
+			want:       true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -160,12 +261,16 @@ func TestDecideRebuild(t *testing.T) {
 }
 
 // TestPickTrigger checks the trigger label the poller attributes to a tick
-// it has already decided (via decideRebuild) to rebuild for, including two
+// it has already decided (via decideRebuild) to rebuild for, including
 // remembered-refusal cases mirroring TestDecideRebuild: rule (b)'s textual
-// condition can hold even when a remembered refusal means rule (c) is
-// actually what justified rebuilding, and the label must reflect that --
+// condition can hold even when a remembered refusal means rule (c) or (d)
+// is actually what justified rebuilding, and the label must reflect that --
 // both when the refusal is lifted by a generation advance and when it is
-// lifted by a stamp advance.
+// lifted by a stamp advance. It also checks rule (d)'s own label
+// (triggerAnalyzing) and that rule (b)'s case still takes priority over it:
+// a stamp advance while status happens to read "analyzing" must still be
+// labeled analysis, not analyzing, since it was a completed analysis run
+// that justified the rebuild, not the analyzing-phase catch-up rule.
 func TestPickTrigger(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	t1 := t0.Add(time.Hour)
@@ -225,15 +330,95 @@ func TestPickTrigger(t *testing.T) {
 			snap:   &snapshot.Snapshot{AnalysisStamp: t2},
 			want:   triggerIdleStale,
 		},
+		{
+			name:   "stale + analyzing, stamp unchanged => analyzing",
+			st:     &pollState{},
+			status: "analyzing",
+			stamp:  t0,
+			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			want:   triggerAnalyzing,
+		},
+		{
+			// Mirrors the idle-status "remembered refusal ... => idle_stale"
+			// case above, but for status "analyzing": rule (b)'s bare
+			// condition holds textually (stamp t1 is after AnalysisStamp
+			// t0), but the remembered refusal suppresses it, so the label
+			// must fall through to rule (d)'s triggerAnalyzing, not
+			// misattribute the rebuild to rule (b).
+			name:   "remembered refusal during analyzing: rule (b) textually true but suppressed => analyzing, not analysis",
+			st:     &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
+			status: "analyzing",
+			stamp:  t1,
+			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			want:   triggerAnalyzing,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pickTrigger(tc.st, tc.stamp, tc.snap); got != tc.want {
+			if got := pickTrigger(tc.st, tc.stamp, tc.snap, tc.status); got != tc.want {
 				t.Fatalf("pickTrigger() = %q, want %q", got, tc.want)
 			}
 		})
 	}
+}
+
+// TestAnalyzingRebuildsBookkeeping unit-tests the two small pollState
+// mutations tick performs around rule (d) (see tick's doc comment):
+// resetAnalyzingRebuilds clears analyzingRebuilds the moment status stops
+// reading "analyzing" (so the next analyzing episode gets its own fresh
+// budget of maxAnalyzingRebuilds instead of inheriting whatever the
+// previous episode used up), and recordAnalyzingRebuild increments it
+// whenever a rebuild actually ran labeled triggerAnalyzing -- unconditionally
+// on the outcome, so a rebuild RebuildNow went on to refuse for exceeding
+// cfg.MemoryLimit still counts against the cap, same as an adopted one
+// would, and ignoring any other trigger label entirely.
+func TestAnalyzingRebuildsBookkeeping(t *testing.T) {
+	t.Run("resets when status leaves analyzing", func(t *testing.T) {
+		st := &pollState{analyzingRebuilds: 2}
+		resetAnalyzingRebuilds(st, "idle")
+		if st.analyzingRebuilds != 0 {
+			t.Fatalf("analyzingRebuilds = %d, want 0 after a non-analyzing tick", st.analyzingRebuilds)
+		}
+	})
+
+	t.Run("stays put while status is still analyzing", func(t *testing.T) {
+		st := &pollState{analyzingRebuilds: 1}
+		resetAnalyzingRebuilds(st, "analyzing")
+		if st.analyzingRebuilds != 1 {
+			t.Fatalf("analyzingRebuilds = %d, want unchanged 1 while status is still analyzing", st.analyzingRebuilds)
+		}
+	})
+
+	t.Run("increments on an analyzing-triggered rebuild", func(t *testing.T) {
+		st := &pollState{analyzingRebuilds: 0}
+		recordAnalyzingRebuild(st, triggerAnalyzing)
+		if st.analyzingRebuilds != 1 {
+			t.Fatalf("analyzingRebuilds = %d, want 1 after an analyzing-triggered rebuild", st.analyzingRebuilds)
+		}
+	})
+
+	t.Run("increments regardless of a subsequent memory-limit refusal", func(t *testing.T) {
+		// recordAnalyzingRebuild has no overBudget parameter at all: tick
+		// calls it whenever trigger == triggerAnalyzing, before it ever
+		// looks at e.overBudget.Load(), so a refused rebuild counts against
+		// the cap exactly like an adopted one -- this test just documents
+		// that recordAnalyzingRebuild's contract does not distinguish the
+		// two by construction.
+		st := &pollState{analyzingRebuilds: 1}
+		recordAnalyzingRebuild(st, triggerAnalyzing)
+		if st.analyzingRebuilds != 2 {
+			t.Fatalf("analyzingRebuilds = %d, want 2", st.analyzingRebuilds)
+		}
+	})
+
+	t.Run("ignores rebuilds triggered by other rules", func(t *testing.T) {
+		st := &pollState{analyzingRebuilds: 0}
+		recordAnalyzingRebuild(st, triggerIdleStale)
+		if st.analyzingRebuilds != 0 {
+			t.Fatalf("analyzingRebuilds = %d, want unchanged 0 for a non-analyzing trigger", st.analyzingRebuilds)
+		}
+	})
 }
 
 // The tests below exercise Start/Stop's goroutine lifecycle without a

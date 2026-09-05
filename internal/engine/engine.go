@@ -184,11 +184,12 @@ func (e *Engine) snapshotStillCurrent(snap *snapshot.Snapshot) bool {
 // engine's current snapshot.
 //
 // trigger names why this call is happening (triggerStartup, triggerAnalysis,
-// triggerIdleStale from the poller, or triggerManual for every other
-// caller); it is logged verbatim in the "trigger" attr on both the success
-// and memory-limit-refusal log lines below, so log consumers can tell a
-// poller-driven rebuild from a manual one. analysisStamp is stamped onto the
-// snapshot's AnalysisStamp field before the memory-limit check (so it is set
+// triggerIdleStale, or triggerAnalyzing from the poller, or triggerManual
+// for every other caller); it is logged verbatim in the "trigger" attr on
+// both the success and memory-limit-refusal log lines below, so log
+// consumers can tell a poller-driven rebuild from a manual one.
+// analysisStamp is stamped onto the snapshot's AnalysisStamp field before
+// the memory-limit check (so it is set
 // whether or not the snapshot is actually adopted -- irrelevant either way
 // for a dropped snapshot, but keeping the assignment unconditional avoids a
 // second, easy-to-forget branch); callers with no meaningful reading (every

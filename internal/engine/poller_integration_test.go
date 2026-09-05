@@ -85,6 +85,86 @@ func TestPollerDrivesRebuilds(t *testing.T) {
 	}
 }
 
+// TestPollerAnalyzingPhaseRebuild is rule (d)'s integration evidence: once a
+// snapshot exists and a write goes stale while the datapipe is currently
+// analyzing -- as opposed to idle, which is rule (c)'s territory -- the
+// poller rebuilds anyway, and the trigger it logs is triggerAnalyzing, not
+// some other rule's label. last_complete_analysis_at is left unchanged
+// across the status flip to "analyzing" specifically so rule (b) (a newer
+// stamp) cannot also explain the rebuild: this is the analysis-just-started
+// moment, before any completed-run stamp update, so only rule (d) can be
+// responsible for what gets observed here.
+func TestPollerAnalyzingPhaseRebuild(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	createDatapipeStatusTable(t, pool)
+
+	stamp := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO datapipe_status (singleton, status, updated_at, last_complete_analysis_at) VALUES (true, 'idle', now(), $1)`,
+		stamp,
+	); err != nil {
+		t.Fatalf("insert datapipe_status: %v", err)
+	}
+
+	handler := newCountingHandler()
+	eng := New(pgDriver, pool, Config{
+		Enabled:      true,
+		PollInterval: 50 * time.Millisecond,
+		Log:          slog.New(handler),
+	})
+
+	eng.Start(ctx)
+	defer eng.Stop()
+
+	// rule (a): no snapshot exists yet, so the first tick builds one.
+	// Counting from 0 (rather than reading rebuildAttempts only after
+	// waitForFreshSnapshot) sidesteps any question of whether Fresh()
+	// can observe the adopted snapshot a moment before rebuildAttempts'
+	// deferred increment runs (see RebuildNow's doc): waiting on the
+	// attempt count itself is unambiguous either way.
+	waitForAttempts(t, eng, 1, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale right after the startup build")
+	}
+
+	// A write invalidates the snapshot the poller just adopted, and the
+	// datapipe status flips to analyzing.
+	eng.NoteWrite(nil)
+	if _, err := pool.Exec(ctx,
+		`UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`,
+	); err != nil {
+		t.Fatalf("update datapipe_status: %v", err)
+	}
+
+	// Rule (d) must fire even though the datapipe is analyzing rather than
+	// idle: wait for a second real LoadSnapshot attempt, then confirm both
+	// that the snapshot is fresh again and that the rebuild which got us
+	// there was actually labeled triggerAnalyzing.
+	waitForAttempts(t, eng, 2, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale after rule (d) should have rebuilt during analyzing")
+	}
+	if n := handler.triggerCount(triggerAnalyzing); n != 1 {
+		t.Fatalf("snapshot-rebuilt records with trigger=%q = %d, want 1", triggerAnalyzing, n)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		eng.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Stop did not return within 1s")
+	}
+}
+
 // createDatapipeStatusTable creates the datapipe_status table with the
 // column names and constraint verified against upstream BloodHound
 // v9.6.0's migrations (cmd/api/src/database/migration/migrations/
@@ -144,15 +224,20 @@ const refusalWarnMsg = "bloodtrail: snapshot rebuild refused: exceeds memory lim
 
 // countingHandler is a minimal slog.Handler that counts log records by
 // message, so a test can assert how many times a specific event was logged
-// without parsing text output. Safe for concurrent use (the poller goroutine
-// logs while the test goroutine reads counts).
+// without parsing text output. It also tracks, per distinct "trigger" attr
+// value seen on a "bloodtrail: snapshot rebuilt" record, how many times that
+// trigger was logged -- so a test can tell which decideRebuild rule actually
+// drove an observed rebuild, not just that some rebuild happened. Safe for
+// concurrent use (the poller goroutine logs while the test goroutine reads
+// counts).
 type countingHandler struct {
-	mu     sync.Mutex
-	counts map[string]int
+	mu       sync.Mutex
+	counts   map[string]int
+	triggers map[string]int
 }
 
 func newCountingHandler() *countingHandler {
-	return &countingHandler{counts: make(map[string]int)}
+	return &countingHandler{counts: make(map[string]int), triggers: make(map[string]int)}
 }
 
 func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -161,6 +246,15 @@ func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.counts[r.Message]++
+
+	if r.Message == "bloodtrail: snapshot rebuilt" {
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "trigger" {
+				h.triggers[a.Value.String()]++
+			}
+			return true
+		})
+	}
 	return nil
 }
 
@@ -171,6 +265,14 @@ func (h *countingHandler) count(msg string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.counts[msg]
+}
+
+// triggerCount returns how many "bloodtrail: snapshot rebuilt" records
+// carried the given trigger attr value (see Handle).
+func (h *countingHandler) triggerCount(trigger string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.triggers[trigger]
 }
 
 // waitForAttempts polls eng.rebuildAttempts until it reaches at least want,
