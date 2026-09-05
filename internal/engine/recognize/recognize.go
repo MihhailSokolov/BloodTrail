@@ -128,6 +128,17 @@ func literalToID(expr cypher.Expression) (graph.ID, bool) {
 		return 0, false
 	}
 
+	return valueToID(value)
+}
+
+// valueToID converts an already-unwrapped Parameter/Literal payload (see
+// literalToID) into a graph.ID: accepted types are graph.ID, int64, and
+// uint64; anything else fails. Factored out of literalToID so builder.go's
+// matchIDIn can apply the same scalar-conversion rule to each element of a
+// []any id list (query.InIDs itself never produces one -- it always wraps a
+// single []graph.ID -- but a hand-built or differently-encoded id list
+// might) without duplicating the type switch.
+func valueToID(value any) (graph.ID, bool) {
 	switch v := value.(type) {
 	case graph.ID:
 		return v, true
