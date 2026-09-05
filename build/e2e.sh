@@ -103,6 +103,100 @@ served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true
 served_delta=$((served_after - served_before))
 [ "$served_delta" -ge 2 ] || { echo "engine did not serve both GET /api/v2/graphs/shortest-path and POST /api/v2/graphs/cypher (\"path engine served\" count $served_before -> $served_after, delta $served_delta); PostgreSQL answered instead" >&2; exit 1; }
 
+echo "==> Enabling debug logging for the builder-served log line"
+# internal/engine/serve_builder.go's servedOp logs "bloodtrail: builder
+# engine served" one level quieter (Debug) than the path engine's Info
+# "bloodtrail: path engine served" used above, deliberately, since a
+# structural node/relationship query is expected to run far more often than
+# a shortest-path one. Debug only surfaces once BLOODTRAIL_LOG_LEVEL=debug
+# reaches the bloodhound service, and settings.go's SettingsFromEnv (called
+# once from driver.go at driver construction) only ever reads that
+# environment variable at process start, so it takes a container recreate to
+# take effect -- there is no live-reconfigure path and no `bloodtrail
+# install` flag for it (see cmd/bloodtrail/main.go's flag set). The smallest
+# mechanism is editing the override file `bloodtrail install` already wrote
+# (compose.OverrideFileName, rendered by compose.Override.Render with the
+# `bhe_graph_driver` entry already in it) and reapplying it with the same
+# two -f files the installer itself merges via dockerx.Compose.WithExtraFile
+# -- `bloodtrail rollback` only ever os.Remove()s this file wholesale, so
+# editing its contents here does not confuse it.
+#
+# This restart is deliberately placed here, after the path phase, rather
+# than right after `install` returns (which would be earlier, and was
+# considered): the fixture's ingest+analysis already ran as part of
+# `install --admin-password`'s own smoke test (internal/installer's
+# runVerification), inside the single container instance install itself
+# started, and that run is what drives the "trigger":"analysis" snapshot
+# rebuild the wait loop above requires. Recreating the container between
+# install and that wait would both drop the pre-recreate container's log
+# history (docker compose logs only ever shows the current container
+# instance) and replace the required "analysis" trigger with a "startup"
+# one (rule (a) in internal/engine/poller.go's decideRebuild -- no snapshot
+# exists yet after a recreate), breaking the existing assertion above.
+# Restarting now, once that wait and the path-phase queries it fed have
+# already passed, costs only one more short wait for the API and the
+# engine's own (now startup-triggered) snapshot rebuild before the builder
+# phase queries it.
+OVERRIDE_FILE="$WORK/docker-compose.bloodtrail.yml"
+awk '{print} /^    environment:$/ { print "      - BLOODTRAIL_LOG_LEVEL=debug" }' "$OVERRIDE_FILE" > "$OVERRIDE_FILE.tmp"
+mv "$OVERRIDE_FILE.tmp" "$OVERRIDE_FILE"
+grep -q "BLOODTRAIL_LOG_LEVEL=debug" "$OVERRIDE_FILE"
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" -f "$OVERRIDE_FILE" up -d
+for _ in $(seq 1 90); do api_ready && break; sleep 5; done
+api_ready
+
+echo "==> Waiting for the path engine's snapshot to rebuild after the debug-logging restart"
+snapshot_rebuilt=false
+for _ in $(seq 1 24); do
+  bh_logs
+  if grep -q "snapshot rebuilt" "$WORK/bloodhound-logs.txt"; then snapshot_rebuilt=true; break; fi
+  sleep 5
+done
+[ "$snapshot_rebuilt" = true ] || { echo "the path engine never logged a rebuilt snapshot within 120s of the debug-logging restart" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+
+echo "==> Querying the builder engine directly"
+# The fixture's Domain Admins group (RID 512) lists the built-in
+# Administrator (RID 500) as a direct member -- see
+# internal/verify/fixture/groups.json's "-512" entry's "Members" array --
+# the same relationship the path phase above walked, this time served (or
+# not) through the builder-serving path (internal/engine/serve_builder.go)
+# instead of a shortest-path/cypher query.
+#
+# The route and its {object_id} semantics are pinned from upstream source,
+# not guessed: .build/upstream-v9.6.0/cmd/api/src/api/registration/v2.go
+# registers "GET /api/v2/groups/{object_id}/members" -> resources.
+# ListADGroupMembers; ad_related_entity.go's handleAdRelatedEntityQuery calls
+# queries.BuildEntityQueryParams, whose GetEntityObjectIDFromRequestPath
+# reads {object_id} as a plain string and GetEntityByObjectId matches it
+# straight against the node's objectid property -- so {object_id} is the AD
+# SID string, exactly what GROUP_SID already holds, not a database row id.
+#
+# The session token from the login above should still be valid (BloodHound
+# records sessions in PostgreSQL, not in the bloodhound process the restart
+# above recreated), but re-authenticate anyway rather than lean on that.
+LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
+TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+[ -n "$TOKEN" ] || { echo "could not obtain a session token for the builder phase" >&2; exit 1; }
+
+bh_logs
+served_before="$(grep -c "builder engine served" "$WORK/bloodhound-logs.txt" || true)"
+
+members_code="$(curl -s -o "$WORK/group-members.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/v2/groups/$GROUP_SID/members")"
+[ "$members_code" = "200" ] || { echo "GET /api/v2/groups/\$GROUP_SID/members returned HTTP $members_code" >&2; cat "$WORK/group-members.json" >&2; exit 1; }
+# The response envelope is {"data":[{"objectID":...,"name":...,"label":...,
+# "kinds":[...]}], "count", "limit", "skip"} -- see cmd/api/src/model/
+# model.go's PagedNodeListEntry (json tag "objectID", not "objectid") and
+# marshalling.go's ResponseWrapper.
+member_found="$(jq --arg sid "$USER_SID" '[.data[] | select(.objectID == $sid)] | length' "$WORK/group-members.json")"
+[ "$member_found" -ge 1 ] || { echo "GET /api/v2/groups/\$GROUP_SID/members did not include the RID-500 user $USER_SID" >&2; cat "$WORK/group-members.json" >&2; exit 1; }
+
+bh_logs
+served_after="$(grep -c "builder engine served" "$WORK/bloodhound-logs.txt" || true)"
+builder_served_delta=$((served_after - served_before))
+[ "$builder_served_delta" -ge 1 ] || { echo "the builder engine did not serve GET /api/v2/groups/\$GROUP_SID/members (\"builder engine served\" count $served_before -> $served_after, delta $builder_served_delta); PostgreSQL answered instead" >&2; exit 1; }
+
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"

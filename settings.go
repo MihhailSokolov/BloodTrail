@@ -18,7 +18,13 @@ import (
 const (
 	EnvSnapshotDir = "BLOODTRAIL_SNAPSHOT_DIR"
 	EnvMemoryLimit = "BLOODTRAIL_MEMORY_LIMIT"
-	EnvLogLevel    = "BLOODTRAIL_LOG_LEVEL"
+	// EnvLogLevel sets the minimum level BloodTrail's own log lines are
+	// guaranteed to be visible at, applied in Open via debugOverrideHandler
+	// (driver.go): it can only add visibility on top of whatever already
+	// configures slog.Default() (in production, BloodHound's own bhlog
+	// package and its independent log-level config), never suppress it.
+	// "debug" is what surfaces e.g. "bloodtrail: builder engine served".
+	EnvLogLevel = "BLOODTRAIL_LOG_LEVEL"
 	// EnvEngine toggles the in-memory path engine on or off. Accepts "on"
 	// (default) or "off", as well as true/false/1/0 (case-insensitive).
 	// When off, every read is delegated to PostgreSQL exactly as in the

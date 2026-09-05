@@ -61,6 +61,39 @@ func init() {
 	dawgs.Register(DriverName, Open)
 }
 
+// debugOverrideHandler lets BLOODTRAIL_LOG_LEVEL force additional log
+// levels through slog.Default()'s existing handler without narrowing it:
+// Enabled reports true whenever either the wrapped handler would already
+// accept the record, or the record's level meets settings.LogLevel.
+//
+// This is an OR, not a replacement, deliberately: settings.LogLevel
+// defaults to slog.LevelInfo -- the same default nearly every slog handler
+// ships with -- so the OR is a no-op whenever BLOODTRAIL_LOG_LEVEL is
+// unset, leaving the driver's logging exactly as whatever already
+// configured slog.Default() (in production, BloodHound's own bhlog package,
+// gated by its own independent log-level config; in tests,
+// installLogCapture in engine_serving_integration_test.go and its
+// staleness_integration_test.go counterpart, which set slog.Default() to a
+// Debug-level handler directly and must keep working unmodified by this).
+// Setting BLOODTRAIL_LOG_LEVEL=debug only ever adds visibility for
+// BloodTrail's own Debug-level lines (e.g. "bloodtrail: builder engine
+// served"); it can't be used to suppress logging BloodHound's own
+// configuration already enables, matching Settings' documented promise not
+// to touch BloodHound's configuration.
+//
+// Handle is left promoted from the embedded Handler: none of the standard
+// library handlers (nor bhlog's contextHandler, which BloodHound wraps them
+// in) re-check level inside Handle, so a record this Enabled waves through
+// is written unconditionally.
+type debugOverrideHandler struct {
+	slog.Handler
+	level slog.Level
+}
+
+func (h debugOverrideHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return level >= h.level || h.Handler.Enabled(ctx, level)
+}
+
 // Open is the dawgs.DriverConstructor for BloodTrail. It requires the same
 // dawgs.Config BloodHound builds for the PostgreSQL driver, pool included.
 func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
@@ -84,11 +117,13 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 		return nil, fmt.Errorf("bloodtrail: unexpected PostgreSQL driver type %T", backend)
 	}
 
+	logger := slog.New(debugOverrideHandler{Handler: slog.Default().Handler(), level: settings.LogLevel})
+
 	eng := engine.New(pgDriver, cfg.Pool, engine.Config{
 		Enabled:      settings.Engine,
 		PollInterval: settings.EnginePollInterval,
 		MemoryLimit:  settings.MemoryLimit,
-		Log:          slog.Default(),
+		Log:          logger,
 	})
 	// A driver-scoped background context, deliberately not ctx: the poller
 	// goroutine Start launches must outlive this Open call and keep running
@@ -101,7 +136,7 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 		mode = "engine"
 	}
 
-	slog.InfoContext(ctx, "BloodTrail driver active",
+	logger.InfoContext(ctx, "BloodTrail driver active",
 		slog.String("version", Version),
 		slog.String("mode", mode),
 		slog.String("backend", pg.DriverName),
