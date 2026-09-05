@@ -26,18 +26,25 @@ arrays, and a single CPU core sweeps every edge in under a second. See
 - BloodTrail is a DAWGS driver, selected with `graph_driver: "bloodtrail"`. BloodHound's
   ingest, analysis, API and UI are unchanged; they talk to the same `graph.Database`
   interface as before.
-- The driver keeps a replica of the graph in memory: dense ids, forward and reverse
-  adjacency with an edge kind per entry, kind bitmaps, columnar properties and property
-  indexes. Queries are executed against the replica by an interpreter over DAWGS's
-  Cypher syntax tree, which is the tree both BloodHound's Go query builder and its text
-  Cypher already produce.
-- PostgreSQL remains the system of record. Writes go to PostgreSQL first and are
-  applied to the replica on commit; on startup the replica is loaded from PostgreSQL or
-  from a snapshot file.
+- As of milestone 2, the driver keeps a replica of the graph's *topology* in memory:
+  dense ids, forward and reverse adjacency with an edge kind per entry, and kind
+  bitmaps -- exactly what the shortest-path queries described below need. It holds no
+  node or edge properties; a served result's properties are hydrated from PostgreSQL
+  per query instead. See [In-memory path engine](#in-memory-path-engine) for what is
+  actually served from the replica today.
+- PostgreSQL remains the system of record. Writes go to PostgreSQL first; the replica
+  itself is rebuilt wholesale from PostgreSQL by a poller (after every completed
+  analysis run, and again once the ingest/analysis pipeline goes idle following a
+  write) rather than updated write-through, and there is no snapshot-file restart yet.
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
   rollback.
+- **Planned, not yet built** (see [Roadmap](#roadmap)): columnar properties and
+  property indexes in the replica itself; an interpreter that executes queries beyond
+  shortest-path directly against DAWGS's Cypher syntax tree; write-through updates to
+  the replica on commit instead of a poller-driven rebuild; and loading/restoring the
+  replica from a snapshot file on startup.
 
 ## In-memory path engine
 
@@ -57,8 +64,9 @@ are correct regardless of the replica's state.
   always goes to PostgreSQL, exactly as in milestone 1.
 
 - **Freshness and fallback.** The engine keeps a compressed in-memory replica (node and edge
-  ids, kinds, and the properties path queries need), rebuilt from PostgreSQL after every
-  completed analysis run and again after a write once the ingest/analysis pipeline goes idle.
+  ids and kinds only -- no properties; a served result's properties are hydrated from
+  PostgreSQL per query), rebuilt from PostgreSQL after every completed analysis run and again
+  after a write once the ingest/analysis pipeline goes idle.
   A query is served from memory only if the engine is enabled, a snapshot exists, that snapshot
   is still current (no write has landed since it was built), the query's endpoints resolve
   inside it, and the traversal fits the request's own memory budget. Any of these failing --
@@ -158,7 +166,11 @@ v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
 ## Repository layout
 
 ```
-bench/csrbench/   CSR traversal micro-benchmark (self-contained Go module)
+internal/engine/    The in-memory path engine: snapshot rebuild/poller, endpoint
+                     resolution, traversal, and Cypher/Criteria recognition
+bench/csrbench/      CSR traversal micro-benchmark (self-contained Go module)
+bench/adgen/         Generates a synthetic AD-shaped graph and loads it into PostgreSQL
+bench/pathbench/     Benchmarks the in-memory path engine against a loaded graph
 ```
 
 ## Upstream versions
