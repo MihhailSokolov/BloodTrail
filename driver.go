@@ -61,18 +61,15 @@ func init() {
 	dawgs.Register(DriverName, Open)
 }
 
-// debugOverrideHandler lets BLOODTRAIL_LOG_LEVEL force additional log
-// levels through slog.Default()'s existing handler without narrowing it:
-// Enabled reports true whenever either the wrapped handler would already
-// accept the record, or the record's level meets settings.LogLevel.
+// debugOverrideHandler lets an explicitly-set BLOODTRAIL_LOG_LEVEL force
+// additional log levels through slog.Default()'s existing handler without
+// narrowing it: Enabled reports true whenever either the wrapped handler
+// would already accept the record, or the record's level meets h.level.
 //
-// This is an OR, not a replacement, deliberately: settings.LogLevel
-// defaults to slog.LevelInfo -- the same default nearly every slog handler
-// ships with -- so the OR is a no-op whenever BLOODTRAIL_LOG_LEVEL is
-// unset, leaving the driver's logging exactly as whatever already
-// configured slog.Default() (in production, BloodHound's own bhlog package,
-// gated by its own independent log-level config; in tests,
-// installLogCapture in engine_serving_integration_test.go and its
+// This is an OR, not a replacement, deliberately: it only ever widens
+// whatever already configures slog.Default() (in production, BloodHound's
+// own bhlog package, gated by its own independent log-level config; in
+// tests, installLogCapture in engine_serving_integration_test.go and its
 // staleness_integration_test.go counterpart, which set slog.Default() to a
 // Debug-level handler directly and must keep working unmodified by this).
 // Setting BLOODTRAIL_LOG_LEVEL=debug only ever adds visibility for
@@ -80,6 +77,16 @@ func init() {
 // served"); it can't be used to suppress logging BloodHound's own
 // configuration already enables, matching Settings' documented promise not
 // to touch BloodHound's configuration.
+//
+// buildLogger (below) is what makes "unset is a no-op" actually true: Open
+// only ever constructs a debugOverrideHandler when settings.LogLevelSet is
+// true. Without that gate, settings.LogLevel's zero-adjacent default of
+// slog.LevelInfo would itself act as an implicit floor -- silently
+// re-widening a deployment that turned its ambient logging down to Warn or
+// Error back up to Info for every BloodTrail line. This type's own Enabled
+// method has no way to tell "explicitly Info" apart from "defaulted to
+// Info", so that distinction has to be enforced by never constructing the
+// wrapper at all when it doesn't apply -- see Settings.LogLevelSet's doc.
 //
 // Handle is left promoted from the embedded Handler: none of the standard
 // library handlers (nor bhlog's contextHandler, which BloodHound wraps them
@@ -92,6 +99,34 @@ type debugOverrideHandler struct {
 
 func (h debugOverrideHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return level >= h.level || h.Handler.Enabled(ctx, level)
+}
+
+// WithAttrs and WithGroup re-wrap the derived handler so the override
+// survives deriving a child handler (e.g. a future cfg.Log.With(...)):
+// without these, the embedded slog.Handler's own WithAttrs/WithGroup would
+// return a plain, un-overridden handler, silently dropping
+// BLOODTRAIL_LOG_LEVEL's effect on anything logged through the derived
+// logger.
+func (h debugOverrideHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return debugOverrideHandler{Handler: h.Handler.WithAttrs(attrs), level: h.level}
+}
+
+func (h debugOverrideHandler) WithGroup(name string) slog.Handler {
+	return debugOverrideHandler{Handler: h.Handler.WithGroup(name), level: h.level}
+}
+
+// buildLogger builds the *slog.Logger Open hands to the engine, applying
+// debugOverrideHandler over base only when settings.LogLevelSet is true --
+// i.e. only when BLOODTRAIL_LOG_LEVEL was explicitly present and valid in
+// the environment. When it is false, base is used unwrapped: leaving
+// BLOODTRAIL_LOG_LEVEL unset must be a genuine no-op, never an implicit
+// "widen to Info" (see debugOverrideHandler's doc and
+// Settings.LogLevelSet's).
+func buildLogger(settings Settings, base slog.Handler) *slog.Logger {
+	if !settings.LogLevelSet {
+		return slog.New(base)
+	}
+	return slog.New(debugOverrideHandler{Handler: base, level: settings.LogLevel})
 }
 
 // Open is the dawgs.DriverConstructor for BloodTrail. It requires the same
@@ -117,7 +152,7 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 		return nil, fmt.Errorf("bloodtrail: unexpected PostgreSQL driver type %T", backend)
 	}
 
-	logger := slog.New(debugOverrideHandler{Handler: slog.Default().Handler(), level: settings.LogLevel})
+	logger := buildLogger(settings, slog.Default().Handler())
 
 	eng := engine.New(pgDriver, cfg.Pool, engine.Config{
 		Enabled:      settings.Engine,

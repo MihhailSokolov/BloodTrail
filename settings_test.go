@@ -25,6 +25,9 @@ func TestSettingsFromEnvDefaults(t *testing.T) {
 	if s.SnapshotDir != "" || s.MemoryLimit != 0 || s.LogLevel != slog.LevelInfo {
 		t.Fatalf("unexpected defaults: %+v", s)
 	}
+	if s.LogLevelSet {
+		t.Error("LogLevelSet = true with BLOODTRAIL_LOG_LEVEL unset, want false")
+	}
 	if s.Engine != true {
 		t.Errorf("Engine default = %v, want true (on by default)", s.Engine)
 	}
@@ -53,11 +56,32 @@ func TestSettingsFromEnvParsesAll(t *testing.T) {
 	if s.LogLevel != slog.LevelDebug {
 		t.Errorf("LogLevel = %v", s.LogLevel)
 	}
+	if !s.LogLevelSet {
+		t.Error("LogLevelSet = false with BLOODTRAIL_LOG_LEVEL=debug, want true")
+	}
 	if s.Engine != false {
 		t.Errorf("Engine = %v, want false", s.Engine)
 	}
 	if s.EnginePollInterval != 250*time.Millisecond {
 		t.Errorf("EnginePollInterval = %v, want 250ms", s.EnginePollInterval)
+	}
+}
+
+// TestSettingsFromEnvLogLevelSetTracksExplicitness exercises the case most
+// likely to regress silently: BLOODTRAIL_LOG_LEVEL=info parses to the exact
+// same LogLevel as leaving it unset (both are slog.LevelInfo), so
+// LogLevelSet -- not LogLevel -- is the only field Open (driver.go) can rely
+// on to tell "explicitly asked for Info" apart from "never set it".
+func TestSettingsFromEnvLogLevelSetTracksExplicitness(t *testing.T) {
+	s, err := SettingsFromEnv(lookupFrom(map[string]string{EnvLogLevel: "info"}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.LogLevel != slog.LevelInfo {
+		t.Errorf("LogLevel = %v, want Info", s.LogLevel)
+	}
+	if !s.LogLevelSet {
+		t.Error("LogLevelSet = false with BLOODTRAIL_LOG_LEVEL=info explicitly set, want true")
 	}
 }
 

@@ -74,3 +74,108 @@ func TestDebugOverrideHandlerIsAdditiveOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestDebugOverrideHandlerSurvivesWithAttrsAndWithGroup guards against a
+// future cfg.Log.With(...)/WithGroup(...) silently dropping
+// BLOODTRAIL_LOG_LEVEL's effect: without overriding WithAttrs/WithGroup,
+// the embedded slog.Handler's own implementations would return a plain,
+// un-overridden handler for the derived logger.
+func TestDebugOverrideHandlerSurvivesWithAttrsAndWithGroup(t *testing.T) {
+	ctx := context.Background()
+	inner := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn})
+	h := debugOverrideHandler{Handler: inner, level: slog.LevelDebug}
+
+	t.Run("WithAttrs", func(t *testing.T) {
+		derived := h.WithAttrs([]slog.Attr{slog.String("k", "v")})
+		if _, ok := derived.(debugOverrideHandler); !ok {
+			t.Fatalf("WithAttrs returned %T, want debugOverrideHandler", derived)
+		}
+		if !derived.Enabled(ctx, slog.LevelDebug) {
+			t.Error("Debug not enabled after WithAttrs; the override was dropped")
+		}
+	})
+
+	t.Run("WithGroup", func(t *testing.T) {
+		derived := h.WithGroup("g")
+		if _, ok := derived.(debugOverrideHandler); !ok {
+			t.Fatalf("WithGroup returned %T, want debugOverrideHandler", derived)
+		}
+		if !derived.Enabled(ctx, slog.LevelDebug) {
+			t.Error("Debug not enabled after WithGroup; the override was dropped")
+		}
+	})
+}
+
+// TestBuildLoggerOnlyWidensWhenExplicitlySet exercises buildLogger
+// (driver.go), which Open calls to decide whether to install
+// debugOverrideHandler at all. Settings.LogLevel defaults to slog.LevelInfo
+// whether or not BLOODTRAIL_LOG_LEVEL was ever set, so LogLevelSet is the
+// only signal buildLogger can use to tell "explicitly asked to widen"
+// apart from "never configured" -- getting this wrong would mean a
+// BloodHound deployment that turned its own logging down to Warn or Error
+// still gets BloodTrail's Info lines on every served query, purely because
+// Settings' zero-adjacent default happens to be Info.
+func TestBuildLoggerOnlyWidensWhenExplicitlySet(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unset BLOODTRAIL_LOG_LEVEL never widens an ambient warn-level handler", func(t *testing.T) {
+		settings, err := SettingsFromEnv(lookupFrom(nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if settings.LogLevelSet {
+			t.Fatalf("LogLevelSet = true with %s unset", EnvLogLevel)
+		}
+
+		ambient := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn})
+		logger := buildLogger(settings, ambient)
+		if logger.Handler().Enabled(ctx, slog.LevelInfo) {
+			t.Error("Info enabled with BLOODTRAIL_LOG_LEVEL unset and an ambient warn-level handler; unset must be a no-op")
+		}
+		if _, wrapped := logger.Handler().(debugOverrideHandler); wrapped {
+			t.Error("handler was wrapped in debugOverrideHandler despite LogLevelSet being false")
+		}
+	})
+
+	t.Run("explicit info widens an ambient warn-level handler", func(t *testing.T) {
+		settings, err := SettingsFromEnv(lookupFrom(map[string]string{EnvLogLevel: "info"}))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !settings.LogLevelSet {
+			t.Fatalf("LogLevelSet = false with %s=info", EnvLogLevel)
+		}
+
+		ambient := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn})
+		logger := buildLogger(settings, ambient)
+		if !logger.Handler().Enabled(ctx, slog.LevelInfo) {
+			t.Error("Info not enabled despite explicit BLOODTRAIL_LOG_LEVEL=info widening an ambient warn-level handler")
+		}
+	})
+
+	t.Run("explicit debug widens an ambient info-level handler", func(t *testing.T) {
+		settings, err := SettingsFromEnv(lookupFrom(map[string]string{EnvLogLevel: "debug"}))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		ambient := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo})
+		logger := buildLogger(settings, ambient)
+		if !logger.Handler().Enabled(ctx, slog.LevelDebug) {
+			t.Error("Debug not enabled despite explicit BLOODTRAIL_LOG_LEVEL=debug")
+		}
+	})
+
+	t.Run("explicit warn never narrows an ambient debug-level handler", func(t *testing.T) {
+		settings, err := SettingsFromEnv(lookupFrom(map[string]string{EnvLogLevel: "warn"}))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		ambient := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})
+		logger := buildLogger(settings, ambient)
+		if !logger.Handler().Enabled(ctx, slog.LevelDebug) {
+			t.Error("Debug disabled despite explicit BLOODTRAIL_LOG_LEVEL=warn on top of an ambient debug-level handler; explicit settings must never narrow")
+		}
+	})
+}

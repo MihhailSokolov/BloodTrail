@@ -22,8 +22,11 @@ const (
 	// guaranteed to be visible at, applied in Open via debugOverrideHandler
 	// (driver.go): it can only add visibility on top of whatever already
 	// configures slog.Default() (in production, BloodHound's own bhlog
-	// package and its independent log-level config), never suppress it.
-	// "debug" is what surfaces e.g. "bloodtrail: builder engine served".
+	// package and its independent log-level config), never suppress it. Open
+	// only installs that override when this variable is explicitly set
+	// (Settings.LogLevelSet) -- leaving it unset is a true no-op, not an
+	// implicit "widen to Info". "debug" is what surfaces e.g. "bloodtrail:
+	// builder engine served".
 	EnvLogLevel = "BLOODTRAIL_LOG_LEVEL"
 	// EnvEngine toggles the in-memory path engine on or off. Accepts "on"
 	// (default) or "off", as well as true/false/1/0 (case-insensitive).
@@ -47,8 +50,19 @@ type Settings struct {
 	SnapshotDir string
 	// MemoryLimit bounds the in-memory replica. Zero means unset.
 	MemoryLimit size.Size
-	// LogLevel for the driver's own logging.
+	// LogLevel for the driver's own logging. Defaults to slog.LevelInfo for
+	// display purposes (e.g. printing the effective settings), but that
+	// default carries no meaning on its own -- see LogLevelSet, which is
+	// what Open actually checks before treating this as an explicit choice.
 	LogLevel slog.Level
+	// LogLevelSet reports whether EnvLogLevel was actually present (and
+	// valid) in the environment, distinguishing "explicitly set to info"
+	// from "left unset" -- both of which otherwise leave LogLevel at its
+	// zero-adjacent default of slog.LevelInfo. Open (driver.go) only wraps
+	// slog.Default()'s handler in debugOverrideHandler when this is true;
+	// when false, BLOODTRAIL_LOG_LEVEL must be a complete no-op, even though
+	// LogLevel itself still reads as Info.
+	LogLevelSet bool
 	// Engine gates whether the in-memory path engine ever attempts to serve
 	// a query. Defaults to true (on); EnvEngine can turn it off.
 	Engine bool
@@ -85,6 +99,7 @@ func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 			return Settings{}, fmt.Errorf("%s: %w", EnvLogLevel, err)
 		}
 		settings.LogLevel = level
+		settings.LogLevelSet = true
 	}
 
 	if v, ok := lookup(EnvEngine); ok {
