@@ -123,11 +123,15 @@ type Step struct {
 // a `sym.objectid = <string-literal>` WHERE conjunct, the fast O(1)
 // PropStore.NodeByObjectID path. Predicates is every WHERE conjunct (or
 // inline-map-desugared equality, see addNodePattern) that Plan determined
-// touches this variable *alone* -- pushed here purely as an executor
+// touches this variable *alone* -- a REDUNDANT, additive copy of a subset of
+// what Part.Where already carries, pushed here purely as an executor
 // optimization (early per-candidate filtering before a full row is
-// assembled); Part.Where remains the complete, always-correct WHERE
-// expression regardless, so re-evaluating a pushed predicate there too is
-// redundant but never wrong.
+// assembled). Part.Where alone is always the complete, sufficient WHERE
+// expression: an executor that ignores Predicates entirely and evaluates
+// only Part.Where is slower, never wrong. An executor must always evaluate
+// Part.Where in full against every assembled row regardless of what
+// Predicates also duplicates for early filtering -- Predicates is never a
+// substitute for Where, only a hint layered on top of it.
 //
 // Kinds/IDs/ObjectIDAnchor are populated *only* from the node's own pattern
 // occurrences and from single-symbol id()/objectid WHERE conjuncts -- a
@@ -229,12 +233,19 @@ type WithClause struct {
 // entry and no Chains entry at all -- the executor's cue to run a plain
 // kind-bitmap-anchored scan for that symbol instead of a chain expansion).
 //
-// Where is the Part's *complete*, unmodified WHERE expression (every WHERE
-// clause from every ReadingClause in this Part, ANDed together) -- the
-// executor must evaluate this in full against every assembled row
-// regardless of what NodeConstraint.Predicates also duplicates for
-// early-filtering; Where is the correctness source of truth, Predicates is
-// purely an optimization. Where is nil when the Part has no WHERE at all.
+// Where is the Part's *complete and sufficient* WHERE expression: every
+// WHERE clause from every ReadingClause in this Part, ANDed together with
+// every inline node-pattern property map's desugared equality (see
+// addNodePattern/desugarPropertyMap) -- never merely "whatever was left
+// over after pushdown". The executor must evaluate this in full against
+// every assembled row; doing so is both necessary and sufficient to decide
+// row membership. NodeConstraint.Predicates duplicates a subset of these
+// same conjuncts (plus the same desugared equalities) purely so an executor
+// can filter a candidate early, before a full row is even assembled -- an
+// executor that ignores Predicates and evaluates only Where is slower,
+// never wrong; an executor must always evaluate Where in full regardless of
+// what it also did with Predicates. Where is nil when the Part has no WHERE
+// clause and no pattern in it carries an inline property map.
 //
 // With is non-nil exactly on a Part that is followed by another Part (i.e.
 // it is never set on Query.Parts' last element): it is the WITH clause that
@@ -316,6 +327,25 @@ type OrderKey struct {
 // entirely, or may ignore it and let Env's own cache do the work; either way
 // the compile-at-most-once guarantee already holds by the time Execute ever
 // sees the plan.
+//
+// Execution invariant this whole file's accept surface depends on (Tasks
+// 7-9 implement it, but Plan is written assuming it holds): a served
+// Query's results are fully materialized before any row is emitted to the
+// caller, and ANY evaluator error encountered anywhere during that
+// materialization -- ErrRuntimeCast, ErrCollation, ErrNotComparable,
+// ErrUnsupported, or any other eval.go error -- aborts the *whole* query,
+// which the engine then delegates to PostgreSQL in full; there is no
+// partial serving of a prefix of rows followed by a fallback for the rest.
+// This is why Plan is free to accept statically-untypeable constructs whose
+// safety can only be confirmed per-row at execution time (e.g.
+// `size(n.prop)` when n.prop might not be a list, or `x IN n.prop` when
+// n.prop might not be a list at all) -- accepting them is safe precisely
+// because a row that turns out to be untypeable never gets emitted on its
+// own; it instead aborts materialization and the engine delegates the
+// entire query to pg, which is always correct. A "serve what materialized
+// successfully, delegate only the rest" execution model would violate this
+// contract and require re-auditing every acceptance decision in this file
+// that currently relies on it.
 type Query struct {
 	Parts     []Part
 	Returning Projection
@@ -382,6 +412,18 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.Snapshot) (result *Query, ok bo
 		parts = append(parts, part)
 
 		if st.ret != nil {
+			if countShortestSteps(parts) > 1 {
+				// "more than one shortestPath/allShortestPaths pattern part
+				// per query" -- a conservative tightening: the corpus never
+				// needs more than one, and this planner has not verified how
+				// pg/dawgs' translation composes two independent shortest-
+				// path searches (each potentially with its own endpoint set)
+				// within one query, so it declines rather than guess. Scoped
+				// across every Part of the whole Query, not just one Part,
+				// since a two-Part (one-WITH-boundary) query could otherwise
+				// smuggle a second shortestPath past a per-Part-only check.
+				return nil, false
+			}
 			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, st.ret)
 			if !ok {
 				return nil, false
@@ -462,6 +504,23 @@ func countAliasSet(wc WithClause) map[string]bool {
 	return out
 }
 
+// countShortestSteps counts every Step across every given Part whose
+// Shortest is not ShortestNone -- i.e. every shortestPath()/
+// allShortestPaths() pattern part compiled so far, across the whole Query
+// (not just one Part), for Plan's "more than one shortestPath pattern part
+// per query" reject rule.
+func countShortestSteps(parts []Part) int {
+	n := 0
+	for _, p := range parts {
+		for _, step := range p.Chains {
+			if step.Shortest != ShortestNone {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // --- Symbol table --------------------------------------------------------
 
 // symKind classifies what a pattern variable's name is bound to, for
@@ -522,6 +581,18 @@ type partBuilder struct {
 	// HasExplicitEndpointInequality finalize pass.
 	shortestSteps []int
 
+	// desugaredEqualities accumulates one `sym.k = <literal>` Comparison per
+	// key of every inline node-pattern property map encountered while
+	// walking this Part's patterns (see addNodePattern/desugarPropertyMap),
+	// in pattern-then-sorted-key order. planPart folds these into
+	// whereConjuncts -- and therefore into the ordinary checkExpr/pushdown
+	// pipeline and ultimately Part.Where -- exactly like any WHERE-clause
+	// conjunct the query text wrote directly, so Part.Where stays complete
+	// and sufficient on its own; pushdown separately re-derives the
+	// redundant NodeConstraint.Predicates copy for these same conjuncts,
+	// same as it does for any other single-symbol conjunct.
+	desugaredEqualities []cypher.Expression
+
 	// touched is a scratch set, reset before each top-level WHERE conjunct
 	// or RETURN/WITH item is checked, recording which known symbols
 	// checkExpr's walk actually referenced -- the mechanism pushdown (WHERE
@@ -567,6 +638,11 @@ func planPart(snap *snapshot.Snapshot, regexes map[string]*regexp.Regexp, carrie
 			}
 		}
 	}
+
+	// Fold every inline-map-desugared equality into the same conjunct list
+	// a written-out WHERE clause would populate, so Part.Where ends up
+	// complete and sufficient by construction -- see Part's doc.
+	whereConjuncts = append(whereConjuncts, pb.desugaredEqualities...)
 
 	for _, conjunct := range whereConjuncts {
 		pb.touched = map[string]bool{}
@@ -641,18 +717,38 @@ func flattenTopLevelConjuncts(expr cypher.Expression) []cypher.Expression {
 
 // declareSymbol registers sym as kind, or -- if sym is already known within
 // this Part -- confirms it was declared with the *same* kind. This is what
-// implements "duplicate variable reuse... joins by identity": a pattern
-// variable bound more than once (e.g. `(a)-->(b), (b)-->(a)` reusing "a" and
-// "b", or the same node pattern appearing in two sequential MATCH clauses)
-// is supported, with the executor required to resolve every occurrence to
-// the *same* concrete node/edge -- but reusing a name across genuinely
-// different roles (a node pattern here, a relationship pattern there) is
-// rejected rather than silently picked one way.
+// implements "duplicate variable reuse... joins by identity" for node (and
+// path) variables: a node pattern variable bound more than once (e.g.
+// `(a)-->(b), (b)-->(a)` reusing "a" and "b", or the same node pattern
+// appearing in two sequential MATCH clauses) is supported, with the
+// executor required to resolve every occurrence to the *same* concrete
+// node -- but reusing a name across genuinely different roles (a node
+// pattern here, a relationship pattern there) is rejected rather than
+// silently picked one way.
+//
+// This identity-joining reuse is deliberately NOT extended to relationship
+// variables: buildStep binds an edge symbol via declareEdgeSymbol instead,
+// which rejects any second occurrence outright (this package implements no
+// relationship-uniqueness/per-row edge-identity tracking -- see buildStep's
+// doc).
 func (pb *partBuilder) declareSymbol(sym string, kind symKind) bool {
 	if existing, ok := pb.known[sym]; ok {
 		return existing == kind
 	}
 	pb.known[sym] = kind
+	return true
+}
+
+// declareEdgeSymbol registers sym as bound to a relationship pattern
+// occurrence, rejecting outright if sym already names *anything* (a prior
+// edge binding, or a node/path variable of the same name) -- see buildStep's
+// doc for why edge symbols do not get declareSymbol's node-friendly
+// identity-joining reuse.
+func (pb *partBuilder) declareEdgeSymbol(sym string) bool {
+	if _, exists := pb.known[sym]; exists {
+		return false
+	}
+	pb.known[sym] = symEdge
 	return true
 }
 
@@ -819,11 +915,17 @@ func (pb *partBuilder) addShortestPathPart(part *cypher.PatternPart) bool {
 // addNodePattern registers np's variable (or a fresh anonymous symbol) as a
 // node, merges its kind labels into that symbol's NodeConstraint (an
 // unresolvable kind name rejects the whole query), and -- if np carries an
-// inline property map -- desugars it into pushed equality predicates in
-// sorted-key order (the controller's pinned semantics: byte-identical
-// equality, same string-type guard StringEq already applies at eval time).
-// An inline map keyed by a $parameter, or whose *values* are anything but
-// literals, rejects (parameters anywhere; non-literal map values are not a
+// inline property map -- desugars it into `sym.k = <literal>` equality AST
+// nodes in sorted-key order (the controller's pinned semantics:
+// byte-identical equality, same string-type guard StringEq already applies
+// at eval time), queued on pb.desugaredEqualities for planPart to fold into
+// the ordinary WHERE-conjunct pipeline (and therefore into Part.Where, the
+// completeness contract Part's doc describes -- NOT appended to
+// NodeConstraint.Predicates directly here; pushdown does that redundantly,
+// same as for any other single-symbol WHERE conjunct, once these equalities
+// have been merged into whereConjuncts). An inline map keyed by a
+// $parameter, or whose *values* are anything but literals, rejects
+// (parameters anywhere; non-literal map values are not a
 // compile-time-knowable equality and are out of the matrix).
 func (pb *partBuilder) addNodePattern(np *cypher.NodePattern) (string, bool) {
 	sym := pb.symbolFor(np.Variable)
@@ -847,13 +949,19 @@ func (pb *partBuilder) addNodePattern(np *cypher.NodePattern) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		nc.Predicates = append(nc.Predicates, preds...)
+		pb.desugaredEqualities = append(pb.desugaredEqualities, preds...)
 	}
 	return sym, true
 }
 
 // desugarPropertyMap converts an inline `{k: v, ...}` node-pattern map into
-// one `sym.k = v` equality Comparison per key, in ascending key order.
+// one `sym.k = v` equality *cypher.Comparison AST node per key, in ascending
+// key order -- mirroring exactly the shape the dawgs frontend itself builds
+// for a written-out `WHERE sym.k = v` conjunct (a *cypher.PropertyLookup
+// over a *cypher.Variable, compared to a *cypher.Literal), so checkExpr's
+// validation and pushdown's pattern-matching (extractIDAnchor,
+// extractObjectIDAnchor, ...) treat a desugared equality identically to one
+// the query text wrote out by hand.
 func desugarPropertyMap(sym string, m cypher.MapLiteral) ([]cypher.Expression, bool) {
 	if len(m) == 0 {
 		return nil, true
@@ -893,6 +1001,17 @@ func desugarPropertyMap(sym string, m cypher.MapLiteral) ([]cypher.Expression, b
 // always rejects: edge property access/predicates are out of the matrix
 // entirely, and the snapshot has no edge property store to check an inline
 // map against even if it were desugared the way node patterns are.
+//
+// A non-anonymous edge symbol may bind exactly one Step: unlike a node
+// variable (see declareSymbol's doc on identity-joining node reuse), this
+// package does not implement Cypher's relationship-uniqueness semantics
+// (the executor has no per-row "which edges has this row already consumed"
+// tracking), so a second pattern occurrence of the same relationship
+// variable name -- whether in another step of the same chain or in an
+// entirely different pattern part -- rejects outright rather than silently
+// picking one occurrence or the other. This is a strict narrowing of
+// declareSymbol's general "same kind => same identity, allow it" rule,
+// deliberately bypassed here for edges specifically.
 func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.RelationshipPattern, shortest ShortestMode, pathSym string) (Step, bool) {
 	if rel.Properties != nil {
 		return Step{}, false
@@ -903,7 +1022,7 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 		edgeSym = rel.Variable.Symbol
 	}
 	if edgeSym != "" {
-		if !pb.declareSymbol(edgeSym, symEdge) {
+		if !pb.declareEdgeSymbol(edgeSym) {
 			return Step{}, false
 		}
 	}
@@ -931,6 +1050,30 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 			return Step{}, false
 		}
 		rng = &Range{Min: min, Max: max}
+	}
+
+	// shortestPath()/allShortestPaths() over a variable-length range is
+	// accepted only for the plain, unbounded-hop-count case (min exactly 1
+	// -- "as many hops as it takes, at least one"). Two narrower shapes are
+	// rejected here as a conservative tightening, both because the corpus
+	// never needs them and because the path-engine design this planner sits
+	// on top of only reasons about shortestPath's minimum as "1 or the
+	// zero-length special case", never an arbitrary floor:
+	//   - Range.Min > 1 (`*3..5` inside shortestPath): shortestPath already
+	//     finds the globally shortest trail; requiring it to additionally be
+	//     at least N>1 hops long is a shape no served query needs and one
+	//     this planner declines rather than risk misinterpreting.
+	//   - Range.Min == 0 (`*0..`, zero-length): a zero-length shortestPath
+	//     match (source == target, an empty path) is a degenerate case this
+	//     planner has not verified pg/dawgs' own shortestPath translation
+	//     handles the same way a plain var-length `*0..` chain does -- see
+	//     Plan's doc on the corpus's standalone (non-shortestPath) `*0..`
+	//     acceptance, which is unaffected by this rule.
+	// A plain (non-shortestPath) var-length pattern keeps its existing,
+	// unrestricted Min/Max acceptance -- this check applies only when
+	// shortest != ShortestNone.
+	if shortest != ShortestNone && rng != nil && rng.Min != 1 {
+		return Step{}, false
 	}
 
 	direction := rel.Direction
@@ -1692,6 +1835,13 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 
 	var items []ProjectionOutput
 	projectedAliases := map[string]bool{}
+	// projectedKinds records, for every RETURN alias, whether its own output
+	// is node/edge/path-valued (symNode/symEdge/symPath) or a plain scalar
+	// (symScalar, standing in here for "everything else this evaluator
+	// produces a plain float64/string/bool/nil for" -- a property lookup, a
+	// function call, arithmetic, a literal) -- see planOrder's doc for why
+	// this distinction matters.
+	projectedKinds := map[string]symKind{}
 
 	for _, raw := range proj.Items {
 		item, ok := raw.(*cypher.ProjectionItem)
@@ -1700,6 +1850,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 		}
 
 		pb.touched = map[string]bool{}
+		itemKind := symScalar
 		if pv, isVar := unwrapParens(item.Expression).(*cypher.Variable); isVar && pv != nil && pb.known[pv.Symbol] == symPath {
 			// Bare path-variable projection: see Part's doc and symPath's
 			// doc for why this is the one deliberate bypass of checkExpr --
@@ -1708,8 +1859,15 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 			// from the Step(s) carrying the matching PathSym instead of
 			// ever calling EvalValue for it.
 			pb.touched[pv.Symbol] = true
+			itemKind = symPath
 		} else if !pb.checkExpr(item.Expression) || !isValueShape(item.Expression) {
 			return Projection{}, nil, 0, -1, false
+		} else if isVar && pv != nil {
+			// A bare Variable's own projected kind is whatever it was bound
+			// to (symNode/symEdge/symScalar) -- checkExpr already confirmed
+			// it is known and not symCollectAlias/symPath (the symPath case
+			// is handled by the branch above).
+			itemKind = pb.known[pv.Symbol]
 		}
 
 		if !projectionTypingOK(item.Expression) {
@@ -1721,6 +1879,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 			return Projection{}, nil, 0, -1, false
 		}
 		projectedAliases[name] = true
+		projectedKinds[name] = itemKind
 
 		items = append(items, ProjectionOutput{
 			Alias:        name,
@@ -1729,7 +1888,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 		})
 	}
 
-	orderKeys, ok := planOrder(proj.Order, projectedAliases, countAliases)
+	orderKeys, ok := planOrder(proj.Order, projectedKinds, countAliases)
 	if !ok {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -1953,7 +2112,19 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 // ORDER BY adminCount DESC` shape). Anything else (a property lookup, a
 // function call, arithmetic, an unrelated symbol) rejects -- "ORDER BY
 // expressions other than projected aliases/ids/count".
-func planOrder(order *cypher.Order, projectedAliases, countAliases map[string]bool) ([]OrderKey, bool) {
+//
+// A projected alias must additionally be scalar-valued: projectedKinds
+// records each RETURN alias's own kind (symNode/symEdge/symPath for a bare
+// node/edge/path-variable projection, symScalar for everything else --
+// property lookups, function calls, arithmetic, literals). eval.go's
+// comparison machinery (evalComparison/CompareValues) has no ordering over a
+// node's/edge's full property-map value or a path -- there is no
+// "less-than" between two nodes -- so ORDER BY on a node/edge/path-valued
+// alias is rejected here rather than accepted and left to guarantee an
+// executor-time ErrUnsupported/ErrNotComparable on the very first sort
+// comparison. A COUNT alias (countAliases) is always scalar by construction
+// and bypasses this check.
+func planOrder(order *cypher.Order, projectedKinds map[string]symKind, countAliases map[string]bool) ([]OrderKey, bool) {
 	if order == nil {
 		return nil, true
 	}
@@ -1966,7 +2137,12 @@ func planOrder(order *cypher.Order, projectedAliases, countAliases map[string]bo
 		if !ok || v == nil {
 			return nil, false
 		}
-		if !projectedAliases[v.Symbol] && !countAliases[v.Symbol] {
+		if countAliases[v.Symbol] {
+			keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})
+			continue
+		}
+		kind, isProjected := projectedKinds[v.Symbol]
+		if !isProjected || kind == symNode || kind == symEdge || kind == symPath {
 			return nil, false
 		}
 		keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})

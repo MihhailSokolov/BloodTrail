@@ -273,9 +273,121 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "datetime with argument rejected", cypher: `MATCH (n:User) WHERE n.x < datetime('2024-01-01').epochseconds RETURN n`, want: false},
 		{name: "params anywhere in return", cypher: `MATCH (n:User) RETURN $x`, want: false},
 		{name: "bare comparison as return value rejected", cypher: `MATCH (n:User) RETURN n.x = 5 AS flag`, want: false},
+
+		// ORDER BY on a node/edge/path-valued projected alias rejects
+		// (finding 2): eval.go has no ordering over a node's/edge's/path's
+		// value, only over the plain scalars a property lookup/function
+		// call/arithmetic/literal produces.
+		{name: "order by node alias rejected", cypher: `MATCH (n:User) RETURN n ORDER BY n`, want: false},
+		{name: "order by edge alias rejected", cypher: `MATCH (a:User)-[r:X]->(b:User) RETURN r ORDER BY r`, want: false},
+		{name: "order by path alias rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) RETURN p ORDER BY p`, want: false},
+		{name: "order by scalar alias ok", cypher: `MATCH (n:User) RETURN n.name AS nm ORDER BY nm`, want: true},
+
+		// shortestPath range restrictions (finding 3): a conservative
+		// tightening over plain var-length, which keeps its existing,
+		// unrestricted Min/Max acceptance.
+		{name: "shortestPath range min>1 rejected", cypher: `MATCH p = shortestPath((s)-[:X*3..5]->(t:User)) RETURN p`, want: false},
+		{name: "shortestPath zero-length range rejected", cypher: `MATCH p = shortestPath((s)-[:X*0..]->(t:User)) RETURN p`, want: false},
+		{name: "plain var-length min>1 still accepted", cypher: `MATCH (n:User)-[:X*3..5]->(m:User) RETURN n`, want: true},
+		{
+			name:   "more than one shortestPath pattern part per query rejected",
+			cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t:User)), q = shortestPath((a)-[:X*1..]->(b:User)) RETURN p`,
+			want:   false,
+		},
+		{
+			name:   "more than one shortestPath across a WITH boundary rejected",
+			cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t:User)) WITH p MATCH q = shortestPath((a)-[:X*1..]->(b:User)) RETURN q`,
+			want:   false,
+		},
+
+		// Edge symbol reuse across steps/pattern parts rejects (finding 4):
+		// this package implements no relationship-uniqueness/per-row
+		// edge-identity tracking, unlike node variable reuse (which stays
+		// supported, joining by identity).
+		{name: "edge symbol reused across steps in one chain rejected", cypher: `MATCH (a:User)-[r:X]->(b:User)-[r:X]->(c:User) RETURN a`, want: false},
+		{name: "edge symbol reused across pattern parts rejected", cypher: `MATCH (a:User)-[r:X]->(b:User) MATCH (c:User)-[r:X]->(d:User) RETURN a`, want: false},
 	}
 
 	runPlanGolden(t, snap, cases)
+}
+
+// TestPlanInlineMapDesugarsIntoWhere is the golden test for finding 1
+// (fail-unsafe IR contract): an inline node-pattern property map must
+// desugar into a real equality conjunct on Part.Where itself, not merely
+// into NodeConstraint.Predicates -- Part.Where must be complete and
+// sufficient on its own, per Part's doc. This pins that contract by
+// evaluating the compiled Where expression directly via EvalPredicate
+// against both a matching and a non-matching node, exactly as an executor
+// that ignores NodeConstraint.Predicates entirely (using Where alone) would.
+func TestPlanInlineMapDesugarsIntoWhere(t *testing.T) {
+	snap := testSnapshot(t, nil)
+
+	rq, err := frontend.ParseCypher(frontend.NewContext(), `MATCH (n:User {name:'X'}) RETURN n`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	q, ok := Plan(rq, snap)
+	if !ok {
+		t.Fatalf("Plan() ok = false, want true")
+	}
+	if len(q.Parts) != 1 {
+		t.Fatalf("len(q.Parts) = %d, want 1", len(q.Parts))
+	}
+	part := q.Parts[0]
+	if part.Where == nil {
+		t.Fatal("Part.Where is nil, want the desugared `n.name = 'X'` equality")
+	}
+
+	// NodeConstraint.Predicates should also carry the same equality
+	// redundantly (an executor optimization) -- but Part.Where alone must
+	// already be sufficient, which is what this test actually exercises.
+	nc, ok := part.Nodes["n"]
+	if !ok || len(nc.Predicates) == 0 {
+		t.Fatal("NodeConstraint.Predicates is empty, want the redundant pushed equality")
+	}
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(map[snapshot.KindID]string{0: "User"})
+	if err := b.AddNode(1, []snapshot.KindID{0}, []byte(`{"name":"X"}`)); err != nil {
+		t.Fatalf("AddNode(1): %v", err)
+	}
+	if err := b.AddNode(2, []snapshot.KindID{0}, []byte(`{"name":"Y"}`)); err != nil {
+		t.Fatalf("AddNode(2): %v", err)
+	}
+	evalSnap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	env := &Env{Snap: evalSnap}
+
+	matchID, ok := evalSnap.Dense(1)
+	if !ok {
+		t.Fatal("Dense(1) not found")
+	}
+	nonMatchID, ok := evalSnap.Dense(2)
+	if !ok {
+		t.Fatal("Dense(2) not found")
+	}
+
+	matchRow := NewRow()
+	matchRow.SetNode("n", matchID)
+	got, err := EvalPredicate(env, matchRow, part.Where)
+	if err != nil {
+		t.Fatalf("EvalPredicate(matching node): %v", err)
+	}
+	if got != TriTrue {
+		t.Fatalf("EvalPredicate(matching node) = %s, want %s", got, TriTrue)
+	}
+
+	nonMatchRow := NewRow()
+	nonMatchRow.SetNode("n", nonMatchID)
+	got, err = EvalPredicate(env, nonMatchRow, part.Where)
+	if err != nil {
+		t.Fatalf("EvalPredicate(non-matching node): %v", err)
+	}
+	if got != TriFalse {
+		t.Fatalf("EvalPredicate(non-matching node) = %s, want %s", got, TriFalse)
+	}
 }
 
 // TestPlanNeverPanics feeds Plan a handful of nil/degenerate inputs to
