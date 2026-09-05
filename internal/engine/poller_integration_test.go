@@ -165,6 +165,161 @@ func TestPollerAnalyzingPhaseRebuild(t *testing.T) {
 	}
 }
 
+// TestPollerAnalyzingCapAndReset drives rule (d)'s cap and reset (see
+// maxAnalyzingRebuilds, resetAnalyzingRebuilds, recordAnalyzingRebuild in
+// poller.go) through the real poll loop, rather than through decideRebuild
+// or the counter functions directly: TestPollerAnalyzingPhaseRebuild already
+// proves rule (d) fires once during an analyzing episode, but neither it nor
+// any unit test exercises tick's own wiring of
+// resetAnalyzingRebuilds/recordAnalyzingRebuild -- deleting either call from
+// tick leaves every other test in the suite green.
+//
+// The scenario: reach the cap (two rebuilds in one analyzing episode, then a
+// third write that must NOT rebuild), then prove the cap is per-episode by
+// leaving analyzing and coming back.
+//
+// Rule (c) (stale + idle) is territory this test cannot avoid touching: by
+// the time the cap is reached, the snapshot is deliberately left stale (an
+// uncounted write beyond the cap), and leaving "analyzing" for "idle" from
+// there hits rule (c) immediately. Rather than contort the write timing to
+// dodge it, this test accounts for that extra idle_stale rebuild explicitly
+// (see the comment at that step) -- it is also what resets
+// st.analyzingRebuilds for the final step to observe.
+func TestPollerAnalyzingCapAndReset(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	createDatapipeStatusTable(t, pool)
+
+	// last_complete_analysis_at is never touched again after this insert:
+	// keeping it fixed for the whole test means stamp.After(snap.AnalysisStamp)
+	// (rule (b)) never becomes true, so every rebuild this test observes is
+	// unambiguously rule (c) or rule (d), never rule (b).
+	stamp := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO datapipe_status (singleton, status, updated_at, last_complete_analysis_at) VALUES (true, 'idle', now(), $1)`,
+		stamp,
+	); err != nil {
+		t.Fatalf("insert datapipe_status: %v", err)
+	}
+
+	const pollInterval = 25 * time.Millisecond
+	handler := newCountingHandler()
+	eng := New(pgDriver, pool, Config{
+		Enabled:      true,
+		PollInterval: pollInterval,
+		Log:          slog.New(handler),
+	})
+
+	eng.Start(ctx)
+	defer eng.Stop()
+
+	// rule (a): no snapshot exists yet, so the first tick builds one.
+	waitForAttempts(t, eng, 1, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale right after the startup build")
+	}
+
+	// --- Drive the cap: two analyzing-triggered rebuilds, then a third
+	// write that must be refused by the cap. ---
+
+	// First write invalidates the snapshot, then the datapipe flips to
+	// analyzing: rule (d) must fire (1st rebuild of the episode).
+	eng.NoteWrite(nil)
+	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`); err != nil {
+		t.Fatalf("flip to analyzing: %v", err)
+	}
+	waitForAttempts(t, eng, 2, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale after the first analyzing rebuild")
+	}
+	if n := handler.triggerCount(triggerAnalyzing); n != 1 {
+		t.Fatalf("triggerAnalyzing count = %d, want 1 after the first analyzing rebuild", n)
+	}
+
+	// A second write, still analyzing: rule (d) fires again (2nd rebuild,
+	// cap now at 2/2 for this episode).
+	eng.NoteWrite(nil)
+	waitForAttempts(t, eng, 3, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale after the second analyzing rebuild")
+	}
+	if n := handler.triggerCount(triggerAnalyzing); n != 2 {
+		t.Fatalf("triggerAnalyzing count = %d, want 2 after the second analyzing rebuild (cap reached)", n)
+	}
+
+	// A third write, still analyzing and already at 2/2: rule (d) must NOT
+	// fire again. Bounded negative wait (a handful of poll intervals, not
+	// the 2s positive-wait budget used elsewhere) rather than an unbounded
+	// one -- generous relative to pollInterval to avoid flaking on scheduler
+	// jitter, but still short enough that this assertion resolves quickly
+	// when the cap is (correctly) holding, and fails promptly when it isn't.
+	eng.NoteWrite(nil)
+	time.Sleep(6 * pollInterval)
+	if n := eng.rebuildAttempts.Load(); n != 3 {
+		t.Fatalf("rebuildAttempts = %d after a third write while analyzing and capped, want exactly 3 (rule (d) must not exceed maxAnalyzingRebuilds)", n)
+	}
+	if n := handler.triggerCount(triggerAnalyzing); n != 2 {
+		t.Fatalf("triggerAnalyzing count = %d after the capped third write, want still 2", n)
+	}
+	if _, fresh := eng.Fresh(); fresh {
+		t.Fatalf("Fresh() reports fresh after the capped third write; it must still be stale since rule (d) refused to rebuild")
+	}
+
+	// --- Prove the cap is per-episode: leave analyzing and come back. ---
+
+	// The snapshot is still stale from the capped write above. Flipping to
+	// idle from here also satisfies rule (c) (stale + idle), so this step
+	// deliberately expects one more rebuild of its own -- an idle_stale one,
+	// not a bug and not what this section is testing for. It is also what
+	// resets st.analyzingRebuilds (tick calls resetAnalyzingRebuilds on
+	// every non-analyzing status, unconditionally on whether a rebuild
+	// happens), which the final step below depends on.
+	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'idle', updated_at = now() WHERE singleton`); err != nil {
+		t.Fatalf("flip to idle: %v", err)
+	}
+	waitForAttempts(t, eng, 4, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale after rule (c)'s idle rebuild")
+	}
+	if n := handler.triggerCount(triggerIdleStale); n != 1 {
+		t.Fatalf("triggerIdleStale count = %d, want 1 (rule (c) firing once while idle)", n)
+	}
+
+	// A fresh write plus flipping back to analyzing, with the snapshot
+	// stale: if resetAnalyzingRebuilds had not cleared st.analyzingRebuilds
+	// while status read "idle" above, the counter would still read 2 (last
+	// episode's cap) and rule (d) would refuse to fire here, leaving the
+	// snapshot stale and this wait timing out. Observing a rebuild (and a
+	// fresh snapshot, and a third triggerAnalyzing record) proves the reset
+	// actually ran and this analyzing episode gets its own fresh budget.
+	eng.NoteWrite(nil)
+	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`); err != nil {
+		t.Fatalf("flip back to analyzing: %v", err)
+	}
+	waitForAttempts(t, eng, 5, 2*time.Second)
+	if _, fresh := eng.Fresh(); !fresh {
+		t.Fatalf("Fresh() reports stale after the reset episode's rebuild; resetAnalyzingRebuilds may not have cleared the counter")
+	}
+	if n := handler.triggerCount(triggerAnalyzing); n != 3 {
+		t.Fatalf("triggerAnalyzing count = %d, want 3 (a fresh episode's first rebuild after the reset)", n)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		eng.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Stop did not return within 1s")
+	}
+}
+
 // createDatapipeStatusTable creates the datapipe_status table with the
 // column names and constraint verified against upstream BloodHound
 // v9.6.0's migrations (cmd/api/src/database/migration/migrations/
