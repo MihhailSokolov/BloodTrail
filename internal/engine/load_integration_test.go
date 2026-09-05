@@ -169,3 +169,100 @@ func TestLoadSnapshotResolvesEdgeID(t *testing.T) {
 		t.Fatal("EdgeByID on an id nothing was inserted with should not resolve")
 	}
 }
+
+// TestLoadSnapshotProperties checks that LoadSnapshot hydrates node property
+// bags into Snapshot.Props and sets MultiGraph correctly on a single-graph
+// database.
+//
+// graphtest.LoadRandom seeds its 60 nodes via graph.NewProperties(), i.e.
+// with an empty property bag, so it cannot exercise the properties column by
+// itself; this test additionally inserts two nodes directly via the pg
+// driver's own pool, each carrying a real property bag, and asserts both
+// round-trip through Props correctly.
+func TestLoadSnapshotProperties(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	randomIDs := graphtest.LoadRandom(t, pgDriver, 1)
+
+	graphModel, ok := pgDriver.DefaultGraph()
+	if !ok {
+		t.Fatal("no default graph is set")
+	}
+
+	var firstID, secondID int64
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO node (graph_id, kind_ids, properties) VALUES ($1, '{}', $2) RETURNING id",
+		graphModel.ID, `{"objectid":"S-1-Z","enabled":true}`,
+	).Scan(&firstID); err != nil {
+		t.Fatalf("insert first properties node: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO node (graph_id, kind_ids, properties) VALUES ($1, '{}', $2) RETURNING id",
+		graphModel.ID, `{"objectid":"S-1-Q","score":42}`,
+	).Scan(&secondID); err != nil {
+		t.Fatalf("insert second properties node: %v", err)
+	}
+
+	snap, err := engine.LoadSnapshot(ctx, pgDriver, pool)
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+
+	if snap.MultiGraph {
+		t.Fatal("MultiGraph = true, want false on a single-graph database")
+	}
+
+	// A LoadRandom-seeded node carries no properties -- confirms the premise
+	// above and that an empty jsonb bag round-trips as an empty map rather
+	// than, say, a spurious entry.
+	randomDense, ok := snap.Dense(uint64(randomIDs[0]))
+	if !ok {
+		t.Fatalf("Dense(%d): not found in snapshot", randomIDs[0])
+	}
+	if m := snap.Props.NodeMap(randomDense); len(m) != 0 {
+		t.Fatalf("NodeMap(random node) = %v, want empty", m)
+	}
+
+	objectIDProp, ok := snap.Props.IDByName("objectid")
+	if !ok {
+		t.Fatal("Props.IDByName(\"objectid\"): not found")
+	}
+	enabledProp, ok := snap.Props.IDByName("enabled")
+	if !ok {
+		t.Fatal("Props.IDByName(\"enabled\"): not found")
+	}
+	scoreProp, ok := snap.Props.IDByName("score")
+	if !ok {
+		t.Fatal("Props.IDByName(\"score\"): not found")
+	}
+
+	firstDense, ok := snap.Dense(uint64(firstID))
+	if !ok {
+		t.Fatalf("Dense(%d): not found in snapshot", firstID)
+	}
+	if v, ok := snap.Props.Value(firstDense, objectIDProp); !ok || v != "S-1-Z" {
+		t.Fatalf("Props.Value(firstDense, objectid) = (%v, %v), want (\"S-1-Z\", true)", v, ok)
+	}
+	if v, ok := snap.Props.Value(firstDense, enabledProp); !ok || v != true {
+		t.Fatalf("Props.Value(firstDense, enabled) = (%v, %v), want (true, true)", v, ok)
+	}
+
+	secondDense, ok := snap.Dense(uint64(secondID))
+	if !ok {
+		t.Fatalf("Dense(%d): not found in snapshot", secondID)
+	}
+	if v, ok := snap.Props.Value(secondDense, objectIDProp); !ok || v != "S-1-Q" {
+		t.Fatalf("Props.Value(secondDense, objectid) = (%v, %v), want (\"S-1-Q\", true)", v, ok)
+	}
+	if v, ok := snap.Props.Value(secondDense, scoreProp); !ok || v != float64(42) {
+		t.Fatalf("Props.Value(secondDense, score) = (%v, %v), want (42, true)", v, ok)
+	}
+
+	if dense, ok := snap.Props.NodeByObjectID("S-1-Z"); !ok || dense != firstDense {
+		t.Fatalf("NodeByObjectID(\"S-1-Z\") = (%d, %v), want (%d, true)", dense, ok, firstDense)
+	}
+}
