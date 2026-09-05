@@ -208,29 +208,41 @@ func TestPropEq(t *testing.T) {
 
 func TestStringPredicatePositive(t *testing.T) {
 	cases := []struct {
-		name   string
-		op     StringOp
-		val    any
-		ok     bool
-		needle string
-		want   Tri
+		name    string
+		op      StringOp
+		val     any
+		ok      bool
+		needle  string
+		want    Tri
+		wantErr error
 	}{
-		{"starts with true", OpStartsWith, "hello world", true, "hello", TriTrue},
-		{"starts with false", OpStartsWith, "hello world", true, "world", TriFalse},
-		{"ends with true", OpEndsWith, "hello world", true, "world", TriTrue},
-		{"ends with false", OpEndsWith, "hello world", true, "hello", TriFalse},
-		{"contains true", OpContains, "hello world", true, "lo wo", TriTrue},
-		{"contains false", OpContains, "hello world", true, "xyz", TriFalse},
-		{"regex true", OpRegex, "abc123", true, `^[a-z]+[0-9]+$`, TriTrue},
-		{"regex false", OpRegex, "abc123", true, `^[0-9]+$`, TriFalse},
-		{"positive missing is null", OpContains, nil, false, "x", TriNull},
-		{"positive present json null is null", OpStartsWith, nil, true, "x", TriNull},
-		{"positive non-string present is null", OpContains, float64(512), true, "5", TriNull},
-		{"positive non-string bool present is null", OpStartsWith, true, true, "t", TriNull},
+		{"starts with true", OpStartsWith, "hello world", true, "hello", TriTrue, nil},
+		{"starts with false", OpStartsWith, "hello world", true, "world", TriFalse, nil},
+		{"ends with true", OpEndsWith, "hello world", true, "world", TriTrue, nil},
+		{"ends with false", OpEndsWith, "hello world", true, "hello", TriFalse, nil},
+		{"contains true", OpContains, "hello world", true, "lo wo", TriTrue, nil},
+		{"contains false", OpContains, "hello world", true, "xyz", TriFalse, nil},
+		{"regex true", OpRegex, "abc123", true, `^[a-z]+[0-9]+$`, TriTrue, nil},
+		{"regex false", OpRegex, "abc123", true, `^[0-9]+$`, TriFalse, nil},
+		{"positive missing is null", OpContains, nil, false, "x", TriNull, nil},
+		{"positive present json null is null", OpStartsWith, nil, true, "x", TriNull, nil},
+		{"positive non-string number present is a runtime cast error", OpContains, float64(512), true, "5", TriFalse, ErrRuntimeCast},
+		{"positive non-string bool present is a runtime cast error", OpStartsWith, true, true, "t", TriFalse, ErrRuntimeCast},
+		{"positive non-string list present is a runtime cast error", OpContains, []any{float64(1)}, true, "1", TriFalse, ErrRuntimeCast},
+		{"positive non-string map present is a runtime cast error", OpContains, map[string]any{"a": float64(1)}, true, "1", TriFalse, ErrRuntimeCast},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := StringPredicate(c.op, c.val, c.ok, c.needle, false)
+			got, err := StringPredicate(c.op, c.val, c.ok, c.needle, false)
+			if c.wantErr != nil {
+				if !errors.Is(err, c.wantErr) {
+					t.Fatalf("err = %v, want %v", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if got != c.want {
 				t.Fatalf("got %s, want %s", got, c.want)
 			}
@@ -240,27 +252,40 @@ func TestStringPredicatePositive(t *testing.T) {
 
 func TestStringPredicateNegated(t *testing.T) {
 	cases := []struct {
-		name   string
-		op     StringOp
-		val    any
-		ok     bool
-		needle string
-		want   Tri
+		name    string
+		op      StringOp
+		val     any
+		ok      bool
+		needle  string
+		want    Tri
+		wantErr error
 	}{
-		{"negated contains: missing passes", OpContains, nil, false, "x", TriTrue},
-		{"negated starts with: missing passes", OpStartsWith, nil, false, "x", TriTrue},
-		{"negated ends with: missing passes", OpEndsWith, nil, false, "x", TriTrue},
-		{"negated regex: missing passes when pattern needs a char", OpRegex, nil, false, "^[0-9]+$", TriTrue},
-		{"negated contains: present json null passes (coalesced to empty string)", OpContains, nil, true, "x", TriTrue},
-		{"negated contains: real match inverts to false", OpContains, "hello", true, "ell", TriFalse},
-		{"negated contains: real non-match inverts to true", OpContains, "hello", true, "xyz", TriTrue},
-		{"negated starts with: non-string present uses text rendering", OpContains, float64(512), true, "1", TriFalse},
-		{"negated starts with: non-string present non-match inverts true", OpContains, float64(512), true, "9", TriTrue},
-		{"negated regex matching empty string is false", OpRegex, nil, false, "^.*$", TriFalse},
+		{"negated contains: missing passes", OpContains, nil, false, "x", TriTrue, nil},
+		{"negated starts with: missing passes", OpStartsWith, nil, false, "x", TriTrue, nil},
+		{"negated ends with: missing passes", OpEndsWith, nil, false, "x", TriTrue, nil},
+		{"negated regex: missing passes when pattern needs a char", OpRegex, nil, false, "^[0-9]+$", TriTrue, nil},
+		{"negated contains: present json null passes (coalesced to empty string)", OpContains, nil, true, "x", TriTrue, nil},
+		{"negated contains: real match inverts to false", OpContains, "hello", true, "ell", TriFalse, nil},
+		{"negated contains: real non-match inverts to true", OpContains, "hello", true, "xyz", TriTrue, nil},
+		{"negated starts with: non-string number present is a runtime cast error", OpContains, float64(512), true, "1", TriFalse, ErrRuntimeCast},
+		{"negated starts with: non-string number present non-match is still a runtime cast error", OpContains, float64(512), true, "9", TriFalse, ErrRuntimeCast},
+		{"negated regex matching empty string is false", OpRegex, nil, false, "^.*$", TriFalse, nil},
+		{"negated non-string bool present is a runtime cast error", OpStartsWith, true, true, "t", TriFalse, ErrRuntimeCast},
+		{"negated non-string list present is a runtime cast error", OpContains, []any{float64(1)}, true, "1", TriFalse, ErrRuntimeCast},
+		{"negated non-string map present is a runtime cast error", OpContains, map[string]any{"a": float64(1)}, true, "1", TriFalse, ErrRuntimeCast},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := StringPredicate(c.op, c.val, c.ok, c.needle, true)
+			got, err := StringPredicate(c.op, c.val, c.ok, c.needle, true)
+			if c.wantErr != nil {
+				if !errors.Is(err, c.wantErr) {
+					t.Fatalf("err = %v, want %v", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if got != c.want {
 				t.Fatalf("got %s, want %s", got, c.want)
 			}
@@ -443,6 +468,25 @@ func TestCompareStringVsStringIsCollationDependent(t *testing.T) {
 	_ = got
 }
 
+func TestCompareEqualStringsShortCircuitBeforeCollation(t *testing.T) {
+	// This pins a load-bearing ordering inside Compare: the jsonbEqual
+	// short-circuit at the top must run, and return, before the
+	// string-vs-string branch that produces ErrCollation is ever reached.
+	// Two equal strings are a raw-equality question ("are these the same
+	// value"), not an ordering question ("which sorts first") -- pg's own
+	// cypher_value_compare checks raw equality first for exactly this
+	// reason, and if this package's port ever reordered those checks,
+	// Compare("a","a") would incorrectly delegate via ErrCollation instead
+	// of answering 0 locally.
+	got, err := Compare("a", "a")
+	if err != nil {
+		t.Fatalf("Compare(\"a\",\"a\") returned err = %v, want nil", err)
+	}
+	if got != 0 {
+		t.Fatalf("Compare(\"a\",\"a\") = %d, want 0", got)
+	}
+}
+
 func TestCompareNumbers(t *testing.T) {
 	cases := []struct {
 		name string
@@ -608,11 +652,19 @@ func TestStringPredicateRegexInvalidPatternIsNoMatch(t *testing.T) {
 	// A pattern that fails to compile is treated as no-match rather than
 	// panicking; Cypher regex literals are expected to be validated before
 	// a query reaches interpretation, so this is a defensive fallback only.
-	if got := StringPredicate(OpRegex, "abc", true, "(unclosed", false); got != TriFalse {
+	got, err := StringPredicate(OpRegex, "abc", true, "(unclosed", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != TriFalse {
 		t.Fatalf("got %s, want %s", got, TriFalse)
 	}
 	// Negated: coalesce still applies, and the inverted no-match is TriTrue.
-	if got := StringPredicate(OpRegex, "abc", true, "(unclosed", true); got != TriTrue {
+	got, err = StringPredicate(OpRegex, "abc", true, "(unclosed", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != TriTrue {
 		t.Fatalf("got %s, want %s", got, TriTrue)
 	}
 }

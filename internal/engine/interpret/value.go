@@ -299,40 +299,51 @@ const (
 // StringPredicate evaluates STARTS WITH / ENDS WITH / CONTAINS / a regex
 // match, positive or negated.
 //
-// Positive form: DAWGS translates these into a LIKE (or a regex match)
-// directly against the property, which is only well-typed for a string
-// property; a missing or non-string property yields Cypher NULL, matching
-// the same "predicates over properties are only defined for matching JSON
-// types" spirit as StringEq's typeof guard.
+// Absent (ok=false) and present-JSON-null (val=nil, ok=true) behave
+// identically in both forms, because pg's `->>` extraction of either is SQL
+// NULL: positive form propagates that to TriNull. Negated form coalesces
+// the NULL extraction to the empty string first (`coalesce(x ->> ..., ”)`)
+// and runs the *positive* test against "" before inverting -- so the
+// result is whatever the positive match against the empty string is, then
+// flipped, not an unconditional constant. For STARTS WITH/ENDS
+// WITH/CONTAINS with a non-empty needle this is always TriTrue (the empty
+// string never starts with/ends with/contains a non-empty needle), which
+// is the common case DAWGS' rewrite is aimed at -- but a regex needle that
+// itself matches the empty string (e.g. `^.*$`) still inverts to TriFalse,
+// exactly as coalesce-then-match-then-invert requires. (`NOT x STARTS WITH
+// y` cannot be plain `NOT(x STARTS WITH y)` at the SQL level, since
+// negating a NULL is still NULL and Cypher wants "no value" to satisfy the
+// negation -- this is why DAWGS rewrites through coalesce instead.)
 //
-// Negated form: `NOT x STARTS WITH y` is not simply `NOT(x STARTS WITH y)`
-// at the SQL level, because negating a NULL is still NULL and Cypher wants
-// "no value" to satisfy the negation. DAWGS' rewrite instead runs the
-// positive test against coalesce(x ->> ..., ”) and negates that: a missing
-// property (or a present JSON null, since ->> on JSON null is also SQL
-// NULL) coalesces to the empty string, which never starts with, ends with,
-// or contains a non-empty needle, so the negation is unconditionally TRUE.
-// A present non-string value coalesces to nothing (its ->> rendering is
-// already non-NULL text), so it is compared by its own text rendering,
-// consistent with the coalesce being a no-op whenever the extraction wasn't
-// NULL to begin with.
-func StringPredicate(op StringOp, val any, ok bool, needle string, negated bool) Tri {
-	if negated {
-		text, present := jsonText(val)
-		if !ok || !present {
-			text = ""
+// A present *string* value is compared directly (or, negated, compared then
+// inverted) -- no NULL or cast concern.
+//
+// A present *non-string, non-null* value (a number, bool, array, or object)
+// still produces non-NULL text under pg's `->>` (its own JSON text
+// rendering), so pg's LIKE/regex match runs against that rendering in both
+// the positive and the coalesce-negated form. This package will not
+// reproduce PostgreSQL's numeric/boolean text rendering in Go -- the
+// renderings can diverge (e.g. numeric formatting edge cases), and a
+// plausible-looking Go rendering that happens to disagree with pg would
+// silently produce the wrong match/no-match rather than a loud error. Both
+// forms therefore return ErrRuntimeCast for this case, so the caller bails
+// the whole query to delegation and pg computes the real answer.
+func StringPredicate(op StringOp, val any, ok bool, needle string, negated bool) (Tri, error) {
+	if !ok || val == nil {
+		if !negated {
+			return TriNull, nil
 		}
-		return boolToTri(!matchString(op, text, needle))
-	}
-
-	if !ok {
-		return TriNull
+		return boolToTri(!matchString(op, "", needle)), nil
 	}
 	s, isString := val.(string)
 	if !isString {
-		return TriNull
+		return TriFalse, ErrRuntimeCast
 	}
-	return boolToTri(matchString(op, s, needle))
+	matched := matchString(op, s, needle)
+	if negated {
+		matched = !matched
+	}
+	return boolToTri(matched), nil
 }
 
 // matchString runs the case-sensitive positive test for op. For OpRegex the
@@ -604,10 +615,23 @@ func Compare(a, b any) (int, error) {
 		return 0, nil
 
 	default:
+		// Unreachable: typeRank places every value this package's value
+		// model produces (map[string]any, []any, string, bool, float64)
+		// into ranks 1-5, and aRank == bRank is guaranteed above (a mismatch
+		// already returned), so a and b are one of the five types the cases
+		// above already handle. Kept, like typeRank's own default, only so
+		// the port stays visibly total against the SQL source's own
+		// case/else structure.
 		return 0, nil
 	}
 }
 
+// compareFloat orders two float64s numerically. NaN and +/-Inf never need a
+// defined answer here: every float64 in this package's value model was
+// decoded by encoding/json's default Unmarshal into `any` (see the package
+// doc comment), and JSON's number grammar has no literal for NaN or
+// infinity, so encoding/json cannot produce either -- these values are
+// unreachable, not merely assumed absent.
 func compareFloat(a, b float64) int {
 	switch {
 	case a < b:
