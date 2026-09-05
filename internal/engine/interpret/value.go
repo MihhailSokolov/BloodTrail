@@ -329,17 +329,60 @@ const (
 // forms therefore return ErrRuntimeCast for this case, so the caller bails
 // the whole query to delegation and pg computes the real answer.
 func StringPredicate(op StringOp, val any, ok bool, needle string, negated bool) (Tri, error) {
+	return stringPredicateCore(func(s string) bool {
+		return matchString(op, s, needle)
+	}, val, ok, negated)
+}
+
+// RegexPredicate is StringPredicate's OpRegex case, parameterized over a
+// pre-compiled *regexp.Regexp instead of a needle string that would be
+// recompiled via regexp.Compile on every call (matchString's approach for
+// OpRegex). It exists for callers -- currently eval.go's regex compilation
+// cache, which amortizes compilation across an entire query's row loop --
+// that already hold a compiled pattern and would otherwise have to either
+// recompile it just to call StringPredicate, or reimplement the
+// coalesce-then-match-then-invert policy themselves. re may be nil (a
+// pattern that failed to compile): matched then treats every input as
+// no-match, exactly like matchString's own compile-failure fallback,
+// instead of panicking.
+//
+// This shares stringPredicateCore with StringPredicate, so the two can never
+// drift on the null/absent/non-string/negation policy -- see that function's
+// doc comment, and StringPredicate's, for the full three-valued-logic
+// rationale (both apply here unchanged; only how "does s match" is decided
+// differs).
+func RegexPredicate(re *regexp.Regexp, val any, ok bool, negated bool) (Tri, error) {
+	return stringPredicateCore(func(s string) bool {
+		return re != nil && re.MatchString(s)
+	}, val, ok, negated)
+}
+
+// stringPredicateCore implements the coalesce-then-match-then-invert
+// three-valued semantics shared by StringPredicate (STARTS WITH/ENDS
+// WITH/CONTAINS/regex-by-needle-string) and RegexPredicate
+// (regex-by-pre-compiled-matcher): absent/JSON-null propagates to TriNull
+// unless negated, in which case the *positive* match against "" is computed
+// and then inverted; a present non-string value is always ErrRuntimeCast
+// (this package never reproduces pg's JSON-text rendering of numbers/
+// bools/arrays/objects -- see StringPredicate's doc comment); a present
+// string is matched (and, if negated, inverted). match is called with the
+// coalesced-to-empty-string operand in the absent/null case and the actual
+// string operand otherwise -- it never sees a non-string value. Holding this
+// policy in exactly one place is the point: StringPredicate and
+// RegexPredicate differ only in how they decide "does s match", never in
+// what happens around that decision.
+func stringPredicateCore(match func(s string) bool, val any, ok bool, negated bool) (Tri, error) {
 	if !ok || val == nil {
 		if !negated {
 			return TriNull, nil
 		}
-		return boolToTri(!matchString(op, "", needle)), nil
+		return boolToTri(!match("")), nil
 	}
 	s, isString := val.(string)
 	if !isString {
 		return TriFalse, ErrRuntimeCast
 	}
-	matched := matchString(op, s, needle)
+	matched := match(s)
 	if negated {
 		matched = !matched
 	}

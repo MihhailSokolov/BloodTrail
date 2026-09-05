@@ -4,6 +4,7 @@ package interpret
 
 import (
 	"errors"
+	"regexp"
 	"testing"
 )
 
@@ -667,6 +668,91 @@ func TestStringPredicateRegexInvalidPatternIsNoMatch(t *testing.T) {
 	if got != TriTrue {
 		t.Fatalf("got %s, want %s", got, TriTrue)
 	}
+}
+
+// TestRegexPredicate covers RegexPredicate, the pre-compiled-matcher variant
+// of StringPredicate's OpRegex case (eval.go's regex compilation cache calls
+// this instead of StringPredicate, so it can pass an *Env-cached
+// *regexp.Regexp instead of a needle string that StringPredicate would
+// recompile on every call). It must share StringPredicate's exact
+// null/absent/non-string/negation policy -- that's the whole point of
+// factoring both through one private core -- so these cases mirror
+// TestStringPredicatePositive/TestStringPredicateNegated's regex rows.
+func TestRegexPredicate(t *testing.T) {
+	digits := regexp.MustCompile(`^[0-9]+$`)
+
+	t.Run("absent negated is TriTrue", func(t *testing.T) {
+		// Coalesce-to-empty-string then invert: "" doesn't match ^[0-9]+$, so
+		// the negated result is TriTrue -- same as StringPredicate's negated
+		// absent-value case.
+		got, err := RegexPredicate(digits, nil, false, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != TriTrue {
+			t.Fatalf("got %s, want %s", got, TriTrue)
+		}
+	})
+
+	t.Run("absent positive is TriNull", func(t *testing.T) {
+		got, err := RegexPredicate(digits, nil, false, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != TriNull {
+			t.Fatalf("got %s, want %s", got, TriNull)
+		}
+	})
+
+	t.Run("present non-string is ErrRuntimeCast", func(t *testing.T) {
+		got, err := RegexPredicate(digits, float64(123), true, false)
+		if !errors.Is(err, ErrRuntimeCast) {
+			t.Fatalf("err = %v, want ErrRuntimeCast", err)
+		}
+		if got != TriFalse {
+			t.Fatalf("got %s, want %s", got, TriFalse)
+		}
+	})
+
+	t.Run("present string match", func(t *testing.T) {
+		got, err := RegexPredicate(digits, "12345", true, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != TriTrue {
+			t.Fatalf("got %s, want %s", got, TriTrue)
+		}
+	})
+
+	t.Run("present string non-match, negated inverts to TriTrue", func(t *testing.T) {
+		got, err := RegexPredicate(digits, "abc", true, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != TriTrue {
+			t.Fatalf("got %s, want %s", got, TriTrue)
+		}
+	})
+
+	t.Run("present string match, negated inverts to TriFalse", func(t *testing.T) {
+		got, err := RegexPredicate(digits, "12345", true, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != TriFalse {
+			t.Fatalf("got %s, want %s", got, TriFalse)
+		}
+	})
+
+	t.Run("nil matcher (failed compile) behaves as no-match", func(t *testing.T) {
+		got, err := RegexPredicate(nil, "12345", true, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != TriFalse {
+			t.Fatalf("got %s, want %s", got, TriFalse)
+		}
+	})
 }
 
 func TestJSONTextExtractionOfCompositeValuesIsDefensive(t *testing.T) {

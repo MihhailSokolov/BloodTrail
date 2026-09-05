@@ -587,10 +587,9 @@ func evalRegexComparison(env *Env, row *Row, leftExpr, rightExpr cypher.Expressi
 	return evalRegexPredicate(env, val, ok, pattern, negated)
 }
 
-// evalRegexPredicate is StringPredicate's regex case, reimplemented here
-// (rather than called via value.go's StringPredicate/matchString) so the
-// compiled pattern can come from Env's cache instead of being recompiled
-// from source text on every call.
+// evalRegexPredicate is StringPredicate's regex case, called against a
+// compiled pattern from Env's cache instead of a needle string that would be
+// recompiled via regexp.Compile on every call.
 //
 // Design note (regex compilation seam): value.go's StringPredicate takes a
 // needle string, not a compiled pattern, and recompiles via
@@ -612,36 +611,21 @@ func evalRegexComparison(env *Env, row *Row, leftExpr, rightExpr cypher.Expressi
 // pattern text; until then, this is the seam that avoids the "compile once
 // per row" cost the brief calls out as unacceptable.
 //
-// The negation semantics duplicate StringPredicate's own coalesce-then-
-// match-then-invert logic (see its doc comment) rather than delegating to
-// it, since that logic's shape is generic over "how do I test a string"
-// (regex match, vs. prefix/suffix/substring) and StringPredicate has no seam
-// for supplying a pre-compiled matcher.
+// The null/absent/non-string/negation policy itself is NOT duplicated here:
+// it lives in exactly one place, value.go's stringPredicateCore, shared by
+// both StringPredicate (needle-string matching) and value.RegexPredicate
+// (pre-compiled-matcher matching, which this function delegates to). A
+// pattern that fails to compile yields a nil *regexp.Regexp, which
+// RegexPredicate treats as unconditional no-match, exactly like
+// value.go's matchString does for an uncompilable OpRegex needle -- Cypher
+// regex literals are expected to be validated before a query reaches
+// interpretation.
 func evalRegexPredicate(env *Env, val any, ok bool, pattern string, negated bool) (Tri, error) {
 	re, compileErr := env.compiledRegex(pattern)
-	match := func(s string) bool {
-		// A pattern that fails to compile is treated as no-match, exactly
-		// like value.go's matchString: Cypher regex literals are expected to
-		// be validated before a query reaches interpretation.
-		return compileErr == nil && re.MatchString(s)
+	if compileErr != nil {
+		re = nil
 	}
-
-	if !ok || val == nil {
-		if !negated {
-			return TriNull, nil
-		}
-		return boolToTri(!match("")), nil
-	}
-
-	s, isString := val.(string)
-	if !isString {
-		return TriFalse, ErrRuntimeCast
-	}
-	matched := match(s)
-	if negated {
-		matched = !matched
-	}
-	return boolToTri(matched), nil
+	return RegexPredicate(re, val, ok, negated)
 }
 
 // literalStringValue evaluates expr and requires the result to be a present
@@ -1187,13 +1171,29 @@ func evalCoalesce(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool,
 	return nil, false, nil
 }
 
-// evalSizeFunction implements size(list-property) -> int32 length. Per the
-// brief, size() of a string is a different pg rendering (character length,
-// not array length) that this evaluator does not attempt to reproduce --
-// the future gate is expected to route size(<string-typed operand>) to
-// delegation at plan time rather than ever construct a call this function
-// would see, so a non-list, non-absent argument here is ErrUnsupported
-// rather than a silent wrong answer.
+// evalSizeFunction implements size(list-property) -> list length, returned
+// as a float64 -- NOT a Go int32 -- because this package's entire value
+// model is float64-only for numbers (see value.go's doc comment: "exactly
+// one of nil, string, float64, bool, []any, or map[string]any"). Every
+// comparison/arithmetic primitive this evaluator routes through
+// (ScalarEq/PropEq/OrderCompare/In, and evalArithmetic's own float64 type
+// assertions) type-switches on float64 with no int32 case, so a bare int32
+// result here would silently break `WHERE size(n.spns) = 3`,
+// `size(n.spns) > 2`, and `size(n.spns) IN [3, 4]` -- each would compare an
+// int32 against a float64 literal and always come out false/no-match rather
+// than erroring loudly. A later projection layer (a future task, once
+// RETURN values are serialized back to callers) is expected to convert a
+// bare, top-level size() result to a pg-parity int32 at that boundary --
+// this function's job is only to make size() compose correctly with every
+// other primitive inside WHERE/comparison/arithmetic evaluation, which
+// requires float64 here.
+//
+// Per the brief, size() of a string is a different pg rendering (character
+// length, not array length) that this evaluator does not attempt to
+// reproduce -- the future gate is expected to route
+// size(<string-typed operand>) to delegation at plan time rather than ever
+// construct a call this function would see, so a non-list, non-absent
+// argument here is ErrUnsupported rather than a silent wrong answer.
 func evalSizeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool, error) {
 	if len(fi.Arguments) != 1 {
 		return nil, false, ErrUnsupported
@@ -1209,7 +1209,7 @@ func evalSizeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, b
 	if !isList {
 		return nil, false, ErrUnsupported
 	}
-	return int32(len(list)), true, nil
+	return float64(len(list)), true, nil
 }
 
 // evalSplitFunction implements split(str, sep) -> []any of string. Both

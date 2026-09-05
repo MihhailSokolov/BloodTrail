@@ -450,8 +450,15 @@ func TestEvalSizeFunction(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("got err=%v ok=%v", err, ok)
 		}
-		if n, isInt32 := val.(int32); !isInt32 || n != 3 {
-			t.Fatalf("size(n.spns) = %#v, want int32(3)", val)
+		// The package's value model is float64-only for numbers (see value.go's
+		// doc comment): every comparison/arithmetic primitive in value.go
+		// type-switches on float64, so an int32 result here would silently
+		// break `WHERE size(...) = 3`, `> `, and `IN` (they'd never match a
+		// float64 literal). A later projection layer is expected to convert a
+		// bare, top-level size() result to int32 for pg parity -- see
+		// evalSizeFunction's doc comment.
+		if n, isFloat64 := val.(float64); !isFloat64 || n != 3 {
+			t.Fatalf("size(n.spns) = %#v, want float64(3)", val)
 		}
 	})
 
@@ -468,6 +475,45 @@ func TestEvalSizeFunction(t *testing.T) {
 		_, _, err := EvalValue(env, row, returnExprOf(t, "MATCH (n) RETURN size(n.name)"))
 		if !errors.Is(err, ErrUnsupported) {
 			t.Fatalf("err = %v, want ErrUnsupported", err)
+		}
+	})
+
+	// Regression coverage for the float64-vs-int32 bug: size() must compose
+	// with every numeric comparison primitive in value.go (ScalarEq,
+	// OrderCompare, In), all of which type-switch on float64 only. Before the
+	// fix, evalSizeFunction returned a bare Go int32, so none of these three
+	// ever matched a float64 numeric literal and each silently evaluated to
+	// TriFalse instead of TriTrue.
+	t.Run("size() = literal compares equal via ScalarEq", func(t *testing.T) {
+		row := f.row("n", 800)
+		got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE size(n.spns) = 3 RETURN n"))
+		if err != nil {
+			t.Fatalf("EvalPredicate: %v", err)
+		}
+		if got != TriTrue {
+			t.Fatalf("got %s, want %s", got, TriTrue)
+		}
+	})
+
+	t.Run("size() > literal compares via OrderCompare", func(t *testing.T) {
+		row := f.row("n", 800)
+		got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE size(n.spns) > 2 RETURN n"))
+		if err != nil {
+			t.Fatalf("EvalPredicate: %v", err)
+		}
+		if got != TriTrue {
+			t.Fatalf("got %s, want %s", got, TriTrue)
+		}
+	})
+
+	t.Run("size() IN literal list matches via In", func(t *testing.T) {
+		row := f.row("n", 800)
+		got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE size(n.spns) IN [3, 4] RETURN n"))
+		if err != nil {
+			t.Fatalf("EvalPredicate: %v", err)
+		}
+		if got != TriTrue {
+			t.Fatalf("got %s, want %s", got, TriTrue)
 		}
 	})
 }
