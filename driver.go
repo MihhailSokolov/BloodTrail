@@ -124,27 +124,48 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 	}, options...)
 }
 
-// WriteTransaction runs txDelegate against the embedded PostgreSQL driver
-// unwrapped -- writes always go straight to PostgreSQL, the system of
-// record -- and notifies the engine of the write once the transaction
-// commits successfully, invalidating any snapshot the engine is currently
-// serving from until its next rebuild picks up the change.
+// WriteTransaction runs txDelegate against the embedded PostgreSQL driver --
+// writes always go straight to PostgreSQL, the system of record -- with the
+// delegate's tx wrapped in an observingTransaction (write_observer.go) that
+// records, into a single WriteScope shared for the life of this call,
+// exactly which node and edge kinds the delegate's calls touched. On success
+// that scope is handed to engine.NoteWrite, invalidating only the kinds the
+// write actually reached instead of the whole snapshot -- a call whose
+// scope stays empty (touched nothing this package's tracking recognizes,
+// e.g. a transaction that only read) still bumps the engine's generation
+// counter (NoteWrite's own doc), so Fresh()'s plain staleness check is
+// unaffected by this change.
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
-	if err := d.Driver.WriteTransaction(ctx, txDelegate, options...); err != nil {
+	scope := engine.NewWriteScope()
+	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		return txDelegate(&observingTransaction{Transaction: tx, scope: scope})
+	}, options...); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	d.engine.NoteWrite(scope)
 	return nil
 }
 
-// BatchOperation runs batchDelegate against the embedded PostgreSQL driver
-// and notifies the engine of the write once the batch completes
-// successfully, the same way WriteTransaction does.
+// BatchOperation runs batchDelegate against the embedded PostgreSQL driver,
+// the same way WriteTransaction does for a graph.Batch instead of a
+// graph.Transaction: the delegate's batch is wrapped in an observingBatch
+// (write_observer.go), which also gets d.engine directly -- unlike a
+// transaction, a batch documents that Commit may be called mid-delegate to
+// flush early and keep receiving operations, so observingBatch.Commit calls
+// NoteWrite itself at that moment instead of waiting for this method's own
+// call below. observer is declared once, outside the delegate closure below,
+// so that this method's final NoteWrite call reads observer.scope's *current*
+// value -- which observingBatch.Commit may have already reset to a fresh,
+// still-accumulating WriteScope by the time batchDelegate returns.
 func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDelegate, options ...graph.BatchOption) error {
-	if err := d.Driver.BatchOperation(ctx, batchDelegate, options...); err != nil {
+	observer := &observingBatch{scope: engine.NewWriteScope(), eng: d.engine}
+	if err := d.Driver.BatchOperation(ctx, func(batch graph.Batch) error {
+		observer.Batch = batch
+		return batchDelegate(observer)
+	}, options...); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	d.engine.NoteWrite(observer.scope)
 	return nil
 }
 
@@ -185,25 +206,41 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 
 // DeleteNodesByKinds deletes nodes through the embedded PostgreSQL driver
 // (a raw pooled connection, not a WriteTransaction/BatchOperation call) and
-// notifies the engine of the write once it completes successfully. See
+// notifies the engine of the write once it completes successfully, scoped to
+// TouchAllNodes and TouchAllEdges rather than a nil (touch-everything)
+// scope: this is still conservative on the node side (includeAny/excludeAny
+// name which nodes qualify for deletion, but a deleted node's own kinds are
+// never narrower than "could be anything" from here, since a node can carry
+// several kinds and this call only filters, it doesn't report which ones
+// existed) and, on the edge side, deleting a node cascades to delete every
+// edge incident to it, which may carry kinds having nothing to do with
+// includeAny at all -- so TouchAllEdges, not TouchEdgeKinds(includeAny). See
 // Run's doc for why an override is needed at all.
 func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
 	if err := d.Driver.DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	scope := engine.NewWriteScope()
+	scope.TouchAllNodes()
+	scope.TouchAllEdges()
+	d.engine.NoteWrite(scope)
 	return nil
 }
 
 // DeleteRelationshipsByKinds deletes relationships through the embedded
 // PostgreSQL driver (a raw pooled connection, not a
 // WriteTransaction/BatchOperation call) and notifies the engine of the write
-// once it completes successfully. See Run's doc for why an override is
-// needed at all.
+// once it completes successfully, scoped to exactly kinds: unlike
+// DeleteNodesByKinds, deleting relationships has no cascade -- removing an
+// edge never removes a node or any other edge -- so kinds fully describes
+// what this call could possibly have touched. See Run's doc for why an
+// override is needed at all.
 func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kinds) error {
 	if err := d.Driver.DeleteRelationshipsByKinds(ctx, kinds); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	scope := engine.NewWriteScope()
+	scope.TouchEdgeKinds(kinds)
+	d.engine.NoteWrite(scope)
 	return nil
 }
