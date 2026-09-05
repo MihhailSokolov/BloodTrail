@@ -9,11 +9,12 @@ import (
 )
 
 // Spec parameterizes a synthetic AD-shaped graph: how many user principals
-// to generate (which drives every other count, see Generate's doc comment)
-// and the seed a run is reproducible from.
+// to generate (which drives every other count, see Generate's doc comment),
+// the seed a run is reproducible from, and optionally the number of domains.
 type Spec struct {
-	Users int
-	Seed  int64
+	Users   int
+	Seed    int64
+	Domains int // 0 (default) keeps automatic 1-per-50k rule; N > 0 forces exactly N domains
 }
 
 // Node is a generated graph vertex. ObjectID is the synthetic AD objectid
@@ -145,9 +146,10 @@ type domain struct {
 //
 // Shape (see the task-15 brief for the source of these ratios):
 //
-//   - domains = max(1, Users/50000); Users, Computers (=Users/2 overall) and
-//     Groups (=Users/5 overall, floor, minimum 2 to hold the two well-known
-//     groups below) are partitioned across domains as evenly as possible.
+//   - domains = spec.Domains if > 0, else max(1, Users/50000); Users,
+//     Computers (=Users/2 overall) and Groups (=Users/5 overall, floor,
+//     minimum 2 to hold the two well-known groups below) are partitioned
+//     across domains as evenly as possible.
 //   - every domain has exactly one Domain Admins group (objectid suffix
 //     "-512") and one Domain Users hub (objectid suffix "-513").
 //   - every user MemberOf the domain's Domain Users hub.
@@ -182,7 +184,10 @@ func Generate(spec Spec) Graph {
 		users = 0
 	}
 
-	domains := domainCount(users)
+	domains := spec.Domains
+	if domains <= 0 {
+		domains = domainCount(users)
+	}
 	usersPerDomain := partitionInts(users, domains)
 
 	rng := rand.New(rand.NewSource(spec.Seed))

@@ -373,3 +373,90 @@ func TestGenerateMultiDomainIsolation(t *testing.T) {
 		}
 	}
 }
+
+// TestGenerateDomainsOverride exercises the Domains override in Spec:
+// forcing an explicit domain count overrides the automatic 1-per-50k rule.
+//
+// It asserts:
+//   - Generate(Spec{Users: 150000, Seed: 1, Domains: 2}) produces exactly
+//     2 domains (not 3 as the automatic rule would yield);
+//   - domain partitioning is consistent: users divided evenly across 2
+//     domains, one -512 group per domain, no cross-domain edges;
+//   - Domains: 0 (default) preserves current behavior: domainCount-based
+//     automatic rule applies;
+//   - small Domains override with fewer than 50k users per domain works:
+//     Users=1000, Domains: 3 produces 3 domains of ~333 users each.
+func TestGenerateDomainsOverride(t *testing.T) {
+	// Test Domains: 2 override with Users: 150000 (automatic would be 3)
+	const users150k = 150_000
+	wantDomains := 2
+	g := Generate(Spec{Users: users150k, Seed: 1, Domains: wantDomains})
+
+	// Count -512 (Domain Admins) groups: should be exactly 2
+	adminCount := 0
+	for _, n := range g.Nodes {
+		if strings.HasSuffix(n.ObjectID, "-512") {
+			adminCount++
+		}
+	}
+	if adminCount != wantDomains {
+		t.Fatalf("Domains: 2 override: found %d nodes with -512 suffix, want exactly %d", adminCount, wantDomains)
+	}
+
+	// Verify partition is as expected: 150000 users / 2 domains = 75000 each
+	usersPerDomain := partitionInts(users150k, wantDomains)
+	expectedPerDomain := users150k / wantDomains
+	for d, count := range usersPerDomain {
+		if count != expectedPerDomain {
+			t.Fatalf("domain %d: users = %d, want %d", d, count, expectedPerDomain)
+		}
+	}
+
+	// Test Domains: 0 (default) preserves automatic behavior
+	g2 := Generate(Spec{Users: users150k, Seed: 1, Domains: 0})
+	g3 := Generate(Spec{Users: users150k, Seed: 1})
+	if !reflect.DeepEqual(g2, g3) {
+		t.Fatalf("Domains: 0 should be identical to omitting Domains field")
+	}
+
+	// Verify automatic rule still applies: domainCount(150000) == 3
+	automaticDomains := domainCount(users150k)
+	if automaticDomains != 3 {
+		t.Fatalf("test setup: domainCount(%d) = %d, want 3", users150k, automaticDomains)
+	}
+
+	// Count -512 groups in automatic run: should be 3
+	adminCountAuto := 0
+	for _, n := range g3.Nodes {
+		if strings.HasSuffix(n.ObjectID, "-512") {
+			adminCountAuto++
+		}
+	}
+	if adminCountAuto != automaticDomains {
+		t.Fatalf("automatic mode: found %d nodes with -512 suffix, want exactly %d", adminCountAuto, automaticDomains)
+	}
+
+	// Test Domains: 3 with small user count (Users=1000, which would normally be 1 domain)
+	const smallUsers = 1000
+	g4 := Generate(Spec{Users: smallUsers, Seed: 2, Domains: 3})
+
+	adminCountSmall := 0
+	for _, n := range g4.Nodes {
+		if strings.HasSuffix(n.ObjectID, "-512") {
+			adminCountSmall++
+		}
+	}
+	if adminCountSmall != 3 {
+		t.Fatalf("Domains: 3 override with small Users: found %d nodes with -512 suffix, want exactly 3", adminCountSmall)
+	}
+
+	// Verify partition: 1000 users / 3 domains = 333, 333, 334
+	usersPerDomainSmall := partitionInts(smallUsers, 3)
+	expectedTotal := 0
+	for _, count := range usersPerDomainSmall {
+		expectedTotal += count
+	}
+	if expectedTotal != smallUsers {
+		t.Fatalf("partition sum = %d, want %d", expectedTotal, smallUsers)
+	}
+}

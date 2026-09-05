@@ -44,10 +44,11 @@ const progressEvery = 100_000
 
 func main() {
 	var (
-		dsn   = flag.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
-		users = flag.Int("users", 1000, "number of User principals to generate; drives every other count (see README.md)")
-		seed  = flag.Int64("seed", 1, "random seed; the same seed and -users always produce the same graph")
-		wipe  = flag.Bool("wipe", false, "truncate the node/edge tables (every graph, not just this one) before loading")
+		dsn     = flag.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
+		users   = flag.Int("users", 1000, "number of User principals to generate; drives every other count (see README.md)")
+		seed    = flag.Int64("seed", 1, "random seed; the same seed and -users always produce the same graph")
+		domains = flag.Int("domains", 0, "number of domains to generate; 0 (default) uses automatic 1-per-50k rule, N > 0 forces exactly N domains")
+		wipe    = flag.Bool("wipe", false, "truncate the node/edge tables (every graph, not just this one) before loading")
 	)
 	flag.Parse()
 
@@ -59,16 +60,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "adgen: -users must be positive")
 		os.Exit(2)
 	}
+	if *domains < 0 {
+		fmt.Fprintln(os.Stderr, "adgen: -domains must be non-negative")
+		os.Exit(2)
+	}
 
-	if err := run(context.Background(), *dsn, *users, *seed, *wipe); err != nil {
+	if err := run(context.Background(), *dsn, *users, *seed, *domains, *wipe); err != nil {
 		log.Fatalf("adgen: %v", err)
 	}
 }
 
-func run(ctx context.Context, dsn string, users int, seed int64, wipe bool) error {
-	fmt.Fprintf(os.Stderr, "adgen: generating graph for users=%d seed=%d ...\n", users, seed)
+func run(ctx context.Context, dsn string, users int, seed int64, domains int, wipe bool) error {
+	fmt.Fprintf(os.Stderr, "adgen: generating graph for users=%d seed=%d domains=%d ...\n", users, seed, domains)
 	t0 := time.Now()
-	g := Generate(Spec{Users: users, Seed: seed})
+	g := Generate(Spec{Users: users, Seed: seed, Domains: domains})
 	fmt.Fprintf(os.Stderr, "adgen: generated %d nodes, %d edges in %v\n", len(g.Nodes), len(g.Edges), time.Since(t0))
 
 	cfg, err := pgxpool.ParseConfig(dsn)

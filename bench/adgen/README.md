@@ -13,11 +13,16 @@ benchmark the path engine against it (`make bench-path`).
 
 ## What it generates
 
-The shape is driven entirely by `-users`:
+The shape is driven entirely by `-users` and optionally by `-domains`:
 
-- **Domains**: one domain per 50,000 users, minimum one. Users, Computers
+- **Domains**: by default, one domain per 50,000 users (minimum one). Pass
+  `-domains N` to override with exactly N domains. Users, Computers
   (`Users/2`), and Groups (`Users/5`, minimum 2) are split as evenly as
-  possible across domains.
+  possible across domains. Large Active Directory forests typically have a
+  handful of domains rather than dozens; the 5M-node benchmark should be
+  generated with `-domains 4` to match realistic domain density and path
+  engine constraints (the engine's per-query SideBudget of 16 limits queries
+  to forests with at most 16 Domain Admins groups in memory at once).
 - Every domain has exactly one **Domain Admins** group (objectid suffix
   `-512`) and one **Domain Users** hub (objectid suffix `-513`), following
   real AD's well-known RIDs. Every other principal gets a synthetic
@@ -141,6 +146,7 @@ the entire run, not just the remainder.
 | `-dsn`    | (none)  | PostgreSQL connection string. Required.                          |
 | `-users`  | `1000`  | Number of User principals; drives every other count (see above). |
 | `-seed`   | `1`     | Random seed; same seed + `-users` reproduces the same graph.     |
+| `-domains`| `0`     | Number of domains; `0` (default) uses automatic 1-per-50k rule, `N > 0` forces exactly N domains. |
 | `-wipe`   | `false` | Truncate `node`/`edge` (every graph) before loading.             |
 
 Progress is reported to stderr, including a line every ~100,000 rows during
