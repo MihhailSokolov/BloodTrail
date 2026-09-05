@@ -1708,7 +1708,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 			// from the Step(s) carrying the matching PathSym instead of
 			// ever calling EvalValue for it.
 			pb.touched[pv.Symbol] = true
-		} else if !pb.checkExpr(item.Expression) {
+		} else if !pb.checkExpr(item.Expression) || !isValueShape(item.Expression) {
 			return Projection{}, nil, 0, -1, false
 		}
 
@@ -1781,6 +1781,33 @@ func literalNonNegativeInt(expr cypher.Expression) (int64, bool) {
 		return int64(v), true
 	default:
 		return 0, false
+	}
+}
+
+// isValueShape reports whether expr's top-level (paren-unwrapped) node is
+// one eval.go's EvalValue actually has a case for: Literal, Variable,
+// PropertyLookup, ListLiteral, FunctionInvocation, ArithmeticExpression, or
+// UnaryAddOrSubtractExpression. checkExpr itself is shared with WHERE-clause
+// validation and therefore also accepts boolean-only shapes (Comparison,
+// Conjunction, Disjunction, ExclusiveDisjunction, Negation, KindMatcher) --
+// exactly the node types EvalValue's own switch has no case for and would
+// answer with ErrUnsupported. Accepting one of those as a RETURN/WITH item's
+// *own* top-level expression (e.g. `RETURN n.x = 5 AS flag`) would never
+// produce a wrong answer (an EvalValue ErrUnsupported bails the whole query
+// to delegation before any row is emitted, per the architecture's
+// materialize-then-emit design), but it would guarantee a wasted
+// materialization pass on every single invocation for a shape Plan could
+// have declined for free -- so this narrower check runs in addition to
+// checkExpr for a projection item's own top-level expression specifically
+// (nested sub-expressions reached through checkExpr's normal recursion are
+// unaffected: a WHERE clause legitimately nests Comparisons everywhere).
+func isValueShape(expr cypher.Expression) bool {
+	switch unwrapParens(expr).(type) {
+	case *cypher.Literal, *cypher.Variable, *cypher.PropertyLookup, *cypher.ListLiteral,
+		*cypher.FunctionInvocation, *cypher.ArithmeticExpression, *cypher.UnaryAddOrSubtractExpression:
+		return true
+	default:
+		return false
 	}
 }
 

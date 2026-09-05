@@ -272,6 +272,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "objectid anchor", cypher: `MATCH (n:User) WHERE n.objectid = 'S-1-1' RETURN n`, want: true},
 		{name: "datetime with argument rejected", cypher: `MATCH (n:User) WHERE n.x < datetime('2024-01-01').epochseconds RETURN n`, want: false},
 		{name: "params anywhere in return", cypher: `MATCH (n:User) RETURN $x`, want: false},
+		{name: "bare comparison as return value rejected", cypher: `MATCH (n:User) RETURN n.x = 5 AS flag`, want: false},
 	}
 
 	runPlanGolden(t, snap, cases)
