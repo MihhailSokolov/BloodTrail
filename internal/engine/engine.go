@@ -96,6 +96,28 @@ type Engine struct {
 	pollStop     chan struct{}
 	pollDone     chan struct{}
 	pollStopOnce sync.Once
+
+	// mapKind resolves a graph.Kind name to its KindID, as
+	// e.pgDriver.KindMapper().MapKind would. The builder-serving path
+	// (serve_builder.go: TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds and
+	// Task 7's rel-query siblings) calls this instead of reaching into
+	// pgDriver directly, purely so unit tests can fake kind-name resolution
+	// without standing up a real KindMapper (which needs a live PostgreSQL
+	// connection) -- the same motivation noteResolved's resolve parameter
+	// serves for marks.go, adapted to a field since these methods are
+	// themselves the entry points under test, with no wrapper to hand a
+	// fake resolver into at the call site. New defaults this to the real
+	// KindMapper call; servePathQuery's own kind-mapping calls are
+	// deliberately left untouched, still going through
+	// e.pgDriver.KindMapper() directly.
+	mapKind func(ctx context.Context, kind graph.Kind) (int16, error)
+
+	// mapKindNames resolves KindIDs back to their graph.Kind names, as
+	// e.kindNamesByID (marks.go) would. Same seam, same motivation, and same
+	// New default (e.kindNamesByID) as mapKind above, just for the opposite
+	// direction -- needed by TryNodeFetchKinds to render its
+	// graph.KindsResult output.
+	mapKindNames func(ids []snapshot.KindID) (graph.Kinds, error)
 }
 
 // New constructs an Engine bound to pgDriver/pool. It does not load a
@@ -105,7 +127,12 @@ func New(pgDriver *pg.Driver, pool *pgxpool.Pool, cfg Config) *Engine {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Engine{pgDriver: pgDriver, pool: pool, cfg: cfg}
+	e := &Engine{pgDriver: pgDriver, pool: pool, cfg: cfg}
+	e.mapKind = func(ctx context.Context, kind graph.Kind) (int16, error) {
+		return e.pgDriver.KindMapper().MapKind(ctx, kind)
+	}
+	e.mapKindNames = e.kindNamesByID
+	return e
 }
 
 // Generation returns the engine's current write-generation counter, the same
