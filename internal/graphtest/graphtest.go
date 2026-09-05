@@ -45,8 +45,10 @@ func PGAvailable(t *testing.T) string {
 
 // OpenPG opens a pg.Driver and pgxpool.Pool against dsn and asserts a
 // BloodHound-ish schema with GraphName as the default graph. Node and edge
-// kinds are not predeclared: AssertKinds defines them lazily the first time
-// LoadDataset writes a node or edge of a kind not seen before.
+// kinds are not predeclared here: LoadDataset asserts each dataset's own
+// kind alphabet immediately before loading it (see its doc for why that
+// can't simply be left to lazy definition), and LoadRandom does the same
+// for its fixed kind alphabet.
 //
 // t.Cleanup closes the pool.
 func OpenPG(t *testing.T, dsn string) (*pg.Driver, *pgxpool.Pool) {
@@ -87,8 +89,22 @@ func WipeGraph(t *testing.T, d *pg.Driver) {
 // LoadDataset reads and loads an opengraph JSON dataset at path into d's
 // default graph, returning the mapping from the dataset's document node IDs
 // to the database IDs they were assigned.
+//
+// Before writing anything, it asserts a schema declaring the dataset's own
+// node and edge kinds under GraphName. This is not optional bookkeeping:
+// opengraph.WriteGraph (called below, the same helper opengraph.Load itself
+// wraps) writes the dataset's nodes through a write transaction --
+// tx.CreateNode, which lazily defines an unseen kind via
+// SchemaManager.AssertKinds -- but writes its edges through BatchOperation,
+// whose relationship path only maps kind names already in the catalog
+// (SchemaManager.MapKind) and errors "unable to map kind: X" on one that
+// isn't (see LoadRandom's doc for the same gap, and its identical fix). A
+// database that already has every dataset's kinds defined from a prior run
+// masks this; a freshly provisioned one does not, so the assertion belongs
+// here rather than in each individual caller.
 func LoadDataset(t *testing.T, d *pg.Driver, path string) opengraph.IDMap {
 	t.Helper()
+	ctx := context.Background()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -96,7 +112,18 @@ func LoadDataset(t *testing.T, d *pg.Driver, path string) opengraph.IDMap {
 	}
 	defer f.Close()
 
-	ids, err := opengraph.Load(context.Background(), d, f)
+	doc, err := opengraph.ParseDocument(f)
+	if err != nil {
+		t.Fatalf("graphtest: parse %s: %v", path, err)
+	}
+
+	nodeKinds, edgeKinds := doc.Graph.Kinds()
+	schema := graph.Schema{Graphs: []graph.Graph{{Name: GraphName, Nodes: nodeKinds, Edges: edgeKinds}}}
+	if err := d.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("graphtest: assert schema for %s: %v", path, err)
+	}
+
+	ids, err := opengraph.WriteGraph(ctx, d, &doc.Graph)
 	if err != nil {
 		t.Fatalf("graphtest: load %s: %v", path, err)
 	}

@@ -142,9 +142,8 @@ func locateDAWGSModuleDir(t *testing.T) string {
 // already-declared kind ids rather than lazily defining them the way
 // tx.CreateNode/tx.CreateRelationshipByIDs do (see graphtest.LoadRandom's
 // doc) -- so every kind a dataset uses must be asserted before it loads.
-// Fixture cases need no such pre-declaration: WithRollbackFixture writes
-// through opengraph.WriteGraphTx, which uses the lazily-asserting
-// transaction methods directly.
+// Fixture cases are a separate concern with their own separate fix: see
+// fixtureKinds' doc, unioned into this schema at its one call site below.
 func corpusSchema(t *testing.T, datasetNames []string, datasetPath func(string) string) graph.Schema {
 	t.Helper()
 
@@ -168,6 +167,46 @@ func corpusSchema(t *testing.T, datasetNames []string, datasetPath func(string) 
 		Graphs:       []graph.Graph{{Name: graphtest.GraphName, Nodes: nodeKinds, Edges: edgeKinds}},
 		DefaultGraph: graph.Graph{Name: graphtest.GraphName},
 	}
+}
+
+// fixtureKinds returns the union of every node/edge kind carried by the
+// Fixture graph of every fixture case across files -- every parsed case
+// file in the corpus, not just one dataset group's.
+//
+// corpusSchema's doc explains why dataset kinds must be pre-declared before
+// opengraph.Load's batch edge-write path will accept them; fixture cases
+// avoid that specific problem by writing through opengraph.WriteGraphTx's
+// lazily-asserting transaction methods instead. But a fixture case's own
+// Cypher can still pattern-match against a kind (e.g. a label predicate
+// like "n:Computer") that its own Fixture graph never actually creates --
+// the case is testing that the pattern correctly matches nothing, not that
+// the kind exists in this fixture. Reading a kind out of a MATCH pattern
+// during Cypher-to-SQL translation goes through SchemaManager.MapKind,
+// which -- unlike AssertKinds -- never defines a kind, only looks one up,
+// so it fails unless some kind, somewhere, already caused that name to be
+// asserted. Kind rows persist once asserted (SchemaManager.AssertKinds runs
+// in its own, separate, non-rolled-back write transaction, even when called
+// from inside a fixture case's rolled-back one), so another fixture case
+// earlier in the corpus that does create a "Computer" node would normally
+// carry the kind forward -- but that only works if case order happens to
+// cooperate, which nothing guarantees. Declaring every fixture kind up
+// front, alongside every dataset kind, removes the ordering dependency
+// entirely: by the time any case runs, every kind any case could reference
+// already exists.
+func fixtureKinds(files []caseFile) (nodeKinds, edgeKinds graph.Kinds) {
+	for _, cf := range files {
+		for _, tc := range cf.Cases {
+			if tc.Fixture == nil {
+				continue
+			}
+
+			nk, ek := tc.Fixture.Kinds()
+			nodeKinds = nodeKinds.Add(nk...)
+			edgeKinds = edgeKinds.Add(ek...)
+		}
+	}
+
+	return nodeKinds, edgeKinds
 }
 
 // TestDAWGSCorpus is milestone 3's "DAWGS integration corpus green" exit
@@ -209,6 +248,7 @@ func TestDAWGSCorpus(t *testing.T) {
 	var (
 		groups       = map[string]*group{}
 		datasetNames []string
+		allCaseFiles []caseFile
 	)
 
 	for _, path := range files {
@@ -221,6 +261,7 @@ func TestDAWGSCorpus(t *testing.T) {
 		if err := json.Unmarshal(raw, &cf); err != nil {
 			t.Fatalf("decode %s: %v", path, err)
 		}
+		allCaseFiles = append(allCaseFiles, cf)
 
 		ds := cf.Dataset
 		if ds == "" {
@@ -267,6 +308,16 @@ func TestDAWGSCorpus(t *testing.T) {
 	db := graph.Database(d)
 
 	schema := corpusSchema(t, datasetNames, datasetPath)
+
+	// Fixture cases carry their own inline node/edge kinds, and some of
+	// those kinds never appear in any dataset file -- see fixtureKinds' doc
+	// for why they still need declaring up front rather than left to the
+	// lazy definition WriteGraphTx's transaction methods would otherwise
+	// provide.
+	fixtureNodeKinds, fixtureEdgeKinds := fixtureKinds(allCaseFiles)
+	schema.Graphs[0].Nodes = schema.Graphs[0].Nodes.Add(fixtureNodeKinds...)
+	schema.Graphs[0].Edges = schema.Graphs[0].Edges.Add(fixtureEdgeKinds...)
+
 	if err := d.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("assert schema: %v", err)
 	}
