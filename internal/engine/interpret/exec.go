@@ -6,39 +6,30 @@
 // bags, joining shared variables by binding identity, filtering by WHERE,
 // and projecting the RETURN clause.
 //
-// Scope (Task 7 of the milestone): fixed-length relationship Steps only
-// (Step.Range == nil, Step.Shortest == ShortestNone) within a single Part
-// that carries no WithClause, and a RETURN clause with no ORDER BY/SKIP/
-// LIMIT/DISTINCT. Everything outside that shape is declined via the
-// unexported errUnsupportedStep sentinel rather than guessed at -- exactly
-// like Plan's own default-deny posture, and for the same reason: a caller
-// that receives errUnsupportedStep (or any other error out of Execute) is
-// expected to delegate the whole query to PostgreSQL, which is always
-// correct.
+// Scope (Task 7 of the milestone): fixed-length relationship Steps within a
+// single Part that carries no WithClause, and a RETURN clause with no ORDER
+// BY/SKIP/LIMIT/DISTINCT -- plus, as of Task 8, variable-length (Step.Range
+// != nil) and shortestPath()/allShortestPaths() (Step.Shortest !=
+// ShortestNone) Steps, dispatched out to expand.go (see runComponent's own
+// doc comment below for exactly which shapes of those two are handled here
+// versus declined). Everything else is declined via the unexported
+// errUnsupportedStep sentinel rather than guessed at -- exactly like Plan's
+// own default-deny posture, and for the same reason: a caller that receives
+// errUnsupportedStep (or any other error out of Execute) is expected to
+// delegate the whole query to PostgreSQL, which is always correct.
 //
 // Seams for later tasks (both extend this file's machinery rather than
 // rewrite it):
 //
-//   - Task 8 (var-length trails and shortestPath): the early per-Step gate
-//     in Execute below is exactly the hook to replace -- swap "reject Range
-//     != nil / Shortest != ShortestNone" for a call into Task 8's own
-//     expansion, reusing runComponent's anchor selection, adjacency(),
-//     edgeKindOK, nodeSatisfiesConstraint, and cloneRow unchanged. Task 8
-//     also owns PathVal construction (it converts the dense paths it
-//     enumerates into *PathVal directly); this file only *declares* PathVal
-//     because ResultSet/OutVal already need the type to exist.
 //   - Task 9 (WITH pipeline): the early Query-shape gate (WithClause/Order/
 //     Skip/Limit/Distinct) is that hook -- Task 9 replaces it with the
 //     actual grouping/ordering/dedup pass, chaining Parts together via
 //     GroupKeys the way this file chains a single Part's own components via
 //     shared node identity (cartesianJoin's approach generalizes directly:
 //     a WITH boundary is just another join key set).
-//   - projectItem's fallthrough to EvalValue for a bare path-variable
-//     RETURN item is deliberate: nothing in this file ever calls
-//     Row.SetPathVar, so EvalValue's evalVariableValue reports
-//     ErrUnsupported for it today, which correctly aborts materialization
-//     and lets the caller delegate. Once Task 8 starts binding path values,
-//     projectItem gains an explicit OutPath case ahead of that fallthrough.
+//   - projectItem now has an explicit OutPath case for a bare path-variable
+//     RETURN item, reading whatever expand.go's Task 8 functions bound via
+//     Row.SetPathVar (always a *PathVal in this package, see expand.go).
 package interpret
 
 import (
@@ -199,15 +190,6 @@ func Execute(env *Env, q *Query, b Budgets) (*ResultSet, error) {
 		return nil, errUnsupportedStep
 	}
 	part := &q.Parts[0]
-
-	// Task 8 seam: var-length and shortestPath/allShortestPaths Steps are
-	// not implemented here.
-	for i := range part.Chains {
-		st := &part.Chains[i]
-		if st.Range != nil || st.Shortest != ShortestNone {
-			return nil, errUnsupportedStep
-		}
-	}
 
 	meter := &workMeter{budget: b}
 
@@ -397,7 +379,34 @@ func mergeRowInto(dst, src *Row) {
 // "closing" Step -- a cycle in the pattern's own symbol graph, e.g.
 // `(a)-->(b), (b)-->(a)` reusing "a"/"b", or a self-loop pattern
 // `(a)-->(a)`) to a verification pass once the whole tree has been walked.
+//
+// Task 8 dispatch: a component consisting of exactly one Step that is
+// variable-length (Range != nil) or shortestPath/allShortestPaths (Shortest
+// != ShortestNone) is handed to expand.go's dedicated expansion instead --
+// neither shape grows an existing row set one adjacency hop at a time the
+// way expandStep does (a var-length Step enumerates a whole DFS of trails
+// per seed; a shortestPath Step resolves both endpoints to complete node
+// sets before ever calling into the snapshot's adjacency at all), so they do
+// not fit this function's tree/closing-edge BFS model. A component that
+// *mixes* such a Step with any other Step (e.g. `(a)-[:E*1..2]->(b),
+// (a)-[:F]->(c)`, sharing "a") is declined outright (errUnsupportedStep):
+// composing expand.go's own row-set-producing model with this function's
+// bound-symbol-growing model is unverified and not needed by any required
+// shape, so this declines rather than guess. Every shape in this task's
+// required test corpus is a single, standalone var-length or shortestPath
+// pattern -- exactly the case handled here.
 func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdxs []int) ([]*Row, error) {
+	if hasSpecialStep(part, stepIdxs) {
+		if len(stepIdxs) != 1 {
+			return nil, errUnsupportedStep
+		}
+		step := &part.Chains[stepIdxs[0]]
+		if step.Shortest != ShortestNone {
+			return expandShortestPathComponent(env, meter, part, step)
+		}
+		return expandVarLengthComponent(env, meter, part, step)
+	}
+
 	anchor := chooseAnchor(env, part.Nodes, syms)
 	rows, err := scanAnchor(env, meter, anchor, part.Nodes[anchor])
 	if err != nil {
@@ -462,6 +471,19 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 	}
 
 	return rows, nil
+}
+
+// hasSpecialStep reports whether any of part.Chains[stepIdxs] is a
+// variable-length or shortestPath/allShortestPaths Step -- runComponent's
+// Task 8 dispatch condition.
+func hasSpecialStep(part *Part, stepIdxs []int) bool {
+	for _, idx := range stepIdxs {
+		st := &part.Chains[idx]
+		if st.Range != nil || st.Shortest != ShortestNone {
+			return true
+		}
+	}
+	return false
 }
 
 // --- anchor selection ------------------------------------------------------
@@ -897,13 +919,14 @@ func projectRow(env *Env, proj Projection, r *Row) ([]OutVal, error) {
 	return out, nil
 }
 
-// projectItem evaluates one RETURN item. A bare node or edge variable
-// projects as OutNode/OutEdge directly from the row's own binding (EvalValue
-// would otherwise materialize a node's full property map, or reject an edge
-// variable outright -- see evalVariableValue's doc comment); everything
-// else -- a property lookup, a function call, arithmetic, a literal, or (see
-// the package doc's Task 8 seam) a bare path variable this task never binds
-// -- goes through EvalValue and projects as OutScalar.
+// projectItem evaluates one RETURN item. A bare node, edge, or path variable
+// projects as OutNode/OutEdge/OutPath directly from the row's own binding
+// (EvalValue would otherwise materialize a node's full property map, reject
+// an edge variable outright, or (having no path-value model at all) report
+// ErrUnsupported for a path variable -- see evalVariableValue's doc
+// comment); everything else -- a property lookup, a function call,
+// arithmetic, or a literal -- goes through EvalValue and projects as
+// OutScalar.
 func projectItem(env *Env, r *Row, item ProjectionOutput) (OutVal, error) {
 	if v, isVar := unwrapParens(item.Expr).(*cypher.Variable); isVar && v != nil {
 		if nodeID, ok := r.Node(v.Symbol); ok {
@@ -911,6 +934,12 @@ func projectItem(env *Env, r *Row, item ProjectionOutput) (OutVal, error) {
 		}
 		if edgeRef, ok := r.Edge(v.Symbol); ok {
 			return OutVal{Kind: OutEdge, Edge: edgeRef}, nil
+		}
+		if pv, ok := r.PathVar(v.Symbol); ok {
+			// Every path value this package ever binds (see expand.go) is a
+			// *PathVal; Row.PathVar's `any` shape exists only because it
+			// predates that task, per its own doc comment.
+			return OutVal{Kind: OutPath, Path: pv.(*PathVal)}, nil
 		}
 	}
 

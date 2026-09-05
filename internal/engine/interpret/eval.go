@@ -435,8 +435,10 @@ func asLiteral(expr cypher.Expression) (*cypher.Literal, bool) {
 
 // evalEquality implements `=`/`<>` per the brief's routing table:
 // literal-vs-anything routes through evalLiteralComparison (which further
-// splits on the literal's own type), and anything-vs-anything else (property
-// vs property, or either/both sides a computed function/arithmetic result)
+// splits on the literal's own type), a bare `<node var> op <node var>` (or
+// the analogous edge-variable shape) routes through evalIdentityEquality
+// (see its own doc comment for why), and anything else (property vs
+// property, or either/both sides a computed function/arithmetic result)
 // routes through PropEq, which NULLs on either side's absence and otherwise
 // does raw structural equality -- correct for two computed values just as
 // much as for two raw property lookups, since a computed value is never
@@ -447,6 +449,13 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 	}
 	if leftLit, ok := asLiteral(leftExpr); ok {
 		return evalLiteralComparison(env, row, rightExpr, op, leftLit)
+	}
+
+	if t, ok := evalIdentityEquality(row, leftExpr, rightExpr); ok {
+		if op == cypher.OperatorNotEquals {
+			t = t.Not()
+		}
+		return t, nil
 	}
 
 	aVal, aOk, err := EvalValue(env, row, leftExpr)
@@ -462,6 +471,46 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 		t = t.Not()
 	}
 	return t, nil
+}
+
+// evalIdentityEquality special-cases `<bound node var> = <bound node var>`
+// (and the analogous edge-variable shape) as a NodeID/EdgeRef identity
+// comparison, pre-empting evalEquality's generic PropEq path for exactly
+// this shape. This matters because evalVariableValue's EvalValue result for
+// a bare node variable is its full property map (needed for `RETURN n`'s own
+// value shape -- see that function's doc comment), which has no defined
+// equality semantics of its own and, critically, discards identity entirely:
+// two textually distinct nodes that happen to carry identical property bags
+// (the common case for a bare/property-less node, and not even a rare one
+// for two real nodes that share every property) would otherwise compare
+// "equal" via PropEq's structural jsonbEqual, when real Cypher/pg compares
+// two node (or relationship) values by identity. This is exactly the shape
+// task-8-brief.md's shortestPath self-pair rule depends on
+// (`WHERE s<>t`, s and t both bare node variables) -- and, per task-6's own
+// report ("The COLLECT-membership execution gap"), an instance of a
+// documented pattern this codebase already flags: identity-based semantics
+// over a node variable must be special-cased structurally before falling
+// through to generic property-value comparison.
+//
+// ok is false (deferring to the generic PropEq path, unchanged) for every
+// other shape -- either operand not a bare Variable, either operand not
+// resolving to the same value namespace (both nodes, or both edges) in row,
+// or a node compared against an edge.
+func evalIdentityEquality(row *Row, leftExpr, rightExpr cypher.Expression) (t Tri, ok bool) {
+	lv, lIsVar := unwrapParens(leftExpr).(*cypher.Variable)
+	rv, rIsVar := unwrapParens(rightExpr).(*cypher.Variable)
+	if !lIsVar || !rIsVar || lv == nil || rv == nil {
+		return TriFalse, false
+	}
+	if ln, lIsNode := row.Node(lv.Symbol); lIsNode {
+		rn, rIsNode := row.Node(rv.Symbol)
+		return boolToTri(rIsNode && ln == rn), rIsNode
+	}
+	if le, lIsEdge := row.Edge(lv.Symbol); lIsEdge {
+		re, rIsEdge := row.Edge(rv.Symbol)
+		return boolToTri(rIsEdge && le.Fwd == re.Fwd), rIsEdge
+	}
+	return TriFalse, false
 }
 
 // evalLiteralComparison implements `otherExpr op lit` (or `lit op otherExpr`,
