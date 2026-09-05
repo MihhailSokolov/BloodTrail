@@ -1302,6 +1302,88 @@ func TestTryRelQueryRowsProjectionMismatchDeclines(t *testing.T) {
 	}
 }
 
+// TestTryRelQueriesUnconstrainedRelSpecServesFully covers the regression:
+// a fully-unconstrained recognize.RelSpec{} (no EdgeKinds, no StartIDs, no
+// EndIDs, no endpoint constraints) must serve the complete edge set against
+// a clean snapshot. This proves the engine handles the most permissive query
+// shape and returns all edges with their full (start, edgeID, end) triples.
+func TestTryRelQueriesUnconstrainedRelSpecServesFully(t *testing.T) {
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	ctx := context.Background()
+	spec := recognize.RelSpec{}
+
+	// TryRelCount must return the total edge count (7 edges in the fixture).
+	count, ok := e.TryRelCount(ctx, spec)
+	if !ok {
+		t.Fatalf("TryRelCount: ok = false, want true (unconstrained RelSpec should serve)")
+	}
+	if count != 7 {
+		t.Fatalf("TryRelCount: count = %d, want 7 (all edges in fixture)", count)
+	}
+
+	// TryRelFetchTriples must yield exactly every edge's (start, edgeID, end).
+	triplesCursor, ok := e.TryRelFetchTriples(ctx, spec)
+	if !ok {
+		t.Fatalf("TryRelFetchTriples: ok = false, want true (unconstrained RelSpec should serve)")
+	}
+	triples := drainTriples(t, triplesCursor)
+	wantTriples := []graph.RelationshipTripleResult{
+		{ID: 101, StartID: 1, EndID: 5},
+		{ID: 102, StartID: 2, EndID: 5},
+		{ID: 103, StartID: 1, EndID: 3},
+		{ID: 104, StartID: 2, EndID: 4},
+		{ID: 105, StartID: 3, EndID: 1},
+		{ID: 106, StartID: 4, EndID: 2},
+		{ID: 107, StartID: 1, EndID: 4},
+	}
+	assertTriples(t, triples, wantTriples)
+
+	// TryRelQueryRows with ProjectionStartEnd and orderByEdgeID=false
+	// must yield every (start, end) pair.
+	rowResult, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStartEnd, false)
+	if !ok {
+		t.Fatalf("TryRelQueryRows: ok = false, want true (unconstrained RelSpec should serve)")
+	}
+	defer rowResult.Close()
+
+	var pairs [][2]graph.ID
+	var s, end graph.ID
+	for rowResult.Next() {
+		if err := rowResult.Scan(&s, &end); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		pairs = append(pairs, [2]graph.ID{s, end})
+	}
+	if err := rowResult.Error(); err != nil {
+		t.Fatalf("Error() = %v, want nil", err)
+	}
+
+	wantPairs := [][2]graph.ID{
+		{1, 5}, {2, 5}, {1, 3}, {2, 4}, {3, 1}, {4, 2}, {1, 4},
+	}
+	if len(pairs) != len(wantPairs) {
+		t.Fatalf("pairs = %v, want %v (all 7 edges)", pairs, wantPairs)
+	}
+	// Sort both for comparison (order may vary, but set must match).
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i][0] != pairs[j][0] {
+			return pairs[i][0] < pairs[j][0]
+		}
+		return pairs[i][1] < pairs[j][1]
+	})
+	sort.Slice(wantPairs, func(i, j int) bool {
+		if wantPairs[i][0] != wantPairs[j][0] {
+			return wantPairs[i][0] < wantPairs[j][0]
+		}
+		return wantPairs[i][1] < wantPairs[j][1]
+	})
+	for i := range wantPairs {
+		if pairs[i] != wantPairs[i] {
+			t.Fatalf("pairs = %v, want %v (all 7 edges)", pairs, wantPairs)
+		}
+	}
+}
+
 // TestTryRelFetchIDsCloseDoesNotLeakFeeder is this file's Task 7
 // cursor-leak regression test, modeled directly on
 // TestTryNodeFetchIDsCloseDoesNotLeakFeeder above: a cursor that is drained
