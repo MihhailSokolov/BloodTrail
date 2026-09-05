@@ -548,7 +548,14 @@ func smallestKindBitmap(env *Env, kinds []snapshot.KindID) *snapshot.Bitset {
 // candidate visited -- regardless of source -- spends one work unit and is
 // independently checked against the *complete* nc (not just whatever
 // narrowed the candidate source), since e.g. an id() anchor does not by
-// itself guarantee the same symbol's kind labels also hold.
+// itself guarantee the same symbol's kind labels also hold. Per Budgets'
+// documented "+1 per row produced anywhere -- component rows,
+// cartesian-joined rows, and final rows alike", a candidate that survives
+// nc also spends a second, separate work unit for the row it produces --
+// exactly the two-tier charge expandStep/verifyClosingStep already apply
+// (inspect the candidate, then charge again for each one that becomes a
+// row) -- so the anchor scan that seeds a component is not a silent
+// exception to that accounting.
 func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*Row, error) {
 	var rows []*Row
 	visit := func(id snapshot.NodeID) error {
@@ -560,6 +567,9 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 		}
 		r := NewRow()
 		r.SetNode(sym, id)
+		if err := meter.spend(1); err != nil {
+			return err
+		}
 		rows = append(rows, r)
 		return nil
 	}
@@ -666,21 +676,54 @@ type adjCandidate struct {
 //     candidates directly), else In(bound) (bound is the "to" side, so its
 //     reverse CSR gives the "from" candidates that would traverse forward
 //     into it).
-//   - Direction == Both: both Out(bound) and In(bound) regardless of
-//     boundIsFrom (an undirected step is symmetric in which structural role
-//     the bound endpoint plays), each candidate guarded by other != bound --
-//     the "start.id != end.id" rule pinned from dawgs'
-//     traversal_directionless.go leftNodeConstraint/terminalNodeConstraint:
-//     a non-self-loop edge satisfies exactly one of pg's `id = start_id`/
-//     `id = end_id` disjuncts from bound's perspective, so Out and In never
+//   - Direction == Both, step.FromSym != step.ToSym (two distinct pattern
+//     symbols joined by an undirected step -- the common case, and the only
+//     shape expandStep's tree-edge calls ever produce): both Out(bound) and
+//     In(bound), each candidate guarded by other != bound -- the "start.id
+//     != end.id" rule pinned from dawgs' traversal_directionless.go
+//     leftNodeConstraint/terminalNodeConstraint, applied only when the two
+//     endpoint *identifiers* differ, mirroring
+//     buildPairwiseDirectionlessTraversalPatternRoot's own "Only apply
+//     endpoint inequality when the bound nodes are different" comment: a
+//     non-self-loop edge satisfies exactly one of pg's `id = start_id`/`id =
+//     end_id` disjuncts from bound's perspective, so Out and In never
 //     double-count the same physical edge here, and a genuine self-loop
-//     (which would satisfy both) is excluded from both instead.
+//     (which would satisfy both) is excluded from both instead. The guard
+//     is keyed on the step's *symbols*, not a runtime id comparison: pg
+//     decides this branch statically from the identifiers at translate
+//     time, never from a runtime value, so two distinct symbols that happen
+//     to alias to the same node at runtime (e.g. bound earlier via an
+//     unrelated self-loop elsewhere in the pattern) must still be excluded
+//     here exactly as they would be in pg's generated SQL -- see
+//     TestExecUndirectedDifferentSymbolClosingStepExcludesRuntimeSelfLoop.
+//   - Direction == Both, step.FromSym == step.ToSym (a literal same-symbol
+//     pattern, e.g. `(n)-[:E]-(n)`): the inequality guard above does not
+//     apply -- excluding other == bound here would make every such pattern
+//     deterministically match nothing, which is exactly Finding 1 of the
+//     2026-09-05 milestone-4 review. This mirrors dawgs'
+//     buildSelfReferentialDirectionlessTraversalRoot, the branch reached for
+//     exactly this shape, which applies no equivalent inequality guard
+//     (its comment: "push the right-node join condition into WHERE so that
+//     start_id and end_id both reference the same node"). Only Out(bound)
+//     is walked, not also In(bound): a self-loop's start and end are the
+//     same node, so it already appears in Out(bound) once; walking
+//     In(bound) too would find the identical edge a second time via the
+//     reverse index and double-count it. Multiplicity was pinned by
+//     generating dawgs@v0.8.0's actual SQL for `match (u)-[]-(u) return u`
+//     (via translate.Translate/Translated): the self-referential root joins
+//     the edge table to a single node table once, with the *same*
+//     OR-condition `(n0.id = e.end_id or n0.id = e.start_id)` appearing in
+//     both the JOIN's ON and the WHERE clause -- a single INNER JOIN, not a
+//     union of a forward and a reverse traversal, so it emits exactly ONE
+//     row per matching self-loop edge, never two. Walking only Out(bound)
+//     here reproduces that multiplicity exactly.
 //
 // buildStep only ever normalizes a compiled Step's Direction to Outbound or
 // Both (an inbound arrow is swapped into an outbound one at plan time), so
 // this is exhaustive over what a Step can actually carry.
 func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, boundIsFrom bool) ([]adjCandidate, error) {
 	var out []adjCandidate
+	sameSymbol := step.FromSym == step.ToSym
 
 	visitOut := func() error {
 		targets, kinds := env.Snap.Out(bound)
@@ -689,7 +732,7 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 			if err := meter.spend(1); err != nil {
 				return err
 			}
-			if step.Direction == graph.DirectionBoth && other == bound {
+			if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
 				continue
 			}
 			out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: lo + uint64(i)})
@@ -703,7 +746,7 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 			if err := meter.spend(1); err != nil {
 				return err
 			}
-			if step.Direction == graph.DirectionBoth && other == bound {
+			if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
 				continue
 			}
 			out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: uint64(env.Snap.InEdgeIdx[lo+uint64(i)])})
@@ -714,6 +757,14 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 	if step.Direction == graph.DirectionBoth {
 		if err := visitOut(); err != nil {
 			return nil, err
+		}
+		if sameSymbol {
+			// Same-symbol undirected step: only a self-loop on bound can
+			// ever match (the caller reduces every candidate to other ==
+			// bound anyway), and Out(bound) already lists each self-loop
+			// exactly once -- see the doc comment above for the pg-matching
+			// multiplicity this preserves.
+			return out, nil
 		}
 		if err := visitIn(); err != nil {
 			return nil, err

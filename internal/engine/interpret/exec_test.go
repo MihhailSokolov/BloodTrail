@@ -331,6 +331,92 @@ func TestExecUndirectedStepExcludesSelfBothOrientations(t *testing.T) {
 	assertRowSet(t, rs, want)
 }
 
+// --- undirected same-symbol step: self-loop pattern (n)-[:E]-(n) -----------
+
+// TestExecUndirectedSameSymbolSelfLoop pins two things at once, per the
+// review finding that sent us back to dawgs' own SQL:
+//
+//  1. A literal same-symbol undirected pattern must actually find self-loop
+//     edges (it deterministically found zero before this fix, because
+//     adjacency's DirectionBoth "other == bound" self-exclusion fired
+//     unconditionally, even when bound is the *only* node the step can ever
+//     match against).
+//
+//  2. Multiplicity: exactly ONE row per self-loop edge, not two (once per
+//     CSR orientation). This mirrors dawgs@v0.8.0's
+//     buildSelfReferentialDirectionlessTraversalRoot (cypher/models/pgsql/
+//     translate/traversal_directionless.go), confirmed by generating its
+//     actual SQL for `match (u)-[]-(u) return u`:
+//
+//     with s0 as (select ... from edge e0 join node n0
+//     on (n0.id = e0.end_id or n0.id = e0.start_id)
+//     where (n0.id = e0.end_id or n0.id = e0.start_id)) ...
+//
+// -- a single INNER JOIN with one OR-condition shared by the ON and WHERE
+// clauses, not a union of a forward and a reverse traversal, so it emits
+// exactly one row per matching edge.
+func TestExecUndirectedSameSymbolSelfLoop(t *testing.T) {
+	const kindE snapshot.KindID = 10
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindE: "E"},
+		[]execNodeSpec{
+			{40, nil, nil}, // s (self-loop)
+			{41, nil, nil}, // t (has an outgoing edge, but not a self-loop)
+			{42, nil, nil}, // w (t's non-self-loop neighbor)
+		},
+		[]execEdgeSpec{
+			{6000, 40, 40, kindE}, // s -> s (self-loop; must be found, exactly once)
+			{6001, 41, 42, kindE}, // t -> w (not a self-loop; must never satisfy (n)-[:E]-(n))
+		},
+	)
+
+	rs := mustExec(t, snap, `MATCH (n)-[:E]-(n) RETURN n`, generousBudget)
+
+	s, _ := snap.Dense(40)
+	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: s}})})
+}
+
+// TestExecUndirectedDifferentSymbolClosingStepExcludesRuntimeSelfLoop is the
+// control the same finding asked for: two *different* pattern symbols ("a",
+// "b") that happen to alias to the same node at runtime (via an earlier
+// directed self-loop step binding a == b) must still have their undirected
+// closing step's self-exclusion apply. The guard is keyed on the step's
+// symbols (FromSym != ToSym), not on a runtime id comparison -- matching
+// dawgs' own static, per-identifier branching in
+// buildPairwiseDirectionlessTraversalPatternRoot ("Only apply endpoint
+// inequality when the bound nodes are different"), which decides the SQL
+// shape from the identifiers alone at translate time, never from a runtime
+// value. Without this, relaxing the self-exclusion for the same-symbol case
+// (this fix's Finding 1) could easily have been over-broadened into also
+// admitting this different-symbol-but-runtime-equal case, which must still
+// be excluded.
+func TestExecUndirectedDifferentSymbolClosingStepExcludesRuntimeSelfLoop(t *testing.T) {
+	const (
+		kindE snapshot.KindID = 10
+		kindF snapshot.KindID = 11
+	)
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindE: "E", kindF: "F"},
+		[]execNodeSpec{
+			{50, nil, nil}, // s: self-loop on both E and F
+		},
+		[]execEdgeSpec{
+			{8000, 50, 50, kindE}, // s -[:E]-> s: binds a == b == s via the directed step
+			{8001, 50, 50, kindF}, // s -[:F]- s: would satisfy the undirected closing step
+			// only if the self-exclusion were incorrectly skipped for a's/b's
+			// coincidental runtime equality.
+		},
+	)
+
+	rs := mustExec(t, snap, `MATCH (a)-[:E]->(b), (a)-[:F]-(b) RETURN a,b`, generousBudget)
+
+	if len(rs.Rows) != 0 {
+		t.Fatalf("got %d rows, want 0 (different-symbol undirected closing step must still exclude a runtime self-loop coincidence): %v", len(rs.Rows), rowKeys(rs.Rows))
+	}
+}
+
 // --- property predicate filtering via WHERE ---------------------------------
 
 func TestExecWherePropertyPredicate(t *testing.T) {
