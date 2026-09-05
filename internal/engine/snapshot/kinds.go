@@ -24,7 +24,7 @@ func NewKindTable(pairs map[KindID]string) *KindTable {
 		}
 	}
 
-	names := make([]string, maxID+1)
+	names := make([]string, int(maxID)+1)
 	ids := make(map[string]KindID, len(pairs))
 	for id, name := range pairs {
 		if id >= 0 {

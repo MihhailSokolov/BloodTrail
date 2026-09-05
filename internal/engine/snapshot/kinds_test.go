@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 package snapshot
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestKindTableNameAndID(t *testing.T) {
 	tbl := NewKindTable(map[KindID]string{1: "User", 2: "Group"})
@@ -33,6 +36,19 @@ func TestKindTableLen(t *testing.T) {
 	empty := NewKindTable(nil)
 	if got := empty.Len(); got != 0 {
 		t.Fatalf("Len() on empty table = %d, want 0", got)
+	}
+}
+
+func TestKindTableMaxKindID(t *testing.T) {
+	const maxID KindID = math.MaxInt16 // 32767, the largest a SMALLSERIAL column holds
+
+	tbl := NewKindTable(map[KindID]string{maxID: "MaxKind"})
+
+	if got, ok := tbl.Name(maxID); !ok || got != "MaxKind" {
+		t.Fatalf("Name(%d) = (%q, %v), want (%q, true)", maxID, got, ok, "MaxKind")
+	}
+	if got, ok := tbl.ID("MaxKind"); !ok || got != maxID {
+		t.Fatalf(`ID("MaxKind") = (%d, %v), want (%d, true)`, got, ok, maxID)
 	}
 }
 
