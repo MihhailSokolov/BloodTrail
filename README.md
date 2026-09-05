@@ -5,9 +5,11 @@ packaged as a [DAWGS](https://github.com/SpecterOps/DAWGS) driver, so that attac
 analysis and every other graph query stay fast on large Active Directory environments
 and ordinary hardware.
 
-**Status:** milestone 2 (path engine). Shortest paths, all shortest paths, and BloodHound's
-own pre-built shortest-path searches are served from an in-memory replica when it is fresh;
-every other read still goes to PostgreSQL.
+**Status:** milestone 3 (query-builder serving). Shortest paths, all shortest paths, and
+BloodHound's own pre-built shortest-path searches are served from an in-memory replica when
+it is fresh, and so is a defined set of structural node/relationship queries BloodHound's
+query builder issues -- entity panel listings and analysis's own structural scans among
+them. Every other read still goes to PostgreSQL.
 
 ## Why
 
@@ -26,12 +28,14 @@ arrays, and a single CPU core sweeps every edge in under a second. See
 - BloodTrail is a DAWGS driver, selected with `graph_driver: "bloodtrail"`. BloodHound's
   ingest, analysis, API and UI are unchanged; they talk to the same `graph.Database`
   interface as before.
-- As of milestone 2, the driver keeps a replica of the graph's *topology* in memory:
-  dense ids, forward and reverse adjacency with an edge kind per entry, and kind
-  bitmaps -- exactly what the shortest-path queries described below need. It holds no
-  node or edge properties; a served result's properties are hydrated from PostgreSQL
-  per query instead. See [In-memory path engine](#in-memory-path-engine) for what is
-  actually served from the replica today.
+- The driver keeps a replica of the graph's *topology* in memory: dense ids, forward
+  and reverse adjacency with an edge id and kind per entry, and kind bitmaps -- what
+  milestone 2's shortest-path queries need, and, as of milestone 3, also what a defined
+  set of structural node/relationship queries need. It holds no node or edge
+  properties; a served result's properties are hydrated from PostgreSQL per query
+  instead. See [In-memory path engine](#in-memory-path-engine) and
+  [Query-builder serving](#query-builder-serving) for what is actually served from the
+  replica today.
 - PostgreSQL remains the system of record. Writes go to PostgreSQL first; the replica
   itself is rebuilt wholesale from PostgreSQL by a poller (after every completed
   analysis run, and again once the ingest/analysis pipeline goes idle following a
@@ -41,10 +45,11 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   installer that upgrades an existing BloodHound CE deployment with backup and
   rollback.
 - **Planned, not yet built** (see [Roadmap](#roadmap)): columnar properties and
-  property indexes in the replica itself; an interpreter that executes queries beyond
-  shortest-path directly against DAWGS's Cypher syntax tree; write-through updates to
-  the replica on commit instead of a poller-driven rebuild; and loading/restoring the
-  replica from a snapshot file on startup.
+  property indexes in the replica itself; an interpreter that executes pre-built and
+  user Cypher queries beyond the shapes recognized today directly against DAWGS's
+  Cypher syntax tree; write-through updates to the replica on commit instead of a
+  poller-driven rebuild; and loading/restoring the replica from a snapshot file on
+  startup.
 
 ## In-memory path engine
 
@@ -91,12 +96,73 @@ are correct regardless of the replica's state.
     `512MiB`, or a plain byte count). A rebuild that would exceed it is refused, and the engine
     keeps serving from (or falling back from) whatever snapshot it already had. Unset or `0`
     means unbounded.
+  - `BLOODTRAIL_LOG_LEVEL` -- `debug`, `info`, `warn`, or `error`. When set, it widens the
+    minimum level BloodTrail's own log lines are guaranteed to be visible at, on top of
+    whatever already configures the process's logger -- it can only add visibility, never
+    take it away. Left unset, it is a complete no-op. `debug` is what surfaces e.g.
+    `bloodtrail: builder engine served`.
 
 - **Log markers**, all under a `bloodtrail:` prefix: `bloodtrail: snapshot rebuilt` (Info, on
   every successful rebuild), `bloodtrail: snapshot rebuild refused: exceeds memory limit`
-  (Warn, rate-limited), `bloodtrail: path engine served` (Info, once per query actually
-  answered from memory), and `bloodtrail: path engine declined` (Debug, with a `reason` attr,
-  whenever a query fell back to PostgreSQL).
+  (Warn, rate-limited), `bloodtrail: path engine served` (Info, once per shortest-path query
+  actually answered from memory), `bloodtrail: path engine declined` (Debug, with a `reason`
+  attr, whenever a shortest-path query fell back to PostgreSQL), and their query-builder
+  counterparts `bloodtrail: builder engine served` / `bloodtrail: builder engine declined`
+  (both Debug -- a structural query runs far more often than a shortest-path one, so these
+  stay one level quieter).
+
+## Query-builder serving
+
+Milestone 3 extends the same in-memory replica to also answer BloodHound's **query
+builder** -- the fluent `Nodes()`/`Relationships()` API BloodHound's own Go code uses
+internally, as distinct from a user's Cypher text. This is what backs, among other
+things, the entity panel's member and controller listings and the structural scans
+analysis itself issues while recomputing derived edges and tags. When a builder query
+matches one of a defined set of structural shapes, and the replica is fresh enough for
+it, BloodTrail answers it from memory instead of PostgreSQL:
+
+- **Node queries** -- count, fetch ids, or fetch id-plus-kind listings -- for any query
+  constrained by at least one node-kind filter. An `id()`-only filter has no kind to
+  check freshness against, so it always delegates.
+- **Relationship queries** -- count, fetch ids, fetch (start, end) id pairs, and fetch
+  id-plus-kind-annotated triples -- for any combination of an edge-kind filter and
+  endpoint id/kind filters.
+- **Two row projections** that BloodHound's own traversal driver issues while walking
+  the graph: a bare (start, end) pair per edge, and a single traversal step's far
+  endpoint (id and kinds) alongside the traversed edge's own id and kind. Both can honor
+  the ascending-by-edge-id ordering that driver's paging relies on, whenever the scan is
+  anchored to one endpoint's id.
+
+Property predicates -- anything that filters or projects a node or relationship's
+*property* rather than its id or kind -- always go to PostgreSQL: the replica holds no
+properties, unchanged from milestone 2. So does any query shaped differently from the
+above -- more than one chained filter, an ordering/offset/limit the engine doesn't
+implement, or a caller-supplied row projection -- the same "engine declines, PostgreSQL
+always answers correctly" contract the path engine already has.
+
+- **Kind-scoped freshness.** Every write is now recorded against the specific node and
+  edge kinds it actually touched, not only as a blanket "something changed." A builder
+  query is served only if every kind it can observe is clean since the replica was
+  built: a node query's own kind constraints; a relationship query's edge-kind filter,
+  plus, if it also constrains either endpoint by kind, that endpoint's kinds too. A
+  write to an unrelated kind elsewhere in the graph no longer blocks it. Shortest-path
+  queries are unaffected by this and keep milestone 2's coarser rule -- any write at all
+  invalidates them until the next rebuild. That rebuild now also happens, up to twice,
+  *during* a running analysis: once as analysis starts, so builder queries over
+  untouched source kinds keep serving fresh reads while analysis is still writing its
+  own derived kinds, and once more if that first rebuild is itself made stale by
+  analysis's own earliest writes.
+
+- **Memory.** Serving relationship queries needs a bit more than the path engine's bare
+  topology: each edge's own database id (~8 bytes), a reverse-index pointer back to it
+  (~4 bytes), and a small permutation array to look an edge up by that id (~4 bytes) --
+  roughly 16 bytes per edge on top of milestone 2's layout. At 5 million nodes and 50
+  million edges, budget about 1.6 GB resident, against milestone 2's 0.6 GB.
+  `BLOODTRAIL_MEMORY_LIMIT` (see Configuration above) caps this the same way it always
+  has: a rebuild that would exceed it is refused, and the engine keeps serving (or
+  falling back from) whatever snapshot it already had.
+
+See [bench/builderbench](bench/builderbench) for the measurement.
 
 ## Installing on an existing BloodHound CE deployment
 
@@ -166,11 +232,13 @@ v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
 ## Repository layout
 
 ```
-internal/engine/    The in-memory path engine: snapshot rebuild/poller, endpoint
-                     resolution, traversal, and Cypher/Criteria recognition
+internal/engine/     The in-memory engine: snapshot rebuild/poller, kind-scoped
+                     freshness marks, endpoint resolution and traversal, builder-query
+                     serving, and Cypher/Criteria recognition
 bench/csrbench/      CSR traversal micro-benchmark (self-contained Go module)
 bench/adgen/         Generates a synthetic AD-shaped graph and loads it into PostgreSQL
 bench/pathbench/     Benchmarks the in-memory path engine against a loaded graph
+bench/builderbench/  Benchmarks query-builder serving against a loaded graph
 ```
 
 ## Upstream versions
