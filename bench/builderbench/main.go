@@ -664,7 +664,23 @@ func highestInDegreeGroup(ctx context.Context, pool *pgxpool.Pool, graphID int32
 // an error). createDatapipeStatusTable must run, and insertDatapipeStatus's
 // row must exist, before dawgs.Open constructs the bloodtrail driver in
 // execute, so the very first poll tick already finds a valid row.
+//
+// IMPORTANT: builderbench requires a dedicated benchmark database. It will
+// refuse to run if datapipe_status already exists, since CREATE TABLE IF
+// NOT EXISTS would silently no-op on a real BloodHound database's table, but
+// the deferred DROP TABLE IF EXISTS would then destroy that real table (live
+// pipeline state). Point -dsn at a database created and loaded by adgen for
+// benchmarking only, never at a real BloodHound installation.
 func createDatapipeStatusTable(ctx context.Context, pool *pgxpool.Pool) error {
+	// Check if the table already exists. If it does, refuse to run.
+	var exists bool
+	if err := pool.QueryRow(ctx, "SELECT to_regclass('datapipe_status') IS NOT NULL").Scan(&exists); err != nil {
+		return fmt.Errorf("check datapipe_status pre-existence: %w", err)
+	}
+	if exists {
+		return fmt.Errorf("datapipe_status table already exists; builderbench requires a dedicated benchmark database loaded by adgen, never a real BloodHound installation (the deferred DROP would destroy live pipeline state)")
+	}
+
 	const ddl = `CREATE TABLE IF NOT EXISTS datapipe_status (
 		singleton boolean DEFAULT true NOT NULL,
 		status text NOT NULL,
@@ -817,14 +833,14 @@ func fmtDurationsMs(durations []time.Duration) string {
 	return out + "]"
 }
 
-// slogDiscard silences the bloodtrail driver's own default logging (it
+// init silences the bloodtrail driver's own default logging (it
 // would otherwise log an Info line for driver construction and, depending
 // on BLOODTRAIL_LOG_LEVEL, per-query serve/decline lines) so builderbench's
-// own output stays the only thing on stdout/stderr. Installed once, in
-// init, since bloodtrail.Open reads slog.Default() exactly once at
-// construction time and this must happen before that -- long before
-// execute's own flow reaches dawgs.Open, so init is the only place this can
-// reliably run first regardless of how run/execute are restructured later.
+// own output stays the only thing on stdout/stderr. This runs before main,
+// since bloodtrail.Open reads slog.Default() exactly once at construction
+// time and this must happen before that -- long before execute's own flow
+// reaches dawgs.Open, so init is the only place this can reliably run first
+// regardless of how run/execute are restructured later.
 func init() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
 }

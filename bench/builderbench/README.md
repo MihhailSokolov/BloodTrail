@@ -105,6 +105,12 @@ go run ./bench/adgen -dsn "$BLOODTRAIL_TEST_PG" -users 2000 -wipe
 go run ./bench/builderbench -dsn "$BLOODTRAIL_TEST_PG"
 ```
 
+**Important: `builderbench` requires a dedicated benchmark database.** It
+will refuse to run if `datapipe_status` already exists, since this guards
+against accidentally running against a real BloodHound installation where the
+deferred table drop would destroy live pipeline state. Always point `-dsn` at
+a database created and loaded by `adgen` for benchmarking only.
+
 Do **not** pass `-enforce` at small scale: a 2,000-user graph is small
 enough that PostgreSQL itself answers most of these shapes from cache in a
 millisecond or two, so the ratios (while still visibly greater than 1x on
