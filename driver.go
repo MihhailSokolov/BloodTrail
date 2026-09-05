@@ -96,9 +96,14 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 	// caller's ctx is later canceled. Close stops it via engine.Stop.
 	eng.Start(context.Background())
 
+	mode := "delegate"
+	if settings.Engine {
+		mode = "engine"
+	}
+
 	slog.InfoContext(ctx, "BloodTrail driver active",
 		slog.String("version", Version),
-		slog.String("mode", "delegate"),
+		slog.String("mode", mode),
 		slog.String("backend", pg.DriverName),
 		slog.Bool("engine", settings.Engine),
 	)

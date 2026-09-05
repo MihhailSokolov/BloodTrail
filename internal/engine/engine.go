@@ -28,9 +28,9 @@ type Config struct {
 	// query. false declines every call immediately (reason "disabled").
 	Enabled bool
 
-	// PollInterval is the poller's rebuild cadence (a later task); Engine
-	// itself never reads it, but it lives here so Config is the one place
-	// BLOODTRAIL_* settings land.
+	// PollInterval is the poller's rebuild cadence: poller.go reads it to
+	// pace RebuildNow calls. It lives on Config, rather than on the poller
+	// itself, so Config stays the one place BLOODTRAIL_* settings land.
 	PollInterval time.Duration
 
 	// MemoryLimit bounds a rebuilt snapshot's approximate resident size
@@ -299,7 +299,7 @@ const (
 // above); a successful serve is logged at Info.
 //
 // The actual pipeline lives in servePathQuery, shared with TryCypher; see
-// its doc for the six numbered steps.
+// its doc for the seven numbered steps.
 func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
 	start := time.Now()
 
@@ -379,13 +379,15 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 //  1. cfg.Enabled, then Fresh() -- decline "disabled" / "no_snapshot" /
 //     "stale".
 //  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
-//     "unresolvable" on error).
+//     "unresolvable" on error, including a kindMapper.MapKind failure for a
+//     Kinds-constrained endpoint -- see resolveKindsEndpoint's doc).
 //  3. Unless pq.ExcludeSelf, decline "self_endpoint" if the resolved roots
 //     and terminals share a node with an outgoing edge
 //     (traverse.SelfEndpointConflict): PostgreSQL's own shortest-path query
 //     cannot serve that request either, so the engine defers rather than
 //     risk an answer PostgreSQL itself would refuse.
-//  4. Build the edge KindMask from pq.EdgeKinds.
+//  4. Build the edge KindMask from pq.EdgeKinds (decline "error" if mapping
+//     one of pq.EdgeKinds through kindMapper.MapKind fails).
 //  5. traverse.AllShortestPaths (decline "too_large" / "memory_limit" /
 //     "error").
 //  6. Hydrate the resulting dense paths into graph.Path values (decline
@@ -431,10 +433,16 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 		return nil, false
 	}
 
+	edgeKinds, err := buildKindMask(ctx, kindMapper, snap.MaxKindID, pq.EdgeKinds)
+	if err != nil {
+		e.decline(ctx, reasonError, err)
+		return nil, false
+	}
+
 	tq := traverse.Query{
 		Roots:       roots,
 		Terminals:   terminals,
-		Kinds:       buildKindMask(ctx, kindMapper, snap.MaxKindID, pq.EdgeKinds),
+		Kinds:       edgeKinds,
 		Mode:        convertMode(pq.Mode),
 		ExcludeSelf: pq.ExcludeSelf,
 		Limit:       pq.Limit,
@@ -491,11 +499,13 @@ func (e *Engine) decline(ctx context.Context, reason string, err error) {
 // own IDs-over-Bits precedence), then Criteria, then Kinds, then
 // unconstrained.
 //
-// The only branch that can fail is Criteria: it runs a live query through
-// tx. Every other branch works entirely off snap and never errors --
-// including an id or kind that snap doesn't recognize, which correctly
-// narrows the endpoint to zero matches (see resolveIDEndpoint /
-// resolveKindsEndpoint) rather than failing the call.
+// Two branches can fail: Criteria runs a live query through tx, and Kinds
+// maps each label through kindMapper.MapKind, which can itself fail for
+// reasons the dawgs pg driver doesn't distinguish from a genuinely unknown
+// kind (see resolveKindsEndpoint's doc). The IDs branch never errors --
+// including an id that snap doesn't recognize, which correctly narrows the
+// endpoint to zero matches (see resolveIDEndpoint) rather than failing the
+// call -- nor does the unconstrained default branch.
 func resolveEndpoint(ctx context.Context, tx graph.Transaction, kindMapper pg.KindMapper, snap *snapshot.Snapshot, ep recognize.Endpoint) (traverse.Endpoint, error) {
 	switch {
 	case len(ep.IDs) > 0:
@@ -503,7 +513,7 @@ func resolveEndpoint(ctx context.Context, tx graph.Transaction, kindMapper pg.Ki
 	case ep.Criteria != nil:
 		return resolveCriteriaEndpoint(ctx, tx, snap, ep.Criteria)
 	case len(ep.Kinds) > 0:
-		return resolveKindsEndpoint(ctx, kindMapper, snap, ep.Kinds), nil
+		return resolveKindsEndpoint(ctx, kindMapper, snap, ep.Kinds)
 	default:
 		return traverse.Endpoint{}, nil
 	}
@@ -571,24 +581,36 @@ func resolveCriteriaEndpoint(_ context.Context, tx graph.Transaction, snap *snap
 
 // resolveKindsEndpoint intersects the NodesOfKind bitmap for every kind in
 // kinds: a node pattern like (n:A:B) requires ALL of its labels at once, so
-// multiple kinds narrow the match rather than widen it. A kind the database
-// doesn't (yet) know -- kindMapper.MapKind fails for it -- can never match a
-// real node, so it collapses the whole intersection to empty immediately,
-// the same way PostgreSQL matches zero nodes for a label nothing carries.
-func resolveKindsEndpoint(ctx context.Context, kindMapper pg.KindMapper, snap *snapshot.Snapshot, kinds graph.Kinds) traverse.Endpoint {
+// multiple kinds narrow the match rather than widen it.
+//
+// kindMapper.MapKind failing for one of kinds declines the whole call
+// (distinct from an empty-but-successful result) rather than treating the
+// failure as "this label matches zero nodes": dawgs' pg.SchemaManager
+// implementation (the only one BloodTrail runs against) returns the same
+// plain error, "unable to map kind: <kind>", both when the kind genuinely
+// doesn't exist yet and when the re-fetch it tries first fails outright
+// (e.g. the database is unreachable) -- there is no sentinel or typed error
+// to tell those two cases apart. Silently collapsing every MapKind error to
+// "zero matches" (this function's behavior before this doc) would be wrong
+// for the latter case: it would confidently report no paths exist when the
+// truth is simply unknown. Declining is the safe choice either way -- the
+// caller falls back to PostgreSQL, which answers a genuinely unknown label
+// with zero matches on its own, so the only cost is the rarer, slower
+// fallback path for that case.
+func resolveKindsEndpoint(ctx context.Context, kindMapper pg.KindMapper, snap *snapshot.Snapshot, kinds graph.Kinds) (traverse.Endpoint, error) {
 	bitmaps := make([]*snapshot.Bitset, 0, len(kinds))
 	for _, kind := range kinds {
 		kindID, err := kindMapper.MapKind(ctx, kind)
 		if err != nil {
-			return traverse.Endpoint{Bits: snapshot.NewBitset(0)}
+			return traverse.Endpoint{}, fmt.Errorf("engine: resolveKindsEndpoint: map kind %s: %w", kind, err)
 		}
 		bitmaps = append(bitmaps, snap.NodesOfKind(kindID))
 	}
 
 	if len(bitmaps) == 1 {
-		return traverse.Endpoint{Bits: bitmaps[0]}
+		return traverse.Endpoint{Bits: bitmaps[0]}, nil
 	}
-	return traverse.Endpoint{Bits: intersectBitmaps(snap.NodeCount(), bitmaps)}
+	return traverse.Endpoint{Bits: intersectBitmaps(snap.NodeCount(), bitmaps)}, nil
 }
 
 // intersectBitmaps returns a fresh Bitset (sized for n dense NodeIDs)
@@ -619,25 +641,33 @@ func intersectBitmaps(n int, bitmaps []*snapshot.Bitset) *snapshot.Bitset {
 
 // buildKindMask translates pq.EdgeKinds into the traverse.KindMask
 // AllShortestPaths expects: an empty EdgeKinds means "every kind allowed"
-// (SetAll); otherwise only kinds that map to a KindID known to the database
-// are set. A kind the database doesn't know yet is silently left unset --
-// no real edge can carry it, matching PostgreSQL finding no edges for a kind
-// nothing carries -- rather than failing the whole query.
-func buildKindMask(ctx context.Context, kindMapper pg.KindMapper, maxKindID snapshot.KindID, edgeKinds graph.Kinds) *snapshot.KindMask {
+// (SetAll); otherwise every kind must map to a KindID known to the database.
+//
+// A kindMapper.MapKind failure declines the whole call rather than silently
+// leaving that kind unset in the mask, for the same reason resolveKindsEndpoint
+// declines rather than treating the failure as "matches nothing": dawgs' pg
+// driver returns the same error for a genuinely unknown kind and for a
+// fetch failure along the way, so leaving the kind unset on any error risked
+// quietly serving an incomplete edge-kind filter (fewer kinds allowed than
+// the query asked for) instead of falling back to PostgreSQL. See
+// resolveKindsEndpoint's doc for the full reasoning.
+func buildKindMask(ctx context.Context, kindMapper pg.KindMapper, maxKindID snapshot.KindID, edgeKinds graph.Kinds) (*snapshot.KindMask, error) {
 	mask := snapshot.NewKindMask(maxKindID)
 
 	if len(edgeKinds) == 0 {
 		mask.SetAll()
-		return mask
+		return mask, nil
 	}
 
 	for _, kind := range edgeKinds {
-		if kindID, err := kindMapper.MapKind(ctx, kind); err == nil {
-			mask.Set(kindID)
+		kindID, err := kindMapper.MapKind(ctx, kind)
+		if err != nil {
+			return nil, fmt.Errorf("engine: buildKindMask: map kind %s: %w", kind, err)
 		}
+		mask.Set(kindID)
 	}
 
-	return mask
+	return mask, nil
 }
 
 // convertMode translates recognize.Mode to traverse.Mode. The two types are
