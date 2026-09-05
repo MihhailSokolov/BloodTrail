@@ -27,7 +27,7 @@ import (
 // Generation and AnalysisStamp are left zero for the engine and poller
 // (Tasks 10 and 12) to set later.
 func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) (*snapshot.Snapshot, error) {
-	graphModel, ok := pgDriver.SchemaManager.DefaultGraph()
+	graphModel, ok := pgDriver.DefaultGraph()
 	if !ok {
 		return nil, fmt.Errorf("engine: LoadSnapshot: no default graph is set")
 	}

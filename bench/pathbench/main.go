@@ -137,7 +137,11 @@ func run(args []string) int {
 			fmt.Fprintf(os.Stderr, "pathbench: create cpuprofile: %v\n", err)
 			return 1
 		}
-		defer f.Close()
+		defer func() {
+			if cerr := f.Close(); cerr != nil {
+				fmt.Fprintf(os.Stderr, "pathbench: close cpuprofile: %v\n", cerr)
+			}
+		}()
 		if err := pprof.StartCPUProfile(f); err != nil {
 			fmt.Fprintf(os.Stderr, "pathbench: start cpuprofile: %v\n", err)
 			return 1
@@ -225,7 +229,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 		return nil, fmt.Errorf("assert schema: %w", err)
 	}
 
-	graphModel, ok := driver.SchemaManager.DefaultGraph()
+	graphModel, ok := driver.DefaultGraph()
 	if !ok {
 		return nil, fmt.Errorf("no default graph resolved after AssertSchema")
 	}

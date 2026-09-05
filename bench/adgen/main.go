@@ -106,7 +106,7 @@ func run(ctx context.Context, dsn string, users int, seed int64, domains int, wi
 		}
 	}
 
-	graphModel, ok := driver.SchemaManager.DefaultGraph()
+	graphModel, ok := driver.DefaultGraph()
 	if !ok {
 		return fmt.Errorf("no default graph resolved after AssertSchema")
 	}
