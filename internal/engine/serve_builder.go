@@ -395,9 +395,30 @@ func (e *Engine) TryNodeFetchIDs(ctx context.Context, spec recognize.NodeSpec) (
 // TryNodeFetchKinds attempts to serve spec's matching nodes' ids and kinds
 // entirely from the engine's current snapshot, returning (cursor, true) on
 // success. It returns (nil, false) under the same conditions as
-// TryNodeCount (see resolveNodeSpec's doc), plus one more: failing to
-// resolve the KindIDs actually carried by the matching nodes back to their
-// graph.Kind names declines reasonError.
+// TryNodeCount (see resolveNodeSpec's doc), plus two more:
+//
+//   - Any node kind, anywhere in the snapshot, is not clean relative to
+//     snap.Generation (reasonKindStale), checked via
+//     e.allNodeKindsClean(snap.Generation) immediately after resolveNodeSpec
+//     succeeds. This is deliberately stricter than TryNodeCount/
+//     TryNodeFetchIDs, whose own freshness needs are already fully covered
+//     by resolveNodeSpec's nodeKindsClean(spec.ConstraintKinds()) check: a
+//     count or an id listing depends only on which nodes carry (or don't
+//     carry) spec's own constrained kinds, so a write touching some other,
+//     unconstrained kind can never change either answer. A kind LISTING is
+//     different -- it reports every kind each matching node carries, not
+//     just whether it carries one of spec's constrained kinds. A write that
+//     adds or removes an UNNAMED kind on a node that still matches spec
+//     (e.g. an analysis pass tagging an already-matching User with an extra
+//     kind) changes the correct answer to this specific query, with no
+//     effect at all on spec.ConstraintKinds()' own cleanliness -- exactly
+//     the gap resolveNodeSpec's gate alone cannot see, and exactly what
+//     upstream's GetPrimaryNodeKindCounts (which calls FetchKinds, not
+//     Count, for this reason) actually consumes. So this method alone, among
+//     the three sharing resolveNodeSpec, must also require every node kind
+//     in the whole snapshot to be clean, not just spec's own.
+//   - failing to resolve the KindIDs actually carried by the matching nodes
+//     back to their graph.Kind names declines reasonError.
 //
 // Every distinct KindID carried by any matching node is resolved to its
 // graph.Kind name via one batched e.mapKindNames call (resolveMatchingKindNames),
@@ -412,6 +433,11 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 
 	matches, snap, ok := e.resolveNodeSpec(ctx, opNodeKinds, spec)
 	if !ok {
+		return nil, false
+	}
+
+	if !e.allNodeKindsClean(snap.Generation) {
+		e.declineOp(ctx, opNodeKinds, reasonKindStale, nil)
 		return nil, false
 	}
 
@@ -1107,7 +1133,7 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 // shaped by proj (recognize.RowProjection) entirely from the engine's
 // current snapshot, returning a pull-based graph.Result (rowResult,
 // rowresult.go) on success. It returns (nil, false) under the same
-// conditions as TryRelCount, plus two more, both checked only after
+// conditions as TryRelCount, plus three more, all checked only after
 // resolveRelSpec's gate has already passed (so cfg.Enabled/no-snapshot/
 // unmappable-kind/kind-stale declines always take priority, mirroring every
 // other TryRel* entry point's decline ordering):
@@ -1125,6 +1151,26 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 //     can be the entire edge set, which the real upstream orderByEdgeID
 //     callers (traversal's paging order) never ask a full-scan query for
 //     anyway.
+//   - For a step projection (proj != recognize.ProjectionStartEnd), any node
+//     kind anywhere in the snapshot is not clean relative to plan.snap.
+//     Generation (reasonKindStale). A step projection's row carries the far
+//     node's own kinds column (TryNodeFetchKinds' identical concern, see its
+//     doc), which resolveRelSpec's own gate does not fully cover:
+//     resolveRelSpec only checks node-kind cleanliness at all when
+//     spec.StartConstraints or spec.EndConstraints is non-empty, and even
+//     then only for spec.NodeConstraintKinds() -- the kinds the query
+//     filters BY, not every kind a far node might carry and this row type
+//     then EXPOSES. A step projection's far endpoint is typically
+//     unconstrained by kind at all (the common shape: "every outbound step
+//     from this one known node"), so a write that adds or removes some
+//     unrelated kind on a far node already in the match set would otherwise
+//     go completely uncaught, leaving this method's kind columns
+//     stale-as-fresh. So, exactly like TryNodeFetchKinds, a step projection
+//     additionally requires allNodesClean && allNodeKindsClean, deliberately
+//     stronger than resolveRelSpec's own check. ProjectionStartEnd's row is
+//     a bare id pair exposing no kind information at all, so it needs no
+//     such check and stays exactly as permissive as resolveRelSpec's own
+//     gate already allows.
 //
 // When orderByEdgeID is honored, newRelScanIter's relIterator is fully
 // drained (drainRelIter) and sorted ascending by edge id before rowResult is
@@ -1174,6 +1220,12 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 
 	var kindNames map[snapshot.KindID]graph.Kind
 	if proj != recognize.ProjectionStartEnd {
+		g := plan.snap.Generation
+		if !e.allNodesClean(g) || !e.allNodeKindsClean(g) {
+			e.declineOp(ctx, opRelRows, reasonKindStale, nil)
+			return nil, false
+		}
+
 		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID, func(snapshot.KindID) bool { return true }), e.mapKindNames)
 		if err != nil {
 			e.declineOp(ctx, opRelRows, reasonError, err)

@@ -392,6 +392,32 @@ func TestCypherMutates(t *testing.T) {
 	}
 }
 
+// TestCypherMutatesRecoversFromPanicByAssumingMutation covers cypherMutates'
+// recover path directly: a panic from the Cypher frontend must make
+// cypherMutates report true ("assume it mutates"), not false. This is worth
+// a dedicated test because the two are easy to get backwards -- an unnamed
+// bool return combined with a deferred `_ = recover()` compiles fine and
+// looks conservative, but actually reports false (the return statement's
+// already-computed zero value) on any panic, silently telling
+// observingTransaction.Query "this does not mutate" for a query this
+// package was completely unable to analyze. Finding real Cypher text known
+// to crash the dawgs frontend isn't a dependency this test wants, so it
+// stubs parseCypherFrontend (the seam this file's cypherMutates delegates
+// parsing to) to panic unconditionally instead -- test-only, restored via
+// t.Cleanup so no other test in this package observes the stub.
+func TestCypherMutatesRecoversFromPanicByAssumingMutation(t *testing.T) {
+	original := parseCypherFrontend
+	t.Cleanup(func() { parseCypherFrontend = original })
+
+	parseCypherFrontend = func(string) (*cypher.RegularQuery, error) {
+		panic("simulated dawgs frontend panic")
+	}
+
+	if got := cypherMutates("MATCH (n) RETURN n"); !got {
+		t.Fatalf("cypherMutates after a parser panic = %v, want true (conservative recover)", got)
+	}
+}
+
 // -----------------------------------------------------------------------
 // relationshipKindMatcherKinds / edgeKindsFromCriteria
 // -----------------------------------------------------------------------

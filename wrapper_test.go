@@ -1255,14 +1255,16 @@ func TestWrappedTransactionNodesReturnsRecordingWrapper(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// Driver: Run/WipeGraph/DeleteNodesByKinds/DeleteRelationshipsByKinds
+// Driver: Run/WipeGraph/SetDefaultGraph/DeleteNodesByKinds/
+// DeleteRelationshipsByKinds
 // -----------------------------------------------------------------------
 //
-// These four capability methods are promoted from *pg.Driver unmodified by
+// These five capability methods are promoted from *pg.Driver unmodified by
 // plain embedding, but embedding has no virtual dispatch: pg.Driver.Run and
 // pg.Driver.WipeGraph both call the *pg.Driver's own WriteTransaction
-// internally (a concrete, same-package call), and DeleteNodesByKinds /
-// DeleteRelationshipsByKinds use a raw pooled connection -- none of the four
+// internally (a concrete, same-package call), pg.Driver.SetDefaultGraph
+// calls its own ReadTransaction the same way, and DeleteNodesByKinds /
+// DeleteRelationshipsByKinds use a raw pooled connection -- none of the five
 // ever reaches this package's own WriteTransaction override, so each is
 // overridden separately on *Driver (driver.go) to call engine.NoteWrite()
 // itself after a nil-error return.
@@ -1273,7 +1275,7 @@ func TestWrappedTransactionNodesReturnsRecordingWrapper(t *testing.T) {
 // integration suite instead (engine_serving_integration_test.go's
 // TestWipeGraphInvalidatesEngineSnapshot). What *is* cleanly testable
 // without a live database is the error path: unreachablePGDriver points at
-// an address nothing listens on, so every one of the four calls fails
+// an address nothing listens on, so every one of the five calls fails
 // quickly (observed at single-digit milliseconds; connection refused, not a
 // timeout) with a clean error rather than a panic, and NoteWrite() must not
 // fire when the embedded call itself failed.
@@ -1314,6 +1316,14 @@ func TestDriverMutatingCapabilityMethodsDoNotBumpGenerationOnError(t *testing.T)
 		}},
 		{"WipeGraph", func(ctx context.Context, d *Driver) error {
 			return d.WipeGraph(ctx, nil)
+		}},
+		{"SetDefaultGraph", func(ctx context.Context, d *Driver) error {
+			// SetDefaultGraph resolves to *pg.Driver's own ReadTransaction
+			// (drivers/pg/manager.go), which acquires a pooled connection
+			// exactly like WriteTransaction does -- so this still exercises
+			// a real network failure against unreachablePGDriver, not a
+			// short-circuited no-op.
+			return d.SetDefaultGraph(ctx, graph.Graph{Name: "Probe"})
 		}},
 		{"DeleteNodesByKinds", func(ctx context.Context, d *Driver) error {
 			// Both kind sets empty still reaches execDelete (a genuine

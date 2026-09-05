@@ -443,6 +443,77 @@ func TestTryNodeFetchKindsResolveErrorDeclines(t *testing.T) {
 	}
 }
 
+// TestTryNodeFetchKindsDeclinesOnUnrelatedKindWrite is Finding 1's unit
+// evidence: TryNodeFetchKinds serves a full per-node kind LISTING, which
+// observes every kind a matching node carries -- not just whether it
+// carries one of spec's own constrained kinds, the way TryNodeCount/
+// TryNodeFetchIDs' answers do. A NoteWrite that touches Group -- a kind
+// entirely unrelated to a spec constrained on Computer, and not present on
+// any Computer-carrying node in buildNodeSpecSnapshot -- must still make
+// TryNodeFetchKinds decline reasonKindStale (via the extra
+// allNodeKindsClean(snap.Generation) check its own doc describes), while
+// TryNodeCount and TryNodeFetchIDs on that exact same spec keep serving
+// normally, since neither one's answer depends on anything beyond spec's
+// own ConstraintKinds().
+func TestTryNodeFetchKindsDeclinesOnUnrelatedKindWrite(t *testing.T) {
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	ctx := context.Background()
+
+	scope := NewWriteScope()
+	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
+	e.NoteWrite(scope)
+
+	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "Computer")}}
+
+	if _, ok := e.TryNodeFetchKinds(ctx, spec); ok {
+		t.Fatalf("TryNodeFetchKinds(Computer): ok = true, want false (kind_stale: an unrelated node kind, Group, was touched)")
+	}
+
+	count, ok := e.TryNodeCount(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeCount(Computer): ok = false, want true (Count depends only on its own constraint kinds)")
+	}
+	if count != 2 {
+		t.Fatalf("TryNodeCount(Computer) = %d, want 2", count)
+	}
+
+	idCursor, ok := e.TryNodeFetchIDs(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeFetchIDs(Computer): ok = false, want true (FetchIDs depends only on its own constraint kinds)")
+	}
+	assertIDs(t, drainIDs(t, idCursor), []graph.ID{2, 3})
+}
+
+// TestTryNodeFetchKindsServesAgainAfterFreshSnapshot covers recovery from
+// TestTryNodeFetchKindsDeclinesOnUnrelatedKindWrite's kind-stale decline:
+// once a fresh snapshot is adopted at the write's new generation (what
+// RebuildNow would do), the previously-stale spec must serve again through
+// TryNodeFetchKinds specifically -- not just through TryNodeCount/
+// TryNodeFetchIDs, which never declined in the first place.
+func TestTryNodeFetchKindsServesAgainAfterFreshSnapshot(t *testing.T) {
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	ctx := context.Background()
+
+	scope := NewWriteScope()
+	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
+	e.NoteWrite(scope)
+
+	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "Computer")}}
+	if _, ok := e.TryNodeFetchKinds(ctx, spec); ok {
+		t.Fatalf("TryNodeFetchKinds before rebuild: ok = true, want false (kind_stale)")
+	}
+
+	freshSnap := buildNodeSpecSnapshot(t)
+	freshSnap.Generation = e.Generation()
+	e.snap.Store(freshSnap)
+
+	cursor, ok := e.TryNodeFetchKinds(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeFetchKinds after rebuild: ok = false, want true")
+	}
+	assertIDs(t, idsOf(drainKinds(t, cursor)), []graph.ID{2, 3})
+}
+
 // TestTryNodeFetchIDsCloseDoesNotLeakFeeder is this file's cursor-leak
 // regression test, modeled on
 // TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly
@@ -1227,6 +1298,67 @@ func TestRowResultDrivesShallowFetchRelationshipsLoopShape(t *testing.T) {
 	if r107.nid != 4 || r107.ek == nil || r107.ek.String() != "AdminTo" {
 		t.Fatalf("row for edge 107 = %+v, want node 4, kind AdminTo", r107)
 	}
+}
+
+// TestTryRelQueryRowsStepProjectionDeclinesOnUnrelatedNodeKindWrite is
+// Finding 2's unit evidence: a step projection's row carries the far node's
+// own kinds column, which resolveRelSpec's own gate does not fully cover --
+// that gate only checks node-kind cleanliness at all when spec.
+// StartConstraints or spec.EndConstraints is non-empty, which this spec
+// (deliberately, matching the common upstream shape: every outbound step
+// from one known node, with no endpoint kind filter) leaves both empty. A
+// NoteWrite touching Group -- a node kind this spec never constrains by, and
+// not the AdminTo edges' own concern at all -- must still make
+// TryRelQueryRows(ProjectionStepOutbound) decline reasonKindStale (via the
+// extra allNodesClean/allNodeKindsClean check the method's own doc
+// describes), while the same spec through ProjectionStartEnd -- whose row is
+// a bare id pair exposing no kind information -- keeps serving normally.
+func TestTryRelQueryRowsStepProjectionDeclinesOnUnrelatedNodeKindWrite(t *testing.T) {
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	ctx := context.Background()
+
+	scope := NewWriteScope()
+	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
+	e.NoteWrite(scope)
+
+	spec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
+
+	if _, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false); ok {
+		t.Fatalf("TryRelQueryRows(StepOutbound): ok = true, want false (kind_stale: an unrelated node kind, Group, was touched)")
+	}
+
+	if _, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStartEnd, false); !ok {
+		t.Fatalf("TryRelQueryRows(StartEnd): ok = false, want true (pair projection exposes no kinds, so it is unaffected)")
+	}
+}
+
+// TestTryRelQueryRowsStepProjectionServesAgainAfterFreshSnapshot covers
+// recovery from TestTryRelQueryRowsStepProjectionDeclinesOnUnrelatedNodeKindWrite's
+// kind-stale decline: once a fresh snapshot is adopted at the write's new
+// generation (what RebuildNow would do), the previously-stale step
+// projection must serve again.
+func TestTryRelQueryRowsStepProjectionServesAgainAfterFreshSnapshot(t *testing.T) {
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	ctx := context.Background()
+
+	scope := NewWriteScope()
+	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
+	e.NoteWrite(scope)
+
+	spec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
+	if _, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false); ok {
+		t.Fatalf("TryRelQueryRows before rebuild: ok = true, want false (kind_stale)")
+	}
+
+	freshSnap := buildRelSpecSnapshot(t)
+	freshSnap.Generation = e.Generation()
+	e.snap.Store(freshSnap)
+
+	result, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false)
+	if !ok {
+		t.Fatalf("TryRelQueryRows after rebuild: ok = false, want true")
+	}
+	result.Close()
 }
 
 // TestTryRelQueryRowsOrderByEdgeIDAscending covers orderByEdgeID=true

@@ -33,19 +33,20 @@ var Version = "dev"
 
 // Driver wraps the PostgreSQL driver. Embedding the concrete type promotes
 // every method, including the capability methods BloodHound discovers
-// through graph.AsDriver (KindMapper, OptimizeStorage, and the four
+// through graph.AsDriver (KindMapper, OptimizeStorage, and the five
 // overridden below). ReadTransaction, WriteTransaction, BatchOperation and
 // Close are overridden to wire the in-memory engine into the
-// read/write/lifecycle path; Run, WipeGraph, DeleteNodesByKinds and
-// DeleteRelationshipsByKinds are overridden separately because embedding has
-// no virtual dispatch -- each of those, called on the embedded *pg.Driver,
-// resolves internally to the *pg.Driver's own WriteTransaction (Run,
-// WipeGraph) or a raw pooled connection (the two Delete* methods), never to
-// this package's own WriteTransaction override, so without an explicit
-// override here none of the four would ever reach engine.NoteWrite().
-// OptimizeStorage and AssertSchema/kind assertion are deliberately left
-// promoted unmodified: neither one changes graph data the engine's snapshot
-// could go stale over.
+// read/write/lifecycle path; Run, WipeGraph, SetDefaultGraph,
+// DeleteNodesByKinds and DeleteRelationshipsByKinds are overridden
+// separately because embedding has no virtual dispatch -- each of those,
+// called on the embedded *pg.Driver, resolves internally to the
+// *pg.Driver's own WriteTransaction (Run, WipeGraph), ReadTransaction
+// (SetDefaultGraph), or a raw pooled connection (the two Delete* methods),
+// never to this package's own WriteTransaction override, so without an
+// explicit override here none of the five would ever reach
+// engine.NoteWrite(). OptimizeStorage and AssertSchema/kind assertion are
+// deliberately left promoted unmodified: neither one changes graph data the
+// engine's snapshot could go stale over.
 type Driver struct {
 	*pg.Driver
 	settings Settings
@@ -268,6 +269,34 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 // generation. See Run's doc for why an override is needed at all.
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
 	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
+		return err
+	}
+	d.engine.NoteWrite(nil)
+	return nil
+}
+
+// SetDefaultGraph retargets the embedded PostgreSQL driver's default graph
+// and notifies the engine of the write once it completes successfully. See
+// Run's doc for why an override is needed at all: pg.Driver.SetDefaultGraph
+// resolves internally to the *pg.Driver's own ReadTransaction
+// (drivers/pg/manager.go's SchemaManager.SetDefaultGraph), a concrete,
+// same-package call that never reaches this package's own WriteTransaction
+// override, so without this override the engine would keep serving
+// snapshots -- and this driver's own mapKind/mapKindNames lookups
+// (internal/engine's KindMapper seam) would keep resolving kind names --
+// built against whichever graph was default *before* this call, potentially
+// indefinitely (nothing else advances the write generation on its own).
+//
+// A nil NoteWrite scope is used, exactly like Run/WipeGraph: retargeting the
+// default graph changes which nodes, edges, and kinds "the graph" even
+// refers to, which is outside anything this package's kind-scoped write
+// tracking (engine/marks.go, write_observer.go's WriteScope) reasons about
+// -- the same "outside what kind-scoped tracking can reason about" call
+// observingTransaction.WithGraph and observingBatch.WithGraph
+// (write_observer.go) already make for a mid-transaction graph retarget, via
+// their own TouchAll().
+func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
+	if err := d.Driver.SetDefaultGraph(ctx, graphSchema); err != nil {
 		return err
 	}
 	d.engine.NoteWrite(nil)

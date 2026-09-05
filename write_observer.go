@@ -621,15 +621,30 @@ func (b *observingBatch) Commit() error {
 	return b.Batch.Commit()
 }
 
-// cypherMutates parses text with the same dawgs Cypher frontend
-// internal/engine/recognize/cypher.go's FromCypher uses and reports whether
-// its AST contains any updating clause (CREATE, SET, REMOVE, DELETE, or
-// MERGE) anywhere in the query body -- in the top-level SinglePartQuery, or
-// in any part of a MultiPartQuery (a query with one or more WITH
-// boundaries). A parse failure reports true: this is the same conservative
-// default NoteWrite(nil) has always meant for Run's raw-Cypher callers
-// (driver.go), and text that fails to parse here is exactly as unknown to
-// this package as it would be to whatever eventually rejects it downstream.
+// parseCypherFrontend is cypherMutates' parsing step, factored out into a
+// package-level var purely as a test seam: write_observer_test.go's
+// TestCypherMutatesRecoversFromPanicByAssumingMutation stubs it to panic
+// unconditionally, which is the only reliable way to exercise cypherMutates'
+// recover path below -- finding real Cypher text that is actually known to
+// crash the dawgs frontend is not a dependency this test wants to take on.
+// Production code (Open, indirectly, via observingTransaction.Query) always
+// runs with this default value; nothing else in this package ever reassigns
+// it.
+var parseCypherFrontend = func(text string) (*cypher.RegularQuery, error) {
+	return frontend.ParseCypher(frontend.DefaultCypherContext(), text)
+}
+
+// cypherMutates parses text via parseCypherFrontend -- the same dawgs Cypher
+// frontend internal/engine/recognize/cypher.go's FromCypher uses -- and
+// reports whether its AST contains any updating clause (CREATE, SET,
+// REMOVE, DELETE, or MERGE) anywhere in the query body -- in the top-level
+// SinglePartQuery, or in any part of a MultiPartQuery (a query with one or
+// more WITH boundaries). A parse failure, or a panic from the frontend
+// itself (see the recover below), reports true: this is the same
+// conservative default NoteWrite(nil) has always meant for Run's raw-Cypher
+// callers (driver.go), and text that fails to parse -- or crashes parsing --
+// here is exactly as unknown to this package as it would be to whatever
+// eventually rejects it downstream.
 //
 // This deliberately does not attempt to recognize which specific kinds an
 // updating clause touches (unlike edgeKindsFromCriteria above, which does,
@@ -638,17 +653,29 @@ func (b *observingBatch) Commit() error {
 // of arbitrary kinds named anywhere in its pattern or SET/REMOVE items, and
 // nothing here attempts to walk that out. observingTransaction.Query calls
 // this and marks the whole scope dirty on true.
-func cypherMutates(text string) bool {
+//
+// mutates is a NAMED return, not a plain bool, and this matters: an unnamed
+// return would still let the deferred recover below run on a panic, but the
+// function would then hand back whatever the interrupted `return` statement
+// was about to produce -- for a bare panic with no preceding return, that is
+// bool's zero value, false ("does not mutate"), the exact opposite of the
+// conservative answer this doc has always promised. Naming the return and
+// assigning mutates = true from inside the deferred recover is what makes a
+// panic actually report true instead of silently reporting false.
+func cypherMutates(text string) (mutates bool) {
 	defer func() {
 		// The dawgs frontend is not documented to never panic on malformed
 		// input; a recover here keeps a parser surprise from crashing the
 		// write path it would otherwise run underneath, converting it into
 		// the same conservative "assume it mutates" answer a parse error
-		// already gets.
-		_ = recover()
+		// already gets -- see mutates' own doc above for why this only works
+		// because the return value is named.
+		if recover() != nil {
+			mutates = true
+		}
 	}()
 
-	regularQuery, err := frontend.ParseCypher(frontend.DefaultCypherContext(), text)
+	regularQuery, err := parseCypherFrontend(text)
 	if err != nil || regularQuery == nil || regularQuery.SingleQuery == nil {
 		return true
 	}
