@@ -499,3 +499,129 @@ func TestKindScopedStalenessEndToEnd(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: added-tag node count serves again post-rebuild",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessNodeKindTag) }, 1)
 }
+
+// stalenessUpsertBaseKind / stalenessUpsertNovelKind are this file's own
+// fixture kinds for TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind
+// below, distinct from stalenessNodeKind*/stalenessEdgeKind* above for the
+// same isolation reason those give: this test builds and rebuilds its own
+// driver instance, independent of TestKindScopedStalenessEndToEnd, so its
+// counts must never be able to collide with that test's fixture.
+var (
+	stalenessUpsertBaseKind  = graph.StringKind("StalenessUpsertBase")
+	stalenessUpsertNovelKind = graph.StringKind("StalenessUpsertNovel")
+)
+
+// TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind is the end-to-end
+// regression test for the finding this fix addresses (task-11-report.md,
+// "Fix round 1"): a BatchOperation's UpdateNodes call that sets a node's
+// Kinds field to include a novel kind -- WITHOUT also setting AddedKinds,
+// the one detail every existing caller in this codebase happens to always
+// pair together, but nothing in graph.Batch's documented contract requires
+// -- must still be seen as a write to that novel kind.
+//
+// Before this fix, observingBatch.UpdateNodes only ever looked at
+// AddedKinds/DeletedKinds (touchNodeKindDelta), so a Kinds-only change like
+// this recorded an Empty() scope: NoteWrite saw nothing to mark, even though
+// dawgs' pg batch driver actually unions the full Kinds field into the
+// database row regardless (NodeUpdateParameters.Append/FormatNodesUpdate,
+// see engine.WriteScope.UpsertNodeKinds' doc for the verified SQL). A node
+// Count on the novel kind would then incorrectly report itself "clean"
+// against the pre-write snapshot generation, match this kind's bitmap in a
+// snapshot where the kind never even existed (empty bitmap, since
+// NodesOfKind is nil-safe -- serve_builder.go), and serve 0 instead of the
+// correct 1: served, but silently wrong. This test's central assertion is
+// therefore not just "declines" but "declines AND returns the right value",
+// via requireMarkerDelta's combined check.
+//
+// This test proves the fix end-to-end through the real driver, independent
+// of and in addition to TestKindScopedStalenessEndToEnd's flow 4 (which
+// exercises the AddedKinds-paired shape every caller uses today and so never
+// would have caught this gap): a node created with StalenessUpsertBase is
+// later updated via BatchOperation.UpdateNodes with Kinds = [Base, Novel]
+// and AddedKinds left nil/empty. A node Count on the novel kind must
+// delegate to PostgreSQL immediately after (the builder-serving marker must
+// NOT fire) and must still answer correctly (1); a node Count on the
+// already-present base kind must keep serving from the snapshot the whole
+// time, since UpsertNodeKinds' snapshot set-difference must not dirty a kind
+// the node already carried before this write (marks_test.go's
+// TestNoteWriteUpsertNodeKindsNovelKindDirtiesOnlyThatKind is this same
+// claim's white-box unit-test counterpart). A manual rebuild afterward must
+// make the novel kind's count serve too.
+func TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	var baseID graph.ID
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties(), stalenessUpsertBaseKind)
+		if err != nil {
+			return err
+		}
+		baseID = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("fixture setup WriteTransaction: %v", err)
+	}
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow (baseline): %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("baseline: engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: base-kind node count serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertBaseKind) }, 1)
+
+	// The write this test guards against: Kinds gains a novel kind with
+	// AddedKinds left empty. dawgs' pg batch driver still unions Kinds into
+	// the database row (NodeUpdateParameters.Append), so this node genuinely
+	// becomes StalenessUpsertNovel too -- the engine must not miss that.
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodes([]*graph.Node{{
+			ID:         baseID,
+			Kinds:      graph.Kinds{stalenessUpsertBaseKind, stalenessUpsertNovelKind},
+			Properties: graph.NewProperties(),
+		}})
+	}); err != nil {
+		t.Fatalf("BatchOperation (Kinds-only upsert): %v", err)
+	}
+
+	requireMarkerDelta(t, buf, builderServedMarker, 0, "novel-kind node count delegates immediately after the Kinds-only upsert, and still answers correctly",
+		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertNovelKind) }, 1)
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "base-kind node count still serves (Base was already present in the snapshot; the upsert's set-difference must not dirty it)",
+		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertBaseKind) }, 1)
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow (post-upsert): %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("post-upsert: engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "novel-kind node count serves again post-rebuild",
+		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertNovelKind) }, 1)
+}

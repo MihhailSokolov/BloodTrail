@@ -1241,6 +1241,76 @@ func TestObservingBatchUpdateNodesKindDeltaTouchesScope(t *testing.T) {
 		t.Fatalf("UpdateNodes: unexpected error: %v", err)
 	}
 	assertScope(t, scope, []string{"Admin"}, nil, false, false, nil, nil)
+	if got := scope.UpsertedNodeKinds(); got != nil {
+		t.Fatalf("UpsertedNodeKinds() = %v, want nil: node.Kinds was empty, nothing should be recorded", got)
+	}
+}
+
+// TestObservingBatchUpdateNodesKindsOnlyRecordsUpsertPairs is the regression
+// test for the finding this fix addresses: dawgs' pg batch driver unions the
+// FULL node.Kinds field into the database row on every UpdateNodes call
+// (NodeUpdateParameters.Append/FormatNodesUpdate, see observingBatch.
+// UpdateNodes' own doc), regardless of AddedKinds -- so a node updated with
+// only Kinds set (no AddedKinds/DeletedKinds at all, the exact shape
+// touchNodeKindDelta alone cannot see) must still have its Kinds recorded
+// for NoteWrite to resolve against the snapshot. This asserts that recording
+// directly via the UpsertedNodeKinds test accessor, since resolution itself
+// (subset-of-snapshot vs. novel) is covered by marks_test.go's own
+// UpsertNodeKinds tests, not re-derivable from this file's fakes alone.
+func TestObservingBatchUpdateNodesKindsOnlyRecordsUpsertPairs(t *testing.T) {
+	inner := &fakeBatch{}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	nodes := []*graph.Node{
+		{ID: 1, Kinds: graph.Kinds{graph.StringKind("User")}, Properties: graph.NewProperties()},
+		{ID: 2, Kinds: graph.Kinds{graph.StringKind("Computer")}, Properties: graph.NewProperties()},
+	}
+	if err := b.UpdateNodes(nodes); err != nil {
+		t.Fatalf("UpdateNodes: unexpected error: %v", err)
+	}
+	if len(inner.updateNodesCalls) != 1 {
+		t.Fatalf("UpdateNodes did not delegate")
+	}
+
+	// touchNodeKindDelta sees no AddedKinds/DeletedKinds on either node, so
+	// the plain node/edge kind marks and all* flags stay untouched -- the
+	// Kinds-only upsert pairs are recorded on the side, not folded into
+	// TouchedNodeKinds, since their eventual dirtiness depends on the
+	// snapshot at NoteWrite time (marks_test.go), not on anything knowable
+	// here.
+	assertScope(t, scope, nil, nil, false, false, nil, nil)
+
+	got := scope.UpsertedNodeKinds()
+	want := map[graph.ID]graph.Kinds{
+		1: {graph.StringKind("User")},
+		2: {graph.StringKind("Computer")},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("UpsertedNodeKinds() = %v, want %v", got, want)
+	}
+	for id, wantKinds := range want {
+		if !kindsEqual(got[id], wantKinds) {
+			t.Fatalf("UpsertedNodeKinds()[%d] = %v, want %v", id, got[id], wantKinds)
+		}
+	}
+}
+
+// TestObservingBatchUpdateNodesNilNodeSkipped covers UpdateNodes' existing
+// nil-guard: a nil entry in nodes must not panic on either the
+// touchNodeKindDelta call or the new UpsertNodeKinds call.
+func TestObservingBatchUpdateNodesNilNodeSkipped(t *testing.T) {
+	inner := &fakeBatch{}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	nodes := []*graph.Node{nil}
+	if err := b.UpdateNodes(nodes); err != nil {
+		t.Fatalf("UpdateNodes: unexpected error: %v", err)
+	}
+	if !scope.Empty() {
+		t.Fatalf("UpdateNodes([nil]) touched scope, want untouched")
+	}
 }
 
 func TestObservingBatchCreateRelationshipTouchesScopeAndDelegates(t *testing.T) {

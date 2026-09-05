@@ -287,6 +287,127 @@ func TestNoteWriteDeleteNodeIDUnresolvedDirtiesAllNodesAndAllEdges(t *testing.T)
 	}
 }
 
+// TestNoteWriteUpsertNodeKindsSubsetOfSnapshotDirtiesNothing covers
+// UpsertNodeKinds' core soundness claim: if every kind in the pair is
+// already present in the snapshot's own record of that node, the write's
+// union could not have changed kind membership at all, so nothing gets
+// dirtied -- not even the node's own already-present kind.
+func TestNoteWriteUpsertNodeKindsSubsetOfSnapshotDirtiesNothing(t *testing.T) {
+	e := New(nil, nil, Config{})
+	// node 1 carries kind 100 ("User") in the snapshot.
+	e.snap.Store(buildTwoNodeSnapshot(t, 42, 10))
+	preGen := e.Generation()
+
+	scope := NewWriteScope()
+	scope.UpsertNodeKinds(graph.ID(1), graph.Kinds{graph.StringKind("User")})
+
+	resolve := fakeResolver(t, map[snapshot.KindID]graph.Kind{100: graph.StringKind("User")})
+	e.noteResolved(scope, resolve)
+	postGen := e.Generation()
+
+	if !e.nodeKindsClean(preGen, graph.Kinds{graph.StringKind("User")}) {
+		t.Fatalf("nodeKindsClean(preGen, User) = false, want true: User was already present in the snapshot, the upsert added nothing new")
+	}
+	if !e.nodeKindsClean(postGen, graph.Kinds{graph.StringKind("User")}) {
+		t.Fatalf("nodeKindsClean(postGen, User) = false, want true")
+	}
+	if !e.allNodesClean(preGen) || !e.allEdgesClean(preGen) {
+		t.Fatalf("a fully-subset upsert must not fall back to allNodes/allEdges")
+	}
+}
+
+// TestNoteWriteUpsertNodeKindsNovelKindDirtiesOnlyThatKind covers
+// UpsertNodeKinds' main case: a pair naming one kind already in the
+// snapshot and one that is not must dirty only the novel kind -- the
+// already-present kind is left clean, proving the fix does not regress into
+// the naive "dirty everything in Kinds" alternative the task brief warns
+// against.
+func TestNoteWriteUpsertNodeKindsNovelKindDirtiesOnlyThatKind(t *testing.T) {
+	e := New(nil, nil, Config{})
+	e.snap.Store(buildTwoNodeSnapshot(t, 42, 10))
+	preGen := e.Generation()
+
+	scope := NewWriteScope()
+	scope.UpsertNodeKinds(graph.ID(1), graph.Kinds{graph.StringKind("User"), graph.StringKind("Tag")})
+
+	// Only node 1's own snapshot kind id (100) is ever resolved here -- Tag
+	// has no snapshot-side id to look up, since it is not present at all.
+	resolve := fakeResolver(t, map[snapshot.KindID]graph.Kind{100: graph.StringKind("User")})
+	e.noteResolved(scope, resolve)
+	postGen := e.Generation()
+
+	if e.nodeKindsClean(preGen, graph.Kinds{graph.StringKind("Tag")}) {
+		t.Fatalf("nodeKindsClean(preGen, Tag) = true, want false: Tag is novel to this node")
+	}
+	if !e.nodeKindsClean(postGen, graph.Kinds{graph.StringKind("Tag")}) {
+		t.Fatalf("nodeKindsClean(postGen, Tag) = false, want true")
+	}
+	if !e.nodeKindsClean(preGen, graph.Kinds{graph.StringKind("User")}) {
+		t.Fatalf("nodeKindsClean(preGen, User) = false, want true: User was already present, must stay clean")
+	}
+	if !e.allNodesClean(preGen) || !e.allEdgesClean(preGen) {
+		t.Fatalf("a resolved upsert must not fall back to allNodes/allEdges")
+	}
+}
+
+// TestNoteWriteUpsertNodeKindsAbsentIDDirtiesAllPairKinds covers
+// UpsertNodeKinds' bounded-conservative fallback: an id the current
+// snapshot doesn't recognize at all (created after the snapshot was built,
+// or no snapshot exists yet) dirties every kind the pair names -- but,
+// unlike an unresolved DeleteNodeID, does NOT escalate to allNodes/allEdges,
+// since this is a well-understood bounded case, not a genuine resolution
+// failure. failResolver proves resolve is never even called along this path.
+func TestNoteWriteUpsertNodeKindsAbsentIDDirtiesAllPairKinds(t *testing.T) {
+	e := New(nil, nil, Config{})
+	e.snap.Store(buildTwoNodeSnapshot(t, 42, 10))
+	preGen := e.Generation()
+
+	scope := NewWriteScope()
+	scope.UpsertNodeKinds(graph.ID(999), graph.Kinds{graph.StringKind("NewKind1"), graph.StringKind("NewKind2")}) // never staged above
+
+	e.noteResolved(scope, failResolver(t))
+	postGen := e.Generation()
+
+	if e.nodeKindsClean(preGen, graph.Kinds{graph.StringKind("NewKind1")}) {
+		t.Fatalf("nodeKindsClean(preGen, NewKind1) = true, want false")
+	}
+	if e.nodeKindsClean(preGen, graph.Kinds{graph.StringKind("NewKind2")}) {
+		t.Fatalf("nodeKindsClean(preGen, NewKind2) = true, want false")
+	}
+	if !e.nodeKindsClean(postGen, graph.Kinds{graph.StringKind("NewKind1"), graph.StringKind("NewKind2")}) {
+		t.Fatalf("nodeKindsClean(postGen, NewKind1/NewKind2) = false, want true")
+	}
+	if !e.allNodesClean(preGen) || !e.allEdgesClean(preGen) {
+		t.Fatalf("an absent-id upsert is bounded-conservative, must not fall back to allNodes/allEdges")
+	}
+}
+
+// TestNoteWriteUpsertNodeKindsResolveErrorDirtiesEverything covers the "on
+// error, fall back to TouchAll" contract for a genuine resolver failure
+// while translating a *found* node's own snapshot kind ids -- the one
+// UpsertNodeKinds failure mode that IS treated as unrecoverable, unlike the
+// bounded absent-id case above.
+func TestNoteWriteUpsertNodeKindsResolveErrorDirtiesEverything(t *testing.T) {
+	e := New(nil, nil, Config{})
+	e.snap.Store(buildTwoNodeSnapshot(t, 42, 10))
+	preGen := e.Generation()
+
+	scope := NewWriteScope()
+	scope.UpsertNodeKinds(graph.ID(1), graph.Kinds{graph.StringKind("User"), graph.StringKind("Tag")})
+
+	failingResolve := func(_ []snapshot.KindID) (graph.Kinds, error) {
+		return nil, errors.New("marks_test: kind mapper unreachable")
+	}
+	e.noteResolved(scope, failingResolve)
+
+	if e.allNodesClean(preGen) {
+		t.Fatalf("allNodesClean(preGen) = true, want false: a resolver failure must fall back to TouchAll")
+	}
+	if e.allEdgesClean(preGen) {
+		t.Fatalf("allEdgesClean(preGen) = true, want false")
+	}
+}
+
 // TestNoteWriteDeleteEdgeIDResolveErrorDirtiesEverything covers the "on
 // error, fall back to TouchAll" contract for a genuine resolver failure (as
 // opposed to a plain id-not-found miss, covered above): since a KindMapper

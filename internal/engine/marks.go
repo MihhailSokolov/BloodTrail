@@ -40,8 +40,19 @@ type WriteScope struct {
 	deleteNodeIDs []graph.ID
 	deleteEdgeIDs []graph.ID
 
+	nodeKindUpserts []nodeKindsUpsert
+
 	allNodes bool
 	allEdges bool
+}
+
+// nodeKindsUpsert pairs a node's database id with the kinds an upsert-shaped
+// write declared for it, as recorded by WriteScope.UpsertNodeKinds -- see
+// that method's doc for what "upsert-shaped" means here and why it needs its
+// own resolution step distinct from DeleteNodeID's.
+type nodeKindsUpsert struct {
+	id    graph.ID
+	kinds graph.Kinds
 }
 
 // NewWriteScope returns an empty WriteScope, ready for its Touch*/Delete*
@@ -97,6 +108,49 @@ func (s *WriteScope) DeleteNodeID(id graph.ID) {
 	s.deleteNodeIDs = append(s.deleteNodeIDs, id)
 }
 
+// UpsertNodeKinds records that the write set kinds as the node with database
+// id id's base Kinds field, via an operation whose actual database effect is
+// to UNION kinds wholesale into the row's existing kind_ids -- not to apply a
+// delta the way AddedKinds/DeletedKinds do. dawgs' pg driver's batch
+// UpdateNodes is exactly this shape: NodeUpdateParameters.Append
+// (drivers/pg/batch.go) maps node.Kinds -- the node's FULL kind set, not
+// node.AddedKinds -- into the SQL statement's "added_kinds" parameter, and
+// FormatNodesUpdate's SQL unions it into kind_ids regardless of AddedKinds
+// ("kind_ids = uniq(sort(kind_ids - u.deleted_kinds || u.added_kinds))", with
+// u.added_kinds bound from node.Kinds). So a caller that sets Kinds without
+// also calling node.AddKinds(...) still changes which kinds the node carries
+// in the database -- exactly the gap touchNodeKindDelta (which only ever
+// looks at AddedKinds/DeletedKinds) cannot see on its own; see
+// write_observer.go's observingBatch.UpdateNodes for where this is called
+// from, and its doc for the full verified detail.
+//
+// NoteWrite resolves each (id, kinds) pair against the engine's current
+// snapshot to find which of kinds could have been NEWLY added by the union --
+// see noteResolved's doc for exactly how, and resolveUpsertedNodeKinds' doc
+// for the full case analysis. In short: a kind already present in the
+// snapshot's own record of the node cannot have its *membership* changed by a
+// union that includes it again (present ∪ present = present), so it needs no
+// fresh mark here -- and if the node had that kind removed since the
+// snapshot was built, whatever removed it (a DeletedKinds delta, a
+// DeleteNodeID, or an unscoped write) already dirtied it through its own
+// path, and marks are monotonic (stampMarks' doc: a mark's generation never
+// decreases), so that dirt is never lost by skipping the kind here. Only a
+// kind genuinely absent from the snapshot's record of this node is one this
+// specific write could be the first thing to ever add, so only those get a
+// fresh mark. This is what keeps a tagging-style call (Kinds set alongside
+// AddKinds(newKind), the shape every caller in this codebase uses today) from
+// dirtying every hot kind (User, Computer, ...) the node already carried --
+// the naive-but-unsound alternative this fix deliberately avoids.
+//
+// A nil or empty kinds is a no-op: an upsert naming no kinds cannot change
+// kind membership at all, so there is nothing to record.
+func (s *WriteScope) UpsertNodeKinds(id graph.ID, kinds graph.Kinds) {
+	if len(kinds) == 0 {
+		return
+	}
+	s.nodeKindUpserts = append(s.nodeKindUpserts, nodeKindsUpsert{id: id, kinds: kinds})
+}
+
 // DeleteEdgeID records that the write deleted the edge with database id id.
 // NoteWrite resolves id against the current snapshot to find the specific
 // edge kind this deletion actually affects; see NoteWrite's doc for the
@@ -136,6 +190,7 @@ func (s *WriteScope) TouchAll() {
 func (s *WriteScope) Empty() bool {
 	return len(s.nodeKinds) == 0 && len(s.edgeKinds) == 0 &&
 		len(s.deleteNodeIDs) == 0 && len(s.deleteEdgeIDs) == 0 &&
+		len(s.nodeKindUpserts) == 0 &&
 		!s.allNodes && !s.allEdges
 }
 
@@ -188,6 +243,31 @@ func (s *WriteScope) DeletedEdges() []graph.ID {
 	}
 	out := make([]graph.ID, len(s.deleteEdgeIDs))
 	copy(out, s.deleteEdgeIDs)
+	return out
+}
+
+// UpsertedNodeKinds returns, as a map from node id to a fresh copy of its own
+// kinds slice, every (id, kinds) pair UpsertNodeKinds has recorded on s. This
+// exists for tests (write_observer_test.go) -- production code (noteResolved)
+// reads s.nodeKindUpserts directly -- mirroring TouchedNodeKinds' doc on why
+// an inspection accessor separate from Empty() matters. It returns nil, not
+// an empty non-nil map, when nothing was ever recorded, matching
+// DeletedNodes/DeletedEdges' own zero-value convention. Every value is a
+// fresh copy the caller may freely mutate without affecting s; if the same id
+// was recorded more than once (not expected in practice -- a single
+// UpdateNodes call names a given node id at most once), only the last
+// recorded pair for that id survives in the returned map, since this is an
+// assertion aid over the raw call sequence, not an aggregation of it.
+func (s *WriteScope) UpsertedNodeKinds() map[graph.ID]graph.Kinds {
+	if len(s.nodeKindUpserts) == 0 {
+		return nil
+	}
+	out := make(map[graph.ID]graph.Kinds, len(s.nodeKindUpserts))
+	for _, pair := range s.nodeKindUpserts {
+		kinds := make(graph.Kinds, len(pair.kinds))
+		copy(kinds, pair.kinds)
+		out[pair.id] = kinds
+	}
 	return out
 }
 
@@ -363,6 +443,14 @@ var errUnresolvedDelete = errors.New("engine: delete id not present in current s
 //     marks both allNodes and allEdges dirty: a node deletion's blast
 //     radius always includes edges, so there is no narrower safe fallback
 //     the way there is for a lone edge deletion.
+//     - Each scope.nodeKindUpserts entry (WriteScope.UpsertNodeKinds' doc)
+//     resolves via resolveUpsertedNodeKinds to the subset of its own kinds
+//     genuinely new to the node, relative to the current snapshot's record
+//     of it -- skipped entirely once touchAllNodes is already true, since
+//     nothing it could add would change that answer. A resolver failure
+//     here marks both allNodes and allEdges dirty, the same conservative
+//     answer a deleteEdgeIDs resolver failure gives, for the same reason:
+//     nothing safe to be more specific about.
 //  4. Acquire marks.mu once and commit every resolved name and every all*
 //     flag from step 3, all stamped with the same gen. This is the only
 //     step that holds marks.mu, and it never performs I/O -- see the marks
@@ -411,6 +499,19 @@ func (e *Engine) noteResolved(scope *WriteScope, resolve func([]snapshot.KindID)
 			edgeNames = append(edgeNames, eNames...)
 		} else {
 			touchAllNodes, touchAllEdges = true, true
+		}
+	}
+
+	if len(scope.nodeKindUpserts) > 0 && !touchAllNodes {
+		names, err := resolveUpsertedNodeKinds(e.snap.Load(), scope.nodeKindUpserts, resolve)
+		if err != nil {
+			// A genuine resolver failure gives no reliable information to be
+			// conservative *about*, the same reasoning the deleteEdgeIDs
+			// resolver-failure branch above gives -- so the only safe answer
+			// is TouchAll's effect.
+			touchAllNodes, touchAllEdges = true, true
+		} else {
+			nodeNames = append(nodeNames, names...)
 		}
 	}
 
@@ -551,6 +652,74 @@ func resolveDeletedNodeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve fu
 	}
 
 	return nodeNames, edgeNames, true
+}
+
+// resolveUpsertedNodeKinds resolves, for every (id, kinds) pair in upserts,
+// which of kinds are actually NEW to the node -- the ones a kind_ids union
+// could newly have added -- relative to the current snapshot's own record of
+// that node's kinds. For each pair:
+//
+//   - If snap is non-nil and id resolves via snap.Dense, that node's own
+//     snapshot kind IDs (KindOffsets/NodeKinds) are translated to names via
+//     resolve, and every entry in kinds NOT among those names is added to
+//     the result -- see WriteScope.UpsertNodeKinds' doc for why a kind
+//     already present in the snapshot needs no mark from this call.
+//   - If id is absent from snap (or snap itself is nil), every one of kinds
+//     is added to the result unconditionally: this is the bounded-
+//     conservative case WriteScope.UpsertNodeKinds' doc anticipates -- a
+//     node this write path cannot find in the snapshot either didn't exist
+//     when the snapshot was built (in which case its CreateNode already
+//     dirtied its kinds through the normal observed path) or the snapshot
+//     itself is absent (in which case every caller of NoteWrite is already
+//     in the "nothing has ever been built" state). Either way, marking
+//     exactly this pair's own kinds -- rather than escalating to TouchAll --
+//     costs nothing extra to get right and stays precise.
+//
+// The returned error is nil in both cases above; it is non-nil only when
+// resolve itself fails while translating a *found* node's snapshot kind
+// IDs -- a genuine resolver failure, which the caller (noteResolved) handles
+// the same way every other resolver failure in this file is handled (fall
+// back to TouchAll), since a failed KindMapper gives no reliable information
+// to be conservative *about*.
+func resolveUpsertedNodeKinds(snap *snapshot.Snapshot, upserts []nodeKindsUpsert, resolve func([]snapshot.KindID) (graph.Kinds, error)) ([]string, error) {
+	var names []string
+
+	for _, pair := range upserts {
+		pairNames := kindIDNames(pair.kinds)
+
+		if snap == nil {
+			names = append(names, pairNames...)
+			continue
+		}
+
+		dense, found := snap.Dense(uint64(pair.id))
+		if !found {
+			names = append(names, pairNames...)
+			continue
+		}
+
+		lo, hi := snap.KindOffsets[dense], snap.KindOffsets[dense+1]
+		snapKindIDs := snap.NodeKinds[lo:hi]
+
+		existing := make(map[string]struct{}, len(snapKindIDs))
+		if len(snapKindIDs) > 0 {
+			snapKinds, err := resolve(snapKindIDs)
+			if err != nil {
+				return nil, fmt.Errorf("engine: resolve upserted node kinds: %w", err)
+			}
+			for _, name := range kindIDNames(snapKinds) {
+				existing[name] = struct{}{}
+			}
+		}
+
+		for _, name := range pairNames {
+			if _, ok := existing[name]; !ok {
+				names = append(names, name)
+			}
+		}
+	}
+
+	return names, nil
 }
 
 // cleanAgainst reports whether every kind name in kinds -- or, if kinds is

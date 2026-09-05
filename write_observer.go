@@ -54,6 +54,16 @@ func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ..
 // here -- unlike observingBatch.UpdateNodeBy's upsert case below, this call
 // can only ever be touching a node the graph already had, so Kinds carries
 // no information the delta doesn't already capture.
+//
+// This is verified, not assumed, against dawgs' actual pg driver: the
+// tx-level UpdateNode this call delegates to (drivers/pg/transaction.go)
+// reads only node.AddedKinds and node.DeletedKinds when building its
+// AddKinds/DeleteKinds update statements -- it never references node.Kinds.
+// So the delta this method touches is exactly, not just approximately, the
+// database's real kind-membership effect; contrast observingBatch.
+// UpdateNodes below, whose analogous-looking pg batch write path does read
+// node.Kinds and therefore needs an additional UpsertNodeKinds call (see
+// touchNodeKindDelta's doc for the side-by-side comparison).
 func (t *observingTransaction) UpdateNode(node *graph.Node) error {
 	touchNodeKindDelta(t.scope, node)
 	return t.Transaction.UpdateNode(node)
@@ -120,9 +130,29 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 // when either is non-empty, and does nothing otherwise. This is the shared
 // rule behind observingTransaction.UpdateNode and observingBatch.
 // UpdateNodes -- both calls that only ever update a node already known to
-// exist, so the label delta is the whole story; contrast observingBatch.
-// UpdateNodeBy, an upsert that may instead be creating the node, where the
-// base Kinds field must be touched too (see that method's doc).
+// exist (contrast observingBatch.UpdateNodeBy, an upsert that may instead be
+// creating the node, where the base Kinds field must be touched too; see
+// that method's doc).
+//
+// For observingTransaction.UpdateNode this delta IS the whole story: dawgs'
+// pg driver's tx-level UpdateNode (drivers/pg/transaction.go) builds its
+// update statement solely from query.AddKinds(query.Node(), node.AddedKinds)
+// and query.DeleteKinds(query.Node(), node.DeletedKinds) when each is
+// non-empty -- it never reads node.Kinds at all -- so there is no
+// information a Kinds-only touch could add. This is a verified fact about
+// the real driver, not an assumption; see observingTransaction.UpdateNode's
+// own doc.
+//
+// For observingBatch.UpdateNodes, by contrast, this delta is only PART of
+// the story: dawgs' pg driver's batch UpdateNodes additionally unions the
+// node's full Kinds field into the database row regardless of AddedKinds
+// (NodeUpdateParameters.Append/FormatNodesUpdate in drivers/pg/batch.go and
+// drivers/pg/query/format.go). observingBatch.UpdateNodes therefore calls
+// this AND separately calls scope.UpsertNodeKinds(node.ID, node.Kinds) --
+// see that method's own doc, and engine.WriteScope.UpsertNodeKinds' doc, for
+// why a snapshot-scoped set-difference there is both necessary and
+// sufficient to close the gap this function alone would leave open for that
+// one caller.
 func touchNodeKindDelta(scope *engine.WriteScope, node *graph.Node) {
 	if len(node.AddedKinds) == 0 && len(node.DeletedKinds) == 0 {
 		return
@@ -446,6 +476,21 @@ func (b *observingBatch) Relationships() graph.RelationshipQuery {
 // delta, and there is no way from here to tell which case actually happened,
 // so Kinds must be touched every time alongside whatever AddedKinds/
 // DeletedKinds delta was also given.
+//
+// Verified sound against dawgs' actual pg batch write path (not just assumed
+// safe by analogy): UpdateNodeBy buffers into nodeUpdateByBuffer, flushed via
+// flushNodeUpsertBatch -> NodeUpsertParameters.Append (drivers/pg/batch.go),
+// which reads update.Node.Kinds ONLY -- never AddedKinds/DeletedKinds -- into
+// the upsert statement's excluded.kind_ids, and FormatNodeUpsert's SQL
+// (drivers/pg/query/format.go) unions it into the row's kind_ids on conflict
+// ("kind_ids = uniq(sort(n.kind_ids || excluded.kind_ids))"). Touching
+// update.Node.Kinds unconditionally, as this method already does, is
+// therefore not merely a safe superset of that effect -- it is an exact
+// match. The additional AddedKinds/DeletedKinds touches are conservative
+// extras this call has always made (neither field reaches the database
+// through this write path at all) and cost nothing to keep, so this method's
+// body is left as-is; contrast observingBatch.UpdateNodes below, whose
+// distinct pg batch write path required an actual code change to stay sound.
 func (b *observingBatch) UpdateNodeBy(update graph.NodeUpdate) error {
 	if update.Node != nil {
 		b.scope.TouchNodeKinds(update.Node.Kinds)
@@ -456,14 +501,46 @@ func (b *observingBatch) UpdateNodeBy(update graph.NodeUpdate) error {
 }
 
 // UpdateNodes touches each node's AddedKinds/DeletedKinds delta via
-// touchNodeKindDelta -- the same rule observingTransaction.UpdateNode
-// applies, for the same reason: graph.Batch's own doc describes this call as
-// updating existing nodes "by ID", not upserting, so Kinds itself carries no
-// information the delta doesn't already capture.
+// touchNodeKindDelta, AND separately calls scope.UpsertNodeKinds(node.ID,
+// node.Kinds) for every node with a non-empty Kinds field.
+//
+// graph.Batch's own doc describes this call as updating existing nodes "by
+// ID", not upserting -- which might suggest, as it correctly does for
+// observingTransaction.UpdateNode's identical-looking case, that the
+// AddedKinds/DeletedKinds delta is the whole story and Kinds itself carries
+// no extra information. Verified against dawgs' actual pg batch write path,
+// it is not: UpdateNodes buffers into nodeUpdateBuffer, flushed via
+// flushNodeUpdateBatch -> NodeUpdateParameters.Append (drivers/pg/batch.go),
+// which reads node.Kinds -- the node's FULL kind set, not node.AddedKinds --
+// into the update statement's "added_kinds" SQL parameter, and
+// FormatNodesUpdate's SQL (drivers/pg/query/format.go) unions it into
+// kind_ids unconditionally: "kind_ids = uniq(sort(kind_ids - u.deleted_kinds
+// || u.added_kinds))". So a caller that sets Kinds without also calling
+// node.AddKinds(...) -- nothing in graph.Node's API or graph.Batch's
+// documented contract forbids this -- changes kind membership in the
+// database with zero information in AddedKinds/DeletedKinds for
+// touchNodeKindDelta to see. (The batch's largeUpdate path, taken instead of
+// flushNodeUpdateBatch above LargeNodeUpdateThreshold nodes, reads node.Kinds
+// the same way via LargeNodeUpdateRows.Append/FormatMergeNodeLargeUpdate, so
+// this call's per-node marking below covers both without needing to know
+// which path a given UpdateNodes call will take.)
+//
+// The UpsertNodeKinds call does not naively mark every node.Kinds entry
+// dirty -- doing so would dirty hot, already-clean kinds (User, Computer,
+// ...) on every tagging-style UpdateNodes call that sets Kinds alongside
+// AddedKinds (the shape every caller in this codebase uses today), defeating
+// this milestone's whole design goal of narrow, kind-scoped invalidation.
+// Instead resolution is deferred to NoteWrite time, against the engine's
+// current snapshot, so only kinds the union could have genuinely added get
+// marked; see engine.WriteScope.UpsertNodeKinds' doc for the full soundness
+// argument.
 func (b *observingBatch) UpdateNodes(nodes []*graph.Node) error {
 	for _, node := range nodes {
 		if node != nil {
 			touchNodeKindDelta(b.scope, node)
+			if len(node.Kinds) > 0 {
+				b.scope.UpsertNodeKinds(node.ID, node.Kinds)
+			}
 		}
 	}
 	return b.Batch.UpdateNodes(nodes)
