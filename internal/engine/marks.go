@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/specterops/dawgs/graph"
@@ -136,6 +137,72 @@ func (s *WriteScope) Empty() bool {
 	return len(s.nodeKinds) == 0 && len(s.edgeKinds) == 0 &&
 		len(s.deleteNodeIDs) == 0 && len(s.deleteEdgeIDs) == 0 &&
 		!s.allNodes && !s.allEdges
+}
+
+// TouchedNodeKinds returns, in sorted order, the name of every node kind
+// TouchNodeKinds has recorded on s. This exists for tests and diagnostics --
+// production code (noteResolved) reads s.nodeKinds directly -- so that a
+// caller outside this package can assert exactly which dimension a write
+// touched, rather than only the coarse "touched something" Empty() answers.
+// It returns a fresh copy on every call; the caller may do anything it likes
+// with the result without risk of mutating s.
+func (s *WriteScope) TouchedNodeKinds() []string {
+	return sortedKeys(s.nodeKinds)
+}
+
+// TouchedEdgeKinds is TouchedNodeKinds' edge equivalent.
+func (s *WriteScope) TouchedEdgeKinds() []string {
+	return sortedKeys(s.edgeKinds)
+}
+
+// TouchedAllNodes reports whether TouchAllNodes (directly, or via TouchAll)
+// has been called on s. See TouchedNodeKinds' doc for why this exists.
+func (s *WriteScope) TouchedAllNodes() bool {
+	return s.allNodes
+}
+
+// TouchedAllEdges reports whether TouchAllEdges (directly, or via TouchAll)
+// has been called on s. See TouchedNodeKinds' doc for why this exists.
+func (s *WriteScope) TouchedAllEdges() bool {
+	return s.allEdges
+}
+
+// DeletedNodes returns a copy of every node id DeleteNodeID has recorded on
+// s, in call order. See TouchedNodeKinds' doc for why this exists; like that
+// method, this returns a fresh slice the caller may freely mutate without
+// affecting s -- a nil result (never touched) is returned as nil, not an
+// empty non-nil slice, matching s.deleteNodeIDs' own zero value.
+func (s *WriteScope) DeletedNodes() []graph.ID {
+	if len(s.deleteNodeIDs) == 0 {
+		return nil
+	}
+	out := make([]graph.ID, len(s.deleteNodeIDs))
+	copy(out, s.deleteNodeIDs)
+	return out
+}
+
+// DeletedEdges is DeletedNodes' edge equivalent.
+func (s *WriteScope) DeletedEdges() []graph.ID {
+	if len(s.deleteEdgeIDs) == 0 {
+		return nil
+	}
+	out := make([]graph.ID, len(s.deleteEdgeIDs))
+	copy(out, s.deleteEdgeIDs)
+	return out
+}
+
+// sortedKeys returns the keys of m in sorted order, or nil if m is empty --
+// the shared implementation behind TouchedNodeKinds/TouchedEdgeKinds.
+func sortedKeys(m map[string]struct{}) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // marks is Engine's kind-scoped write history: for each kind name ever

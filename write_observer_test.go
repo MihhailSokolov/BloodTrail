@@ -3,6 +3,7 @@
 package bloodtrail
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
@@ -321,6 +322,38 @@ func kindsEqual(got, want graph.Kinds) bool {
 	return true
 }
 
+// assertScope fails the test unless scope's exported inspection accessors
+// (engine.WriteScope's TouchedNodeKinds/TouchedEdgeKinds/TouchedAllNodes/
+// TouchedAllEdges/DeletedNodes/DeletedEdges) report exactly the given
+// dimensions -- nil for wantNodeKinds/wantEdgeKinds/wantDeletedNodes/
+// wantDeletedEdges means "none". This exists so a test can assert the EXACT
+// dimension an override touched, rather than only scope.Empty()'s coarse
+// "touched something": a regression that marks the wrong dimension (e.g. a
+// CreateNode that accidentally touched edgeKinds instead of nodeKinds) would
+// still pass an Empty()-only assertion but is caught here.
+func assertScope(t *testing.T, scope *engine.WriteScope, wantNodeKinds, wantEdgeKinds []string, wantAllNodes, wantAllEdges bool, wantDeletedNodes, wantDeletedEdges []graph.ID) {
+	t.Helper()
+
+	if got := scope.TouchedNodeKinds(); !reflect.DeepEqual(got, wantNodeKinds) {
+		t.Fatalf("TouchedNodeKinds() = %v, want %v", got, wantNodeKinds)
+	}
+	if got := scope.TouchedEdgeKinds(); !reflect.DeepEqual(got, wantEdgeKinds) {
+		t.Fatalf("TouchedEdgeKinds() = %v, want %v", got, wantEdgeKinds)
+	}
+	if got := scope.TouchedAllNodes(); got != wantAllNodes {
+		t.Fatalf("TouchedAllNodes() = %v, want %v", got, wantAllNodes)
+	}
+	if got := scope.TouchedAllEdges(); got != wantAllEdges {
+		t.Fatalf("TouchedAllEdges() = %v, want %v", got, wantAllEdges)
+	}
+	if got := scope.DeletedNodes(); !reflect.DeepEqual(got, wantDeletedNodes) {
+		t.Fatalf("DeletedNodes() = %v, want %v", got, wantDeletedNodes)
+	}
+	if got := scope.DeletedEdges(); !reflect.DeepEqual(got, wantDeletedEdges) {
+		t.Fatalf("DeletedEdges() = %v, want %v", got, wantDeletedEdges)
+	}
+}
+
 // relVariable and nodeVariable build fresh *cypher.Variable values for the
 // relationship ("r") and node ("n") symbols dawgs/query's constructors
 // attach -- see relationshipKindMatcherKinds' doc.
@@ -540,9 +573,7 @@ func TestObservingTransactionCreateNodeTouchesScopeAndDelegates(t *testing.T) {
 	if len(inner.createNodeKinds) != 1 || len(inner.createNodeKinds[0]) != 1 || inner.createNodeKinds[0][0] != kind {
 		t.Fatalf("CreateNode did not delegate kinds correctly: %v", inner.createNodeKinds)
 	}
-	if scope.Empty() {
-		t.Fatalf("CreateNode did not touch scope")
-	}
+	assertScope(t, scope, []string{kind.String()}, nil, false, false, nil, nil)
 }
 
 func TestObservingTransactionCreateNodeNoKindsLeavesScopeEmpty(t *testing.T) {
@@ -581,9 +612,7 @@ func TestObservingTransactionUpdateNodeAddedKindsTouchesScope(t *testing.T) {
 	if err := tx.UpdateNode(node); err != nil {
 		t.Fatalf("UpdateNode: unexpected error: %v", err)
 	}
-	if scope.Empty() {
-		t.Fatalf("UpdateNode with AddedKinds left scope untouched")
-	}
+	assertScope(t, scope, []string{"Admin"}, nil, false, false, nil, nil)
 }
 
 func TestObservingTransactionUpdateNodeDeletedKindsTouchesScope(t *testing.T) {
@@ -594,9 +623,7 @@ func TestObservingTransactionUpdateNodeDeletedKindsTouchesScope(t *testing.T) {
 	if err := tx.UpdateNode(node); err != nil {
 		t.Fatalf("UpdateNode: unexpected error: %v", err)
 	}
-	if scope.Empty() {
-		t.Fatalf("UpdateNode with DeletedKinds left scope untouched")
-	}
+	assertScope(t, scope, []string{"Admin"}, nil, false, false, nil, nil)
 }
 
 func TestObservingTransactionCreateRelationshipByIDsTouchesScopeAndDelegates(t *testing.T) {
@@ -615,9 +642,7 @@ func TestObservingTransactionCreateRelationshipByIDsTouchesScopeAndDelegates(t *
 	if len(inner.createRelByIDsCalls) != 1 || inner.createRelByIDsCalls[0].kind != kind {
 		t.Fatalf("CreateRelationshipByIDs did not delegate: %v", inner.createRelByIDsCalls)
 	}
-	if scope.Empty() {
-		t.Fatalf("CreateRelationshipByIDs did not touch scope")
-	}
+	assertScope(t, scope, nil, []string{kind.String()}, false, false, nil, nil)
 }
 
 func TestObservingTransactionUpdateRelationshipNotOverridden(t *testing.T) {
@@ -694,8 +719,13 @@ func TestObservingTransactionQueryMutationSniffAndAlwaysDelegates(t *testing.T) 
 			if result != inner.queryResult {
 				t.Fatalf("Query did not return the inner transaction's result")
 			}
-			if got := !scope.Empty(); got != tc.wantTouched {
-				t.Fatalf("scope touched = %v, want %v", got, tc.wantTouched)
+			if tc.wantTouched {
+				// TouchAll marks both dimensions, unconditionally -- Query
+				// cannot narrow a mutating Cypher statement to specific
+				// kinds (cypherMutates' doc).
+				assertScope(t, scope, nil, nil, true, true, nil, nil)
+			} else {
+				assertScope(t, scope, nil, nil, false, false, nil, nil)
 			}
 		})
 	}
@@ -712,9 +742,7 @@ func TestObservingTransactionRawAlwaysTouchesScopeAndDelegates(t *testing.T) {
 	if result != inner.rawResult {
 		t.Fatalf("Raw did not return the inner transaction's result")
 	}
-	if scope.Empty() {
-		t.Fatalf("Raw did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
 }
 
 func TestObservingTransactionWithGraphTouchesScopeAndKeepsObserving(t *testing.T) {
@@ -726,9 +754,7 @@ func TestObservingTransactionWithGraphTouchesScopeAndKeepsObserving(t *testing.T
 	if inner.withGraphCalls != 1 {
 		t.Fatalf("WithGraph did not delegate to the inner transaction")
 	}
-	if scope.Empty() {
-		t.Fatalf("WithGraph did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
 
 	wrapped, ok := got.(*observingTransaction)
 	if !ok {
@@ -794,9 +820,7 @@ func TestObservingNodeQueryDeleteTouchesScopeAndDelegates(t *testing.T) {
 	if inner.deleteCalls != 1 {
 		t.Fatalf("Delete did not delegate to the inner query")
 	}
-	if scope.Empty() {
-		t.Fatalf("Delete did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
 }
 
 func TestObservingNodeQueryUpdatePromotedWithoutTouchingScope(t *testing.T) {
@@ -815,14 +839,99 @@ func TestObservingNodeQueryUpdatePromotedWithoutTouchingScope(t *testing.T) {
 	}
 }
 
-func TestObservingNodeQueryOrderByPromoted(t *testing.T) {
+func TestObservingNodeQueryOrderByDelegatesAndRewraps(t *testing.T) {
 	inner := &fakeNodeQuery{}
 	nq := &observingNodeQuery{NodeQuery: inner, scope: engine.NewWriteScope()}
 
-	_ = nq.OrderBy(graph.Criteria("x"))
+	got := nq.OrderBy(graph.Criteria("x"))
+	if _, ok := got.(*observingNodeQuery); !ok {
+		t.Fatalf("OrderBy returned %T, want *observingNodeQuery", got)
+	}
 	if inner.orderByCalls != 1 {
 		t.Fatalf("OrderBy did not delegate to the inner query")
 	}
+}
+
+func TestObservingNodeQueryOffsetDelegatesAndRewraps(t *testing.T) {
+	inner := &fakeNodeQuery{}
+	nq := &observingNodeQuery{NodeQuery: inner, scope: engine.NewWriteScope()}
+
+	got := nq.Offset(5)
+	if _, ok := got.(*observingNodeQuery); !ok {
+		t.Fatalf("Offset returned %T, want *observingNodeQuery", got)
+	}
+	if inner.offsetCalls != 1 {
+		t.Fatalf("Offset did not delegate to the inner query")
+	}
+}
+
+func TestObservingNodeQueryLimitDelegatesAndRewraps(t *testing.T) {
+	inner := &fakeNodeQuery{}
+	nq := &observingNodeQuery{NodeQuery: inner, scope: engine.NewWriteScope()}
+
+	got := nq.Limit(5)
+	if _, ok := got.(*observingNodeQuery); !ok {
+		t.Fatalf("Limit returned %T, want *observingNodeQuery", got)
+	}
+	if inner.limitCalls != 1 {
+		t.Fatalf("Limit did not delegate to the inner query")
+	}
+}
+
+// TestObservingNodeQueryFilterOrderByDeleteStaysObservedAndTouchesScope is
+// the regression test for the critical finding fixed alongside these
+// overrides: before OrderBy re-wrapped, Filter(x).OrderBy(y) returned the
+// bare inner graph.NodeQuery (whatever the pg implementation's own OrderBy
+// returns for chaining, unwrapped), so a trailing .Delete() silently
+// escaped observation and scope never learned about the delete.
+func TestObservingNodeQueryFilterOrderByDeleteStaysObservedAndTouchesScope(t *testing.T) {
+	inner := &fakeNodeQuery{}
+	scope := engine.NewWriteScope()
+	nq := &observingNodeQuery{NodeQuery: inner, scope: scope}
+
+	chained := nq.Filter(graph.Criteria("x")).OrderBy(graph.Criteria("y"))
+	if _, ok := chained.(*observingNodeQuery); !ok {
+		t.Fatalf("Filter(...).OrderBy(...) returned %T, want *observingNodeQuery", chained)
+	}
+	if err := chained.Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.deleteCalls != 1 {
+		t.Fatalf("Delete did not reach the inner query: deleteCalls = %d", inner.deleteCalls)
+	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
+}
+
+// TestObservingNodeQueryOffsetDeleteStaysObservedAndTouchesScope is Offset's
+// equivalent of the OrderBy regression test above.
+func TestObservingNodeQueryOffsetDeleteStaysObservedAndTouchesScope(t *testing.T) {
+	inner := &fakeNodeQuery{}
+	scope := engine.NewWriteScope()
+	nq := &observingNodeQuery{NodeQuery: inner, scope: scope}
+
+	if err := nq.Offset(1).Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.offsetCalls != 1 || inner.deleteCalls != 1 {
+		t.Fatalf("Offset/Delete did not both reach the inner query: offsetCalls=%d deleteCalls=%d", inner.offsetCalls, inner.deleteCalls)
+	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
+}
+
+// TestObservingNodeQueryLimitDeleteStaysObservedAndTouchesScope is Limit's
+// equivalent of the OrderBy regression test above.
+func TestObservingNodeQueryLimitDeleteStaysObservedAndTouchesScope(t *testing.T) {
+	inner := &fakeNodeQuery{}
+	scope := engine.NewWriteScope()
+	nq := &observingNodeQuery{NodeQuery: inner, scope: scope}
+
+	if err := nq.Limit(1).Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.limitCalls != 1 || inner.deleteCalls != 1 {
+		t.Fatalf("Limit/Delete did not both reach the inner query: limitCalls=%d deleteCalls=%d", inner.limitCalls, inner.deleteCalls)
+	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
 }
 
 // -----------------------------------------------------------------------
@@ -892,9 +1001,7 @@ func TestObservingRelationshipQueryDeleteRecognizedKindTouchesScopeAndDelegates(
 	if inner.deleteCalls != 1 {
 		t.Fatalf("Delete did not delegate to the inner query")
 	}
-	if scope.Empty() {
-		t.Fatalf("Delete did not touch scope")
-	}
+	assertScope(t, scope, nil, []string{kind.String()}, false, false, nil, nil)
 }
 
 func TestObservingRelationshipQueryDeleteUnrecognizedTouchesScopeAndDelegates(t *testing.T) {
@@ -911,9 +1018,7 @@ func TestObservingRelationshipQueryDeleteUnrecognizedTouchesScopeAndDelegates(t 
 	if inner.deleteCalls != 1 {
 		t.Fatalf("Delete did not delegate to the inner query")
 	}
-	if scope.Empty() {
-		t.Fatalf("Delete did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, false, true, nil, nil)
 }
 
 func TestObservingRelationshipQueryUpdatePromotedWithoutTouchingScope(t *testing.T) {
@@ -932,6 +1037,106 @@ func TestObservingRelationshipQueryUpdatePromotedWithoutTouchingScope(t *testing
 	}
 }
 
+func TestObservingRelationshipQueryOrderByDelegatesAndRewraps(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: engine.NewWriteScope()}
+
+	got := rq.OrderBy(graph.Criteria("x"))
+	if _, ok := got.(*observingRelationshipQuery); !ok {
+		t.Fatalf("OrderBy returned %T, want *observingRelationshipQuery", got)
+	}
+	if inner.orderByCalls != 1 {
+		t.Fatalf("OrderBy did not delegate to the inner query")
+	}
+}
+
+func TestObservingRelationshipQueryOffsetDelegatesAndRewraps(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: engine.NewWriteScope()}
+
+	got := rq.Offset(5)
+	if _, ok := got.(*observingRelationshipQuery); !ok {
+		t.Fatalf("Offset returned %T, want *observingRelationshipQuery", got)
+	}
+	if inner.offsetCalls != 1 {
+		t.Fatalf("Offset did not delegate to the inner query")
+	}
+}
+
+func TestObservingRelationshipQueryLimitDelegatesAndRewraps(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: engine.NewWriteScope()}
+
+	got := rq.Limit(5)
+	if _, ok := got.(*observingRelationshipQuery); !ok {
+		t.Fatalf("Limit returned %T, want *observingRelationshipQuery", got)
+	}
+	if inner.limitCalls != 1 {
+		t.Fatalf("Limit did not delegate to the inner query")
+	}
+}
+
+// TestObservingRelationshipQueryFilterOrderByDeleteStaysObservedAndTouchesScope
+// is the observingRelationshipQuery half of the critical finding's
+// regression test (see observingNodeQuery's identical-purpose test for the
+// full explanation): before OrderBy re-wrapped, Filter(x).OrderBy(y) handed
+// back the bare inner graph.RelationshipQuery, so a trailing .Delete() never
+// reached this wrapper and scope never learned about the delete.
+func TestObservingRelationshipQueryFilterOrderByDeleteStaysObservedAndTouchesScope(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	scope := engine.NewWriteScope()
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+
+	kind := graph.StringKind("HasSession")
+	chained := rq.Filter(cypher.NewKindMatcher(relVariable(), graph.Kinds{kind}, false)).OrderBy(graph.Criteria("y"))
+	if _, ok := chained.(*observingRelationshipQuery); !ok {
+		t.Fatalf("Filter(...).OrderBy(...) returned %T, want *observingRelationshipQuery", chained)
+	}
+	if err := chained.Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.deleteCalls != 1 {
+		t.Fatalf("Delete did not reach the inner query: deleteCalls = %d", inner.deleteCalls)
+	}
+	// The single recognized-kind criteria recorded by Filter survives the
+	// OrderBy hop, so Delete still narrows to that kind instead of falling
+	// back to TouchAllEdges.
+	assertScope(t, scope, nil, []string{kind.String()}, false, false, nil, nil)
+}
+
+// TestObservingRelationshipQueryOffsetDeleteStaysObservedAndTouchesScope is
+// Offset's equivalent of the OrderBy regression test above.
+func TestObservingRelationshipQueryOffsetDeleteStaysObservedAndTouchesScope(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	scope := engine.NewWriteScope()
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+
+	if err := rq.Offset(1).Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.offsetCalls != 1 || inner.deleteCalls != 1 {
+		t.Fatalf("Offset/Delete did not both reach the inner query: offsetCalls=%d deleteCalls=%d", inner.offsetCalls, inner.deleteCalls)
+	}
+	// No criteria recorded at all, so Delete falls back to TouchAllEdges.
+	assertScope(t, scope, nil, nil, false, true, nil, nil)
+}
+
+// TestObservingRelationshipQueryLimitDeleteStaysObservedAndTouchesScope is
+// Limit's equivalent of the OrderBy regression test above.
+func TestObservingRelationshipQueryLimitDeleteStaysObservedAndTouchesScope(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	scope := engine.NewWriteScope()
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+
+	if err := rq.Limit(1).Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.limitCalls != 1 || inner.deleteCalls != 1 {
+		t.Fatalf("Limit/Delete did not both reach the inner query: limitCalls=%d deleteCalls=%d", inner.limitCalls, inner.deleteCalls)
+	}
+	assertScope(t, scope, nil, nil, false, true, nil, nil)
+}
+
 // -----------------------------------------------------------------------
 // observingBatch
 // -----------------------------------------------------------------------
@@ -948,9 +1153,7 @@ func TestObservingBatchCreateNodeTouchesScopeAndDelegates(t *testing.T) {
 	if len(inner.createNodeCalls) != 1 || inner.createNodeCalls[0] != node {
 		t.Fatalf("CreateNode did not delegate: %v", inner.createNodeCalls)
 	}
-	if scope.Empty() {
-		t.Fatalf("CreateNode did not touch scope")
-	}
+	assertScope(t, scope, []string{"User"}, nil, false, false, nil, nil)
 }
 
 func TestObservingBatchDeleteNodeRecordsIDAndDelegates(t *testing.T) {
@@ -964,9 +1167,7 @@ func TestObservingBatchDeleteNodeRecordsIDAndDelegates(t *testing.T) {
 	if len(inner.deleteNodeCalls) != 1 || inner.deleteNodeCalls[0] != graph.ID(7) {
 		t.Fatalf("DeleteNode did not delegate: %v", inner.deleteNodeCalls)
 	}
-	if scope.Empty() {
-		t.Fatalf("DeleteNode did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, false, false, []graph.ID{7}, nil)
 }
 
 func TestObservingBatchNodesAndRelationshipsReturnObservingWrappers(t *testing.T) {
@@ -1010,9 +1211,7 @@ func TestObservingBatchUpdateNodeByTouchesBaseKindsAndDelegates(t *testing.T) {
 	if len(inner.updateNodeByCalls) != 1 {
 		t.Fatalf("UpdateNodeBy did not delegate")
 	}
-	if scope.Empty() {
-		t.Fatalf("UpdateNodeBy did not touch scope for the node's base Kinds")
-	}
+	assertScope(t, scope, []string{"Base"}, nil, false, false, nil, nil)
 }
 
 func TestObservingBatchUpdateNodesNoKindDeltaLeavesScopeEmpty(t *testing.T) {
@@ -1041,9 +1240,7 @@ func TestObservingBatchUpdateNodesKindDeltaTouchesScope(t *testing.T) {
 	if err := b.UpdateNodes(nodes); err != nil {
 		t.Fatalf("UpdateNodes: unexpected error: %v", err)
 	}
-	if scope.Empty() {
-		t.Fatalf("UpdateNodes with AddedKinds left scope untouched")
-	}
+	assertScope(t, scope, []string{"Admin"}, nil, false, false, nil, nil)
 }
 
 func TestObservingBatchCreateRelationshipTouchesScopeAndDelegates(t *testing.T) {
@@ -1058,9 +1255,7 @@ func TestObservingBatchCreateRelationshipTouchesScopeAndDelegates(t *testing.T) 
 	if len(inner.createRelationshipCalls) != 1 || inner.createRelationshipCalls[0] != rel {
 		t.Fatalf("CreateRelationship did not delegate: %v", inner.createRelationshipCalls)
 	}
-	if scope.Empty() {
-		t.Fatalf("CreateRelationship did not touch scope")
-	}
+	assertScope(t, scope, nil, []string{"HasSession"}, false, false, nil, nil)
 }
 
 func TestObservingBatchCreateRelationshipByIDsTouchesScopeAndDelegates(t *testing.T) {
@@ -1075,9 +1270,7 @@ func TestObservingBatchCreateRelationshipByIDsTouchesScopeAndDelegates(t *testin
 	if len(inner.createRelByIDsCalls) != 1 || inner.createRelByIDsCalls[0].kind != kind {
 		t.Fatalf("CreateRelationshipByIDs did not delegate: %v", inner.createRelByIDsCalls)
 	}
-	if scope.Empty() {
-		t.Fatalf("CreateRelationshipByIDs did not touch scope")
-	}
+	assertScope(t, scope, nil, []string{kind.String()}, false, false, nil, nil)
 }
 
 func TestObservingBatchDeleteRelationshipRecordsIDAndDelegates(t *testing.T) {
@@ -1091,9 +1284,7 @@ func TestObservingBatchDeleteRelationshipRecordsIDAndDelegates(t *testing.T) {
 	if len(inner.deleteRelationshipCalls) != 1 || inner.deleteRelationshipCalls[0] != graph.ID(3) {
 		t.Fatalf("DeleteRelationship did not delegate: %v", inner.deleteRelationshipCalls)
 	}
-	if scope.Empty() {
-		t.Fatalf("DeleteRelationship did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, false, false, nil, []graph.ID{3})
 }
 
 func TestObservingBatchUpdateRelationshipByTouchesScopeAndDelegates(t *testing.T) {
@@ -1108,9 +1299,7 @@ func TestObservingBatchUpdateRelationshipByTouchesScopeAndDelegates(t *testing.T
 	if len(inner.updateRelationshipByCalls) != 1 {
 		t.Fatalf("UpdateRelationshipBy did not delegate")
 	}
-	if scope.Empty() {
-		t.Fatalf("UpdateRelationshipBy did not touch scope")
-	}
+	assertScope(t, scope, nil, []string{"MemberOf"}, false, false, nil, nil)
 }
 
 func TestObservingBatchWithGraphTouchesScopeAndKeepsObserving(t *testing.T) {
@@ -1123,9 +1312,7 @@ func TestObservingBatchWithGraphTouchesScopeAndKeepsObserving(t *testing.T) {
 	if inner.withGraphCalls != 1 {
 		t.Fatalf("WithGraph did not delegate to the inner batch")
 	}
-	if scope.Empty() {
-		t.Fatalf("WithGraph did not touch scope")
-	}
+	assertScope(t, scope, nil, nil, true, true, nil, nil)
 
 	wrapped, ok := got.(*observingBatch)
 	if !ok {

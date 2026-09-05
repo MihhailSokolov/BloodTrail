@@ -133,9 +133,9 @@ func touchNodeKindDelta(scope *engine.WriteScope, node *graph.Node) {
 
 // observingNodeQuery wraps a live graph.NodeQuery so that Delete() can mark
 // scope before delegating. graph.NodeQuery is embedded, so every method this
-// file does not override (Query, Update, OrderBy, Offset, Limit, Count,
-// First, Fetch, FetchIDs, FetchKinds) is promoted straight through to the
-// inner query unchanged -- Update in particular is promoted deliberately:
+// file does not override (Query, Update, Count, First, Fetch, FetchIDs,
+// FetchKinds) is promoted straight through to the inner query unchanged --
+// Update in particular is promoted deliberately:
 // NodeQuery.Update only ever sets properties (graph.NodeQuery's own doc,
 // "updates all candidate nodes with the given properties"), never labels, so
 // there is no kind information for it to report.
@@ -164,6 +164,36 @@ func (q *observingNodeQuery) Filterf(criteriaDelegate graph.CriteriaProvider) gr
 	return q
 }
 
+// OrderBy delegates to the inner query and re-wraps the result so the fluent
+// chain keeps flowing through observingNodeQuery -- see Filter's doc for why
+// that matters. Without this override, the embedded graph.NodeQuery's own
+// OrderBy would be promoted straight through and return whatever the inner
+// query's OrderBy returns (itself, unwrapped, for the pg driver's own
+// NodeQuery), silently detaching the chain from this wrapper: a subsequent
+// .Delete() would then land on the inner query directly and scope would
+// never learn about it. Unlike recordingRelationshipQuery's identical-shaped
+// override on the read side, this does not taint anything -- an observer's
+// only job is to keep the chain observed, not to decide whether a later
+// call is safe to serve from the engine.
+func (q *observingNodeQuery) OrderBy(criteria ...graph.Criteria) graph.NodeQuery {
+	q.NodeQuery = q.NodeQuery.OrderBy(criteria...)
+	return q
+}
+
+// Offset is OrderBy's Offset equivalent; see its doc for why re-wrapping
+// (rather than promoting) matters here.
+func (q *observingNodeQuery) Offset(skip int) graph.NodeQuery {
+	q.NodeQuery = q.NodeQuery.Offset(skip)
+	return q
+}
+
+// Limit is OrderBy's Limit equivalent; see its doc for why re-wrapping
+// (rather than promoting) matters here.
+func (q *observingNodeQuery) Limit(limit int) graph.NodeQuery {
+	q.NodeQuery = q.NodeQuery.Limit(limit)
+	return q
+}
+
 // Delete marks the whole scope dirty for both nodes and edges before
 // delegating: deleting a node cascades to every edge incident to it (the
 // same reasoning DeleteNodeID's resolution path in engine/marks.go
@@ -182,11 +212,11 @@ func (q *observingNodeQuery) Delete() error {
 // read-side recordingRelationshipQuery) so a subsequent Delete() has a
 // chance to recognize a kind-scoped delete and mark only the kinds it
 // actually affects, instead of TouchAllEdges. graph.RelationshipQuery is
-// embedded, so every method this file does not override (Update, OrderBy,
-// Offset, Limit, Count, First, Query, Fetch, FetchDirection, FetchIDs,
-// FetchTriples, FetchKinds, FetchAllShortestPaths) is promoted straight
-// through unchanged -- Update in particular is promoted deliberately, for
-// the same property-only reason observingNodeQuery's doc gives.
+// embedded, so every method this file does not override (Update, Count,
+// First, Query, Fetch, FetchDirection, FetchIDs, FetchTriples, FetchKinds,
+// FetchAllShortestPaths) is promoted straight through unchanged -- Update in
+// particular is promoted deliberately, for the same property-only reason
+// observingNodeQuery's doc gives.
 //
 // The zero value is not useful; construct one via observingTransaction's own
 // Relationships() or observingBatch's own Relationships().
@@ -222,6 +252,34 @@ func (r *observingRelationshipQuery) Filter(criteria graph.Criteria) graph.Relat
 func (r *observingRelationshipQuery) Filterf(criteriaDelegate graph.CriteriaProvider) graph.RelationshipQuery {
 	r.criteria = append(r.criteria, criteriaDelegate())
 	r.RelationshipQuery = r.RelationshipQuery.Filterf(criteriaDelegate)
+	return r
+}
+
+// OrderBy delegates to the inner query and re-wraps the result so the
+// fluent chain keeps flowing through observingRelationshipQuery -- mirroring
+// observingNodeQuery.OrderBy's identical reasoning (see its doc): without
+// this override, the promoted embedded method would return the inner pg
+// query unwrapped, and a chain ending in .Delete() after .OrderBy(...) would
+// silently skip this wrapper's scope marking. This does not taint the
+// query the way recordingRelationshipQuery.OrderBy does on the read side --
+// an observer only needs to stay attached to the chain, not to decide
+// whether a later call can be served from the engine.
+func (r *observingRelationshipQuery) OrderBy(criteria ...graph.Criteria) graph.RelationshipQuery {
+	r.RelationshipQuery = r.RelationshipQuery.OrderBy(criteria...)
+	return r
+}
+
+// Offset is OrderBy's Offset equivalent; see its doc for why re-wrapping
+// (rather than promoting) matters here.
+func (r *observingRelationshipQuery) Offset(skip int) graph.RelationshipQuery {
+	r.RelationshipQuery = r.RelationshipQuery.Offset(skip)
+	return r
+}
+
+// Limit is OrderBy's Limit equivalent; see its doc for why re-wrapping
+// (rather than promoting) matters here.
+func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
+	r.RelationshipQuery = r.RelationshipQuery.Limit(limit)
 	return r
 }
 
