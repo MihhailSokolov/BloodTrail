@@ -403,3 +403,67 @@ func TestAllNodeKindsClean(t *testing.T) {
 		t.Fatalf("allNodeKindsClean(postGen) = false, want true")
 	}
 }
+
+// TestStampMarksMonotonicMax verifies the monotonic-max invariant: when writes
+// commit out of generation order (a slower write with a smaller generation
+// landing after a faster write with a larger generation), the larger
+// generation must survive. This regression test directly calls noteResolved
+// with explicit generations to simulate two concurrent writes where writer B
+// (gen=6, fast) completes before writer A (gen=5, slow).
+//
+// Without the monotonic-max guard, the slower writer's smaller generation
+// would overwrite the faster writer's larger generation, causing a "durable
+// corruption" where a later cleanliness check incorrectly reports clean even
+// though generation 6 dirtied the kind.
+func TestStampMarksMonotonicMax(t *testing.T) {
+	e := New(nil, nil, Config{})
+
+	// Simulate writer B (fast, gen=6) writing "User" kind first.
+	scopeB := NewWriteScope()
+	scopeB.TouchNodeKinds(graph.Kinds{graph.StringKind("User")})
+	genB := uint64(6)
+	e.stampMarks(genB, false, false, []string{"User"}, nil)
+
+	// Verify that "User" is marked dirty at gen 6.
+	e.marks.mu.Lock()
+	genAtUser := e.marks.nodeKinds["User"]
+	e.marks.mu.Unlock()
+	if genAtUser != 6 {
+		t.Fatalf("after writer B, nodeKinds[User] = %d, want 6", genAtUser)
+	}
+
+	// Simulate writer A (slow, gen=5) writing "User" kind after writer B.
+	// With the bug (unconditional overwrite), this would set nodeKinds[User]=5.
+	// With the fix (monotonic max), nodeKinds[User] must stay 6.
+	genA := uint64(5)
+	e.stampMarks(genA, false, false, []string{"User"}, nil)
+
+	// Verify that "User" is still marked at the larger generation (6).
+	e.marks.mu.Lock()
+	genAtUserAfter := e.marks.nodeKinds["User"]
+	e.marks.mu.Unlock()
+	if genAtUserAfter != 6 {
+		t.Fatalf("after writer A, nodeKinds[User] = %d, want 6 (monotonic max, not %d from writer A)", genAtUserAfter, genA)
+	}
+
+	// Same test for allNodesGen: simulate B writing allNodes=true first,
+	// then A writing allNodes=true with a smaller generation.
+	e2 := New(nil, nil, Config{})
+	e2.stampMarks(6, true, false, nil, nil)
+
+	e2.marks.mu.Lock()
+	genAllNodes := e2.marks.allNodesGen
+	e2.marks.mu.Unlock()
+	if genAllNodes != 6 {
+		t.Fatalf("after writer B, allNodesGen = %d, want 6", genAllNodes)
+	}
+
+	e2.stampMarks(5, true, false, nil, nil)
+
+	e2.marks.mu.Lock()
+	genAllNodesAfter := e2.marks.allNodesGen
+	e2.marks.mu.Unlock()
+	if genAllNodesAfter != 6 {
+		t.Fatalf("after writer A, allNodesGen = %d, want 6 (monotonic max, not 5)", genAllNodesAfter)
+	}
+}

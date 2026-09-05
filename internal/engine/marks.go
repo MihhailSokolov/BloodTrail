@@ -167,6 +167,17 @@ func (s *WriteScope) Empty() bool {
 // handful of map lookups and uint64 compares under the lock) -- a
 // reader/writer lock's extra bookkeeping would not pay for itself here.
 //
+// Monotonic-max invariant: Every generation value stamped into nodeKinds,
+// edgeKinds, allNodesGen, and allEdgesGen must be monotonically increasing or
+// stay the same; values must never decrease. When two concurrent writes
+// commit out of generation order (a slower write with a smaller generation
+// landing after a faster write with a larger generation), the larger
+// generation must survive. This prevents durable corruption: if a cleanliness
+// check reads a mark entry at generation 5 when generation 6 already dirtied
+// the kind, the check would wrongly report clean. The stampMarks and
+// stampNamesLocked methods enforce this by taking max(existing, gen) rather
+// than unconditionally overwriting.
+//
 // Ordering with Engine's lock-free generation counter: NoteWrite bumps the
 // counter first (a single atomic Add, exactly as the no-arg NoteWrite always
 // did) and only afterwards acquires mu to stamp marks with that new value.
@@ -343,22 +354,33 @@ func (e *Engine) noteResolved(scope *WriteScope, resolve func([]snapshot.KindID)
 // once and records gen against allNodesGen/allEdgesGen (if allNodes/allEdges)
 // and against every name in nodeNames/edgeNames, then releases it. Called at
 // most once per NoteWrite call.
+//
+// Crucially, this method observes a monotonic invariant: when two concurrent
+// writes commit out of generation order (a slower write with a smaller
+// generation landing after a faster write with a larger generation), the
+// larger generation must survive. This prevents durable corruption where a
+// cleanliness check incorrectly reports clean despite a higher-generation
+// write having already dirtied the kind. The stamp never decreases: if an
+// entry already holds a value >= gen, it is left unchanged.
 func (e *Engine) stampMarks(gen uint64, allNodes, allEdges bool, nodeNames, edgeNames []string) {
 	e.marks.mu.Lock()
 	defer e.marks.mu.Unlock()
 
-	if allNodes {
+	if allNodes && gen > e.marks.allNodesGen {
 		e.marks.allNodesGen = gen
 	}
-	if allEdges {
+	if allEdges && gen > e.marks.allEdgesGen {
 		e.marks.allEdgesGen = gen
 	}
 	stampNamesLocked(&e.marks.nodeKinds, nodeNames, gen)
 	stampNamesLocked(&e.marks.edgeKinds, edgeNames, gen)
 }
 
-// stampNamesLocked sets (*m)[name] = gen for every name in names, allocating
-// *m on first use. Must be called with marks.mu already held.
+// stampNamesLocked sets (*m)[name] to the maximum of gen and any existing
+// value for each name in names, allocating *m on first use. This enforces the
+// monotonic-max invariant documented in stampMarks: when two writes commit out
+// of order, the larger generation must survive, preventing durable corruption
+// from a stale cleanliness check. Must be called with marks.mu already held.
 func stampNamesLocked(m *map[string]uint64, names []string, gen uint64) {
 	if len(names) == 0 {
 		return
@@ -367,7 +389,9 @@ func stampNamesLocked(m *map[string]uint64, names []string, gen uint64) {
 		*m = make(map[string]uint64, len(names))
 	}
 	for _, name := range names {
-		(*m)[name] = gen
+		if gen > (*m)[name] {
+			(*m)[name] = gen
+		}
 	}
 }
 
