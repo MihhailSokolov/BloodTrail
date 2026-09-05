@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/query"
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine"
@@ -122,6 +123,18 @@ type mockRelationshipQuery struct {
 	deleteCalls  int
 
 	fetchAllShortestPathsCalls int
+
+	countCalls        int
+	fetchIDsCalls     int
+	fetchTriplesCalls int
+	fetchKindsCalls   int
+
+	// queryCalls counts every Query invocation reaching this mock; the most
+	// recent call's finalCriteria is kept in lastQueryFinalCriteria so a test
+	// can assert the inner query received exactly the arguments
+	// recordingRelationshipQuery.Query was given, unchanged.
+	queryCalls             int
+	lastQueryFinalCriteria []graph.Criteria
 }
 
 func (m *mockRelationshipQuery) Filter(criteria graph.Criteria) graph.RelationshipQuery {
@@ -161,15 +174,22 @@ func (m *mockRelationshipQuery) Limit(int) graph.RelationshipQuery {
 }
 
 func (m *mockRelationshipQuery) Count() (int64, error) {
-	panic("mockRelationshipQuery: Count not implemented")
+	m.countCalls++
+	return 0, nil
 }
 
 func (m *mockRelationshipQuery) First() (*graph.Relationship, error) {
 	panic("mockRelationshipQuery: First not implemented")
 }
 
-func (m *mockRelationshipQuery) Query(func(graph.Result) error, ...graph.Criteria) error {
-	panic("mockRelationshipQuery: Query not implemented")
+// Query records the call and hands delegate an empty, error-free
+// graph.Result (graph.NewErrorResult(nil)) -- these tests only care that the
+// inner Query was reached, with which finalCriteria, not about any rows it
+// would report.
+func (m *mockRelationshipQuery) Query(delegate func(graph.Result) error, finalCriteria ...graph.Criteria) error {
+	m.queryCalls++
+	m.lastQueryFinalCriteria = finalCriteria
+	return delegate(graph.NewErrorResult(nil))
 }
 
 func (m *mockRelationshipQuery) Fetch(func(graph.Cursor[*graph.Relationship]) error) error {
@@ -180,12 +200,14 @@ func (m *mockRelationshipQuery) FetchDirection(graph.Direction, func(graph.Curso
 	panic("mockRelationshipQuery: FetchDirection not implemented")
 }
 
-func (m *mockRelationshipQuery) FetchIDs(func(graph.Cursor[graph.ID]) error) error {
-	panic("mockRelationshipQuery: FetchIDs not implemented")
+func (m *mockRelationshipQuery) FetchIDs(delegate func(graph.Cursor[graph.ID]) error) error {
+	m.fetchIDsCalls++
+	return delegate(emptyIDCursor{})
 }
 
-func (m *mockRelationshipQuery) FetchTriples(func(graph.Cursor[graph.RelationshipTripleResult]) error) error {
-	panic("mockRelationshipQuery: FetchTriples not implemented")
+func (m *mockRelationshipQuery) FetchTriples(delegate func(graph.Cursor[graph.RelationshipTripleResult]) error) error {
+	m.fetchTriplesCalls++
+	return delegate(emptyRelationshipTripleCursor{})
 }
 
 func (m *mockRelationshipQuery) FetchAllShortestPaths(delegate func(cursor graph.Cursor[graph.Path]) error) error {
@@ -193,16 +215,51 @@ func (m *mockRelationshipQuery) FetchAllShortestPaths(delegate func(cursor graph
 	return delegate(emptyPathCursor{})
 }
 
-func (m *mockRelationshipQuery) FetchKinds(func(cursor graph.Cursor[graph.RelationshipKindsResult]) error) error {
-	panic("mockRelationshipQuery: FetchKinds not implemented")
+func (m *mockRelationshipQuery) FetchKinds(delegate func(cursor graph.Cursor[graph.RelationshipKindsResult]) error) error {
+	m.fetchKindsCalls++
+	return delegate(emptyRelationshipKindsCursor{})
 }
+
+// emptyRelationshipTripleCursor is a
+// graph.Cursor[graph.RelationshipTripleResult] with nothing to yield, used
+// as the cursor mockRelationshipQuery.FetchTriples hands to its delegate
+// (mirrors emptyPathCursor).
+type emptyRelationshipTripleCursor struct{}
+
+func (emptyRelationshipTripleCursor) Error() error { return nil }
+func (emptyRelationshipTripleCursor) Close()       {}
+func (emptyRelationshipTripleCursor) Chan() chan graph.RelationshipTripleResult {
+	ch := make(chan graph.RelationshipTripleResult)
+	close(ch)
+	return ch
+}
+
+var _ graph.Cursor[graph.RelationshipTripleResult] = emptyRelationshipTripleCursor{}
+
+// emptyRelationshipKindsCursor is a
+// graph.Cursor[graph.RelationshipKindsResult] with nothing to yield, used as
+// the cursor mockRelationshipQuery.FetchKinds hands to its delegate (mirrors
+// emptyPathCursor; distinct from emptyKindsCursor below, which is
+// mockNodeQuery.FetchKinds' graph.Cursor[graph.KindsResult] counterpart --
+// the node and relationship kinds-result types differ).
+type emptyRelationshipKindsCursor struct{}
+
+func (emptyRelationshipKindsCursor) Error() error { return nil }
+func (emptyRelationshipKindsCursor) Close()       {}
+func (emptyRelationshipKindsCursor) Chan() chan graph.RelationshipKindsResult {
+	ch := make(chan graph.RelationshipKindsResult)
+	close(ch)
+	return ch
+}
+
+var _ graph.Cursor[graph.RelationshipKindsResult] = emptyRelationshipKindsCursor{}
 
 var _ graph.RelationshipQuery = (*mockRelationshipQuery)(nil)
 
 // emptyIDCursor is a graph.Cursor[graph.ID] with nothing to yield, used as
-// the cursor mockNodeQuery.FetchIDs hands to its delegate -- these tests only
-// care that the inner FetchIDs was reached, not about the ids it would
-// report (mirrors emptyPathCursor).
+// the cursor mockNodeQuery.FetchIDs and mockRelationshipQuery.FetchIDs each
+// hand their delegate -- these tests only care that the inner FetchIDs was
+// reached, not about the ids it would report (mirrors emptyPathCursor).
 type emptyIDCursor struct{}
 
 func (emptyIDCursor) Error() error { return nil }
@@ -517,6 +574,363 @@ func TestRecordingRelationshipQueryFetchAllShortestPathsDeclinedByEngineFallsThr
 	}
 	if innerRel.fetchAllShortestPathsCalls != 1 {
 		t.Fatalf("expected the inner query's FetchAllShortestPaths to run when the engine declines")
+	}
+}
+
+// testEdgeKind is a stand-in graph.Kind used to build recognize.
+// FromRelCriteria-recognized KindMatcher criteria below -- its identity
+// doesn't matter to any of these tests, only that it is non-empty (see
+// recognize.KindConstraint's doc for why an empty-Kinds KindMatcher is
+// rejected outright rather than modeled).
+var testEdgeKind = graph.StringKind("TestEdge")
+
+func TestRecordingRelationshipQueryOrderByEdgeIDAscendingSetsFlagWithoutTainting(t *testing.T) {
+	// Both spellings recognize.OrderIsEdgeIDAscending accepts (its own doc):
+	// dawgs' traversal.LightweightDriver uses the Identity(Relationship())
+	// form, ops/traversal.go's TraversalPlan uses the bare Relationship()
+	// form.
+	cases := []struct {
+		name  string
+		order graph.Criteria
+	}{
+		{"Identity(Relationship())", query.Order(query.Identity(query.Relationship()), query.Ascending())},
+		{"bare Relationship()", query.Order(query.Relationship(), query.Ascending())},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			innerRel := &mockRelationshipQuery{}
+			tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+
+			rq := tx.Relationships().OrderBy(tc.order)
+
+			rrq, ok := rq.(*recordingRelationshipQuery)
+			if !ok {
+				t.Fatalf("OrderBy returned %T, want *recordingRelationshipQuery", rq)
+			}
+			if !rrq.orderByEdgeID {
+				t.Fatalf("OrderBy(%s) did not set orderByEdgeID", tc.name)
+			}
+			if rrq.tainted {
+				t.Fatalf("OrderBy(%s) tainted the query, want orderByEdgeID set instead", tc.name)
+			}
+			if innerRel.orderByCalls != 1 {
+				t.Fatalf("OrderBy did not delegate to the inner query (calls = %d)", innerRel.orderByCalls)
+			}
+		})
+	}
+}
+
+func TestRecordingRelationshipQueryOrderByUnrecognizedTaintsNotOrderByEdgeID(t *testing.T) {
+	innerRel := &mockRelationshipQuery{}
+	tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+
+	// A plain string never satisfies recognize.OrderIsEdgeIDAscending's type
+	// assertion against *cypher.SortItem, so this must taint rather than set
+	// orderByEdgeID -- mirrors TestRecordingRelationshipQueryOrderByOffsetLimitTaintAndDelegate's
+	// "OrderBy" case, with the added orderByEdgeID assertion that test does
+	// not make.
+	rq := tx.Relationships().OrderBy(graph.Criteria("not-a-sort-item"))
+
+	rrq, ok := rq.(*recordingRelationshipQuery)
+	if !ok {
+		t.Fatalf("OrderBy returned %T, want *recordingRelationshipQuery", rq)
+	}
+	if !rrq.tainted {
+		t.Fatalf("unrecognized OrderBy did not taint the query")
+	}
+	if rrq.orderByEdgeID {
+		t.Fatalf("unrecognized OrderBy incorrectly set orderByEdgeID")
+	}
+	if innerRel.orderByCalls != 1 {
+		t.Fatalf("OrderBy did not delegate to the inner query (calls = %d)", innerRel.orderByCalls)
+	}
+}
+
+// TestRecordingRelationshipQueryOrderByEdgeIDDeclinesShortestPathsServing is
+// the path-serving regression FetchAllShortestPaths' own doc documents:
+// orderByEdgeID must gate FetchAllShortestPaths off even when every other
+// condition (untainted, non-declined transaction, exactly one recognized
+// criteria) holds, since an ordered query is not the canonical shortest-paths
+// shape recognize.FromCriteria models.
+func TestRecordingRelationshipQueryOrderByEdgeIDDeclinesShortestPathsServing(t *testing.T) {
+	innerRel := &mockRelationshipQuery{}
+	tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+
+	pathCriteria := query.And(
+		query.Equals(query.StartID(), graph.ID(1)),
+		query.Equals(query.EndID(), graph.ID(2)),
+	)
+	rq := tx.Relationships().Filter(pathCriteria).OrderBy(
+		query.Order(query.Identity(query.Relationship()), query.Ascending()),
+	)
+
+	if err := rq.FetchAllShortestPaths(func(graph.Cursor[graph.Path]) error { return nil }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if innerRel.fetchAllShortestPathsCalls != 1 {
+		t.Fatalf("expected the inner query's FetchAllShortestPaths to run once orderByEdgeID is set")
+	}
+}
+
+// TestRecordingRelationshipQueryStructuralFetchesFallThroughWithoutASingleRecognizedCriteria
+// mirrors TestRecordingNodeQueryCountFetchIDsFetchKindsFallThroughWithoutASingleRecognizedCriteria
+// (node_query.go's counterpart), generalized over all four of Count/
+// FetchIDs/FetchTriples/FetchKinds via a table of operations.
+func TestRecordingRelationshipQueryStructuralFetchesFallThroughWithoutASingleRecognizedCriteria(t *testing.T) {
+	type op struct {
+		name string
+		call func(graph.RelationshipQuery) error
+		toll func(*mockRelationshipQuery) int
+	}
+	ops := []op{
+		{"Count", func(rq graph.RelationshipQuery) error { _, err := rq.Count(); return err }, func(m *mockRelationshipQuery) int { return m.countCalls }},
+		{"FetchIDs", func(rq graph.RelationshipQuery) error {
+			return rq.FetchIDs(func(graph.Cursor[graph.ID]) error { return nil })
+		}, func(m *mockRelationshipQuery) int { return m.fetchIDsCalls }},
+		{"FetchTriples", func(rq graph.RelationshipQuery) error {
+			return rq.FetchTriples(func(graph.Cursor[graph.RelationshipTripleResult]) error { return nil })
+		}, func(m *mockRelationshipQuery) int { return m.fetchTriplesCalls }},
+		{"FetchKinds", func(rq graph.RelationshipQuery) error {
+			return rq.FetchKinds(func(graph.Cursor[graph.RelationshipKindsResult]) error { return nil })
+		}, func(m *mockRelationshipQuery) int { return m.fetchKindsCalls }},
+	}
+
+	scenarios := []struct {
+		name  string
+		build func(graph.RelationshipQuery) graph.RelationshipQuery
+	}{
+		{"no criteria", func(rq graph.RelationshipQuery) graph.RelationshipQuery { return rq }},
+		{"more than one criteria", func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+			return rq.Filter(graph.Criteria("a")).Filter(graph.Criteria("b"))
+		}},
+		{"unrecognized single criteria", func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+			// A plain string never satisfies recognize.FromRelCriteria's type
+			// assertion against cypher.Expression.
+			return rq.Filter(graph.Criteria("not-an-expression"))
+		}},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			for _, o := range ops {
+				t.Run(o.name, func(t *testing.T) {
+					innerRel := &mockRelationshipQuery{}
+					tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+					rq := scenario.build(tx.Relationships())
+
+					if err := o.call(rq); err != nil {
+						t.Fatalf("%s: unexpected error: %v", o.name, err)
+					}
+					if got := o.toll(innerRel); got != 1 {
+						t.Fatalf("expected the inner query's %s to run (calls = %d)", o.name, got)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestRecordingRelationshipQueryStructuralFetchesDeclinedByEngineFallThrough
+// mirrors TestRecordingNodeQueryFetchIDsFetchKindsDeclinedByEngineFallThrough:
+// a single recognized criteria the engine would decline (disabledEngine
+// always declines) must still fall through cleanly to the inner query, for
+// all four of Count/FetchIDs/FetchTriples/FetchKinds.
+func TestRecordingRelationshipQueryStructuralFetchesDeclinedByEngineFallThrough(t *testing.T) {
+	innerRel := &mockRelationshipQuery{}
+	tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+	rq := tx.Relationships().Filter(query.Kind(query.Relationship(), testEdgeKind))
+
+	if _, err := rq.Count(); err != nil {
+		t.Fatalf("Count: unexpected error: %v", err)
+	}
+	if innerRel.countCalls != 1 {
+		t.Fatalf("expected the inner query's Count to run when the engine declines")
+	}
+
+	if err := rq.FetchIDs(func(graph.Cursor[graph.ID]) error { return nil }); err != nil {
+		t.Fatalf("FetchIDs: unexpected error: %v", err)
+	}
+	if innerRel.fetchIDsCalls != 1 {
+		t.Fatalf("expected the inner query's FetchIDs to run when the engine declines")
+	}
+
+	if err := rq.FetchTriples(func(graph.Cursor[graph.RelationshipTripleResult]) error { return nil }); err != nil {
+		t.Fatalf("FetchTriples: unexpected error: %v", err)
+	}
+	if innerRel.fetchTriplesCalls != 1 {
+		t.Fatalf("expected the inner query's FetchTriples to run when the engine declines")
+	}
+
+	if err := rq.FetchKinds(func(graph.Cursor[graph.RelationshipKindsResult]) error { return nil }); err != nil {
+		t.Fatalf("FetchKinds: unexpected error: %v", err)
+	}
+	if innerRel.fetchKindsCalls != 1 {
+		t.Fatalf("expected the inner query's FetchKinds to run when the engine declines")
+	}
+}
+
+// TestRecordingRelationshipQueryStructuralFetchesDeclinedTransactionFallsThrough
+// mirrors TestRecordingNodeQueryDeclinedTransactionFallsThrough: a declined
+// transaction (WithGraph's contract) must skip the engine even for an
+// otherwise-recognizable, untainted, single-criteria query, for all four of
+// Count/FetchIDs/FetchTriples/FetchKinds.
+func TestRecordingRelationshipQueryStructuralFetchesDeclinedTransactionFallsThrough(t *testing.T) {
+	innerRel := &mockRelationshipQuery{}
+	tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+	retargeted := tx.WithGraph(graph.Graph{Name: "other"}).(*wrappedTransaction)
+
+	rq := retargeted.Relationships().Filter(query.Kind(query.Relationship(), testEdgeKind))
+	if _, err := rq.Count(); err != nil {
+		t.Fatalf("Count: unexpected error: %v", err)
+	}
+	if innerRel.countCalls != 1 {
+		t.Fatalf("expected the inner query's Count to run on a declined transaction")
+	}
+}
+
+// relQueryProjections holds the three canonical query.Returning shapes
+// recognize.FromReturning recognizes (see its own doc), reused across the
+// Query tests below.
+var (
+	relQueryStartEndReturning     = query.Returning(query.StartID(), query.EndID())
+	relQueryStepOutboundReturning = query.Returning(
+		query.EndID(), query.KindsOf(query.End()),
+		query.RelationshipID(), query.KindsOf(query.Relationship()),
+	)
+	relQueryStepInboundReturning = query.Returning(
+		query.StartID(), query.KindsOf(query.Start()),
+		query.RelationshipID(), query.KindsOf(query.Relationship()),
+	)
+)
+
+// TestRecordingRelationshipQueryQueryFallsThroughOnGuardMismatches covers
+// every way Query must decline the engine and fall through to the inner
+// query unchanged, before ever reaching engine.TryRelQueryRows: tainted, a
+// declined transaction, a criteria/finalCriteria count other than one on
+// either side, an unrecognized RETURN shape, an unrecognized rel-criteria
+// shape, and a recognized RowProjection whose direction doesn't match the
+// recognized RelSpec's own anchoring (projectionDirectionConsistent).
+func TestRecordingRelationshipQueryQueryFallsThroughOnGuardMismatches(t *testing.T) {
+	recognizedRelCriteria := query.Kind(query.Relationship(), testEdgeKind)
+	startAnchored := query.Equals(query.StartID(), graph.ID(1))
+	endAnchored := query.Equals(query.EndID(), graph.ID(2))
+
+	cases := []struct {
+		name  string
+		build func(graph.RelationshipQuery) graph.RelationshipQuery
+		final []graph.Criteria
+	}{
+		{
+			name: "tainted",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(recognizedRelCriteria).Offset(1)
+			},
+			final: []graph.Criteria{relQueryStartEndReturning},
+		},
+		{
+			name: "multi-finalCriteria",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(recognizedRelCriteria)
+			},
+			final: []graph.Criteria{relQueryStartEndReturning, relQueryStartEndReturning},
+		},
+		{
+			name: "no finalCriteria",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(recognizedRelCriteria)
+			},
+			final: nil,
+		},
+		{
+			name: "multiple initial criteria",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(recognizedRelCriteria).Filter(startAnchored)
+			},
+			final: []graph.Criteria{relQueryStartEndReturning},
+		},
+		{
+			name: "unrecognized returning",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(recognizedRelCriteria)
+			},
+			final: []graph.Criteria{query.Returning(query.Node())},
+		},
+		{
+			name: "unrecognized rel criteria",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(graph.Criteria("not-an-expression"))
+			},
+			final: []graph.Criteria{relQueryStartEndReturning},
+		},
+		{
+			name: "direction mismatch: step-outbound without StartIDs anchored",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(endAnchored)
+			},
+			final: []graph.Criteria{relQueryStepOutboundReturning},
+		},
+		{
+			name: "direction mismatch: step-inbound without EndIDs anchored",
+			build: func(rq graph.RelationshipQuery) graph.RelationshipQuery {
+				return rq.Filter(startAnchored)
+			},
+			final: []graph.Criteria{relQueryStepInboundReturning},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			innerRel := &mockRelationshipQuery{}
+			tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+			rq := tc.build(tx.Relationships())
+
+			if err := rq.Query(func(graph.Result) error { return nil }, tc.final...); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if innerRel.queryCalls != 1 {
+				t.Fatalf("expected the inner query's Query to run (calls = %d)", innerRel.queryCalls)
+			}
+			if len(innerRel.lastQueryFinalCriteria) != len(tc.final) {
+				t.Fatalf("inner Query received %d finalCriteria, want %d (unchanged pass-through)", len(innerRel.lastQueryFinalCriteria), len(tc.final))
+			}
+		})
+	}
+}
+
+// TestRecordingRelationshipQueryQueryDeclinedTransactionFallsThrough covers
+// the one guard TestRecordingRelationshipQueryQueryFallsThroughOnGuardMismatches
+// does not (it needs a *wrappedTransaction.WithGraph call, not just a
+// differently-built query): a declined transaction must skip the engine even
+// for an otherwise fully recognized, direction-consistent Query call.
+func TestRecordingRelationshipQueryQueryDeclinedTransactionFallsThrough(t *testing.T) {
+	innerRel := &mockRelationshipQuery{}
+	tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+	retargeted := tx.WithGraph(graph.Graph{Name: "other"}).(*wrappedTransaction)
+
+	rq := retargeted.Relationships().Filter(query.Kind(query.Relationship(), testEdgeKind))
+	if err := rq.Query(func(graph.Result) error { return nil }, relQueryStartEndReturning); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if innerRel.queryCalls != 1 {
+		t.Fatalf("expected the inner query's Query to run on a declined transaction")
+	}
+}
+
+// TestRecordingRelationshipQueryQueryDeclinedByEngineFallsThrough covers the
+// last case: a fully recognized, direction-consistent Query call that the
+// engine itself declines (disabledEngine always declines) must still fall
+// through cleanly to the inner query.
+func TestRecordingRelationshipQueryQueryDeclinedByEngineFallsThrough(t *testing.T) {
+	innerRel := &mockRelationshipQuery{}
+	tx := newWrappedTransaction(&mockTransaction{relQuery: innerRel})
+	rq := tx.Relationships().Filter(query.Kind(query.Relationship(), testEdgeKind))
+
+	if err := rq.Query(func(graph.Result) error { return nil }, relQueryStartEndReturning); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if innerRel.queryCalls != 1 {
+		t.Fatalf("expected the inner query's Query to run when the engine declines")
 	}
 }
 

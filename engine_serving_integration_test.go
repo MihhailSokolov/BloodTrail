@@ -18,9 +18,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs"
+	"github.com/specterops/dawgs/container"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/graphcache"
 	"github.com/specterops/dawgs/query"
+	"github.com/specterops/dawgs/traversal"
 	"github.com/specterops/dawgs/util/size"
 
 	bloodtrail "github.com/MihhailSokolov/BloodTrail"
@@ -281,6 +284,121 @@ func nodeIDsByKind(t *testing.T, ctx context.Context, db graph.Database, kind gr
 	})
 	if err != nil {
 		t.Fatalf("Nodes().Filter(Kind(%s)).FetchIDs(): %v", kind, err)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// digraphEdgeSet collects every (start, end) database-id edge pair reachable
+// via digraph's own EachNode/EachAdjacentNode(..., graph.DirectionOutbound)
+// walk into a plain set, so two independently built container.DirectedGraph
+// values (e.g. bt vs. the pg oracle, run over the same underlying
+// PostgreSQL data and therefore the same database ids) can be compared for
+// exact edge-set equality via edgeSetsEqual, ignoring container's own
+// internal dense-index bookkeeping entirely (csr.go's EachNode/
+// EachAdjacentNode both yield external database ids, never the dense CSR
+// indices AddEdge assigns internally).
+func digraphEdgeSet(digraph container.DirectedGraph) map[[2]uint64]struct{} {
+	edges := make(map[[2]uint64]struct{})
+	digraph.EachNode(func(node uint64) bool {
+		digraph.EachAdjacentNode(node, graph.DirectionOutbound, func(adjacent uint64) bool {
+			edges[[2]uint64{node, adjacent}] = struct{}{}
+			return true
+		})
+		return true
+	})
+	return edges
+}
+
+// edgeSetsEqual reports whether a and b contain exactly the same edges.
+func edgeSetsEqual(a, b map[[2]uint64]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for edge := range a {
+		if _, ok := b[edge]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchNodeByID fetches the single *graph.Node carrying id through db --
+// used to build the *graph.Node traversal.Plan.Root wants, which
+// loadDatasets/opengraph.IDMap only ever hands back as a bare graph.ID.
+// tx.Nodes().Filter(...).First() is not one of recordingNodeQuery's own
+// overrides (node_query.go's doc: First is promoted straight through
+// unchanged), so this always reaches PostgreSQL directly regardless of
+// whether the engine has a snapshot -- exactly as a real caller resolving a
+// traversal root would.
+func fetchNodeByID(t *testing.T, ctx context.Context, db graph.Database, id graph.ID) *graph.Node {
+	t.Helper()
+
+	var node *graph.Node
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.Nodes().Filter(query.Equals(query.NodeID(), id)).First()
+		node = n
+		return err
+	})
+	if err != nil {
+		t.Fatalf("fetch node %d: %v", id, err)
+	}
+	return node
+}
+
+// bfsCollectNodeIDs drives traversal.New(db, 1).BreadthFirst from root using
+// traversal.LightweightDriver(direction, graphcache.New(), query.Kind(query.
+// Relationship(), kind), filter) -- the exact upstream pattern
+// recordingRelationshipQuery.Query (relationship_query.go) and its
+// orderByEdgeID plumbing exist to serve: LightweightDriver's own
+// shallowFetchRelationships (traversal/traversal.go) issues, for every
+// segment it descends into, a fresh tx.Relationships().Filter(...).
+// OrderBy(query.Order(query.Identity(query.Relationship()),
+// query.Ascending())).Query(...) call -- OrderBy with exactly the first of
+// recognize.OrderIsEdgeIDAscending's two accepted spellings, then Query with
+// one of the two step RowProjection shapes (recognize.
+// ProjectionStepOutbound for graph.DirectionOutbound, ProjectionStepInbound
+// for graph.DirectionInbound).
+//
+// numParallelWorkers is deliberately 1, not dawgs' own multi-worker-capable
+// default: graph.PathSegment.Descend (graph/path.go) accumulates a path
+// tree's size by walking Trunk pointers up to the root and mutating each
+// ancestor's unexported size field with a plain, unsynchronized += -- with
+// more than one worker, two goroutines can both be descending from segments
+// that share an ancestor (any two children of the same node, which this
+// fixture's very first BFS level already produces) and race on that
+// ancestor's size, a data race in dawgs itself with nothing to do with this
+// package's own driver wrapping. -race would (correctly) flag that race
+// under go test's -race requirement (task-9-brief.md), so this helper avoids
+// it by never running more than one traversal worker; a single worker still
+// drives every one of shallowFetchRelationships' Filter/OrderBy/Query calls
+// through the wrapped driver exactly as multiple workers would, just
+// serially, which is all this task needs to exercise.
+//
+// The traversal.UniquePathSegmentFilter wrapper collects every segment's
+// node into a traversal.NodeCollector and unconditionally allows further
+// descent (bounded, for a real graph, by that same filter's own dedup-by-
+// edge-id cycle guard), so the returned ids are every node reachable from
+// root via a kind-filtered walk in direction, sorted ascending for direct
+// set comparison against a second call (e.g. bt vs. the pg oracle) the same
+// way nodeIDsByKind's callers already compare FetchIDs() output.
+func bfsCollectNodeIDs(t *testing.T, ctx context.Context, db graph.Database, root *graph.Node, direction graph.Direction, kind graph.Kind) []graph.ID {
+	t.Helper()
+
+	collector := traversal.NewNodeCollector()
+	filter := traversal.UniquePathSegmentFilter(func(next *graph.PathSegment) bool {
+		collector.Collect(next)
+		return true
+	})
+	driver := traversal.LightweightDriver(direction, graphcache.New(), query.Kind(query.Relationship(), kind), filter)
+
+	if err := (traversal.New(db, 1)).BreadthFirst(ctx, traversal.Plan{Root: root, Driver: driver}); err != nil {
+		t.Fatalf("BreadthFirst: %v", err)
+	}
+
+	ids := make([]graph.ID, 0, len(collector.Nodes))
+	for id := range collector.Nodes {
+		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
@@ -774,5 +892,175 @@ func TestNodeQueryServesFromLiveDriver(t *testing.T) {
 	}
 	if gotObjectIDCount != 1 {
 		t.Fatalf("property-filtered Count() = %d, want 1", gotObjectIDCount)
+	}
+}
+
+// TestContainerFetchDirectedGraphServesFromLiveDriver is Task 9's evidence
+// for the Count/FetchIDs/FetchTriples/FetchKinds/Query interceptions added
+// to recordingRelationshipQuery (relationship_query.go): dawgs' own
+// container.FetchDirectedGraph -- a real upstream consumer, imported here
+// rather than reimplemented, per this task's own point (see relationship_
+// query.go's Query doc) -- issues exactly
+// tx.Relationships().Filter(criteria).Query(delegate,
+// query.Returning(query.StartID(), query.EndID())), the single-criteria,
+// single-finalCriteria, ProjectionStartEnd shape Query recognizes with no
+// direction requirement at all (projectionDirectionConsistent's doc).
+// Opened through dawgs.Open exactly as TestNodeQueryServesFromLiveDriver is,
+// with a live datapipe_status row driving the poller, the resulting
+// container.DirectedGraph's edge set must agree exactly with the same call
+// against the pg driver oracle, and the builder-serving path must actually
+// have been used (builderServedMarker).
+func TestContainerFetchDirectedGraphServesFromLiveDriver(t *testing.T) {
+	dsn := os.Getenv(testPGEnv)
+	if dsn == "" {
+		t.Skipf("%s not set", testPGEnv)
+	}
+
+	// Must be set before dawgs.Open: SettingsFromEnv and the engine's
+	// captured Config.Log are both read exactly once, at Open() time.
+	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+	pool := openPool(t, ctx, dsn)
+	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
+
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	schema := schemaFromDatasets(t)
+	if err := bt.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	loadDatasets(t, ctx, bt)
+
+	// A plain pg driver on the same pool and data is the oracle.
+	oracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = oracle.Close(ctx) }()
+	if err := oracle.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema on pg: %v", err)
+	}
+
+	createDatapipeStatusTable(t, pool)
+	// Registered after the bt/oracle Close defers above, so LIFO ordering
+	// runs this drop first -- while the pool they share is still open. See
+	// createDatapipeStatusTable's doc.
+	defer dropDatapipeStatusTable(t, pool)
+
+	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
+	insertDatapipeStatus(t, pool, "running", stamp1)
+
+	// traversal_shapes.json's ChainEdge kind: a straight 10-hop chain
+	// c0->c1->...->c10, giving an unambiguous 10-edge answer.
+	kind := graph.StringKind("ChainEdge")
+	criteria := query.KindIn(query.Relationship(), kind)
+
+	gotEdges := waitForBuilderServe(t, buf, 0, 5*time.Second, func() map[[2]uint64]struct{} {
+		digraph, err := container.FetchDirectedGraph(ctx, bt, criteria)
+		if err != nil {
+			t.Fatalf("FetchDirectedGraph (bt): %v", err)
+		}
+		return digraphEdgeSet(digraph)
+	})
+
+	wantDigraph, err := container.FetchDirectedGraph(ctx, oracle, criteria)
+	if err != nil {
+		t.Fatalf("FetchDirectedGraph (oracle): %v", err)
+	}
+	wantEdges := digraphEdgeSet(wantDigraph)
+	if len(wantEdges) == 0 {
+		t.Fatalf("oracle returned no edges; the query or dataset names are wrong")
+	}
+	if !edgeSetsEqual(gotEdges, wantEdges) {
+		t.Fatalf("FetchDirectedGraph edge sets differ\n got: %v\nwant: %v", gotEdges, wantEdges)
+	}
+}
+
+// TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver is Task 9's
+// evidence for orderByEdgeID: dawgs' own
+// traversal.New(db, 1).BreadthFirst(ctx, traversal.Plan{Root: ..., Driver:
+// traversal.LightweightDriver(...)}) (see bfsCollectNodeIDs' doc for why the
+// worker count is 1, not dawgs' own traversal.New(db, 2) as sketched in the
+// task brief) -- again a real upstream consumer, not reimplemented --
+// drives shallowFetchRelationships (traversal/traversal.go), which OrderBys
+// every relationship query by ascending relationship id before calling
+// Query with a step RowProjection. This is
+// the one upstream shape that sets recordingRelationshipQuery.orderByEdgeID
+// and requires Query (not Count/FetchIDs/FetchTriples/FetchKinds, which all
+// decline once it's set) to pass it through to engine.TryRelQueryRows.
+//
+// Opened through dawgs.Open exactly like the container test above, the set
+// of nodes traversal.NodeCollector reaches from traversal_shapes.json's
+// FanoutEdge tree root (f0) must agree exactly with the same walk against
+// the pg driver oracle, and the builder-serving path must actually have been
+// used (builderServedMarker).
+func TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver(t *testing.T) {
+	dsn := os.Getenv(testPGEnv)
+	if dsn == "" {
+		t.Skipf("%s not set", testPGEnv)
+	}
+
+	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+	pool := openPool(t, ctx, dsn)
+	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
+
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	schema := schemaFromDatasets(t)
+	if err := bt.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	ids := loadDatasets(t, ctx, bt)
+
+	oracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = oracle.Close(ctx) }()
+	if err := oracle.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema on pg: %v", err)
+	}
+
+	createDatapipeStatusTable(t, pool)
+	defer dropDatapipeStatusTable(t, pool)
+
+	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
+	insertDatapipeStatus(t, pool, "running", stamp1)
+
+	// traversal_shapes.json's FanoutEdge tree: f0 fans out through f1..f3 and
+	// f1a..f3b to a third level (f1a1..f3b1) -- 15 reachable descendants,
+	// unambiguous and acyclic.
+	kind := graph.StringKind("FanoutEdge")
+	btRoot := fetchNodeByID(t, ctx, bt, ids["f0"])
+
+	gotIDs := waitForBuilderServe(t, buf, 0, 5*time.Second, func() []graph.ID {
+		return bfsCollectNodeIDs(t, ctx, bt, btRoot, graph.DirectionOutbound, kind)
+	})
+
+	oracleRoot := fetchNodeByID(t, ctx, oracle, ids["f0"])
+	wantIDs := bfsCollectNodeIDs(t, ctx, oracle, oracleRoot, graph.DirectionOutbound, kind)
+	if len(wantIDs) == 0 {
+		t.Fatalf("oracle traversal reached no nodes; the query or dataset names are wrong")
+	}
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("BreadthFirst reached %d nodes, want %d\n got: %v\nwant: %v", len(gotIDs), len(wantIDs), gotIDs, wantIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("BreadthFirst node sets differ\n got: %v\nwant: %v", gotIDs, wantIDs)
+		}
 	}
 }
