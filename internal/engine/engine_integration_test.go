@@ -250,7 +250,7 @@ func TestTryAllShortestPathsStale(t *testing.T) {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
-	eng.NoteWrite()
+	eng.NoteWrite(nil)
 
 	pq := recognize.PathQuery{
 		Start: recognize.Endpoint{IDs: []graph.ID{ids["c0"]}},

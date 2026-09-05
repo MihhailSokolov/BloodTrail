@@ -62,6 +62,10 @@ type Engine struct {
 	snap       atomic.Pointer[snapshot.Snapshot]
 	generation atomic.Uint64
 
+	// marks is the kind-scoped complement to generation above: which kind
+	// names NoteWrite has touched, and at which generation. See marks.go.
+	marks marks
+
 	// overBudget records whether the most recent RebuildNow refused to
 	// adopt its freshly loaded snapshot because ApproxBytes() exceeded
 	// cfg.MemoryLimit. The poller (poller.go) reads this after every
@@ -102,14 +106,6 @@ func New(pgDriver *pg.Driver, pool *pgxpool.Pool, cfg Config) *Engine {
 		cfg.Log = slog.Default()
 	}
 	return &Engine{pgDriver: pgDriver, pool: pool, cfg: cfg}
-}
-
-// NoteWrite records that the underlying graph changed, invalidating the
-// current snapshot for TryAllShortestPaths purposes until the next
-// RebuildNow picks up a snapshot stamped with the new generation. Safe for
-// concurrent use; intended to be called from the driver's write path.
-func (e *Engine) NoteWrite() {
-	e.generation.Add(1)
 }
 
 // Generation returns the engine's current write-generation counter, the same

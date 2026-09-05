@@ -56,7 +56,7 @@ func TestPollerDrivesRebuilds(t *testing.T) {
 
 	// A write outside the poller's own rebuild invalidates the snapshot the
 	// poller just adopted.
-	eng.NoteWrite()
+	eng.NoteWrite(nil)
 
 	stamp2 := stamp1.Add(time.Hour)
 	if _, err := pool.Exec(ctx,
@@ -293,7 +293,7 @@ func TestPollerMemoryLimitRefusalDoesNotSpamRetries(t *testing.T) {
 	// already guaranteed recorded -- checking the log count immediately
 	// afterward, with no separate wait, is then race-free.
 	graphtest.LoadDataset(t, pgDriver, adcsFixturePath)
-	eng.NoteWrite()
+	eng.NoteWrite(nil)
 
 	waitForAttempts(t, eng, baseline+1, 2*time.Second)
 	if n := handler.count(refusalWarnMsg); n != 1 {
@@ -328,7 +328,7 @@ func TestPollerMemoryLimitRefusalDoesNotSpamRetries(t *testing.T) {
 	// climbs to baseline+2, but the log count stays at 1 -- the two halves
 	// of the fix (decideRebuild's gate vs. RebuildNow's log rate limit)
 	// each doing exactly their own job.
-	eng.NoteWrite()
+	eng.NoteWrite(nil)
 
 	waitForAttempts(t, eng, baseline+2, 2*time.Second)
 	if n := handler.count(refusalWarnMsg); n != 1 {

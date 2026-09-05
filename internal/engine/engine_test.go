@@ -27,7 +27,7 @@ func TestFreshness(t *testing.T) {
 		t.Fatalf("Fresh() right after storing a snapshot at the current generation = (%v, %v), want (%v, true)", got, fresh, snap)
 	}
 
-	e.NoteWrite()
+	e.NoteWrite(nil)
 
 	if got, fresh := e.Fresh(); fresh || got != snap {
 		t.Fatalf("Fresh() after NoteWrite = (%v, %v), want (%v, false)", got, fresh, snap)

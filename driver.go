@@ -133,7 +133,7 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 	if err := d.Driver.WriteTransaction(ctx, txDelegate, options...); err != nil {
 		return err
 	}
-	d.engine.NoteWrite()
+	d.engine.NoteWrite(nil)
 	return nil
 }
 
@@ -144,7 +144,7 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 	if err := d.Driver.BatchOperation(ctx, batchDelegate, options...); err != nil {
 		return err
 	}
-	d.engine.NoteWrite()
+	d.engine.NoteWrite(nil)
 	return nil
 }
 
@@ -165,7 +165,7 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 	if err := d.Driver.Run(ctx, query, parameters); err != nil {
 		return err
 	}
-	d.engine.NoteWrite()
+	d.engine.NoteWrite(nil)
 	return nil
 }
 
@@ -179,7 +179,7 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
 		return err
 	}
-	d.engine.NoteWrite()
+	d.engine.NoteWrite(nil)
 	return nil
 }
 
@@ -191,7 +191,7 @@ func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds,
 	if err := d.Driver.DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
 		return err
 	}
-	d.engine.NoteWrite()
+	d.engine.NoteWrite(nil)
 	return nil
 }
 
@@ -204,6 +204,6 @@ func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kin
 	if err := d.Driver.DeleteRelationshipsByKinds(ctx, kinds); err != nil {
 		return err
 	}
-	d.engine.NoteWrite()
+	d.engine.NoteWrite(nil)
 	return nil
 }
