@@ -53,6 +53,16 @@ echo "==> Vendoring driver source into $VENDOR_DIR"
 rm -rf "$WORK/$VENDOR_DIR" && mkdir -p "$WORK/$VENDOR_DIR"
 cp "$REPO_ROOT"/*.go "$REPO_ROOT/go.mod" "$REPO_ROOT/go.sum" "$WORK/$VENDOR_DIR/"
 rm -f "$WORK/$VENDOR_DIR"/*_test.go
+# The in-memory path engine lives under internal/engine; everything else
+# under internal/ (the installer, its own CLI, verify fixtures, ...) is
+# operator tooling that has no business inside the served image.
+mkdir -p "$WORK/$VENDOR_DIR/internal"
+cp -R "$REPO_ROOT/internal/engine" "$WORK/$VENDOR_DIR/internal/engine"
+# Test files reference test-only helper packages (internal/graphtest, not
+# vendored) that `go mod tidy` below would otherwise try to resolve, since it
+# also records go.sum entries for the test dependencies of every package the
+# main module imports -- transitively, this vendored tree included.
+find "$WORK/$VENDOR_DIR/internal/engine" -name '*_test.go' -delete
 sed -i.bak "s|^var Version = \"dev\"|var Version = \"$DRIVER_VERSION\"|" "$WORK/$VENDOR_DIR/driver.go" && rm -f "$WORK/$VENDOR_DIR/driver.go.bak"
 grep -q "Version = \"$DRIVER_VERSION\"" "$WORK/$VENDOR_DIR/driver.go"
 

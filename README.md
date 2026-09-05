@@ -5,8 +5,9 @@ packaged as a [DAWGS](https://github.com/SpecterOps/DAWGS) driver, so that attac
 analysis and every other graph query stay fast on large Active Directory environments
 and ordinary hardware.
 
-**Status:** milestone 1 (packaging). The driver delegates every operation to PostgreSQL;
-no acceleration yet.
+**Status:** milestone 2 (path engine). Shortest paths, all shortest paths, and BloodHound's
+own pre-built shortest-path searches are served from an in-memory replica when it is fresh;
+every other read still goes to PostgreSQL.
 
 ## Why
 
@@ -37,6 +38,57 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
   rollback.
+
+## In-memory path engine
+
+BloodHound's most expensive queries are shortest-path questions: the pathfinding tab, and the
+pre-built shortest-path searches its UI ships (to Domain Admins, to Tier Zero, from
+Kerberoastable users, and so on). BloodTrail answers these from the in-memory replica instead
+of PostgreSQL whenever it safely can, and always falls back to PostgreSQL otherwise, so results
+are correct regardless of the replica's state.
+
+- **What is served.** `GET /api/v2/graphs/shortest-path` (BloodHound's `FetchAllShortestPaths`
+  call, built from `start_node`/`end_node` object IDs and an optional relationship-kind filter)
+  and any Cypher sent to `POST /api/v2/graphs/cypher` that matches BloodHound's own
+  `shortestPath(...)` / `allShortestPaths(...)` shape: a single `MATCH` with one shortest-path
+  pattern, an optional `WHERE` built from endpoint kind/property predicates and an `s <> t`
+  exclusion, and a `RETURN` of just the path with an optional `LIMIT`. Every other read --
+  entity panels, node search, tagging, a Cypher query outside that shape -- is unaffected and
+  always goes to PostgreSQL, exactly as in milestone 1.
+
+- **Freshness and fallback.** The engine keeps a compressed in-memory replica (node and edge
+  ids, kinds, and the properties path queries need), rebuilt from PostgreSQL after every
+  completed analysis run and again after a write once the ingest/analysis pipeline goes idle.
+  A query is served from memory only if the engine is enabled, a snapshot exists, that snapshot
+  is still current (no write has landed since it was built), the query's endpoints resolve
+  inside it, and the traversal fits the request's own memory budget. Any of these failing --
+  disabled, no snapshot yet, a write in flight, an unrecognized query shape, or too large a
+  traversal -- makes the engine decline outright and PostgreSQL answers instead; the only
+  difference an operator or user should ever see is latency.
+
+- **Single-writer assumption.** PostgreSQL stays the system of record: every write goes there
+  first, through BloodTrail's own driver. The engine notices a write happened (invalidating its
+  current snapshot) through that same driver call, then rebuilds once the pipeline is next idle
+  or an analysis run completes. This means the engine assumes it is the only path writes take
+  to the graph tables -- the normal shape of a BloodHound CE deployment, a single API server
+  process. A second process writing to the same PostgreSQL graph without going through this
+  driver instance would go unnoticed until the next analysis run.
+
+- **Configuration** (environment variables, read once at driver startup):
+  - `BLOODTRAIL_ENGINE` -- `on` (default) or `off` (also accepts `true`/`false`/`1`/`0`).
+    `off` makes every read delegate straight to PostgreSQL, as in milestone 1.
+  - `BLOODTRAIL_ENGINE_POLL_INTERVAL` -- the poller's rebuild-check cadence, parsed with Go's
+    `time.ParseDuration` (e.g. `5s`, `1m`). Defaults to `5s`.
+  - `BLOODTRAIL_MEMORY_LIMIT` -- caps the replica's approximate resident size (e.g. `4GiB`,
+    `512MiB`, or a plain byte count). A rebuild that would exceed it is refused, and the engine
+    keeps serving from (or falling back from) whatever snapshot it already had. Unset or `0`
+    means unbounded.
+
+- **Log markers**, all under a `bloodtrail:` prefix: `bloodtrail: snapshot rebuilt` (Info, on
+  every successful rebuild), `bloodtrail: snapshot rebuild refused: exceeds memory limit`
+  (Warn, rate-limited), `bloodtrail: path engine served` (Info, once per query actually
+  answered from memory), and `bloodtrail: path engine declined` (Debug, with a `reason` attr,
+  whenever a query fell back to PostgreSQL).
 
 ## Installing on an existing BloodHound CE deployment
 

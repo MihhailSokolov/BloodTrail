@@ -44,6 +44,53 @@ docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T
 (cd "$ROOT" && go run ./cmd/bloodtrail status --compose-file "$WORK/docker-compose.yml") > "$WORK/status.txt"
 grep -q "running:.*$IMAGE" "$WORK/status.txt"
 
+echo "==> Waiting for the path engine's snapshot to build from the ingested fixture"
+# Written to a file rather than piped into grep, for the same reason as the
+# status check above: `docker compose logs` keeps writing after `grep -q`
+# finds its match and closes the pipe, dies of SIGPIPE, and (with pipefail)
+# turns a successful match into a failed pipeline.
+bh_logs() { docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" logs bloodhound > "$WORK/bloodhound-logs.txt" 2>&1; }
+snapshot_rebuilt=false
+for _ in $(seq 1 24); do
+  bh_logs
+  if grep -q "snapshot rebuilt" "$WORK/bloodhound-logs.txt"; then snapshot_rebuilt=true; break; fi
+  sleep 5
+done
+[ "$snapshot_rebuilt" = true ] || { echo "the path engine never logged a rebuilt snapshot within 120s" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+
+echo "==> Querying the path engine directly"
+# The fixture's built-in Administrator (RID 500) is a direct MemberOf member
+# of Domain Admins (RID 512) -- see internal/verify/fixture/groups.json's
+# "S-1-5-...-512" entry and users.json's "S-1-5-...-500" entry.
+DOMAIN_SID="S-1-5-21-3130019616-2776909439-2417379446"
+USER_SID="$DOMAIN_SID-500"
+GROUP_SID="$DOMAIN_SID-512"
+
+LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
+TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+[ -n "$TOKEN" ] || { echo "could not obtain a session token for the engine phase" >&2; exit 1; }
+
+sp_code="$(curl -s -o "$WORK/shortest-path.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/v2/graphs/shortest-path?start_node=$USER_SID&end_node=$GROUP_SID")"
+[ "$sp_code" = "200" ] || { echo "GET /api/v2/graphs/shortest-path returned HTTP $sp_code" >&2; cat "$WORK/shortest-path.json" >&2; exit 1; }
+node_count="$(jq '.data.nodes | length' "$WORK/shortest-path.json")"
+[ "$node_count" -gt 0 ] || { echo "GET /api/v2/graphs/shortest-path returned no nodes" >&2; cat "$WORK/shortest-path.json" >&2; exit 1; }
+
+bh_logs
+served_before="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
+
+cypher="MATCH p=shortestPath((s)-[:MemberOf*1..]->(t:Group)) WHERE s.objectid = '$USER_SID' AND t.objectid ENDS WITH '-512' AND s<>t RETURN p LIMIT 10"
+CYPHER_BODY="$(jq -n --arg q "$cypher" '{query:$q}')"
+cypher_code="$(curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$CYPHER_BODY" http://127.0.0.1:8080/api/v2/graphs/cypher)"
+[ "$cypher_code" = "200" ] || { echo "POST /api/v2/graphs/cypher returned HTTP $cypher_code" >&2; cat "$WORK/cypher.json" >&2; exit 1; }
+
+bh_logs
+served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
+[ "$served_after" -gt "$served_before" ] || { echo "the path engine did not serve the queries (\"path engine served\" count $served_before -> $served_after); PostgreSQL answered instead" >&2; exit 1; }
+
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"
