@@ -289,6 +289,155 @@ func nodeIDsByKind(t *testing.T, ctx context.Context, db graph.Database, kind gr
 	return ids
 }
 
+// relCountByKind runs tx.Relationships().Filter(query.Kind(query.
+// Relationship(), kind)).Count() -- the exact structural shape
+// recordingRelationshipQuery.Count (relationship_query.go) recognizes and may
+// serve from the engine -- through db, returning the result.
+func relCountByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) int64 {
+	t.Helper()
+
+	var count int64
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.Relationships().Filter(query.Kind(query.Relationship(), kind)).Count()
+		count = n
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Relationships().Filter(Kind(%s)).Count(): %v", kind, err)
+	}
+	return count
+}
+
+// relCountByKindOrdered is relCountByKind with an added OrderBy that
+// recognize.OrderIsEdgeIDAscending accepts -- exactly the paging order
+// dawgs' own traversal.LightweightDriver issues before every Query call (see
+// bfsCollectNodeIDs' doc) -- proving Count's own !orderByEdgeID guard
+// component: this must fall through to PostgreSQL rather than serve from the
+// engine, since an order has no meaning for a bare count
+// (relationship_query.go's Count doc).
+//
+// Unlike relCountByKind, this returns the error rather than failing the test
+// on one: ordering an aggregated Count() query this way is rejected by
+// PostgreSQL itself (a plain "ORDER BY column must appear in an aggregate"
+// error, reproducible identically against the pg driver alone, independent
+// of bloodtrail entirely) -- so "falls through to PostgreSQL" here means
+// "fails exactly the way calling this against the raw pg driver already
+// does," not "succeeds with a count." The caller compares bt's and oracle's
+// results (including whether each errored) rather than assuming success.
+func relCountByKindOrdered(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) (int64, error) {
+	t.Helper()
+
+	var count int64
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.Relationships().
+			Filter(query.Kind(query.Relationship(), kind)).
+			OrderBy(query.Order(query.Identity(query.Relationship()), query.Ascending())).
+			Count()
+		count = n
+		return err
+	})
+	return count, err
+}
+
+// relCountByKindLimited is relCountByKind with an added Limit -- one of the
+// calls that taints a recordingRelationshipQuery (relationship_query.go's
+// Limit override) -- proving Count's own !tainted guard component: this must
+// fall through to PostgreSQL rather than serve from the engine.
+func relCountByKindLimited(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind, limit int) int64 {
+	t.Helper()
+
+	var count int64
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.Relationships().
+			Filter(query.Kind(query.Relationship(), kind)).
+			Limit(limit).
+			Count()
+		count = n
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Relationships().Filter(Kind(%s)).Limit(%d).Count(): %v", kind, limit, err)
+	}
+	return count
+}
+
+// relIDsByKind runs tx.Relationships().Filter(query.Kind(query.
+// Relationship(), kind)).FetchIDs() through db, returning the matching
+// relationship ids sorted ascending so two calls' results (e.g. bt vs. the pg
+// oracle) are directly comparable as sequences -- scan order itself is
+// unspecified (TryRelFetchIDs' doc), but each edge id is unique, so sorting
+// both sides the same way canonicalizes any two equal sets to the same
+// sequence.
+func relIDsByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) []graph.ID {
+	t.Helper()
+
+	var ids []graph.ID
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		return tx.Relationships().Filter(query.Kind(query.Relationship(), kind)).FetchIDs(func(cursor graph.Cursor[graph.ID]) error {
+			for id := range cursor.Chan() {
+				ids = append(ids, id)
+			}
+			return cursor.Error()
+		})
+	})
+	if err != nil {
+		t.Fatalf("Relationships().Filter(Kind(%s)).FetchIDs(): %v", kind, err)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// relTriplesByKind is relIDsByKind's FetchTriples counterpart, sorted
+// ascending by each triple's own relationship id for the same reason.
+func relTriplesByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) []graph.RelationshipTripleResult {
+	t.Helper()
+
+	var triples []graph.RelationshipTripleResult
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		return tx.Relationships().Filter(query.Kind(query.Relationship(), kind)).FetchTriples(func(cursor graph.Cursor[graph.RelationshipTripleResult]) error {
+			for triple := range cursor.Chan() {
+				triples = append(triples, triple)
+			}
+			return cursor.Error()
+		})
+	})
+	if err != nil {
+		t.Fatalf("Relationships().Filter(Kind(%s)).FetchTriples(): %v", kind, err)
+	}
+	sort.Slice(triples, func(i, j int) bool { return triples[i].ID < triples[j].ID })
+	return triples
+}
+
+// relKindsByKind is relIDsByKind's FetchKinds counterpart, sorted ascending
+// by each row's own relationship id for the same reason.
+func relKindsByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) []graph.RelationshipKindsResult {
+	t.Helper()
+
+	var rows []graph.RelationshipKindsResult
+	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		return tx.Relationships().Filter(query.Kind(query.Relationship(), kind)).FetchKinds(func(cursor graph.Cursor[graph.RelationshipKindsResult]) error {
+			for row := range cursor.Chan() {
+				rows = append(rows, row)
+			}
+			return cursor.Error()
+		})
+	})
+	if err != nil {
+		t.Fatalf("Relationships().Filter(Kind(%s)).FetchKinds(): %v", kind, err)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows
+}
+
+// builderServedCount returns the number of builderServedMarker lines
+// currently captured in buf -- a plain wrapper around the
+// strings.Count(buf.String(), builderServedMarker) expression repeated around
+// every call in TestRelationshipStructuralFetchesServeFromLiveDriver, so a
+// before/after pair around one call reads as a single marker-delta check.
+func builderServedCount(buf *lockedBuffer) int {
+	return strings.Count(buf.String(), builderServedMarker)
+}
+
 // digraphEdgeSet collects every (start, end) database-id edge pair reachable
 // via digraph's own EachNode/EachAdjacentNode(..., graph.DirectionOutbound)
 // walk into a plain set, so two independently built container.DirectedGraph
@@ -1062,5 +1211,203 @@ func TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver(t *testing.T
 		if gotIDs[i] != wantIDs[i] {
 			t.Fatalf("BreadthFirst node sets differ\n got: %v\nwant: %v", gotIDs, wantIDs)
 		}
+	}
+}
+
+// TestRelationshipStructuralFetchesServeFromLiveDriver is this task's
+// evidence for the !orderByEdgeID and !tainted guard components shared by
+// recordingRelationshipQuery's Count/FetchIDs/FetchTriples/FetchKinds
+// (relationship_query.go): unlike TestContainerFetchDirectedGraphServesFrom
+// LiveDriver and TestTraversalLightweightDriverBreadthFirstServesFromLive
+// Driver above -- which only ever exercise Query, through real upstream
+// consumers that never trip either guard clause -- this test calls the four
+// structural fetch methods directly, both on their own (proving each is
+// actually served, not merely recognized) and combined with an OrderBy or
+// Limit that must disqualify them from being served at all.
+//
+// Opened through dawgs.Open exactly like TestNodeQueryServesFromLiveDriver,
+// with a live datapipe_status row driving the poller:
+//
+//   - Phase 1 proves the served path: a kind-filtered Count/FetchIDs/
+//     FetchTriples/FetchKinds call must each agree with the pg-driver oracle
+//     AND increment builderServedMarker's count by at least one on that
+//     exact call. Checking each call's own delta (not just that the marker
+//     appears somewhere in the whole test's log) is what makes phase 2 below
+//     meaningful: without this, an always-true guard would look identical to
+//     a working one.
+//   - Phase 2 proves the two guard components themselves: the identical
+//     filter, with an OrderBy that recognize.OrderIsEdgeIDAscending accepts
+//     (2a) or a Limit (2b) added before Count(), must still agree with the
+//     oracle (falling through to PostgreSQL and answering correctly) but
+//     must add NO new builderServedMarker line. Stripping either guard's
+//     clause (!orderByEdgeID or !tainted) from Count's condition would
+//     instead serve these two calls from the engine, appearing here as an
+//     unwanted marker increment -- exactly the failure this phase exists to
+//     catch.
+//
+// traversal_shapes.json's ChainEdge kind (a straight 10-hop chain
+// c0->c1->...->c10, the same kind TestContainerFetchDirectedGraphServesFrom
+// LiveDriver uses) gives an unambiguous, easy-to-verify answer.
+func TestRelationshipStructuralFetchesServeFromLiveDriver(t *testing.T) {
+	dsn := os.Getenv(testPGEnv)
+	if dsn == "" {
+		t.Skipf("%s not set", testPGEnv)
+	}
+
+	// Must be set before dawgs.Open: SettingsFromEnv and the engine's
+	// captured Config.Log are both read exactly once, at Open() time.
+	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+	pool := openPool(t, ctx, dsn)
+	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
+
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	schema := schemaFromDatasets(t)
+	if err := bt.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	loadDatasets(t, ctx, bt)
+
+	// A plain pg driver on the same pool and data is the oracle.
+	oracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = oracle.Close(ctx) }()
+	if err := oracle.AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("assert schema on pg: %v", err)
+	}
+
+	createDatapipeStatusTable(t, pool)
+	// Registered after the bt/oracle Close defers above, so LIFO ordering
+	// runs this drop first -- while the pool they share is still open. See
+	// createDatapipeStatusTable's doc.
+	defer dropDatapipeStatusTable(t, pool)
+
+	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
+	insertDatapipeStatus(t, pool, "running", stamp1)
+
+	kind := graph.StringKind("ChainEdge")
+
+	// --- Phase 1a: Count(), waiting for the engine's first build.
+	gotCount := waitForBuilderServe(t, buf, 0, 5*time.Second, func() int64 {
+		return relCountByKind(t, ctx, bt, kind)
+	})
+	wantCount := relCountByKind(t, ctx, oracle, kind)
+	if wantCount == 0 {
+		t.Fatalf("oracle returned zero relationships for kind %s; the fixture or kind name is wrong", kind)
+	}
+	if gotCount != wantCount {
+		t.Fatalf("Count() = %d, want %d (oracle)", gotCount, wantCount)
+	}
+
+	// The snapshot is now warm and clean, with no write landing between here
+	// and the end of the test. Every call below is checked against its own
+	// before/after marker delta, so each of the four methods must reach the
+	// served branch on its own merits rather than merely piggyback on the
+	// build the call above already triggered.
+
+	// --- Phase 1b: Count() again, this time asserting its own marker delta.
+	before := builderServedCount(buf)
+	gotCount = relCountByKind(t, ctx, bt, kind)
+	if delta := builderServedCount(buf) - before; delta < 1 {
+		t.Fatalf("Count(): builder-served marker delta = %d, want >= 1", delta)
+	}
+	if gotCount != wantCount {
+		t.Fatalf("Count() = %d, want %d (oracle)", gotCount, wantCount)
+	}
+
+	// --- Phase 1c: FetchIDs().
+	before = builderServedCount(buf)
+	gotIDs := relIDsByKind(t, ctx, bt, kind)
+	if delta := builderServedCount(buf) - before; delta < 1 {
+		t.Fatalf("FetchIDs(): builder-served marker delta = %d, want >= 1", delta)
+	}
+	wantIDs := relIDsByKind(t, ctx, oracle, kind)
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("FetchIDs() returned %d ids, want %d\n got: %v\nwant: %v", len(gotIDs), len(wantIDs), gotIDs, wantIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("FetchIDs() sets differ\n got: %v\nwant: %v", gotIDs, wantIDs)
+		}
+	}
+
+	// --- Phase 1d: FetchTriples().
+	before = builderServedCount(buf)
+	gotTriples := relTriplesByKind(t, ctx, bt, kind)
+	if delta := builderServedCount(buf) - before; delta < 1 {
+		t.Fatalf("FetchTriples(): builder-served marker delta = %d, want >= 1", delta)
+	}
+	wantTriples := relTriplesByKind(t, ctx, oracle, kind)
+	if len(gotTriples) != len(wantTriples) {
+		t.Fatalf("FetchTriples() returned %d triples, want %d\n got: %v\nwant: %v", len(gotTriples), len(wantTriples), gotTriples, wantTriples)
+	}
+	for i := range wantTriples {
+		if gotTriples[i] != wantTriples[i] {
+			t.Fatalf("FetchTriples() sets differ\n got: %v\nwant: %v", gotTriples, wantTriples)
+		}
+	}
+
+	// --- Phase 1e: FetchKinds().
+	before = builderServedCount(buf)
+	gotKinds := relKindsByKind(t, ctx, bt, kind)
+	if delta := builderServedCount(buf) - before; delta < 1 {
+		t.Fatalf("FetchKinds(): builder-served marker delta = %d, want >= 1", delta)
+	}
+	wantKinds := relKindsByKind(t, ctx, oracle, kind)
+	if len(gotKinds) != len(wantKinds) {
+		t.Fatalf("FetchKinds() returned %d rows, want %d\n got: %v\nwant: %v", len(gotKinds), len(wantKinds), gotKinds, wantKinds)
+	}
+	for i := range wantKinds {
+		if gotKinds[i] != wantKinds[i] {
+			t.Fatalf("FetchKinds() sets differ\n got: %v\nwant: %v", gotKinds, wantKinds)
+		}
+	}
+
+	// --- Phase 2a: the !orderByEdgeID guard. The identical filter, with an
+	// OrderBy recognize.OrderIsEdgeIDAscending accepts, must behave exactly
+	// like the same call against the raw pg driver -- which, empirically,
+	// PostgreSQL itself rejects (an aggregate Count() ordered by a plain
+	// column, "ORDER BY column must appear in an aggregate" -- see
+	// relCountByKindOrdered's doc) -- but must add NO new marker either way:
+	// an order has no meaning for a bare count, so Count declines rather than
+	// silently dropping it (relationship_query.go's Count doc) or serving an
+	// answer PostgreSQL itself would refuse to compute this way.
+	before = builderServedCount(buf)
+	gotOrdered, gotOrderedErr := relCountByKindOrdered(t, ctx, bt, kind)
+	delta := builderServedCount(buf) - before
+	wantOrdered, wantOrderedErr := relCountByKindOrdered(t, ctx, oracle, kind)
+	if (gotOrderedErr == nil) != (wantOrderedErr == nil) {
+		t.Fatalf("Count() with OrderBy(edge id asc): error parity differs\n bt: count=%d err=%v\noracle: count=%d err=%v", gotOrdered, gotOrderedErr, wantOrdered, wantOrderedErr)
+	}
+	if gotOrderedErr == nil && gotOrdered != wantOrdered {
+		t.Fatalf("Count() with OrderBy(edge id asc) = %d, want %d (oracle)", gotOrdered, wantOrdered)
+	}
+	if delta != 0 {
+		t.Fatalf("Count() with OrderBy(edge id asc): builder-served marker delta = %d, want 0 (the !orderByEdgeID guard should have declined and fallen through to PostgreSQL)", delta)
+	}
+
+	// --- Phase 2b: the !tainted guard. The identical filter, with a Limit
+	// (one of the calls that taints a recordingRelationshipQuery -- see
+	// relationship_query.go's tainted doc) added before Count(), must
+	// likewise add NO new marker: a taint changes what Count would need to
+	// mean, so the engine must not be consulted at all.
+	before = builderServedCount(buf)
+	gotLimited := relCountByKindLimited(t, ctx, bt, kind, 1)
+	delta = builderServedCount(buf) - before
+	wantLimited := relCountByKindLimited(t, ctx, oracle, kind, 1)
+	if gotLimited != wantLimited {
+		t.Fatalf("Count() with Limit(1) = %d, want %d (oracle)", gotLimited, wantLimited)
+	}
+	if delta != 0 {
+		t.Fatalf("Count() with Limit(1): builder-served marker delta = %d, want 0 (the !tainted guard should have declined and fallen through to PostgreSQL)", delta)
 	}
 }
