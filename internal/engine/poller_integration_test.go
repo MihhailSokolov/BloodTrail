@@ -226,13 +226,31 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 	// --- Drive the cap: two analyzing-triggered rebuilds, then a third
 	// write that must be refused by the cap. ---
 
-	// First write invalidates the snapshot, then the datapipe flips to
-	// analyzing: rule (d) must fire (1st rebuild of the episode).
-	eng.NoteWrite(nil)
+	// The datapipe flips to analyzing FIRST, and only then does the write
+	// invalidate the snapshot -- deliberately not the other way around. The
+	// poll loop runs concurrently with this setup, so a tick can land
+	// between any two statements here; flipping first means such a tick
+	// only ever observes "analyzing" + still-fresh, a combination no
+	// decideRebuild rule fires on (rule (d) needs !fresh too). Writing
+	// first, as an earlier version of this test did, opens a window where
+	// that in-between tick instead sees the write's staleness against the
+	// still-"idle" status and fires rule (c) (idle_stale) for what this
+	// step means to be the episode's 1st rebuild -- consuming rebuildAttempts
+	// under the wrong label and failing the triggerAnalyzing check below
+	// intermittently (reproduced by artificially widening this exact window
+	// during diagnosis).
 	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`); err != nil {
 		t.Fatalf("flip to analyzing: %v", err)
 	}
-	waitForAttempts(t, eng, 2, 2*time.Second)
+	eng.NoteWrite(nil)
+
+	// rule (d) must fire (1st rebuild of the episode). Waiting on the
+	// triggerAnalyzing tally itself -- the same observable the check right
+	// after it inspects -- rather than the coarser rebuildAttempts (which
+	// advances for ANY RebuildNow call, whichever rule drove it) means this
+	// wait can only be satisfied by rule (d) actually firing, not by some
+	// other rule's rebuild reaching the same count.
+	waitForTriggerCount(t, handler, triggerAnalyzing, 1, 2*time.Second)
 	if _, fresh := eng.Fresh(); !fresh {
 		t.Fatalf("Fresh() reports stale after the first analyzing rebuild")
 	}
@@ -240,10 +258,11 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 		t.Fatalf("triggerAnalyzing count = %d, want 1 after the first analyzing rebuild", n)
 	}
 
-	// A second write, still analyzing: rule (d) fires again (2nd rebuild,
+	// A second write, still analyzing (no status change to race against
+	// here, so no reordering concern): rule (d) fires again (2nd rebuild,
 	// cap now at 2/2 for this episode).
 	eng.NoteWrite(nil)
-	waitForAttempts(t, eng, 3, 2*time.Second)
+	waitForTriggerCount(t, handler, triggerAnalyzing, 2, 2*time.Second)
 	if _, fresh := eng.Fresh(); !fresh {
 		t.Fatalf("Fresh() reports stale after the second analyzing rebuild")
 	}
@@ -281,7 +300,7 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'idle', updated_at = now() WHERE singleton`); err != nil {
 		t.Fatalf("flip to idle: %v", err)
 	}
-	waitForAttempts(t, eng, 4, 2*time.Second)
+	waitForTriggerCount(t, handler, triggerIdleStale, 1, 2*time.Second)
 	if _, fresh := eng.Fresh(); !fresh {
 		t.Fatalf("Fresh() reports stale after rule (c)'s idle rebuild")
 	}
@@ -289,18 +308,27 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 		t.Fatalf("triggerIdleStale count = %d, want 1 (rule (c) firing once while idle)", n)
 	}
 
-	// A fresh write plus flipping back to analyzing, with the snapshot
-	// stale: if resetAnalyzingRebuilds had not cleared st.analyzingRebuilds
-	// while status read "idle" above, the counter would still read 2 (last
-	// episode's cap) and rule (d) would refuse to fire here, leaving the
-	// snapshot stale and this wait timing out. Observing a rebuild (and a
-	// fresh snapshot, and a third triggerAnalyzing record) proves the reset
-	// actually ran and this analyzing episode gets its own fresh budget.
-	eng.NoteWrite(nil)
+	// Flipping back to analyzing FIRST, then writing -- the same ordering
+	// as the episode's opening step above, and for the same reason: a tick
+	// landing between the two statements below sees "analyzing" +
+	// still-fresh (the idle_stale rebuild just above left the snapshot
+	// fresh again), which no rule fires on, whereas writing first would
+	// risk an in-between tick seeing the write against the still-"idle"
+	// status and firing rule (c) instead of (d) for what this step means to
+	// observe.
 	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`); err != nil {
 		t.Fatalf("flip back to analyzing: %v", err)
 	}
-	waitForAttempts(t, eng, 5, 2*time.Second)
+	eng.NoteWrite(nil)
+
+	// If resetAnalyzingRebuilds had not cleared st.analyzingRebuilds while
+	// status read "idle" above, the counter would still read 2 (last
+	// episode's cap) and rule (d) would refuse to fire here, leaving the
+	// snapshot stale and this wait timing out. Waiting on the
+	// triggerAnalyzing tally directly (rather than rebuildAttempts) and
+	// observing it reach a third record proves the reset actually ran and
+	// this analyzing episode gets its own fresh budget.
+	waitForTriggerCount(t, handler, triggerAnalyzing, 3, 2*time.Second)
 	if _, fresh := eng.Fresh(); !fresh {
 		t.Fatalf("Fresh() reports stale after the reset episode's rebuild; resetAnalyzingRebuilds may not have cleared the counter")
 	}
@@ -449,6 +477,31 @@ func waitForAttempts(t *testing.T, eng *Engine, want uint64, timeout time.Durati
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out after %s waiting for rebuildAttempts to reach %d; got %d", timeout, want, eng.rebuildAttempts.Load())
+}
+
+// waitForTriggerCount polls handler.triggerCount(trigger) until it reaches at
+// least want, or fails the test on timeout. Used instead of waitForAttempts
+// at every call site that means to observe a *specific* decideRebuild rule
+// firing: rebuildAttempts advances for any RebuildNow call regardless of
+// which rule (or none -- triggerManual) drove it, so waiting on it alone can
+// be satisfied by an unrelated rebuild reaching the target count at the
+// right moment, silently attributing that count to the wrong rule. This
+// keys the wait off the exact same observable the follow-up equality check
+// inspects, so the test can never observe a half-completed state where the
+// count target was met by something other than the rebuild being tested
+// for. See TestPollerAnalyzingCapAndReset's ordering comments for the
+// concrete race this was introduced to close.
+func waitForTriggerCount(t *testing.T, handler *countingHandler, trigger string, want int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if handler.triggerCount(trigger) >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for trigger %q count to reach %d; got %d", timeout, trigger, want, handler.triggerCount(trigger))
 }
 
 // TestPollerMemoryLimitRefusalDoesNotSpamRetries is the regression test for
