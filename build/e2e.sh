@@ -70,15 +70,15 @@ LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", u
 TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the engine phase" >&2; exit 1; }
 
+bh_logs
+served_before="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
+
 sp_code="$(curl -s -o "$WORK/shortest-path.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/v2/graphs/shortest-path?start_node=$USER_SID&end_node=$GROUP_SID")"
 [ "$sp_code" = "200" ] || { echo "GET /api/v2/graphs/shortest-path returned HTTP $sp_code" >&2; cat "$WORK/shortest-path.json" >&2; exit 1; }
 node_count="$(jq '.data.nodes | length' "$WORK/shortest-path.json")"
 [ "$node_count" -gt 0 ] || { echo "GET /api/v2/graphs/shortest-path returned no nodes" >&2; cat "$WORK/shortest-path.json" >&2; exit 1; }
-
-bh_logs
-served_before="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
 
 cypher="MATCH p=shortestPath((s)-[:MemberOf*1..]->(t:Group)) WHERE s.objectid = '$USER_SID' AND t.objectid ENDS WITH '-512' AND s<>t RETURN p LIMIT 10"
 CYPHER_BODY="$(jq -n --arg q "$cypher" '{query:$q}')"
@@ -89,7 +89,8 @@ cypher_code="$(curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
 
 bh_logs
 served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
-[ "$served_after" -gt "$served_before" ] || { echo "the path engine did not serve the queries (\"path engine served\" count $served_before -> $served_after); PostgreSQL answered instead" >&2; exit 1; }
+served_delta=$((served_after - served_before))
+[ "$served_delta" -ge 2 ] || { echo "engine did not serve both GET /api/v2/graphs/shortest-path and POST /api/v2/graphs/cypher (\"path engine served\" count $served_before -> $served_after, delta $served_delta); PostgreSQL answered instead" >&2; exit 1; }
 
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
