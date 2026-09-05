@@ -149,8 +149,10 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.Snapshot, 
 //  5. The matching dense-NodeID bitset itself: each KindConstraint's
 //     any-of union or all-of intersection of NodesOfKind bitmaps
 //     (matchConstraint), every constraint's result intersected with the
-//     next (intersectBitmaps), and -- if spec.IDs is non-empty -- intersected
-//     again with the Dense-mapped id set (denseIDBitmap): an id absent from
+//     next (intersectBitmaps), and -- if spec.IDs is non-nil -- intersected
+//     again with the Dense-mapped id set (denseIDBitmap): a non-nil
+//     zero-length IDs slice is a well-formed "matches nothing" spec (e.g.
+//     id(n)=1 AND id(n)=2); nil IDs means unconstrained. An id absent from
 //     the snapshot drops silently, the same "narrow towards zero matches"
 //     contract resolveIDEndpoint already documents for the path-query side.
 //
@@ -189,7 +191,7 @@ func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.
 		matches = intersectBitmaps(snap.NodeCount(), constraintBitmaps)
 	}
 
-	if len(spec.IDs) > 0 {
+	if spec.IDs != nil {
 		matches = intersectBitmaps(snap.NodeCount(), []*snapshot.Bitset{matches, denseIDBitmap(snap, spec.IDs)})
 	}
 

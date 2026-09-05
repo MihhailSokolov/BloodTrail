@@ -511,3 +511,72 @@ func TestTryNodeFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestTryNodeQueriesEmptyIDsMatchesNothing covers the nil-vs-empty-IDs contract:
+// a non-nil, zero-length IDs slice is a well-formed "matches nothing" spec (e.g.
+// id(n)=1 AND id(n)=2). TryNodeCount must return (0, true), and TryNodeFetchIDs
+// must yield no rows. This regression test ensures resolveNodeSpec branches on
+// spec.IDs != nil instead of len(spec.IDs) > 0.
+func TestTryNodeQueriesEmptyIDsMatchesNothing(t *testing.T) {
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	// User kind matches 1, 2, 5, but empty IDs slice means intersection is empty
+	spec := recognize.NodeSpec{
+		Constraints: []recognize.KindConstraint{kindConstraint(false, "User")},
+		IDs:         []graph.ID{},
+	}
+	ctx := context.Background()
+
+	count, ok := e.TryNodeCount(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeCount: ok = false, want true")
+	}
+	if count != 0 {
+		t.Fatalf("TryNodeCount: count = %d, want 0 (empty IDs means matches nothing)", count)
+	}
+
+	idCursor, ok := e.TryNodeFetchIDs(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeFetchIDs: ok = false, want true")
+	}
+	ids := drainIDs(t, idCursor)
+	if len(ids) != 0 {
+		t.Fatalf("TryNodeFetchIDs: got %v, want empty (empty IDs means matches nothing)", ids)
+	}
+
+	kindsCursor, ok := e.TryNodeFetchKinds(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeFetchKinds: ok = false, want true")
+	}
+	rows := drainKinds(t, kindsCursor)
+	if len(rows) != 0 {
+		t.Fatalf("TryNodeFetchKinds: got %v, want empty (empty IDs means matches nothing)", rows)
+	}
+}
+
+// TestTryNodeQueriesNilIDsUnconstrained covers the nil-vs-empty-IDs contract:
+// a nil IDs means id() was never constrained, so all kind-matched nodes should
+// be returned. This test ensures that after fixing the empty-IDs bug, nil IDs
+// still work correctly.
+func TestTryNodeQueriesNilIDsUnconstrained(t *testing.T) {
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	// User kind matches 1, 2, 5; nil IDs means all of them pass through
+	spec := recognize.NodeSpec{
+		Constraints: []recognize.KindConstraint{kindConstraint(false, "User")},
+		IDs:         nil,
+	}
+	ctx := context.Background()
+
+	count, ok := e.TryNodeCount(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeCount: ok = false, want true")
+	}
+	if count != 3 {
+		t.Fatalf("TryNodeCount: count = %d, want 3 (nil IDs means unconstrained)", count)
+	}
+
+	idCursor, ok := e.TryNodeFetchIDs(ctx, spec)
+	if !ok {
+		t.Fatalf("TryNodeFetchIDs: ok = false, want true")
+	}
+	assertIDs(t, drainIDs(t, idCursor), []graph.ID{1, 2, 5})
+}
