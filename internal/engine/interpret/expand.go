@@ -91,6 +91,7 @@ package interpret
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/specterops/dawgs/graph"
 
@@ -303,19 +304,39 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		maxDepth = step.Range.Max
 	}
 
-	dense, err := traverse.AllShortestPaths(env.Snap, traverse.Query{
+	q := traverse.Query{
 		Roots:       traverse.Endpoint{IDs: roots},
 		Terminals:   traverse.Endpoint{IDs: terminals},
 		Kinds:       kindMaskFor(env, step.EdgeKinds),
 		Mode:        mode,
 		ExcludeSelf: step.HasExplicitEndpointInequality,
 		MaxDepth:    maxDepth,
-	})
+	}
+
+	rowCap, memLimit, unbounded := shortestPathBudget(meter, maxDepth)
+	if !unbounded {
+		if rowCap <= 0 {
+			return nil, ErrBudget
+		}
+		q.Limit = rowCap + 1
+		q.MemoryLimit = memLimit
+	}
+
+	dense, err := traverse.AllShortestPaths(env.Snap, q)
 	if err != nil {
 		if errors.Is(err, traverse.ErrTooLarge) || errors.Is(err, traverse.ErrMemoryLimit) {
 			return nil, ErrBudget
 		}
 		return nil, err
+	}
+	if !unbounded && len(dense) > rowCap {
+		// traverse.Query.Limit only stops it from producing more than
+		// rowCap+1 dense paths; the executor's own remaining budget can
+		// admit at most rowCap of them, so more than that must decline
+		// outright (ErrBudget) rather than silently serve the first rowCap
+		// and drop the rest -- see shortestPathBudget's own doc comment on
+		// the all-or-nothing materialization invariant this preserves.
+		return nil, ErrBudget
 	}
 
 	out := make([]*Row, 0, len(dense))
@@ -324,7 +345,11 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		nr.SetNode(step.FromSym, p.Nodes[0])
 		nr.SetNode(step.ToSym, p.Nodes[len(p.Nodes)-1])
 		if step.PathSym != "" {
-			nr.SetPathVar(step.PathSym, convertPath(env, p))
+			pv, err := convertPath(env, p)
+			if err != nil {
+				return nil, err
+			}
+			nr.SetPathVar(step.PathSym, pv)
 		}
 		if err := meter.spend(1); err != nil {
 			return nil, err
@@ -332,6 +357,76 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		out = append(out, nr)
 	}
 	return out, nil
+}
+
+// shortestPathBudget resolves meter's own remaining Budgets into the
+// traverse.Query fields that bound how many dense Paths -- and how many
+// bytes' worth of them -- traverse.AllShortestPaths is allowed to
+// materialize before expandShortestPathComponent's own per-row meter.spend/
+// ErrBudget check (above) ever gets a chance to inspect a single one of
+// them. Without this, a ModeAll run over a high-fan-out region of the graph
+// (many co-equal shortest paths per pair, or many pairs each with a few) can
+// build a []Path far larger than any budget would ever admit entirely
+// inside traverse's own strategy dispatch: PairBudget/SideBudget only cap
+// how many *pairs*/BFS runs a strategy will attempt, not the total path
+// count summed across all of them.
+//
+// rowCap is the exact number of additional rows the executor's own
+// remaining budget could still admit: MaxRows' remaining row count and
+// MaxWork's remaining work-unit count are both directly row-count-shaped
+// here (this function's own per-row loop spends exactly one of each per
+// converted path), so the tighter of the two wins. Query.Limit is then set
+// to rowCap+1, one more than the executor could actually use -- enough for
+// traverse to stop enumerating (and accumulating memory) the moment it is
+// clear the true result cannot fit the budget, while still letting the
+// caller distinguish "the whole result fits" (len(dense) <= rowCap) from
+// "it doesn't" (len(dense) == rowCap+1) without ever silently truncating a
+// fitting result down to the budget or admitting a non-fitting one --
+// Query's own documented all-or-nothing materialization invariant applies
+// here exactly as it does to every other evaluator error in this package.
+//
+// unbounded is true (rowCap and memLimit meaningless) when neither Budgets
+// dimension is set at all, matching traverse.Query.Limit/MemoryLimit's own
+// "0 => unbounded" contract -- expandShortestPathComponent leaves both
+// fields at their zero value in that case, preserving today's behavior for
+// every caller that runs with no budget.
+//
+// memLimit derives from the same rowCap via the exact per-path byte formula
+// traverse's own memBudget already applies internally (bfs.go's
+// enumerate/pairEnumerate: 12 bytes per node plus 48 bytes overhead),
+// scaled by the worst-case path length this query could ever produce (the
+// resolved max-hop depth plus one node) -- a second, independent guard
+// against a small number of very deep paths exhausting memory even in a
+// query whose path *count* alone would fit under Limit.
+func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit uint64, unbounded bool) {
+	unbounded = true
+	if meter.budget.MaxRows > 0 {
+		remaining := meter.budget.MaxRows - meter.finalRows
+		if remaining < 0 {
+			remaining = 0
+		}
+		rowCap, unbounded = remaining, false
+	}
+	if meter.budget.MaxWork > 0 {
+		remaining := meter.budget.MaxWork - meter.work
+		if remaining < 0 {
+			remaining = 0
+		}
+		if unbounded || remaining < int64(rowCap) {
+			rowCap, unbounded = int(remaining), false
+		}
+	}
+	if unbounded {
+		return 0, 0, true
+	}
+
+	depth := maxDepth
+	if depth <= 0 {
+		depth = traverse.MaxDepth
+	}
+	bytesPerPath := uint64(depth+1)*12 + 48
+
+	return rowCap, uint64(rowCap+1) * bytesPerPath, false
 }
 
 // resolveEndpointSet materializes every dense node id satisfying nc, in
@@ -413,6 +508,18 @@ func kindMaskFor(env *Env, kinds []snapshot.KindID) *snapshot.KindMask {
 	return mask
 }
 
+// errConvertPathEdgeNotFound is returned by convertPath when a traverse.Path
+// hop has no matching (target, kind) slot anywhere in the source node's own
+// forward-CSR segment. Per convertPath's own doc comment this should be
+// unreachable for any Path traverse.AllShortestPaths actually returns against
+// a real snapshot -- it exists only so convertPath can fail loudly (aborting
+// the whole query, which the caller is expected to delegate to PostgreSQL --
+// see expandShortestPathComponent's own error-handling doc) rather than
+// silently synthesize a wrong EdgeRef, if that invariant is ever violated
+// (e.g. by a hand-built test snapshot, or a future traverse.Path source this
+// package doesn't control).
+var errConvertPathEdgeNotFound = errors.New("interpret: convertPath: no forward-CSR edge found for path hop")
+
 // convertPath converts one traverse.Path (a node sequence plus one edge kind
 // per hop) into a *PathVal (a node sequence plus one EdgeRef per hop),
 // resolving each hop's forward-CSR slot by scanning the source node's own
@@ -426,21 +533,43 @@ func kindMaskFor(env *Env, kinds []snapshot.KindID) *snapshot.KindMask {
 // performs no such uniqueness check), and traverse.Path itself carries no
 // edge id to disambiguate between them in that degenerate case; converting
 // via the first match is the best available deterministic choice there.
-func convertPath(env *Env, p traverse.Path) *PathVal {
+//
+// A hop with NO matching slot at all should likewise never happen against a
+// real snapshot: every traverse.Path this package ever converts was produced
+// by traverse.AllShortestPaths walking that exact snapshot's own forward CSR
+// one hop at a time (see bfs.go's enumerate/pairEnumerate, which only ever
+// push a candidate hop after reading it straight off s.Out(u)), so the same
+// (source, target, kind) triple convertPath re-scans for here is, by
+// construction, a triple traverse itself just walked across in that CSR.
+// Only a Path fabricated by hand (as this file's own unit test does, to
+// exercise this branch at all) or a future caller handing convertPath a Path
+// computed against a different snapshot than env.Snap could ever reach this
+// case for real. Rather than fall back to a fabricated EdgeRef{Fwd: 0} (which
+// would silently alias whatever real, unrelated edge happens to occupy
+// forward-CSR slot 0), convertPath reports the mismatch as an error, which
+// aborts the whole query -- exactly the same "decline and delegate" posture
+// this package uses for every other evaluator error, and strictly safer than
+// serving a corrupted PathVal.
+func convertPath(env *Env, p traverse.Path) (*PathVal, error) {
 	edges := make([]EdgeRef, len(p.Kinds))
 	for i, k := range p.Kinds {
 		u, w := p.Nodes[i], p.Nodes[i+1]
 		targets, kinds := env.Snap.Out(u)
 		lo := env.Snap.OutOffsets[u]
+		found := false
 		for j, t := range targets {
 			if t == w && kinds[j] == k {
 				edges[i] = EdgeRef{Fwd: lo + uint64(j)}
+				found = true
 				break
 			}
+		}
+		if !found {
+			return nil, fmt.Errorf("interpret: convertPath: hop %d (node %d -> node %d, kind %d): %w", i, u, w, k, errConvertPathEdgeNotFound)
 		}
 	}
 	return &PathVal{
 		Nodes: append([]snapshot.NodeID(nil), p.Nodes...),
 		Edges: edges,
-	}
+	}, nil
 }

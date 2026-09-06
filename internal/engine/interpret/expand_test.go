@@ -466,54 +466,38 @@ func shortestPathParityFixture(t *testing.T) (*snapshot.Snapshot, *snapshot.Kind
 // unbounded `*1..`, an explicit `s<>t`, mirroring
 // testdata/prebuilt_shortest_path.json's shape minus its LIMIT, which Task 9
 // -- not this one -- implements) and asserts the resulting paths equal a
-// traverse.AllShortestPaths call built independently from the query's own
-// semantics (same roots/terminals/kind mask/mode/ExcludeSelf), not merely
-// re-using expand.go's own code path.
+// hardcoded expected signature set, computed by hand from the fixture's own
+// known graph shape rather than derived at test time via convertPath (the
+// very function these rows are produced through) or a second
+// traverse.AllShortestPaths call: either would make the assertion
+// structurally blind to a regression in the thing it's supposed to be
+// checking, since a bug shared by both the "got" and "want" side of a
+// comparison never shows up as a mismatch. See TestExpandVarLengthDiamondBothTrails
+// and its siblings for the same hardcoded-signature style this mirrors.
+//
+// shortestPathParityFixture is a symmetric diamond: s-a-t (edges 300, 301)
+// and s-b-t (edges 302, 303) are both length-2 shortest paths. ModeOne's
+// single winner (s-b-t) follows directly from traverse's own documented
+// pairEnumerate mechanics (bfs.go): s's out-adjacency yields a (edge 300)
+// before b (edge 302), pairEnumerate pushes candidate hops onto an explicit
+// LIFO stack in that same order, so the last-pushed branch (via b) is popped
+// and walked to completion -- and therefore found -- first.
 func TestExpandShortestPathMatchesTraverseDirectly(t *testing.T) {
-	snap, mask := shortestPathParityFixture(t)
-	env := &Env{Snap: snap}
+	snap, _ := shortestPathParityFixture(t)
 
 	t.Run("shortestPath (ModeOne)", func(t *testing.T) {
-		dense, err := traverse.AllShortestPaths(snap, traverse.Query{
-			Roots:       traverse.Endpoint{IDs: []snapshot.NodeID{0}},
-			Terminals:   traverse.Endpoint{IDs: []snapshot.NodeID{3}},
-			Kinds:       mask,
-			Mode:        traverse.ModeOne,
-			ExcludeSelf: true,
-		})
-		if err != nil {
-			t.Fatalf("traverse.AllShortestPaths: %v", err)
-		}
-		want := make([]string, len(dense))
-		for i, p := range dense {
-			want[i] = pathSig(snap, convertPath(env, p))
-		}
-
 		assertPathSigs(t, snap,
-			`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, 0, want)
+			`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, 0,
+			[]string{"N:1,3,4,|E:302,303,"})
 	})
 
 	t.Run("allShortestPaths (ModeAll)", func(t *testing.T) {
-		dense, err := traverse.AllShortestPaths(snap, traverse.Query{
-			Roots:       traverse.Endpoint{IDs: []snapshot.NodeID{0}},
-			Terminals:   traverse.Endpoint{IDs: []snapshot.NodeID{3}},
-			Kinds:       mask,
-			Mode:        traverse.ModeAll,
-			ExcludeSelf: true,
-		})
-		if err != nil {
-			t.Fatalf("traverse.AllShortestPaths: %v", err)
-		}
-		want := make([]string, len(dense))
-		for i, p := range dense {
-			want[i] = pathSig(snap, convertPath(env, p))
-		}
-		if len(want) != 2 {
-			t.Fatalf("fixture sanity check: traverse found %d shortest paths, want 2 (s-a-t and s-b-t)", len(want))
-		}
-
 		assertPathSigs(t, snap,
-			`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, 0, want)
+			`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, 0,
+			[]string{
+				"N:1,2,4,|E:300,301,",
+				"N:1,3,4,|E:302,303,",
+			})
 	})
 }
 
@@ -541,30 +525,15 @@ func TestExpandShortestPathEndpointPredicateNarrowsSet(t *testing.T) {
 			{id: 401, start: 2, end: 3, kind: kindE},
 		},
 	)
-	env := &Env{Snap: snap}
-	mask := snapshot.NewKindMask(snap.MaxKindID)
-	mask.Set(kindE)
 
-	dense, err := traverse.AllShortestPaths(snap, traverse.Query{
-		Roots:       traverse.Endpoint{IDs: []snapshot.NodeID{0}}, // only node 1 (the active root)
-		Terminals:   traverse.Endpoint{IDs: []snapshot.NodeID{2}},
-		Kinds:       mask,
-		Mode:        traverse.ModeOne,
-		ExcludeSelf: true,
-	})
-	if err != nil {
-		t.Fatalf("traverse.AllShortestPaths: %v", err)
-	}
-	want := make([]string, len(dense))
-	for i, p := range dense {
-		want[i] = pathSig(snap, convertPath(env, p))
-	}
-	if len(want) != 1 {
-		t.Fatalf("fixture sanity check: traverse found %d shortest paths, want 1", len(want))
-	}
-
+	// Only node 1 (the active root) may seed the search, so the only
+	// possible path is s(1)-t(3) via edge 400; node 2's edge 401 must never
+	// appear. Hardcoded rather than derived via convertPath or a second
+	// traverse.AllShortestPaths call -- see TestExpandShortestPathMatchesTraverseDirectly's
+	// doc comment for why.
 	assertPathSigs(t, snap,
-		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s.active = true AND s<>t RETURN p`, 0, want)
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s.active = true AND s<>t RETURN p`, 0,
+		[]string{"N:1,3,|E:400,"})
 }
 
 // TestExpandShortestPathSelfEndpointWithoutInequality: root and terminal
@@ -609,28 +578,206 @@ func TestExpandShortestPathSelfEndpointWithInequalityDropsSelfPairs(t *testing.T
 		},
 		[]execEdgeSpec{{id: 1, start: 1, end: 2, kind: kindE}},
 	)
-	env := &Env{Snap: snap}
-	mask := snapshot.NewKindMask(snap.MaxKindID)
-	mask.Set(kindE)
 
-	dense, err := traverse.AllShortestPaths(snap, traverse.Query{
-		Roots:       traverse.Endpoint{IDs: []snapshot.NodeID{0}},
-		Terminals:   traverse.Endpoint{IDs: []snapshot.NodeID{0, 1}},
-		Kinds:       mask,
-		Mode:        traverse.ModeOne,
-		ExcludeSelf: true,
-	})
-	if err != nil {
-		t.Fatalf("traverse.AllShortestPaths: %v", err)
-	}
-	want := make([]string, len(dense))
-	for i, p := range dense {
-		want[i] = pathSig(snap, convertPath(env, p))
-	}
-	if len(want) != 1 {
-		t.Fatalf("fixture sanity check: traverse found %d shortest paths, want 1", len(want))
-	}
-
+	// Roots = {1}, Terminals = {1, 2}; s<>t drops the (1,1) self-pair, so
+	// the only surviving path is 1-2 via edge 1. Hardcoded rather than
+	// derived via convertPath or a second traverse.AllShortestPaths call --
+	// see TestExpandShortestPathMatchesTraverseDirectly's doc comment for
+	// why.
 	assertPathSigs(t, snap,
-		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, 0, want)
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, 0,
+		[]string{"N:1,2,|E:1,"})
+}
+
+// --- shortestPath / allShortestPaths budget wiring --------------------------
+
+// TestExpandShortestPathBudget exercises shortestPathBudget's arithmetic directly:
+// the tighter of MaxRows' and MaxWork's *remaining* capacity wins, "no
+// budget set at all" reports unbounded (traverse.Query.Limit/MemoryLimit
+// left at their own zero/"unbounded" value), and a budget already exhausted
+// (remaining < 0) clamps to zero rather than going negative -- a negative
+// rowCap would make expandShortestPathComponent's own `rowCap+1` overflow
+// back toward a nonsensical (or even negative) traverse.Query.Limit instead
+// of declining outright.
+func TestExpandShortestPathBudget(t *testing.T) {
+	cases := []struct {
+		name       string
+		budget     Budgets
+		work       int64
+		finalRows  int
+		wantBound  bool // true => a finite rowCap is expected (not unbounded)
+		wantRowCap int
+	}{
+		{
+			name:      "no budget set at all is unbounded",
+			budget:    Budgets{},
+			wantBound: false,
+		},
+		{
+			name:       "MaxRows only",
+			budget:     Budgets{MaxRows: 20},
+			finalRows:  5,
+			wantBound:  true,
+			wantRowCap: 15,
+		},
+		{
+			name:       "MaxWork only",
+			budget:     Budgets{MaxWork: 100},
+			work:       30,
+			wantBound:  true,
+			wantRowCap: 70,
+		},
+		{
+			name:       "both set, MaxWork is the tighter remaining budget",
+			budget:     Budgets{MaxRows: 1000, MaxWork: 50},
+			work:       10,
+			wantBound:  true,
+			wantRowCap: 40,
+		},
+		{
+			name:       "both set, MaxRows is the tighter remaining budget",
+			budget:     Budgets{MaxRows: 5, MaxWork: 1000},
+			wantBound:  true,
+			wantRowCap: 5,
+		},
+		{
+			name:       "MaxWork already exhausted clamps to zero, not negative",
+			budget:     Budgets{MaxWork: 10},
+			work:       25,
+			wantBound:  true,
+			wantRowCap: 0,
+		},
+		{
+			name:       "MaxRows already exhausted clamps to zero, not negative",
+			budget:     Budgets{MaxRows: 10},
+			finalRows:  25,
+			wantBound:  true,
+			wantRowCap: 0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			meter := &workMeter{budget: c.budget, work: c.work, finalRows: c.finalRows}
+			rowCap, memLimit, unbounded := shortestPathBudget(meter, 0)
+			if unbounded == c.wantBound {
+				t.Fatalf("unbounded = %v, want %v", unbounded, !c.wantBound)
+			}
+			if unbounded {
+				return
+			}
+			if rowCap != c.wantRowCap {
+				t.Fatalf("rowCap = %d, want %d", rowCap, c.wantRowCap)
+			}
+			if memLimit == 0 {
+				t.Fatalf("memLimit = 0, want a positive byte cap for a bounded query")
+			}
+		})
+	}
+}
+
+// TestExpandShortestPathBudgetDeclinesOnHighFanOut: allShortestPaths()
+// (ModeAll) between one root and one target joined by many distinct
+// length-2 co-equal shortest paths must decline with ErrBudget under a
+// small work budget *without* first materializing anywhere near the full
+// fan-out's worth of dense paths. traverse.AllShortestPaths' own
+// strategy-selection guards (PairBudget/SideBudget) only bound how many
+// (root, terminal) *pairs*/BFS runs a strategy attempts -- with exactly one
+// root and one target this fixture always qualifies for the cheapest
+// strategy regardless of fan-out, so nothing in traverse's own dispatch
+// would ever refuse it on that basis alone.
+//
+// This calls expandShortestPathComponent directly (the way runComponent
+// does) rather than going through Execute, and inspects the workMeter
+// afterward, deliberately bypassing Execute's own unconditional
+// end-of-query work check (exec.go's meter.check(), run once before any
+// successful ResultSet is returned): that check is a correctness safety net
+// that will eventually surface ErrBudget for an over-budget result no
+// matter how wastefully it was produced, so asserting only "Execute()
+// returns ErrBudget" would pass even if expandShortestPathComponent fully
+// materialized every one of the fan-out's paths first and only got caught
+// downstream. Checking meter.work directly isolates the actual property
+// this fix adds: traverse.AllShortestPaths itself must never be allowed to
+// return anywhere near the full fan-out's worth of paths in the first
+// place (see shortestPathBudget's own doc comment).
+func TestExpandShortestPathBudgetDeclinesOnHighFanOut(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+	nodes := []execNodeSpec{
+		{id: 1, kinds: []snapshot.KindID{kindRoot}},
+		{id: 2, kinds: []snapshot.KindID{kindTarget}},
+	}
+	var edges []execEdgeSpec
+	nextEdgeID := uint64(1)
+	const fanOut = 200
+	for i := uint64(0); i < fanOut; i++ {
+		mid := 100 + i
+		nodes = append(nodes, execNodeSpec{id: mid})
+		edges = append(edges,
+			execEdgeSpec{id: nextEdgeID, start: 1, end: mid, kind: kindE},
+			execEdgeSpec{id: nextEdgeID + 1, start: mid, end: 2, kind: kindE},
+		)
+		nextEdgeID += 2
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	q := planQuery(t, snap, `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`)
+	part := &q.Parts[0]
+	comps := groupComponents(part)
+	if len(comps) != 1 || len(comps[0].stepIdxs) != 1 {
+		t.Fatalf("unexpected component shape for a single shortestPath pattern: %+v", comps)
+	}
+	step := &part.Chains[comps[0].stepIdxs[0]]
+
+	meter := &workMeter{budget: Budgets{MaxRows: 1_000_000, MaxWork: 10}}
+	_, err := expandShortestPathComponent(&Env{Snap: snap}, meter, part, step)
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("expandShortestPathComponent() error = %v, want ErrBudget", err)
+	}
+	if meter.work >= fanOut {
+		t.Fatalf("meter.work = %d after declining, want it to stay far below the %d-path fan-out (traverse materialized too much before declining)", meter.work, fanOut)
+	}
+}
+
+// --- convertPath -------------------------------------------------------
+
+// TestExpandConvertPathErrorsOnNoMatchingForwardEdge: a fabricated traverse.Path
+// whose hop names a (target, kind) pair that has no matching slot in the
+// source node's own forward-CSR segment must return an error rather than
+// silently falling back to a fabricated EdgeRef{Fwd: 0} -- which would alias
+// whatever real, unrelated edge happens to occupy forward-CSR slot 0. Per
+// convertPath's own doc comment this should be unreachable for any
+// traverse.Path traverse.AllShortestPaths actually returns against the same
+// snapshot; exercised here only by hand-fabricating the mismatch directly.
+func TestExpandConvertPathErrorsOnNoMatchingForwardEdge(t *testing.T) {
+	const kindE snapshot.KindID = 10
+	const kindGhost snapshot.KindID = 99
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindE: "E", kindGhost: "Ghost"},
+		[]execNodeSpec{{id: 1}, {id: 2}},
+		[]execEdgeSpec{{id: 1, start: 1, end: 2, kind: kindE}},
+	)
+	env := &Env{Snap: snap}
+
+	n1, ok := snap.Dense(1)
+	if !ok {
+		t.Fatalf("Dense(1): not found")
+	}
+	n2, ok := snap.Dense(2)
+	if !ok {
+		t.Fatalf("Dense(2): not found")
+	}
+
+	// node 1 -> node 2 exists in the CSR, but only under kind kindE, never
+	// kindGhost: no forward-CSR slot matches this fabricated hop.
+	_, err := convertPath(env, traverse.Path{
+		Nodes: []snapshot.NodeID{n1, n2},
+		Kinds: []snapshot.KindID{kindGhost},
+	})
+	if !errors.Is(err, errConvertPathEdgeNotFound) {
+		t.Fatalf("convertPath() error = %v, want errConvertPathEdgeNotFound", err)
+	}
 }

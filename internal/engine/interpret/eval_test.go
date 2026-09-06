@@ -739,6 +739,132 @@ func TestEvalPropEqRouting(t *testing.T) {
 	})
 }
 
+// --- evalIdentityEquality ----------------------------------------------
+
+// TestEvalNodeIdentityEquality: bare node-variable `=`/`<>` must compare by
+// identity (the same underlying dense NodeID), pre-empting the generic
+// PropEq path entirely -- see evalIdentityEquality's own doc comment for why
+// this matters: two *distinct* nodes carrying identical (here, both
+// entirely absent) property bags would otherwise compare structurally
+// "equal" via PropEq's jsonbEqual, exactly backward for what identity
+// comparison means. Node 100 ("no name at all") and node 300 ("no gmsa")
+// are deliberately chosen for this: both carry an empty property map, so a
+// property-value comparison of the two would (wrongly) also come out
+// TriTrue, masking a regression that reintroduced the value-comparison
+// fallback for this shape -- two nodes with visibly different properties
+// would not catch that class of bug at all.
+func TestEvalNodeIdentityEquality(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+
+	n1, n2 := f.dense[100], f.dense[300]
+	row := func(a, b snapshot.NodeID) *Row {
+		r := NewRow()
+		r.SetNode("a", a)
+		r.SetNode("b", b)
+		return r
+	}
+
+	cases := []struct {
+		name  string
+		row   *Row
+		query string
+		want  Tri
+	}{
+		{"same node, =, TriTrue", row(n1, n1), "MATCH (n) WHERE a = b RETURN n", TriTrue},
+		{"different nodes, =, TriFalse", row(n1, n2), "MATCH (n) WHERE a = b RETURN n", TriFalse},
+		{"same node, <>, TriFalse", row(n1, n1), "MATCH (n) WHERE a <> b RETURN n", TriFalse},
+		{"different nodes, <>, TriTrue", row(n1, n2), "MATCH (n) WHERE a <> b RETURN n", TriTrue},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := EvalPredicate(env, c.row, whereExprOf(t, c.query))
+			if err != nil {
+				t.Fatalf("EvalPredicate: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("got %s, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEvalEdgeIdentityEquality: the same identity-comparison shape as
+// TestEvalNodeIdentityEquality, but for bare edge variables (EdgeRef.Fwd
+// identity via Row.Edge) -- evalIdentityEquality's second branch, reached
+// only once both operands fail the node check.
+func TestEvalEdgeIdentityEquality(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+
+	row := func(a, b EdgeRef) *Row {
+		r := NewRow()
+		r.SetEdge("r1", a)
+		r.SetEdge("r2", b)
+		return r
+	}
+
+	cases := []struct {
+		name  string
+		row   *Row
+		query string
+		want  Tri
+	}{
+		{"same edge, =, TriTrue", row(EdgeRef{Fwd: 5}, EdgeRef{Fwd: 5}), "MATCH (n) WHERE r1 = r2 RETURN n", TriTrue},
+		{"different edges, =, TriFalse", row(EdgeRef{Fwd: 5}, EdgeRef{Fwd: 7}), "MATCH (n) WHERE r1 = r2 RETURN n", TriFalse},
+		{"same edge, <>, TriFalse", row(EdgeRef{Fwd: 5}, EdgeRef{Fwd: 5}), "MATCH (n) WHERE r1 <> r2 RETURN n", TriFalse},
+		{"different edges, <>, TriTrue", row(EdgeRef{Fwd: 5}, EdgeRef{Fwd: 7}), "MATCH (n) WHERE r1 <> r2 RETURN n", TriTrue},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := EvalPredicate(env, c.row, whereExprOf(t, c.query))
+			if err != nil {
+				t.Fatalf("EvalPredicate: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("got %s, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEvalScalarMapComparesByValueNotIdentity is a guard test: it proves
+// evalIdentityEquality's shortcut applies only to a bare Variable that
+// resolves to a bound Node or Edge in the Row (per its own doc comment),
+// never to a scalar binding -- the shape a future WITH pipeline produces for
+// a map-valued expression (`WITH {a: 1} AS m`). Two distinct Go map values
+// with identical content must still compare equal via the generic PropEq/
+// jsonbEqual path, and two with different content must not: if a future
+// change ever widened the identity shortcut to scalars (or scalars were
+// compared by some pointer/reference notion instead), the "identical
+// content, different Go map instances" case below would wrongly flip to
+// TriFalse.
+func TestEvalScalarMapComparesByValueNotIdentity(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+
+	row := NewRow()
+	row.SetScalar("m1", map[string]any{"x": float64(1), "y": "a"})
+	row.SetScalar("m2", map[string]any{"x": float64(1), "y": "a"}) // distinct map value, same content
+
+	got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE m1 = m2 RETURN n"))
+	if err != nil {
+		t.Fatalf("EvalPredicate: %v", err)
+	}
+	if got != TriTrue {
+		t.Fatalf("got %s, want TriTrue (maps with identical content must compare equal by value)", got)
+	}
+
+	row.SetScalar("m2", map[string]any{"x": float64(2), "y": "a"})
+	got, err = EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE m1 = m2 RETURN n"))
+	if err != nil {
+		t.Fatalf("EvalPredicate: %v", err)
+	}
+	if got != TriFalse {
+		t.Fatalf("got %s, want TriFalse (maps with different content must not compare equal)", got)
+	}
+}
+
 func TestEvalOrderCompare(t *testing.T) {
 	f := newFixture(t)
 	env := f.env()
