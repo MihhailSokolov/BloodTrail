@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/specterops/dawgs/cypher/frontend"
+	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
 	"github.com/specterops/dawgs/util/size"
 
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/interpret"
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/recognize"
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/traverse"
@@ -305,14 +308,49 @@ const (
 	// an answer PostgreSQL itself cannot produce for the same request.
 	reasonSelfEndpoint = "self_endpoint"
 	// reasonParams is TryCypher-only: a non-empty params map means the
-	// caller intends to bind $parameters, which recognize.FromCypher never
-	// produces (its accepted shape rejects any conjunct containing a
-	// $parameter), so the engine cannot know it would honor them correctly.
+	// caller intends to bind $parameters, which BloodHound's cypher endpoint
+	// (ops.FetchByQuery) never sends on its own -- it always calls
+	// tx.Query(query, map[string]any{}) -- so a non-empty map can only mean
+	// a caller bound $parameters the interpreter has no way to honor
+	// (interpret.Plan's accepted shape rejects any $parameter reference
+	// outright, so this is also a cheap, snapshot-free pre-check before
+	// parsing is even attempted).
 	reasonParams = "params"
-	// reasonUnrecognized is TryCypher-only: recognize.FromCypher did not
-	// recognize text as one of the accepted shortestPath/allShortestPaths
-	// shapes.
-	reasonUnrecognized = "unrecognized"
+	// reasonUnsupported is TryCypher-only: covers both a text that fails to
+	// parse at all (frontend.ParseCypher, the same dawgs Cypher frontend and
+	// zero-filter *frontend.Context the real pg-backed driver's own
+	// compileText uses -- see drivers/pg/compiler.go@v0.8.0 -- returned an
+	// error) and a text that parses but interpret.Plan declines (ok=false):
+	// both mean exactly the same thing to a caller of TryCypher --
+	// "delegate the whole query to PostgreSQL, which will parse/plan it
+	// itself" -- and PostgreSQL's own driver re-parses the identical text
+	// from scratch, so a parse failure's own error content is deliberately
+	// never logged here (only the fact that this reason fired); logging it
+	// would just duplicate whatever error the caller's own eventual
+	// PostgreSQL round trip already surfaces.
+	reasonUnsupported = "unsupported"
+	// reasonMultiGraph is TryCypher-only: the interpreter has no notion of
+	// which graph a query is scoped to -- unlike servePathQuery, whose
+	// resolveEndpoint/traverse machinery only ever walks the one snapshot it
+	// was given -- so serving from a database snapshot.LoadSnapshot flagged
+	// as holding more than one graph (Snapshot.MultiGraph) risks silently
+	// answering across a graph boundary PostgreSQL itself would respect.
+	reasonMultiGraph = "multi_graph"
+	// reasonTranslateGate is TryCypher-only: translateGateOK (gate.go)
+	// reported that dawgs' own PostgreSQL translator would not also accept
+	// this query, so serving it from memory could produce a result
+	// PostgreSQL itself would never return. See gate.go's package doc for
+	// why this check exists at all.
+	reasonTranslateGate = "translate_gate"
+	// reasonBudget is TryCypher-only: interpret.Execute reported
+	// interpret.ErrBudget -- the query's row or work budget (maxCypherRows/
+	// maxCypherWork, serve_cypher.go) was exceeded during materialization.
+	reasonBudget = "budget"
+	// reasonCollation is TryCypher-only: interpret.Execute reported
+	// interpret.ErrCollation -- an ORDER BY or comparison whose result
+	// depends on PostgreSQL's own collation (string ordering), which this
+	// interpreter never attempts to reproduce locally.
+	reasonCollation = "collation"
 )
 
 // TryAllShortestPaths attempts to serve pq entirely from the engine's
@@ -341,56 +379,160 @@ func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, 
 	return hydrated, true
 }
 
+// cypherServedLogMessage is the exact Debug-level message TryCypher logs
+// whenever it serves a query entirely from the interpreter/snapshot, so an
+// e2e/observability test can grep for it (mirroring servePathQuery's own
+// "bloodtrail: path engine served" convention, but under its own distinct
+// marker: unlike that pipeline, TryCypher no longer routes through
+// servePathQuery at all, so the two entry points' served events need their
+// own separate markers to stay distinguishable in the log).
+const cypherServedLogMessage = "bloodtrail: cypher engine served"
+
 // TryCypher attempts to serve text (a Cypher query string, as sent to
 // BloodHound's cypher endpoint) entirely from the engine's current snapshot,
 // returning (result, true) on success. It returns (nil, false) whenever the
 // engine cannot, or chooses not to, serve the query itself, in which case
-// the caller must delegate to PostgreSQL.
+// the caller must delegate to PostgreSQL -- always correct, since every
+// decline below either means the interpreter never claimed to support this
+// shape, or means dawgs' own PostgreSQL translator itself would not accept
+// it either (translateGateOK), or means only PostgreSQL can settle the
+// question authoritatively (a stale snapshot, a collation-dependent
+// comparison).
 //
-// params must be empty (nil or a zero-length map) to be served: BloodHound's
-// cypher endpoint calls ops.FetchByQuery, which always calls
-// tx.Query(query, map[string]any{}) -- an empty, non-nil map -- so a
-// non-empty params map can only mean a caller bound $parameters the engine
-// has no way to honor (recognize.FromCypher's accepted shape rejects any
-// $parameter reference outright), and is declined (reason "params") without
-// even attempting to recognize text.
+// tx is accepted purely to keep this signature identical to
+// TryAllShortestPaths' and to wrappedTransaction.Query's one call site
+// (transaction.go): unlike the retired recognize.FromCypher/servePathQuery
+// pipeline (which used tx for live-PG Criteria endpoint resolution),
+// interpret.Plan/Execute never touch a transaction at all -- the
+// interpreter's entire read happens against the in-memory snapshot, so tx
+// goes completely unused here.
 //
-// text must recognize.FromCypher into a recognize.PathQuery (decline reason
-// "unrecognized" otherwise); the recognized query is then served by the same
-// servePathQuery pipeline TryAllShortestPaths uses, and the resulting
-// graph.PathSet is wrapped in a newPathResult so the caller can drain it
-// exactly as it would drain a live database Result (see ops.FetchByQuery,
-// the real consumer this is modeled on). A successful serve is logged at
-// Info with query="cypher" (TryAllShortestPaths' equivalent log line carries
-// no such field, so the two entry points' served events stay distinguishable
-// in the log).
+// params must be empty (nil or a zero-length map) to be served -- see
+// reasonParams' own doc for why a non-empty map can only mean unhonorable
+// bound parameters.
+//
+// Pipeline (each step's failure declines with its own reason -- see the
+// reason* consts above -- logged at Debug by e.decline; every false return
+// leaves the caller to delegate to PostgreSQL, which is always correct):
+//
+//  1. cfg.Enabled -- decline reasonDisabled, matching servePathQuery's own
+//     identical first check: an operator disabling the engine must disable
+//     every serving path, cypher included, not just TryAllShortestPaths.
+//  2. len(params) > 0 -- decline reasonParams.
+//  3. text fails to parse (frontend.ParseCypher, the same zero-filter
+//     *frontend.Context and dawgs Cypher frontend the real pg-backed
+//     driver's own compileText uses) -- decline reasonUnsupported, logging
+//     only the reason, never the parse error's own content (see
+//     reasonUnsupported's doc).
+//  4. no snapshot has ever been adopted (e.Fresh() returns a nil snapshot)
+//     -- decline reasonNoSnapshot.
+//  5. interpret.Plan(rq, snap) not ok -- decline reasonUnsupported.
+//  6. snap.MultiGraph -- decline reasonMultiGraph.
+//  7. translateGateOK(ctx, cypher.Copy(rq), snap) false -- decline
+//     reasonTranslateGate. A *copy* of rq is handed to the gate, never rq
+//     itself: dawgs' own translator's optimizer can mutate the AST it is
+//     given in place (translateGateOK's own doc), and interpret.Plan's
+//     Query IR (already built from rq at step 5) holds direct pointers into
+//     rq's own WHERE expression nodes for interpret.Execute to evaluate at
+//     step 8 -- handing the gate rq itself could silently corrupt those
+//     nodes out from under Execute before it ever runs. See
+//     TestTryCypherGateCannotCorruptServedResult for the regression test
+//     proving this can never leak into a served result.
+//  8. the snapshot captured at step 4 is no longer fresh (a write landed
+//     while steps 5-7 ran) -- decline reasonStale. Deliberately checked
+//     here, after the gate rather than immediately after step 4, per the
+//     milestone's pinned pipeline order: whether to even attempt planning
+//     and gating a query does not depend on freshness, only whether to
+//     actually execute it against snap does.
+//  9. interpret.Execute -- its sentinel errors map to specific reasons (see
+//     cypherExecReason); any other error declines reasonError.
+//  10. Collect every database edge id any OutEdge/OutPath column in the
+//     result references (collectEdgeIDs); if any exist, hydrate their
+//     properties (hydrateEdgePropsByID) and re-check snap is still current
+//     (snapshotStillCurrent) -- decline reasonHydration/reasonStale on
+//     failure, exactly the same "did a write land while we were doing I/O"
+//     recheck servePathQuery's own step 7 performs, applied here only when
+//     hydration actually did I/O. A pure-snapshot result (no edge/path
+//     column at all) skips this recheck entirely: nothing after step 8
+//     touched anything that could go stale.
+//
+// A successful serve builds a cypherRowsResult (serve_cypher.go) over the
+// executed interpret.ResultSet and logs cypherServedLogMessage at Debug.
 func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text string, params map[string]any) (graph.Result, bool) {
 	start := time.Now()
+
+	if !e.cfg.Enabled {
+		e.decline(ctx, reasonDisabled, nil)
+		return nil, false
+	}
 
 	if len(params) > 0 {
 		e.decline(ctx, reasonParams, nil)
 		return nil, false
 	}
 
-	pq, ok := recognize.FromCypher(text)
+	rq, err := frontend.ParseCypher(frontend.NewContext(), text)
+	if err != nil || rq == nil {
+		e.decline(ctx, reasonUnsupported, nil)
+		return nil, false
+	}
+
+	snap, fresh := e.Fresh()
+	if snap == nil {
+		e.decline(ctx, reasonNoSnapshot, nil)
+		return nil, false
+	}
+
+	q, ok := interpret.Plan(rq, snap)
 	if !ok {
-		e.decline(ctx, reasonUnrecognized, nil)
+		e.decline(ctx, reasonUnsupported, nil)
 		return nil, false
 	}
 
-	hydrated, served := e.servePathQuery(ctx, tx, pq)
-	if !served {
+	if snap.MultiGraph {
+		e.decline(ctx, reasonMultiGraph, nil)
 		return nil, false
 	}
 
-	e.cfg.Log.InfoContext(ctx, "bloodtrail: path engine served",
-		slog.String("query", "cypher"),
-		slog.String("mode", modeLabel(pq.Mode)),
-		slog.Int("paths", len(hydrated)),
+	// A fresh copy, never rq itself -- see this method's own step 7 doc.
+	if !translateGateOK(ctx, cypher.Copy[*cypher.RegularQuery](rq), snap) {
+		e.decline(ctx, reasonTranslateGate, nil)
+		return nil, false
+	}
+
+	if !fresh {
+		e.decline(ctx, reasonStale, nil)
+		return nil, false
+	}
+
+	rs, err := interpret.Execute(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	if err != nil {
+		e.decline(ctx, cypherExecReason(err), err)
+		return nil, false
+	}
+
+	var edgeProps map[uint64]*graph.Properties
+	if edgeIDs := collectEdgeIDs(snap, rs); len(edgeIDs) > 0 {
+		edgeProps, err = hydrateEdgePropsByID(ctx, e.pool, snap.GraphID, edgeIDs)
+		if err != nil {
+			e.decline(ctx, reasonHydration, err)
+			return nil, false
+		}
+		if !e.snapshotStillCurrent(snap) {
+			e.decline(ctx, reasonStale, nil)
+			return nil, false
+		}
+	}
+
+	result := newCypherRowsResult(snap, rs, projectionValueKinds(q), edgeProps)
+
+	e.cfg.Log.DebugContext(ctx, cypherServedLogMessage,
+		slog.String("op", "cypher"),
+		slog.Int("rows", len(rs.Rows)),
 		slog.Duration("duration", time.Since(start)),
 	)
 
-	return newPathResult(hydrated), true
+	return result, true
 }
 
 // servePathQuery is the pipeline TryAllShortestPaths and TryCypher both

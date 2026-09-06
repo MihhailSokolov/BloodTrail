@@ -2,9 +2,16 @@
 
 // Package recognize identifies BloodHound's canonical FetchAllShortestPaths
 // query shapes -- the graph.Criteria tree the API builds directly
-// (FromCriteria) and, in a later task, its Cypher-text equivalent -- and
-// translates them into a PathQuery the in-memory engine can serve without
-// delegating to PostgreSQL.
+// (FromCriteria), plus the builder-query shapes recognized elsewhere in this
+// package (builder.go/projection.go) -- and translates them into a
+// PathQuery the in-memory engine can serve without delegating to
+// PostgreSQL.
+//
+// This package's own Cypher-text equivalent of FromCriteria (FromCypher)
+// existed only through milestone 3; milestone 4's general-purpose Cypher
+// interpreter (internal/engine/interpret) superseded it entirely, and
+// engine.TryCypher now serves Cypher text directly through that interpreter
+// instead of recognizing a fixed shortestPath/allShortestPaths shape here.
 //
 // It intentionally does not import internal/engine/traverse: Mode mirrors
 // traverse.Mode's constants as a separate, plain-int type so the two

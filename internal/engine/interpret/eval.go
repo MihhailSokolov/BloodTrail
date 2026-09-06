@@ -62,6 +62,24 @@ type Row struct {
 	edges   map[string]EdgeRef
 	paths   map[string]any
 	scalars map[string]any
+
+	// usedEdges records the forward-CSR index of every edge any Step has
+	// bound while constructing this row, regardless of whether that Step
+	// named it (SetEdge above is keyed by symbol, purely for RETURN/WHERE
+	// value lookup, and is never populated for an anonymous relationship
+	// pattern at all) -- markEdgeUsed/edgeUsed below serve a different,
+	// narrower purpose: exec.go's verifyClosingStep consults this to
+	// enforce Cypher's relationship-uniqueness rule (no two Steps of the
+	// same pattern may resolve to the identical relationship) for exactly
+	// the one shape that rule can silently violate here -- a "closing" Step
+	// completing a cycle back to an already-bound node (see
+	// verifyClosingStep's own doc). A plain slice, not a map: a matched
+	// row's own hop count is always small (this executor's variable-length
+	// depth cap, MaxExpansionDepth, is 15), so a linear scan in edgeUsed
+	// costs less than a map's hashing overhead would, and a plain append in
+	// markEdgeUsed needs no lazy-allocate-on-first-use dance the way the
+	// map-valued fields above do.
+	usedEdges []uint64
 }
 
 // NewRow returns an empty Row ready for SetNode/SetEdge/SetPathVar/
@@ -133,6 +151,26 @@ func (r *Row) SetScalar(sym string, v any) {
 func (r *Row) Scalar(sym string) (any, bool) {
 	v, ok := r.scalars[sym]
 	return v, ok
+}
+
+// markEdgeUsed records fwd (a forward-CSR index) as consumed by some Step
+// while constructing this row -- see usedEdges' own doc for why this exists
+// separately from SetEdge. Marking the same fwd more than once is harmless
+// (edgeUsed only ever needs a yes/no answer, never a count).
+func (r *Row) markEdgeUsed(fwd uint64) {
+	r.usedEdges = append(r.usedEdges, fwd)
+}
+
+// edgeUsed reports whether fwd was already recorded via markEdgeUsed on this
+// row or on whichever row it was cloned/merged from (cloneRow/mergeRowInto
+// carry usedEdges forward like every other Row field).
+func (r *Row) edgeUsed(fwd uint64) bool {
+	for _, used := range r.usedEdges {
+		if used == fwd {
+			return true
+		}
+	}
+	return false
 }
 
 // Env carries the state one query's evaluation needs beyond the AST and the

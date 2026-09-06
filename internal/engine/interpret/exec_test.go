@@ -500,6 +500,43 @@ func TestExecClosingStepCycle(t *testing.T) {
 	assertRowSet(t, rs, want)
 }
 
+// TestExecClosingStepRejectsSelfLoopEdgeReuse is a regression test for a
+// real serving bug the dawgs conformance corpus's own "self_cycles" dataset
+// surfaced once TryCypher was wired to this package (integration/testdata/
+// cases/self_cycles.json's "fixed-length untyped (a)-[]->(b)-[]->(a) with
+// limit 100 returns all 8 two-hop round-trip endpoint pairs" case): unlike
+// TestExecClosingStepCycle above (p<->q, two genuinely distinct edges),
+// node s here has a *single* self-loop edge and nothing else. The pattern
+// `(a)-->(b)-->(a)` binds a=b=s via that one edge (the only Step 0
+// candidate), and the closing Step (b-->a) then finds that exact same edge
+// again as its only candidate -- without relationship-uniqueness tracking
+// (Row.usedEdges/edgeUsed, verifyClosingStep's own doc), this produces a
+// spurious "two-hop round trip" for a node that never actually had two
+// distinct hops to offer. t (with its own, separate self-loop) is a second,
+// independent copy of the same fixture shape, confirming the fix scales
+// per-row rather than only working by coincidence for a single node.
+func TestExecClosingStepRejectsSelfLoopEdgeReuse(t *testing.T) {
+	const kindT snapshot.KindID = 1
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindT: "T"},
+		[]execNodeSpec{
+			{10, []snapshot.KindID{kindT}, nil}, // s: single self-loop, no other edges
+			{20, []snapshot.KindID{kindT}, nil}, // t: a second, independent self-loop
+		},
+		[]execEdgeSpec{
+			{9000, 10, 10, 0}, // s -> s
+			{9001, 20, 20, 0}, // t -> t
+		},
+	)
+
+	rs := mustExec(t, snap, `MATCH (a)-->(b)-->(a) RETURN a,b`, generousBudget)
+
+	if len(rs.Rows) != 0 {
+		t.Fatalf("got %d rows, want 0 (a single self-loop edge must not satisfy a two-distinct-edge round trip): %v", len(rs.Rows), rowKeys(rs.Rows))
+	}
+}
+
 // --- Task 8b: mixed fixed/var-length chains + named-path assembly ---------
 //
 // BloodHound's prebuilt queries routinely mix fixed and variable-length

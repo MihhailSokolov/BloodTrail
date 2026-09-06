@@ -729,8 +729,9 @@ func flattenTopLevelConjuncts(expr cypher.Expression) []cypher.Expression {
 // This identity-joining reuse is deliberately NOT extended to relationship
 // variables: buildStep binds an edge symbol via declareEdgeSymbol instead,
 // which rejects any second occurrence outright (this package implements no
-// relationship-uniqueness/per-row edge-identity tracking -- see buildStep's
-// doc).
+// general, name-driven relationship-identity join the way node reuse gets
+// -- see buildStep's doc, which also covers the narrower, closing-Step-only
+// edge-uniqueness check the executor does implement).
 func (pb *partBuilder) declareSymbol(sym string, kind symKind) bool {
 	if existing, ok := pb.known[sym]; ok {
 		return existing == kind
@@ -1004,11 +1005,16 @@ func desugarPropertyMap(sym string, m cypher.MapLiteral) ([]cypher.Expression, b
 //
 // A non-anonymous edge symbol may bind exactly one Step: unlike a node
 // variable (see declareSymbol's doc on identity-joining node reuse), this
-// package does not implement Cypher's relationship-uniqueness semantics
-// (the executor has no per-row "which edges has this row already consumed"
-// tracking), so a second pattern occurrence of the same relationship
-// variable name -- whether in another step of the same chain or in an
-// entirely different pattern part -- rejects outright rather than silently
+// package does not implement Cypher's relationship-uniqueness semantics as a
+// general, name-driven join the way node-identity reuse gets (the executor
+// tracks, per row, only the narrow "has this exact edge already been used
+// by some earlier Step in this pattern" fact that a *cyclic* pattern's
+// closing-Step verification needs -- exec.go's Row.usedEdges/edgeUsed and
+// verifyClosingStep's own doc -- not a general "these two named occurrences
+// must resolve to the same edge" identity join), so a second pattern
+// occurrence of the same relationship variable name -- whether in another
+// step of the same chain or in an entirely different pattern part --
+// rejects outright rather than silently
 // picking one occurrence or the other. This is a strict narrowing of
 // declareSymbol's general "same kind => same identity, allow it" rule,
 // deliberately bypassed here for edges specifically.

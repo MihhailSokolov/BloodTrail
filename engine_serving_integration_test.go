@@ -29,10 +29,16 @@ import (
 	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
-// servedMarker is the exact message engine.TryAllShortestPaths/TryCypher log
-// (at Info) whenever they serve a query from the in-memory snapshot --
+// servedMarker is the exact message engine.TryAllShortestPaths logs (at
+// Info) whenever it serves a query from the in-memory snapshot --
 // duplicated here (rather than exported from internal/engine) since only
-// this test needs to recognize it in captured log output.
+// this test needs to recognize it in captured log output. engine.TryCypher
+// no longer shares this marker: since being rewired to the general-purpose
+// Cypher interpreter (internal/engine/interpret), it logs its own, Debug-
+// level "bloodtrail: cypher engine served" instead (engine.go's
+// cypherServedLogMessage) -- this test never issues a raw Cypher-text
+// query through the wrapped driver, so it has no reason to watch for that
+// marker.
 const servedMarker = "bloodtrail: path engine served"
 
 // builderServedMarker is the exact message engine.TryNodeCount/

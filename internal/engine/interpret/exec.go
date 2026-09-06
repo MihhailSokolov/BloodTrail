@@ -180,7 +180,29 @@ func Execute(env *Env, q *Query, b Budgets) (*ResultSet, error) {
 // shared node-symbol identity (see groupComponents), and returns every
 // fully-bound row -- WHERE is not applied here; Execute does that once over
 // the complete row set.
+//
+// A part with no node patterns at all -- part.Nodes is empty -- is a
+// legitimate, Plan-accepted shape: a whole query with no MATCH clause at all
+// (a bare `RETURN <expr>`), or, in a 2-Part (one-WITH-boundary) query,
+// Part[0] itself being nothing but a leading `WITH <expr> AS x` with no
+// MATCH before it (planPart returns Part{Nodes: map[string]*NodeConstraint{}}
+// -- empty, not nil -- for an empty ReadingClauses list; see its own doc).
+// Either way, the query has exactly one solution at this point: the empty
+// binding, satisfied trivially with no constraints to check -- mirroring
+// pg's own "a WITH/RETURN with nothing to match still runs its expressions
+// exactly once, not zero times" semantics, and exactly the same treatment
+// runCarriedPart (pipeline.go) already gives Part[1] under the identical
+// condition. Falling through to groupComponents below would instead find
+// zero components (groupComponents iterates part.Nodes' keys, of which
+// there are none) and this function would return zero rows -- silently
+// discarding the query's one and only solution instead of serving it, e.g.
+// dropping every row of `WITH 365 AS max_days MATCH (n:User) WHERE
+// n.x < max_days RETURN n` before Part[1] (the MATCH) ever runs.
 func matchPart(env *Env, part *Part, meter *workMeter) ([]*Row, error) {
+	if len(part.Nodes) == 0 {
+		return []*Row{NewRow()}, nil
+	}
+
 	var merged []*Row
 	first := true
 	for _, comp := range groupComponents(part) {
@@ -298,7 +320,10 @@ func cloneRow(r *Row) *Row {
 	return nr
 }
 
-// mergeRowInto copies every binding from src into dst.
+// mergeRowInto copies every binding from src into dst, usedEdges (see Row's
+// own doc) included: two cartesian-joined or WITH-carried rows' used-edge
+// sets union together, so a closing Step evaluated after the merge still
+// sees every edge either side already consumed.
 func mergeRowInto(dst, src *Row) {
 	for k, v := range src.nodes {
 		dst.SetNode(k, v)
@@ -311,6 +336,9 @@ func mergeRowInto(dst, src *Row) {
 	}
 	for k, v := range src.paths {
 		dst.SetPathVar(k, v)
+	}
+	for _, fwd := range src.usedEdges {
+		dst.markEdgeUsed(fwd)
 	}
 }
 
@@ -1070,6 +1098,12 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			if pathArcKey != "" {
 				nr.SetEdge(pathArcKey, EdgeRef{Fwd: c.fwd})
 			}
+			// Recorded regardless of EdgeSym/pathArcKey -- an anonymous
+			// relationship pattern (no variable name at all) still consumes
+			// a real, specific edge, and verifyClosingStep needs to know
+			// that just as much as it would for a named one. See Row's
+			// usedEdges doc.
+			nr.markEdgeUsed(c.fwd)
 			if err := meter.spend(1); err != nil {
 				return nil, err
 			}
@@ -1083,10 +1117,28 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 // two endpoints are already bound in every row: for each row it looks for a
 // matching edge between the two bound ids, fanning out one row per matching
 // edge (parallel qualifying edges, like a fresh tree-edge expansion, each
-// produce a distinct row -- this executor implements no relationship-
-// uniqueness tracking, matching plan.go's own documented scope) and binding
-// step.EdgeSym (if named) to whichever edge matched. A row with no matching
-// edge at all is dropped.
+// produce a distinct row) and binding step.EdgeSym (if named) to whichever
+// edge matched. A row with no matching edge at all is dropped.
+//
+// A candidate edge already recorded in the row's own usedEdges (r.edgeUsed)
+// is skipped -- Cypher's relationship-uniqueness rule: no two Steps of the
+// same pattern may resolve to the identical relationship. Without this
+// check, a self-loop node (its one outgoing edge simultaneously satisfying
+// both "the tree Step that reached it" and "the closing Step verifying the
+// cycle") would silently double-count that single edge as two distinct
+// hops -- exactly the shape the dawgs conformance corpus's own "self_cycles"
+// dataset catches (`MATCH (a)-[]->(b)-[]->(a)` over a node with a single
+// self-loop edge must not itself count as a valid two-hop round trip, since
+// there is no second, distinct edge to close the cycle with). This is the
+// one place in this package such a coincidence can arise undetected: a
+// strict linear chain (expandChainComponent) never revisits an
+// already-bound symbol at all (isStrictLinearChain's own "no repeated
+// ToSym" check), so it can never produce a closing Step in the first place,
+// and every *other* reuse of the same relationship variable name is already
+// rejected outright at plan time (buildStep's declareEdgeSymbol) -- neither
+// of those two guards, though, has anything to say about two *anonymous* (or
+// differently named) relationship patterns that just happen, for this one
+// row, to resolve to the same physical edge.
 func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*Row, error) {
 	var out []*Row
 	for _, r := range rows {
@@ -1104,10 +1156,14 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 			if !edgeKindOK(step.EdgeKinds, c.kind) {
 				continue
 			}
+			if r.edgeUsed(c.fwd) {
+				continue
+			}
 			nr := cloneRow(r)
 			if step.EdgeSym != "" {
 				nr.SetEdge(step.EdgeSym, EdgeRef{Fwd: c.fwd})
 			}
+			nr.markEdgeUsed(c.fwd)
 			if err := meter.spend(1); err != nil {
 				return nil, err
 			}

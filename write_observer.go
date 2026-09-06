@@ -635,8 +635,10 @@ var parseCypherFrontend = func(text string) (*cypher.RegularQuery, error) {
 }
 
 // cypherMutates parses text via parseCypherFrontend -- the same dawgs Cypher
-// frontend internal/engine/recognize/cypher.go's FromCypher uses -- and
-// reports whether its AST contains any updating clause (CREATE, SET,
+// frontend package (github.com/specterops/dawgs/cypher/frontend) the engine's
+// own Cypher interpreter uses (internal/engine/interpret's Plan, and
+// engine.TryCypher itself) -- and reports whether its AST contains any
+// updating clause (CREATE, SET,
 // REMOVE, DELETE, or MERGE) anywhere in the query body -- in the top-level
 // SinglePartQuery, or in any part of a MultiPartQuery (a query with one or
 // more WITH boundaries). A parse failure, or a panic from the frontend

@@ -240,6 +240,53 @@ RETURN m`
 	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: m1}})})
 }
 
+// TestPipelineLeadingWithNoPrecedingMatchFeedsPredicate is a regression test
+// for a real serving bug the dawgs corpus's own "bind a numeric literal as a
+// WITH variable and use it in arithmetic in the next MATCH" case
+// (integration/testdata/cases/multipart.json) surfaced once TryCypher was
+// wired to this package: `WITH <expr> AS x MATCH ... WHERE ... x ...` -- a
+// WITH with *no* MATCH before it at all, unlike
+// TestPipelineWithConstantCarryOverFeedsPredicate above, whose Part[0] does
+// have its own leading `MATCH (n:User) WHERE ...` -- served a completely
+// empty ResultSet regardless of what Part[1]'s own MATCH would otherwise
+// have matched.
+//
+// Root cause: Plan's planPart returns a valid Part{Nodes: map[string]
+// *NodeConstraint{}} (empty, not nil) for a stage with zero ReadingClauses
+// -- exactly what a leading, MATCH-less WITH stage plans to -- but runQuery
+// (pipeline.go) called matchPart directly for Part[0] with no special
+// handling for that empty-Nodes case, so groupComponents found zero
+// components (it iterates part.Nodes' keys) and matchPart returned zero
+// rows instead of the one solution ("the empty binding") the query
+// actually has at that point. This silently discarded Part[0]'s only row
+// before Part[1]'s own MATCH -- and the WITH-carried scalar it needed --
+// ever ran, regardless of what that MATCH would otherwise have found.
+// runCarriedPart already special-cases the identical "zero Nodes" shape for
+// Part[1] (pipeline.go, `if len(part.Nodes) == 0`); the fix (exec.go's
+// matchPart) gives Part[0] the same one-row treatment.
+func TestPipelineLeadingWithNoPrecedingMatchFeedsPredicate(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, map[string]any{"objectid": "m1", "threshold": float64(100)}}, // > 60 -> survives
+			{2, []snapshot.KindID{kindUser}, map[string]any{"objectid": "m2", "threshold": float64(10)}},  // <= 60 -> excluded
+		},
+		nil,
+	)
+
+	query := `WITH 60 AS days
+MATCH (m:User)
+WHERE m.threshold > days
+RETURN m`
+
+	rs := mustExec(t, snap, query, generousBudget)
+
+	m1, _ := snap.Dense(1)
+	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: m1}})})
+}
+
 // --- COUNT vs COUNT(DISTINCT ...) -------------------------------------------
 
 func TestPipelineCountVsCountDistinct(t *testing.T) {

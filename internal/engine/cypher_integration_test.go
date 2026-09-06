@@ -7,6 +7,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -76,9 +77,10 @@ func (s stubResultTx) GraphQueryMemoryLimit() size.Size {
 var _ graph.Transaction = stubResultTx{}
 
 // drainEngineResult feeds result -- what TryCypher handed back -- through
-// the real ops.FetchByQuery via stubResultTx, proving newPathResult /
-// mapPathValue satisfy FetchByQuery's mapper protocol (relationship, then
-// node, then path -- see ops/ops.go:190) rather than merely resembling it.
+// the real ops.FetchByQuery via stubResultTx, proving cypherRowsResult
+// (serve_cypher.go) satisfies FetchByQuery's mapper protocol (relationship,
+// then node, then path -- see ops/ops.go:190) rather than merely resembling
+// it.
 func drainEngineResult(t *testing.T, result graph.Result, text string) graph.PathSet {
 	t.Helper()
 
@@ -160,10 +162,25 @@ func TestTryCypherDifferential(t *testing.T) {
 	multiKindB := graph.StringKind("MultiKindB")
 	multiKindEdge := graph.StringKind("MultiKindEdge")
 
+	// hydratedEdgeKind links two candidate starts to the same end, exactly
+	// like multiKindEdge above, but carries a real, non-empty property bag
+	// (unlike every other edge kind seeded in this fixture, which uses
+	// graph.NewProperties() -- empty) -- Task 13's own required differential
+	// coverage: a path query whose edges actually need Task 11's
+	// hydrateEdgePropsByID round trip, not just the CSR-only shape
+	// hydration-less edges would already get right for free. assertSameSet
+	// (via canonicalize) compares edge Properties byte for byte, so a
+	// hydration bug (wrong edge id batched, wrong property decoded, or no
+	// hydration attempted at all) would show up here as a property mismatch
+	// even though the path's own node/edge shape matched.
+	hydratedEdgeKind := graph.StringKind("HydratedPropEdge")
+
 	var (
-		notCoalesceEndID graph.ID
-		regexStartID     graph.ID
-		multiKindEndID   graph.ID
+		notCoalesceEndID    graph.ID
+		regexStartID        graph.ID
+		multiKindEndID      graph.ID
+		hydratedEdgeStartID graph.ID
+		hydratedEdgeEndID   graph.ID
 	)
 	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		// NOT + COALESCE case: two candidate starts, one filtered out.
@@ -207,6 +224,30 @@ func TestTryCypherDifferential(t *testing.T) {
 			return err
 		}
 		regexStartID = startNode.ID
+
+		// Hydrated-edge-properties case: a shortestPath whose one edge
+		// carries a real property bag, so the differential comparison below
+		// (assertSameSet, via canonicalize) actually exercises Task 11/13's
+		// hydrateEdgePropsByID round trip -- every other edge kind in this
+		// fixture is seeded with graph.NewProperties() (empty), which a
+		// completely unhydrated edge (a zero-value *graph.Properties) would
+		// satisfy just as well, so none of them alone would catch a
+		// hydration bug.
+		hydratedStart, err := tx.CreateNode(graph.NewProperties(), propNodeKind)
+		if err != nil {
+			return err
+		}
+		hydratedEnd, err := tx.CreateNode(graph.NewProperties(), propNodeKind)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(hydratedStart.ID, hydratedEnd.ID, hydratedEdgeKind,
+			graph.NewProperties().Set("since", "2020-01-01").Set("weight", float64(7)),
+		); err != nil {
+			return err
+		}
+		hydratedEdgeEndID = hydratedEnd.ID
+		hydratedEdgeStartID = hydratedStart.ID
 
 		// Multi-label AND-semantics case: two candidate starts tied at
 		// distance 1 from the end, differing only in which labels they
@@ -285,6 +326,31 @@ func TestTryCypherDifferential(t *testing.T) {
 			name: "multi-label endpoint ANDs its kinds via the Criteria path",
 			text: fmt.Sprintf(`MATCH p = allShortestPaths((s:MultiKindA:MultiKindB)-[:MultiKindEdge*1..]->(e)) WHERE id(e) = %d AND s.name = 'alice' RETURN p`, multiKindEndID),
 		},
+		{
+			// Task 13's required "plain property MATCH" coverage: a bare
+			// MATCH/WHERE/RETURN with no shortestPath/allShortestPaths
+			// pattern at all -- exactly the general-purpose shape the
+			// retired milestone-2 recognizer could never serve, and the
+			// interpreter now can. adminNode's name is unique across this
+			// entire fixture, so the match (and therefore the aggregated
+			// single-node "path" ops.FetchByQuery builds from a plain node
+			// RETURN -- see FetchByQuery's own doc) is exactly one row on
+			// both sides.
+			name: "plain property MATCH (no shortestPath at all)",
+			text: `MATCH (n:PropNode) WHERE n.name = 'Administrator' RETURN n`,
+		},
+		{
+			// Task 13's required "path query asserting hydrated edge
+			// properties equal pg's" coverage: hydratedEdgeKind's one edge
+			// carries a real property bag (since/weight), so this
+			// differential comparison actually exercises Task 11/13's
+			// hydrateEdgePropsByID round trip -- assertSameSet's
+			// canonicalize compares edge Properties byte for byte, so a
+			// hydration bug would show up here as a property mismatch even
+			// though the path's own node/edge shape matched.
+			name: "shortestPath with a real hydrated edge property bag",
+			text: fmt.Sprintf(`MATCH p = shortestPath((s)-[:HydratedPropEdge*1..]->(e)) WHERE id(s) = %d AND id(e) = %d RETURN p`, hydratedEdgeStartID, hydratedEdgeEndID),
+		},
 	}
 
 	for _, tc := range cases {
@@ -318,10 +384,20 @@ func TestTryCypherDifferential(t *testing.T) {
 	}
 }
 
-// TestTryCypherRejectsNonShortestPath is Task 11's required reject case: a
-// query recognize.FromCypher cannot recognize (no shortestPath /
-// allShortestPaths pattern at all) must decline rather than being served.
-func TestTryCypherRejectsNonShortestPath(t *testing.T) {
+// TestTryCypherRejectsNonShortestPath was Task 11's required reject case
+// under the retired milestone-2 recognizer (recognize.FromCypher), which
+// only ever recognized shortestPath/allShortestPaths shapes -- so a plain
+// `MATCH (n) RETURN n` was, at the time, the simplest possible "declined"
+// example. Task 13's interpreter-backed TryCypher serves that exact shape
+// directly (see TestTryCypherDifferential's own "plain property MATCH (no
+// shortestPath at all)" case above), so this case is renamed and re-pointed
+// at a shape the interpreter itself still declines:
+// interpret.Plan's default-deny posture rejects every UpdatingClause
+// (CREATE/MERGE/SET/DELETE/REMOVE) outright, regardless of what RETURN item
+// follows it (see interpret/plan.go's planStages) -- a stable, permanent
+// reject case, unlike a mere "not yet implemented" gap that a future
+// interpreter feature could close out from under this test.
+func TestTryCypherRejectsUpdatingClause(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
@@ -336,13 +412,13 @@ func TestTryCypherRejectsNonShortestPath(t *testing.T) {
 
 	var served bool
 	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
-		_, served = eng.TryCypher(ctx, tx, `MATCH (n) RETURN n`, nil)
+		_, served = eng.TryCypher(ctx, tx, `CREATE (n:NewNode) RETURN n`, nil)
 		return nil
 	}); err != nil {
 		t.Fatalf("ReadTransaction: %v", err)
 	}
 	if served {
-		t.Fatalf("TryCypher served a non-shortestPath query, want declined")
+		t.Fatalf("TryCypher served a CREATE query, want declined")
 	}
 }
 
@@ -395,4 +471,316 @@ func TestTryCypherParams(t *testing.T) {
 			t.Fatalf("TryCypher served with a non-empty params map, want declined")
 		}
 	})
+}
+
+// TestTryCypherAggregationQuery is Task 13's required "corpus aggregation
+// query" coverage: interpret/plan_test.go's unexported corpusAggregationQuery
+// (migrated verbatim from BloodHound's real analysis-query corpus,
+// "Kerberoastable users with most admin privileges" -- duplicated here byte
+// for byte, the same way gate_test.go's corpusAggregationQueryText already
+// does, since it is unexported and defined in a _test.go file, so invisible
+// outside package interpret) -- a WITH DISTINCT/COUNT/ORDER BY/LIMIT query
+// with no shortestPath/allShortestPaths pattern at all -- served against a
+// small property-bearing User/Computer subgraph engineered for exactly one
+// qualifying user (two decoys, one per negative WHERE conjunct, confirm the
+// filter is not vacuously true), so the RETURN u result -- and therefore the
+// single aggregated "path" ops.FetchByQuery's own node/path mapping builds
+// from a plain node RETURN (see FetchByQuery's own doc) -- is unambiguous on
+// both the engine and pg oracle sides.
+func TestTryCypherAggregationQuery(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	kindUser := graph.StringKind("User")
+	kindComputer := graph.StringKind("Computer")
+	kindAdminTo := graph.StringKind("AdminTo")
+
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		computer, err := tx.CreateNode(graph.NewProperties(), kindComputer)
+		if err != nil {
+			return err
+		}
+
+		// goodUser satisfies every WHERE conjunct and has an AdminTo edge to
+		// computer, so it is the query's one and only result.
+		goodUser, err := tx.CreateNode(graph.NewProperties().
+			Set("hasspn", true).Set("enabled", true).Set("objectid", "OBJ-GOOD-1"), kindUser)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(goodUser.ID, computer.ID, kindAdminTo, graph.NewProperties()); err != nil {
+			return err
+		}
+
+		// badUserGMSA fails NOT COALESCE(u.gmsa, false) = true.
+		badUserGMSA, err := tx.CreateNode(graph.NewProperties().
+			Set("hasspn", true).Set("enabled", true).Set("objectid", "OBJ-BAD-GMSA").Set("gmsa", true), kindUser)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(badUserGMSA.ID, computer.ID, kindAdminTo, graph.NewProperties()); err != nil {
+			return err
+		}
+
+		// badUserDisabled fails u.enabled = true.
+		badUserDisabled, err := tx.CreateNode(graph.NewProperties().
+			Set("hasspn", true).Set("enabled", false).Set("objectid", "OBJ-BAD-DISABLED"), kindUser)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(badUserDisabled.ID, computer.ID, kindAdminTo, graph.NewProperties()); err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("seed aggregation fixture: %v", err)
+	}
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	const text = `MATCH (u:User)
+WHERE u.hasspn = true
+  AND u.enabled = true
+  AND NOT u.objectid ENDS WITH '-502'
+  AND NOT COALESCE(u.gmsa, false) = true
+  AND NOT COALESCE(u.msa, false) = true
+MATCH (u)-[:MemberOf|AdminTo*1..]->(c:Computer)
+WITH DISTINCT u, COUNT(c) AS adminCount
+RETURN u
+ORDER BY adminCount DESC
+LIMIT 100`
+
+	var (
+		engineResult graph.Result
+		served       bool
+	)
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		engineResult, served = eng.TryCypher(ctx, tx, text, nil)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+	if !served {
+		t.Fatalf("TryCypher declined, want served (query: %s)", text)
+	}
+
+	engineOut := drainEngineResult(t, engineResult, text)
+
+	var oracleOut graph.PathSet
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		oracleOut = drainOracleResult(t, tx, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction (oracle): %v", err)
+	}
+
+	assertSameSet(t, engineOut, oracleOut, false)
+}
+
+// TestTryCypherCollectAntiJoinQuery is Task 13's required "*0.. COLLECT
+// anti-join" coverage: interpret/plan_test.go's unexported
+// corpusCollectAntiJoinQuery (migrated verbatim from BloodHound's real
+// analysis-query corpus, "Domain Admins logons to non-Domain Controllers" --
+// duplicated here for the same reason TestTryCypherAggregationQuery's own
+// doc explains) -- a two-Part query joined by a WITH COLLECT(...) boundary,
+// whose second Part excludes every node the first collected via
+// `NOT c IN exclude` -- served against a small Computer/User/Group subgraph
+// engineered for exactly one non-excluded path.
+func TestTryCypherCollectAntiJoinQuery(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	kindUser := graph.StringKind("User")
+	kindComputer := graph.StringKind("Computer")
+	kindGroup := graph.StringKind("Group")
+	kindMemberOf := graph.StringKind("MemberOf")
+	kindHasSession := graph.StringKind("HasSession")
+
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		group516, err := tx.CreateNode(graph.NewProperties().Set("objectid", "DOMAIN-516"), kindGroup)
+		if err != nil {
+			return err
+		}
+		group512, err := tx.CreateNode(graph.NewProperties().Set("objectid", "DOMAIN-512"), kindGroup)
+		if err != nil {
+			return err
+		}
+
+		// compExcluded reaches group516 via one MemberOf hop, so it lands in
+		// the first MATCH's `exclude` := COLLECT(s) set.
+		compExcluded, err := tx.CreateNode(graph.NewProperties(), kindComputer)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(compExcluded.ID, group516.ID, kindMemberOf, graph.NewProperties()); err != nil {
+			return err
+		}
+		userExcluded, err := tx.CreateNode(graph.NewProperties(), kindUser)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(compExcluded.ID, userExcluded.ID, kindHasSession, graph.NewProperties()); err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(userExcluded.ID, group512.ID, kindMemberOf, graph.NewProperties()); err != nil {
+			return err
+		}
+
+		// compGood never reaches group516, so it must survive the
+		// `NOT c IN exclude` filter and be the query's one served path.
+		compGood, err := tx.CreateNode(graph.NewProperties(), kindComputer)
+		if err != nil {
+			return err
+		}
+		userGood, err := tx.CreateNode(graph.NewProperties(), kindUser)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(compGood.ID, userGood.ID, kindHasSession, graph.NewProperties()); err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(userGood.ID, group512.ID, kindMemberOf, graph.NewProperties()); err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("seed anti-join fixture: %v", err)
+	}
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	const text = `MATCH (s)-[:MemberOf*0..]->(g:Group)
+WHERE g.objectid ENDS WITH '-516'
+WITH COLLECT(s) AS exclude
+MATCH p = (c:Computer)-[:HasSession]->(:User)-[:MemberOf*1..]->(g:Group)
+WHERE g.objectid ENDS WITH '-512' AND NOT c IN exclude
+RETURN p
+LIMIT 1000`
+
+	var (
+		engineResult graph.Result
+		served       bool
+	)
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		engineResult, served = eng.TryCypher(ctx, tx, text, nil)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+	if !served {
+		t.Fatalf("TryCypher declined, want served (query: %s)", text)
+	}
+
+	engineOut := drainEngineResult(t, engineResult, text)
+
+	var oracleOut graph.PathSet
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		oracleOut = drainOracleResult(t, tx, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction (oracle): %v", err)
+	}
+
+	assertSameSet(t, engineOut, oracleOut, false)
+}
+
+// TestTryCypherReturnPropertyLiteralMatchesOracleType is Task 13's required
+// "RETURN n.prop literal projection" coverage: TryCypher's own result and a
+// direct PostgreSQL round trip through the plain pg driver -- deliberately
+// bypassing ops.FetchByQuery's own node/edge/path mapping, which launders
+// every scalar column through graph.Literal{Value: ...} and would hide a
+// Go-type mismatch behind an `any` comparison that only ever inspects the
+// wrapped value, never the value's own concrete type -- must agree on both
+// the exact value and the exact Go type materializeScalar/decodeScalarString
+// (serve_cypher.go) produce for a plain, non-amended (no id()/size()/
+// datetime() epoch component, no WITH COUNT alias) property projection.
+func TestTryCypherReturnPropertyLiteralMatchesOracleType(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	propNodeKind := graph.StringKind("PropNode")
+	var nodeID graph.ID
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties().Set("name", "Administrator"), propNodeKind)
+		if err != nil {
+			return err
+		}
+		nodeID = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	text := fmt.Sprintf(`MATCH (n:PropNode) WHERE id(n) = %d RETURN n.name`, nodeID)
+
+	readOneValue := func(t *testing.T, result graph.Result) any {
+		t.Helper()
+		defer result.Close()
+		if !result.Next() {
+			t.Fatalf("result: no rows (query: %s)", text)
+		}
+		values := result.Values()
+		if len(values) != 1 {
+			t.Fatalf("result: %d columns, want 1 (query: %s)", len(values), text)
+		}
+		if result.Next() {
+			t.Fatalf("result: more than one row (query: %s)", text)
+		}
+		if err := result.Error(); err != nil {
+			t.Fatalf("result.Error(): %v", err)
+		}
+		return values[0]
+	}
+
+	var engineValue any
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		result, served := eng.TryCypher(ctx, tx, text, nil)
+		if !served {
+			t.Fatalf("TryCypher declined, want served (query: %s)", text)
+		}
+		engineValue = readOneValue(t, result)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction (engine): %v", err)
+	}
+
+	var oracleValue any
+	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		oracleValue = readOneValue(t, tx.Query(text, map[string]any{}))
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadTransaction (oracle): %v", err)
+	}
+
+	if engineValue != oracleValue {
+		t.Fatalf("engine value = %#v, oracle value = %#v: want equal", engineValue, oracleValue)
+	}
+	if gotType, wantType := reflect.TypeOf(engineValue), reflect.TypeOf(oracleValue); gotType != wantType {
+		t.Fatalf("engine value type = %v, oracle value type = %v: want equal", gotType, wantType)
+	}
+	if engineValue != "Administrator" {
+		t.Fatalf("engine value = %#v, want %q", engineValue, "Administrator")
+	}
 }

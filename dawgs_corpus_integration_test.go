@@ -47,14 +47,15 @@
 // LoadDataset's edges included -- see write_observer.go/driver.go), so
 // TryCypher declines and every query answers by delegating straight to
 // PostgreSQL ("delegating" subtests); and once more after a manual
-// d.engine.RebuildNow, so the handful of shapes recognize.FromCypher
-// actually recognizes (mostly milestone-2 path shapes -- shortestPath,
-// allShortestPaths, bounded variable-length expansion; the rest of the
-// corpus is shapes TryCypher was never meant to serve and keeps delegating
-// regardless) get a real chance to be served from the snapshot
-// ("engine" subtests). A failure that only shows up under "engine" points at
-// a real serving bug, not an adaptation mistake -- see the doc on
-// TestDAWGSCorpus below.
+// d.engine.RebuildNow, so every shape internal/engine/interpret's Plan
+// actually accepts -- milestone 4's general-purpose Cypher interpreter, a
+// much broader surface than milestone 3's retired shortestPath/
+// allShortestPaths-only recognizer (recognize.FromCypher, removed once
+// TryCypher was rewired to the interpreter) -- gets a real chance to be
+// served from the snapshot ("engine" subtests); the rest of the corpus is
+// shapes Plan declines and TryCypher keeps delegating regardless. A failure
+// that only shows up under "engine" points at a real serving bug, not an
+// adaptation mistake -- see the doc on TestDAWGSCorpus below.
 //
 // Fixture cases (a "fixture" field) run inside a rolled-back write
 // transaction (Session.WithRollbackFixture): Driver.WriteTransaction only
@@ -381,8 +382,8 @@ func TestDAWGSCorpus(t *testing.T) {
 			}
 
 			// Mode 2: engine -- same cases, same loaded data, now with a
-			// fresh snapshot so recognize.FromCypher's recognized shapes
-			// actually get served from it.
+			// fresh snapshot so every shape interpret.Plan accepts actually
+			// gets served from it.
 			t.Run("engine", runReadOnlyCases)
 
 			// Fixture cases: each runs once, in a rolled-back write

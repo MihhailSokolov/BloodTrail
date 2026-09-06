@@ -74,13 +74,16 @@ import (
 )
 
 // servedMarker and builderServedMarker are the exact messages
-// TryAllShortestPaths/TryCypher (engine.go) and TryNodeCount/TryRelCount/etc.
+// TryAllShortestPaths (engine.go) and TryNodeCount/TryRelCount/etc.
 // (serve_builder.go's servedOp) log whenever they actually serve a query
 // from the in-memory snapshot -- duplicated here from
 // engine_serving_integration_test.go (a different package, bloodtrail_test,
 // so its unexported consts are not visible from here) for the same reason
 // that file gives: only this test needs to recognize them in captured log
-// output.
+// output. TryCypher logs its own, separate marker (engine.go's
+// cypherServedLogMessage) since being rewired to the Cypher interpreter;
+// this file never issues a raw Cypher-text query, so it has no reason to
+// watch for that one.
 const (
 	servedMarker        = "bloodtrail: path engine served"
 	builderServedMarker = "bloodtrail: builder engine served"

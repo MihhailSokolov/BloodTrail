@@ -19,6 +19,7 @@ package engine
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 
@@ -70,6 +71,92 @@ const (
 	// column triple).
 	edgePropsBatchSize = 10_000
 )
+
+// --- TryCypher pipeline support -------------------------------------------
+//
+// collectEdgeIDs and cypherExecReason are the two pieces of Task 13's
+// TryCypher pipeline (engine.go) that are pure functions of an already-
+// executed interpret.ResultSet/error rather than engine.Engine methods in
+// their own right, so -- like this file's materialization helpers above and
+// projectionValueKinds below -- they live here rather than in engine.go
+// itself.
+
+// collectEdgeIDs gathers every database edge id any OutEdge or OutPath
+// column of rs's rows references, translated from the forward-CSR index
+// each interpret.EdgeRef carries (e.Fwd) to the database edge id
+// materializeEdge/materializePath ultimately need (snap.OutEdgeIDs[e.Fwd]) --
+// exactly the key hydrateEdgePropsByID batches on.
+//
+// The returned slice may contain duplicates (the same edge reached via two
+// different rows or columns, or via more than one path segment) and is in
+// no particular order: hydrateEdgePropsByIDBatched already deduplicates its
+// input before issuing any query (dedupeUint64s), so there is no reason to
+// do that work twice here. A nil/empty return means rs carries no edge or
+// path value at all -- TryCypher's own signal to skip hydration, and with
+// it the post-hydration snapshotStillCurrent recheck, entirely for a
+// pure-scalar/node result that never touched anything hydration or the
+// recheck could catch.
+func collectEdgeIDs(snap *snapshot.Snapshot, rs *interpret.ResultSet) []uint64 {
+	var ids []uint64
+	for _, row := range rs.Rows {
+		for _, v := range row {
+			switch v.Kind {
+			case interpret.OutEdge:
+				ids = append(ids, snap.OutEdgeIDs[v.Edge.Fwd])
+			case interpret.OutPath:
+				if v.Path == nil {
+					continue
+				}
+				for _, e := range v.Path.Edges {
+					ids = append(ids, snap.OutEdgeIDs[e.Fwd])
+				}
+			}
+		}
+	}
+	return ids
+}
+
+// cypherExecReason maps one interpret.Execute error to the TryCypher decline
+// reason it logs, per the milestone's pinned sentinel-to-reason table:
+// interpret.ErrBudget (a MaxRows/MaxWork budget was exceeded) ->
+// reasonBudget; interpret.ErrCollation (the answer depends on PostgreSQL's
+// own collation) -> reasonCollation; interpret.ErrSelfEndpoint (mirrors
+// servePathQuery's own reasonSelfEndpoint decline, reused rather than
+// duplicated) -> reasonSelfEndpoint; interpret.ErrRuntimeCast,
+// interpret.ErrNotComparable, and interpret.ErrUnsupported (a runtime type
+// mismatch, a non-orderable comparison, and an AST shape the evaluator
+// itself does not recognize, respectively -- see each sentinel's own doc in
+// interpret/eval.go and interpret/value.go) -> reasonUnsupported, the same
+// "delegate, no further diagnosis needed" bucket Plan's own decline already
+// uses.
+//
+// Every other error -- including interpret's own unexported
+// errUnsupportedStep sentinel, which exec.go's doc comment deliberately
+// keeps unexported so that no caller (this one included) ever special-cases
+// it -- falls to reasonError, matching servePathQuery's own identical
+// catch-all. This is a deliberate, documented departure from naming
+// errUnsupportedStep's bucket "unsupported" explicitly: Go simply has no way
+// to errors.Is against an identifier this package does not export, and
+// exec.go's own doc explains why that is intentional, not an oversight this
+// function should work around (e.g. by matching on err.Error() text, which
+// would be one internal rename away from silently breaking). The decline
+// behavior -- return false, let the caller delegate to PostgreSQL -- is
+// identical either way; only the logged reason attr's exact label differs
+// for that one internal case.
+func cypherExecReason(err error) string {
+	switch {
+	case errors.Is(err, interpret.ErrBudget):
+		return reasonBudget
+	case errors.Is(err, interpret.ErrCollation):
+		return reasonCollation
+	case errors.Is(err, interpret.ErrSelfEndpoint):
+		return reasonSelfEndpoint
+	case errors.Is(err, interpret.ErrRuntimeCast), errors.Is(err, interpret.ErrNotComparable), errors.Is(err, interpret.ErrUnsupported):
+		return reasonUnsupported
+	default:
+		return reasonError
+	}
+}
 
 // --- Node/edge/path materialization -----------------------------------
 
