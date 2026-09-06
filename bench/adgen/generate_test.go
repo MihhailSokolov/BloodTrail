@@ -3,17 +3,38 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
+
+// pinNow overrides the package's nowFunc for the duration of t, so tests
+// that need Generate's *entire* output (including its timestamp fields) to
+// be reproducible across multiple calls don't depend on two calls landing
+// in the same wall-clock second. See nowFunc's doc comment in generate.go
+// for why Generate deliberately anchors timestamps to generation time
+// rather than to spec.Seed.
+func pinNow(t *testing.T, at time.Time) {
+	t.Helper()
+	orig := nowFunc
+	nowFunc = func() time.Time { return at }
+	t.Cleanup(func() { nowFunc = orig })
+}
 
 // TestGenerateDeterministic asserts that two calls to Generate with the same
 // Spec produce byte-for-byte (structurally) identical graphs: same node
-// order, same objectids, same edges. Generate must not rely on map
-// iteration order or any other nondeterministic source when it builds the
-// Nodes/Edges slices.
+// order, same objectids, same edges, same property bags. Generate must not
+// rely on map iteration order or any other nondeterministic source when it
+// builds the Nodes/Edges slices. Node timestamp properties are anchored to
+// nowFunc() rather than spec.Seed (see nowFunc's doc comment in
+// generate.go), so pinNow holds that fixed for the duration of this test --
+// otherwise two real-time calls landing a wall-clock second apart would
+// make this assertion flaky by construction, even though Generate's day
+// *offsets* would still agree.
 func TestGenerateDeterministic(t *testing.T) {
+	pinNow(t, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
 	spec := Spec{Users: 1000, Seed: 1}
 
 	a := Generate(spec)
@@ -38,7 +59,7 @@ func TestGenerateSeedVarianceProducesDifferentGraphs(t *testing.T) {
 
 // TestGenerateCounts pins down the deterministic (non-random) node/edge
 // count arithmetic described in the task brief for Users=1000: 1 domain (<
-// 50k users), Computers = Users/2, Groups = Users/5 (>=2 to hold the two
+// 50k users), Computers = Users/2, Groups = Users/5 (>=4 to hold the four
 // well-known groups), plus bounds on the edge count that hold for ANY seed
 // because only the group-nesting category (p=0.3 per non-special group) has
 // seed-dependent count; every other edge category has a fixed, seed-
@@ -50,7 +71,7 @@ func TestGenerateCounts(t *testing.T) {
 	const (
 		wantUsers     = users
 		wantComputers = users / 2
-		wantGroups    = users / 5 // includes the 2 well-known groups
+		wantGroups    = users / 5 // includes the 4 well-known groups
 		wantNodes     = wantUsers + wantComputers + wantGroups
 	)
 	if len(g.Nodes) != wantNodes {
@@ -104,9 +125,9 @@ func TestGenerateCounts(t *testing.T) {
 	//   AdminTo:         round(adminToCoverage*C)            =  250
 	//   HasSession:      round(hasSessionCoverage*C)         =  150
 	//   ACL:             round(aclDensityPerUser*users)+2    = 8002
-	//   nesting:         seed-dependent, in [0, groups-2]
+	//   nesting:         seed-dependent, in [0, groups-wellKnownGroupsPerDomain]
 	const fixedEdges = wantUsers + extraMemberOfPerUser*wantUsers + 250 + 150 + (8002)
-	maxEdges := fixedEdges + (wantGroups - 2)
+	maxEdges := fixedEdges + (wantGroups - wellKnownGroupsPerDomain)
 	// Lower bound: every user's MemberOf-to-hub edge is unique by
 	// construction (distinct StartIdx per user, same EndIdx/Kind), so
 	// dedup can never remove any of those.
@@ -387,6 +408,11 @@ func TestGenerateMultiDomainIsolation(t *testing.T) {
 //   - small Domains override with fewer than 50k users per domain works:
 //     Users=1000, Domains: 3 produces 3 domains of ~333 users each.
 func TestGenerateDomainsOverride(t *testing.T) {
+	// g2 vs g3 below compares two full Generate() calls for equality; pin
+	// nowFunc so their timestamp properties agree too (see pinNow's doc
+	// comment).
+	pinNow(t, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
+
 	// Test Domains: 2 override with Users: 150000 (automatic would be 3)
 	const users150k = 150_000
 	wantDomains := 2
@@ -458,5 +484,276 @@ func TestGenerateDomainsOverride(t *testing.T) {
 	}
 	if expectedTotal != smallUsers {
 		t.Fatalf("partition sum = %d, want %d", expectedTotal, smallUsers)
+	}
+}
+
+// TestGenerateWellKnownRIDGroupsPerDomain asserts that every domain gets
+// exactly one each of the four well-known, RID-suffixed groups the
+// cypherbench RID-suffix query shape (task 21) looks up: Domain Admins
+// (-512), Domain Users (-513), Domain Controllers (-516), and Enterprise
+// Admins (-519).
+func TestGenerateWellKnownRIDGroupsPerDomain(t *testing.T) {
+	g := Generate(Spec{Users: 1000, Seed: 3})
+	domains := domainCount(1000)
+
+	for _, suffix := range []string{"-512", "-513", "-516", "-519"} {
+		count := 0
+		for _, n := range g.Nodes {
+			if strings.HasSuffix(n.ObjectID, suffix) {
+				count++
+			}
+		}
+		if count != domains {
+			t.Fatalf("suffix %q: found %d nodes, want exactly %d (one per domain)", suffix, count, domains)
+		}
+	}
+}
+
+// TestGeneratePrincipalTimestampsAnchorToGenerationTime asserts the
+// resolution the task brief calls for: a principal's day-relative
+// timestamp properties (lastlogontimestamp here) are computed as
+// nowFunc() minus a seed-deterministic number of days, not as an absolute
+// point fixed by the seed. Generating the identical Spec at two different
+// "now" instants must produce the identical node (same objectid, since
+// objectid generation never touches nowFunc) with lastlogontimestamp
+// shifted by exactly the gap between those two instants -- proving the
+// per-node day *offset* survived unchanged while only the anchor moved.
+func TestGeneratePrincipalTimestampsAnchorToGenerationTime(t *testing.T) {
+	t1 := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2 := t1.Add(72 * time.Hour)
+	spec := Spec{Users: 200, Seed: 17}
+
+	pinNow(t, t1)
+	g1 := Generate(spec)
+	pinNow(t, t2)
+	g2 := Generate(spec)
+
+	u1 := firstUserNode(t, g1)
+	u2 := firstUserNode(t, g2)
+	if u1.ObjectID != u2.ObjectID {
+		t.Fatalf("first User node's objectid changed between generation times: %q vs %q (objectid must not depend on nowFunc)", u1.ObjectID, u2.ObjectID)
+	}
+
+	ts1, ok := u1.Props["lastlogontimestamp"].(int64)
+	if !ok {
+		t.Fatalf("node %q: lastlogontimestamp is %T, want int64", u1.ObjectID, u1.Props["lastlogontimestamp"])
+	}
+	ts2, ok := u2.Props["lastlogontimestamp"].(int64)
+	if !ok {
+		t.Fatalf("node %q: lastlogontimestamp is %T, want int64", u2.ObjectID, u2.Props["lastlogontimestamp"])
+	}
+
+	wantDelta := t2.Unix() - t1.Unix()
+	if gotDelta := ts2 - ts1; gotDelta != wantDelta {
+		t.Fatalf("lastlogontimestamp delta between generation times = %d, want %d (day offset should be seed-deterministic; only the anchor should move)", gotDelta, wantDelta)
+	}
+}
+
+func firstUserNode(t *testing.T, g Graph) Node {
+	t.Helper()
+	for _, n := range g.Nodes {
+		if containsKind(n.Kinds, "User") {
+			return n
+		}
+	}
+	t.Fatalf("no User node found in generated graph")
+	return Node{}
+}
+
+// TestGeneratePrincipalPropertyBags asserts the realistic-property-bag
+// shape the task brief calls for: every User/Computer node carries the
+// full common-principal field set (plus its kind-specific extras), the
+// per-field true/false split lands close to the brief's target
+// probabilities, and the mean marshaled JSON size across every principal
+// (User+Computer) node lands in the brief's 400-700 byte target window.
+// Users=5000 (a single domain, so exact arithmetic applies) is large
+// enough to make the sampled ratios a stable proxy for the underlying
+// per-node probabilities without slowing the test suite down.
+func TestGeneratePrincipalPropertyBags(t *testing.T) {
+	pinNow(t, time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC))
+
+	const wantUsers = 5000 // -> 2500 computers, 1000 groups, 1 domain
+	g := Generate(Spec{Users: wantUsers, Seed: 21})
+
+	var (
+		userCount, computerCount                             int
+		userEnabled, userAdminCount                          int
+		userHasSPN, userDontReqPreauth, userPwdNeverExpires  int
+		computerEnabled, computerAdminCount, computerHasLAPS int
+		principalBagBytes, principalCount                    int
+	)
+
+	for _, n := range g.Nodes {
+		switch {
+		case containsKind(n.Kinds, "User"):
+			userCount++
+			assertPrincipalCommonShape(t, n)
+			assertBoolProp(t, n, "hasspn")
+			assertBoolProp(t, n, "dontreqpreauth")
+			assertBoolProp(t, n, "pwdneverexpires")
+			if n.Props["enabled"].(bool) {
+				userEnabled++
+			}
+			if n.Props["admincount"].(bool) {
+				userAdminCount++
+			}
+			if n.Props["hasspn"].(bool) {
+				userHasSPN++
+			}
+			if n.Props["dontreqpreauth"].(bool) {
+				userDontReqPreauth++
+			}
+			if n.Props["pwdneverexpires"].(bool) {
+				userPwdNeverExpires++
+			}
+			principalBagBytes += marshaledSize(t, n)
+			principalCount++
+		case containsKind(n.Kinds, "Computer"):
+			computerCount++
+			assertPrincipalCommonShape(t, n)
+			assertStringProp(t, n, "operatingsystem")
+			assertBoolProp(t, n, "haslaps")
+			if n.Props["enabled"].(bool) {
+				computerEnabled++
+			}
+			if n.Props["admincount"].(bool) {
+				computerAdminCount++
+			}
+			if n.Props["haslaps"].(bool) {
+				computerHasLAPS++
+			}
+			principalBagBytes += marshaledSize(t, n)
+			principalCount++
+		}
+	}
+
+	if userCount != wantUsers {
+		t.Fatalf("User nodes = %d, want %d", userCount, wantUsers)
+	}
+	if computerCount != wantUsers/2 {
+		t.Fatalf("Computer nodes = %d, want %d", computerCount, wantUsers/2)
+	}
+
+	assertRatioWithin(t, "user enabled", userEnabled, userCount, 0.90, 0.99)
+	assertRatioWithin(t, "user hasspn", userHasSPN, userCount, 0.005, 0.05)
+	assertRatioWithin(t, "user dontreqpreauth", userDontReqPreauth, userCount, 0.001, 0.03)
+	assertRatioWithin(t, "user pwdneverexpires", userPwdNeverExpires, userCount, 0.15, 0.26)
+	assertRatioWithin(t, "user admincount", userAdminCount, userCount, 0.02, 0.09)
+
+	assertRatioWithin(t, "computer enabled", computerEnabled, computerCount, 0.90, 0.99)
+	assertRatioWithin(t, "computer admincount", computerAdminCount, computerCount, 0.02, 0.09)
+	assertRatioWithin(t, "computer haslaps", computerHasLAPS, computerCount, 0.50, 0.70)
+
+	meanBytes := float64(principalBagBytes) / float64(principalCount)
+	if meanBytes < 400 || meanBytes > 700 {
+		t.Fatalf("mean principal (User+Computer) JSON bag size = %.1f bytes, want in [400, 700]", meanBytes)
+	}
+	t.Logf("mean principal JSON bag size across %d nodes: %.1f bytes", principalCount, meanBytes)
+}
+
+// assertPrincipalCommonShape checks the property fields README.md
+// documents as shared by every User/Computer node.
+func assertPrincipalCommonShape(t *testing.T, n Node) {
+	t.Helper()
+	assertBoolProp(t, n, "enabled")
+	assertBoolProp(t, n, "admincount")
+	assertIntProp(t, n, "lastlogontimestamp")
+	assertIntProp(t, n, "pwdlastset")
+	assertIntProp(t, n, "whencreated")
+	assertStringProp(t, n, "samaccountname")
+	assertStringProp(t, n, "distinguishedname")
+
+	lastSeen := assertStringProp(t, n, "lastseen")
+	if _, err := time.Parse(time.RFC3339, lastSeen); err != nil {
+		t.Fatalf("node %q: lastseen %q does not parse as RFC3339: %v", n.ObjectID, lastSeen, err)
+	}
+}
+
+func assertBoolProp(t *testing.T, n Node, key string) {
+	t.Helper()
+	if _, ok := n.Props[key].(bool); !ok {
+		t.Fatalf("node %q: %s is %T, want bool", n.ObjectID, key, n.Props[key])
+	}
+}
+
+func assertIntProp(t *testing.T, n Node, key string) {
+	t.Helper()
+	if _, ok := n.Props[key].(int64); !ok {
+		t.Fatalf("node %q: %s is %T, want int64", n.ObjectID, key, n.Props[key])
+	}
+}
+
+func assertStringProp(t *testing.T, n Node, key string) string {
+	t.Helper()
+	v, ok := n.Props[key].(string)
+	if !ok || v == "" {
+		t.Fatalf("node %q: %s is %q (%T), want a non-empty string", n.ObjectID, key, n.Props[key], n.Props[key])
+	}
+	return v
+}
+
+func marshaledSize(t *testing.T, n Node) int {
+	t.Helper()
+	b, err := json.Marshal(n.Props)
+	if err != nil {
+		t.Fatalf("node %q: marshal properties: %v", n.ObjectID, err)
+	}
+	return len(b)
+}
+
+func assertRatioWithin(t *testing.T, label string, count, total int, lo, hi float64) {
+	t.Helper()
+	if total == 0 {
+		t.Fatalf("%s: total is 0, cannot compute ratio", label)
+	}
+	ratio := float64(count) / float64(total)
+	if ratio < lo || ratio > hi {
+		t.Fatalf("%s: ratio = %.4f (%d/%d), want in [%.4f, %.4f]", label, ratio, count, total, lo, hi)
+	}
+}
+
+// TestGenerateGroupPropertyBag asserts groups (including the well-known
+// RID-suffixed ones) carry admincount and a realistic-length description,
+// and that the admincount true-rate lands close to the brief's 10% target.
+func TestGenerateGroupPropertyBag(t *testing.T) {
+	g := Generate(Spec{Users: 5000, Seed: 21})
+
+	var groupCount, groupAdminCount int
+	for _, n := range g.Nodes {
+		if !containsKind(n.Kinds, "Group") {
+			continue
+		}
+		groupCount++
+		assertBoolProp(t, n, "admincount")
+		desc := assertStringProp(t, n, "description")
+		if len(desc) < 20 {
+			t.Fatalf("node %q: description %q is implausibly short (%d bytes)", n.ObjectID, desc, len(desc))
+		}
+		if n.Props["admincount"].(bool) {
+			groupAdminCount++
+		}
+	}
+
+	if groupCount == 0 {
+		t.Fatalf("no Group nodes found")
+	}
+	assertRatioWithin(t, "group admincount", groupAdminCount, groupCount, 0.04, 0.18)
+}
+
+// BenchmarkGenerate measures Generate's per-call wall-clock cost at a
+// moderate scale, including the per-node property-bag construction task 19
+// added -- the task brief's concern is that this "should not blow
+// generation time" once task 21 scales up to the milestone's 5M-node
+// benchmark target. Run with:
+//
+//	go test ./bench/adgen/ -bench=BenchmarkGenerate -benchtime=5x -run '^$'
+//
+// and extrapolate ns/op to nodes/sec; see the task-19 report for the
+// specific measurement and its extrapolation to 5M nodes.
+func BenchmarkGenerate(b *testing.B) {
+	spec := Spec{Users: 100_000, Seed: 1}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		Generate(spec)
 	}
 }

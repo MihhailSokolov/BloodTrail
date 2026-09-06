@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
+	"time"
 )
 
 // Spec parameterizes a synthetic AD-shaped graph: how many user principals
@@ -20,7 +22,10 @@ type Spec struct {
 // Node is a generated graph vertex. ObjectID is the synthetic AD objectid
 // (a SID-like string); Kinds always includes "Base" plus exactly one of
 // "User", "Computer", or "Group"; Props always carries "objectid" and
-// "name".
+// "name" plus a realistic bag of AD-shaped properties sized and
+// distributed to approximate the fixture-measured upstream reality -- see
+// README.md's "Property bags" section for the full shape table and the
+// determinism/timestamp caveat.
 type Node struct {
 	ObjectID string
 	Kinds    []string
@@ -98,6 +103,46 @@ const (
 	aclDensityPerUser = 8.0
 )
 
+// nowFunc returns the reference wall-clock time every generated node's
+// day-relative timestamp properties (lastlogontimestamp/pwdlastset/
+// whencreated/lastseen) are anchored to. It is a variable -- not a bare
+// time.Now() call inlined into Generate -- purely so tests can pin it to a
+// fixed instant and assert that Generate's *day offsets* are seed-
+// deterministic without also asserting exact wall-clock values (which
+// would make such an assertion flaky by construction). Production callers
+// (main.go) never touch this.
+//
+// This deliberately breaks with Generate's otherwise-total determinism
+// (see Generate's doc comment): real AD's own timestamp properties are
+// epoch seconds compared against datetime().epochseconds - N*86400 at
+// *query* time (see internal/graphtest/corpusfixture.go's "Time-dependent
+// predicates" section for the same tradeoff made by the milestone-4 corpus
+// fixture), so a graph whose timestamps were anchored to a seed-fixed
+// point in time would silently age out of any such window the longer it
+// sits unqueried after generation. Anchoring to generation time instead
+// means: the same -seed and -users always produce the same *offsets*
+// (which node is "recently active" vs. "stale" relative to every other
+// node, and by how many days), but the *absolute* timestamps differ run to
+// run by however long has passed between generation runs.
+var nowFunc = time.Now
+
+// wellKnownGroupsPerDomain is the number of well-known, RID-suffixed
+// groups every domain gets up front -- Domain Admins ("-512"), Domain
+// Users ("-513"), Domain Controllers ("-516"), and Enterprise Admins
+// ("-519"), the four RID suffixes the cypherbench query shape (task 21)
+// looks up -- before any synthetic group.
+const wellKnownGroupsPerDomain = 4
+
+// maxTimestampOffsetDays bounds how far into the past a principal's
+// lastlogontimestamp/pwdlastset/whencreated can be dated, relative to
+// nowFunc(): "epoch numbers spread over 0-400 days back" per the task
+// brief.
+const maxTimestampOffsetDays = 400
+
+// day is a calendar day, used only to convert maxTimestampOffsetDays (and
+// individual random day offsets) into a time.Duration.
+const day = 24 * time.Hour
+
 // domainCount returns the number of domains Generate splits users users
 // across for the given Spec.Users value: floor(users/50000), minimum 1.
 func domainCount(users int) int {
@@ -148,10 +193,11 @@ type domain struct {
 //
 //   - domains = spec.Domains if > 0, else max(1, Users/50000); Users,
 //     Computers (=Users/2 overall) and Groups (=Users/5 overall, floor,
-//     minimum 2 to hold the two well-known groups below) are partitioned
+//     minimum 4 to hold the four well-known groups below) are partitioned
 //     across domains as evenly as possible.
-//   - every domain has exactly one Domain Admins group (objectid suffix
-//     "-512") and one Domain Users hub (objectid suffix "-513").
+//   - every domain has exactly one each of four well-known, RID-suffixed
+//     groups: Domain Admins ("-512"), Domain Users ("-513", every user's
+//     hub), Domain Controllers ("-516"), and Enterprise Admins ("-519").
 //   - every user MemberOf the domain's Domain Users hub.
 //   - groups nest into an earlier group in the same domain with p=0.3,
 //     capped at nesting depth 5.
@@ -176,8 +222,11 @@ type domain struct {
 // users each) -- see README.md for the worked-out formula numbers at
 // that scale.
 //
-// Node kinds are always ["Base", <User|Computer|Group>]; properties are
-// always {"objectid": <ObjectID>, "name": <display name>}.
+// Node kinds are always ["Base", <User|Computer|Group>]; properties always
+// include "objectid" and "name" plus a realistic, deterministically
+// generated property bag (see README.md's "Property bags" section for the
+// full shape table and the timestamp-anchoring caveat covered by nowFunc's
+// doc comment above).
 func Generate(spec Spec) Graph {
 	users := spec.Users
 	if users < 0 {
@@ -197,31 +246,46 @@ func Generate(spec Spec) Graph {
 
 	domainInfo := make([]domain, domains)
 
+	// now anchors every generated node's timestamp properties for this
+	// entire call: one wall-clock read for the whole graph, not one per
+	// node (which would be needlessly slow and would make same-run nodes
+	// drift relative to each other for no reason). See nowFunc's doc
+	// comment for why this, rather than spec.Seed, is the timestamp
+	// anchor.
+	now := nowFunc()
+
 	for d := 0; d < domains; d++ {
 		u := usersPerDomain[d]
 		c := u / 2
 		g := u / 5
-		if g < 2 {
-			g = 2
+		if g < wellKnownGroupsPerDomain {
+			g = wellKnownGroupsPerDomain
 		}
 
 		sid := fmt.Sprintf("S-1-5-21-%d-%d-%d", rng.Uint32(), rng.Uint32(), rng.Uint32())
+		domainDN := fmt.Sprintf("DC=DOMAIN%d,DC=SYNTH", d)
 		rid := 1000
 
 		info := domain{}
 
 		info.adminsIdx = len(nodes)
-		nodes = append(nodes, newNode(sid+"-512", KindGroup, fmt.Sprintf("DOMAIN ADMINS@DOMAIN%d.SYNTH", d)))
+		nodes = append(nodes, newGroupNode(sid+"-512", fmt.Sprintf("DOMAIN ADMINS@DOMAIN%d.SYNTH", d), rng))
 
 		info.usersHubIx = len(nodes)
-		nodes = append(nodes, newNode(sid+"-513", KindGroup, fmt.Sprintf("DOMAIN USERS@DOMAIN%d.SYNTH", d)))
+		nodes = append(nodes, newGroupNode(sid+"-513", fmt.Sprintf("DOMAIN USERS@DOMAIN%d.SYNTH", d), rng))
 
-		info.groupIdx = []int{info.adminsIdx, info.usersHubIx}
-		for gi := 2; gi < g; gi++ {
+		domainControllersIdx := len(nodes)
+		nodes = append(nodes, newGroupNode(sid+"-516", fmt.Sprintf("DOMAIN CONTROLLERS@DOMAIN%d.SYNTH", d), rng))
+
+		enterpriseAdminsIdx := len(nodes)
+		nodes = append(nodes, newGroupNode(sid+"-519", fmt.Sprintf("ENTERPRISE ADMINS@DOMAIN%d.SYNTH", d), rng))
+
+		info.groupIdx = []int{info.adminsIdx, info.usersHubIx, domainControllersIdx, enterpriseAdminsIdx}
+		for gi := wellKnownGroupsPerDomain; gi < g; gi++ {
 			oid := fmt.Sprintf("%s-%d", sid, rid)
 			rid++
 			idx := len(nodes)
-			nodes = append(nodes, newNode(oid, KindGroup, fmt.Sprintf("GROUP%d@DOMAIN%d.SYNTH", gi, d)))
+			nodes = append(nodes, newGroupNode(oid, fmt.Sprintf("GROUP%d@DOMAIN%d.SYNTH", gi, d), rng))
 			info.groupIdx = append(info.groupIdx, idx)
 		}
 
@@ -230,7 +294,8 @@ func Generate(spec Spec) Graph {
 			oid := fmt.Sprintf("%s-%d", sid, rid)
 			rid++
 			idx := len(nodes)
-			nodes = append(nodes, newNode(oid, KindUser, fmt.Sprintf("USER%d@DOMAIN%d.SYNTH", ui, d)))
+			name := fmt.Sprintf("USER%d@DOMAIN%d.SYNTH", ui, d)
+			nodes = append(nodes, newUserNode(oid, name, domainDN, rng, now))
 			info.userIdx = append(info.userIdx, idx)
 		}
 
@@ -239,7 +304,8 @@ func Generate(spec Spec) Graph {
 			oid := fmt.Sprintf("%s-%d", sid, rid)
 			rid++
 			idx := len(nodes)
-			nodes = append(nodes, newNode(oid, KindComputer, fmt.Sprintf("COMPUTER%d.DOMAIN%d.SYNTH", ci, d)))
+			name := fmt.Sprintf("COMPUTER%d.DOMAIN%d.SYNTH", ci, d)
+			nodes = append(nodes, newComputerNode(oid, name, domainDN, rng, now))
 			info.compIdx = append(info.compIdx, idx)
 		}
 
@@ -283,15 +349,150 @@ func dedupEdges(edges []Edge) []Edge {
 	return out
 }
 
-func newNode(objectID, kind, name string) Node {
+// randomPastEpoch returns a Unix epoch-seconds timestamp somewhere in
+// [0, maxTimestampOffsetDays] days before now, chosen from rng. Every call
+// consumes exactly one rng.Intn draw, in the fixed order its callers make
+// them, which is what keeps Generate's day *offsets* seed-deterministic
+// even though now (and therefore the absolute timestamp this returns)
+// varies run to run -- see nowFunc's doc comment.
+func randomPastEpoch(rng *rand.Rand, now time.Time) int64 {
+	offsetDays := rng.Intn(maxTimestampOffsetDays + 1)
+	return now.Add(-time.Duration(offsetDays) * day).Unix()
+}
+
+// localPart returns the portion of name before its first occurrence of
+// sep, or name unchanged if sep does not appear -- e.g.
+// localPart("USER1@DOMAIN0.SYNTH", "@") == "USER1",
+// localPart("COMPUTER1.DOMAIN0.SYNTH", ".") == "COMPUTER1".
+func localPart(name, sep string) string {
+	if i := strings.Index(name, sep); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// principalCommonProps builds the property-bag fields shared by User and
+// Computer nodes: the fixture-measured shape (see README.md's "Property
+// bags" section) of enabled/admincount flags, three day-offset timestamps,
+// and the samaccountname/distinguishedname/lastseen identity fields every
+// AD principal carries. Callers add their own kind-specific fields
+// (hasspn etc. for User; operatingsystem/haslaps for Computer) to the
+// returned map.
+func principalCommonProps(objectID, name, dn, sam string, rng *rand.Rand, now time.Time) map[string]any {
+	enabled := rng.Float64() < 0.95
+	adminCount := rng.Float64() < 0.05
+	lastLogon := randomPastEpoch(rng, now)
+	pwdLastSet := randomPastEpoch(rng, now)
+	whenCreated := randomPastEpoch(rng, now)
+
+	return map[string]any{
+		"objectid":           objectID,
+		"name":               name,
+		"enabled":            enabled,
+		"admincount":         adminCount,
+		"lastlogontimestamp": lastLogon,
+		"pwdlastset":         pwdLastSet,
+		"whencreated":        whenCreated,
+		"samaccountname":     sam,
+		"distinguishedname":  dn,
+		"lastseen":           now.Format(time.RFC3339),
+	}
+}
+
+// newUserNode builds a User node: the shared principal bag (see
+// principalCommonProps) plus the three Kerberos/password-policy flags the
+// task brief calls out specifically for users.
+func newUserNode(objectID, name, domainDN string, rng *rand.Rand, now time.Time) Node {
+	local := localPart(name, "@")
+	dn := fmt.Sprintf("CN=%s,OU=Users,OU=Corp Accounts,%s", local, domainDN)
+	props := principalCommonProps(objectID, name, dn, strings.ToLower(local), rng, now)
+	props["hasspn"] = rng.Float64() < 0.02
+	props["dontreqpreauth"] = rng.Float64() < 0.01
+	props["pwdneverexpires"] = rng.Float64() < 0.20
+
+	return Node{ObjectID: objectID, Kinds: []string{KindBase, KindUser}, Props: props}
+}
+
+// newComputerNode builds a Computer node: the shared principal bag plus
+// operatingsystem/haslaps.
+func newComputerNode(objectID, name, domainDN string, rng *rand.Rand, now time.Time) Node {
+	local := localPart(name, ".")
+	dn := fmt.Sprintf("CN=%s,OU=Computers,OU=Corp Assets,%s", local, domainDN)
+	sam := strings.ToUpper(local) + "$"
+	props := principalCommonProps(objectID, name, dn, sam, rng, now)
+	props["operatingsystem"] = pickOperatingSystem(rng)
+	props["haslaps"] = rng.Float64() < 0.60
+
+	return Node{ObjectID: objectID, Kinds: []string{KindBase, KindComputer}, Props: props}
+}
+
+// newGroupNode builds a Group node: objectid/name plus admincount (10%)
+// and a realistic-length description, per the task brief. Well-known
+// groups (Domain Admins, Domain Users, Domain Controllers, Enterprise
+// Admins) use this same constructor as ordinary synthetic groups -- only
+// their objectid's RID suffix and name distinguish them.
+func newGroupNode(objectID, name string, rng *rand.Rand) Node {
 	return Node{
 		ObjectID: objectID,
-		Kinds:    []string{KindBase, kind},
+		Kinds:    []string{KindBase, KindGroup},
 		Props: map[string]any{
-			"objectid": objectID,
-			"name":     name,
+			"objectid":    objectID,
+			"name":        name,
+			"admincount":  rng.Float64() < 0.10,
+			"description": pickGroupDescription(rng),
 		},
 	}
+}
+
+// weightedOS is one entry in operatingSystems' cumulative-weight
+// distribution.
+type weightedOS struct {
+	os     string
+	weight float64
+}
+
+// operatingSystems is Computer nodes' operatingsystem distribution: mostly
+// modern builds, with a legacy tail whose strings are deliberately drawn
+// to match the pre-built Cypher corpus' own legacy-OS regex
+// ("(?i).*Windows.* (2000|2003|2008|2012|xp|vista|7|8|me|nt).*", see
+// testdata/prebuilt/agt.json and internal/graphtest/corpusfixture.go's
+// legacyOS pool) so cypherbench's legacy-computer queries (task 21) have
+// real rows to match in a generated benchmark graph, not only in the
+// smaller corpus fixture. Weights sum to 1.0.
+var operatingSystems = []weightedOS{
+	{"WINDOWS SERVER 2019 DATACENTER", 0.35},
+	{"WINDOWS 11 ENTERPRISE", 0.30},
+	{"WINDOWS SERVER 2022 DATACENTER", 0.15},
+	{"WINDOWS 10 ENTERPRISE", 0.10},
+	{"WINDOWS SERVER 2008 R2 STANDARD", 0.06},
+	{"WINDOWS 7 PROFESSIONAL", 0.04},
+}
+
+// pickOperatingSystem draws one operatingsystem value from operatingSystems
+// per its cumulative weights.
+func pickOperatingSystem(rng *rand.Rand) string {
+	r := rng.Float64()
+	cumulative := 0.0
+	for _, w := range operatingSystems {
+		cumulative += w.weight
+		if r < cumulative {
+			return w.os
+		}
+	}
+	return operatingSystems[len(operatingSystems)-1].os
+}
+
+// groupDescriptions are realistic-length (~60 byte) AD group description
+// strings; pickGroupDescription draws one uniformly at random.
+var groupDescriptions = []string{
+	"Members of this group have full administrative control.",
+	"Standard security group used for resource access control.",
+	"Distribution list synchronized from the on-premises directory.",
+	"Delegated group scoped to a single organizational unit.",
+}
+
+func pickGroupDescription(rng *rand.Rand) string {
+	return groupDescriptions[rng.Intn(len(groupDescriptions))]
 }
 
 // generateDomainEdges appends every edge belonging to one domain to edges
@@ -302,7 +503,7 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 	users := info.userIdx
 	comps := info.compIdx
 	groups := info.groupIdx
-	extraGroups := groups[2:] // every group except Domain Admins/Domain Users
+	extraGroups := groups[wellKnownGroupsPerDomain:] // every group except the four well-known ones
 
 	// 1. every user MemberOf the Domain Users hub.
 	for _, u := range users {
@@ -312,7 +513,7 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 	// 2. group nesting: each non-special group, with p=0.3, MemberOf a
 	// random earlier group in the same domain, capped at nesting depth 5.
 	depth := make([]int, len(groups))
-	for gi := 2; gi < len(groups); gi++ {
+	for gi := wellKnownGroupsPerDomain; gi < len(groups); gi++ {
 		if rng.Float64() >= 0.3 {
 			continue
 		}

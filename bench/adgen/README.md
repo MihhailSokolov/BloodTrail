@@ -17,16 +17,19 @@ The shape is driven entirely by `-users` and optionally by `-domains`:
 
 - **Domains**: by default, one domain per 50,000 users (minimum one). Pass
   `-domains N` to override with exactly N domains. Users, Computers
-  (`Users/2`), and Groups (`Users/5`, minimum 2) are split as evenly as
-  possible across domains. Large Active Directory forests typically have a
-  handful of domains rather than dozens; the 5M-node benchmark should be
+  (`Users/2`), and Groups (`Users/5`, minimum 4, to hold the four well-known
+  groups below) are split as evenly as possible across domains. Large
+  Active Directory forests typically have a handful of domains rather than
+  dozens; the 5M-node benchmark should be
   generated with `-domains 4` to match realistic domain density and path
   engine constraints (the engine's per-query SideBudget of 16 limits queries
   to forests with at most 16 Domain Admins groups in memory at once).
-- Every domain has exactly one **Domain Admins** group (objectid suffix
-  `-512`) and one **Domain Users** hub (objectid suffix `-513`), following
-  real AD's well-known RIDs. Every other principal gets a synthetic
-  domain-scoped RID starting at 1000.
+- Every domain has exactly one each of four **well-known, RID-suffixed
+  groups**, following real AD's well-known RIDs: **Domain Admins**
+  (`-512`), **Domain Users** (`-513`, every user's hub), **Domain
+  Controllers** (`-516`), and **Enterprise Admins** (`-519`) -- the four
+  RID suffixes the cypherbench RID-suffix query shape looks up. Every other
+  principal gets a synthetic domain-scoped RID starting at 1000.
 - Every **User** is a member of the domain's Domain Users hub, plus 8 extra
   `MemberOf` edges to random groups.
 - **Groups nest**: each non-well-known group has a 30% chance of being a
@@ -40,8 +43,9 @@ The shape is driven entirely by `-users` and optionally by `-domains`:
   `AddMember` edge from that group to Domain Admins) is always added on top
   of the random ACL noise, guaranteeing at least one multi-hop path from a
   user to Domain Admins in every generated graph.
-- Every node carries kinds `["Base", <User|Computer|Group>]` and properties
-  `{"objectid": ..., "name": ...}`.
+- Every node carries kinds `["Base", <User|Computer|Group>]` and a
+  realistic property bag beyond just `objectid`/`name` -- see "Property
+  bags" below.
 
 ### Edge density: ~10 edges per node, by default
 
@@ -73,15 +77,122 @@ nesting categories are randomized.
 
 Generation is a pure, deterministic function of `Spec{Users, Seed}`
 (`generate.go`'s `Generate`): the same `-users`/`-seed` pair always produces
-byte-for-byte the same graph. `generate_test.go` covers this at
-`-users 1000` (fast, no database needed): determinism, seed variance, exact
-node counts, one `-512` group per domain, every edge referencing a valid
-node index, and a guaranteed multi-hop path from a user to Domain Admins.
+the same graph *structure* -- same node/edge counts, same objectids, same
+edges, same boolean flags and day-offsets in every property bag. The one
+deliberate exception is wall-clock-anchored timestamp values (see "Property
+bags" below): those differ between two runs of the same `-users`/`-seed`
+pair by however much real time passed between the runs, even though the
+*offsets* they were computed from are identical. `generate_test.go` covers
+determinism at `-users 1000` (fast, no database needed): structural
+determinism (with the reference wall-clock time pinned, so property bags
+are checked byte-for-byte too), seed variance, exact node counts, one well-
+known RID-suffixed group of each kind per domain, every edge referencing a
+valid node index, and a guaranteed multi-hop path from a user to Domain
+Admins.
 
 Duplicate `(start, end, kind)` triples that the random edge categories can
 produce (e.g. two different categories independently choosing the same pair)
 are deduplicated before the graph is returned, since the database enforces
 `unique (start_id, end_id, kind_id, graph_id)` on the edge table.
+
+### Property bags
+
+Beyond `objectid`/`name`, every node carries a deterministically generated
+property bag sized and distributed to approximate fixture-measured upstream
+reality (mean ~8.5 properties / ~374 bytes per node overall; principals
+15-31 properties / 500-900 bytes in that measurement). This matters for the
+milestone's 5M-node cypher/memory benchmarks (task 21): a graph with only
+`{objectid, name}` on every node understates both memory footprint and the
+property-predicate work real Cypher queries do.
+
+| Field                 | User | Computer | Group | Notes                                                              |
+|-----------------------|:----:|:--------:|:-----:|---------------------------------------------------------------------|
+| `objectid`, `name`    | Y    | Y        | Y     | Always present (unchanged from before this property-bag work).      |
+| `enabled`              | Y    | Y        |       | 95% true.                                                            |
+| `admincount`           | Y    | Y        | Y     | 5% true for User/Computer, 10% true for Group.                       |
+| `lastlogontimestamp`   | Y    | Y        |       | Epoch seconds, 0-400 days before generation time (see below).       |
+| `pwdlastset`           | Y    | Y        |       | Epoch seconds, 0-400 days before generation time.                    |
+| `whencreated`          | Y    | Y        |       | Epoch seconds, 0-400 days before generation time.                    |
+| `samaccountname`       | Y    | Y        |       | Derived from the node's local name (lowercase for User, `NAME$` for Computer). |
+| `distinguishedname`    | Y    | Y        |       | Realistic-depth synthetic DN, ~90 bytes.                             |
+| `lastseen`             | Y    | Y        |       | RFC3339 string, set to generation time.                              |
+| `hasspn`               | Y    |          |       | 2% true.                                                             |
+| `dontreqpreauth`       | Y    |          |       | 1% true.                                                             |
+| `pwdneverexpires`      | Y    |          |       | 20% true.                                                            |
+| `operatingsystem`      |      | Y        |       | Weighted mix, mostly modern builds with a legacy tail (see below).   |
+| `haslaps`              |      | Y        |       | 60% true.                                                            |
+| `description`          |      |          | Y     | Realistic-length string, ~60 bytes.                                  |
+
+**Regenerating a graph**: re-running the identical `adgen -users N -seed S`
+command later reproduces the same topology, objectids, edges, and every
+flag/offset in each property bag -- but *not* byte-identical timestamp
+values, since those are anchored to wall-clock generation time rather than
+`-seed` (see "Timestamps are anchored to generation time" below). That is
+expected, not a determinism regression: don't diff two loads' raw
+`lastlogontimestamp`/`pwdlastset`/`whencreated`/`lastseen` values as a
+reproducibility check -- diff the node/edge structure and the boolean
+flags instead, the way `generate_test.go`'s determinism tests do.
+
+`operatingsystem`'s legacy tail (`WINDOWS SERVER 2008 R2 STANDARD`,
+`WINDOWS 7 PROFESSIONAL`) and modern majority (`WINDOWS SERVER 2019
+DATACENTER`, `WINDOWS 11 ENTERPRISE`, plus `WINDOWS SERVER 2022 DATACENTER`
+and `WINDOWS 10 ENTERPRISE`) are deliberately drawn from strings that match
+the pre-built Cypher corpus' own legacy-OS regex
+(`(?i).*Windows.* (2000|2003|2008|2012|xp|vista|7|8|me|nt).*`, see
+`testdata/prebuilt/agt.json` and `internal/graphtest/corpusfixture.go`'s
+`legacyOS` pool) -- see `generate.go`'s `operatingSystems` var.
+
+**Target**: mean marshaled-JSON bag size across every principal (User +
+Computer) node lands in 400-700 bytes;
+`TestGeneratePrincipalPropertyBags` in `generate_test.go` generates a
+sample graph, marshals every principal's bag, and asserts both the mean
+size and every flag's true-rate land within a generous tolerance band of
+their target probabilities above. `TestGenerateGroupPropertyBag` covers the
+Group shape the same way. Edge properties stay `{}` (see "Edges stay
+empty" below) and are not part of this target.
+
+#### Timestamps are anchored to generation time, not to `-seed`
+
+`lastlogontimestamp`/`pwdlastset`/`whencreated`/`lastseen` are computed
+from the wall-clock time `Generate` runs at (`time.Now()` at the top of the
+call, once for the whole graph), not from `-seed`. This is a deliberate
+departure from Generate's otherwise-total `-seed`/`-users` determinism:
+real AD's own timestamp properties are epoch seconds that Cypher hygiene
+queries compare against `datetime().epochseconds - N*86400` at *query*
+time (the milestone-4 corpus fixture,
+`internal/graphtest/corpusfixture.go`, makes this same tradeoff, see its
+"Time-dependent predicates" section). A graph whose timestamps were pinned
+to a `-seed`-derived point in time would silently age out of any such
+window the longer it sat unqueried after generation -- a `-seed 1` graph
+generated today and one generated next month would need identical
+"days-old" timestamps to both still look "recently active", which is only
+possible if the anchor moves with generation time.
+
+What *is* `-seed`/`-users`-deterministic is each node's **offset**: how
+many days before generation time its timestamps land, drawn from the same
+seeded `*rand.Rand` stream as every other flag. Re-running
+`-users 1000 -seed 1` next week reproduces the identical graph shape --
+same objectids, same edges, same enabled/admincount/hasspn/etc. flags, same
+*relative* recency ordering between nodes -- but every absolute timestamp
+value shifts by the week that passed. `nowFunc` in `generate.go` is the
+single seam this goes through (a package variable, not an inlined
+`time.Now()` call), which is what lets `generate_test.go` pin it to a fixed
+instant and assert full byte-for-byte reproducibility including timestamps
+when that matters, and separately assert (`TestGeneratePrincipalTimestampsAnchorToGenerationTime`)
+that only the anchor moves between two different pinned instants at the
+same seed.
+
+### Edges stay empty
+
+Edge rows are always written with `properties = {}` (see `main.go`'s
+`newEdgeCopySource`) -- `Edge` doesn't even have a `Props` field. This is
+deliberate, not an oversight: the milestone's path/cypher engine never
+keeps edge properties resident in memory (only node property bags and the
+graph topology are loaded), and no query in the pre-built Cypher corpus or
+the cypherbench query shape filters or projects on an edge property.
+Spending bytes on edge property bags at 5M nodes / ~50M edges would inflate
+load time and disk/network I/O for data no benchmarked code path ever
+reads.
 
 ### The `-users` knob and scale
 
@@ -145,7 +256,7 @@ the entire run, not just the remainder.
 |-----------|---------|------------------------------------------------------------------|
 | `-dsn`    | (none)  | PostgreSQL connection string. Required.                          |
 | `-users`  | `1000`  | Number of User principals; drives every other count (see above). |
-| `-seed`   | `1`     | Random seed; same seed + `-users` reproduces the same graph.     |
+| `-seed`   | `1`     | Random seed; same seed + `-users` reproduces the same graph structure and property-bag flags/offsets (timestamps re-anchor to the new run's generation time -- see "Property bags"). |
 | `-domains`| `0`     | Number of domains; `0` (default) uses automatic 1-per-50k rule, `N > 0` forces exactly N domains. |
 | `-wipe`   | `false` | Truncate `node`/`edge` (every graph) before loading.             |
 
