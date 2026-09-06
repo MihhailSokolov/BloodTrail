@@ -169,7 +169,7 @@ the path engine already has.
   roughly 16 bytes per edge on top of milestone 2's layout. Milestone 4 adds node
   properties and an objectid index on top of that in turn -- see
   [Cypher interpreter](#cypher-interpreter)'s own Memory note for the full formula and
-  the measured total at 5 million nodes / 48.9 million edges. `BLOODTRAIL_MEMORY_LIMIT`
+  the measured total at 4.76 million nodes / ~48.9 million edges. `BLOODTRAIL_MEMORY_LIMIT`
   (see Configuration above) caps the whole replica the same way it always has: a
   rebuild that would exceed it is refused, and the engine keeps serving (or falling
   back from) whatever snapshot it already had.
@@ -192,11 +192,19 @@ query BloodHound's UI ships.
   including `shortestPath(...)`/`allShortestPaths(...)`, and a range of aggregations
   (`COUNT`, `COLLECT` and the anti-join pattern it commonly feeds -- `WITH COLLECT(...)
   AS x ... WHERE NOT n IN x`) and `ORDER BY` where the ordering is unambiguous without
-  PostgreSQL's own collation. See `bench/cypherbench` for five representative shapes
-  measured end to end, and the root package's `*_corpus_integration_test.go` /
+  PostgreSQL's own collation. See the root package's `*_corpus_integration_test.go` /
   `random_cypher_differential_integration_test.go` for the differential suites that
   pin this behavior against a live PostgreSQL oracle across BloodHound's own pre-built
-  query corpus and randomly generated Cypher alike.
+  query corpus and randomly generated Cypher alike. Speed, honestly: of
+  `bench/cypherbench`'s five representative shapes measured at 4.76M nodes, one (an
+  objectid point lookup) is ~657x faster than delegating, one is unmeasured at this
+  scale (its pg baseline doesn't finish in reasonable time), and three currently miss
+  their target ratio -- two of them slower than plain PostgreSQL, for reasons specific
+  to each shape (a LIMIT the interpreter doesn't yet apply early; an unconstrained
+  shortestPath endpoint set; a scan pg's own index already narrows about as well). See
+  `bench/cypherbench/README.md`'s "Measured at 5M" table for the actual numbers and
+  the reasoning behind each -- this is real, imperfect, in-progress performance, not a
+  claim that every Cypher shape is already faster served locally.
 - **What always delegates.** Any query the interpreter's planner does not recognize at
   all; any query bound `$parameters` (BloodHound's own cypher endpoint never sends
   these, so a non-empty `params` map can only mean something this interpreter has no
@@ -213,8 +221,27 @@ query BloodHound's UI ships.
   question a PostgreSQL-backed serve would eventually ask -- without a database round
   trip -- and declines (delegating to PostgreSQL as usual) if the translator would have
   rejected it. This closes the gap between "the interpreter thinks it can answer this"
-  and "PostgreSQL would actually have accepted this query at all," so a served result
-  can never diverge from what PostgreSQL itself would have produced.
+  and "PostgreSQL would actually have accepted this query at all" -- it does not by
+  itself prove the two compute identical answers. That equivalence is established
+  empirically: every served query shape is differential-tested against a live
+  PostgreSQL oracle (the corpus and randomized suites named in "What is served" above),
+  not formally proven, and plan-time rejects exist specifically for every comparison/
+  ordering shape those suites found the two engines could otherwise disagree on.
+  **Known residual divergences** (both deliberately accepted, neither ever a *wrong*
+  row -- only a dropped one or a value that can differ by a small amount):
+  - A relational comparison (`<`/`<=`/`>`/`>=`) between a property and a statically
+    numeric expression casts the property to a number on both sides; if that property
+    holds a non-numeric value on some row, PostgreSQL aborts the whole query with a
+    runtime error, while the interpreter just drops that one row instead of erroring.
+    Unrealistic for real BloodHound timestamp-shaped data, which is why this shape is
+    still served rather than declined outright.
+  - `datetime()`'s epoch accessors are evaluated once, against BloodTrail's own host
+    clock, at the moment it starts executing the query -- a delegated query instead
+    evaluates PostgreSQL's `now()` on the database server's own clock, at whatever
+    later instant PostgreSQL itself runs it. The two values can differ by however much
+    the two clocks (and the two instants) drift apart -- ordinarily far too small to
+    change which rows an `inactive for N days`-style query returns, but a real
+    difference in principle, not merely a rounding note.
 - **Freshness.** Unlike milestone 3's kind-scoped builder-query freshness, Cypher
   serving uses the coarser whole-generation rule shortest-path queries already have:
   the replica must be the current, unmodified snapshot from the moment planning starts
@@ -247,11 +274,10 @@ query BloodHound's UI ships.
   - **The (global) kind name table**: negligible -- one entry per distinct node/edge
     kind name in the whole database, not per node or edge.
 
-  **Measured total**, 5 million nodes / 48.9 million edges (`bench/adgen`'s synthetic
-  Active Directory graph, with realistic per-node property bags): the whole replica's
-  `ApproxBytes` -- topology and builder-query indices, property bags, the objectid
-  index, and the kind name table together -- comes to 4,038,143,672 bytes, about
-  3851 MiB (roughly 3.76 GiB).
+  **Measured total**, 4.76 million nodes / ~48.9 million edges (`bench/adgen`'s
+  synthetic Active Directory graph, with realistic per-node property bags): the whole
+  replica's `ApproxBytes` -- topology and builder-query indices, property bags, the
+  objectid index, and the kind name table together -- comes to about 3.76 GiB (~4.0 GB).
 
 `BLOODTRAIL_MEMORY_LIMIT` bounds the whole replica -- topology, builder-query indices,
 properties, and the objectid index together -- exactly as it always has: a rebuild that
@@ -331,11 +357,22 @@ v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
 internal/engine/       The in-memory engine: snapshot rebuild/poller, kind-scoped
                        freshness marks, endpoint resolution and traversal, builder-query
                        serving, and the Cypher interpreter (internal/engine/interpret)
+cmd/bloodtrail/        CLI: installs/verifies/reports on/rolls back the driver in an
+                       existing BloodHound CE compose deployment
 bench/csrbench/        CSR traversal micro-benchmark (self-contained Go module)
 bench/adgen/           Generates a synthetic AD-shaped graph and loads it into PostgreSQL
 bench/pathbench/       Benchmarks the in-memory path engine against a loaded graph
 bench/builderbench/    Benchmarks query-builder serving against a loaded graph
 bench/cypherbench/     Benchmarks Cypher-interpreter serving against a loaded graph
+build/                 Builds a BloodHound CE image with the BloodTrail driver compiled
+                       in (build-image.sh) and the e2e smoke-test script (e2e.sh)
+patches/               The upstream BloodHound CE source patch this driver is built
+                       against (see Upstream versions below)
+scripts/               One-off tooling: extract-prebuilt-queries.go (regenerates
+                       testdata/prebuilt/ from an upstream checkout) and install.sh
+testdata/              Fixtures for the differential test suites: dawgs/ (ported from
+                       specterops/dawgs) and prebuilt/ (BloodHound's own pre-built
+                       Cypher query corpus, extracted by scripts/)
 ```
 
 ## Upstream versions

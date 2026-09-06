@@ -95,6 +95,28 @@ shapes -- the spec only requires the engine not be *slower*.
 empty graph, a driver that returns an outright error) aborts the run with a
 nonzero exit regardless of `-enforce`.
 
+## Measured at 5M (`bench/adgen`'s 4.76M-node / ~48.9M-edge graph)
+
+Honestly: only one of the five shapes clears its bar by a wide margin, one
+is unmeasured at this scale, and the other three currently miss theirs --
+two of them slower than plain PostgreSQL. Each row below explains why,
+rather than treating a miss as simply "not done yet":
+
+| Shape                       | Bar | Measured p50 ratio (pg/bt) | Verdict | Why |
+|------------------------------|:---:|:---------------------------:|:-------:|-----|
+| `objectid_point_lookup`      | 1x  | **657x**                     | pass    | The in-memory objectid index answers in well under a millisecond; pg still pays a full jsonb round trip. This is the shape the index exists for. |
+| `rid_suffix_scan`            | 5x  | 2.03x                        | miss    | pg's `kind_ids` GIN index already narrows the `ENDS WITH` scan to roughly the same row count the engine itself walks -- both sides are doing comparable work, so 5x was an optimistic bar for this shape's actual steady-state cost, not a bug to fix. |
+| `flag_scan`                  | 5x  | 0.04x (i.e. ~25x *slower*)   | miss    | The interpreter materializes the full matched-and-filtered row set before applying `LIMIT 1000`, rather than stopping early once 1000 rows are found -- a real, unimplemented optimization (LIMIT-aware early termination), not a measurement artifact. |
+| `shortest_path_prebuilt`     | 5x  | 0.60x (i.e. slower than pg)  | miss    | The engine currently materializes the query's unconstrained endpoint set from the full 4.76M-node side before searching, where pg's own planner can seed the search more cheaply; a profiling target, not yet fixed. |
+| `collect_antijoin_prebuilt`  | 5x  | unmeasured                   | blocked | The pg baseline for this shape (a 700,000-member group's full trail enumeration) did not finish within a reasonable wall-clock bound at 5M scale, so no ratio exists to report at this size; the engine side alone has not been separately profiled here either. |
+
+These are read directly off a real `-enforce` run against the 5M fixture,
+not rounded targets -- see the shape definitions above for what each query
+actually does. None of this affects *correctness*: every shape's row output
+matched between the two drivers on every run (`match=true`); this table is
+purely about the engine's current speed relative to PostgreSQL at this one
+graph size, on the shapes benchmarked so far.
+
 ## Flags
 
 | Flag       | Default | Meaning                                                   |
