@@ -406,6 +406,23 @@ func TestPlanRejectMatrix(t *testing.T) {
 			cypher: `MATCH (a:X)-[:X]->(b:X), p = shortestPath((s:X)-[:X*1..]->(t:X)) WHERE s<>t RETURN a`,
 			want:   true,
 		},
+
+		// Fix (review finding, this task): pg statically types `+` between
+		// two raw property lookups as string concatenation unconditionally,
+		// regardless of what they hold at runtime
+		// (isConcatenationOperation's "both operands are property lookups"
+		// branch, dawgs@v0.8.0 cypher/models/pgsql/translate/expression.go)
+		// -- this project's own `n.score + n.score` over numeric scores
+		// used to silently serve a numeric 84 where pg returns the
+		// concatenated string "4242". Reproducing pg's choice would mean
+		// rendering an arbitrary JSON scalar exactly as pg's own jsonb
+		// `->>` operator does, which this package declines (see applyAdd's
+		// own doc, eval.go) -- and no corpus query needs this shape -- so
+		// checkArithmetic rejects it outright at plan time instead. See
+		// classifyAddOperand (eval.go) for the shared static classifier.
+		{name: "arithmetic + both operands property lookups rejected", cypher: `MATCH (n:User),(m:Computer) RETURN n.a + m.b AS x`, want: false},
+		{name: "arithmetic + same property lookup added to itself rejected", cypher: `MATCH (n:User) RETURN n.score + n.score AS x`, want: false},
+		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) RETURN n.a + 1 AS x`, want: true},
 	}
 
 	runPlanGolden(t, snap, cases)

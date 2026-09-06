@@ -532,9 +532,24 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 // adjacency-slot-inspection unit meter.spend already charges elsewhere in
 // this package, so remaining MaxWork divided by that estimate is a
 // unit-correct bound on how many such runs the query's own budget can
-// afford. strategyPairs' own per-pair cost (a bounded two-sided BFS) never
-// exceeds one full-graph BFS in the worst case, so the same, deliberately
-// conservative estimate also safely bounds PairBudget.
+// afford.
+//
+// strategyPairs' own per-pair cost is reused for PairBudget from the exact
+// same estimate, but that reuse is looser than a literal reading of "one
+// full-graph BFS" would suggest -- pairShortest (bfs.go) runs a bounded
+// bidirectional meet-in-the-middle search (phase 1, worst case comparable
+// to one full BFS) and then, once the distance is known, TWO more full,
+// depth-capped bfsFrom calls to populate both distance buffers for
+// enumeration (phase 2) -- roughly 2-4x one full-graph BFS worst case
+// overall, not the <=1x this comment previously (incorrectly) claimed. The
+// arithmetic below is unchanged by this correction: PairBudget is still
+// only ever widened past traverse's own package default, never narrowed,
+// so nothing here regresses today's behavior -- but "safely bounds" is too
+// strong a claim for what is actually a same-order-of-magnitude estimate,
+// not a tight one; a query whose real per-pair cost sits at the upper end
+// of that 2-4x range can still spend a small multiple of the override this
+// function computes before meter.spend's own accounting (the actual
+// enforcement mechanism) catches up.
 func strategyBudgetOverrides(meter *workMeter, snap *snapshot.Snapshot) (sideBudget, pairBudget int) {
 	if meter.budget.MaxWork <= 0 {
 		return 0, 0

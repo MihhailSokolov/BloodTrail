@@ -1717,32 +1717,47 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 // whatever Tri this returns the ordinary way, so NOT needs no special
 // handling of its own).
 //
-// This package accepts only the one shape pg's own translation supports
-// for it (verified against dawgs@v0.8.0's cypher/models/pgsql/translate/
-// predicate.go): a SINGLE, FIXED-LENGTH relationship step between two node
-// patterns that are BARE REFERENCES to already-pattern-bound node
-// variables. The grammar for a pattern predicate is exactly one
-// oC_RelationshipsPattern -- oC_NodePattern (oC_PatternElementChain)+ --
-// which can itself be a multi-hop chain (`(a)-[:X]->(b)-[:Y]->(c)`, 5
-// PatternElements: Node, Rel, Node, Rel, Node); pg's own
-// translatePatternPredicate rejects any such chain that resolves to more
-// or less than one internal PatternPart with "expected exactly one pattern
-// part for pattern predicate", which this package mirrors far more simply
-// as len(PatternElements) == 3 (exactly one relationship, i.e. one hop):
-// PatternPredicateVisitor (frontend/pattern.go) flattens the whole chain
-// into one PatternElements slice regardless of hop count, so any chain
-// longer than one hop produces more than 3 elements and rejects here --
-// delegating the whole query to PostgreSQL is this package's only fallback
-// for that shape either way, so declining at Plan time rather than at
-// translate time costs nothing.
+// This package accepts only a narrow slice of what pg's own translation can
+// actually do for a pattern predicate (verified against dawgs@v0.8.0's
+// cypher/models/pgsql/translate/predicate.go): a SINGLE, FIXED-LENGTH
+// relationship step between two node patterns that are BARE REFERENCES to
+// already-pattern-bound node variables. The grammar for a pattern predicate
+// is exactly one oC_RelationshipsPattern -- oC_NodePattern
+// (oC_PatternElementChain)+ -- which can itself be a multi-hop chain
+// (`(a)-[:X]->(b)-[:Y]->(c)`, 5 PatternElements: Node, Rel, Node, Rel,
+// Node); PatternPredicateVisitor (frontend/pattern.go) flattens the whole
+// chain into one PatternElements slice regardless of hop count, so any
+// chain longer than one hop produces more than 3 elements and rejects here
+// via len(PatternElements) == 3.
+//
+// This is NOT a mirror of some pg limitation, and an earlier version of
+// this comment overstated one: pg's own buildPatternPredicates (predicate.go)
+// has a general path -- distinct from its "optimized" single-hop existence
+// fast path (buildOptimizedRelationshipExistPredicate) -- that lowers a
+// multi-hop pattern predicate into a correlated CTE chain, one CTE per
+// TraversalStep, each built the same way an ordinary MATCH step would be
+// (buildTraversalPatternRootWithOuterCorrelation for the row-correlated
+// root step, then buildTraversalPatternStep per subsequent hop), wrapped in
+// `EXISTS(SELECT ... FROM <last CTE> WHERE COUNT(*) > 0)`. The "expected
+// exactly one pattern part" error translatePatternPredicate raises guards a
+// different case entirely (more than one comma-separated PatternPart inside
+// one predicate, a shape this grammar cannot even produce), not hop count --
+// a multi-hop chain is still exactly one PatternPart, just with more than
+// one TraversalStep, which that general path's own per-step loop handles
+// directly. So pg genuinely CAN answer a multi-hop pattern predicate; this
+// package declining one is a deliberate scope cut (evalPatternPredicate is
+// only ever a pure two-endpoint adjacency probe, hasAdjacentEdge, with
+// nothing resembling that general path's row-correlated multi-step
+// machinery), not something forced by pg's own capabilities.
 //
 // Also rejected, all deliberately conservative narrowings this package's
 // required corpus never needs (REJECTED delegates to PostgreSQL, which is
 // always safe, per the milestone's own established convention):
-//   - Range != nil (`(n)-[:K*1..]->(m)` inside a pattern predicate): pg's
-//     own buildPatternPredicates rejects this outright ("expansion in
-//     pattern predicate not supported"), so this package must too rather
-//     than silently plan a shape pg itself cannot translate.
+//   - Range != nil (`(n)-[:K*1..]->(m)` inside a pattern predicate): this
+//     one IS a genuine pg limitation -- buildPatternPredicates' per-step
+//     loop explicitly rejects it outright ("expansion in pattern predicate
+//     not supported"), so this package must too rather than silently plan
+//     a shape pg itself cannot translate.
 //   - A named relationship variable (`(n)-[r:K]->(m)`): existence-only
 //     evaluation (evalPatternPredicate) never binds anything from inside a
 //     pattern predicate, matching pg's own semantics (a pattern predicate
@@ -1757,13 +1772,14 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 //     required corpus always writes both endpoints as bare references to
 //     variables the outer MATCH already bound (e.g. `WHERE
 //     (n)-[:K]-(m)` after `MATCH (n:Domain)...(m:Domain)`); pg's own
-//     translation *does* appear to support introducing a fresh/anonymous
-//     node inside a pattern predicate (a genuine existential subquery over
-//     a new variable, not merely a semi-join against an existing binding),
-//     but this package implements nothing to resolve a fresh node's own
-//     constraints inside evalPatternPredicate's pure two-endpoint adjacency
-//     check, so that broader shape stays planner-rejected rather than
-//     mis-served.
+//     general path resolves a fresh/anonymous node exactly the way it
+//     resolves one in an ordinary MATCH (a genuine existential subquery
+//     over a new variable, not merely a semi-join against an existing
+//     binding), so -- like the multi-hop case above -- this is this
+//     package's own scope cut, not a pg mirror: evalPatternPredicate
+//     implements nothing to resolve a fresh node's own constraints inside
+//     its pure two-endpoint adjacency check, so that broader shape stays
+//     planner-rejected rather than mis-served.
 func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 	if pp == nil || len(pp.PatternElements) != 3 {
 		return false
@@ -1954,11 +1970,33 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 // too -- accepting it in Plan would guarantee a runtime ErrUnsupported bail
 // on the very first row, wasting the whole materialization pass before
 // falling back to delegation anyway.
+//
+// One additional rejection, specific to `+`: pg's own translation
+// statically types two raw property lookups added together as string
+// concatenation, unconditionally, regardless of what they hold at runtime
+// (isConcatenationOperation's "both operands are property lookups" branch --
+// see applyAdd's doc comment in eval.go for the full pg-parity investigation
+// and the review finding this closes: `n.score + n.score` over numeric
+// scores used to silently serve a numeric 84 where pg returns the
+// concatenated string "4242"). Reproducing pg's choice would mean rendering
+// an arbitrary JSON scalar exactly as pg's own jsonb `->>` operator does,
+// which this package's established "no unpinned rendering reproduction"
+// convention declines to attempt (see applyAdd's doc again) -- and no
+// corpus query needs this shape -- so it is simplest and safest to delegate
+// the whole query here instead of ever computing a per-row answer for it.
+//
+// This can only ever apply to the chain's very first `+` (ae.Left paired
+// with ae.Partials[0].Right): a flat Cypher arithmetic chain folds
+// left-associatively, so for every later `+` the true left operand is
+// whatever the preceding folds already produced -- never, itself, a literal
+// PropertyLookup AST node -- exactly mirroring why pg's own nested
+// pgsql.BinaryExpression tree can only ever see two literal property-lookup
+// operands at that same first position.
 func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
 	}
-	for _, p := range ae.Partials {
+	for i, p := range ae.Partials {
 		if p == nil {
 			return false
 		}
@@ -1968,6 +2006,11 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 			return false
 		}
 		if !pb.checkExpr(p.Right, false) {
+			return false
+		}
+		if i == 0 && p.Operator == cypher.OperatorAdd &&
+			classifyAddOperand(ae.Left) == addPropertyLookup &&
+			classifyAddOperand(p.Right) == addPropertyLookup {
 			return false
 		}
 	}

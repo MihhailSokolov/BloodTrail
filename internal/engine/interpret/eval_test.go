@@ -613,15 +613,18 @@ func TestEvalArithmetic(t *testing.T) {
 	})
 }
 
-// TestEvalStringConcatenation pins gap (b)'s fix (task 16b): `+` between two
-// runtime strings concatenates (applyAdd's own doc comment pins the full
-// pg-parity investigation and the safety argument for every other case
-// here).
+// TestEvalStringConcatenation pins gap (b)'s fix (task 16b) as corrected by
+// this task's own review finding: `+` is disambiguated STATICALLY, from
+// each operand's AST shape (classifyAddOperand), never from what it
+// evaluates to at runtime -- applyAdd's own doc comment pins the full
+// pg-parity investigation, the review finding that replaced the earlier
+// runtime-sniffing implementation, and the safety argument for every case
+// exercised here.
 func TestEvalStringConcatenation(t *testing.T) {
 	f := newFixture(t)
 	env := f.env()
 
-	t.Run("string literal + string property concatenates", func(t *testing.T) {
+	t.Run("string-lit+string-prop concat", func(t *testing.T) {
 		val, ok, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN 'CN=' + n.name"))
 		if err != nil || !ok {
 			t.Fatalf("got err=%v ok=%v", err, ok)
@@ -631,7 +634,7 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
-	t.Run("string property + string literal concatenates (operand order reversed)", func(t *testing.T) {
+	t.Run("string-prop+string-lit concat (operand order reversed)", func(t *testing.T) {
 		val, ok, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN n.name + '-x'"))
 		if err != nil || !ok {
 			t.Fatalf("got err=%v ok=%v", err, ok)
@@ -641,18 +644,24 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
-	t.Run("both operands string properties concatenates", func(t *testing.T) {
+	// prop+prop: checkArithmetic (plan.go) rejects this shape at plan time
+	// (TestPlanRejectMatrix's "arithmetic + both operands property lookups
+	// rejected" pins that), so a served query never reaches this. Called
+	// directly here anyway (bypassing Plan, as every other test in this
+	// file does), applyAdd's defensive branch bails ErrUnsupported rather
+	// than guess -- it must NOT silently concatenate (which the runtime
+	// value happening to be two strings would previously have done) nor
+	// silently add, since neither answer is provably the one pg would give
+	// for every runtime shape this AST pairing can produce.
+	t.Run("prop+prop bails ErrUnsupported (defensive; Plan rejects this shape)", func(t *testing.T) {
 		row := f.tworow("n", 200, "m", 960) // 960's name = "beta"
-		val, ok, err := EvalValue(env, row, returnExprOf(t, "MATCH (n),(m) RETURN n.name + m.name"))
-		if err != nil || !ok {
-			t.Fatalf("got err=%v ok=%v", err, ok)
-		}
-		if val != "AZUREADKERBEROS.TEST.LOCALbeta" {
-			t.Fatalf("got %#v, want %q", val, "AZUREADKERBEROS.TEST.LOCALbeta")
+		_, _, err := EvalValue(env, row, returnExprOf(t, "MATCH (n),(m) RETURN n.name + m.name"))
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("err = %v, want ErrUnsupported", err)
 		}
 	})
 
-	t.Run("absent property makes the whole concatenation NULL, not an error", func(t *testing.T) {
+	t.Run("string-lit+absent property is NULL, not an error", func(t *testing.T) {
 		// Node 100 has no "name" property at all -- mirrors applyArithmetic's
 		// existing, unchanged absent-operand contract (a==nil||b==nil -> NULL)
 		// which this fix's applyAdd is layered underneath, not around.
@@ -665,27 +674,61 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
-	t.Run("string + non-string bool property bails ErrRuntimeCast", func(t *testing.T) {
+	t.Run("string-lit+non-string bool-prop bails ErrRuntimeCast", func(t *testing.T) {
 		_, _, err := EvalValue(env, f.row("n", 700), returnExprOf(t, "MATCH (n) RETURN 'x' + n.flag"))
 		if !errors.Is(err, ErrRuntimeCast) {
 			t.Fatalf("err = %v, want ErrRuntimeCast", err)
 		}
 	})
 
-	t.Run("non-string numeric property + string bails ErrRuntimeCast", func(t *testing.T) {
+	t.Run("number-prop+string-lit bails ErrRuntimeCast (concat semantics, non-string number)", func(t *testing.T) {
 		_, _, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN n.score + 'x'"))
 		if !errors.Is(err, ErrRuntimeCast) {
 			t.Fatalf("err = %v, want ErrRuntimeCast", err)
 		}
 	})
 
-	t.Run("neither operand a string still does ordinary numeric addition", func(t *testing.T) {
+	t.Run("string-lit+number-prop bails ErrRuntimeCast (exact operand order)", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN 'x' + n.score"))
+		if !errors.Is(err, ErrRuntimeCast) {
+			t.Fatalf("err = %v, want ErrRuntimeCast", err)
+		}
+	})
+
+	t.Run("number-prop+number-lit adds (neither operand statically Text)", func(t *testing.T) {
 		val, ok, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN n.score + 1"))
 		if err != nil || !ok {
 			t.Fatalf("got err=%v ok=%v", err, ok)
 		}
 		if val != float64(43) {
 			t.Fatalf("got %#v, want 43", val)
+		}
+	})
+
+	t.Run("1+number-prop adds (exact operand order)", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN 1 + n.score"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != float64(43) {
+			t.Fatalf("got %#v, want 43", val)
+		}
+	})
+
+	// 1+string-prop: neither operand is statically Text (1 is a plain
+	// numeric literal, n.name is a property lookup, not both are property
+	// lookups), so this takes NUMERIC semantics -- and n.name evaluates to
+	// a genuine runtime string, so it bails ErrRuntimeCast rather than
+	// silently concatenate. This is the shape a purely runtime-sniffing
+	// implementation risks getting wrong (grouping "not statically Text"
+	// with "whatever it evaluates to" and treating two runtime strings as
+	// automatic concatenation): pg's own `(properties->>'name')::numeric`
+	// cast would itself raise a runtime error for this row, which this
+	// bail mirrors instead of guessing.
+	t.Run("1+string-prop bails ErrRuntimeCast (numeric semantics, runtime string)", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN 1 + n.name"))
+		if !errors.Is(err, ErrRuntimeCast) {
+			t.Fatalf("err = %v, want ErrRuntimeCast", err)
 		}
 	})
 
