@@ -543,7 +543,7 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //     same moment would no longer produce.
 //
 //  12. Build the served result via buildCypherRowsResult (serve_cypher.go),
-//     which -- the same I2 fail-safe as step 9 -- eagerly materializes
+//     which -- the same recovered-panic fail-safe as step 9 -- eagerly materializes
 //     every row right there, under its own recover, rather than the lazy,
 //     one-row-at-a-time materialization a graph.Result normally performs
 //     inside Next(): a panic during materialization must be caught HERE,

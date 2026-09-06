@@ -285,11 +285,12 @@ func TestTryCypherDifferential(t *testing.T) {
 		}
 		multiKindEndID = multiEndNode.ID
 
-		// C1 differential coverage: PostgreSQL enforces no uniqueness
-		// constraint on objectid, so real data can (and does) contain more
-		// than one node sharing the same value. An objectid anchor that
-		// silently picked just one match would under-serve relative to the
-		// pg oracle, which naturally returns both rows for this query.
+		// Duplicate-objectid differential coverage: PostgreSQL enforces no
+		// uniqueness constraint on objectid, so real data can (and does)
+		// contain more than one node sharing the same value. An objectid
+		// anchor that silently picked just one match would under-serve
+		// relative to the pg oracle, which naturally returns both rows for
+		// this query.
 		if _, err := tx.CreateNode(graph.NewProperties().Set("objectid", "DUP-OID"), propNodeKind); err != nil {
 			return err
 		}
@@ -379,7 +380,7 @@ func TestTryCypherDifferential(t *testing.T) {
 			text: `MATCH (n:PropNode) WHERE n.name = 'Administrator' RETURN n`,
 		},
 		{
-			// C1: two PropNode instances share objectid "DUP-OID" (seeded
+			// Two PropNode instances share objectid "DUP-OID" (seeded
 			// above); both must come back, matching the pg oracle's row
 			// count exactly.
 			name: "duplicate objectid anchor returns every match",

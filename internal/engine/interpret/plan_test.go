@@ -618,14 +618,14 @@ RETURN m`,
 			want: true,
 		},
 		{
-			// I3 regression: the corpus's own "Users with passwords not
-			// rotated in over 1 year" / "... inactive for 60 days" shape --
-			// a carried numeric WITH alias buried inside arithmetic buried
-			// inside a datetime()-epoch subtraction, not a bare top-level
-			// reference to the alias. isStaticallyNumericScalar must resolve
-			// numericScalars at every nesting depth, not just the top one,
-			// or this regresses to a spurious decline (found and fixed
-			// during this same review's own corpus differential re-run).
+			// Regression coverage for the corpus's own "Users with
+			// passwords not rotated in over 1 year" / "... inactive for 60
+			// days" shape -- a carried numeric WITH alias buried inside
+			// arithmetic buried inside a datetime()-epoch subtraction, not
+			// a bare top-level reference to the alias. isStaticallyNumericScalar
+			// must resolve numericScalars at every nesting depth, not just
+			// the top one, or this regresses to a spurious decline (found
+			// and fixed during a corpus differential re-run).
 			name: "carried numeric WITH alias nested inside datetime epoch arithmetic still accepted",
 			cypher: `WITH 60 as inactive_days
 MATCH (n:User)
