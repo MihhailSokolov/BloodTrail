@@ -78,15 +78,22 @@
 //
 // A shortestPath()/allShortestPaths() Step is not expanded by growing rows
 // one adjacency hop at a time the way a tree Step is (see runComponent's
-// dispatch below): both of its pattern endpoints are resolved to complete
-// in-memory node sets FIRST (resolveEndpointSet, reusing scanAnchor's own
-// id/objectid/kind-bitmap/full-scan anchoring plus each endpoint's pushed,
-// single-symbol WHERE predicates -- this is the in-memory replacement for
-// the live-PG endpoint resolution an earlier milestone used), and only then
-// handed to traverse.AllShortestPaths as one Roots x Terminals query.
-// This mirrors dawgs' own translation: a shortestPath()/allShortestPaths()
-// call compiles to a single recursive-CTE search seeded from *two* resolved
-// node sets, not a chain of per-row hops.
+// dispatch below): both of its pattern endpoints are resolved to a
+// traverse.Endpoint FIRST (resolveEndpoint), then handed to
+// traverse.AllShortestPaths as one Roots x Terminals query. resolveEndpoint
+// only actually materializes a concrete node-id set for a *narrowing* side
+// (ids/objectid/predicates present -- reusing scanAnchor's own
+// id/objectid/full-scan anchoring plus each endpoint's pushed, single-symbol
+// WHERE predicates, the in-memory replacement for the live-PG endpoint
+// resolution an earlier milestone used); a kinds-only side is instead handed
+// to traverse as a lazy kind bitmap it can iterate/probe directly, and a
+// truly unconstrained side as traverse's own "matches every node" sentinel
+// -- neither ever visits a candidate node one at a time the way scanAnchor
+// does, since traverse's own dispatch (below) already picks whichever side
+// is cheapest to seed a search from without this package doing that work
+// twice. This mirrors dawgs' own translation: a shortestPath()/
+// allShortestPaths() call compiles to a single recursive-CTE search seeded
+// from *two* resolved node sets, not a chain of per-row hops.
 
 package interpret
 
@@ -351,16 +358,16 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		return nil, errUnsupportedStep
 	}
 
-	roots, err := resolveEndpointSet(env, meter, step.FromSym, part.Nodes[step.FromSym])
+	roots, err := resolveEndpoint(env, meter, step.FromSym, part.Nodes[step.FromSym])
 	if err != nil {
 		return nil, err
 	}
-	terminals, err := resolveEndpointSet(env, meter, step.ToSym, part.Nodes[step.ToSym])
+	terminals, err := resolveEndpoint(env, meter, step.ToSym, part.Nodes[step.ToSym])
 	if err != nil {
 		return nil, err
 	}
 
-	if !step.HasExplicitEndpointInequality && idsIntersect(roots, terminals) {
+	if !step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap.NodeCount(), roots, terminals) {
 		return nil, ErrSelfEndpoint
 	}
 
@@ -377,8 +384,8 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 	sideBudget, pairBudget := strategyBudgetOverrides(meter, env.Snap)
 
 	q := traverse.Query{
-		Roots:       traverse.Endpoint{IDs: roots},
-		Terminals:   traverse.Endpoint{IDs: terminals},
+		Roots:       roots,
+		Terminals:   terminals,
 		Kinds:       kindMaskFor(env, step.EdgeKinds),
 		Mode:        mode,
 		ExcludeSelf: step.HasExplicitEndpointInequality,
@@ -671,23 +678,126 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 	return ids, nil
 }
 
-// idsIntersect reports whether ascending-ordered a and b share any element,
-// via a linear ascending merge (both scanAnchor's kind-bitmap iteration and
-// its id()/objectid/full-scan branches already produce ascending, deduped
-// output, so no sort is needed here).
-func idsIntersect(a, b []snapshot.NodeID) bool {
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch {
-		case a[i] == b[j]:
-			return true
-		case a[i] < b[j]:
-			i++
-		default:
-			j++
+// resolveEndpoint builds a traverse.Endpoint for one side (sym, constrained
+// by nc) of a shortestPath()/allShortestPaths() pattern, materializing a
+// concrete node-id set only when nc actually narrows the candidate set --
+// see this file's package doc comment for why a wide side left unmaterialized
+// is the whole point of this function existing instead of always calling
+// resolveEndpointSet:
+//
+//   - nc == nil, or nc carries no kind/id/objectid/predicate constraint at
+//     all (the symbol is truly unconstrained) -> traverse.Endpoint{}, the
+//     same "matches every node" sentinel traverse's own dispatch already
+//     understands (traverse.Endpoint.Unconstrained doc).
+//   - nc has one or more Kinds and nothing else (no ids/objectid/
+//     predicates) -> traverse.Endpoint{Bits: ...}: a single kind reuses the
+//     snapshot's own live per-kind bitmap directly (kindsEndpointBitmap), a
+//     multi-kind AND intersects them into a freshly allocated one. Neither
+//     case visits candidates one at a time the way scanAnchor does, so this
+//     is the fix for the wide-kinds-only-side cost this file's package doc
+//     describes.
+//   - anything that actually narrows the set (ids and/or an objectid anchor
+//     and/or pushed single-symbol Predicates) -> exactly today's
+//     materialized-IDs path (resolveEndpointSet), unchanged: a predicate
+//     needs a real Row to evaluate EvalPredicate against, which traverse has
+//     no hook for, so a predicate-bearing side must keep paying scanAnchor's
+//     per-candidate cost regardless of how narrow the result ends up being.
+//
+// The empty-vs-unconstrained invariant resolveEndpointSet's own doc comment
+// describes holds here too: a constrained side (kinds-only or narrowing)
+// that matches zero nodes returns a non-nil-but-empty Bits/IDs value, never
+// Endpoint{} -- an allocated zero-population Bitset and an empty non-nil
+// []NodeID slice are both, correctly, "matches nothing", never "matches
+// everything".
+func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint) (traverse.Endpoint, error) {
+	if nc == nil {
+		return traverse.Endpoint{}, nil
+	}
+	narrowing := len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || len(nc.Predicates) > 0
+	if !narrowing {
+		if len(nc.Kinds) == 0 {
+			// nc is non-nil but carries no constraint whatsoever -- Plan
+			// never actually produces this shape, but it means the same
+			// thing nc == nil does above, so it gets the same treatment.
+			return traverse.Endpoint{}, nil
+		}
+		return traverse.Endpoint{Bits: kindsEndpointBitmap(env, nc.Kinds)}, nil
+	}
+
+	ids, err := resolveEndpointSet(env, meter, sym, nc)
+	if err != nil {
+		return traverse.Endpoint{}, err
+	}
+	return traverse.Endpoint{IDs: ids}, nil
+}
+
+// kindsEndpointBitmap returns the traverse.Endpoint{Bits} value for a
+// kinds-only NodeConstraint: kinds are AND-ed together (nodeSatisfiesConstraint
+// requires every one of them, and so does this), so a single kind reuses the
+// snapshot's own live per-kind bitmap directly (no copy -- neither this
+// package nor traverse ever mutates an Endpoint's Bits), while more than one
+// intersects them into a freshly allocated Bitset, iterating whichever input
+// is smallest so the cost is proportional to the smallest candidate kind
+// rather than the snapshot's total node count. Mirrors the servePathQuery
+// path's own resolveKindsEndpoint/intersectBitmaps kind-intersection
+// approach, reimplemented here (rather than imported) because that code
+// lives in a package that already imports this one.
+func kindsEndpointBitmap(env *Env, kinds []snapshot.KindID) *snapshot.Bitset {
+	if len(kinds) == 1 {
+		return env.Snap.NodesOfKind(kinds[0])
+	}
+
+	bitmaps := make([]*snapshot.Bitset, len(kinds))
+	for i, k := range kinds {
+		bitmaps[i] = env.Snap.NodesOfKind(k)
+	}
+	smallest := bitmaps[0]
+	for _, bm := range bitmaps[1:] {
+		if bm.Count() < smallest.Count() {
+			smallest = bm
 		}
 	}
-	return false
+
+	result := snapshot.NewBitset(env.Snap.NodeCount())
+	smallest.Iterate(func(id snapshot.NodeID) bool {
+		for _, bm := range bitmaps {
+			if bm != smallest && !bm.Has(id) {
+				return true
+			}
+		}
+		result.Set(id)
+		return true
+	})
+	return result
+}
+
+// endpointsIntersect reports whether roots and terminals (total is the
+// snapshot's own NodeCount, needed for Endpoint.Count/Iterate's "matches
+// every node" default) share at least one dense id -- the traverse.Endpoint-
+// aware replacement for the old materialized-slice idsIntersect, preserving
+// its exact semantics (a plain set-membership overlap test) rather than
+// traverse.SelfEndpointConflict's additional out-degree>0 requirement: see
+// ErrSelfEndpoint's own doc comment for why this package's self-endpoint
+// rule must stay exactly what it always was. Iterates whichever side
+// Count(total) reports as smaller and probes it against the other via Has,
+// so a Bits-vs-Bits or Bits-vs-IDs pair costs at most the smaller side's own
+// population, and neither side is ever materialized purely to run this
+// check.
+func endpointsIntersect(total int, roots, terminals traverse.Endpoint) bool {
+	small, big := roots, terminals
+	if terminals.Count(total) < roots.Count(total) {
+		small, big = terminals, roots
+	}
+
+	found := false
+	small.Iterate(total, func(id snapshot.NodeID) bool {
+		if big.Has(id) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // kindMaskFor builds the *snapshot.KindMask traverse.Query.Kinds expects from

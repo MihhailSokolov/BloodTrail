@@ -637,6 +637,78 @@ func TestExpandShortestPathSelfEndpointWithInequalityDropsSelfPairs(t *testing.T
 		[]string{"N:1,2,|E:1,"})
 }
 
+// TestExpandShortestPathKindsOnlySideNotMaterialized: a shortestPath source
+// symbol constrained by a kind label alone (no ids/objectid/predicates) must
+// be handed to traverse as a lazy kind bitmap rather than materialized one
+// candidate at a time -- 200 `Base`-kind nodes as the source side, a
+// 2-member `Target` kind narrowed further to exactly one node via an
+// objectid predicate on the terminal side (forcing the terminal's own
+// resolution through the narrowing/materialized path, so this test isolates
+// the source side's own behavior).
+//
+// Correctness (the query still serves the one real path) and cost (the
+// query's own total work stays far below what materializing all 200 source
+// candidates would have cost) are both asserted: materializing that side the
+// old way spends exactly 2 work units per candidate (one to admit it, one
+// for the row it produces -- see scanAnchorVisit's own doc comment), a cost
+// this test measures directly via resolveEndpointSet (still the mechanism a
+// narrowing side uses) against the identical 200-node kind constraint,
+// rather than hard-coding the arithmetic, so this test keeps working even if
+// that per-candidate charge ever changes.
+func TestExpandShortestPathKindsOnlySideNotMaterialized(t *testing.T) {
+	const (
+		kindBase   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+		numBase                    = 200
+	)
+
+	var nodes []execNodeSpec
+	for i := uint64(1); i <= numBase; i++ {
+		nodes = append(nodes, execNodeSpec{id: i, kinds: []snapshot.KindID{kindBase}})
+	}
+	nodes = append(nodes,
+		execNodeSpec{id: 300, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"objectid": "target-300"}},
+		execNodeSpec{id: 301, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"objectid": "target-301"}},
+	)
+	edges := []execEdgeSpec{
+		{id: 1000, start: 1, end: 300, kind: kindE},
+	}
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindBase: "Base", kindTarget: "Target", kindE: "E"},
+		nodes, edges)
+
+	// Calibrate: what resolveEndpointSet itself would charge to materialize
+	// this exact 200-node kind-only candidate set, measured directly rather
+	// than assumed.
+	calibMeter := &workMeter{budget: generousBudget}
+	baseNC := &NodeConstraint{Kinds: []snapshot.KindID{kindBase}}
+	if _, err := resolveEndpointSet(&Env{Snap: snap}, calibMeter, "s", baseNC); err != nil {
+		t.Fatalf("resolveEndpointSet calibration: %v", err)
+	}
+	materializedCost := calibMeter.work
+	if materializedCost < 2*numBase {
+		t.Fatalf("calibration: materializedCost = %d, want >= %d (2 work units per candidate)", materializedCost, 2*numBase)
+	}
+
+	q := planQuery(t, snap, `MATCH p = shortestPath((s:Base)-[:E*1..]->(t:Target)) WHERE t.objectid = 'target-300' AND s<>t RETURN p`)
+	meter := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, q, meter)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	got := pathSigsAtColumn(t, snap, rs, 0)
+	want := []string{"N:1,300,|E:1000,"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("path set mismatch\ngot:  %v\nwant: %v", got, want)
+	}
+
+	if meter.work >= materializedCost/2 {
+		t.Fatalf("meter.work = %d, want far below the %d-unit cost of materializing the wide Base side (kinds-only side was materialized despite the fix)", meter.work, materializedCost)
+	}
+}
+
 // --- shortestPath / allShortestPaths budget wiring --------------------------
 
 // TestExpandShortestPathBudget exercises shortestPathBudget's arithmetic
