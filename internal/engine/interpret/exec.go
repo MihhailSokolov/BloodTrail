@@ -6,30 +6,25 @@
 // bags, joining shared variables by binding identity, filtering by WHERE,
 // and projecting the RETURN clause.
 //
-// Scope (Task 7 of the milestone): fixed-length relationship Steps within a
-// single Part that carries no WithClause, and a RETURN clause with no ORDER
-// BY/SKIP/LIMIT/DISTINCT -- plus, as of Task 8, variable-length (Step.Range
-// != nil) and shortestPath()/allShortestPaths() (Step.Shortest !=
-// ShortestNone) Steps, dispatched out to expand.go (see runComponent's own
-// doc comment below for exactly which shapes of those two are handled here
-// versus declined). Everything else is declined via the unexported
-// errUnsupportedStep sentinel rather than guessed at -- exactly like Plan's
-// own default-deny posture, and for the same reason: a caller that receives
-// errUnsupportedStep (or any other error out of Execute) is expected to
-// delegate the whole query to PostgreSQL, which is always correct.
+// This file provides the single-Part machinery every Query shape this
+// package serves is built from: pattern matching within one Part
+// (matchPart/runComponent, fixed-length Steps here, variable-length/
+// shortestPath Steps dispatched out to expand.go), WHERE filtering, and
+// RETURN projection. pipeline.go's runQuery (Task 9) is what actually drives
+// Execute end to end -- chaining Part[0] and Part[1] across a WITH boundary
+// via this file's own cartesianJoin/mergeRowInto row-merge primitives,
+// applying WITH's grouping/aggregation, and finishing with RETURN DISTINCT/
+// ORDER BY/SKIP/LIMIT -- reusing this file's per-Part machinery unchanged
+// rather than duplicating it. Everything neither this file nor pipeline.go
+// recognizes is declined via the unexported errUnsupportedStep sentinel
+// rather than guessed at -- exactly like Plan's own default-deny posture,
+// and for the same reason: a caller that receives errUnsupportedStep (or any
+// other error out of Execute) is expected to delegate the whole query to
+// PostgreSQL, which is always correct.
 //
-// Seams for later tasks (both extend this file's machinery rather than
-// rewrite it):
-//
-//   - Task 9 (WITH pipeline): the early Query-shape gate (WithClause/Order/
-//     Skip/Limit/Distinct) is that hook -- Task 9 replaces it with the
-//     actual grouping/ordering/dedup pass, chaining Parts together via
-//     GroupKeys the way this file chains a single Part's own components via
-//     shared node identity (cartesianJoin's approach generalizes directly:
-//     a WITH boundary is just another join key set).
-//   - projectItem now has an explicit OutPath case for a bare path-variable
-//     RETURN item, reading whatever expand.go's Task 8 functions bound via
-//     Row.SetPathVar (always a *PathVal in this package, see expand.go).
+// projectItem has an explicit OutPath case for a bare path-variable RETURN
+// item, reading whatever expand.go's Task 8 functions bound via
+// Row.SetPathVar (always a *PathVal in this package, see expand.go).
 package interpret
 
 import (
@@ -165,67 +160,14 @@ func (m *workMeter) addFinalRow() error {
 // materialization aborts the whole call. b bounds the work Execute is
 // willing to spend; see Budgets.
 //
-// See the package doc comment for exactly which Query/Step shapes this
-// task's Execute handles and which it declines via errUnsupportedStep for
-// a later task to pick up.
+// The actual multi-part/WITH/DISTINCT/ORDER BY/SKIP/LIMIT pipeline lives in
+// pipeline.go's runQuery (Task 9); this function is left as the package's
+// stable public entry point plus its own nil-defensiveness.
 func Execute(env *Env, q *Query, b Budgets) (*ResultSet, error) {
 	if env == nil || env.Snap == nil || q == nil {
 		return nil, errUnsupportedStep
 	}
-
-	// Task 9 seam: no WITH pipeline, ordering, paging, or dedup yet.
-	if len(q.Order) != 0 || q.Skip != 0 || q.Limit != -1 || q.Returning.Distinct {
-		return nil, errUnsupportedStep
-	}
-	for i := range q.Parts {
-		if q.Parts[i].With != nil {
-			return nil, errUnsupportedStep
-		}
-	}
-	if len(q.Parts) != 1 {
-		// Impossible today given the WithClause check above (Part's own doc:
-		// With is non-nil on every Part but the last), but Task 7 does not
-		// attempt any cross-Part join on its own -- decline defensively
-		// rather than guess at Task 9's semantics.
-		return nil, errUnsupportedStep
-	}
-	part := &q.Parts[0]
-
-	meter := &workMeter{budget: b}
-
-	rows, err := matchPart(env, part, meter)
-	if err != nil {
-		return nil, err
-	}
-
-	outRows := make([][]OutVal, 0, len(rows))
-	for _, r := range rows {
-		if part.Where != nil {
-			t, err := EvalPredicate(env, r, part.Where)
-			if err != nil {
-				return nil, err
-			}
-			if t != TriTrue {
-				continue
-			}
-		}
-
-		if err := meter.addFinalRow(); err != nil {
-			return nil, err
-		}
-
-		outRow, err := projectRow(env, q.Returning, r)
-		if err != nil {
-			return nil, err
-		}
-		outRows = append(outRows, outRow)
-	}
-
-	if err := meter.check(); err != nil {
-		return nil, err
-	}
-
-	return &ResultSet{Keys: projectionKeys(q.Returning), Rows: outRows}, nil
+	return runQuery(env, q, &workMeter{budget: b})
 }
 
 // --- pattern matching: components and joins -------------------------------
