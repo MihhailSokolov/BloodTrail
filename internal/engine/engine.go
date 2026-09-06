@@ -121,6 +121,44 @@ type Engine struct {
 	// direction -- needed by TryNodeFetchKinds to render its
 	// graph.KindsResult output.
 	mapKindNames func(ids []snapshot.KindID) (graph.Kinds, error)
+
+	// cypherHydrationRaceHook, when non-nil, runs synchronously inside
+	// TryCypher immediately after collectEdgeIDs has determined that
+	// hydration is actually needed, and immediately before the
+	// hydrateEdgePropsByID call that performs it. Production code never sets
+	// this field -- the zero value is a complete no-op, so every real caller
+	// pays nothing for its existence.
+	//
+	// It exists purely as an integration-test seam (see the root package's
+	// staleness_integration_test.go, TestCypherHydrationRecheck), installed
+	// via SetCypherHydrationRaceHookForTest, for forcing a write to land
+	// deterministically in the exact window step 10's snapshotStillCurrent
+	// recheck (TryCypher's own doc) exists to catch: a single TryCypher call
+	// is one synchronous function with no other externally observable point
+	// between Execute completing and hydration starting for a caller outside
+	// this package to intervene at, short of a timing-dependent goroutine
+	// race against a real concurrent write. The hook body is free to call
+	// NoteWrite directly (the minimal way to reproduce a write's effect on
+	// the write-generation counter) or drive a real write through the root
+	// package's own Driver -- pgxpool hands out independent connections, so
+	// a write issued from here would not deadlock against the read
+	// transaction TryCypher itself is running under.
+	cypherHydrationRaceHook func()
+}
+
+// SetCypherHydrationRaceHookForTest installs (or, given nil, clears) fn as
+// the engine's cypherHydrationRaceHook -- see that field's own doc for what
+// it is and why it exists. Exported so an integration test in another
+// package (the root package's staleness_integration_test.go) can install
+// it.
+//
+// Not safe to call concurrently with an in-flight TryCypher call: this
+// field is a plain, unsynchronized func value, deliberately not an
+// atomic.Pointer, since its only intended caller is test code that arranges
+// its own happens-before ordering (set the hook, then issue the one TryCypher
+// call it is meant to intercept, all from the same goroutine).
+func (e *Engine) SetCypherHydrationRaceHookForTest(fn func()) {
+	e.cypherHydrationRaceHook = fn
 }
 
 // New constructs an Engine bound to pgDriver/pool. It does not load a
@@ -454,7 +492,9 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //     recheck servePathQuery's own step 7 performs, applied here only when
 //     hydration actually did I/O. A pure-snapshot result (no edge/path
 //     column at all) skips this recheck entirely: nothing after step 8
-//     touched anything that could go stale.
+//     touched anything that could go stale. cypherHydrationRaceHook (see its
+//     own doc) fires immediately before hydrateEdgePropsByID whenever this
+//     branch is taken, purely as a test seam for forcing this exact race.
 //
 // A successful serve builds a cypherRowsResult (serve_cypher.go) over the
 // executed interpret.ResultSet and logs cypherServedLogMessage at Debug.
@@ -513,6 +553,9 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 
 	var edgeProps map[uint64]*graph.Properties
 	if edgeIDs := collectEdgeIDs(snap, rs); len(edgeIDs) > 0 {
+		if e.cypherHydrationRaceHook != nil {
+			e.cypherHydrationRaceHook()
+		}
 		edgeProps, err = hydrateEdgePropsByID(ctx, e.pool, snap.GraphID, edgeIDs)
 		if err != nil {
 			e.decline(ctx, reasonHydration, err)

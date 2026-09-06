@@ -59,6 +59,7 @@ package bloodtrail
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -67,6 +68,7 @@ import (
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/ops"
 	"github.com/specterops/dawgs/query"
 	"github.com/specterops/dawgs/util/size"
 
@@ -627,4 +629,466 @@ func TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind(t *testing.T) {
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "novel-kind node count serves again post-rebuild",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertNovelKind) }, 1)
+}
+
+// --- Task 18: Cypher-serving staleness/guard integration tests -----------
+//
+// The three tests below extend this file's kind-scoped staleness narrative
+// to engine.TryCypher, whose own freshness model is deliberately coarser
+// than the builder-serving path's (see engine.go's own doc: TryCypher's
+// interpreter has no notion of which kinds a query touches, so it can only
+// ever ask the plain, whole-generation Fresh() bit -- the same bit
+// TestKindScopedStalenessEndToEnd's flow 2 already showed a shortest-path
+// query is bound by too). TestCypherStalenessPropertyOnlyWrite goes one
+// step further than that flow: a pure property write never touches any
+// kind mark at all (write_observer.go's touchNodeKindDelta), so it is
+// exactly the write class that leaves a kind-scoped builder query serving
+// right through it while a Cypher read of that same property must not.
+// TestCypherHydrationRecheck exercises TryCypher's own step-10
+// post-hydration recheck, forced deterministically via a small test-only
+// seam added to internal/engine/engine.go (SetCypherHydrationRaceHookForTest)
+// -- no existing seam already forced this exact race for either serving
+// path, so this task adds the minimal one TryCypher needs, mirroring the
+// same "capture a snapshot, then check it's still current after I/O"
+// pattern servePathQuery's own step 7 already establishes.
+// TestCypherMultiGraphGuard covers the one TryCypher-only decline this file
+// had not yet exercised: Snapshot.MultiGraph, set by LoadSnapshot's global
+// probeMultiGraph, has nothing to do with kind-scoped or whole-generation
+// staleness at all, so it gets its own dedicated database state (a second,
+// unrelated graph) rather than reusing any write-based flow above.
+
+// cypherStringValue runs text -- a Cypher query returning exactly one row
+// with exactly one string-valued column -- through db and returns that
+// value. It works unchanged whether TryCypher served text from the engine
+// or wrappedTransaction.Query fell through to PostgreSQL: both paths
+// return an ordinary graph.Result over the same Values()/Next() contract.
+func cypherStringValue(t *testing.T, ctx context.Context, db graph.Database, text string) string {
+	t.Helper()
+
+	var value string
+	if err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		result := tx.Query(text, nil)
+		defer result.Close()
+
+		if !result.Next() {
+			return fmt.Errorf("no rows")
+		}
+		values := result.Values()
+		if len(values) != 1 {
+			return fmt.Errorf("%d columns, want 1", len(values))
+		}
+		s, ok := values[0].(string)
+		if !ok {
+			return fmt.Errorf("value %#v is not a string", values[0])
+		}
+		value = s
+
+		if result.Next() {
+			return fmt.Errorf("more than one row")
+		}
+		return result.Error()
+	}); err != nil {
+		t.Fatalf("cypherStringValue(%q): %v", text, err)
+	}
+	return value
+}
+
+// cypherPathCount runs text -- a Cypher shortestPath/allShortestPaths query
+// -- through db via dawgs' own ops.FetchByQuery and returns how many paths
+// came back. FetchByQuery's mapper protocol is exactly what
+// internal/engine/serve_cypher.go's cypherRowsResult satisfies (see
+// internal/engine/cypher_integration_test.go's drainEngineResult, which
+// proves this against the real type), so -- like cypherStringValue above --
+// this works unchanged whether the query was served by the engine or
+// delegated to PostgreSQL.
+func cypherPathCount(t *testing.T, ctx context.Context, db graph.Database, text string) int {
+	t.Helper()
+
+	var count int
+	if err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		qr, err := ops.FetchByQuery(tx, text)
+		if err != nil {
+			return err
+		}
+		count = len(qr.Paths)
+		return nil
+	}); err != nil {
+		t.Fatalf("cypherPathCount(%q): %v", text, err)
+	}
+	return count
+}
+
+// requireDecline runs query and requires that engine.decline's shared
+// "bloodtrail: path engine declined" event -- the same method
+// TryAllShortestPaths/servePathQuery and TryCypher both log through,
+// distinguished only by their "reason" attr -- fired with exactly
+// wantReason since the call began, and that the value query produced
+// (necessarily PostgreSQL's own answer: a declined TryCypher call never
+// returns a result at all) still equals want. declineReason
+// (prebuilt_corpus_integration_test.go, this same package) does the actual
+// log-tail parsing, the identical helper that file's own corpus
+// differential suite already relies on to report *why* a corpus query
+// unexpectedly delegated.
+func requireDecline[T comparable](t *testing.T, buf *lockedBuffer, wantReason string, label string, query func() T, want T) {
+	t.Helper()
+
+	before := buf.String()
+	got := query()
+	tail := buf.String()[len(before):]
+
+	if reason := declineReason(tail); reason != wantReason {
+		t.Fatalf("%s: decline reason = %q, want %q\ncaptured log:\n%s", label, reason, wantReason, tail)
+	}
+	if got != want {
+		t.Fatalf("%s: got %v, want %v", label, got, want)
+	}
+}
+
+// cypherStalenessNodeKind is TestCypherStalenessPropertyOnlyWrite's own
+// fixture kind, distinctly named for the same collision-avoidance reason
+// stalenessNodeKind*/stalenessUpsert* above are.
+var cypherStalenessNodeKind = graph.StringKind("CypherStalenessNode")
+
+// TestCypherStalenessPropertyOnlyWrite is Task 18's first deliverable: a
+// pure property write -- graph.Transaction.UpdateNode with neither
+// AddedKinds nor DeletedKinds set -- records nothing at all onto the
+// WriteScope write_observer.go's touchNodeKindDelta builds
+// (TestObservingTransactionUpdateNodePropertyOnlyLeavesScopeEmpty pins this
+// down at the unit level; this test proves the end-to-end consequence). A
+// kind-scoped builder query is therefore still "clean" against it and keeps
+// serving right through the write -- but engine.NoteWrite bumps the
+// write-generation counter unconditionally, before it even looks at
+// whether scope is empty (marks.go's noteResolved, step 1 of its own doc),
+// so TryCypher's coarser, whole-generation Fresh() check goes stale on this
+// exact write anyway. This is a strictly narrower trigger than
+// TestKindScopedStalenessEndToEnd's flow 2 (which at least dirtied kind-B's
+// own mark): a pure property write dirties no kind's mark whatsoever, yet
+// still must flip Cypher serving to delegation.
+//
+// Flow: seed one CypherStalenessNode with name="before", rebuild, confirm
+// both a Cypher property read and a kind-scoped node Count serve. The
+// property-only write sets name="after". The Cypher read must now delegate
+// to PostgreSQL -- and must return the NEW value, proving the fallback
+// actually consults live data rather than any cached answer -- while the
+// kind-scoped node Count keeps serving the unchanged count throughout, the
+// two-freshness-models contrast this test exists to pin down. A manual
+// rebuild afterward restores Cypher serving, now reflecting "after".
+func TestCypherStalenessPropertyOnlyWrite(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	var nodeID graph.ID
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties().Set("name", "before"), cypherStalenessNodeKind)
+		if err != nil {
+			return err
+		}
+		nodeID = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("fixture setup WriteTransaction: %v", err)
+	}
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow (baseline): %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("baseline: engine reports stale immediately after RebuildNow")
+	}
+
+	text := fmt.Sprintf(`MATCH (n:CypherStalenessNode) WHERE id(n) = %d RETURN n.name`, nodeID)
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "baseline: cypher property read serves",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "before")
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: kind-scoped node count serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, cypherStalenessNodeKind) }, 1)
+
+	// The write under test: properties only, no AddedKinds/DeletedKinds --
+	// touchNodeKindDelta records nothing onto scope for this call, so the
+	// CypherStalenessNode kind mark never dirties.
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		return tx.UpdateNode(&graph.Node{ID: nodeID, Properties: graph.NewProperties().Set("name", "after")})
+	}); err != nil {
+		t.Fatalf("WriteTransaction (property-only update): %v", err)
+	}
+
+	if _, fresh := d.engine.Fresh(); fresh {
+		t.Fatalf("engine still reports fresh after a property-only write; Fresh() must go stale on any write (whole-generation)")
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 0, "after property-only write: cypher property read delegates, and still returns the live (new) value",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "after property-only write: kind-scoped node count still serves (no kind mark was ever touched)",
+		func() int64 { return nodeCountByKind(t, ctx, bt, cypherStalenessNodeKind) }, 1)
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow (post-write): %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("post-write: engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: cypher property read serves again, reflecting the new value",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
+}
+
+// cypherHydrationNodeKind and cypherHydrationEdgeKind are
+// TestCypherHydrationRecheck's own fixture kinds.
+var (
+	cypherHydrationNodeKind = graph.StringKind("CypherHydrationNode")
+	cypherHydrationEdgeKind = graph.StringKind("CypherHydrationEdge")
+)
+
+// TestCypherHydrationRecheck is Task 18's second deliverable: proving
+// TryCypher's step-10 post-hydration snapshotStillCurrent recheck
+// (engine.go's own pipeline doc) actually declines when a write lands in
+// the narrow window between interpret.Execute completing and
+// hydrateEdgePropsByID's own PostgreSQL round trip -- the same race
+// servePathQuery's step 7 exists to catch on the shortest-path side, here
+// exercised on the Cypher side instead.
+//
+// A single synchronous TryCypher call has no externally observable point
+// between those two steps for a caller outside package engine to
+// intervene at, short of a timing-dependent goroutine race against a real
+// concurrent write -- so this test forces it deterministically instead, via
+// a minimal seam this task adds to internal/engine/engine.go,
+// SetCypherHydrationRaceHookForTest (see that method's own doc): installed
+// just before the one call under test, it runs synchronously the moment
+// TryCypher determines this query's result needs edge-property hydration,
+// immediately before hydrateEdgePropsByID's own query -- calling
+// engine.NoteWrite(nil) right there reproduces, deterministically, exactly
+// what a genuinely concurrent write landing in that instant would do to
+// the write-generation counter.
+//
+// The query itself (a one-edge shortestPath) is planned and executed
+// entirely correctly against a still-fresh snapshot -- Plan, the translate
+// gate, and Execute all run, and complete, before the hook ever fires --
+// so the only thing under test is step 10's own recheck: TryCypher must
+// decline (reasonStale) rather than hand back a result computed against a
+// snapshot a write has since invalidated, and wrappedTransaction.Query must
+// fall through to PostgreSQL, which -- since nothing about the database
+// itself actually changed; NoteWrite(nil) only advances the engine's own
+// in-memory counter -- must still find the exact same one path.
+func TestCypherHydrationRecheck(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	var startID, endID graph.ID
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		s, err := tx.CreateNode(graph.NewProperties(), cypherHydrationNodeKind)
+		if err != nil {
+			return err
+		}
+		e, err := tx.CreateNode(graph.NewProperties(), cypherHydrationNodeKind)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(s.ID, e.ID, cypherHydrationEdgeKind, graph.NewProperties()); err != nil {
+			return err
+		}
+		startID, endID = s.ID, e.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("fixture setup WriteTransaction: %v", err)
+	}
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("engine reports stale immediately after RebuildNow")
+	}
+
+	text := fmt.Sprintf(`MATCH p = shortestPath((s)-[:CypherHydrationEdge*1..]->(e)) WHERE id(s) = %d AND id(e) = %d RETURN p`, startID, endID)
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "baseline: shortestPath cypher query serves",
+		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
+
+	// Arm the race hook for exactly the one call below: the moment TryCypher
+	// determines this query's result needs edge-property hydration, force a
+	// write to land first, deterministically hitting step 10's recheck.
+	d.engine.SetCypherHydrationRaceHookForTest(func() { d.engine.NoteWrite(nil) })
+	t.Cleanup(func() { d.engine.SetCypherHydrationRaceHookForTest(nil) })
+
+	requireDecline(t, buf, "stale", "hydration recheck: a write lands between Execute and hydration, so the query declines and falls back to PostgreSQL, still returning the correct path",
+		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
+
+	// Disarm before rebuilding: RebuildNow itself never reaches
+	// TryCypher's hydration branch, but leaving the hook armed past its one
+	// intended call would silently force every future hydrating query in
+	// this test (there are none below) to decline too.
+	d.engine.SetCypherHydrationRaceHookForTest(nil)
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow (post-race): %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("post-race: engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: shortestPath cypher query serves again",
+		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
+}
+
+// cypherMultiGraphNodeKind/cypherMultiGraphSecondKind are
+// TestCypherMultiGraphGuard's own fixture kinds -- one for the node living
+// in the driver's default graph, one for the node in the second, unrelated
+// graph this test creates purely to trip probeMultiGraph.
+// cypherMultiGraphSecondGraphName names that second graph.
+var (
+	cypherMultiGraphNodeKind        = graph.StringKind("CypherMultiGraphNode")
+	cypherMultiGraphSecondKind      = graph.StringKind("CypherMultiGraphSecondNode")
+	cypherMultiGraphSecondGraphName = "bloodtrail_test_second_graph"
+)
+
+// TestCypherMultiGraphGuard is Task 18's third deliverable: TryCypher must
+// decline reasonMultiGraph the instant LoadSnapshot's probeMultiGraph
+// (internal/engine/load.go) finds a second graph holding at least one node
+// anywhere in the database -- regardless of whether that second graph has
+// anything to do with the query being asked, since the interpreter has no
+// notion of which graph a query is scoped to at all (engine.go's own doc
+// for reasonMultiGraph). The kind-scoped builder-serving path carries no
+// such guard (serve_builder.go never inspects Snapshot.MultiGraph), so a
+// builder query on the very same default-graph fixture must keep serving,
+// completely unaffected -- this milestone's now-familiar contrast between
+// the two serving paths, drawn here along the MultiGraph axis instead of a
+// freshness one.
+//
+// The second graph is created directly through the raw pg driver (not the
+// wrapped bloodtrail one) via WithGraph, which dawgs' own SchemaManager.
+// AssertGraph lazily creates the moment a node is written to it -- exactly
+// the same lazy-creation path CreateNode always takes for kinds. Both
+// drivers share the one PostgreSQL connection pool graphtest.OpenPG hands
+// out (dawgs.Config.Pool, passed through unchanged to bt below), so the
+// second graph's row and node are visible to whichever driver's own
+// LoadSnapshot later runs probeMultiGraph's global, cross-graph query,
+// regardless of which driver object created them.
+//
+// t.Cleanup wipes every node and edge across all graphs (WipeGraph's
+// documented scope: "truncates the partitioned node and edge tables ...
+// across all graphs", driver.go's own WipeGraph doc in the dawgs pg
+// driver) before this test returns, so the second graph's node cannot
+// leave Snapshot.MultiGraph permanently true for whatever test in this
+// shared, long-lived integration database happens to run next -- it only
+// left the *graph* catalog row behind, which probeMultiGraph's own
+// EXISTS-a-node join ignores.
+//
+// This wipe is registered via t.Cleanup, not deferred inline, and
+// deliberately registered AFTER bt's own Close -- also moved to t.Cleanup
+// rather than a plain defer -- so that t.Cleanup's documented last-added-
+// first-called order runs the wipe *before* bt.Close: bt.Driver (the
+// wrapped driver's own embedded pg.Driver) closes the exact pgxpool.Pool
+// this test shares with pgDriver (both opened against dawgs.Config.Pool /
+// graphtest.OpenPG's same pool), so a wipe ordered after it would find the
+// pool already closed.
+func TestCypherMultiGraphGuard(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	t.Cleanup(func() { _ = bt.Close(ctx) })
+	t.Cleanup(func() { graphtest.WipeGraph(t, pgDriver) })
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	var nodeID graph.ID
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties().Set("name", "solo"), cypherMultiGraphNodeKind)
+		if err != nil {
+			return err
+		}
+		nodeID = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("fixture setup WriteTransaction: %v", err)
+	}
+
+	// A second, unrelated graph with exactly one node -- enough for
+	// probeMultiGraph to flag Snapshot.MultiGraph true on the very next
+	// rebuild, no matter what the query below asks about.
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		tx = tx.WithGraph(graph.Graph{Name: cypherMultiGraphSecondGraphName})
+		_, err := tx.CreateNode(graph.NewProperties(), cypherMultiGraphSecondKind)
+		return err
+	}); err != nil {
+		t.Fatalf("create second graph's node: %v", err)
+	}
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("engine reports stale immediately after RebuildNow")
+	}
+
+	text := fmt.Sprintf(`MATCH (n:CypherMultiGraphNode) WHERE id(n) = %d RETURN n.name`, nodeID)
+
+	requireDecline(t, buf, "multi_graph", "cypher query declines with reasonMultiGraph while a second populated graph exists, and still returns the correct (PostgreSQL-delegated) value",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "solo")
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "kind-scoped builder query still serves; the MultiGraph guard is TryCypher-only",
+		func() int64 { return nodeCountByKind(t, ctx, bt, cypherMultiGraphNodeKind) }, 1)
 }
