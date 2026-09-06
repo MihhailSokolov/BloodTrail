@@ -34,7 +34,6 @@ package bloodtrail
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -372,29 +371,27 @@ func randomCypherPickNumber(rng *rand.Rand) float64 {
 	return randomCypherNumberPool[rng.Intn(len(randomCypherNumberPool))]
 }
 
-// randomCypherPickNonNegativeNumber is randomCypherPickNumber restricted to
-// non-negative results (via math.Abs, preserving the pool's own zero/float/
-// integer variety), for use anywhere a number literal is compared against
-// "val" with `=`/`<>` specifically.
+// Negative literals in `=`/`<>` templates (history): this suite used to
+// restrict `=`/`<>` number literals to non-negative values only, via a
+// since-removed randomCypherPickNonNegativeNumber helper (math.Abs over
+// randomCypherPickNumber), sidestepping a genuine, narrow inconsistency in
+// dawgs' own pgsql translator: `n.prop = <literal>`/`n.prop <> <literal>`
+// compiled to a native jsonb comparison for a bare positive numeric
+// literal, but to a text-extraction-then-cast comparison for a *negative*
+// one (a cypher.UnaryAddOrSubtractExpression, not a plain cypher.Literal),
+// disagreeing on whether a property present as an explicit JSON null (this
+// fixture's own "val" trap) counts as a definite "not equal" (native jsonb:
+// yes) or NULL (cast: no, same as a missing property) -- confirmed by
+// dumping translate.Translate's generated SQL for both shapes; see
+// task-17-report.md's divergence-2 write-up for the original discovery.
 //
-// This sidesteps a genuine, narrow inconsistency in dawgs' own pgsql
-// translator rather than a real Cypher semantic: `n.prop = <literal>`/
-// `n.prop <> <literal>` compiles to a native jsonb comparison for a bare
-// positive numeric literal, but to a text-extraction-then-cast comparison
-// for a *negative* one (a cypher.UnaryAddOrSubtractExpression, not a plain
-// cypher.Literal) -- confirmed by dumping translate.Translate's generated
-// SQL for both shapes. The two routes disagree on whether a property that
-// is present but an explicit JSON null (this fixture's own "val" trap)
-// counts as a definite "not equal" (native jsonb: yes) or NULL (cast: no,
-// same as a missing property) -- entirely a function of the literal's own
-// AST shape, nothing to do with the compared value. interpret/eval.go's
-// evalLiteralComparison intentionally does not attempt to replicate this
-// (see its own doc comment for the full derivation and why); `<`/`<=`/`>`/
-// `>=`/IN are unaffected by sign (always the cast route), so only the `=`/
-// `<>` templates below need this restriction -- see task-17-report.md.
-func randomCypherPickNonNegativeNumber(rng *rand.Rand) float64 {
-	return math.Abs(randomCypherPickNumber(rng))
-}
+// That workaround is gone: interpret/plan.go's checkComparison now rejects
+// (delegates) any `=`/`<>` between a bare property lookup and a negative
+// numeric literal at plan time (see its own doc comment for the full
+// derivation), so a negative-literal `=`/`<>` query here always falls
+// through to plain pg on both the bloodtrail-driver side and the oracle
+// side -- the differential assertion holds by construction regardless of
+// sign, and every template below draws from the full pool again.
 
 // randomCypherNullableProps names every property randomCypherNodeProperties
 // ever sets or omits, for tmplIsNull/tmplIsNotNull's random property choice.
@@ -414,13 +411,18 @@ var randomCypherNullableProps = []string{"str", "val", "flag", "tags"}
 type randomCypherTemplate func(rng *rand.Rand) string
 
 var randomCypherTemplates = []randomCypherTemplate{
-	// Single-Part: plain property comparisons. `=`/`<>` draw a non-negative
-	// literal only -- see randomCypherPickNonNegativeNumber's doc for why.
+	// Single-Part: plain property comparisons. `=`/`<>` draw from the full
+	// pool including negatives -- interpret/plan.go's checkComparison now
+	// rejects (delegates) a bare property lookup compared against a
+	// negative numeric literal via `=`/`<>` at plan time, so this query
+	// always runs through plain pg on both sides regardless of sign; see
+	// the (removed) randomCypherPickNonNegativeNumber's former doc comment,
+	// preserved just above, for the divergence this once worked around.
 	func(rng *rand.Rand) string {
-		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val = %s RETURN n`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNonNegativeNumber(rng)))
+		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val = %s RETURN n`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)))
 	},
 	func(rng *rand.Rand) string {
-		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val <> %s RETURN n`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNonNegativeNumber(rng)))
+		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val <> %s RETURN n`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)))
 	},
 	func(rng *rand.Rand) string {
 		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val < %s RETURN n`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)))
@@ -509,14 +511,13 @@ var randomCypherTemplates = []randomCypherTemplate{
 	},
 
 	// Two-Part (a WITH boundary splits the query into exactly two Parts):
-	// count(...) aggregation gated by a WHERE. `=`/`<>` draw a non-negative
-	// literal, same reasoning as the plain property comparisons above.
+	// count(...) aggregation gated by a WHERE. `=`/`<>` draw from the full
+	// pool including negatives, same reasoning as the plain property
+	// comparisons above (plan-time reject makes the sign-dependent
+	// divergence unreachable regardless).
 	func(rng *rand.Rand) string {
 		op := []string{"=", "<>", "<", ">"}[rng.Intn(4)]
 		lit := randomCypherPickNumber(rng)
-		if op == "=" || op == "<>" {
-			lit = math.Abs(lit)
-		}
 		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val %s %s WITH count(n) AS cnt RETURN cnt`,
 			randomCypherPickKind(rng), op, cypherNumberLiteral(lit))
 	},
@@ -543,20 +544,29 @@ const (
 	randomCypherDifferentialSeeds          = 20
 	randomCypherDifferentialQueriesPerSeed = 10
 	randomCypherDifferentialTotalQueries   = randomCypherDifferentialSeeds * randomCypherDifferentialQueriesPerSeed
-	// randomCypherServedFloor is pinned at 180 out of 200 total queries --
-	// just below the 199/200 this suite's fixed fixture/template/seed set
+	// randomCypherServedFloor is pinned at 170 out of 200 total queries --
+	// just below the 186/200 this suite's fixed fixture/template/seed set
 	// deterministically serves as of 2026-09-06 (`go test -tags integration
-	// -run TestRandomCypherDifferential -v`, "served 199/200 queries",
+	// -run TestRandomCypherDifferential -v`, "served 186/200 queries",
 	// reproduced identically across repeated runs since both the fixture and
 	// every seed's query stream are fully deterministic), so a future
 	// regression that makes the interpreter decline far more broadly (a
 	// translateGateOK tightening, a Plan regression) fails this floor loudly
 	// well before the suite's own per-query correctness assertions would
-	// happen to catch it, while leaving headroom for the one query this
-	// template set already delegates plus a little slack. Retune both this
-	// constant and its comment together if the template set changes enough
-	// to move the observed count.
-	randomCypherServedFloor = 180
+	// happen to catch it, while leaving headroom for the queries this
+	// template set already delegates plus a little slack. This dropped from
+	// an earlier 199/200 (floor 180) once the `=`/`<>` templates went back
+	// to drawing negative number literals (see the removed
+	// randomCypherPickNonNegativeNumber's former doc, preserved above):
+	// interpret/plan.go's checkComparison now rejects (delegates) a bare
+	// property lookup compared against a negative numeric literal via
+	// `=`/`<>` at plan time, so roughly a dozen more of these 200 queries
+	// correctly fall through to PostgreSQL rather than serve from the
+	// in-memory engine -- fewer served, but zero divergence risk, which is
+	// the whole point of this suite. Retune both this constant and its
+	// comment together if the template set changes enough to move the
+	// observed count.
+	randomCypherServedFloor = 170
 )
 
 // TestRandomCypherDifferential is Task 17's adversarial random Cypher

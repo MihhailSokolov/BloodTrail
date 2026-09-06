@@ -567,8 +567,9 @@ func evalIdentityEquality(row *Row, leftExpr, rightExpr cypher.Expression) (t Tr
 // simple complements of each other once collation isn't in play (ScalarEq is
 // already total over present values -- see its doc comment).
 //
-// A NUMBER literal is a known, deliberately *not* handled, edge case: dawgs'
-// own pgsql translator compiles `n.prop = <literal>`/`n.prop <> <literal>`
+// A NUMBER literal used to be a known, deliberately *not* handled, edge
+// case here -- now guarded upstream instead (see below). dawgs' own pgsql
+// translator compiles a *direct* `n.prop = <literal>`/`n.prop <> <literal>`
 // via native jsonb comparison (`(n.properties -> 'prop')::jsonb = to_jsonb
 // (<literal>)::jsonb`, matching ScalarEq's present-JSON-null-is-a-definite-
 // value semantics) when <literal> is a bare positive numeric literal, but via
@@ -578,17 +579,34 @@ func evalIdentityEquality(row *Row, leftExpr, rightExpr cypher.Expression) (t Tr
 // wrapping the positive literal, not a plain cypher.Literal) -- confirmed by
 // dumping translate.Translate's own generated SQL for both shapes. `<`/`<=`/
 // `>`/`>=`/IN are unaffected (always the cast route, any sign -- see
-// evalOrder/In's own already-correct null handling). Reproducing this
+// evalOrder/In's own already-correct null handling), and wrapping the
+// property in a function call (coalesce()/size()/...) is unaffected too
+// (verified the same way -- see plan.go's checkComparison doc).
+//
+// Note this function is never even reached for the negative-literal shape
+// in the first place: a negative literal is a
+// *cypher.UnaryAddOrSubtractExpression, which asLiteral above does not
+// recognize, so evalEquality's generic PropEq/EvalValue path handles it
+// instead -- a path that shares ScalarEq's same jsonbEqual primitive and
+// therefore the same present-JSON-null-is-a-value semantics that only match
+// pg's *positive*-literal (native jsonb) route. Reproducing dawgs' own
 // sign-dependent split correctly in this evaluator would mean threading
-// "was the literal AST a bare cypher.Literal or a Negation" all the way down
-// to here, just to imitate what looks like an accidental inconsistency in
-// dawgs' own translator/optimizer rather than a real Cypher semantic -- out
-// of scope for this package to chase. random_cypher_differential_
-// integration_test.go (repo root) discovered this comparing `n.val <>
-// -100.0` against a fixture property deliberately mixing numbers with an
-// explicit JSON null, and works around it by only ever comparing `=`/`<>`
-// against non-negative literals (see its randomCypherPickNonNegativeNumber),
-// leaving `<`/`>` (unaffected by sign) free to use either.
+// "was the literal AST a bare cypher.Literal or a Negation" all the way
+// through evalEquality, just to imitate what looks like an accidental
+// inconsistency in dawgs' own translator/optimizer rather than a real
+// Cypher semantic.
+//
+// Fixed instead at plan time: interpret/plan.go's checkComparison rejects
+// (delegates) any `=`/`<>` between a bare property lookup and a negative
+// numeric literal, on either side, so this evaluator never actually sees
+// the dangerous combination -- see that function's doc comment for the full
+// derivation. random_cypher_differential_integration_test.go (repo root)
+// originally discovered this comparing `n.val <> -100.0` against a fixture
+// property deliberately mixing numbers with an explicit JSON null, and
+// worked around it at the test-generator level (restricting `=`/`<>` to
+// non-negative literals) before this plan-time reject existed; the
+// generator now draws negative literals freely again, relying on
+// delegation to make the differential assertion hold by construction.
 func evalLiteralComparison(env *Env, row *Row, otherExpr cypher.Expression, op cypher.Operator, lit *cypher.Literal) (Tri, error) {
 	if lit.Null {
 		return TriNull, nil

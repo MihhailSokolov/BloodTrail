@@ -1544,6 +1544,64 @@ func checkLiteralShape(lit *cypher.Literal) bool {
 // default-deny means a future dawgs operator constant this file has not
 // been updated for rejects automatically rather than silently mis-checking
 // it) rejects.
+//
+// # Fail-safe reject: bare property lookup vs. a negative numeric literal, `=`/`<>` only
+//
+// dawgs' own pgsql translator (rewritePropertyLookupOperands,
+// cypher/models/pgsql/translate/expression.go:319, dawgs@v0.8.0) lowers a
+// direct `n.prop = <literal>`/`n.prop <> <literal>` two different ways
+// depending purely on the literal operand's own Cypher AST shape, confirmed
+// by dumping translate.Translate's generated SQL for both:
+//
+//	n.x = 5    -> ((properties -> 'x'))::jsonb = to_jsonb((5)::int8)::jsonb   -- native jsonb equality
+//	n.x = -5   -> ((properties ->> 'x'))::int8 = -5                          -- text-extract-then-cast
+//
+// A bare positive `cypher.Literal` takes the native-jsonb route (via
+// rewriteJSONScalarEqualityOperand); `-5` parses as a
+// `cypher.UnaryAddOrSubtractExpression` wrapping the positive literal, not a
+// `cypher.Literal` itself, so it fails that rewrite's TypeHinted check and
+// falls through to the ordinary cast route -- purely an artifact of the
+// literal's own AST shape, confirmed against both signs directly. The two
+// routes disagree on a property that is *present* but an explicit JSON
+// null: native jsonb equality treats it as a comparable, non-null value
+// (`<>` sees it as a definite "not equal"), while the cast route's `->>`
+// extraction yields SQL NULL for it, same as a missing property (`<>`
+// nulls out, dropping the row) -- and a negative-literal cast additionally
+// risks a genuine PostgreSQL runtime cast error the in-memory evaluator has
+// no way to reproduce, for any heterogeneous-typed jsonb column (an
+// int-shaped cast failing outright on a float-valued row). This project's
+// own evaluator (eval.go's asLiteral/evalEquality) only recognizes a bare
+// `cypher.Literal` as "the literal side" in the first place, so it never
+// attempts to special-case sign at all -- meaning it always answers as if
+// the native-jsonb route applied, which is wrong exactly for this negative
+// shape. See eval.go's evalLiteralComparison doc for the evaluator-side
+// derivation, and task-17-report.md (milestone-4 sdd notes) for the
+// original discovery (as `n.val <> -100.0`, worked around at the time by
+// restricting the random differential suite's own literal generation --
+// this reject supersedes that workaround, see the generator's own history).
+//
+// `<`/`<=`/`>`/`>=` are unaffected by sign -- the same translator function's
+// default case always takes the cast route for those operators regardless
+// of the right operand's shape (confirmed the same way: `n.x < 5` and
+// `n.x < -5` produce the identical `((properties ->> 'x'))::int8 <op> ±5`
+// shape) -- matching what this evaluator's evalOrder/OrderCompare already
+// does, so they stay accepted for any sign.
+//
+// Wrapping the property lookup in a function call (coalesce()/size()/...)
+// takes it out of scope too: the translator's rewrite only ever fires when
+// the comparison's *immediate* operand (LOperand/ROperand of the binary
+// expression) is itself a raw property-lookup binary expression
+// (expressionToPropertyLookupBinaryExpression, property.go:15) -- a
+// FunctionCall wrapping it never matches that shape, so
+// hasLeftPropertyLookup/hasRightPropertyLookup is false and the whole
+// native-jsonb-vs-cast branch never runs, for either sign. Verified
+// directly: `coalesce(n.x, 0) = -5` and `coalesce(n.x, 0) = 5` both compile
+// to the identical `coalesce(((properties ->> 'x'))::int8, 0)::int8 = ±5`;
+// `size(n.tags) = -5` and `= 5` both compile to the identical
+// `jsonb_array_length((properties -> 'tags'))::int = ±5`. So only a truly
+// *bare* property lookup (isBarePropertyLookup below, after unwrapping
+// Parentheticals) needs this reject -- a function-wrapped one is left to
+// the ordinary checkFunction/checkExpr path, unaffected.
 func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition bool) bool {
 	if cmp == nil || len(cmp.Partials) == 0 {
 		return false
@@ -1570,8 +1628,26 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 			if !pb.checkRegexOperands(left, partial.Right) {
 				return false
 			}
-		case cypher.OperatorEquals, cypher.OperatorNotEquals,
-			cypher.OperatorLessThan, cypher.OperatorLessThanOrEqualTo,
+		case cypher.OperatorEquals, cypher.OperatorNotEquals:
+			// Every non-IN/regex operator's operands are plain value
+			// positions -- eval.go's evalPartialComparison calls EvalValue
+			// on both sides regardless of predicatePosition here, so a
+			// nested Comparison in either operand (e.g. the membership
+			// shape used as a value, `x = c IN exclude`) can never be
+			// reached by EvalPredicate's structural recursion.
+			if !pb.checkExpr(left, false) || !pb.checkExpr(partial.Right, false) {
+				return false
+			}
+			// Fail-safe reject: see this function's own doc comment for the
+			// full derivation -- a bare property lookup compared against a
+			// negative numeric literal via `=`/`<>`, on either side, always
+			// delegates rather than risk this evaluator disagreeing with
+			// dawgs' own sign-dependent translation.
+			if (isBarePropertyLookup(left) && isNegativeNumberLiteral(partial.Right)) ||
+				(isBarePropertyLookup(partial.Right) && isNegativeNumberLiteral(left)) {
+				return false
+			}
+		case cypher.OperatorLessThan, cypher.OperatorLessThanOrEqualTo,
 			cypher.OperatorGreaterThan, cypher.OperatorGreaterThanOrEqualTo,
 			cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains,
 			cypher.OperatorIs, cypher.OperatorIsNot:
@@ -1590,6 +1666,53 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 		left = partial.Right
 	}
 	return true
+}
+
+// isBarePropertyLookup reports whether expr (after unwrapping any
+// Parentheticals) is a bare `*cypher.PropertyLookup` -- exactly the shape
+// dawgs' own translator's expressionToPropertyLookupBinaryExpression
+// recognizes for its native-jsonb-vs-cast rewrite split (see
+// checkComparison's own doc for the full derivation). A function call
+// wrapping the property lookup (`coalesce(n.x, 0)`, `size(n.tags)`, ...)
+// deliberately does NOT count -- verified directly against
+// translate.Translate's generated SQL to take an identical, sign-
+// independent shape regardless.
+func isBarePropertyLookup(expr cypher.Expression) bool {
+	pl, ok := unwrapParens(expr).(*cypher.PropertyLookup)
+	return ok && pl != nil
+}
+
+// isNegativeNumberLiteral reports whether expr (after unwrapping any
+// Parentheticals) is the cypher frontend's AST shape for a negative number
+// literal: a `*cypher.UnaryAddOrSubtractExpression` with Operator "-"
+// wrapping -- through the single-term, no-op `*cypher.ArithmeticExpression`
+// the frontend always interposes for an arithmetic operand, and any further
+// Parentheticals -- a non-null `*cypher.Literal` holding int64/uint64/
+// float64 (confirmed against frontend.ParseCypher's own output for `-5`).
+// This intentionally does NOT match a unary minus over anything else (e.g.
+// `-(n.x)`, negating a property at runtime): that shape is not a literal at
+// all in dawgs' translator either, so it takes the ordinary cast route
+// unconditionally and never exercises the sign-dependent quirk
+// checkComparison's doc describes -- only a literal negative number does.
+func isNegativeNumberLiteral(expr cypher.Expression) bool {
+	unary, ok := unwrapParens(expr).(*cypher.UnaryAddOrSubtractExpression)
+	if !ok || unary == nil || unary.Operator != cypher.OperatorSubtract {
+		return false
+	}
+	inner := unwrapParens(unary.Right)
+	if arith, ok := inner.(*cypher.ArithmeticExpression); ok && arith != nil && len(arith.Partials) == 0 {
+		inner = unwrapParens(arith.Left)
+	}
+	lit, ok := inner.(*cypher.Literal)
+	if !ok || lit == nil || lit.Null {
+		return false
+	}
+	switch lit.Value.(type) {
+	case int64, uint64, float64:
+		return true
+	default:
+		return false
+	}
 }
 
 // checkInOperands validates `left IN right`/`left NOT IN right` (the latter

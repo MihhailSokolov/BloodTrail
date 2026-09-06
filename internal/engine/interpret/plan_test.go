@@ -464,6 +464,39 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// instead (see eval_test.go).
 		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN split(n.name, ',') + 1 AS x`, want: true},
 		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN labels(n) + 1 AS x`, want: true},
+
+		// Divergence-2 fix (task 17-report.md / task-17 follow-up): dawgs'
+		// pgsql translator lowers a direct `n.prop = <literal>`/`<>` via
+		// native jsonb equality for a bare POSITIVE numeric literal, but via
+		// text-extraction-then-cast for a NEGATIVE one (a
+		// cypher.UnaryAddOrSubtractExpression, not a plain cypher.Literal) --
+		// the two routes disagree on a present-JSON-null property (native:
+		// a definite non-null comparison result; cast: SQL NULL, same as a
+		// missing property), and a negative cast additionally risks a
+		// genuine pg runtime cast error a heterogeneous-typed jsonb column
+		// this evaluator can't reproduce. Confirmed directly against
+		// translate.Translate's own generated SQL (see checkComparison's doc
+		// for the exact dumps). checkComparison rejects (delegates) any
+		// `=`/`<>` between a bare property lookup and a negative numeric
+		// literal on either side; `<`/`<=`/`>`/`>=` are unaffected by sign
+		// (always the cast route) and stay accepted; a property lookup
+		// wrapped in a function call (coalesce()/size()) never hits the
+		// native-jsonb rewrite at all regardless of sign, verified the same
+		// way, so those stay accepted too.
+		{name: "equality property vs negative literal rejected", cypher: `MATCH (n:User) WHERE n.x = -5 RETURN n`, want: false},
+		{name: "inequality property vs negative literal rejected", cypher: `MATCH (n:User) WHERE n.x <> -5 RETURN n`, want: false},
+		{name: "equality negative literal vs property (operands swapped) rejected", cypher: `MATCH (n:User) WHERE -5 = n.x RETURN n`, want: false},
+		{name: "inequality negative literal vs property (operands swapped) rejected", cypher: `MATCH (n:User) WHERE -5 <> n.x RETURN n`, want: false},
+		{name: "equality property vs negative float literal rejected", cypher: `MATCH (n:User) WHERE n.x = -5.5 RETURN n`, want: false},
+		{name: "equality property vs positive literal still accepted", cypher: `MATCH (n:User) WHERE n.x = 5 RETURN n`, want: true},
+		{name: "inequality property vs positive literal still accepted", cypher: `MATCH (n:User) WHERE n.x <> 5 RETURN n`, want: true},
+		{name: "less-than property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE n.x < -5 RETURN n`, want: true},
+		{name: "less-equal property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE n.x <= -5 RETURN n`, want: true},
+		{name: "greater-than property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE n.x > -5 RETURN n`, want: true},
+		{name: "greater-equal property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE n.x >= -5 RETURN n`, want: true},
+		{name: "equality coalesce-wrapped property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE coalesce(n.x, 0) = -5 RETURN n`, want: true},
+		{name: "equality size()-wrapped property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE size(n.spns) = -5 RETURN n`, want: true},
+		{name: "equality two negative literals (no property lookup) still accepted", cypher: `MATCH (n:User) WHERE -5 = -5 RETURN n`, want: true},
 	}
 
 	runPlanGolden(t, snap, cases)
