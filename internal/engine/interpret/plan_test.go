@@ -364,7 +364,30 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "order by node alias rejected", cypher: `MATCH (n:User) RETURN n ORDER BY n`, want: false},
 		{name: "order by edge alias rejected", cypher: `MATCH (a:User)-[r:X]->(b:User) RETURN r ORDER BY r`, want: false},
 		{name: "order by path alias rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) RETURN p ORDER BY p`, want: false},
-		{name: "order by scalar alias ok", cypher: `MATCH (n:User) RETURN n.name AS nm ORDER BY nm`, want: true},
+
+		// C2 (final review): a bare property-lookup alias rejects, even
+		// though its runtime value is a plain scalar -- a differential
+		// probe against a live pg database found that dawgs' SQL
+		// translation sorts a jsonb-typed (untyped) property alias via
+		// PostgreSQL's native jsonb btree comparison, not via the
+		// cypher_value_compare function this package's own Compare ports;
+		// the two disagree on type-rank order (see planOrder's doc), so
+		// this shape must delegate rather than risk a wrong row SET under
+		// LIMIT.
+		{name: "order by property alias rejected", cypher: `MATCH (n:User) RETURN n.name AS nm ORDER BY nm`, want: false},
+		{name: "order by property alias rejected (no LIMIT either)", cypher: `MATCH (n:User) RETURN n.lastlogontimestamp AS t ORDER BY t`, want: false},
+		{name: "order by arithmetic over property rejected", cypher: `MATCH (n:User) RETURN n.x + 1 AS y ORDER BY y`, want: false},
+
+		// isStaticallyNumericScalar's admitted shapes: id()/size()/
+		// datetime() epoch accessors and arithmetic/literals built only
+		// from those are always a definite Go float64 regardless of what
+		// any property holds, so ordering by Compare's numeric branch can
+		// never disagree with pg's native (also purely numeric, no
+		// cross-type ambiguity) comparison for these.
+		{name: "order by id() alias ok", cypher: `MATCH (n:User) RETURN id(n) AS nid ORDER BY nid`, want: true},
+		{name: "order by size() alias ok", cypher: `MATCH (n:User) RETURN size(n.spns) AS sz ORDER BY sz`, want: true},
+		{name: "order by numeric literal alias ok", cypher: `MATCH (n:User) RETURN 1 AS one ORDER BY one`, want: true},
+		{name: "order by arithmetic over numeric literals alias ok", cypher: `MATCH (n:User) RETURN 1 + 2 AS y ORDER BY y`, want: true},
 
 		// shortestPath range restrictions (finding 3): a conservative
 		// tightening over plain var-length, which keeps its existing,
@@ -532,6 +555,68 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "inequality property vs bare literal still accepted (regression)", cypher: `MATCH (n:User) WHERE n.x <> 5 RETURN n`, want: true},
 		{name: "less-than property vs unary-plus literal still accepted", cypher: `MATCH (n:User) WHERE n.x < +5 RETURN n`, want: true},
 		{name: "less-than property vs parenthesized literal still accepted", cypher: `MATCH (n:User) WHERE n.x < (5) RETURN n`, want: true},
+
+		// C4 (final review): isBareScalarLiteral only covered numeric/bool,
+		// so a wrapped STRING literal slipped through this same reject --
+		// dawgs' translator takes the identical divergent cast route for a
+		// wrapped string operand that it does for a wrapped numeric one
+		// (checkComparison's doc has the confirmed SQL dumps). A bare string
+		// literal is unaffected (still the safe, native-jsonb shape) and
+		// must keep serving.
+		{name: "equality property vs parenthesized string literal rejected", cypher: `MATCH (n:User) WHERE n.x = ('5') RETURN n`, want: false},
+		{name: "inequality property vs parenthesized string literal rejected", cypher: `MATCH (n:User) WHERE n.x <> ('a') RETURN n`, want: false},
+		{name: "equality property vs concatenated string literals rejected", cypher: `MATCH (n:User) WHERE n.x = '5'+'' RETURN n`, want: false},
+		{name: "equality parenthesized string literal vs property (operands swapped) rejected", cypher: `MATCH (n:User) WHERE ('5') = n.x RETURN n`, want: false},
+		{name: "equality property vs bare string literal still accepted", cypher: `MATCH (n:User) WHERE n.x = '5' RETURN n`, want: true},
+		{name: "inequality property vs bare string literal still accepted", cypher: `MATCH (n:User) WHERE n.x <> 'a' RETURN n`, want: true},
+		// Relational (`<`) comparisons are governed by C5's own,
+		// numeric-only relationalComparisonSafe, not C4's bare-literal
+		// reject -- a non-numeric literal on the other side (wrapped or
+		// not) always rejects for `<`/`<=`/`>`/`>=`, since dawgs has no
+		// bare-literal-only native path for those operators at all (see
+		// relationalComparisonSafe's own doc).
+		{name: "less-than property vs parenthesized string literal rejected (C5)", cypher: `MATCH (n:User) WHERE n.x < ('5') RETURN n`, want: false},
+
+		// C5 (final review): dawgs has no bare-literal-only native path for
+		// `<`/`<=`/`>`/`>=` at all -- unlike `=`/`<>`, EVERY relational
+		// comparison casts, confirmed identical for `n.x < 5`, `n.x < -5`,
+		// `n.x < +5`, and `n.x < (5)`. Two shapes were found to cast
+		// unsafely relative to this evaluator and must reject
+		// (relationalComparisonSafe's own doc has the full derivation):
+		// property-vs-property (pg falls back to raw jsonb type-rank
+		// ordering, not this evaluator's structural numeric-only
+		// OrderCompare) and any coalesce()/arithmetic wrapping around a
+		// property operand (pg's cast target for the whole wrapped
+		// expression is derived from its own static type analysis, not
+		// reproduced here). A bare property compared against a statically-
+		// numeric expression (a numeric literal, id()/size(), a
+		// datetime() epoch accessor, or arithmetic over only those, on
+		// EITHER side) is the corpus's own required shape and must keep
+		// serving -- including through a carried WITH numeric alias, which
+		// carries no numeric-literal AST shape of its own but is tracked
+		// via partBuilder.numericScalars.
+		{name: "less-than property vs property rejected", cypher: `MATCH (s:User),(t:User) WHERE s.x < t.y RETURN s`, want: false},
+		{name: "greater-than property vs property rejected", cypher: `MATCH (s:User),(t:User) WHERE s.x > t.y RETURN s`, want: false},
+		{name: "less-equal coalesce-wrapped property vs literal rejected", cypher: `MATCH (n:User) WHERE coalesce(n.x, 0) <= 5 RETURN n`, want: false},
+		{name: "greater-equal literal vs coalesce-wrapped property rejected", cypher: `MATCH (n:User) WHERE 5 >= coalesce(n.x, 0) RETURN n`, want: false},
+		{name: "greater-than arithmetic-wrapped property vs literal rejected", cypher: `MATCH (n:User) WHERE n.x + 1 > 5 RETURN n`, want: false},
+		{name: "less-than literal vs arithmetic-wrapped property rejected", cypher: `MATCH (n:User) WHERE 5 < n.x + 1 RETURN n`, want: false},
+		{name: "less-than property vs numeric literal still accepted", cypher: `MATCH (n:User) WHERE n.x < 5 RETURN n`, want: true},
+		{name: "less-than property vs id() still accepted", cypher: `MATCH (n:User),(m:User) WHERE n.x < id(m) RETURN n`, want: true},
+		{name: "greater-than property vs size() still accepted", cypher: `MATCH (n:User),(m:User) WHERE n.x > size(m.spns) RETURN n`, want: true},
+		{
+			name:   "corpus shape: property vs datetime epoch arithmetic still accepted",
+			cypher: `MATCH (n:User) WHERE n.lastlogontimestamp < (datetime().epochseconds - 60*86400) RETURN n`,
+			want:   true,
+		},
+		{
+			name: "carried numeric WITH alias vs property still accepted",
+			cypher: `MATCH (n:User) WITH 60 AS days
+MATCH (m:User)
+WHERE m.threshold > days
+RETURN m`,
+			want: true,
+		},
 	}
 
 	runPlanGolden(t, snap, cases)

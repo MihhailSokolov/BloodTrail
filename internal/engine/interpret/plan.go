@@ -121,7 +121,11 @@ type Step struct {
 // for the same symbol reject the whole query rather than silently produce
 // an always-empty result -- see extractIDAnchor). ObjectIDAnchor is set from
 // a `sym.objectid = <string-literal>` WHERE conjunct, the fast O(1)
-// PropStore.NodeByObjectID path. Predicates is every WHERE conjunct (or
+// PropStore.NodesByObjectID path (PostgreSQL enforces no uniqueness
+// constraint on objectid, so the executor must treat this as a *set* of
+// candidate nodes -- usually one, but never assumed to be).
+//
+// Predicates is every WHERE conjunct (or
 // inline-map-desugared equality, see addNodePattern) that Plan determined
 // touches this variable *alone* -- a REDUNDANT, additive copy of a subset of
 // what Part.Where already carries, pushed here purely as an executor
@@ -389,10 +393,11 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.Snapshot) (result *Query, ok bo
 	regexes := map[string]*regexp.Regexp{}
 	known := map[string]symKind{}
 	countAliases := map[string]bool{}
+	numericScalars := map[string]bool{}
 
 	parts := make([]Part, 0, len(stages))
 	for _, st := range stages {
-		part, nextKnown, ok := planPart(snap, regexes, known, st.reading)
+		part, nextKnown, ok := planPart(snap, regexes, known, numericScalars, st.reading)
 		if !ok {
 			return nil, false
 		}
@@ -405,6 +410,7 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.Snapshot) (result *Query, ok bo
 			part.With = &wc
 			known = outputKnown
 			countAliases = countAliasSet(wc)
+			numericScalars = numericScalarSet(wc)
 		} else {
 			known = nextKnown
 		}
@@ -504,6 +510,32 @@ func countAliasSet(wc WithClause) map[string]bool {
 	return out
 }
 
+// numericScalarSet returns every alias wc carries forward that is
+// statically guaranteed to hold a genuine number on every row -- a
+// `<literal> AS name` WithConstant whose literal is itself numeric (planWith
+// builds WithConstant.Value via evalLiteralValue, which normalizes every
+// numeric literal -- int64, uint64, or float64 -- to a Go float64, this
+// package's own post-JSON numeric representation), or a `COUNT(...) AS
+// name` WithAggregate (countAggregate always produces a float64). See
+// partBuilder.numericScalars' own doc for why the next Part's
+// checkComparison (relationalComparisonSafe, finding C5) needs this: a bare
+// reference to such an alias has no numeric-literal AST shape of its own
+// for isStaticallyNumericScalar to recognize directly.
+func numericScalarSet(wc WithClause) map[string]bool {
+	out := make(map[string]bool, len(wc.Aggregates)+len(wc.Constants))
+	for _, agg := range wc.Aggregates {
+		if agg.Count != nil {
+			out[agg.Alias] = true
+		}
+	}
+	for _, c := range wc.Constants {
+		if _, ok := c.Value.(float64); ok {
+			out[c.Alias] = true
+		}
+	}
+	return out
+}
+
 // countShortestSteps counts every Step across every given Part whose
 // Shortest is not ShortestNone -- i.e. every shortestPath()/
 // allShortestPaths() pattern part compiled so far, across the whole Query
@@ -576,6 +608,20 @@ type partBuilder struct {
 	anon    int
 	regexes map[string]*regexp.Regexp // shared across the whole Query
 
+	// numericScalars names every symbol carried into this Part (via the
+	// preceding Part's WithClause, if any) that is statically GUARANTEED to
+	// hold a genuine number on every row: a `<literal> AS name` WithConstant
+	// whose literal is itself numeric, or a `COUNT(...) AS name`
+	// WithAggregate (countAggregate always produces a float64 -- see its own
+	// doc). Empty for Part[0] (nothing has been carried into it yet).
+	// relationalComparisonSafe (finding C5) consults this so that a bare
+	// reference to such a carried alias -- the corpus's own `WITH 60 AS
+	// days ... WHERE m.threshold > days` shape -- counts as statically
+	// numeric even though, as a bare *cypher.Variable, it carries no
+	// numeric-literal AST shape of its own for isStaticallyNumericScalar to
+	// see directly.
+	numericScalars map[string]bool
+
 	// shortestSteps indexes pb.chains entries produced by a shortestPath/
 	// allShortestPaths pattern, for the post-WHERE endpoint-constraint and
 	// HasExplicitEndpointInequality finalize pass.
@@ -603,15 +649,18 @@ type partBuilder struct {
 
 // planPart builds one Part from reading (that stage's ReadingClauses),
 // seeded with carried (symbols already bound before this Part -- non-empty
-// only for the stage after a WITH boundary). It returns the built Part and
-// this Part's own final symbol table (carried forward as-is unless the
-// caller applies a WITH on top of it).
-func planPart(snap *snapshot.Snapshot, regexes map[string]*regexp.Regexp, carried map[string]symKind, reading []*cypher.ReadingClause) (Part, map[string]symKind, bool) {
+// only for the stage after a WITH boundary) and numericScalars (see
+// partBuilder.numericScalars' own doc -- likewise non-empty only after a
+// WITH boundary). It returns the built Part and this Part's own final
+// symbol table (carried forward as-is unless the caller applies a WITH on
+// top of it).
+func planPart(snap *snapshot.Snapshot, regexes map[string]*regexp.Regexp, carried map[string]symKind, numericScalars map[string]bool, reading []*cypher.ReadingClause) (Part, map[string]symKind, bool) {
 	pb := &partBuilder{
-		snap:    snap,
-		known:   cloneKnown(carried),
-		nodes:   map[string]*NodeConstraint{},
-		regexes: regexes,
+		snap:           snap,
+		known:          cloneKnown(carried),
+		nodes:          map[string]*NodeConstraint{},
+		regexes:        regexes,
+		numericScalars: numericScalars,
 	}
 
 	var whereConjuncts []cypher.Expression
@@ -1560,25 +1609,35 @@ func checkLiteralShape(lit *cypher.Literal) bool {
 //	n.x = (5)      -> ((properties ->> 'x'))::int8 = (5)                         -- cast (bare parens too)
 //	n.x = 5 + 0    -> ((properties ->> 'x'))::int8 = 5 + 0                       -- cast (genuine arithmetic)
 //
-// Only a bare `cypher.Literal` (int64/uint64/float64/bool) takes the
+// A follow-up probe (the final review's finding C4) found the identical
+// split for a STRING operand, confirmed the same way:
+//
+//	n.x = '5'      -> ((properties -> 'x'))::jsonb = to_jsonb(('5')::text)::jsonb -- native jsonb equality
+//	n.x = ('5')    -> ((properties ->> 'x'))::text = ('5')                        -- cast (bare parens)
+//	n.x = '5'+''   -> ((properties ->> 'x'))::text = '5' || ''                    -- cast (concatenation)
+//
+// Only a bare `cypher.Literal` (int64/uint64/float64/bool/string) takes the
 // native-jsonb route, via rewriteJSONScalarEqualityOperand: that rewrite
 // fires solely when the pgsql-translated operand directly implements
 // pgsql.TypeHinted with a JSON-scalar-equality type (Boolean, Int*,
-// Float4/8, Numeric) -- true only of the pgsql.Literal a bare cypher.Literal
-// translates to. EVERY wrapping this package's own checkExpr admits around
-// a scalar value -- a Parenthetical (even just `(5)`, no sign at all), a
-// UnaryAddOrSubtractExpression of either sign at any nesting depth, or a
-// genuine multi-term ArithmeticExpression (parenthesized or not) -- lowers
+// Float4/8, Numeric, Text) -- true only of the pgsql.Literal a bare
+// cypher.Literal translates to. EVERY wrapping this package's own checkExpr
+// admits around a scalar value -- a Parenthetical (even just `(5)`/`('5')`,
+// no sign at all), a UnaryAddOrSubtractExpression of either sign at any
+// nesting depth, or a genuine multi-term ArithmeticExpression (parenthesized
+// or not, `+` doubling as string concatenation for Text operands) -- lowers
 // to a pgsql.Parenthetical/UnaryExpression/BinaryExpression instead, none of
 // which implement pgsql.TypeHinted, so the rewrite silently declines and
 // the comparison falls through to the identical cast route a bare negative
 // literal takes -- purely an artifact of the operand's own AST shape, not
-// its sign, verified directly for every row in the table above (an earlier
-// version of this reject, isNegativeNumberLiteral, only matched the second
-// row -- a single UnaryAddOrSubtractExpression("-") wrapping a bare literal
-// -- missing every other row here; see the 2026-09-06 fix report in
-// task-17-report.md for the full investigation, including the AST dumps
-// this table's shapes were confirmed against).
+// its sign or type, verified directly for every row in both tables above
+// (an earlier version of this reject, isNegativeNumberLiteral, only matched
+// the second numeric row -- a single UnaryAddOrSubtractExpression("-")
+// wrapping a bare literal -- missing every other row here; a later version,
+// isBareScalarLiteral, covered every numeric/bool row but missed the whole
+// string table above it, closed by extending it to string literals too --
+// both gaps found the same way: dumping translate.Translate's generated SQL
+// for each AST shape and comparing it against the shape actually served).
 //
 // The two routes disagree on a property that is *present* but an explicit
 // JSON null: native jsonb equality treats it as a comparable, non-null
@@ -1678,8 +1737,27 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 				return false
 			}
 		case cypher.OperatorLessThan, cypher.OperatorLessThanOrEqualTo,
-			cypher.OperatorGreaterThan, cypher.OperatorGreaterThanOrEqualTo,
-			cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains,
+			cypher.OperatorGreaterThan, cypher.OperatorGreaterThanOrEqualTo:
+			// Every non-IN/regex operator's operands are plain value
+			// positions -- eval.go's evalPartialComparison calls EvalValue
+			// on both sides regardless of predicatePosition here, so a
+			// nested Comparison in either operand (e.g. the membership
+			// shape used as a value, `x = c IN exclude`) can never be
+			// reached by EvalPredicate's structural recursion.
+			if !pb.checkExpr(left, false) || !pb.checkExpr(partial.Right, false) {
+				return false
+			}
+			// Fail-safe reject: see relationalComparisonSafe's own doc for
+			// the full derivation -- unlike `=`/`<>`, dawgs' translator has
+			// no bare-literal-only native-jsonb path for `<`/`<=`/`>`/`>=`
+			// at all; it ALWAYS casts, and the two shapes that cast
+			// unsafely relative to this evaluator (a property compared
+			// against another property, and any coalesce()/arithmetic
+			// wrapping around a property operand) must delegate instead.
+			if !pb.relationalComparisonSafe(left, partial.Right) {
+				return false
+			}
+		case cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains,
 			cypher.OperatorIs, cypher.OperatorIsNot:
 			// Every non-IN/regex operator's operands are plain value
 			// positions -- eval.go's evalPartialComparison calls EvalValue
@@ -1698,6 +1776,92 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 	return true
 }
 
+// relationalComparisonSafe implements the final review's finding C5:
+// whether a `<`/`<=`/`>`/`>=` comparison between left and right is safe for
+// this evaluator to serve, or must delegate.
+//
+// Unlike `=`/`<>` (checkComparison's own doc: a bare-literal-only
+// native-jsonb path, everything else falling to a cast), dawgs' translator
+// has NO bare-literal special case for the relational operators at all --
+// confirmed directly against translate.Translate's generated SQL, every
+// shape takes a cast: `n.x < 5`, `n.x < -5`, `n.x < +5`, and `n.x < (5)` all
+// produce the identical `((properties ->> 'x'))::int8 < ...` shape. Two
+// distinct ways that cast disagrees with this package's own runtime
+// comparison (eval.go's OrderCompare, which requires both operands to
+// already be like-typed float64s or bails ErrNotComparable/ErrCollation)
+// were confirmed:
+//
+//   - A property compared against ANOTHER property (`s.x < s.y`): with no
+//     literal on either side to hint a cast type from, dawgs falls back to
+//     comparing both sides as raw jsonb via PostgreSQL's own jsonb `<`
+//     operator -- ordered by jsonb's type-rank system (the identical
+//     Null/String/Number/Bool/Array/Object ranking behind finding C2's
+//     ORDER BY divergence), not by OrderCompare's structural numeric-only
+//     rule. The two can disagree on any row where either property is not a
+//     number.
+//   - A coalesce()-wrapped or arithmetic-wrapped property operand
+//     (`coalesce(n.x, 0) < 5`, `n.x + 1 > 5`): the cast target dawgs picks
+//     for the WHOLE wrapped expression is derived from its own static type
+//     analysis (the same coalesce/`+`-operand typing this package already
+//     has to reason about for finding C4/the `+` concat-vs-numeric split --
+//     see classifyAddOperand's doc), which this function does not attempt
+//     to re-derive for a relational context; rather than risk an unproven
+//     cast-type mismatch, every such shape delegates.
+//
+// The corpus's own required shape, a bare property lookup relationally
+// compared against a statically-numeric expression on the other side (e.g.
+// `n.lastlogontimestamp < (datetime().epochseconds - 60*86400)`), is kept:
+// pg's cast there is unambiguously numeric (int8/float8, hinted by the
+// other side's own static numeric type), and so is this evaluator's --
+// EXCEPT for one residual, deliberately accepted divergence, documented in
+// the README's known-divergences note: if the property happens to hold a
+// non-numeric value on some row (unrealistic for a real timestamp-shaped AD
+// property, but not impossible in principle), pg's cast ABORTS the whole
+// query with a runtime error, while this evaluator's OrderCompare instead
+// answers ErrNotComparable, which TriNull-drops just that one row. Silently
+// serving fewer rows than an aborting pg query technically "would have
+// returned" (none, since it errors) is the one case this package accepts
+// as safe-by-construction rather than a false serve: a dropped row is never
+// a WRONG row, and real BloodHound data never puts a string in a timestamp
+// property.
+//
+// isStaticallyNumericScalar (shared with finding C2's ORDER BY fix) is
+// exactly the right notion of "statically numeric" here too: it accepts a
+// numeric literal, id()/size()/datetime() epoch accessors, and arithmetic
+// built only from those -- never a property lookup, which is exactly the
+// operand shape whose static type pg cannot itself prove ahead of
+// execution. isNumericSafeOperand additionally treats a bare reference to a
+// carried numeric WITH alias (pb.numericScalars) the same way, for the
+// corpus's own `WITH 60 AS days ... WHERE m.threshold > days` shape -- see
+// partBuilder.numericScalars' own doc.
+func (pb *partBuilder) relationalComparisonSafe(left, right cypher.Expression) bool {
+	leftNumeric, rightNumeric := pb.isNumericSafeOperand(left), pb.isNumericSafeOperand(right)
+	switch {
+	case leftNumeric && rightNumeric:
+		return true
+	case leftNumeric && isBarePropertyLookup(right):
+		return true
+	case rightNumeric && isBarePropertyLookup(left):
+		return true
+	default:
+		return false
+	}
+}
+
+// isNumericSafeOperand reports whether expr is statically guaranteed to
+// evaluate to a genuine number: either isStaticallyNumericScalar's own AST-
+// shape judgment, or a bare Variable naming an alias pb.numericScalars
+// marks as always-numeric (a carried WITH constant/COUNT this partBuilder's
+// own AST-only isStaticallyNumericScalar has no way to see through, since a
+// bare Variable node carries no literal shape of its own).
+func (pb *partBuilder) isNumericSafeOperand(expr cypher.Expression) bool {
+	if isStaticallyNumericScalar(expr) {
+		return true
+	}
+	v, ok := unwrapParens(expr).(*cypher.Variable)
+	return ok && v != nil && pb.numericScalars[v.Symbol]
+}
+
 // isBarePropertyLookup reports whether expr (after unwrapping any
 // Parentheticals) is a bare `*cypher.PropertyLookup` -- exactly the shape
 // dawgs' own translator's expressionToPropertyLookupBinaryExpression
@@ -1712,18 +1876,20 @@ func isBarePropertyLookup(expr cypher.Expression) bool {
 	return ok && pl != nil
 }
 
-// isNonBareScalarLiteral reports whether expr denotes a numeric or boolean
-// literal value while NOT itself being -- with zero unwrapping -- a bare
-// `*cypher.Literal`. This is exactly the shape whose translation diverges
-// from a true bare literal's (checkComparison's own doc has the full
-// derivation and the confirmed SQL for every case below): a
+// isNonBareScalarLiteral reports whether expr denotes a numeric, boolean, or
+// string literal value while NOT itself being -- with zero unwrapping -- a
+// bare `*cypher.Literal`. This is exactly the shape whose translation
+// diverges from a true bare literal's (checkComparison's own doc has the
+// full derivation and the confirmed SQL for every case below, including the
+// string-literal table finding C4 added): a
 // `*cypher.UnaryAddOrSubtractExpression` of EITHER sign at any nesting depth
 // (`+5`, `-5`, `-(-5)`, ...), a bare `*cypher.Parenthetical` around a
-// literal with no sign at all (`(5)`, `((5))`), and genuine multi-term
-// arithmetic over literal operands, parenthesized or not (`5 + 0`,
-// `(5 + 0)`) -- all of it, because dawgs' rewriteJSONScalarEqualityOperand
-// only recognizes a pgsql node that is directly `pgsql.TypeHinted`, which a
-// bare cypher.Literal's translated pgsql.Literal is and none of
+// literal with no sign at all (`(5)`, `('5')`, `((5))`), and genuine
+// multi-term arithmetic (or, for strings, concatenation) over literal
+// operands, parenthesized or not (`5 + 0`, `(5 + 0)`, `'5'+”`) -- all of
+// it, because dawgs' rewriteJSONScalarEqualityOperand only recognizes a
+// pgsql node that is directly `pgsql.TypeHinted`, which a bare
+// cypher.Literal's translated pgsql.Literal is and none of
 // pgsql.Parenthetical/UnaryExpression/BinaryExpression are.
 //
 // A non-literal core anywhere in the tree (a property lookup, function
@@ -1739,8 +1905,8 @@ func isNonBareScalarLiteral(expr cypher.Expression) bool {
 }
 
 // isBareScalarLiteral reports whether expr is, with zero unwrapping, a
-// non-null `*cypher.Literal` holding an int64/uint64/float64/bool value --
-// exactly (and only) the AST shape dawgs' own native-jsonb rewrite
+// non-null `*cypher.Literal` holding an int64/uint64/float64/bool/string
+// value -- exactly (and only) the AST shape dawgs' own native-jsonb rewrite
 // recognizes (see isNonBareScalarLiteral's doc for the full derivation).
 func isBareScalarLiteral(expr cypher.Expression) bool {
 	lit, ok := expr.(*cypher.Literal)
@@ -1748,7 +1914,7 @@ func isBareScalarLiteral(expr cypher.Expression) bool {
 		return false
 	}
 	switch lit.Value.(type) {
-	case int64, uint64, float64, bool:
+	case int64, uint64, float64, bool, string:
 		return true
 	default:
 		return false
@@ -1758,8 +1924,8 @@ func isBareScalarLiteral(expr cypher.Expression) bool {
 // isScalarLiteralTree reports whether expr, after peeling any
 // Parentheticals (unwrapParens) and recursing through
 // UnaryAddOrSubtractExpression/ArithmeticExpression nodes, is built
-// entirely out of scalar (int64/uint64/float64/bool) literals -- i.e. is
-// "numeric/bool-literal-shaped" for isNonBareScalarLiteral's purposes,
+// entirely out of scalar (int64/uint64/float64/bool/string) literals -- i.e.
+// is "scalar-literal-shaped" for isNonBareScalarLiteral's purposes,
 // regardless of whether it is itself bare (that top-level distinction is
 // isNonBareScalarLiteral's own job, not this helper's).
 func isScalarLiteralTree(expr cypher.Expression) bool {
@@ -2401,6 +2567,10 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 	// function call, arithmetic, a literal) -- see planOrder's doc for why
 	// this distinction matters.
 	projectedKinds := map[string]symKind{}
+	// projectedNumeric records, for every RETURN alias, whether
+	// isStaticallyNumericScalar accepts its own top-level expression --
+	// planOrder's second (beyond bare count aliases) admission criterion.
+	projectedNumeric := map[string]bool{}
 
 	for _, raw := range proj.Items {
 		item, ok := raw.(*cypher.ProjectionItem)
@@ -2439,6 +2609,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 		}
 		projectedAliases[name] = true
 		projectedKinds[name] = itemKind
+		projectedNumeric[name] = isStaticallyNumericScalar(item.Expression)
 
 		items = append(items, ProjectionOutput{
 			Alias:        name,
@@ -2447,7 +2618,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 		})
 	}
 
-	orderKeys, ok := planOrder(proj.Order, projectedKinds, countAliases)
+	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, countAliases)
 	if !ok {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -2672,18 +2843,31 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 // function call, arithmetic, an unrelated symbol) rejects -- "ORDER BY
 // expressions other than projected aliases/ids/count".
 //
-// A projected alias must additionally be scalar-valued: projectedKinds
-// records each RETURN alias's own kind (symNode/symEdge/symPath for a bare
-// node/edge/path-variable projection, symScalar for everything else --
-// property lookups, function calls, arithmetic, literals). eval.go's
-// comparison machinery (evalComparison/CompareValues) has no ordering over a
-// node's/edge's full property-map value or a path -- there is no
-// "less-than" between two nodes -- so ORDER BY on a node/edge/path-valued
-// alias is rejected here rather than accepted and left to guarantee an
-// executor-time ErrUnsupported/ErrNotComparable on the very first sort
-// comparison. A COUNT alias (countAliases) is always scalar by construction
-// and bypasses this check.
-func planOrder(order *cypher.Order, projectedKinds map[string]symKind, countAliases map[string]bool) ([]OrderKey, bool) {
+// A projected alias must additionally be provably numeric. This is
+// NARROWER than "scalar-valued": eval.go's comparison machinery
+// (value.go's Compare, ported line for line from DAWGS' own
+// cypher_value_compare plpgsql function) is what this package's ORDER BY
+// uses -- but a differential probe against a live PostgreSQL database found
+// that dawgs' SQL translation does NOT always route a query's own ORDER BY
+// through that same function: a bare property-lookup alias (jsonb-typed,
+// no static type pg can prove ahead of execution) instead sorts via
+// PostgreSQL's native jsonb btree comparison, whose type-rank order
+// (Null < String < Number < Bool < Array < Object, SQL NULL last) does not
+// match cypher_value_compare's own ranking. Serving such a query with
+// Compare would silently reorder rows relative to pg -- and under a LIMIT,
+// reordering changes which rows even survive, not merely their sequence.
+// COUNT is exempt because it is always a definite, homogeneously-typed int8
+// column, for which native jsonb ordering and Compare's numeric branch
+// agree by construction (no cross-type ambiguity is possible). The other
+// alias shape this function admits, isStaticallyNumericScalar, extends the
+// same reasoning to any RETURN item whose STATIC AST shape guarantees a
+// definite number every row regardless of what any underlying property
+// holds (id()/size()/datetime() epoch accessors, numeric literals,
+// arithmetic over only those) -- never a bare property lookup, which is
+// exactly the shape the probe found unsafe. Every other alias shape
+// (property lookups, arbitrary function calls, node/edge/path values)
+// rejects outright, delegating the whole query to PostgreSQL.
+func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric map[string]bool, countAliases map[string]bool) ([]OrderKey, bool) {
 	if order == nil {
 		return nil, true
 	}
@@ -2704,7 +2888,61 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, countAlia
 		if !isProjected || kind == symNode || kind == symEdge || kind == symPath {
 			return nil, false
 		}
+		if !projectedNumeric[v.Symbol] {
+			return nil, false
+		}
 		keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})
 	}
 	return keys, true
+}
+
+// isStaticallyNumericScalar reports whether expr (a RETURN item's own
+// top-level expression) can only ever evaluate to a Cypher number, judged
+// purely by its STATIC AST shape -- never by sniffing a runtime value --
+// mirroring the discipline classifyAddOperand already applies to `+`
+// operands. It accepts exactly: a bare numeric literal; id(), size(), or
+// datetime().epochseconds/.epochmillis (this package's BareCallKind set,
+// each of which evalIDFunction/evalListSizeFunction/evalDateTimeComponent
+// always produces as a genuine Go float64, never a property-typed value);
+// and arithmetic (+, -, *, /, %, unary +/-) whose every leaf is itself one
+// of those shapes. A bare property lookup is NEVER included, no matter how
+// "obviously numeric" its name looks (e.g. lastlogontimestamp): PostgreSQL
+// keeps no static type for a jsonb property, so a row where it happens to
+// hold a string, a bool, or is absent entirely is not something Plan can
+// rule out ahead of execution -- see planOrder's own doc for why that
+// distinction is exactly the divergence this function exists to avoid.
+func isStaticallyNumericScalar(expr cypher.Expression) bool {
+	expr = unwrapParens(expr)
+
+	switch bareCallKind(expr) {
+	case "id", "size", "epochseconds", "epochmillis":
+		return true
+	}
+
+	switch e := expr.(type) {
+	case *cypher.Literal:
+		if e == nil || e.Null {
+			return false
+		}
+		switch e.Value.(type) {
+		case int64, uint64, float64:
+			return true
+		default:
+			return false
+		}
+	case *cypher.ArithmeticExpression:
+		if e == nil || !isStaticallyNumericScalar(e.Left) {
+			return false
+		}
+		for _, p := range e.Partials {
+			if p == nil || !isStaticallyNumericScalar(p.Right) {
+				return false
+			}
+		}
+		return true
+	case *cypher.UnaryAddOrSubtractExpression:
+		return e != nil && isStaticallyNumericScalar(e.Right)
+	default:
+		return false
+	}
 }
