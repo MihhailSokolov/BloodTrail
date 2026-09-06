@@ -210,6 +210,28 @@ func fixtureKinds(files []caseFile) (nodeKinds, edgeKinds graph.Kinds) {
 	return nodeKinds, edgeKinds
 }
 
+// dawgsCorpusServedFloor is Task 17's engine-mode served floor: pinned at
+// 70 (~90% of observed, rounded down), just below the 79 read-only cases
+// (across every dataset group's "engine" pass, summed) this corpus's fixed
+// case files actually served as of 2026-09-06 (`go test -tags integration
+// -run TestDAWGSCorpus -v`, totalEngineServed logged at the end of
+// TestDAWGSCorpus), deterministic run to run since RebuildNow and the
+// corpus itself carry no randomness. Most of the corpus's ~375 cases are
+// still shapes interpret.Plan declines outright (aggregation variants,
+// temporal values, updates, and more -- see this file's package doc) or
+// that translateGateOK's own second-guess rejects, so 79 (not "most of the
+// corpus") is the correct, already-measured baseline, not a bug in this
+// count. A regression that makes interpret.Plan/translateGateOK decline
+// far more broadly than expected would still leave every individual
+// "engine" subtest green (a declined case simply delegates to PostgreSQL,
+// which is always correct -- see this file's package doc) -- silently
+// defeating the entire point of running two modes at all. This floor
+// catches that silent regression the per-case assertions cannot. Retune
+// both this constant and its comment together if the corpus (a
+// specterops/dawgs dependency bump) or the interpreter's accepted subset
+// changes enough to move the observed count.
+const dawgsCorpusServedFloor = 70
+
 // TestDAWGSCorpus is milestone 3's "DAWGS integration corpus green" exit
 // criterion: dawgs' own Cypher conformance corpus, run against
 // *bloodtrail.Driver instead of a bare driver, in both the delegating and
@@ -222,6 +244,10 @@ func fixtureKinds(files []caseFile) (nodeKinds, edgeKinds graph.Kinds) {
 // answers that recognized shape differently than PostgreSQL does -- a real
 // serving bug to fix in the engine (internal/engine), with a regression
 // test, not something to paper over here.
+//
+// Task 17 additionally tallies every dataset group's "engine" pass served-
+// case count (totalEngineServed) and asserts dawgsCorpusServedFloor at the
+// end -- see that constant's own doc.
 func TestDAWGSCorpus(t *testing.T) {
 	dawgsDir := locateDAWGSModuleDir(t)
 
@@ -280,6 +306,12 @@ func TestDAWGSCorpus(t *testing.T) {
 
 	dsn := graphtest.PGAvailable(t)
 
+	// Must be installed before dawgs.Open constructs the bloodtrail driver
+	// below -- see installLogCapture's own doc (staleness_integration_test.go)
+	// -- so Task 17's engine-mode served-floor tally (dawgsCorpusServedFloor's
+	// own doc) can count cypherServedMarker occurrences.
+	buf := installLogCapture(t)
+
 	// graphtest.OpenPG asserts a bare default-graph schema on a throwaway
 	// *pg.Driver purely to get a *pgxpool.Pool sized and configured the way
 	// every other integration test's pool is; the pgDriver return is unused
@@ -328,6 +360,16 @@ func TestDAWGSCorpus(t *testing.T) {
 	// with exported fields, and WithRollbackFixture (harness.go) needs
 	// nothing else.
 	session := &integration.Session{DB: db, Ctx: ctx}
+
+	// totalEngineServed accumulates a cypherServedMarker delta around every
+	// dataset group's "engine" pass below -- Task 17's served floor
+	// (dawgsCorpusServedFloor's own doc), a suite-wide anti-vacuity tally
+	// distinct from any single case's own pass/fail: a regression that made
+	// interpret.Plan/translateGateOK decline far more broadly could still
+	// leave every individual "engine" case green (delegation to PostgreSQL
+	// is always correct -- see this file's package doc), silently defeating
+	// the entire point of running two modes at all.
+	var totalEngineServed int
 
 	for _, ds := range datasetNames {
 		g := groups[ds]
@@ -383,8 +425,15 @@ func TestDAWGSCorpus(t *testing.T) {
 
 			// Mode 2: engine -- same cases, same loaded data, now with a
 			// fresh snapshot so every shape interpret.Plan accepts actually
-			// gets served from it.
+			// gets served from it. The cypherServedMarker delta around this
+			// one call counts every case this dataset group's "engine" pass
+			// actually served (each served case logs the marker exactly
+			// once, from TryCypher's own single tx.Query call per case --
+			// see runReadOnly), folded into totalEngineServed for the
+			// suite-wide floor checked after the loop.
+			engineServedBefore := markerCount(buf, cypherServedMarker)
 			t.Run("engine", runReadOnlyCases)
+			totalEngineServed += markerCount(buf, cypherServedMarker) - engineServedBefore
 
 			// Fixture cases: each runs once, in a rolled-back write
 			// transaction that never reaches the engine either way (see
@@ -411,6 +460,11 @@ func TestDAWGSCorpus(t *testing.T) {
 				}
 			})
 		})
+	}
+
+	t.Logf("DAWGS corpus: engine mode served %d read-only cases across every dataset group", totalEngineServed)
+	if totalEngineServed < dawgsCorpusServedFloor {
+		t.Errorf("DAWGS corpus engine mode served only %d cases, want >= %d (see dawgsCorpusServedFloor's doc) -- a regression may have made the interpreter decline far more broadly than expected", totalEngineServed, dawgsCorpusServedFloor)
 	}
 }
 

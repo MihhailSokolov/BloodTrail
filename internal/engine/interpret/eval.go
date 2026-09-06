@@ -566,6 +566,29 @@ func evalIdentityEquality(row *Row, leftExpr, rightExpr cypher.Expression) (t Tr
 // through ScalarEq, complemented for `<>` since pg's jsonb `=`/`<>` are
 // simple complements of each other once collation isn't in play (ScalarEq is
 // already total over present values -- see its doc comment).
+//
+// A NUMBER literal is a known, deliberately *not* handled, edge case: dawgs'
+// own pgsql translator compiles `n.prop = <literal>`/`n.prop <> <literal>`
+// via native jsonb comparison (`(n.properties -> 'prop')::jsonb = to_jsonb
+// (<literal>)::jsonb`, matching ScalarEq's present-JSON-null-is-a-definite-
+// value semantics) when <literal> is a bare positive numeric literal, but via
+// text-extraction-then-cast (`(n.properties ->> 'prop')::float8 = <literal>`,
+// which nulls out on a present JSON null exactly like a missing property)
+// when <literal> is *negative* (a cypher.UnaryAddOrSubtractExpression
+// wrapping the positive literal, not a plain cypher.Literal) -- confirmed by
+// dumping translate.Translate's own generated SQL for both shapes. `<`/`<=`/
+// `>`/`>=`/IN are unaffected (always the cast route, any sign -- see
+// evalOrder/In's own already-correct null handling). Reproducing this
+// sign-dependent split correctly in this evaluator would mean threading
+// "was the literal AST a bare cypher.Literal or a Negation" all the way down
+// to here, just to imitate what looks like an accidental inconsistency in
+// dawgs' own translator/optimizer rather than a real Cypher semantic -- out
+// of scope for this package to chase. random_cypher_differential_
+// integration_test.go (repo root) discovered this comparing `n.val <>
+// -100.0` against a fixture property deliberately mixing numbers with an
+// explicit JSON null, and works around it by only ever comparing `=`/`<>`
+// against non-negative literals (see its randomCypherPickNonNegativeNumber),
+// leaving `<`/`>` (unaffected by sign) free to use either.
 func evalLiteralComparison(env *Env, row *Row, otherExpr cypher.Expression, op cypher.Operator, lit *cypher.Literal) (Tri, error) {
 	if lit.Null {
 		return TriNull, nil
