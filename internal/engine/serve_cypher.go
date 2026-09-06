@@ -1,0 +1,577 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Package engine: this file implements the materialization layer between
+// the in-memory Cypher interpreter (internal/engine/interpret's Plan/
+// Execute) and dawgs' graph.Result contract: turning a snapshot.NodeID/
+// interpret.EdgeRef/interpret.PathVal into a full *graph.Node/*graph.
+// Relationship/graph.Path, and wrapping a fully-materialized interpret.
+// ResultSet as a graph.Result (cypherRowsResult) the way pathResult
+// (result.go) and rowResult (rowresult.go) already wrap this milestone's
+// two earlier serving pipelines.
+//
+// This file does NOT wire any of this into TryCypher -- that is Task 13's
+// job, once Task 11 (edge-property hydration) and Task 12 (the rest of the
+// pipeline) exist too. Everything here is pure, snapshot-only
+// materialization: no I/O, no PostgreSQL round trip, nothing that can fail
+// -- exactly the same posture pathResult/rowResult already take (their
+// Error() always returns nil), so cypherRowsResult's does too.
+package engine
+
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+
+	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/graph"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/interpret"
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
+)
+
+// Budget/batch constants for the Cypher interpreter pipeline (the milestone
+// plan's "Global Constants" section), defined here as this task's file is
+// their designated home.
+//
+// maxExpansionDepth's own mirror lives in interpret.MaxExpansionDepth
+// (interpret/plan.go): that constant caps the *hop count* of an unbounded
+// variable-length relationship pattern at plan time, before a snapshot row
+// is ever produced, whereas the three constants below cap what happens to
+// rows and edge lookups *after* planning -- a different axis of the same
+// "don't let one query eat unbounded resources" concern. It cannot simply
+// be redefined here and referenced from interpret: interpret sits below
+// this package in the import graph (this package imports interpret, never
+// the reverse), so interpret.MaxExpansionDepth necessarily stays its own,
+// self-contained copy -- see that constant's own doc comment, which
+// anticipates exactly this file's existence.
+const (
+	// maxCypherRows caps the number of rows a served Cypher query may
+	// produce, mirroring interpret.Budgets.MaxRows -- the executor already
+	// enforces this during materialization (interpret.ErrBudget), so a
+	// caller wiring interpret.Execute for the TryCypher pipeline (Task 13)
+	// is expected to pass Budgets{MaxRows: maxCypherRows, ...} rather than
+	// leave it unbounded.
+	maxCypherRows = 100_000
+
+	// maxCypherWork caps interpret.Budgets.MaxWork, the executor's generic
+	// per-query work-unit counter (nodes scanned, adjacency slots inspected,
+	// rows produced -- see interpret.Budgets' own doc). 1<<28 is generous
+	// enough for any query this interpreter is expected to serve locally
+	// while still bounding a pathological pattern (e.g. a dense var-length
+	// expansion) well short of the kind of runaway cost that would make
+	// local serving slower than simply delegating to PostgreSQL.
+	maxCypherWork = 1 << 28
+
+	// edgePropsBatchSize caps how many database edge ids one Task 11
+	// property-hydration query batches into a single `WHERE id = ANY($1)`
+	// round trip, mirroring hydrate.go's own edgeBatchSize for node/edge
+	// hydration (500 triples there; edge-id-only batches here can run much
+	// larger since each bound parameter is a single uint64, not a three-
+	// column triple).
+	edgePropsBatchSize = 10_000
+)
+
+// --- Node/edge/path materialization -----------------------------------
+
+// materializeNode builds a full graph.Node value for a snapshot's dense
+// node id, mirroring what the pg driver would decode from the same node's
+// own `node` table row: ID from GraphIDs (the node's database id), Kinds
+// resolved from the node's own kind_ids slice (NodeKinds[KindOffsets[n]:
+// KindOffsets[n+1]]) through the snapshot's own local KindTable -- in
+// exactly the array order Builder.AddNode originally received them,
+// matching interpret/eval.go's evalLabelsFunction's identical "no sorting
+// or deduplication" contract for labels(n) -- and Properties built directly
+// from Props.NodeMap(n) via graph.AsProperties, which aliases the map
+// rather than copying it (see graph.AsProperties' doc comment): NodeMap
+// already allocates a fresh map on every call, so this aliasing is safe.
+//
+// A KindID present in NodeKinds that snap.Kinds cannot resolve to a name is
+// silently skipped from the result rather than surfaced as a placeholder
+// Kind -- mirroring evalLabelsFunction's own identical skip, so labels(n)
+// and a materialized node's own Kinds field never disagree. This is
+// expected to be unreachable in practice: snap.Kinds is built from the
+// database's entire global `kind` table (see LoadSnapshot), independent of
+// which kinds any one node happens to carry, so every KindID a node's
+// kind_ids slice can contain was already registered there.
+func materializeNode(snap *snapshot.Snapshot, n snapshot.NodeID) *graph.Node {
+	lo, hi := snap.KindOffsets[n], snap.KindOffsets[n+1]
+	kinds := make(graph.Kinds, 0, hi-lo)
+	for _, id := range snap.NodeKinds[lo:hi] {
+		if name, ok := snap.Kinds.Name(id); ok {
+			kinds = append(kinds, graph.StringKind(name))
+		}
+	}
+	return graph.NewNode(graph.ID(snap.GraphIDs[n]), graph.AsProperties(snap.Props.NodeMap(n)), kinds...)
+}
+
+// materializeEdge builds a full graph.Relationship for one forward-CSR
+// slot: ID/Kind from that slot's own OutEdgeIDs/OutKinds entries, StartID/
+// EndID from GraphIDs at the slot's source and target dense ids. props is
+// supplied by the caller (Task 11's edge-property hydration, wired in Task
+// 13) and passed straight through -- this function never inspects
+// edgeProps itself, so an empty, non-nil *graph.Properties (e.g. from a
+// test, or from edgePropsFor's own missing-entry fallback below) is exactly
+// as valid a props argument as a fully hydrated one.
+//
+// e.Fwd is always a *forward* CSR index, whether the edge itself was
+// originally discovered by walking a node's outgoing adjacency or its
+// incoming one: see EdgeRef's own doc comment (interpret/eval.go) -- a
+// reverse-CSR-discovered edge is already translated to its forward index
+// via Snap.InEdgeIdx before it ever reaches a Row, so this function (like
+// every other reader of an EdgeRef in the interpret package) only ever
+// needs to read the forward arrays.
+//
+// The slot's source node is not itself stored per-slot -- OutTargets/
+// OutKinds/OutEdgeIDs are aligned to the *target* side only, addressed by a
+// flat forward-CSR index that spans every source node's segment
+// contiguously -- so it is recovered by binary-searching OutOffsets, the
+// same CSR row-pointer array interpret/eval.go's adjacency walks by adding
+// its own loop index to OutOffsets[bound] (see adjCandidate's doc comment
+// there). edgeSource below inverts that arithmetic for a caller that has
+// only the resulting flat index left.
+func materializeEdge(snap *snapshot.Snapshot, e interpret.EdgeRef, props *graph.Properties) *graph.Relationship {
+	fwd := e.Fwd
+	start := edgeSource(snap, fwd)
+	end := snap.OutTargets[fwd]
+	name, _ := snap.Kinds.Name(snap.OutKinds[fwd])
+
+	return graph.NewRelationship(
+		graph.ID(snap.OutEdgeIDs[fwd]),
+		graph.ID(snap.GraphIDs[start]),
+		graph.ID(snap.GraphIDs[end]),
+		props,
+		graph.StringKind(name),
+	)
+}
+
+// edgeSource returns the dense NodeID that owns forward-CSR slot fwd -- the
+// unique i such that OutOffsets[i] <= fwd < OutOffsets[i+1]. OutOffsets
+// (length NodeCount()+1) is a monotonically non-decreasing prefix sum of
+// each node's out-degree by construction (snapshot/builder.go's
+// packForward: offsets[i+1] = offsets[i] + degree[i]), so sort.Search can
+// find the smallest i with OutOffsets[i+1] > fwd -- exactly that unique
+// row, including correctly skipping over any zero-out-degree node whose
+// segment is empty (OutOffsets[i] == OutOffsets[i+1]).
+func edgeSource(snap *snapshot.Snapshot, fwd uint64) snapshot.NodeID {
+	n := len(snap.OutOffsets) - 1
+	i := sort.Search(n, func(i int) bool { return snap.OutOffsets[i+1] > fwd })
+	return snapshot.NodeID(i)
+}
+
+// materializePath builds a full graph.Path from a *interpret.PathVal:
+// Nodes materialized via materializeNode in traversal order (Nodes[i]
+// connected to Nodes[i+1] by Edges[i], per PathVal's own doc comment in
+// interpret/exec.go), Edges via materializeEdge. edgeProps supplies each
+// edge's properties, keyed by database edge id (OutEdgeIDs[e.Fwd]) --
+// deliberately a plain edge-id key rather than the (start, end, kind)
+// triple hydrate.go's older edgeKey uses, since materializeEdge already
+// derives start/end/kind from the snapshot alone; Task 11's hydration query
+// needs nothing more than a `WHERE id = ANY($1)` over the edge table to
+// produce this map.
+//
+// A PathVal edge with no corresponding edgeProps entry gets an empty,
+// non-nil *graph.Properties (via edgePropsFor) rather than an error: this
+// function has no way to distinguish "not yet hydrated" from "hydrated as
+// genuinely empty", and the milestone's execution model (Task 13) is
+// responsible for guaranteeing every edge a materialized path can reference
+// was included in that path's own hydration batch before this function is
+// ever called -- so a missing entry here would only reflect a caller bug
+// upstream, which is not this function's job to detect or report.
+//
+// A nil p returns the zero graph.Path{} rather than panicking -- purely
+// defensive, since nothing in this milestone's execution model is expected
+// to call this with a nil *PathVal (OutVal.Path is always non-nil whenever
+// OutVal.Kind is OutPath).
+func materializePath(snap *snapshot.Snapshot, p *interpret.PathVal, edgeProps map[uint64]*graph.Properties) graph.Path {
+	if p == nil {
+		return graph.Path{}
+	}
+
+	nodes := make([]*graph.Node, len(p.Nodes))
+	for i, n := range p.Nodes {
+		nodes[i] = materializeNode(snap, n)
+	}
+
+	edges := make([]*graph.Relationship, len(p.Edges))
+	for i, e := range p.Edges {
+		edges[i] = materializeEdge(snap, e, edgePropsFor(snap, edgeProps, e))
+	}
+
+	return graph.Path{Nodes: nodes, Edges: edges}
+}
+
+// edgePropsFor looks up e's hydrated properties in edgeProps by database
+// edge id, falling back to a fresh, empty *graph.Properties (never nil)
+// when absent. Shared by materializePath (per-edge, for every edge on a
+// path) and materializeValue below (for a bare, top-level OutEdge
+// projection column) so the two never disagree on the missing-entry
+// fallback -- see materializePath's doc for why absence is not treated as
+// an error here.
+func edgePropsFor(snap *snapshot.Snapshot, edgeProps map[uint64]*graph.Properties, e interpret.EdgeRef) *graph.Properties {
+	if props, ok := edgeProps[snap.OutEdgeIDs[e.Fwd]]; ok && props != nil {
+		return props
+	}
+	return graph.NewProperties()
+}
+
+// --- Scalar double-decode ------------------------------------------------
+
+// decodeScalarString mirrors dawgs' pg driver's decodeJSONValue string
+// branch (drivers/pg/result.go:81-99, dawgs@v0.8.0) byte for byte: a scalar
+// string whose strings.TrimSpace begins with '{', '[', or '"' is assumed to
+// be one more layer of JSON-encoded text -- pg's own jsonb text rendering
+// of an object/array/string scalar column -- and is re-parsed via
+// json.Unmarshal. On parse failure, or when the trimmed value is empty, or
+// when it does not start with one of those three bytes, the original
+// string is returned completely unchanged: dawgs' own decodeJSONValue
+// reports ok=false in exactly those cases, and its caller (decodeJSONValues)
+// then leaves the original raw value in place rather than substituting
+// anything -- so mirroring that requires returning the pre-trim, original
+// string s itself, not the trimmed copy, whenever decoding does not apply.
+func decodeScalarString(s string) any {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) == 0 {
+		return s
+	}
+	switch trimmed[0] {
+	case '{', '[', '"':
+	default:
+		return s
+	}
+
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+		return decoded
+	}
+	return s
+}
+
+// --- Projection value-kind resolution ------------------------------------
+
+// valueKind names the pg-parity numeric conversion a materialized scalar
+// column needs, beyond the interpreter's own uniform float64 representation
+// (see interpret/value.go's package doc and evalIDFunction/
+// evalSizeFunction/evalDateTimeComponent's doc comments for why the
+// evaluator itself stays float64-only). valueDefault covers every ordinary
+// projection: no conversion is applied, and the interpreter's post-JSON
+// value (nil | string | float64 | bool | []any | map[string]any) passes
+// through materializeScalar unchanged (aside from decodeScalarString's
+// double-decode rule, which applies uniformly regardless of valueKind).
+type valueKind uint8
+
+const (
+	// valueDefault applies to every projection item that is not one of the
+	// controller's four projection-typing-amendment calls (or a WITH-COUNT
+	// alias reference to one) -- a property lookup, a bare node/edge/path
+	// variable, arithmetic, a literal, labels()/type()/toLower()/toUpper()/
+	// coalesce()/split(), or a datetime() component other than epochseconds/
+	// epochmillis.
+	valueDefault valueKind = iota
+	// valueInt64 applies to id(), datetime().epochseconds, datetime().
+	// epochmillis, and any bare reference (renamed or not) to a WITH
+	// COUNT(...) alias -- the pinned pg-parity type for all four is int64.
+	valueInt64
+	// valueInt32 applies to size() -- pg-parity int32.
+	valueInt32
+)
+
+// projectionValueKinds resolves each of q.Returning.Items' pg-parity output
+// type, index-aligned with q.Returning.Items -- and therefore with every
+// interpret.ResultSet.Keys/Rows[i] column interpret.Execute produces from
+// the same *interpret.Query, since Plan/Execute share exactly this column
+// ordering (interpret.ResultSet's own doc comment).
+//
+// ProjectionOutput.BareCallKind ("id"/"epochseconds"/"epochmillis" ->
+// valueInt64, "size" -> valueInt32) already flags three of the controller's
+// four amendment calls directly at plan time -- see interpret/plan.go's
+// bareCallKind/projectionTypingOK. COUNT is the one exception, and it needs
+// a second pass here rather than a BareCallKind of its own: COUNT is never
+// itself a RETURN item's own top-level expression under this planner's
+// accepted grammar (a bare `RETURN count(x)` is rejected outright --
+// checkExpr's generic FunctionInvocation switch, interpret/plan.go, has no
+// case for "count" at all; classifyAggregate is the *only* place that name
+// is recognized, and it is reachable only from planWith). A WITH COUNT(sym)
+// AS alias instead flows into RETURN as an ordinary bare-variable reference
+// to that alias (planWith's outputKnown[alias] = symScalar), indistinguishable
+// at the RETURN item's own level from any other scalar carry-over -- exactly
+// the gap this resolver's second pass closes: it separately collects every
+// COUNT alias declared by any Part's WithClause (q.Parts[i].With.Aggregates,
+// Count != nil -- at most one Part can carry a non-nil With under this
+// planner's "at most one WITH boundary" restriction, but every Part is
+// scanned regardless, for robustness against that restriction ever
+// loosening) and flags a RETURN item as valueInt64 whenever its own
+// expression is a bare reference to one of those aliases, however deeply
+// parenthesized, and regardless of whether the RETURN item itself renames
+// the output column via AS.
+func projectionValueKinds(q *interpret.Query) []valueKind {
+	countAliases := map[string]bool{}
+	for _, part := range q.Parts {
+		if part.With == nil {
+			continue
+		}
+		for _, agg := range part.With.Aggregates {
+			if agg.Count != nil {
+				countAliases[agg.Alias] = true
+			}
+		}
+	}
+
+	kinds := make([]valueKind, len(q.Returning.Items))
+	for i, item := range q.Returning.Items {
+		switch item.BareCallKind {
+		case "id", "epochseconds", "epochmillis":
+			kinds[i] = valueInt64
+			continue
+		case "size":
+			kinds[i] = valueInt32
+			continue
+		}
+		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil && countAliases[v.Symbol] {
+			kinds[i] = valueInt64
+		}
+	}
+	return kinds
+}
+
+// unwrapParens strips any number of *cypher.Parenthetical wrappers off expr,
+// mirroring interpret package's own unexported helper of the same name
+// (interpret/plan.go) -- duplicated here in miniature rather than exported
+// from interpret, since this is the only place in this package that needs
+// it and the two packages' own paren-unwrapping needs are otherwise
+// unrelated.
+func unwrapParens(expr cypher.Expression) cypher.Expression {
+	for {
+		p, ok := expr.(*cypher.Parenthetical)
+		if !ok || p == nil {
+			return expr
+		}
+		expr = p.Expression
+	}
+}
+
+// materializeScalar converts one interpret.OutScalar value into its final
+// projected form: decodeScalarString's double-decode rule is applied first
+// (unconditionally, to every string scalar, regardless of vk -- it is
+// pg-parity text-column handling, orthogonal to the numeric-type
+// conversions below), then vk's int64/int32 conversion is applied if the
+// (possibly just-decoded) value is a float64. A vk of valueInt64/valueInt32
+// over a non-float64 value (only possible for a NULL/absent bare call
+// result, e.g. id(n) can never be absent but a hypothetical future bare
+// call might) leaves the value unconverted rather than panicking or
+// coercing a NULL into a numeric zero.
+func materializeScalar(v any, vk valueKind) any {
+	if s, isString := v.(string); isString {
+		v = decodeScalarString(s)
+	}
+	switch vk {
+	case valueInt64:
+		if f, ok := v.(float64); ok {
+			return int64(f)
+		}
+	case valueInt32:
+		if f, ok := v.(float64); ok {
+			return int32(f)
+		}
+	}
+	return v
+}
+
+// --- cypherRowsResult: graph.Result over a materialized ResultSet --------
+
+// cypherRowsResult implements graph.Result over an interpret.ResultSet
+// that has already been fully computed by interpret.Execute -- one row per
+// ResultSet.Rows entry, each interpret.OutVal materialized into a *graph.
+// Node/*graph.Relationship/graph.Path/converted-scalar column on demand.
+//
+// Materialization happens lazily, one row at a time, inside Next() rather
+// than all upfront in the constructor: rs.Rows is already fully resident in
+// memory (interpret.Execute's own contract -- "a served Query's results are
+// fully materialized before any row is emitted", interpret/plan.go's Query
+// doc), so there is no correctness reason to convert every row before the
+// first Next() call, and a caller that stops draining early (unusual for
+// ops.FetchByQuery, which always drains to completion, but not guaranteed)
+// saves the conversion cost for the rows it never asked for. This is a
+// deliberate departure from rowResult's "read live off the snapshot's CSR
+// arrays exactly as the caller pulls" framing (rowresult.go) only in that
+// the *source* here (rs.Rows) is already fully materialized data rather
+// than a live iterator -- the row-at-a-time *conversion* discipline is the
+// same in spirit.
+//
+// The zero value is not useful; construct with newCypherRowsResult.
+type cypherRowsResult struct {
+	snap      *snapshot.Snapshot
+	rows      [][]interpret.OutVal
+	keys      []string
+	kinds     []valueKind // index-aligned with rows[i]/keys, from projectionValueKinds
+	edgeProps map[uint64]*graph.Properties
+
+	// idx is the current row, starting one before the first (-1) --
+	// mirroring pathResult/rowResult's identical "Next() advances before
+	// checking bounds" convention (result.go, rowresult.go).
+	idx int
+	// cur holds the current row's materialized values, or nil before the
+	// first Next() call or after Next() has returned false.
+	cur []any
+}
+
+// newCypherRowsResult wraps rs as a graph.Result. kinds must be index-
+// aligned with rs.Keys/rs.Rows[i] -- the caller (Task 13's pipeline) is
+// expected to have produced it via projectionValueKinds(q) against the same
+// *interpret.Query that planned rs. edgeProps supplies every path/edge
+// column's relationship properties (Task 11's hydration, keyed by database
+// edge id) and may be nil or incomplete: edgePropsFor's missing-entry
+// fallback (an empty, non-nil *graph.Properties) covers both cases, so a
+// test may pass nil to exercise column shapes without hydrating anything.
+func newCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) graph.Result {
+	return &cypherRowsResult{
+		snap:      snap,
+		rows:      rs.Rows,
+		keys:      rs.Keys,
+		kinds:     kinds,
+		edgeProps: edgeProps,
+		idx:       -1,
+	}
+}
+
+// Next advances to the next row, materializing it into r.cur, and reports
+// whether one exists.
+func (r *cypherRowsResult) Next() bool {
+	r.idx++
+	if r.idx < 0 || r.idx >= len(r.rows) {
+		r.cur = nil
+		return false
+	}
+	r.cur = r.materializeRow(r.rows[r.idx])
+	return true
+}
+
+// materializeRow converts one already-planned row of interpret.OutVal into
+// its final []any projection, one column at a time via materializeValue.
+func (r *cypherRowsResult) materializeRow(row []interpret.OutVal) []any {
+	out := make([]any, len(row))
+	for i, v := range row {
+		out[i] = r.materializeValue(v, r.kindAt(i))
+	}
+	return out
+}
+
+// kindAt returns r.kinds[i], or valueDefault if kinds is shorter than the
+// row (not expected under newCypherRowsResult's documented contract, but
+// harmless to default rather than panic on an index caller error).
+func (r *cypherRowsResult) kindAt(i int) valueKind {
+	if i < len(r.kinds) {
+		return r.kinds[i]
+	}
+	return valueDefault
+}
+
+// materializeValue dispatches one OutVal to the matching materializer:
+// OutNode/OutEdge/OutPath ignore vk entirely (it is only ever meaningful for
+// OutScalar -- a node/edge/path projection is never one of the controller's
+// four bare-call amendment shapes), OutScalar routes through
+// materializeScalar.
+func (r *cypherRowsResult) materializeValue(v interpret.OutVal, vk valueKind) any {
+	switch v.Kind {
+	case interpret.OutNode:
+		return materializeNode(r.snap, v.Node)
+	case interpret.OutEdge:
+		return materializeEdge(r.snap, v.Edge, edgePropsFor(r.snap, r.edgeProps, v.Edge))
+	case interpret.OutPath:
+		return materializePath(r.snap, v.Path, r.edgeProps)
+	default: // interpret.OutScalar
+		return materializeScalar(v.Scalar, vk)
+	}
+}
+
+// Keys names each projection column, in RETURN order -- interpret.
+// ResultSet.Keys already carries exactly this (see its own doc comment), so
+// this is a direct pass-through.
+func (r *cypherRowsResult) Keys() []string {
+	return r.keys
+}
+
+// Values returns the current row's materialized values, computed by the
+// most recent Next(). Calling Values() before any Next() call, or after
+// Next() has returned false, returns nil -- matching pathResult/rowResult's
+// identical convention.
+func (r *cypherRowsResult) Values() []any {
+	return r.cur
+}
+
+// Mapper returns a graph.ValueMapper recognizing this result's own
+// already-typed raw values: mapPathValue (result.go, shared with
+// pathResult) for a graph.Path rawValue into a *graph.Path target,
+// mapCypherNodeValue for a *graph.Node rawValue into a *graph.Node target,
+// and mapCypherRelationshipValue for a *graph.Relationship rawValue into a
+// *graph.Relationship target. Every other (rawValue, target) combination is
+// declined by all three -- including a *graph.Kinds target presented with a
+// node's own rawValue, which none of the three match -- and dawgs' own
+// defaultMapValue (graph/mapper.go), appended automatically by graph.
+// NewValueMapper, has no case at all for *graph.Node/*graph.Relationship/
+// graph.Path targets either (see mapCypherNodeValue's doc for why), so a
+// plain scalar column (int64/int32/float64/string/bool/[]any/map[string]any)
+// falls all the way through every MapFunc and reaches ops.FetchByQuery's
+// final `else` branch, which wraps it as a graph.Literal -- exactly the
+// behavior the brief's "decline everything else" requirement is aimed at.
+func (r *cypherRowsResult) Mapper() graph.ValueMapper {
+	return graph.NewValueMapper(mapPathValue, mapCypherNodeValue, mapCypherRelationshipValue)
+}
+
+// Scan is graph.Result's deprecated convenience method, implemented via
+// graph.ScanNextResult -- the same shape pathResult.Scan/rowResult.Scan use.
+func (r *cypherRowsResult) Scan(targets ...any) error {
+	return graph.ScanNextResult(r, targets...)
+}
+
+// Error always returns nil: a cypherRowsResult is built from an already-
+// computed interpret.ResultSet (interpret.Execute's own "fully materialized
+// before any row is emitted" contract), so nothing that could fail is left
+// to happen during iteration -- matching pathResult/rowResult's identical
+// posture.
+func (r *cypherRowsResult) Error() error {
+	return nil
+}
+
+// Close is a no-op: a cypherRowsResult holds no external resource (cursor,
+// connection, file, goroutine) to release.
+func (r *cypherRowsResult) Close() {}
+
+// mapCypherNodeValue is cypherRowsResult's MapFunc for a *graph.Node target.
+// A cypherRowsResult row's raw node value is always an already-typed
+// *graph.Node (materializeNode's own return type), never a raw driver
+// scalar -- so, exactly like rowResult's mapRowIDValue/mapRowKindsValue/
+// mapRowKindValue (rowresult.go's own doc comments explain the same root
+// cause in more depth), dawgs' own defaultMapValue cannot be relied on
+// alone: graph/mapper.go's defaultMapValue has no case at all for a *graph.
+// Node target, so without this MapFunc every node-valued row would fall
+// through every mapper and reach ops.FetchByQuery's final literal branch,
+// silently misclassifying a node as a Literal instead of adding it to
+// currentPath.Nodes.
+func mapCypherNodeValue(rawValue, target any) bool {
+	node, isNode := rawValue.(*graph.Node)
+	if !isNode || node == nil {
+		return false
+	}
+	nodeTarget, isNodeTarget := target.(*graph.Node)
+	if !isNodeTarget {
+		return false
+	}
+	*nodeTarget = *node
+	return true
+}
+
+// mapCypherRelationshipValue is mapCypherNodeValue's counterpart for a
+// *graph.Relationship target -- see that function's doc comment for why
+// dawgs' own defaultMapValue cannot handle this case either.
+func mapCypherRelationshipValue(rawValue, target any) bool {
+	rel, isRel := rawValue.(*graph.Relationship)
+	if !isRel || rel == nil {
+		return false
+	}
+	relTarget, isRelTarget := target.(*graph.Relationship)
+	if !isRelTarget {
+		return false
+	}
+	*relTarget = *rel
+	return true
+}
