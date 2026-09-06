@@ -347,21 +347,6 @@ var expectedDelegations = map[string]string{
 	// ('CN=ADMINSDHOLDER,...' + n.distinguishedname), which
 	// applyArithmetic reports as ErrUnsupported -> reasonUnsupported.
 	"selector/AdminSDHolder#0": "WHERE clause concatenates strings via '+'; eval.go's applyArithmetic is deliberately numeric-only",
-
-	// MATCH p=shortestPath((s)-[:<~64 AD pathfinding kinds>*1..]->(t:Tag_Tier_Zero))
-	// WHERE s<>t -- s is completely unconstrained (every node in the graph
-	// is a candidate source), the path length is unbounded, and the
-	// alternation spans nearly every AD relationship kind BloodHound
-	// defines. Even against this suite's ~300-node/~950-edge fixture,
-	// interpret.Execute's fixed MaxWork budget (internal/engine/
-	// serve_cypher.go's maxCypherWork, 1<<28) is exceeded -- a genuine
-	// multi-source, unbounded-hop pathfinding scale limit of the current
-	// executor, not a fixture or correctness bug. Raising the constant
-	// blindly to paper over one worst-case corpus query, with no broader
-	// perf investigation, was judged out of scope for this suite's one
-	// budgeted inline-fix round.
-	"agt/Shortest paths to Tier Zero / High Value targets#0": "unconstrained multi-source unbounded-length shortestPath exceeds interpret.Execute's MaxWork budget",
-	"agi/Shortest paths to Tier Zero / High Value targets#0": "unconstrained multi-source unbounded-length shortestPath exceeds interpret.Execute's MaxWork budget",
 }
 
 // knownAmbiguousQueries lists corpus queries whose shortestPath(...) this

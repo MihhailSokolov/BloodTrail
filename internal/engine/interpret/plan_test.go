@@ -320,6 +320,17 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "shortestPath both endpoints unconstrained rejected", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t)) WHERE s<>t RETURN p`, want: false},
 		{name: "shortestPath one endpoint constrained by kind ok", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t:User)) WHERE s<>t RETURN p`, want: true},
 		{name: "shortestPath one endpoint constrained by id ok", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t)) WHERE id(t) = 1 AND s<>t RETURN p`, want: true},
+		// Gap (c) fix (task 16b): a single-symbol WHERE predicate pushed
+		// into NodeConstraint.Predicates (pushdown, above) is exactly as
+		// "narrowable" as a kind or id() anchor from finalizeShortestPaths'
+		// own point of view -- resolveEndpointSet (expand.go) already
+		// evaluates it per full-scan candidate the same way it would
+		// evaluate any other pushed predicate. Required by
+		// agi.json's "Shortest paths to Tier Zero / High Value targets"
+		// (`WHERE COALESCE(t.system_tags, '') CONTAINS 'admin_tier_0' AND
+		// s<>t`, t carrying no kind label at all) -- see isConstrained's own
+		// doc comment for the full investigation.
+		{name: "shortestPath one endpoint constrained by predicate only ok", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t)) WHERE t.name CONTAINS 'foo' AND s<>t RETURN p`, want: true},
 		{name: "objectid anchor", cypher: `MATCH (n:User) WHERE n.objectid = 'S-1-1' RETURN n`, want: true},
 		{name: "datetime with argument rejected", cypher: `MATCH (n:User) WHERE n.x < datetime('2024-01-01').epochseconds RETURN n`, want: false},
 		{name: "params anywhere in return", cypher: `MATCH (n:User) RETURN $x`, want: false},

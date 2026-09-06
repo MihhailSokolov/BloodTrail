@@ -98,6 +98,13 @@ var ErrMemoryLimit = errors.New("bloodtrail: path engine memory limit exceeded")
 // many (root, terminal) pairs strategy A will run pairPaths over; SideBudget
 // caps how many full-graph BFS runs strategy B will perform, one per
 // element of whichever endpoint is smaller.
+//
+// These are package-level defaults, used whenever a Query leaves its own
+// PairBudget/SideBudget fields at zero -- see that struct's doc comment for
+// how a caller can override them for one call without changing these
+// constants (and therefore without touching every other caller's dispatch
+// behavior, including this package's own tests and bench/adgen/README.md's
+// documented "SideBudget=16" benchmark calibration).
 const (
 	PairBudget = 4096 // max |roots|x|terminals| for per-pair strategy
 	SideBudget = 16   // max full-BFS runs from the constrained side
@@ -246,6 +253,27 @@ type Query struct {
 	MaxDepth         int  // 0 => MaxDepth constant
 	Limit            int  // 0 => unbounded
 	MemoryLimit      uint64
+
+	// PairBudget/SideBudget, when positive, override this package's own
+	// PairBudget/SideBudget constants for this call's strategy dispatch
+	// only (see AllShortestPaths). Zero (the default) leaves the package
+	// constants in effect exactly as before this field existed -- every
+	// caller that never sets these (servePathQuery, pathbench, and every
+	// test in this package) keeps today's dispatch behavior unconditionally.
+	//
+	// PairBudget/SideBudget bound how much *preparatory* pair/BFS work a
+	// strategy is willing to attempt before a single row exists -- a
+	// different axis from Limit/MemoryLimit, which bound the *output* --
+	// so a caller that already tracks its own meaningful, per-query work
+	// budget (see internal/engine/interpret's Budgets/workMeter) can use
+	// these fields to keep a query whose actual affordable search cost is
+	// larger than these scale-agnostic package constants from being
+	// spuriously declined ErrTooLarge. See
+	// internal/engine/interpret/expand.go's strategyBudgetOverrides for the
+	// one caller that sets these today, and its doc comment for the
+	// investigation that motivated this field.
+	PairBudget int
+	SideBudget int
 }
 
 // ErrTooLarge is returned by AllShortestPaths when a Query is too large for
@@ -283,17 +311,26 @@ func AllShortestPaths(s *snapshot.Snapshot, q Query) ([]Path, error) {
 
 	budget := &memBudget{limit: q.MemoryLimit}
 
+	pairBudget := int64(PairBudget)
+	if q.PairBudget > 0 {
+		pairBudget = int64(q.PairBudget)
+	}
+	sideBudget := SideBudget
+	if q.SideBudget > 0 {
+		sideBudget = q.SideBudget
+	}
+
 	rootsUnconstrained := q.Roots.Unconstrained()
 	termsUnconstrained := q.Terminals.Unconstrained()
 	rootCount := q.Roots.Count(n)
 	termCount := q.Terminals.Count(n)
 
 	switch {
-	case !rootsUnconstrained && !termsUnconstrained && int64(rootCount)*int64(termCount) <= PairBudget:
+	case !rootsUnconstrained && !termsUnconstrained && int64(rootCount)*int64(termCount) <= pairBudget:
 		return strategyPairs(s, q, kinds, maxDepth, budget)
-	case !rootsUnconstrained && rootCount <= SideBudget:
+	case !rootsUnconstrained && rootCount <= sideBudget:
 		return strategySmallSide(s, q, kinds, maxDepth, budget, true)
-	case !termsUnconstrained && termCount <= SideBudget:
+	case !termsUnconstrained && termCount <= sideBudget:
 		return strategySmallSide(s, q, kinds, maxDepth, budget, false)
 	default:
 		return nil, ErrTooLarge

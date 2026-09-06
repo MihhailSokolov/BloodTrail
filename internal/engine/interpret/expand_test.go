@@ -794,6 +794,164 @@ func TestExpandShortestPathResidualWhereConjunctDoesNotSpuriouslyDeclineOnMaxRow
 	}
 }
 
+// --- strategyBudgetOverrides / traverse.Query.SideBudget-PairBudget --------
+
+// buildWideShortestPathSnapshot builds a snapshot shaped like the real gap
+// (c) regression this section pins: an effectively unconstrained source
+// symbol (every node in the graph is a candidate `s`, exactly like
+// resolveEndpointSet's own full-scan doc) reaching a 20-member `t:Target`
+// kind set, each via its own distinct single-hop Source node. 20 exceeds
+// traverse.SideBudget (16); with 200 additional isolated filler nodes
+// padding the "unconstrained root" side to 240, rootCount*termCount =
+// 240*20 = 4800 also exceeds traverse.PairBudget (4096) -- so under
+// traverse's own unmodified package-level defaults, NONE of AllShortestPaths'
+// three strategies accept this query's endpoint shape and it declines
+// ErrTooLarge, exactly reproducing this project's own corpus fixture finding
+// (see strategyBudgetOverrides' doc comment in expand.go for the full
+// investigation) at a much smaller, hand-built scale.
+func buildWideShortestPathSnapshot(t *testing.T) (snap *snapshot.Snapshot, wantSigs []string) {
+	t.Helper()
+	const (
+		kindTarget snapshot.KindID = 1
+		kindE      snapshot.KindID = 10
+		numFiller                  = 200
+		numTargets                 = 20
+	)
+
+	var nodes []execNodeSpec
+	var edges []execEdgeSpec
+	nextID := uint64(1)
+
+	for i := 0; i < numFiller; i++ {
+		nodes = append(nodes, execNodeSpec{id: nextID})
+		nextID++
+	}
+	for i := 0; i < numTargets; i++ {
+		source := nextID
+		nodes = append(nodes, execNodeSpec{id: source})
+		nextID++
+		target := nextID
+		nodes = append(nodes, execNodeSpec{id: target, kinds: []snapshot.KindID{kindTarget}})
+		nextID++
+		edges = append(edges, execEdgeSpec{id: nextID, start: source, end: target, kind: kindE})
+		nextID++
+		wantSigs = append(wantSigs, fmt.Sprintf("N:%d,%d,|E:%d,", source, target, edges[len(edges)-1].id))
+	}
+
+	snap = buildExecSnapshot(t, map[snapshot.KindID]string{kindTarget: "Target", kindE: "E"}, nodes, edges)
+	sort.Strings(wantSigs)
+	return snap, wantSigs
+}
+
+// TestExpandShortestPathSideBudgetOverrideServesWideTerminalSet: the exact
+// shape buildWideShortestPathSnapshot documents must decline ErrTooLarge
+// under traverse's raw package defaults, but serve all 20 correct paths once
+// expandShortestPathComponent's strategyBudgetOverrides widens
+// traverse.Query.SideBudget/PairBudget in proportion to the executor's own
+// generous remaining MaxWork.
+func TestExpandShortestPathSideBudgetOverrideServesWideTerminalSet(t *testing.T) {
+	snap, want := buildWideShortestPathSnapshot(t)
+
+	rs := mustExec(t, snap, `MATCH p = shortestPath((s)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, generousBudget)
+	got := pathSigsAtColumn(t, snap, rs, 0)
+	if len(got) != len(want) {
+		t.Fatalf("got %d paths, want %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("path set mismatch\ngot:  %v\nwant: %v", got, want)
+		}
+	}
+}
+
+// TestExpandShortestPathSideBudgetOverrideDoesNotFireOnTightBudget: the same
+// query and snapshot as the override-succeeds test above, but with a small
+// MaxWork whose derived affordance (remaining MaxWork / (nodes+edges)) does
+// not exceed traverse.SideBudget/PairBudget -- strategyBudgetOverrides must
+// return (0, 0) ("use the package defaults") rather than always widening
+// unconditionally, so this must still decline ErrBudget exactly like it did
+// before the override existed. Pins the "floor" behavior: an override can
+// only ever widen dispatch, never substitute a smaller number that would
+// somehow narrow it, and a caller with little budget to spare keeps today's
+// conservative decline.
+func TestExpandShortestPathSideBudgetOverrideDoesNotFireOnTightBudget(t *testing.T) {
+	snap, _ := buildWideShortestPathSnapshot(t)
+
+	err := execExpectErr(t, snap, `MATCH p = shortestPath((s)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, Budgets{MaxRows: 10000, MaxWork: 3000})
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("Execute() error = %v, want ErrBudget", err)
+	}
+}
+
+// TestStrategyBudgetOverrides pins strategyBudgetOverrides' own arithmetic
+// directly, table-driven, the same style as TestExpandShortestPathBudget.
+func TestStrategyBudgetOverrides(t *testing.T) {
+	// A tiny two-node/one-edge snapshot: perRun = NodeCount()+EdgeCount() = 3
+	// for every case below, so remaining/perRun is easy to hand-verify.
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "E"},
+		[]execNodeSpec{{id: 1}, {id: 2}},
+		[]execEdgeSpec{{id: 100, start: 1, end: 2, kind: 1}},
+	)
+
+	cases := []struct {
+		name           string
+		budget         Budgets
+		work           int64
+		wantSideBudget int
+		wantPairBudget int
+	}{
+		{
+			name:           "no MaxWork configured: no override",
+			budget:         Budgets{},
+			wantSideBudget: 0,
+			wantPairBudget: 0,
+		},
+		{
+			name:           "MaxWork fully spent: no override",
+			budget:         Budgets{MaxWork: 100},
+			work:           100,
+			wantSideBudget: 0,
+			wantPairBudget: 0,
+		},
+		{
+			// remaining=9, perRun=3 -> affordable=3, which exceeds neither
+			// package default (16, 4096): both stay at "use the default".
+			name:           "affordable at or below both defaults: no override",
+			budget:         Budgets{MaxWork: 9},
+			wantSideBudget: 0,
+			wantPairBudget: 0,
+		},
+		{
+			// remaining=60, perRun=3 -> affordable=20: exceeds SideBudget
+			// (16) but not PairBudget (4096).
+			name:           "affordable above SideBudget only",
+			budget:         Budgets{MaxWork: 60},
+			wantSideBudget: 20,
+			wantPairBudget: 0,
+		},
+		{
+			// remaining=15000, perRun=3 -> affordable=5000: exceeds both.
+			name:           "affordable above both defaults",
+			budget:         Budgets{MaxWork: 15000},
+			wantSideBudget: 5000,
+			wantPairBudget: 5000,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			meter := &workMeter{budget: c.budget, work: c.work}
+			sideBudget, pairBudget := strategyBudgetOverrides(meter, snap)
+			if sideBudget != c.wantSideBudget {
+				t.Errorf("sideBudget = %d, want %d", sideBudget, c.wantSideBudget)
+			}
+			if pairBudget != c.wantPairBudget {
+				t.Errorf("pairBudget = %d, want %d", pairBudget, c.wantPairBudget)
+			}
+		})
+	}
+}
+
 // --- convertPath -------------------------------------------------------
 
 // TestExpandConvertPathErrorsOnNoMatchingForwardEdge: a fabricated traverse.Path

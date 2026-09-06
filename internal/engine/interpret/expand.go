@@ -336,6 +336,8 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		maxDepth = step.Range.Max
 	}
 
+	sideBudget, pairBudget := strategyBudgetOverrides(meter, env.Snap)
+
 	q := traverse.Query{
 		Roots:       traverse.Endpoint{IDs: roots},
 		Terminals:   traverse.Endpoint{IDs: terminals},
@@ -343,6 +345,8 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		Mode:        mode,
 		ExcludeSelf: step.HasExplicitEndpointInequality,
 		MaxDepth:    maxDepth,
+		SideBudget:  sideBudget,
+		PairBudget:  pairBudget,
 	}
 
 	rowCap, memLimit, unbounded := shortestPathBudget(meter, maxDepth)
@@ -469,6 +473,90 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 	bytesPerPath := uint64(depth+1)*12 + 48
 
 	return rowCap, uint64(rowCap+1) * bytesPerPath, false
+}
+
+// strategyBudgetOverrides derives traverse.Query.SideBudget/PairBudget
+// overrides from meter's own remaining Budgets.MaxWork, so a shortestPath
+// component whose actual configured work budget can comfortably afford more
+// preparatory search than traverse's own package-level PairBudget/SideBudget
+// constants is not spuriously declined by AllShortestPaths' strategy
+// dispatch purely because of those constants -- see traverse.Query's own
+// doc for why PairBudget/SideBudget (how much *preparatory* pair/BFS work a
+// strategy is willing to attempt before any row exists) is a different axis
+// from Limit/MemoryLimit (shortestPathBudget's own concern, bounding
+// *output*).
+//
+// This exists because of a genuine root-cause finding, not a guess: a
+// shortestPath query with a fully unconstrained source symbol and a
+// terminal kind matching more than traverse.SideBudget (16) nodes --
+// exactly "shortestPath((s)-[:...*1..]->(t:Tag_Tier_Zero)) WHERE s<>t"
+// against this project's own 300-node/18-Tag_Tier_Zero corpus fixture --
+// declines with ErrBudget while meter.work sits at a few hundred against a
+// 1<<28 MaxWork budget (confirmed by direct instrumentation, not inferred):
+// the actual failure is traverse.AllShortestPaths itself returning
+// ErrTooLarge, because neither strategy A (root count x terminal count
+// exceeds PairBudget=4096, since the root side is effectively the whole
+// snapshot) nor strategy B (18 > SideBudget=16 on the terminal side, and
+// the root side is far larger than SideBudget too) accepts the shape --
+// not a Task 8 unit-mixing bug in shortestPathBudget's own rowCap
+// arithmetic (that was already fixed in an earlier review pass; see its
+// own doc). Wiring this component's traverse.Query exactly the way
+// servePathQuery (engine.go) does -- leaving PairBudget/SideBudget at their
+// package defaults -- reproduces the identical decline: servePathQuery
+// would refuse this exact request too, since PairBudget/SideBudget are
+// unconditional package constants no caller has ever been able to
+// override. bench/adgen/README.md documents SideBudget=16 as a deliberate
+// design constant for that pipeline's own 5M-node benchmark (capping
+// synthetic Domain Admins groups at 16 to stay under it) -- raising the
+// package constant itself would be a shared, cross-pipeline change this
+// task has no scale-validated basis for, and would invalidate that
+// documented calibration for servePathQuery/pathbench, which never sets
+// these new Query fields and so keeps today's exact dispatch behavior
+// unconditionally.
+//
+// Both overrides are floored at traverse's own current package constant
+// (0 is returned -- "use the package default" -- whenever the computed
+// affordance is not strictly greater than it), so this can only ever
+// widen a strategy dispatch that used to decline, never narrow one that
+// used to succeed. meter.budget.MaxWork <= 0 ("no work budget configured",
+// a test-only convenience -- production callers always configure MaxWork,
+// see serve_cypher.go's maxCypherWork) returns (0, 0): shortestPathBudget's
+// own Limit/MemoryLimit are left unbounded in that case too, so this
+// leaves traverse's package defaults as the only guard, matching today's
+// behavior exactly for that scenario rather than guessing at an
+// unconditionally large override with nothing to size it against.
+//
+// The per-run cost estimate is snap.NodeCount()+snap.EdgeCount() work
+// units: a single strategySmallSide BFS run visits at most every node and
+// every directed edge once (bfsFrom's own worst case), the same
+// adjacency-slot-inspection unit meter.spend already charges elsewhere in
+// this package, so remaining MaxWork divided by that estimate is a
+// unit-correct bound on how many such runs the query's own budget can
+// afford. strategyPairs' own per-pair cost (a bounded two-sided BFS) never
+// exceeds one full-graph BFS in the worst case, so the same, deliberately
+// conservative estimate also safely bounds PairBudget.
+func strategyBudgetOverrides(meter *workMeter, snap *snapshot.Snapshot) (sideBudget, pairBudget int) {
+	if meter.budget.MaxWork <= 0 {
+		return 0, 0
+	}
+	remaining := meter.budget.MaxWork - meter.work
+	if remaining <= 0 {
+		return 0, 0
+	}
+
+	perRun := int64(snap.NodeCount() + snap.EdgeCount())
+	if perRun <= 0 {
+		return 0, 0
+	}
+	affordable := remaining / perRun
+
+	if affordable > int64(traverse.SideBudget) {
+		sideBudget = int(affordable)
+	}
+	if affordable > int64(traverse.PairBudget) {
+		pairBudget = int(affordable)
+	}
+	return sideBudget, pairBudget
 }
 
 // resolveEndpointSet materializes every dense node id satisfying nc, in

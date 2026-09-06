@@ -1187,10 +1187,40 @@ func (pb *partBuilder) shortestStepsAreIsolated() bool {
 }
 
 // isConstrained reports whether sym's NodeConstraint carries a kind label,
-// an id() anchor, or an objectid anchor.
+// an id() anchor, an objectid anchor, or at least one pushed single-symbol
+// WHERE predicate.
+//
+// Task 6's original implementation of finalizeShortestPaths' "at least one
+// endpoint constrained" rule (see that function's doc) checked only
+// Kinds/IDs/ObjectIDAnchor, deliberately mirroring the milestone brief's
+// literal "kind- or id-constrained" wording. Predicates was added here
+// after this task's own gap-closing investigation found a real, required
+// corpus query this excluded for no correctness reason: agi.json's
+// "Shortest paths to Tier Zero / High Value targets" is
+// `shortestPath((s)-[:...*1..]->(t)) WHERE COALESCE(t.system_tags, ”)
+// CONTAINS 'admin_tier_0' AND s<>t` -- t carries no kind label at all (the
+// AGI corpus convention tags Tier Zero via a property, not a label; agt's
+// sibling query uses `t:Tag_Tier_Zero` instead and already satisfied the
+// original rule), so isConstrained(t) was false, and s is genuinely bare
+// (matching the "at least one" rule's own point 1 precedent for a bare `s`
+// with a kind-constrained far side), so isConstrained(s) was false too:
+// finalizeShortestPaths declined a query the executor can serve correctly.
+// pushdown (above) already records this exact WHERE conjunct into
+// nc.Predicates precisely because it touches only t, and
+// resolveEndpointSet (expand.go) already evaluates every entry in
+// Predicates per full-scan candidate when resolving a shortestPath
+// endpoint set -- the same mechanism a kind- or id-constrained symbol
+// relies on, just with scanAnchor's full-scan candidate source instead of
+// its kind-bitmap or id-anchor ones. A predicate-only endpoint is
+// therefore exactly as "narrowable" as a kind- or id-constrained one from
+// finalizeShortestPaths' own point of view (guaranteeing at least one side
+// has *some* narrowing information, so a shortestPath with literally zero
+// information about either endpoint never plans); the difference is only
+// which scanAnchor candidate source and how much work resolving it costs,
+// which the executor's existing budget accounting already guards.
 func (pb *partBuilder) isConstrained(sym string) bool {
 	nc, ok := pb.nodes[sym]
-	return ok && (len(nc.Kinds) > 0 || len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil)
+	return ok && (len(nc.Kinds) > 0 || len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || len(nc.Predicates) > 0)
 }
 
 // hasEndpointInequality scans conjuncts for `a<>b`/`b<>a` or

@@ -225,6 +225,88 @@ func TestAllShortestPaths(t *testing.T) {
 		}
 	})
 
+	t.Run("Query.SideBudget override accepts the same over-budget terminal bitset", func(t *testing.T) {
+		// Same exact query as "strategy C" above (which declines ErrTooLarge
+		// under the package's own SideBudget default), except Query.SideBudget
+		// is set high enough to admit it -- see Query's own doc comment for
+		// why a caller (internal/engine/interpret/expand.go's
+		// strategyBudgetOverrides) might legitimately need to override this
+		// per call rather than change the package constant every other
+		// caller (servePathQuery, pathbench) still relies on unconditionally.
+		s := buildStrategyFixture(t)
+		kinds := maskOf(3, 1, 2)
+		terminals := s.NodesOfKind(isolatedKind)
+
+		q := Query{
+			Roots:      Endpoint{},
+			Terminals:  Endpoint{Bits: terminals},
+			Kinds:      kinds,
+			Mode:       ModeAll,
+			SideBudget: SideBudget + 1,
+		}
+		got, err := AllShortestPaths(s, q)
+		if err != nil {
+			t.Fatalf("AllShortestPaths: %v", err)
+		}
+		// Every isolated node has no edges at all, so no path exists to any
+		// of them from any root -- this pins that the override changed
+		// *dispatch* (which strategy runs) without changing the query's
+		// actual answer: zero real edges still means zero paths.
+		if len(got) != 0 {
+			t.Fatalf("got = %+v, want empty (isolated nodes have no edges)", got)
+		}
+	})
+
+	t.Run("Query.PairBudget override accepts a pair count above the package default", func(t *testing.T) {
+		// Both endpoints constrained by an explicit id list, each side
+		// larger than SideBudget (so strategy B is unavailable on either
+		// side) and their product larger than PairBudget (so strategy A is
+		// unavailable too by default): declines ErrTooLarge without an
+		// override, succeeds once Query.PairBudget covers the product.
+		// wideCount is chosen so both wideCount > SideBudget and
+		// wideCount*wideCount > PairBudget hold regardless of either
+		// constant's current value.
+		wideCount := SideBudget + 1
+		for wideCount*wideCount <= PairBudget {
+			wideCount *= 2
+		}
+
+		b := snapshot.NewBuilder(1)
+		ids := make([]snapshot.NodeID, wideCount)
+		for i := 0; i < wideCount; i++ {
+			if err := b.AddNode(uint64(i), nil, nil); err != nil {
+				t.Fatalf("AddNode(%d): %v", i, err)
+			}
+			ids[i] = snapshot.NodeID(i)
+		}
+		s, err := b.Build()
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+
+		q := Query{
+			Roots:     Endpoint{IDs: ids},
+			Terminals: Endpoint{IDs: ids},
+			Mode:      ModeAll,
+		}
+		got, err := AllShortestPaths(s, q)
+		if !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("err = %v, want ErrTooLarge (sanity: over both PairBudget and SideBudget without an override)", err)
+		}
+		if got != nil {
+			t.Fatalf("got = %+v, want nil", got)
+		}
+
+		q.PairBudget = wideCount * wideCount
+		got, err = AllShortestPaths(s, q)
+		if err != nil {
+			t.Fatalf("AllShortestPaths with PairBudget override: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("got = %+v, want empty (no edges in this fixture)", got)
+		}
+	})
+
 	t.Run("Bits endpoint matches the equivalent explicit-id endpoint", func(t *testing.T) {
 		s := buildStrategyFixture(t)
 		kinds := maskOf(3, 1, 2)
