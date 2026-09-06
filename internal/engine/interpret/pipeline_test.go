@@ -4,6 +4,7 @@ package interpret
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -161,24 +162,31 @@ RETURN c`
 	assertRowSet(t, rs, want)
 }
 
-// --- ORDER BY over a string-valued alias: ErrCollation abort ----------------
+// --- sortRows over a string-valued alias: ErrCollation abort ----------------
+//
+// Plan itself never constructs an OrderKey for a string-valued alias any
+// more (see planOrder's doc on the final review's C2 fix: ORDER BY now
+// requires a count-aggregate alias or a statically-numeric scalar, and a
+// property lookup like `n.name` is neither) -- so this exercises sortRows
+// directly, bypassing Plan/Execute entirely, to keep proving the plumbing
+// itself still aborts correctly (rather than swallowing the error or
+// silently falling back to some other order) for the day a future OrderKey
+// source ever hands it a string, and because value.go's Compare unit tests
+// (TestCompareString*, value_test.go) already assume this end-to-end
+// propagation path exists and is exercised somewhere.
+func TestPipelineSortRowsStringErrCollation(t *testing.T) {
+	rowA, rowB := NewRow(), NewRow()
+	outA := []OutVal{{Kind: OutScalar, Scalar: "Alice"}}
+	outB := []OutVal{{Kind: OutScalar, Scalar: "Bob"}}
 
-func TestPipelineOrderByStringErrCollation(t *testing.T) {
-	const kindUser snapshot.KindID = 1
-
-	snap := buildExecSnapshot(t,
-		map[snapshot.KindID]string{kindUser: "User"},
-		[]execNodeSpec{
-			{1, []snapshot.KindID{kindUser}, map[string]any{"name": "Alice"}},
-			{2, []snapshot.KindID{kindUser}, map[string]any{"name": "Bob"}},
-		},
-		nil,
+	err := sortRows(
+		[]*Row{rowA, rowB},
+		[][]OutVal{outA, outB},
+		[]OrderKey{{Symbol: "name"}},
+		map[string]int{"name": 0},
 	)
-
-	q := planQuery(t, snap, `MATCH (n:User) RETURN n.name AS name ORDER BY name`)
-	_, err := Execute(&Env{Snap: snap}, q, generousBudget)
 	if !errors.Is(err, ErrCollation) {
-		t.Fatalf("Execute: err = %v, want ErrCollation", err)
+		t.Fatalf("sortRows: err = %v, want ErrCollation", err)
 	}
 }
 
@@ -210,6 +218,99 @@ func TestPipelineDistinctNodeDedupByID(t *testing.T) {
 
 	g, _ := snap.Dense(500)
 	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: g}})})
+}
+
+// TestPipelineDistinctKeepsAbsentAndExplicitNullApart is the C3 (final
+// review) regression: PostgreSQL's DISTINCT groups an absent property
+// (jsonb `->` on a missing key -> SQL NULL) separately from a genuinely
+// stored JSON null (a non-NULL 'null'::jsonb value) -- SQL NULL groups with
+// SQL NULL, and 'null'::jsonb groups with 'null'::jsonb, but the two never
+// group together. Before OutVal.ScalarAbsent existed, this package's own
+// dedup key rendered both as the identical "absent/nil" byte tag, collapsing
+// what pg keeps as two separate groups into one.
+//
+// Fixture: four Users' "x" property is absent, present-null, "A", and "B"
+// respectively. `RETURN DISTINCT x.x` must produce 4 rows (matching pg): the
+// buggy behavior collapsed the absent and present-null rows into one,
+// producing only 3.
+func TestPipelineDistinctKeepsAbsentAndExplicitNullApart(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, map[string]any{}},         // x absent
+			{2, []snapshot.KindID{kindUser}, map[string]any{"x": nil}}, // x present, explicit JSON null
+			{3, []snapshot.KindID{kindUser}, map[string]any{"x": "A"}},
+			{4, []snapshot.KindID{kindUser}, map[string]any{"x": "B"}},
+		},
+		nil,
+	)
+
+	rs := mustExec(t, snap, `MATCH (n:User) RETURN DISTINCT n.x AS x`, generousBudget)
+
+	if len(rs.Rows) != 4 {
+		t.Fatalf("RETURN DISTINCT row count = %d, want 4 (absent, explicit-null, \"A\", \"B\" each their own group); got %#v", len(rs.Rows), rs.Rows)
+	}
+
+	var absentCount, presentNullCount int
+	values := map[string]bool{}
+	for _, row := range rs.Rows {
+		v := row[0]
+		if v.Kind != OutScalar {
+			t.Fatalf("row column kind = %v, want OutScalar", v.Kind)
+		}
+		switch {
+		case v.ScalarAbsent:
+			absentCount++
+		case v.Scalar == nil:
+			presentNullCount++
+		default:
+			values[fmt.Sprintf("%v", v.Scalar)] = true
+		}
+	}
+	if absentCount != 1 {
+		t.Fatalf("absent-group rows = %d, want 1", absentCount)
+	}
+	if presentNullCount != 1 {
+		t.Fatalf("present-null-group rows = %d, want 1", presentNullCount)
+	}
+	if !values["A"] || !values["B"] {
+		t.Fatalf("value groups = %v, want {A, B}", values)
+	}
+}
+
+// TestGroupKeyDistinguishesAbsentFromPresentNullScalar is C3's grouping-key
+// counterpart to TestPipelineDistinctKeepsAbsentAndExplicitNullApart above:
+// appendSymbolKey (used to build both WITH's GroupKeys group key and
+// COUNT(DISTINCT scalar)'s dedup key) must not collapse a scalar symbol
+// that was never bound in one row with one bound to an explicit JSON null
+// in another -- mirroring outValKey's identical RETURN DISTINCT fix (see
+// OutVal.ScalarAbsent's doc) for exactly the same reason: pg groups SQL
+// NULL together with other SQL NULLs, but never with the non-NULL jsonb
+// value 'null'::jsonb.
+//
+// No query this planner currently accepts reaches this function with a
+// scalar symbol (WithClause.GroupKeys is populated exclusively from
+// Part[0], which has no scalar bindings before its own first WITH -- see
+// this file's package doc, and countAggregate's own doc on its identical,
+// currently-unreachable scalar COUNT(DISTINCT ...) branch), so this drives
+// appendSymbolKey directly against hand-built Rows rather than through
+// Plan/Execute, purely to pin the encoding contract for whenever a future
+// change does make it reachable.
+func TestGroupKeyDistinguishesAbsentFromPresentNullScalar(t *testing.T) {
+	env := &Env{}
+
+	unbound := NewRow()
+	presentNull := NewRow()
+	presentNull.SetScalar("x", nil)
+
+	unboundKey := string(appendSymbolKey(env, nil, unbound, "x"))
+	presentNullKey := string(appendSymbolKey(env, nil, presentNull, "x"))
+
+	if unboundKey == presentNullKey {
+		t.Fatalf("appendSymbolKey: unbound and present-null scalar produced the same key %q, want distinct", unboundKey)
+	}
 }
 
 // --- WITH constant carry-over feeding a later predicate ---------------------

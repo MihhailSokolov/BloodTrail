@@ -258,6 +258,96 @@ func TestExecObjectIDAnchor(t *testing.T) {
 	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: want}})})
 }
 
+// --- duplicate-objectid anchors must not drop rows (C1) ---------------------
+//
+// PostgreSQL enforces no uniqueness constraint on the `objectid` property,
+// so real BloodHound data can (and does) contain more than one node sharing
+// the same objectid string. An anchor/filter that silently picked just one
+// of them would serve fewer rows than pg does for the identical query.
+
+// dupObjectIDSnapshot builds two User nodes both carrying objectid
+// "dup-oid", plus a third decoy User with a distinct objectid, for testing
+// that every anchor/filter shape that resolves through objectid visits (or
+// admits) both duplicates rather than an arbitrary single one.
+func dupObjectIDSnapshot(t *testing.T) (snap *snapshot.Snapshot, dup1, dup2, decoy uint64) {
+	t.Helper()
+	const kindUser snapshot.KindID = 1
+	dup1, dup2, decoy = 1, 2, 3
+	nodes := []execNodeSpec{
+		{dup1, []snapshot.KindID{kindUser}, map[string]any{"objectid": "dup-oid"}},
+		{dup2, []snapshot.KindID{kindUser}, map[string]any{"objectid": "dup-oid"}},
+		{decoy, []snapshot.KindID{kindUser}, map[string]any{"objectid": "other-oid"}},
+	}
+	snap = buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+	return snap, dup1, dup2, decoy
+}
+
+// TestExecObjectIDAnchorDuplicateReturnsBothNodes checks the anchor-scan
+// path (scanAnchor): a WHERE-clause objectid anchor visits every node
+// sharing the value, not just one.
+func TestExecObjectIDAnchorDuplicateReturnsBothNodes(t *testing.T) {
+	snap, dup1, dup2, _ := dupObjectIDSnapshot(t)
+
+	rs := mustExec(t, snap, `MATCH (n:User) WHERE n.objectid = 'dup-oid' RETURN n`, generousBudget)
+
+	d1, _ := snap.Dense(dup1)
+	d2, _ := snap.Dense(dup2)
+	assertRowSet(t, rs, []string{
+		rowKey([]OutVal{{Kind: OutNode, Node: d1}}),
+		rowKey([]OutVal{{Kind: OutNode, Node: d2}}),
+	})
+}
+
+// TestExecObjectIDAnchorDuplicateInlineMapReturnsBothNodes checks the same
+// thing via the inline-map-desugared-to-anchor form (`{objectid: ...}`
+// rather than an explicit WHERE conjunct).
+func TestExecObjectIDAnchorDuplicateInlineMapReturnsBothNodes(t *testing.T) {
+	snap, dup1, dup2, _ := dupObjectIDSnapshot(t)
+
+	rs := mustExec(t, snap, `MATCH (n:User {objectid: 'dup-oid'}) RETURN n`, generousBudget)
+
+	d1, _ := snap.Dense(dup1)
+	d2, _ := snap.Dense(dup2)
+	assertRowSet(t, rs, []string{
+		rowKey([]OutVal{{Kind: OutNode, Node: d1}}),
+		rowKey([]OutVal{{Kind: OutNode, Node: d2}}),
+	})
+}
+
+// TestExecObjectIDConstraintAtExpansionPositionAdmitsBothDuplicates checks
+// the far-endpoint filter path (nodeSatisfiesConstraint via expandStep):
+// an objectid constraint on a step's unbound side must admit every
+// duplicate reached by expansion, not silently pick one via NodeByObjectID.
+func TestExecObjectIDConstraintAtExpansionPositionAdmitsBothDuplicates(t *testing.T) {
+	const (
+		kindUser snapshot.KindID = 1
+		kindE    snapshot.KindID = 10
+	)
+	anchor, dup1, dup2, decoy := uint64(1), uint64(2), uint64(3), uint64(4)
+	nodes := []execNodeSpec{
+		{anchor, []snapshot.KindID{kindUser}, nil},
+		{dup1, []snapshot.KindID{kindUser}, map[string]any{"objectid": "dup-oid"}},
+		{dup2, []snapshot.KindID{kindUser}, map[string]any{"objectid": "dup-oid"}},
+		{decoy, []snapshot.KindID{kindUser}, map[string]any{"objectid": "other-oid"}},
+	}
+	edges := []execEdgeSpec{
+		{1000, anchor, dup1, kindE},
+		{1001, anchor, dup2, kindE},
+		{1002, anchor, decoy, kindE},
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User", kindE: "E"}, nodes, edges)
+
+	rs := mustExec(t, snap, `MATCH (a:User)-[:E]->(b:User) WHERE b.objectid = 'dup-oid' RETURN a,b`, generousBudget)
+
+	da, _ := snap.Dense(anchor)
+	d1, _ := snap.Dense(dup1)
+	d2, _ := snap.Dense(dup2)
+	assertRowSet(t, rs, []string{
+		rowKey([]OutVal{{Kind: OutNode, Node: da}, {Kind: OutNode, Node: d1}}),
+		rowKey([]OutVal{{Kind: OutNode, Node: da}, {Kind: OutNode, Node: d2}}),
+	})
+}
+
 // --- budgets: MaxRows -------------------------------------------------------
 
 func TestExecMaxRowsBudget(t *testing.T) {

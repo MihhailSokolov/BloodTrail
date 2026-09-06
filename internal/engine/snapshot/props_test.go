@@ -194,27 +194,57 @@ func TestPropStoreNodeByObjectIDIgnoresNonStringValues(t *testing.T) {
 	}
 }
 
-// TestPropStoreNodeByObjectIDDuplicateTieBreak checks that when two nodes
-// share the same string objectid value, the index resolves to the node with
-// the higher NodeID (the later-inserted node), per the strict ascending-id
-// contract of AddNode and the single-assignment-wins semantics of the
-// objectIndex map during buildPropStore's iteration.
-func TestPropStoreNodeByObjectIDDuplicateTieBreak(t *testing.T) {
+// TestPropStoreNodeByObjectIDDuplicate checks that when two nodes share the
+// same string objectid value -- PostgreSQL enforces no uniqueness
+// constraint on objectid, so real data can and does contain this --
+// NodeByObjectID still resolves to *some* match (its point-lookup contract:
+// "a witness exists"), while NodesByObjectID returns the complete set. Ever
+// dropping one of the two nodes from NodesByObjectID would silently serve
+// fewer rows than PostgreSQL does for the same anchor.
+func TestPropStoreNodeByObjectIDDuplicate(t *testing.T) {
 	b := NewBuilder(1)
-	// Both nodes get the same objectid string value
+	// Both nodes get the same objectid string value.
 	mustAddNodeJSON(t, b, 10, []KindID{1}, `{"objectid":"shared-id"}`)
 	mustAddNodeJSON(t, b, 20, []KindID{1}, `{"objectid":"shared-id"}`)
 	s, err := b.Build()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The later-inserted node (NodeID 1, database ID 20) should win
-	id, ok := s.Props.NodeByObjectID("shared-id")
-	if !ok {
-		t.Fatal(`NodeByObjectID("shared-id") not found, want found`)
+
+	if id, ok := s.Props.NodeByObjectID("shared-id"); !ok || (id != 0 && id != 1) {
+		t.Fatalf(`NodeByObjectID("shared-id") = (%d, %v), want (0 or 1, true)`, id, ok)
 	}
-	if id != 1 {
-		t.Fatalf(`NodeByObjectID("shared-id") = %d, want 1 (the later-inserted node)`, id)
+
+	ids, ok := s.Props.NodesByObjectID("shared-id")
+	if !ok {
+		t.Fatal(`NodesByObjectID("shared-id") not found, want found`)
+	}
+	want := []NodeID{0, 1}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf(`NodesByObjectID("shared-id") = %v, want %v (both nodes, not last-writer-wins)`, ids, want)
+	}
+}
+
+// TestPropStoreNodesByObjectIDUniqueIsSingleton checks the non-colliding
+// case (the overwhelming common one): NodesByObjectID returns a one-element
+// slice built straight from objectIndex, with objectIndexDup staying nil
+// (see ApproxBytes' "zero memory unless a collision actually occurs" claim).
+func TestPropStoreNodesByObjectIDUniqueIsSingleton(t *testing.T) {
+	b := NewBuilder(1)
+	mustAddNodeJSON(t, b, 10, []KindID{1}, `{"objectid":"S-1-X"}`)
+	s, err := b.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, ok := s.Props.NodesByObjectID("S-1-X")
+	if !ok {
+		t.Fatal(`NodesByObjectID("S-1-X") not found, want found`)
+	}
+	if want := []NodeID{0}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf(`NodesByObjectID("S-1-X") = %v, want %v`, ids, want)
+	}
+	if s.Props.objectIndexDup != nil {
+		t.Fatalf("objectIndexDup = %v, want nil when no objectid collides", s.Props.objectIndexDup)
 	}
 }
 

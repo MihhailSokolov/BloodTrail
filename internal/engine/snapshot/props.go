@@ -67,7 +67,18 @@ type PropStore struct {
 
 	arena []byte // shared string / raw-JSON byte arena
 
-	objectIndex map[string]NodeID // objectid string value -> node, only for string-valued objectid
+	// objectIndex maps a string-valued objectid to one node carrying it --
+	// the first one encountered during buildPropStore's ascending-NodeID
+	// scan. PostgreSQL enforces no uniqueness constraint on objectid, so
+	// real BloodHound data can and does contain more than one node sharing
+	// the same value; when that happens the colliding value's *complete*
+	// node set is additionally recorded in objectIndexDup, and objectIndex
+	// keeps just the one arbitrary member for NodeByObjectID's O(1)
+	// point-lookup fast path. objectIndexDup is nil (and adds zero memory)
+	// whenever every objectid in the snapshot is unique, which is the
+	// overwhelming common case.
+	objectIndex    map[string]NodeID
+	objectIndexDup map[string][]NodeID
 }
 
 // IDByName returns the PropID interned for name, and whether one exists.
@@ -116,14 +127,39 @@ func (p *PropStore) NodeMap(n NodeID) map[string]any {
 	return m
 }
 
-// NodeByObjectID returns the node whose `objectid` property has the exact
-// string value v, and whether one was found. Only nodes whose objectid
-// value is a JSON string are indexed; a numeric or otherwise non-string
-// objectid never matches. When multiple nodes carry the same string objectid,
-// the one with the highest NodeID (the later-inserted node) wins the index.
+// NodeByObjectID returns ONE node whose `objectid` property has the exact
+// string value v, and whether any match was found. Only nodes whose
+// objectid value is a JSON string are indexed; a numeric or otherwise
+// non-string objectid never matches.
+//
+// PostgreSQL enforces no uniqueness constraint on objectid, so more than one
+// node can legitimately carry the same value. When that happens,
+// NodeByObjectID returns an arbitrary one of them (which one is unspecified
+// and must not be relied on) -- it exists purely as an O(1) point-lookup
+// convenience for callers that only need *a* witness (e.g. "does this value
+// exist at all"). A caller that must not silently drop rows on a duplicate
+// -- an anchor scan seeding a candidate set, or a constraint check deciding
+// whether a specific node id satisfies an objectid predicate -- must use
+// NodesByObjectID instead, which returns every match.
 func (p *PropStore) NodeByObjectID(v string) (NodeID, bool) {
 	id, ok := p.objectIndex[v]
 	return id, ok
+}
+
+// NodesByObjectID returns every node whose `objectid` property has the
+// exact string value v, and whether any match was found. In the common
+// case (v is unique or absent) this costs no more than NodeByObjectID: the
+// single match, if any, comes straight from objectIndex with no extra
+// lookup or allocation. Only when v collides across more than one node does
+// it consult objectIndexDup for the complete set.
+func (p *PropStore) NodesByObjectID(v string) ([]NodeID, bool) {
+	if dup, ok := p.objectIndexDup[v]; ok {
+		return dup, true
+	}
+	if id, ok := p.objectIndex[v]; ok {
+		return []NodeID{id}, true
+	}
+	return nil, false
 }
 
 // decode turns one propEntry into the post-JSON model value Value/NodeMap
@@ -201,11 +237,15 @@ const (
 //	      + sum(len(name) for name in names)       -- interned property names
 //	      + len(ids)          * approxPropNameMapEntryBytes
 //	      + len(objectIndex)  * approxObjectIndexEntryBytes
+//	      + sum(len(ids) for ids in objectIndexDup) * bytesPerUint32 -- dup slots
 //
 // The objectIndex's string keys are not double-counted: they are produced
 // by Value/decode via stringAt, which aliases the arena (see stringAt), so
 // their bytes are already counted in len(arena) above -- only the map's own
-// per-entry bucket/pointer overhead is added.
+// per-entry bucket/pointer overhead is added. objectIndexDup is empty (and
+// contributes nothing) unless the snapshot actually contains a duplicate
+// objectid value; when it does, only the additional NodeIDs beyond the one
+// already counted via objectIndex are added, plus the map's own overhead.
 func (p *PropStore) ApproxBytes() uint64 {
 	var total uint64
 
@@ -219,6 +259,11 @@ func (p *PropStore) ApproxBytes() uint64 {
 	total += uint64(len(p.ids)) * approxPropNameMapEntryBytes
 
 	total += uint64(len(p.objectIndex)) * approxObjectIndexEntryBytes
+
+	total += uint64(len(p.objectIndexDup)) * approxObjectIndexEntryBytes
+	for _, ids := range p.objectIndexDup {
+		total += uint64(len(ids)) * bytesPerUint32
+	}
 
 	return total
 }
@@ -396,8 +441,22 @@ func (b *Builder) buildPropStore(n int) *PropStore {
 			if !ok {
 				continue
 			}
-			if s, ok := v.(string); ok {
-				p.objectIndex[s] = NodeID(i)
+			s, ok := v.(string)
+			if !ok {
+				continue
+			}
+			id := NodeID(i)
+			prev, seen := p.objectIndex[s]
+			switch {
+			case !seen:
+				p.objectIndex[s] = id
+			case p.objectIndexDup[s] != nil:
+				p.objectIndexDup[s] = append(p.objectIndexDup[s], id)
+			default:
+				if p.objectIndexDup == nil {
+					p.objectIndexDup = make(map[string][]NodeID)
+				}
+				p.objectIndexDup[s] = []NodeID{prev, id}
 			}
 		}
 	}

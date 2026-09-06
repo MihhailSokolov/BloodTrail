@@ -847,9 +847,14 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 		}
 
 	case nc != nil && nc.ObjectIDAnchor != nil:
-		if id, ok := env.Snap.Props.NodeByObjectID(*nc.ObjectIDAnchor); ok {
-			if err := visit(id); err != nil {
-				return nil, err
+		// PostgreSQL enforces no uniqueness constraint on objectid, so more
+		// than one node can carry the same value; visit every one of them
+		// (NodesByObjectID), not just an arbitrary witness -- see its doc.
+		if ids, ok := env.Snap.Props.NodesByObjectID(*nc.ObjectIDAnchor); ok {
+			for _, id := range ids {
+				if err := visit(id); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -910,12 +915,24 @@ func nodeSatisfiesConstraint(env *Env, nc *NodeConstraint, id snapshot.NodeID) b
 		}
 	}
 	if nc.ObjectIDAnchor != nil {
-		gotID, ok := env.Snap.Props.NodeByObjectID(*nc.ObjectIDAnchor)
-		if !ok || gotID != id {
+		ids, ok := env.Snap.Props.NodesByObjectID(*nc.ObjectIDAnchor)
+		if !ok || !containsNodeID(ids, id) {
 			return false
 		}
 	}
 	return true
+}
+
+// containsNodeID reports whether id appears anywhere in ids, used to test
+// node-id membership against a possibly-multi-valued objectid match set
+// (see NodesByObjectID).
+func containsNodeID(ids []snapshot.NodeID, id snapshot.NodeID) bool {
+	for _, h := range ids {
+		if h == id {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Step expansion ---------------------------------------------------------

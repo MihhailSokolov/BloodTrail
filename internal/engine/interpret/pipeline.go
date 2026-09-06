@@ -573,9 +573,16 @@ func groupKeyBytes(env *Env, r *Row, syms []string) []byte {
 }
 
 // appendSymbolKey appends sym's binding in r to buf: a node/edge by database
-// id, a scalar by appendScalarKey, or (sym entirely unbound in r) the same
-// null tag appendScalarKey(nil, nil) produces -- Cypher/SQL group an absent
-// value together with a present JSON null.
+// id, or a scalar by appendScalarKey -- EXCEPT when sym is a scalar entirely
+// unbound in r (Row.Scalar's ok == false), which gets the same dedicated 'u'
+// tag outValKey uses for an absent OutScalar, deliberately distinct from
+// appendScalarKey(nil)'s 'z' tag for a genuinely present JSON null. This
+// mirrors RETURN DISTINCT's own dedup-key fix (see OutVal.ScalarAbsent's
+// doc): PostgreSQL's GROUP BY/DISTINCT groups SQL NULL together with other
+// SQL NULLs, but never with the non-NULL jsonb value 'null'::jsonb, so
+// collapsing "never bound" and "bound to a present null" into one key would
+// under-count groups relative to pg for the same reason it would for a
+// RETURN projection.
 func appendSymbolKey(env *Env, buf []byte, r *Row, sym string) []byte {
 	if nodeID, ok := r.Node(sym); ok {
 		return appendTaggedUint(buf, 'N', env.Snap.GraphIDs[nodeID])
@@ -583,7 +590,10 @@ func appendSymbolKey(env *Env, buf []byte, r *Row, sym string) []byte {
 	if edgeRef, ok := r.Edge(sym); ok {
 		return appendTaggedUint(buf, 'D', env.Snap.OutEdgeIDs[edgeRef.Fwd])
 	}
-	val, _ := r.Scalar(sym)
+	val, ok := r.Scalar(sym)
+	if !ok {
+		return append(buf, 'u')
+	}
 	return appendScalarKey(buf, val)
 }
 
@@ -708,6 +718,12 @@ func rowDistinctKey(env *Env, row []OutVal) string {
 // outValKey encodes one projected OutVal the same way appendSymbolKey
 // encodes a Row-bound symbol -- nodes/edges by database id, a path by its
 // node/edge id sequence, everything else (OutScalar) via appendScalarKey.
+//
+// An absent OutScalar (v.ScalarAbsent -- an absent property lookup) is
+// tagged 'u', deliberately distinct from appendScalarKey(nil)'s 'z' tag for
+// a genuinely present JSON null: see OutVal.ScalarAbsent's doc for why
+// PostgreSQL itself never dedups the two together (SQL NULL vs the non-NULL
+// jsonb value 'null'::jsonb).
 func outValKey(env *Env, v OutVal) []byte {
 	switch v.Kind {
 	case OutNode:
@@ -726,6 +742,9 @@ func outValKey(env *Env, v OutVal) []byte {
 		}
 		return buf
 	default: // OutScalar
+		if v.ScalarAbsent {
+			return []byte{'u'}
+		}
 		return appendScalarKey(nil, v.Scalar)
 	}
 }
