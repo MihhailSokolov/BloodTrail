@@ -197,6 +197,78 @@ served_after="$(grep -c "builder engine served" "$WORK/bloodhound-logs.txt" || t
 builder_served_delta=$((served_after - served_before))
 [ "$builder_served_delta" -ge 1 ] || { echo "the builder engine did not serve GET /api/v2/groups/\$GROUP_SID/members (\"builder engine served\" count $served_before -> $served_after, delta $builder_served_delta); PostgreSQL answered instead" >&2; exit 1; }
 
+echo "==> Querying the Cypher interpreter directly"
+# Milestone 4 extends the same in-memory replica to a Cypher interpreter
+# (internal/engine.TryCypher), reached through POST /api/v2/graphs/cypher
+# exactly as the path phase above already exercised once (with a
+# hand-written shortestPath text). This phase instead sends two queries
+# copied verbatim from the milestone's own pre-built corpus
+# (testdata/prebuilt/{selectors,agt}.json), one of each required shape:
+#
+#   - a plain property MATCH (no path, no traversal): selectors.json's
+#     "Domain Admins" selector query, matching the fixture's Domain Admins
+#     group (RID 512) by its objectid suffix.
+#   - a shortestPath: agt.json's "Shortest paths to Domain Admins" query,
+#     BloodHound's own richest pre-built shortestPath search -- an
+#     unconstrained root alternated over its full ~64-member Active
+#     Directory pathfinding edge-kind list (see bench/cypherbench's
+#     identical shape4Text for the same text and why every one of those 64
+#     kinds must already be registered in the `kind` table before the query
+#     can run at all: upstream BloodHound's own migration
+#     (database/migration/extensions/ad_graph_schema.sql) bulk-inserts the
+#     complete AD kind vocabulary at schema-creation time, unlike
+#     bench/adgen's synthetic graph, which only defines the handful of kinds
+#     it actually writes edges for).
+#
+# The fixture's built-in Administrator (RID 500) is a direct MemberOf member
+# of Domain Admins (RID 512, see the path phase's own comment above), so the
+# shortestPath query is guaranteed at least that one trivial one-hop match.
+#
+# BLOODTRAIL_LOG_LEVEL=debug is already active from the restart above (the
+# builder phase's own debug-logging line only surfaces at that level, and
+# the just-completed builder phase already relied on it), so
+# cypherServedLogMessage's Debug line ("bloodtrail: cypher engine served",
+# see internal/engine/engine.go) is visible here too without another
+# restart. The session token from the builder phase above is still valid
+# (no restart happened in between).
+CYPHER_PLAIN_MATCH="$(cat <<'CYPHER_EOF'
+MATCH (n:Group)
+WHERE n.objectid ENDS WITH '-512'
+RETURN n;
+CYPHER_EOF
+)"
+CYPHER_SHORTEST_PATH="$(cat <<'CYPHER_EOF'
+MATCH p=shortestPath((t:Group)<-[:Owns|GenericAll|GenericWrite|WriteOwner|WriteDacl|MemberOf|ForceChangePassword|AllExtendedRights|AddMember|HasSession|GPLink|AllowedToDelegate|CoerceToTGT|AllowedToAct|AdminTo|CanPSRemote|CanRDP|ExecuteDCOM|HasSIDHistory|AddSelf|DCSync|ReadLAPSPassword|ReadGMSAPassword|DumpSMSAPassword|SQLAdmin|AddAllowedToAct|WriteSPN|AddKeyCredentialLink|SyncLAPSPassword|WriteAccountRestrictions|WriteGPLink|GoldenCert|ADCSESC1|ADCSESC3|ADCSESC4|ADCSESC6a|ADCSESC6b|ADCSESC9a|ADCSESC9b|ADCSESC10a|ADCSESC10b|ADCSESC13|SyncedToADUser|CoerceAndRelayNTLMToSMB|CoerceAndRelayNTLMToADCS|WriteOwnerLimitedRights|OwnsLimitedRights|ClaimSpecialIdentity|CoerceAndRelayNTLMToLDAP|CoerceAndRelayNTLMToLDAPS|ContainsIdentity|PropagatesACEsTo|GPOAppliesTo|CanApplyGPO|HasTrustKeys|WriteAltSecurityIdentities|WritePublicInformation|ManageCA|ManageCertificates|Contains|DCFor|SameForestTrust|SpoofSIDHistory|AbuseTGTDelegation*1..]-(s:Base))
+WHERE t.objectid ENDS WITH '-512' AND s<>t
+RETURN p
+LIMIT 1000
+CYPHER_EOF
+)"
+
+bh_logs
+served_before="$(grep -c "cypher engine served" "$WORK/bloodhound-logs.txt" || true)"
+
+match_body="$(jq -n --arg q "$CYPHER_PLAIN_MATCH" '{query:$q}')"
+match_code="$(curl -s -o "$WORK/cypher-match.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$match_body" http://127.0.0.1:8080/api/v2/graphs/cypher)"
+[ "$match_code" = "200" ] || { echo "POST /api/v2/graphs/cypher (plain property MATCH) returned HTTP $match_code" >&2; cat "$WORK/cypher-match.json" >&2; exit 1; }
+match_nodes="$(jq '.data.nodes | length' "$WORK/cypher-match.json")"
+[ "$match_nodes" -gt 0 ] || { echo "POST /api/v2/graphs/cypher (plain property MATCH) returned no nodes" >&2; cat "$WORK/cypher-match.json" >&2; exit 1; }
+
+sp_body="$(jq -n --arg q "$CYPHER_SHORTEST_PATH" '{query:$q}')"
+sp_code="$(curl -s -o "$WORK/cypher-shortest-path.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$sp_body" http://127.0.0.1:8080/api/v2/graphs/cypher)"
+[ "$sp_code" = "200" ] || { echo "POST /api/v2/graphs/cypher (shortestPath) returned HTTP $sp_code" >&2; cat "$WORK/cypher-shortest-path.json" >&2; exit 1; }
+sp_nodes="$(jq '.data.nodes | length' "$WORK/cypher-shortest-path.json")"
+[ "$sp_nodes" -gt 0 ] || { echo "POST /api/v2/graphs/cypher (shortestPath) returned no nodes" >&2; cat "$WORK/cypher-shortest-path.json" >&2; exit 1; }
+
+bh_logs
+served_after="$(grep -c "cypher engine served" "$WORK/bloodhound-logs.txt" || true)"
+cypher_served_delta=$((served_after - served_before))
+[ "$cypher_served_delta" -ge 2 ] || { echo "the cypher interpreter did not serve both corpus queries (\"cypher engine served\" count $served_before -> $served_after, delta $cypher_served_delta); PostgreSQL answered instead" >&2; exit 1; }
+
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"
