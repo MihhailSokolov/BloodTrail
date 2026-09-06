@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package engine: this file implements the translate-gate -- the last line
+// gate.go implements the translate-gate -- the last line
 // of defense between the in-memory Cypher interpreter (interpret.Plan/
 // Execute) and any query the real PostgreSQL-backed dawgs driver would
 // refuse to serve.
@@ -17,6 +17,7 @@
 // translateGateOK closes that gap by asking dawgs' own translator the same
 // question a real pg-backed serve would eventually ask, without any
 // database round trip.
+
 package engine
 
 import (

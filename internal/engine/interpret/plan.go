@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package interpret: plan.go implements the default-deny planner: a walk
+// plan.go implements the default-deny planner: a walk
 // from a parsed dawgs Cypher AST (github.com/specterops/dawgs@v0.8.0
 // cypher/models/cypher, produced by frontend.ParseCypher with a zero-filter
 // context -- the same context the pg driver itself uses) to an executable
@@ -24,6 +24,7 @@
 // snapshot.KindID) and (2) compile the query into a plain-data Query value a
 // later executor (Task 7 onward) can run directly against the snapshot,
 // without ever re-inspecting the AST for feasibility.
+
 package interpret
 
 import (

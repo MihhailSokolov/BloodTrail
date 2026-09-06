@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package interpret: this file implements Task 9 of milestone 4 -- the WITH
+// pipeline.go implements the WITH
 // pipeline (implicit grouping, COUNT/COLLECT aggregation, the COLLECT
 // anti-join id-set membership rewrite), RETURN DISTINCT, ORDER BY, and
 // SKIP/LIMIT. It replaces exec.go's Task 7 seam (the early gate on
@@ -92,6 +92,7 @@
 // into predicate evaluation themselves -- they only ever call EvalValue for
 // their operands, which has no predicate-tree recursion to intercept in the
 // first place.
+
 package interpret
 
 import (

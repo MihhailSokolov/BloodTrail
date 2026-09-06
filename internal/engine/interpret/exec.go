@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package interpret: this file implements the executor: turning one Plan-
+// exec.go implements the executor: turning one Plan-
 // compiled Query into a fully materialized ResultSet by scanning/expanding
 // each Part's pattern directly over the snapshot's CSR arrays and property
 // bags, joining shared variables by binding identity, filtering by WHERE,
@@ -26,6 +26,7 @@
 // item, reading whatever expand.go's Task 8 functions or this file's
 // assembleChainPathVal (Task 8b) bound via Row.SetPathVar (always a *PathVal
 // in this package).
+
 package interpret
 
 import (

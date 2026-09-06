@@ -55,10 +55,14 @@ func buildCSR(n int, src, dst []uint32, kind []uint8) *CSR {
 
 type bitset []uint64
 
-func newBitset(n int) bitset            { return make(bitset, (n+63)/64) }
-func (b bitset) test(i uint32) bool     { return b[i>>6]&(1<<(i&63)) != 0 }
-func (b bitset) set(i uint32)           { b[i>>6] |= 1 << (i & 63) }
-func (b bitset) clear()                 { for i := range b { b[i] = 0 } }
+func newBitset(n int) bitset        { return make(bitset, (n+63)/64) }
+func (b bitset) test(i uint32) bool { return b[i>>6]&(1<<(i&63)) != 0 }
+func (b bitset) set(i uint32)       { b[i>>6] |= 1 << (i & 63) }
+func (b bitset) clear() {
+	for i := range b {
+		b[i] = 0
+	}
+}
 
 // bfs: frontier BFS with optional kind mask (bit k set => kind k allowed). maxDepth<0 = unbounded.
 // returns per-level frontier sizes, total visited, edges scanned.

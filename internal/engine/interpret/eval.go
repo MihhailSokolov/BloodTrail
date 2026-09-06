@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package interpret: this file implements the expression evaluator itself,
+// eval.go implements the expression evaluator itself,
 // walking the dawgs Cypher AST (github.com/specterops/dawgs@v0.8.0
 // cypher/models/cypher) directly against one snapshot.Snapshot and one bound
-// Row, and routing every comparison through value.go's Task 4 primitives
+// Row, and routing every comparison through value.go's own primitives
 // (Tri, StringEq/StringNeq/ScalarEq/PropEq, StringPredicate, In, OrderCompare,
 // IsNull/IsNotNull) rather than re-deriving pg's semantics here.
 //
 // Two entry points are exported: EvalPredicate for boolean (WHERE-clause)
 // context, returning a Tri, and EvalValue for scalar/projection context,
 // returning a (value, present, error) triple in the same post-JSON value
-// model value.go's doc comment describes (nil | string | float64 | bool |
+// model value.go's own package doc comment describes (nil | string | float64 | bool |
 // []any | map[string]any, with a separate present/ok flag distinguishing
 // absence from a stored JSON null).
+
 package interpret
 
 import (

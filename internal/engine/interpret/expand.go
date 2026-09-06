@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package interpret: this file implements Task 8 of milestone 4 -- the two
-// seams Task 7's exec.go left open (see its package doc comment and
+// expand.go implements the two
+// seams exec.go left open (see its own file comment and
 // runComponent's dispatch, below): variable-length relationship-pattern
 // expansion (`*min..max`) and shortestPath()/allShortestPaths() step
 // execution, both driven directly off one snapshot.Snapshot rather than a
@@ -87,6 +87,7 @@
 // This mirrors dawgs' own translation: a shortestPath()/allShortestPaths()
 // call compiles to a single recursive-CTE search seeded from *two* resolved
 // node sets, not a chain of per-row hops.
+
 package interpret
 
 import (

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package engine: this file implements the materialization layer between
+// serve_cypher.go implements the materialization layer between
 // the in-memory Cypher interpreter (internal/engine/interpret's Plan/
 // Execute) and dawgs' graph.Result contract: turning a snapshot.NodeID/
 // interpret.EdgeRef/interpret.PathVal into a full *graph.Node/*graph.
@@ -9,12 +9,13 @@
 // (result.go) and rowResult (rowresult.go) already wrap this milestone's
 // two earlier serving pipelines.
 //
-// This file does NOT wire any of this into TryCypher -- that is Task 13's
-// job, once Task 11 (edge-property hydration) and Task 12 (the rest of the
-// pipeline) exist too. Everything here is pure, snapshot-only
+// engine.go's TryCypher wires all of this together, via
+// safeExecuteCypher/buildCypherRowsResult, into a served graph.Result.
+// Everything here is otherwise pure, snapshot-only
 // materialization: no I/O, no PostgreSQL round trip, nothing that can fail
-// -- exactly the same posture pathResult/rowResult already take (their
-// Error() always returns nil), so cypherRowsResult's does too.
+// on its own -- exactly the same posture pathResult/rowResult already take
+// (their Error() always returns nil), so cypherRowsResult's does too.
+
 package engine
 
 import (
