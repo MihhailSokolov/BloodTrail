@@ -6,6 +6,7 @@
 /dist/
 /pathbench
 /builderbench
+/cypherbench
 bench/csrbench/csrbench
 
 # Benchmark and render scratch

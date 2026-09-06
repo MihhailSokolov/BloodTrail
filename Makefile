@@ -1,4 +1,4 @@
-.PHONY: test lint integration build-image tidy bench-path bench-builder
+.PHONY: test lint integration build-image tidy bench-path bench-builder bench-cypher
 
 test:
 	go test ./...
@@ -26,6 +26,13 @@ bench-path: ## run the path-engine benchmark against BLOODTRAIL_TEST_PG
 # in CI (see bench/builderbench).
 bench-builder: ## run the builder-query benchmark against BLOODTRAIL_TEST_PG
 	go run ./bench/builderbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
+
+# Requires a PostgreSQL reachable at BLOODTRAIL_TEST_PG, already loaded with a
+# graph (see bench/adgen). -enforce fails the build if Cypher serving isn't
+# at least 5x faster than delegating to PostgreSQL (1x for the objectid
+# point lookup); never pass -enforce in CI (see bench/cypherbench).
+bench-cypher: ## run the cypher-interpreter benchmark against BLOODTRAIL_TEST_PG
+	go run ./bench/cypherbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
 
 # Usage: make build-image UPSTREAM_TAG=v9.6.0
 UPSTREAM_TAG ?= v9.6.0
