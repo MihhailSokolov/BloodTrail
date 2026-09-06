@@ -1452,15 +1452,23 @@ func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, b
 	return cur, curOk, nil
 }
 
-// applyArithmetic implements one arithmetic step over float64 operands.
-// Cypher also defines `+` for string/list concatenation, but the brief
-// scopes this evaluator to numeric arithmetic only, so a non-numeric operand
-// is ErrUnsupported (expected to be pre-rejected, or handled by a different
-// code path, at plan time).
+// applyArithmetic implements one arithmetic step over float64 operands, plus
+// `+`'s own string-concatenation disambiguation (applyAdd, below) -- every
+// other operator (-, *, /, %) has no Cypher/pg concatenation analog, so those
+// stay numeric-only exactly as before: a non-numeric operand is
+// ErrUnsupported (expected to be pre-rejected, or handled by a different
+// code path, at plan time -- checkArithmetic (plan.go) does not itself
+// type-check operands for any of these operators, mirroring this function's
+// own runtime-only dispatch).
 func applyArithmetic(a any, aOk bool, op cypher.Operator, b any, bOk bool) (any, bool, error) {
 	if !aOk || !bOk || a == nil || b == nil {
 		return nil, false, nil
 	}
+
+	if op == cypher.OperatorAdd {
+		return applyAdd(a, b)
+	}
+
 	af, aIsNum := a.(float64)
 	bf, bIsNum := b.(float64)
 	if !aIsNum || !bIsNum {
@@ -1468,8 +1476,6 @@ func applyArithmetic(a any, aOk bool, op cypher.Operator, b any, bOk bool) (any,
 	}
 
 	switch op {
-	case cypher.OperatorAdd:
-		return af + bf, true, nil
 	case cypher.OperatorSubtract:
 		return af - bf, true, nil
 	case cypher.OperatorMultiply:
@@ -1487,6 +1493,75 @@ func applyArithmetic(a any, aOk bool, op cypher.Operator, b any, bOk bool) (any,
 	default:
 		return nil, false, ErrUnsupported
 	}
+}
+
+// applyAdd implements Cypher's `+`, which pg's own translation disambiguates
+// per call into either numeric addition or string concatenation (pinned by
+// reading dawgs@v0.8.0's cypher/models/pgsql/translate/expression.go
+// directly, not guessed): rewriteBinaryExpression's OperatorAdd case infers
+// each operand's static pgsql.DataType and calls isConcatenationOperation,
+// which chooses concatenation when either operand's inferred type is Text
+// (a string literal, or anything else pg can statically type as text), or
+// -- "to prefer Cypher's string concatenation form instead of emitting
+// invalid jsonb + jsonb SQL" (that function's own comment) -- when BOTH
+// operands are property lookups (pg has no static type for a raw jsonb
+// property, so it defaults an all-property `+` to concatenation rather than
+// arithmetic). Array-typed operands also concatenate (list concatenation),
+// out of scope here: this evaluator's post-JSON value model has no separate
+// "static AST shape" to dispatch on the way pg's translator does (a and b
+// here are already-evaluated runtime values), so this function approximates
+// the same rule at the value level instead -- both a provably safe and a
+// provably sufficient approximation for every shape this package accepts,
+// reasoned through below.
+//
+//   - Both operands are runtime strings: concatenate. This is exactly pg's
+//     own rule whenever a literal string is on either side (a literal's
+//     runtime value is definitionally the same string pg statically typed
+//     Text), and is also the outcome pg's "both property lookups" rule
+//     produces whenever both properties actually hold string values at
+//     runtime -- the only case this package's required corpus (the
+//     AdminSDHolder selector, `'CN=ADMINSDHOLDER,CN=SYSTEM,' +
+//     n.distinguishedname`) exercises.
+//   - Exactly one operand is a runtime string and the other is a present,
+//     non-string value (a bool/float64/list/map property): this package
+//     bails with ErrRuntimeCast (declines the whole query -- see
+//     cypherExecReason's identical mapping for every other evaluator
+//     sentinel -- to delegate to PostgreSQL) rather than guess at a text
+//     rendering. This is deliberately more conservative than pg itself:
+//     e.g. `n.numericProp + 'x'` pg statically types as concatenation (the
+//     literal is Text) and would render numericProp via `->>` (jsonb's own
+//     "always renders as text" contract, which never itself errors for a
+//     present scalar) -- but a `->>` text rendering does not necessarily
+//     equal Go's fmt-style stringification of the same JSON value for
+//     every type (e.g. a JSON float requires matching pg's exact numeric
+//     text formatting to agree byte-for-byte), and this package has no
+//     tested, pinned reproduction of that formatting to fall back on
+//     safely. Declining is always correct regardless of which side turns
+//     out right, since PostgreSQL remains the fallback and returns its own
+//     answer either way -- see this package's own repeated "REJECTED is
+//     safe" precedent (e.g. expandShortestPathComponent's identical
+//     preference for a spurious decline over a guessed answer).
+//   - Neither operand is a runtime string: falls through to the ordinary
+//     float64 numeric-addition path, unchanged from before this function
+//     existed -- a non-numeric, non-string operand (a bool/list/map) still
+//     bails ErrUnsupported exactly as it always has.
+func applyAdd(a, b any) (any, bool, error) {
+	aStr, aIsStr := a.(string)
+	bStr, bIsStr := b.(string)
+
+	switch {
+	case aIsStr && bIsStr:
+		return aStr + bStr, true, nil
+	case aIsStr || bIsStr:
+		return nil, false, ErrRuntimeCast
+	}
+
+	af, aIsNum := a.(float64)
+	bf, bIsNum := b.(float64)
+	if !aIsNum || !bIsNum {
+		return nil, false, ErrUnsupported
+	}
+	return af + bf, true, nil
 }
 
 // evalUnary implements unary +/- over a numeric operand.

@@ -613,6 +613,110 @@ func TestEvalArithmetic(t *testing.T) {
 	})
 }
 
+// TestEvalStringConcatenation pins gap (b)'s fix (task 16b): `+` between two
+// runtime strings concatenates (applyAdd's own doc comment pins the full
+// pg-parity investigation and the safety argument for every other case
+// here).
+func TestEvalStringConcatenation(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+
+	t.Run("string literal + string property concatenates", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN 'CN=' + n.name"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != "CN=AZUREADKERBEROS.TEST.LOCAL" {
+			t.Fatalf("got %#v, want %q", val, "CN=AZUREADKERBEROS.TEST.LOCAL")
+		}
+	})
+
+	t.Run("string property + string literal concatenates (operand order reversed)", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN n.name + '-x'"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != "AZUREADKERBEROS.TEST.LOCAL-x" {
+			t.Fatalf("got %#v, want %q", val, "AZUREADKERBEROS.TEST.LOCAL-x")
+		}
+	})
+
+	t.Run("both operands string properties concatenates", func(t *testing.T) {
+		row := f.tworow("n", 200, "m", 960) // 960's name = "beta"
+		val, ok, err := EvalValue(env, row, returnExprOf(t, "MATCH (n),(m) RETURN n.name + m.name"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != "AZUREADKERBEROS.TEST.LOCALbeta" {
+			t.Fatalf("got %#v, want %q", val, "AZUREADKERBEROS.TEST.LOCALbeta")
+		}
+	})
+
+	t.Run("absent property makes the whole concatenation NULL, not an error", func(t *testing.T) {
+		// Node 100 has no "name" property at all -- mirrors applyArithmetic's
+		// existing, unchanged absent-operand contract (a==nil||b==nil -> NULL)
+		// which this fix's applyAdd is layered underneath, not around.
+		val, ok, err := EvalValue(env, f.row("n", 100), returnExprOf(t, "MATCH (n) RETURN 'CN=' + n.name"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if ok || val != nil {
+			t.Fatalf("got val=%#v ok=%v, want (nil, false)", val, ok)
+		}
+	})
+
+	t.Run("string + non-string bool property bails ErrRuntimeCast", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 700), returnExprOf(t, "MATCH (n) RETURN 'x' + n.flag"))
+		if !errors.Is(err, ErrRuntimeCast) {
+			t.Fatalf("err = %v, want ErrRuntimeCast", err)
+		}
+	})
+
+	t.Run("non-string numeric property + string bails ErrRuntimeCast", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN n.score + 'x'"))
+		if !errors.Is(err, ErrRuntimeCast) {
+			t.Fatalf("err = %v, want ErrRuntimeCast", err)
+		}
+	})
+
+	t.Run("neither operand a string still does ordinary numeric addition", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN n.score + 1"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != float64(43) {
+			t.Fatalf("got %#v, want 43", val)
+		}
+	})
+
+	// The corpus shape itself (selector/AdminSDHolder): a concatenation
+	// result feeding an equality comparison. An absent right-hand property
+	// must make the whole comparison NULL (the brief's own pinned rule:
+	// "absent property -> NULL result -> comparison NULL -> row drops"),
+	// not an error.
+	t.Run("concatenation feeding an equality comparison: match", func(t *testing.T) {
+		row := f.tworow("n", 200, "m", 960)
+		got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n),(m) WHERE m.name = n.name + 'beta' RETURN m"))
+		if err != nil {
+			t.Fatalf("EvalPredicate: %v", err)
+		}
+		if got != TriFalse {
+			t.Fatalf("got %s, want TriFalse (960's name is \"beta\", not \"AZUREADKERBEROS.TEST.LOCALbeta\")", got)
+		}
+	})
+
+	t.Run("concatenation feeding an equality comparison: absent operand drops the row (NULL, not an error)", func(t *testing.T) {
+		row := f.tworow("n", 100, "m", 960) // 100 has no "name" property
+		got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n),(m) WHERE m.name = n.name + 'beta' RETURN m"))
+		if err != nil {
+			t.Fatalf("EvalPredicate: %v", err)
+		}
+		if got != TriNull {
+			t.Fatalf("got %s, want TriNull", got)
+		}
+	})
+}
+
 // TestEvalLastLogonTimestampScenario pins the brief's named scenario:
 // n.lastlogontimestamp < (datetime().epochseconds - (60 * 86400)) evaluated
 // against a controlled Env.Now.

@@ -320,26 +320,22 @@ func declineReason(logTail string) string {
 // differently-queried "Disabled Tier Zero / High Value principals" entries
 // -- since name alone is not always unique within one file). Every entry
 // must carry a one-line reason, and assertAllowlistKeysUnambiguous asserts
-// every key here matches exactly one corpus query. The milestone target is
-// an empty map -- see task-16-report.md for the investigation behind each
-// entry below; none of these is a trivial fix (this suite's one budgeted
-// inline-fix round went to the one genuine bug task-16-report.md documents
-// fixing elsewhere instead -- graphtest.CorpusSchema's missing
-// DefaultGraph), so each is a real, structural gap flagged for the
-// controller rather than silently patched.
-var expectedDelegations = map[string]string{
-	// eval.go's applyArithmetic has a doc comment stating plainly: "Cypher
-	// also defines `+` for string/list concatenation, but the brief scopes
-	// this evaluator to numeric arithmetic only" -- a deliberate, already-
-	// documented scope boundary from an earlier milestone-4 task, not
-	// something this suite should silently widen. plan.go's checkArithmetic
-	// does not type-check the '+' operator's operands (mirrors eval.go's
-	// own folding, per its doc), so this query plans successfully and fails
-	// at runtime on its first WHERE evaluation
-	// ('CN=ADMINSDHOLDER,...' + n.distinguishedname), which
-	// applyArithmetic reports as ErrUnsupported -> reasonUnsupported.
-	"selector/AdminSDHolder#0": "WHERE clause concatenates strings via '+'; eval.go's applyArithmetic is deliberately numeric-only",
-}
+// every key here matches exactly one corpus query -- a guard that keeps
+// working correctly over an empty map too (nothing to be ambiguous about).
+//
+// Empty as of task 16b: Task 16 originally flagged five entries here (all
+// genuine, investigated interpreter scope gaps, not one-line bugs -- see
+// task-16-report.md for that investigation and task-16b-report.md for what
+// closed each one): WHERE-clause pattern predicates (closed by
+// checkPatternPredicate/evalPatternPredicate, plan.go/eval.go), `+` string
+// concatenation (closed by applyAdd, eval.go), and an unconstrained,
+// unbounded shortestPath to Tag_Tier_Zero declining ErrBudget (root-caused
+// to traverse.AllShortestPaths' own PairBudget/SideBudget strategy dispatch
+// genuinely refusing the shape on this fixture -- not a Task 8 budget-unit
+// bug -- and closed via traverse.Query's new per-call SideBudget/PairBudget
+// overrides, plus a planner fix for a predicate-only shortestPath endpoint
+// the agi variant of the same query also needed).
+var expectedDelegations = map[string]string{}
 
 // knownAmbiguousQueries lists corpus queries whose shortestPath(...) this
 // fixture happens to make genuinely ambiguous for at least one qualifying
