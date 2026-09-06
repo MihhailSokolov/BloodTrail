@@ -106,6 +106,26 @@ type Step struct {
 	// the self-pair via this comparison, in which case self-pairs are
 	// silently dropped instead of erroring.
 	HasExplicitEndpointInequality bool
+	// Reversed records whether buildStep's inbound-arrow swap actually fired
+	// for this step -- i.e. the pattern was originally written with a
+	// backward arrow (`(t)<-[:R]-(s)`), so FromSym/ToSym above hold the
+	// TRAVERSAL direction (s, then t), the opposite of the pattern's own
+	// WRITTEN order (t, then s). A named path's PathVal is otherwise always
+	// assembled in traversal order (expand.go's expandVarLengthTrailsForSeed/
+	// expandShortestPathComponent), which is exactly right for a forward
+	// arrow but backward for one of these -- see reversePathVal's own doc
+	// (the final review's I3 fix) for why every PathVal built from a
+	// Reversed step's own expansion must have its Nodes/Edges order flipped
+	// before it is ever handed to a caller (RETURN p), to match Cypher's
+	// (and pg's) own "node sequence follows the pattern as written"
+	// semantics regardless of which way any one edge happens to point.
+	// Always false for a step reached through expandChainComponent
+	// (isStrictLinearChain's own doc explains why a Reversed step can never
+	// satisfy its "each step starts where the last one ended" chain test),
+	// so this only ever matters for a standalone single-step component
+	// (expandVarLengthComponent) or a shortestPath/allShortestPaths Step
+	// (expandShortestPathComponent).
+	Reversed bool
 }
 
 // NodeConstraint accumulates everything Plan determined about one pattern
@@ -430,7 +450,7 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.Snapshot) (result *Query, ok bo
 				// smuggle a second shortestPath past a per-Part-only check.
 				return nil, false
 			}
-			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, st.ret)
+			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, st.ret)
 			if !ok {
 				return nil, false
 			}
@@ -1136,10 +1156,12 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 		return Step{}, false
 	}
 
+	reversed := false
 	switch direction {
 	case graph.DirectionInbound:
 		fromSym, toSym = toSym, fromSym
 		direction = graph.DirectionOutbound
+		reversed = true
 	case graph.DirectionOutbound, graph.DirectionBoth:
 		// already the executor's expected shape
 	default:
@@ -1149,7 +1171,7 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 	return Step{
 		FromSym: fromSym, EdgeSym: edgeSym, ToSym: toSym,
 		Direction: direction, EdgeKinds: kinds, Range: rng,
-		Shortest: shortest, PathSym: pathSym,
+		Shortest: shortest, PathSym: pathSym, Reversed: reversed,
 	}, true
 }
 
@@ -1828,14 +1850,18 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 // isStaticallyNumericScalar (shared with finding C2's ORDER BY fix) is
 // exactly the right notion of "statically numeric" here too: it accepts a
 // numeric literal, id()/size()/datetime() epoch accessors, and arithmetic
-// built only from those -- never a property lookup, which is exactly the
-// operand shape whose static type pg cannot itself prove ahead of
-// execution. isNumericSafeOperand additionally treats a bare reference to a
-// carried numeric WITH alias (pb.numericScalars) the same way, for the
-// corpus's own `WITH 60 AS days ... WHERE m.threshold > days` shape -- see
-// partBuilder.numericScalars' own doc.
+// built only from those, plus -- given pb.numericScalars, threaded through
+// as its numericScalars parameter -- a bare reference to a carried numeric
+// WITH alias, AT ANY NESTING DEPTH, not just a bare top-level operand: the
+// corpus's own `WHERE n.lastlogontimestamp < (datetime().epochseconds -
+// (inactive_days * 86400))` shape needs exactly this (inactive_days a `WITH
+// 60 AS inactive_days` constant, buried inside arithmetic on the
+// comparison's non-property side). Never a bare property lookup, which is
+// exactly the operand shape whose static type pg cannot itself prove ahead
+// of execution.
 func (pb *partBuilder) relationalComparisonSafe(left, right cypher.Expression) bool {
-	leftNumeric, rightNumeric := pb.isNumericSafeOperand(left), pb.isNumericSafeOperand(right)
+	leftNumeric := isStaticallyNumericScalar(left, pb.numericScalars)
+	rightNumeric := isStaticallyNumericScalar(right, pb.numericScalars)
 	switch {
 	case leftNumeric && rightNumeric:
 		return true
@@ -1846,20 +1872,6 @@ func (pb *partBuilder) relationalComparisonSafe(left, right cypher.Expression) b
 	default:
 		return false
 	}
-}
-
-// isNumericSafeOperand reports whether expr is statically guaranteed to
-// evaluate to a genuine number: either isStaticallyNumericScalar's own AST-
-// shape judgment, or a bare Variable naming an alias pb.numericScalars
-// marks as always-numeric (a carried WITH constant/COUNT this partBuilder's
-// own AST-only isStaticallyNumericScalar has no way to see through, since a
-// bare Variable node carries no literal shape of its own).
-func (pb *partBuilder) isNumericSafeOperand(expr cypher.Expression) bool {
-	if isStaticallyNumericScalar(expr) {
-		return true
-	}
-	v, ok := unwrapParens(expr).(*cypher.Variable)
-	return ok && v != nil && pb.numericScalars[v.Symbol]
 }
 
 // isBarePropertyLookup reports whether expr (after unwrapping any
@@ -2544,10 +2556,15 @@ func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) 
 // --- RETURN ------------------------------------------------------------
 
 // planReturn validates and compiles the query's final RETURN clause against
-// known (the symbol table visible at this point) and countAliases (COUNT
+// known (the symbol table visible at this point), countAliases (COUNT
 // aggregate alias names from the immediately preceding Part's WithClause,
-// for the ORDER BY exception -- empty when there was no preceding WITH).
-func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases map[string]bool, ret *cypher.Return) (Projection, []OrderKey, int64, int64, bool) {
+// for the ORDER BY exception), and numericScalars (that same WithClause's
+// numeric WithConstant/COUNT aliases, per numericScalarSet -- ORDER BY's own
+// isStaticallyNumericScalar admission needs this exactly like
+// relationalComparisonSafe's WHERE-side check does, for a RETURN item
+// referencing a carried numeric alias, however deeply nested inside
+// arithmetic); both empty when there was no preceding WITH.
+func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases, numericScalars map[string]bool, ret *cypher.Return) (Projection, []OrderKey, int64, int64, bool) {
 	if ret == nil || ret.Projection == nil {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -2609,7 +2626,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 		}
 		projectedAliases[name] = true
 		projectedKinds[name] = itemKind
-		projectedNumeric[name] = isStaticallyNumericScalar(item.Expression)
+		projectedNumeric[name] = isStaticallyNumericScalar(item.Expression, numericScalars)
 
 		items = append(items, ProjectionOutput{
 			Alias:        name,
@@ -2896,22 +2913,31 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 	return keys, true
 }
 
-// isStaticallyNumericScalar reports whether expr (a RETURN item's own
-// top-level expression) can only ever evaluate to a Cypher number, judged
-// purely by its STATIC AST shape -- never by sniffing a runtime value --
-// mirroring the discipline classifyAddOperand already applies to `+`
-// operands. It accepts exactly: a bare numeric literal; id(), size(), or
+// isStaticallyNumericScalar reports whether expr (a RETURN item's own top-
+// level expression, or -- recursively -- any sub-expression reached while
+// deciding that) can only ever evaluate to a Cypher number, judged purely by
+// its STATIC AST shape -- never by sniffing a runtime value -- mirroring
+// the discipline classifyAddOperand already applies to `+` operands. It
+// accepts exactly: a bare numeric literal; id(), size(), or
 // datetime().epochseconds/.epochmillis (this package's BareCallKind set,
 // each of which evalIDFunction/evalListSizeFunction/evalDateTimeComponent
-// always produces as a genuine Go float64, never a property-typed value);
-// and arithmetic (+, -, *, /, %, unary +/-) whose every leaf is itself one
-// of those shapes. A bare property lookup is NEVER included, no matter how
-// "obviously numeric" its name looks (e.g. lastlogontimestamp): PostgreSQL
-// keeps no static type for a jsonb property, so a row where it happens to
-// hold a string, a bool, or is absent entirely is not something Plan can
-// rule out ahead of execution -- see planOrder's own doc for why that
-// distinction is exactly the divergence this function exists to avoid.
-func isStaticallyNumericScalar(expr cypher.Expression) bool {
+// always produces as a genuine Go float64, never a property-typed value); a
+// bare Variable naming an alias numericScalars marks as always-numeric (a
+// carried WITH constant/COUNT -- see partBuilder.numericScalars' own doc;
+// nil is a valid, always-empty map for a caller with no such aliases to
+// offer, e.g. planOrder's Part[0] context); and arithmetic (+, -, *, /, %,
+// unary +/-) whose every leaf is itself one of those shapes -- checked at
+// EVERY nesting depth, not just the top level, so a carried alias buried
+// inside a larger expression (the corpus's own `datetime().epochseconds -
+// (inactive_days * 86400)`, inactive_days a `WITH 60 AS inactive_days`
+// constant) is recognized correctly, not just a bare top-level reference to
+// one. A bare property lookup is NEVER included, no matter how "obviously
+// numeric" its name looks (e.g. lastlogontimestamp): PostgreSQL keeps no
+// static type for a jsonb property, so a row where it happens to hold a
+// string, a bool, or is absent entirely is not something Plan can rule out
+// ahead of execution -- see planOrder's own doc for why that distinction is
+// exactly the divergence this function exists to avoid.
+func isStaticallyNumericScalar(expr cypher.Expression, numericScalars map[string]bool) bool {
 	expr = unwrapParens(expr)
 
 	switch bareCallKind(expr) {
@@ -2930,18 +2956,20 @@ func isStaticallyNumericScalar(expr cypher.Expression) bool {
 		default:
 			return false
 		}
+	case *cypher.Variable:
+		return e != nil && numericScalars[e.Symbol]
 	case *cypher.ArithmeticExpression:
-		if e == nil || !isStaticallyNumericScalar(e.Left) {
+		if e == nil || !isStaticallyNumericScalar(e.Left, numericScalars) {
 			return false
 		}
 		for _, p := range e.Partials {
-			if p == nil || !isStaticallyNumericScalar(p.Right) {
+			if p == nil || !isStaticallyNumericScalar(p.Right, numericScalars) {
 				return false
 			}
 		}
 		return true
 	case *cypher.UnaryAddOrSubtractExpression:
-		return e != nil && isStaticallyNumericScalar(e.Right)
+		return e != nil && isStaticallyNumericScalar(e.Right, numericScalars)
 	default:
 		return false
 	}

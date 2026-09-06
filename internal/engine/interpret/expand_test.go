@@ -499,6 +499,54 @@ func TestExpandShortestPathMatchesTraverseDirectly(t *testing.T) {
 				"N:1,3,4,|E:302,303,",
 			})
 	})
+
+	// I3 (final review): the identical pattern written with a backward
+	// arrow (`(t)<-[...]-  (s)`) must render p's node/edge sequence in the
+	// pattern's WRITTEN order (t first, then s) -- the exact reverse of the
+	// forward-arrow cases above, which is also the exact reverse of the
+	// TRAVERSAL order buildStep's inbound-arrow swap makes the executor
+	// actually walk in (FromSym=s, ToSym=t internally either way). A
+	// live-pg differential probe against the corpus's own
+	// `shortestPath((t:Group)<-[:R*1..]-(s:Base))` shape found this
+	// reversed before the fix (reversePathVal, expand.go).
+	t.Run("shortestPath (ModeOne), backward arrow renders written order", func(t *testing.T) {
+		assertPathSigs(t, snap,
+			`MATCH p = shortestPath((t:Target)<-[:E*1..]-(s:Root)) WHERE s<>t RETURN p`, 0,
+			[]string{"N:4,3,1,|E:303,302,"})
+	})
+}
+
+// TestExpandVarLengthBackwardArrowNamedPathWrittenOrder is I3's (final
+// review) regression for the standalone (non-shortestPath) var-length case:
+// a named path pattern written with a backward arrow
+// (`(b:Target)<-[:E*1..3]-(a:Root)`) must render p's Nodes/Edges in the
+// pattern's WRITTEN order -- b first, then the intermediate node(s), then a
+// last -- not the TRAVERSAL order (a first) buildStep's inbound-arrow swap
+// makes expandVarLengthTrailsForSeed actually walk in. Mirrors
+// TestExpandVarLengthDiamondBothTrails' own single-branch fixture (a-x-b),
+// written backward.
+func TestExpandVarLengthBackwardArrowNamedPathWrittenOrder(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindRoot}},
+			{id: 2}, // x
+			{id: 4, kinds: []snapshot.KindID{kindTarget}},
+		},
+		[]execEdgeSpec{
+			{id: 10, start: 1, end: 2, kind: kindE}, // a->x
+			{id: 11, start: 2, end: 4, kind: kindE}, // x->b
+		},
+	)
+
+	assertPathSigs(t, snap, `MATCH p = (b:Target)<-[:E*1..3]-(a:Root) RETURN p`, 0, []string{
+		"N:4,2,1,|E:11,10,",
+	})
 }
 
 // TestExpandShortestPathEndpointPredicateNarrowsSet: a pushed single-symbol

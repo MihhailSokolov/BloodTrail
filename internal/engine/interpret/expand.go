@@ -222,6 +222,8 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 		nr := cloneRow(seed)
 		nr.SetNode(step.ToSym, root)
 		if pathArcKey != "" {
+			// Empty either way (the zero-length case); reversePathVal would
+			// be a no-op here regardless of step.Reversed, so it is skipped.
 			nr.SetPathVar(pathArcKey, &PathVal{})
 		}
 		if err := meter.spend(1); err != nil {
@@ -246,10 +248,22 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			nr := cloneRow(seed)
 			nr.SetNode(step.ToSym, curNode)
 			if pathArcKey != "" {
-				nr.SetPathVar(pathArcKey, &PathVal{
+				pv := &PathVal{
 					Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
 					Edges: append([]EdgeRef(nil), cur.edges...),
-				})
+				}
+				if step.Reversed {
+					// This trail was walked FromSym (traversal source) to
+					// curNode, but step.Reversed means FromSym is itself the
+					// pattern's SECOND-written endpoint (buildStep's
+					// inbound-arrow swap) -- so the path as built is in the
+					// opposite order from what `RETURN pathArcKey` (a whole
+					// standalone pattern's own PathSym; never a chain's
+					// per-step segment -- see Step.Reversed's own doc) must
+					// produce. Flip it back to pattern-written order.
+					reversePathVal(pv)
+				}
+				nr.SetPathVar(pathArcKey, pv)
 			}
 			if err := meter.spend(1); err != nil {
 				return nil, err
@@ -384,6 +398,20 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 			pv, err := convertPath(env, p)
 			if err != nil {
 				return nil, err
+			}
+			if step.Reversed {
+				// p (and therefore pv) runs FromSym (roots) to ToSym
+				// (terminals) in TRAVERSAL order, but step.Reversed means
+				// FromSym is the pattern's SECOND-written endpoint
+				// (buildStep's inbound-arrow swap) -- e.g.
+				// `shortestPath((t:Group)<-[:R*1..]-(s))` swaps to
+				// FromSym=s, ToSym=t internally, so p goes s->t while the
+				// pattern was written t first. Flip pv back to
+				// pattern-written order before it is ever handed to a
+				// caller (RETURN p); see reversePathVal's own doc. Row's
+				// own FromSym/ToSym node bindings above are untouched --
+				// they are internal bookkeeping, not the displayed path.
+				reversePathVal(pv)
 			}
 			nr.SetPathVar(step.PathSym, pv)
 		}
@@ -717,4 +745,39 @@ func convertPath(env *Env, p traverse.Path) (*PathVal, error) {
 		Nodes: append([]snapshot.NodeID(nil), p.Nodes...),
 		Edges: edges,
 	}, nil
+}
+
+// reversePathVal reverses pv's Nodes and Edges slices in place, turning a
+// PathVal built in graph-TRAVERSAL order into one describing the identical
+// path in the opposite node sequence -- the final review's I3 fix for a
+// step whose ORIGINAL Cypher pattern used a backward arrow (`<-`):
+// buildStep normalizes such a step by swapping FromSym/ToSym so the
+// recorded Step.Direction always matches the graph's own forward-CSR
+// traversal direction (Step.Reversed's own doc), which means every PathVal
+// this package assembles from a Reversed step's own expansion
+// (expandVarLengthTrailsForSeed, expandShortestPathComponent) comes out
+// with the far (traversal-source) endpoint first -- correct for a forward
+// arrow, backward for one of these, relative to Cypher's (and pg's) own
+// "a path's node sequence follows the pattern as WRITTEN" semantics. A
+// live-pg differential probe confirmed this directly: `MATCH p =
+// (t:Group)<-[:MemberOf*1..]-(a) RETURN p` renders p's first node as t (the
+// pattern's own first-written variable) on both a real pg database and any
+// correct engine, never a (the traversal source) -- this package's own
+// PathVal construction got that backward until this fix.
+//
+// Reordering the slice alone is sufficient to re-describe the same path
+// back-to-front: an EdgeRef's own start/end/kind are derived structurally
+// from the snapshot's CSR data by materializeEdge, never from the edge's
+// position within a path, so no edge itself needs touching, only which
+// slot of Nodes/Edges it occupies.
+func reversePathVal(pv *PathVal) {
+	if pv == nil {
+		return
+	}
+	for i, j := 0, len(pv.Nodes)-1; i < j; i, j = i+1, j-1 {
+		pv.Nodes[i], pv.Nodes[j] = pv.Nodes[j], pv.Nodes[i]
+	}
+	for i, j := 0, len(pv.Edges)-1; i < j; i, j = i+1, j-1 {
+		pv.Edges[i], pv.Edges[j] = pv.Edges[j], pv.Edges[i]
+	}
 }
