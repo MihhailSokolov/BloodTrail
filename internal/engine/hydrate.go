@@ -209,6 +209,106 @@ func hydrateEdgeBatch(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.Kin
 	return nil
 }
 
+// hydrateEdgePropsByID fetches the properties of every edge in ids from
+// graphID, keyed by database edge id, in batches of at most
+// edgePropsBatchSize (serve_cypher.go's Task 10 constant) ids per `WHERE id
+// = ANY($1)` round trip. Unlike hydrateNodes/hydrateEdges (which report a
+// missing entity as an aggregate count), a missing id here is reported
+// individually -- "bloodtrail: edge %d vanished during hydration" -- since
+// this is the shape Task 13's execution pipeline is expected to surface to a
+// caller as a declined query, and a single concrete id is more actionable
+// there than a bare count. Duplicate ids in the input are deduplicated
+// before any query is issued, so a caller (e.g. multiple paths sharing an
+// edge) never pays for or reports the same id twice. An empty ids returns an
+// empty, non-nil map without issuing any query.
+func hydrateEdgePropsByID(ctx context.Context, pool *pgxpool.Pool, graphID int32, ids []uint64) (map[uint64]*graph.Properties, error) {
+	return hydrateEdgePropsByIDBatched(ctx, pool, graphID, ids, edgePropsBatchSize)
+}
+
+// hydrateEdgePropsByIDBatched is hydrateEdgePropsByID's implementation with
+// an explicit batch size, split out so integration tests can exercise the
+// multi-batch path deterministically without seeding edgePropsBatchSize
+// (10_000) edges just to cross one batch boundary.
+func hydrateEdgePropsByIDBatched(ctx context.Context, pool *pgxpool.Pool, graphID int32, ids []uint64, batchSize int) (map[uint64]*graph.Properties, error) {
+	uniqueIDs := dedupeUint64s(ids)
+	if len(uniqueIDs) == 0 {
+		return map[uint64]*graph.Properties{}, nil
+	}
+
+	out := make(map[uint64]*graph.Properties, len(uniqueIDs))
+
+	for lo := 0; lo < len(uniqueIDs); lo += batchSize {
+		hi := lo + batchSize
+		if hi > len(uniqueIDs) {
+			hi = len(uniqueIDs)
+		}
+
+		if err := hydrateEdgePropsBatch(ctx, pool, graphID, uniqueIDs[lo:hi], out); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, id := range uniqueIDs {
+		if _, ok := out[id]; !ok {
+			return nil, fmt.Errorf("bloodtrail: edge %d vanished during hydration", id)
+		}
+	}
+
+	return out, nil
+}
+
+// hydrateEdgePropsBatch runs one `id = ANY($2)` query over a single batch of
+// database edge ids, writing decoded properties into out keyed by id.
+func hydrateEdgePropsBatch(ctx context.Context, pool *pgxpool.Pool, graphID int32, batch []uint64, out map[uint64]*graph.Properties) error {
+	queryIDs := make([]int64, len(batch))
+	for i, id := range batch {
+		queryIDs[i] = int64(id)
+	}
+
+	rows, err := pool.Query(ctx, "SELECT id, properties FROM edge WHERE graph_id = $1 AND id = ANY($2)", graphID, queryIDs)
+	if err != nil {
+		return fmt.Errorf("engine: hydrateEdgePropsByID: query edge properties: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id         int64
+			properties map[string]any
+		)
+		if err := rows.Scan(&id, &properties); err != nil {
+			return fmt.Errorf("engine: hydrateEdgePropsByID: scan edge properties: %w", err)
+		}
+
+		out[uint64(id)] = graph.AsProperties(properties)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("engine: hydrateEdgePropsByID: edge property rows: %w", err)
+	}
+
+	return nil
+}
+
+// dedupeUint64s returns ids with duplicates removed, preserving first-seen
+// order, or nil if ids is empty. First-seen order keeps
+// hydrateEdgePropsByIDBatched's missing-id error deterministic across
+// repeated calls with the same input.
+func dedupeUint64s(ids []uint64) []uint64 {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	seen := make(map[uint64]struct{}, len(ids))
+	out := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // edgeBatchQuery builds the parameterized SELECT ... WHERE (start_id,
 // end_id, kind_id) IN (VALUES ...) statement for one batch, along with its
 // positional arguments ($1 = graphID, the rest batch's triples in order).
