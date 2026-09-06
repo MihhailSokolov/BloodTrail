@@ -1,0 +1,170 @@
+[
+  {
+    "name": "Application Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH '9B895D92-2CD3-44C7-9D02-A6AC2D5EA5C3@'\nRETURN n;"
+  },
+  {
+    "name": "Knowledge Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH 'B5A8DCF3-09D5-43A9-A639-8E29EF291470@'\nRETURN n;"
+  },
+  {
+    "name": "Account Operators",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-548'\nRETURN n;"
+  },
+  {
+    "name": "Administrators",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-544'\nRETURN n;"
+  },
+  {
+    "name": "Backup Operators",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-551'\nRETURN n;"
+  },
+  {
+    "name": "Domain Admins",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-512'\nRETURN n;"
+  },
+  {
+    "name": "Enterprise Admins",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-519'\nRETURN n;"
+  },
+  {
+    "name": "Print Operators",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-550'\nRETURN n;"
+  },
+  {
+    "name": "Schema Admins",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-518'\nRETURN n;"
+  },
+  {
+    "name": "Server Operators",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-549'\nRETURN n;"
+  },
+  {
+    "name": "Administrator",
+    "query": "MATCH (n:User)\nWHERE n.objectid ENDS WITH '-500'\nRETURN n;"
+  },
+  {
+    "name": "AdminSDHolder",
+    "query": "MATCH (n:Domain)\nMATCH (m:Container)\nWHERE m.distinguishedname = 'CN=ADMINSDHOLDER,CN=SYSTEM,' + n.distinguishedname\nRETURN m;"
+  },
+  {
+    "name": "Domain root object",
+    "query": "MATCH (n:Domain)\nRETURN n;"
+  },
+  {
+    "name": "KRBTGT objects",
+    "query": "MATCH (n:User)\nWHERE n.objectid ENDS WITH '-502'\nRETURN n;"
+  },
+  {
+    "name": "Read-Only Domain Controllers",
+    "query": "MATCH (n:Computer)-[:MemberOf]-\u003e(m:Group) \nWHERE m.objectid ENDS WITH '-521'\nRETURN n;"
+  },
+  {
+    "name": "Global Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH '62E90394-69F5-4237-9190-012177145E10@'\nRETURN n;"
+  },
+  {
+    "name": "Partner Tier2 Support",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH 'E00E864A-17C5-4A4B-9C06-F5B95A8D5BD8@'\nRETURN n;"
+  },
+  {
+    "name": "Privileged Authentication Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH '7BE44C8A-ADAF-4E2A-84D6-AB2649E08A13@'\nRETURN n;"
+  },
+  {
+    "name": "Privileged Role Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH 'E8611AB8-C189-46E8-94E1-60213AB1F814@'\nRETURN n;"
+  },
+  {
+    "name": "Enterprise CA Computers",
+    "query": "MATCH (n:Computer)-[:HostsCAService]-\u003e(:EnterpriseCA)\nRETURN n;"
+  },
+  {
+    "name": "Exchange Trusted Subsystem",
+    "query": "MATCH (n:Group)\nWHERE n.name STARTS WITH 'EXCHANGE TRUSTED SUBSYSTEM@'\nRETURN n;"
+  },
+  {
+    "name": "Exchange Windows Permissions",
+    "query": "MATCH (n:Group)\nWHERE n.name STARTS WITH 'EXCHANGE WINDOWS PERMISSIONS@'\nRETURN n;"
+  },
+  {
+    "name": "DNS Admins",
+    "query": "MATCH (n:Group)\nWHERE n.name STARTS WITH 'DNSADMINS@'\nRETURN n;"
+  },
+  {
+    "name": "Domain Controllers",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-516'\nRETURN n;"
+  },
+  {
+    "name": "Intune Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH '3A2C62DB-5318-420D-8D74-23AFFEE5D9D5@'\nRETURN n;"
+  },
+  {
+    "name": "Security Administrator",
+    "query": "MATCH (n:AZRole) \nWHERE n.objectid STARTS WITH '194AE4CB-B126-40B2-BD5B-6091B380977D@'\nRETURN n;"
+  },
+  {
+    "name": "Cert Publishers",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-517'\nRETURN n;"
+  },
+  {
+    "name": "NTAuth store",
+    "query": "MATCH (n:NTAuthStore) \nRETURN n;"
+  },
+  {
+    "name": "Root CA object",
+    "query": "MATCH (n:RootCA) \nRETURN n;"
+  },
+  {
+    "name": "Enterprise Key Admins",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-527'\nRETURN n;"
+  },
+  {
+    "name": "Key Admins",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-526'\nRETURN n;"
+  },
+  {
+    "name": "Cryptographic Operators",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-569'\nRETURN n;"
+  },
+  {
+    "name": "Distributed COM Users",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-562'\nRETURN n;"
+  },
+  {
+    "name": "AIA CA (AD object)",
+    "query": "MATCH (n:AIACA) \nRETURN n;"
+  },
+  {
+    "name": "Enterprise CA (AD object)",
+    "query": "MATCH (n:EnterpriseCA) \nRETURN n;"
+  },
+  {
+    "name": "Performance Log Users",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH 'S-1-5-32-559'\nRETURN n;"
+  },
+  {
+    "name": "Certificate template",
+    "query": "MATCH (n:CertTemplate) \nRETURN n;"
+  },
+  {
+    "name": "Azure tenant object",
+    "query": "MATCH (n:AZTenant) \nRETURN n;"
+  },
+  {
+    "name": "Enterprise Domain Controllers",
+    "query": "MATCH (n:Group)\nWHERE n.objectid ENDS WITH '-1-5-9'\nRETURN n;"
+  },
+  {
+    "name": "AZUREADSSOACC object",
+    "query": "MATCH (n:Computer)\nWHERE n.samaccountname = 'AZUREADSSOACC$'\nRETURN n;"
+  },
+  {
+    "name": "Read-Only DCs",
+    "query": "MATCH (n:Computer)\nWHERE n.isReadOnlyDC = true\nRETURN n;"
+  },
+  {
+    "name": "Incoming Forest Trust Builders",
+    "query": "MATCH (n:Group) \nWHERE n.objectid ENDS WITH '-557'\nRETURN n;"
+  }
+]
