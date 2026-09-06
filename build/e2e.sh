@@ -91,17 +91,34 @@ sp_code="$(curl -s -o "$WORK/shortest-path.json" -w '%{http_code}' \
 node_count="$(jq '.data.nodes | length' "$WORK/shortest-path.json")"
 [ "$node_count" -gt 0 ] || { echo "GET /api/v2/graphs/shortest-path returned no nodes" >&2; cat "$WORK/shortest-path.json" >&2; exit 1; }
 
+bh_logs
+served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
+served_delta=$((served_after - served_before))
+[ "$served_delta" -ge 1 ] || { echo "the path engine did not serve GET /api/v2/graphs/shortest-path (\"path engine served\" count $served_before -> $served_after, delta $served_delta); PostgreSQL answered instead" >&2; exit 1; }
+
+# The POST below is exercised here too (proving the endpoint is live before
+# the debug-logging restart further down), but its own serving marker is
+# deliberately not asserted at this point: milestone 4 rewired the cypher
+# endpoint off servePathQuery entirely, so it no longer touches the Info
+# "bloodtrail: path engine served" line checked above, and instead logs its
+# own "bloodtrail: cypher engine served" (see internal/engine/engine.go's
+# TryCypher/cypherServedLogMessage) at Debug -- which stays invisible until
+# BLOODTRAIL_LOG_LEVEL=debug reaches the container, and that only happens at
+# the restart below (see its own comment for why it can't simply move
+# earlier: doing so before the "trigger":"analysis" wait above would drop
+# the pre-recreate log history and swap that wait's required trigger for a
+# "startup" one). The dedicated "Querying the Cypher interpreter directly"
+# phase further down -- which runs after that restart, with debug logging
+# already active -- is what actually asserts the cypher engine served this
+# endpoint instead of PostgreSQL.
 cypher="MATCH p=shortestPath((s)-[:MemberOf*1..]->(t:Group)) WHERE s.objectid = '$USER_SID' AND t.objectid ENDS WITH '-512' AND s<>t RETURN p LIMIT 10"
 CYPHER_BODY="$(jq -n --arg q "$cypher" '{query:$q}')"
 cypher_code="$(curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "$CYPHER_BODY" http://127.0.0.1:8080/api/v2/graphs/cypher)"
 [ "$cypher_code" = "200" ] || { echo "POST /api/v2/graphs/cypher returned HTTP $cypher_code" >&2; cat "$WORK/cypher.json" >&2; exit 1; }
-
-bh_logs
-served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
-served_delta=$((served_after - served_before))
-[ "$served_delta" -ge 2 ] || { echo "engine did not serve both GET /api/v2/graphs/shortest-path and POST /api/v2/graphs/cypher (\"path engine served\" count $served_before -> $served_after, delta $served_delta); PostgreSQL answered instead" >&2; exit 1; }
+cypher_node_count="$(jq '.data.nodes | length' "$WORK/cypher.json")"
+[ "$cypher_node_count" -gt 0 ] || { echo "POST /api/v2/graphs/cypher returned no nodes" >&2; cat "$WORK/cypher.json" >&2; exit 1; }
 
 echo "==> Enabling debug logging for the builder-served log line"
 # internal/engine/serve_builder.go's servedOp logs "bloodtrail: builder
