@@ -136,17 +136,26 @@ type ResultSet struct {
 // has no direct access to the Query itself -- expandShortestPathComponent
 // (expand.go) receives only (env, meter, part, step), several calls below
 // runQuery, so the meter (which already reaches every producer) carries
-// this instead of widening that call chain's signatures. runQuery sets
-// both fields exactly once, unconditionally, at the top of its own body;
-// every other caller that builds a workMeter directly (every test that
-// calls a component executor without going through runQuery, plus any
-// future one) leaves limitTargetSet at its zero value (false), which
-// every reader of these fields must treat identically to
-// pipeline.go's own limitTarget(q) returning -1: "no LIMIT pushdown here,
-// run the unlimited path". Do NOT repurpose limitTarget's zero value
-// (0) as that sentinel -- 0 is a legitimate target (a literal `LIMIT 0`),
-// so only limitTargetSet distinguishes "unset" from "eligible with target
-// zero".
+// this instead of widening that call chain's signatures. runQuery sets both
+// fields exactly once, near the top of its own body, but ONLY for a
+// single-Part query (see its own comment on that gate: a 2-Part query's
+// final LIMIT target counts WITH-stage output rows, an entirely different
+// quantity from how many rows Part[0]'s own shortestPath component needs to
+// produce, so threading it through for a 2-Part query would be wrong, not
+// merely unnecessary). Every other case -- a 2-Part query, and every test
+// that builds a workMeter directly without going through runQuery at all --
+// leaves limitTargetSet at its zero value (false), which every reader of
+// these fields must treat identically to pipeline.go's own limitTarget(q)
+// returning -1: "no LIMIT pushdown here, run the unlimited path". Do NOT
+// repurpose limitTarget's zero value (0) as that sentinel -- 0 is a value
+// the meter must still be able to represent faithfully (a literal
+// `LIMIT 0`, which is set, not absent), so only limitTargetSet distinguishes
+// "unset" from "set, whatever the target turns out to be". This does NOT
+// mean every reader treats limitTarget == 0 the same as a positive target,
+// though: traverse.Query.Limit's own contract is "0 => unbounded" (the
+// opposite of a cutoff), so expand.go's shortestPathLimit further excludes
+// limitTarget == 0 from ever narrowing its own cap, even when
+// limitTargetSet is true -- see that function's own doc comment.
 type workMeter struct {
 	budget         Budgets
 	work           int64

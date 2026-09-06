@@ -400,20 +400,7 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		if rowCap <= 0 {
 			return nil, ErrBudget
 		}
-		limit := int64(rowCap) + 1
-		// Push the user's own LIMIT into traverse's own enumeration cutoff
-		// instead of always shipping the full rowCap+1 -- safe exactly when
-		// there is nothing left for the post-executor Part.Where pass below
-		// to filter (noResidualWhere), since only then is every dense path
-		// traverse.AllShortestPaths returns guaranteed to survive unfiltered
-		// into the final result (see shortestPathBudget's own doc comment on
-		// why this differs from folding MaxRows in here directly). Never
-		// widens the cap past rowCap+1: a target the budget cannot afford
-		// still declines exactly as before.
-		if meter.limitTargetSet && meter.limitTarget >= 0 && meter.limitTarget < limit && noResidualWhere(part, step) {
-			limit = meter.limitTarget
-		}
-		q.Limit = int(limit)
+		q.Limit = int(shortestPathLimit(int64(rowCap)+1, meter, part, step))
 		q.MemoryLimit = memLimit
 	}
 
@@ -521,7 +508,7 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 // materialization invariant applies here exactly as it does to every other
 // evaluator error in this package.
 //
-// expandShortestPathComponent additionally narrows that same rowCap+1 down
+// shortestPathLimit (below) additionally narrows that same rowCap+1 down
 // to the query's own user-written LIMIT (when eligible -- see its own
 // noResidualWhere gate) precisely because doing so sidesteps the exact
 // pre/post-Where unit mismatch this comment just spent two paragraphs ruling
@@ -573,6 +560,48 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 	bytesPerPath := uint64(depth+1)*12 + 48
 
 	return rowCap, uint64(rowCap+1) * bytesPerPath, false
+}
+
+// shortestPathLimit resolves the traverse.Query.Limit value for one
+// shortestPath()/allShortestPaths() component: rowCapPlusOne
+// (shortestPathBudget's own pre-existing enumeration cutoff) narrowed down
+// to the query's own user-written LIMIT exactly when doing so is safe, and
+// left unchanged otherwise. Pulled out of expandShortestPathComponent as its
+// own function so each of the narrowing conditions below can be exercised
+// directly -- traverse.AllShortestPaths' own memory-budget backstop
+// (shortestPathBudget's memLimit doc) is calibrated off the query's
+// worst-case possible path depth, not the depth paths in a given graph
+// actually turn out to have, so it is frequently far looser than rowCap+1
+// and can silently absorb a mistake here behind an identical-looking
+// ErrBudget from a different cause, with no observable difference at that
+// level between "narrowed correctly" and "narrowed wrong".
+//
+// The narrowing fires only when: a target is actually threaded in
+// (limitTargetSet -- workMeter's own doc on why this, not limitTarget's
+// zero value, is what "eligible at all" means), that target is strictly
+// positive, it is smaller than rowCapPlusOne (never widen the cutoff -- a
+// target the budget cannot afford must still decline exactly as an
+// unlimited query would), and the component's Part carries no residual
+// WHERE this function cannot itself evaluate (noResidualWhere -- see
+// shortestPathBudget's own doc for why that gate is what makes this safe at
+// all, the same reason Budgets.MaxRows is never folded in here directly).
+//
+// limitTarget == 0 (a literal `LIMIT 0`) is deliberately excluded even
+// though workMeter's own convention treats it as a "set" target like any
+// other: traverse.Query.Limit's contract is "0 => unbounded" (traverse.go),
+// the OPPOSITE of what forwarding a literal zero would need to mean here.
+// The query's final answer comes out right either way -- the top-level
+// SKIP/LIMIT pass empties the whole result for a literal LIMIT 0 regardless
+// of how many rows this component itself produced -- but handing traverse
+// limit == 0 would silently trade the tightest cutoff available
+// (rowCapPlusOne) for no cutoff at all, enumerating up to whatever the much
+// looser memory backstop allows before erroring out, purely wasted work
+// this function exists to avoid paying.
+func shortestPathLimit(rowCapPlusOne int64, meter *workMeter, part *Part, step *Step) int64 {
+	if meter.limitTargetSet && meter.limitTarget > 0 && meter.limitTarget < rowCapPlusOne && noResidualWhere(part, step) {
+		return meter.limitTarget
+	}
+	return rowCapPlusOne
 }
 
 // strategyBudgetOverrides derives traverse.Query.SideBudget/PairBudget
@@ -757,9 +786,48 @@ func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint)
 	narrowing := len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || len(nc.Predicates) > 0
 	if !narrowing {
 		if len(nc.Kinds) == 0 {
-			// nc is non-nil but carries no constraint whatsoever -- Plan
-			// never actually produces this shape, but it means the same
-			// thing nc == nil does above, so it gets the same treatment.
+			// nc is non-nil but carries no constraint whatsoever: it means
+			// the same thing nc == nil does above, so it gets the same
+			// treatment. Plan genuinely produces this shape -- a bare
+			// shortestPath endpoint with no label at all, e.g.
+			// `shortestPath((s)-[:E*1..]->(t:Target)) WHERE s<>t`, gives s
+			// exactly this &NodeConstraint{} (every field nil/empty), not a
+			// nil *NodeConstraint -- so this is a real, reachable branch,
+			// not dead code.
+			//
+			// Two behavior consequences follow from treating it as
+			// unconstrained instead of materializing it (which is what this
+			// function is for -- see its own doc):
+			//
+			//  1. Before this function existed, resolveEndpointSet's
+			//     scanAnchorVisit fell through to its own default case for
+			//     this exact shape (no ids/objectid/kinds) -- a full
+			//     env.Snap.NodeCount() scan, admitting (and meter.spend-ing
+			//     2 units for) every node in the snapshot. Returning
+			//     Endpoint{} here instead means that pre-BFS charge drops to
+			//     zero, so shortestPathBudget's rowCap and
+			//     strategyBudgetOverrides' affordable are both computed
+			//     against a larger remaining work budget than they would
+			//     have been -- a real, intended effect of this fix (the
+			//     same wide-side-must-not-be-materialized goal this file's
+			//     package doc describes), not an oversight.
+			//
+			//  2. traverse.AllShortestPaths' strategyPairs dispatch case
+			//     requires BOTH sides to report !Unconstrained() (its own
+			//     switch, traverse.go). A bare endpoint that used to
+			//     materialize as "every node in the snapshot, as an
+			//     explicit IDs slice" satisfied that (a real, if maximal,
+			//     constrained set); as Endpoint{} it no longer does, so
+			//     strategyPairs is never reachable for a bare-endpoint
+			//     query. On a small enough graph (root count * terminal
+			//     count within PairBudget) that used to mean served by
+			//     strategyPairs; now, with default budgets, it declines
+			//     ErrTooLarge, mapped by this package to ErrBudget. That
+			//     decline is safe -- the caller falls back to querying
+			//     PostgreSQL directly -- but it is a genuine, user-visible
+			//     change in which small-graph bare-endpoint queries the
+			//     in-memory path engine itself can still serve, not
+			//     something this comment gets to assert away.
 			return traverse.Endpoint{}, nil
 		}
 		return traverse.Endpoint{Bits: kindsEndpointBitmap(env, nc.Kinds)}, nil

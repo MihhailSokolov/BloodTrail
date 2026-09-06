@@ -844,6 +844,215 @@ func TestExpandShortestPathLimitPushdownStillDeclinesWhenLimitExceedsBudget(t *t
 	}
 }
 
+// TestShortestPathLimit (I2, white-box): directly exercises
+// shortestPathLimit's four independent conditions -- this is the one place
+// the I2 fix's actual effect (which value shortestPathLimit itself returns)
+// is checked directly, deliberately bypassing traverse.AllShortestPaths.
+// That bypass matters: traverse's own memory-budget backstop is calibrated
+// off the query's worst-case possible path depth (shortestPathBudget's own
+// memLimit doc), not the depth paths in a given graph actually turn out to
+// have, so on every fixture this file's black-box shortestPath LIMIT tests
+// can build it is far looser than rowCapPlusOne and independently produces
+// the identical final ErrBudget a broken shortestPathLimit would also
+// produce -- confirmed by direct instrumentation while developing this fix:
+// reintroducing the I2 bug (accepting limitTarget == 0) against
+// TestShortestPathLimitZeroDoesNotDisableTraverseEnumerationCutoff's tight-
+// MaxWork/high-fan-out fixture makes traverse enumerate 31 real dense paths
+// via that looser memory backstop before erroring, instead of the 11 a
+// correctly-guarded rowCapPlusOne cutoff enumerates -- yet both surface as
+// the same ErrBudget to the caller, so no assertion on Execute's return
+// value alone can tell the bug apart from the fix on that fixture, or on
+// any fixture: shortestPathBudget's memLimit is *always* at least as loose
+// as rowCapPlusOne (it is derived from the same rowCap, scaled up by a
+// worst-case-depth/actual-depth ratio that is always >= 1), so the
+// len(dense) > rowCap decline below fires at-or-before whatever count the
+// memory backstop would have stopped at regardless of which value
+// shortestPathLimit returns. TestShortestPathLimitZeroDoesNotDisableTraverseEnumerationCutoff
+// (below) still pins the end-to-end behavior -- correct regardless of which
+// mechanism produces it -- but this test is what would actually have caught
+// the bug.
+func TestShortestPathLimit(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+	snap := buildExecSnapshot(t, kinds,
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindRoot}, nil},
+			{2, []snapshot.KindID{kindTarget}, nil},
+		},
+		[]execEdgeSpec{{100, 1, 2, kindE}},
+	)
+
+	noResidualPart, noResidualStep := shortestPathPartAndStep(t, snap,
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`)
+	residualPart, residualStep := shortestPathPartAndStep(t, snap,
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s.group = t.group AND s<>t RETURN p`)
+
+	tests := []struct {
+		name           string
+		limitTargetSet bool
+		limitTarget    int64
+		rowCapPlusOne  int64
+		part           *Part
+		step           *Step
+		want           int64
+	}{
+		{
+			name:          "no target threaded in: falls back to rowCapPlusOne",
+			rowCapPlusOne: 11,
+			part:          noResidualPart,
+			step:          noResidualStep,
+			want:          11,
+		},
+		{
+			// The I2 case: without the `limitTarget > 0` guard, this would
+			// wrongly return 0 -- which traverse.Query.Limit reads as
+			// "unbounded" (traverse.go), the opposite of a cutoff.
+			name:           "target zero (LIMIT 0): falls back to rowCapPlusOne, never 0",
+			limitTargetSet: true,
+			limitTarget:    0,
+			rowCapPlusOne:  11,
+			part:           noResidualPart,
+			step:           noResidualStep,
+			want:           11,
+		},
+		{
+			name:           "target positive and smaller than the cap: narrows to target",
+			limitTargetSet: true,
+			limitTarget:    3,
+			rowCapPlusOne:  11,
+			part:           noResidualPart,
+			step:           noResidualStep,
+			want:           3,
+		},
+		{
+			name:           "target at least as large as the cap: never widens",
+			limitTargetSet: true,
+			limitTarget:    11,
+			rowCapPlusOne:  11,
+			part:           noResidualPart,
+			step:           noResidualStep,
+			want:           11,
+		},
+		{
+			name:           "residual WHERE present: never narrows even for an otherwise-eligible target",
+			limitTargetSet: true,
+			limitTarget:    3,
+			rowCapPlusOne:  11,
+			part:           residualPart,
+			step:           residualStep,
+			want:           11,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meter := &workMeter{limitTargetSet: tt.limitTargetSet, limitTarget: tt.limitTarget}
+			got := shortestPathLimit(tt.rowCapPlusOne, meter, tt.part, tt.step)
+			if got != tt.want {
+				t.Fatalf("shortestPathLimit() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// shortestPathPartAndStep plans query against snap and returns its single
+// shortestPath component's Part and Step, for tests that call
+// shortestPathLimit/noResidualWhere directly rather than through the full
+// runQuery/Execute pipeline (mirrors the groupComponents/Chains lookup
+// TestExpandShortestPathBudgetDeclinesOnHighFanOut already uses inline).
+func shortestPathPartAndStep(t *testing.T, snap *snapshot.Snapshot, query string) (*Part, *Step) {
+	t.Helper()
+	q := planQuery(t, snap, query)
+	part := &q.Parts[0]
+	comps := groupComponents(part)
+	if len(comps) != 1 || len(comps[0].stepIdxs) != 1 {
+		t.Fatalf("unexpected component shape for query %q: %+v", query, comps)
+	}
+	return part, &part.Chains[comps[0].stepIdxs[0]]
+}
+
+// TestShortestPathLimitZeroDoesNotDisableTraverseEnumerationCutoff (I2):
+// end-to-end pin of LIMIT 0's observable behavior through the full
+// Execute pipeline. traverse.Query.Limit's own contract is "0 => unbounded"
+// (traverse.go), the OPPOSITE of what a literal `LIMIT 0` should ever
+// cause, so this must be guarded off (shortestPathLimit, tested directly
+// above) and fall back to shortestPathBudget's own pre-existing rowCap+1
+// cutoff instead. As TestShortestPathLimit's own doc explains, this
+// end-to-end test cannot by itself distinguish the guarded fix from the I2
+// bug -- traverse's own memory-budget backstop happens to produce the same
+// final ErrBudget either way on any fixture reachable from here -- but it
+// still pins that the observable behavior is correct, and would catch a
+// wrong *alternative* fix (e.g. special-casing LIMIT 0 to skip the
+// component and return an empty success unconditionally, bypassing the
+// budget check entirely).
+//
+// Two fixtures pin both directions:
+//   - A budget that comfortably affords the whole (small) result: LIMIT 0
+//     must still SERVE (not decline) with exactly 0 rows -- ordinary SQL
+//     LIMIT 0 semantics, unaffected by which internal cap traverse used.
+//   - The high-fan-out fixture under the same tight MaxWork that makes the
+//     unlimited query decline (TestExpandShortestPathBudgetDeclinesOnHighFanOut):
+//     LIMIT 0 must ALSO decline ErrBudget, proving the enumeration cutoff
+//     still applies -- not a hang (traverse never learns to stop early) and
+//     not an empty success (silently reporting "0 rows, no error" for a
+//     query the budget genuinely cannot afford would hide a real
+//     over-budget condition behind LIMIT 0's own "0 rows" shape).
+func TestShortestPathLimitZeroDoesNotDisableTraverseEnumerationCutoff(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+
+	t.Run("affordable budget serves zero rows, not an error", func(t *testing.T) {
+		snap := buildExecSnapshot(t, kinds,
+			[]execNodeSpec{
+				{1, []snapshot.KindID{kindRoot}, nil},
+				{2, []snapshot.KindID{kindTarget}, nil},
+			},
+			[]execEdgeSpec{{100, 1, 2, kindE}},
+		)
+		rs := mustExec(t, snap,
+			`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p LIMIT 0`,
+			generousBudget)
+		if len(rs.Rows) != 0 {
+			t.Fatalf("got %d rows, want 0 (LIMIT 0)", len(rs.Rows))
+		}
+	})
+
+	t.Run("tight budget on high fan-out still declines ErrBudget", func(t *testing.T) {
+		nodes := []execNodeSpec{
+			{1, []snapshot.KindID{kindRoot}, nil},
+			{2, []snapshot.KindID{kindTarget}, nil},
+		}
+		var edges []execEdgeSpec
+		nextEdgeID := uint64(1)
+		const fanOut = 200
+		for i := uint64(0); i < fanOut; i++ {
+			mid := 100 + i
+			nodes = append(nodes, execNodeSpec{mid, nil, nil})
+			edges = append(edges,
+				execEdgeSpec{nextEdgeID, 1, mid, kindE},
+				execEdgeSpec{nextEdgeID + 1, mid, 2, kindE},
+			)
+			nextEdgeID += 2
+		}
+		snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+		err := execExpectErr(t, snap,
+			`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p LIMIT 0`,
+			Budgets{MaxRows: 1_000_000, MaxWork: 10})
+		if !errors.Is(err, ErrBudget) {
+			t.Fatalf("error = %v, want ErrBudget (LIMIT 0 must not disable the budget's own enumeration cutoff)", err)
+		}
+	})
+}
+
 // --- shortestPath / allShortestPaths budget wiring --------------------------
 
 // TestExpandShortestPathBudget exercises shortestPathBudget's arithmetic

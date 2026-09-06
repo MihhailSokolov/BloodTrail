@@ -138,13 +138,34 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	// meter.work alike -- is unchanged by this feature.
 	target := limitTarget(q)
 
-	// Threaded onto meter (unconditionally, every call) so a component
-	// executor several calls below this one -- expand.go's
-	// expandShortestPathComponent, which has no direct access to q itself
-	// -- can also push this same target into its own traverse.Query.Limit.
-	// See workMeter's own doc comment for why limitTargetSet, not a -1
-	// sentinel on limitTarget alone, is what every reader must check.
-	meter.limitTarget, meter.limitTargetSet = target, target >= 0
+	// Threaded onto meter -- but ONLY for a single-Part query -- so a
+	// component executor several calls below this one -- expand.go's
+	// expandShortestPathComponent, which has no direct access to q itself --
+	// can also push this same target into its own traverse.Query.Limit. See
+	// workMeter's own doc comment for why limitTargetSet, not a -1 sentinel
+	// on limitTarget alone, is what every reader must check.
+	//
+	// The len(q.Parts) == 1 gate matters even though target itself is the
+	// WHOLE QUERY's own final LIMIT, computed identically either way: for a
+	// 2-Part (WITH) query, that final target counts rows out of the WITH
+	// stage's OWN output (post-GROUP-BY, post-Part[1]), a completely
+	// different quantity from how many rows Part[0]'s own pattern match --
+	// including any shortestPath component living in it -- needs to
+	// produce. Threading it through unconditionally let a shortestPath
+	// component in Part[0] cap its own enumeration to the final RETURN's
+	// LIMIT, which can silently undercount a WITH-stage aggregate (e.g.
+	// `WITH t, COUNT(s) AS n RETURN n LIMIT 1` truncating Part[0] to 1 row
+	// before COUNT ever sees the rest) or under-serve Part[1] entirely (a
+	// later MATCH joining against a value only some of Part[0]'s
+	// wrongly-dropped rows carried). This mirrors Task 2's own chunked
+	// driver just below, which already declines the analogous mistake for
+	// Part[0]'s ordinary pattern match by restricting itself to
+	// len(q.Parts) == 1 (matchPartLimited is never called otherwise) --
+	// this gate closes the same gap for the meter-threaded path
+	// expandShortestPathComponent reads instead of a direct parameter.
+	if len(q.Parts) == 1 {
+		meter.limitTarget, meter.limitTargetSet = target, target >= 0
+	}
 
 	part0 := &q.Parts[0]
 	var rows []*Row

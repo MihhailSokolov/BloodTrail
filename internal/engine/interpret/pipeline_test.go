@@ -927,3 +927,97 @@ func TestLimitEarlyTerminationVarLength(t *testing.T) {
 		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d", limited.work, baseline.work)
 	}
 }
+
+// --- shortestPath LIMIT pushdown scoped to single-part queries (C1) --------
+
+// TestShortestPathLimitPushdownNotAppliedAcrossWithBoundary_Count: the final
+// RETURN's own LIMIT must never be pushed into a shortestPath component that
+// lives in Part[0] of a two-Part (WITH) query. Part[0]'s own row count and
+// the whole query's final row count are different quantities once a WITH
+// stage groups/aggregates between them, so capping Part[0]'s enumeration to
+// the FINAL limit is a correctness bug, not just a missed optimization.
+//
+// Fixture: 5 Root nodes, each one hop from a single shared Target node --
+// shortestPath(s,t) produces one dense (s,t) pair per Root, five total.
+// `WITH t, COUNT(s) AS n RETURN n LIMIT 1` groups all five pairs into one
+// row (n=5): the final LIMIT 1 caps the WITH-stage's own OUTPUT (one group)
+// to one row, not the number of (s,t) pairs Part[0]'s shortestPath produces
+// on the way there. runQuery threads the final LIMIT's target (here, 1)
+// onto the meter unconditionally, and expandShortestPathComponent's own
+// pushdown reads it regardless of which Part it is serving -- for a 2-Part
+// query that caps Part[0]'s traverse.Query.Limit to 1 too, so only ONE of
+// the five (s,t) pairs is ever produced and n comes out 1, a row PostgreSQL
+// could never have returned (a raw COUNT can never come out lower than the
+// number of things being counted).
+func TestShortestPathLimitPushdownNotAppliedAcrossWithBoundary_Count(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+	var nodes []execNodeSpec
+	var edges []execEdgeSpec
+	for i := uint64(1); i <= 5; i++ {
+		nodes = append(nodes, execNodeSpec{i, []snapshot.KindID{kindRoot}, nil})
+		edges = append(edges, execEdgeSpec{i, i, 10, kindE})
+	}
+	nodes = append(nodes, execNodeSpec{10, []snapshot.KindID{kindTarget}, nil})
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	rs := mustExec(t, snap,
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WITH t, COUNT(s) AS n RETURN n LIMIT 1`,
+		generousBudget)
+
+	if len(rs.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1 (LIMIT 1 applies to the WITH-stage's own single group)", len(rs.Rows))
+	}
+	got := rs.Rows[0][0]
+	if got.Kind != OutScalar || got.Scalar != float64(5) {
+		t.Fatalf("n = %+v, want OutScalar(5) -- all 5 Root->Target pairs counted, not truncated by the final LIMIT", got)
+	}
+}
+
+// TestShortestPathLimitPushdownNotAppliedAcrossWithBoundary_UnderServe: same
+// bug as the COUNT case above, but observed as silently missing rows instead
+// of a too-small aggregate. Fixture: 5 Root nodes (s1..s5) each one hop from
+// a shared Target; three of the five (s3, s4, s5 -- the highest dense ids,
+// so enumerated LAST by traverse's ascending-dense-id order) have a matching
+// :Other node by name, the other two (s1, s2) do not. `WITH s MATCH
+// (u:Other) WHERE u.name = s.name RETURN u LIMIT 3` carries every s forward,
+// joins each against Other by name, and its own LIMIT 3 happens to be large
+// enough to admit every genuine match (there are exactly 3): the correct
+// result is 3 rows. Before the C1 fix, the final LIMIT 3 leaks into Part[0]'s
+// shortestPath pushdown and caps traverse's enumeration to the first 3
+// dense-ascending (s,t) pairs (s1, s2, s3) -- discarding s4 and s5 before
+// Part[1] ever runs -- so only s3's match survives the join and the query
+// under-serves.
+func TestShortestPathLimitPushdownNotAppliedAcrossWithBoundary_UnderServe(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindOther  snapshot.KindID = 3
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindOther: "Other", kindE: "E"}
+	var nodes []execNodeSpec
+	var edges []execEdgeSpec
+	for i := uint64(1); i <= 5; i++ {
+		nodes = append(nodes, execNodeSpec{i, []snapshot.KindID{kindRoot}, map[string]any{"name": fmt.Sprintf("s%d", i)}})
+		edges = append(edges, execEdgeSpec{i, i, 10, kindE})
+	}
+	nodes = append(nodes, execNodeSpec{10, []snapshot.KindID{kindTarget}, nil})
+	// Other nodes matching s3, s4, s5 by name; s1/s2 have no match.
+	for _, i := range []uint64{3, 4, 5} {
+		nodes = append(nodes, execNodeSpec{200 + i, []snapshot.KindID{kindOther}, map[string]any{"name": fmt.Sprintf("s%d", i)}})
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	rs := mustExec(t, snap,
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WITH s MATCH (u:Other) WHERE u.name = s.name RETURN u LIMIT 3`,
+		generousBudget)
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (s3/s4/s5's matches, not truncated to s1/s2/s3 by the leaked final LIMIT)", len(rs.Rows))
+	}
+}
