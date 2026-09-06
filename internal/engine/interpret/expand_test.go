@@ -591,14 +591,19 @@ func TestExpandShortestPathSelfEndpointWithInequalityDropsSelfPairs(t *testing.T
 
 // --- shortestPath / allShortestPaths budget wiring --------------------------
 
-// TestExpandShortestPathBudget exercises shortestPathBudget's arithmetic directly:
-// the tighter of MaxRows' and MaxWork's *remaining* capacity wins, "no
-// budget set at all" reports unbounded (traverse.Query.Limit/MemoryLimit
-// left at their own zero/"unbounded" value), and a budget already exhausted
-// (remaining < 0) clamps to zero rather than going negative -- a negative
-// rowCap would make expandShortestPathComponent's own `rowCap+1` overflow
-// back toward a nonsensical (or even negative) traverse.Query.Limit instead
-// of declining outright.
+// TestExpandShortestPathBudget exercises shortestPathBudget's arithmetic
+// directly: the component cap is derived *purely* from Budgets.MaxWork's
+// remaining capacity -- Budgets.MaxRows never contributes, since MaxRows
+// counts rows admitted after Part.Where filtering (workMeter.addFinalRow)
+// everywhere else in this package, while this component's own dense output
+// is still pre-filter (see shortestPathBudget's doc comment). "No MaxWork
+// budget set at all" reports unbounded regardless of MaxRows
+// (traverse.Query.Limit/MemoryLimit left at their own zero/"unbounded"
+// value), and a MaxWork budget already exhausted (remaining < 0) clamps to
+// zero rather than going negative -- a negative rowCap would make
+// expandShortestPathComponent's own `rowCap+1` overflow back toward a
+// nonsensical (or even negative) traverse.Query.Limit instead of declining
+// outright.
 func TestExpandShortestPathBudget(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -614,11 +619,10 @@ func TestExpandShortestPathBudget(t *testing.T) {
 			wantBound: false,
 		},
 		{
-			name:       "MaxRows only",
-			budget:     Budgets{MaxRows: 20},
-			finalRows:  5,
-			wantBound:  true,
-			wantRowCap: 15,
+			name:      "MaxRows alone bounds nothing: no MaxWork means unbounded regardless of MaxRows/finalRows",
+			budget:    Budgets{MaxRows: 20},
+			finalRows: 5,
+			wantBound: false,
 		},
 		{
 			name:       "MaxWork only",
@@ -628,29 +632,16 @@ func TestExpandShortestPathBudget(t *testing.T) {
 			wantRowCap: 70,
 		},
 		{
-			name:       "both set, MaxWork is the tighter remaining budget",
-			budget:     Budgets{MaxRows: 1000, MaxWork: 50},
+			name:       "MaxRows set alongside MaxWork has no effect on rowCap -- only MaxWork's remaining capacity does",
+			budget:     Budgets{MaxRows: 5, MaxWork: 1000},
 			work:       10,
 			wantBound:  true,
-			wantRowCap: 40,
-		},
-		{
-			name:       "both set, MaxRows is the tighter remaining budget",
-			budget:     Budgets{MaxRows: 5, MaxWork: 1000},
-			wantBound:  true,
-			wantRowCap: 5,
+			wantRowCap: 990,
 		},
 		{
 			name:       "MaxWork already exhausted clamps to zero, not negative",
 			budget:     Budgets{MaxWork: 10},
 			work:       25,
-			wantBound:  true,
-			wantRowCap: 0,
-		},
-		{
-			name:       "MaxRows already exhausted clamps to zero, not negative",
-			budget:     Budgets{MaxRows: 10},
-			finalRows:  25,
 			wantBound:  true,
 			wantRowCap: 0,
 		},
@@ -739,6 +730,67 @@ func TestExpandShortestPathBudgetDeclinesOnHighFanOut(t *testing.T) {
 	}
 	if meter.work >= fanOut {
 		t.Fatalf("meter.work = %d after declining, want it to stay far below the %d-path fan-out (traverse materialized too much before declining)", meter.work, fanOut)
+	}
+}
+
+// TestExpandShortestPathResidualWhereConjunctDoesNotSpuriouslyDeclineOnMaxRows:
+// shortestPathBudget's component-level cap must be derived purely from the
+// remaining Budgets.MaxWork, never from Budgets.MaxRows. MaxRows counts rows
+// admitted *after* Part.Where filtering everywhere else in this package
+// (workMeter.addFinalRow), but the dense []Row this component produces is
+// still pre-filter -- a shortestPath query carrying a residual cross-symbol
+// WHERE conjunct that Plan cannot push into either endpoint's
+// NodeConstraint.Predicates (`s.group = t.group`, referencing both pattern
+// variables) can have a raw path count comfortably above MaxRows while its
+// *filtered* result still fits well under it. This must SERVE, not decline.
+//
+// Fixture: one Root (s, group "A") reaches five Target nodes by a single
+// edge each; two of the five targets share s's group, three do not. Raw
+// dense component output is 5 rows (one shortest path per reachable
+// (s, target) pair); `WHERE s.group = t.group` filters that down to 2.
+// MaxRows is set to 3 -- below the raw 5, above the filtered 2 -- so the
+// pre-fix component cap (derived from MaxRows' remaining capacity) would
+// decline this whole query with ErrBudget even though the real, filtered
+// result fits comfortably; this test pins that it now serves the correct 2
+// rows instead.
+func TestExpandShortestPathResidualWhereConjunctDoesNotSpuriouslyDeclineOnMaxRows(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindRoot}, props: map[string]any{"group": "A"}},
+			{id: 2, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"group": "A"}}, // matches
+			{id: 3, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"group": "A"}}, // matches
+			{id: 4, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"group": "B"}},
+			{id: 5, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"group": "B"}},
+			{id: 6, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"group": "B"}},
+		},
+		[]execEdgeSpec{
+			{id: 100, start: 1, end: 2, kind: kindE},
+			{id: 101, start: 1, end: 3, kind: kindE},
+			{id: 102, start: 1, end: 4, kind: kindE},
+			{id: 103, start: 1, end: 5, kind: kindE},
+			{id: 104, start: 1, end: 6, kind: kindE},
+		},
+	)
+
+	rs := mustExec(t, snap,
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s.group = t.group RETURN p`,
+		Budgets{MaxRows: 3, MaxWork: 10_000_000})
+	got := pathSigsAtColumn(t, snap, rs, 0)
+	want := []string{"N:1,2,|E:100,", "N:1,3,|E:101,"}
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("got %d paths, want %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("path set mismatch\ngot:  %v\nwant: %v", got, want)
+		}
 	}
 }
 

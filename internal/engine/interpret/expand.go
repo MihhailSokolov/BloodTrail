@@ -371,25 +371,47 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 // how many *pairs*/BFS runs a strategy will attempt, not the total path
 // count summed across all of them.
 //
-// rowCap is the exact number of additional rows the executor's own
-// remaining budget could still admit: MaxRows' remaining row count and
-// MaxWork's remaining work-unit count are both directly row-count-shaped
-// here (this function's own per-row loop spends exactly one of each per
-// converted path), so the tighter of the two wins. Query.Limit is then set
-// to rowCap+1, one more than the executor could actually use -- enough for
-// traverse to stop enumerating (and accumulating memory) the moment it is
-// clear the true result cannot fit the budget, while still letting the
-// caller distinguish "the whole result fits" (len(dense) <= rowCap) from
-// "it doesn't" (len(dense) == rowCap+1) without ever silently truncating a
-// fitting result down to the budget or admitting a non-fitting one --
-// Query's own documented all-or-nothing materialization invariant applies
-// here exactly as it does to every other evaluator error in this package.
+// rowCap is derived *only* from Budgets.MaxWork's remaining capacity, never
+// from Budgets.MaxRows. dense (this function's return value bounds the size
+// of, and the slice expandShortestPathComponent's caller loops over) is this
+// component's raw, PRE-Part.Where output -- but Budgets.MaxRows counts
+// rows admitted after Where filtering everywhere else in this package
+// (workMeter.addFinalRow is only ever called on a row that has already
+// survived Part.Where). Folding MaxRows' remaining count into this
+// component's own cap would compare a post-filter unit against a pre-filter
+// quantity: a shortestPath query carrying a residual cross-symbol WHERE
+// conjunct that Plan cannot push into either endpoint's own
+// NodeConstraint.Predicates (e.g. `s.prop = t.prop`, which touches both
+// pattern variables and so can never be a single-symbol predicate) can
+// produce a raw dense count well above MaxRows while its filtered result
+// still fits comfortably under it -- mixing MaxRows in here would spuriously
+// decline that query with ErrBudget (a safe but wasteful delegate) even
+// though nothing downstream would ever actually overflow the row budget.
+// MaxWork has no such mismatch: Budgets' own doc comment (exec.go) pins work
+// as charged uniformly, "+1 per row produced anywhere" -- including this
+// function's own per-row meter.spend call below -- so MaxWork's remaining
+// capacity is a unit-correct bound on raw component rows regardless of how
+// many of them Part.Where later discards. MaxRows enforcement stays exactly
+// where it already lives: workMeter.addFinalRow, once a row has actually
+// survived Where.
 //
-// unbounded is true (rowCap and memLimit meaningless) when neither Budgets
-// dimension is set at all, matching traverse.Query.Limit/MemoryLimit's own
-// "0 => unbounded" contract -- expandShortestPathComponent leaves both
-// fields at their zero value in that case, preserving today's behavior for
-// every caller that runs with no budget.
+// Query.Limit is then set to rowCap+1, one more than the executor could
+// actually use -- enough for traverse to stop enumerating (and accumulating
+// memory) the moment it is clear the true result cannot fit the remaining
+// work budget, while still letting the caller distinguish "the whole result
+// fits" (len(dense) <= rowCap) from "it doesn't" (len(dense) == rowCap+1)
+// without ever silently truncating a fitting result down to the budget or
+// admitting a non-fitting one -- Query's own documented all-or-nothing
+// materialization invariant applies here exactly as it does to every other
+// evaluator error in this package.
+//
+// unbounded is true (rowCap and memLimit meaningless) when Budgets.MaxWork
+// itself is unset, matching traverse.Query.Limit/MemoryLimit's own "0 =>
+// unbounded" contract -- expandShortestPathComponent leaves both fields at
+// their zero value in that case, preserving today's behavior for every
+// caller that runs with no work budget, regardless of whether MaxRows is
+// set (MaxRows alone bounds nothing about this component's own raw output,
+// only what Execute admits afterward).
 //
 // memLimit derives from the same rowCap via the exact per-path byte formula
 // traverse's own memBudget already applies internally (bfs.go's
@@ -399,26 +421,14 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 // against a small number of very deep paths exhausting memory even in a
 // query whose path *count* alone would fit under Limit.
 func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit uint64, unbounded bool) {
-	unbounded = true
-	if meter.budget.MaxRows > 0 {
-		remaining := meter.budget.MaxRows - meter.finalRows
-		if remaining < 0 {
-			remaining = 0
-		}
-		rowCap, unbounded = remaining, false
-	}
-	if meter.budget.MaxWork > 0 {
-		remaining := meter.budget.MaxWork - meter.work
-		if remaining < 0 {
-			remaining = 0
-		}
-		if unbounded || remaining < int64(rowCap) {
-			rowCap, unbounded = int(remaining), false
-		}
-	}
-	if unbounded {
+	if meter.budget.MaxWork <= 0 {
 		return 0, 0, true
 	}
+	remaining := meter.budget.MaxWork - meter.work
+	if remaining < 0 {
+		remaining = 0
+	}
+	rowCap = int(remaining)
 
 	depth := maxDepth
 	if depth <= 0 {
