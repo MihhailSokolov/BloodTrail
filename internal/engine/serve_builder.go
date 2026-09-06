@@ -100,14 +100,16 @@ func (e *Engine) declineOp(ctx context.Context, op, reason string, err error) {
 }
 
 // servedOp logs one Debug "bloodtrail: builder engine served" event -- the
-// builder-serving path's counterpart to TryAllShortestPaths/TryCypher's Info
+// builder-serving path's counterpart to TryAllShortestPaths' Info
 // "bloodtrail: path engine served" line, deliberately one level quieter
 // (Debug, not Info): a structural node/relationship count or id/kind
 // listing query is expected to run far more often than a shortest-path
 // query, so logging every one at Info would be excessive volume for a
-// comparatively low-value event. extra carries whatever per-op attrs the
-// caller wants beyond op and duration (e.g. the resulting count), which
-// every call logs.
+// comparatively low-value event. TryCypher's own served line
+// (cypherServedLogMessage, engine.go) is Debug for the identical reason,
+// not Info -- the two Debug-level lines are peers, not one mirroring the
+// other's level. extra carries whatever per-op attrs the caller wants
+// beyond op and duration (e.g. the resulting count), which every call logs.
 func (e *Engine) servedOp(ctx context.Context, op string, start time.Time, extra ...any) {
 	attrs := append([]any{slog.String("op", op), slog.Duration("duration", time.Since(start))}, extra...)
 	e.cfg.Log.DebugContext(ctx, "bloodtrail: builder engine served", attrs...)

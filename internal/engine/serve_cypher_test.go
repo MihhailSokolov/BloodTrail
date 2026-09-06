@@ -4,6 +4,7 @@ package engine
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -528,4 +529,70 @@ func TestCypherRowsResultErrorAndClose(t *testing.T) {
 		t.Fatalf("Error() = %v, want nil", err)
 	}
 	result.Close() // must not panic
+}
+
+// --- I2: panic backstops ----------------------------------------------------
+
+// TestSafeExecuteCypherRecoversPanic is the final review's I2 regression for
+// the execution side: safeExecuteCypher must convert a panic anywhere
+// inside interpret.Execute into an ordinary error (wrapping errCypherPanic,
+// which cypherExecReason then maps to reasonPanic) rather than letting it
+// propagate to its own caller -- TryCypher, and beyond it, whatever
+// goroutine is holding TryCypher's own caller. Since it is not otherwise
+// known how to reliably provoke a genuine panic from outside the interpret
+// package, this substitutes executeCypher (the package-level indirection
+// safeExecuteCypher calls through for exactly this purpose) with a function
+// that panics deliberately.
+func TestSafeExecuteCypherRecoversPanic(t *testing.T) {
+	orig := executeCypher
+	t.Cleanup(func() { executeCypher = orig })
+	executeCypher = func(*interpret.Env, *interpret.Query, interpret.Budgets) (*interpret.ResultSet, error) {
+		panic("injected panic for I2 regression test")
+	}
+
+	rs, err := safeExecuteCypher(&interpret.Env{}, &interpret.Query{}, interpret.Budgets{})
+	if rs != nil {
+		t.Fatalf("safeExecuteCypher: rs = %v, want nil", rs)
+	}
+	if !errors.Is(err, errCypherPanic) {
+		t.Fatalf("safeExecuteCypher: err = %v, want errCypherPanic", err)
+	}
+	if got := cypherExecReason(err); got != reasonPanic {
+		t.Fatalf("cypherExecReason(err) = %q, want %q", got, reasonPanic)
+	}
+}
+
+// TestBuildCypherRowsResultRecoversPanic is I2's regression for the
+// materialization side: buildCypherRowsResult must recover a panic during
+// newCypherRowsResult's eager row materialization and report ok == false,
+// rather than letting it escape to TryCypher's own caller. Unlike the
+// execution-side test above, this reaches a REAL panic via a crafted
+// poison value: an OutNode column whose NodeID is out of range for the
+// snapshot it is materialized against, which materializeNode's own
+// snap.KindOffsets[n] indexing panics on (index out of range) -- exactly
+// the kind of bug this backstop exists to guard against, not merely a
+// synthetic stand-in for one. interpret.Execute itself is expected to
+// never actually produce such a row, but this backstop's whole point is to
+// stay safe even if it someday did.
+func TestBuildCypherRowsResultRecoversPanic(t *testing.T) {
+	snap := buildCypherTestSnapshot(t,
+		map[snapshot.KindID]string{1: "User"},
+		[]cypherTestNode{{id: 1, kinds: []snapshot.KindID{1}, props: nil}},
+		nil,
+	)
+
+	rs := &interpret.ResultSet{
+		Keys: []string{"n"},
+		Rows: [][]interpret.OutVal{
+			{{Kind: interpret.OutNode, Node: 9999}}, // out of range: snap has one node
+		},
+	}
+
+	result, ok := buildCypherRowsResult(snap, rs, []valueKind{valueDefault}, nil)
+	if ok {
+		t.Fatalf("buildCypherRowsResult: ok = true, want false (poison NodeID should panic and be recovered)")
+	}
+	if result != nil {
+		t.Fatalf("buildCypherRowsResult: result = %v, want nil", result)
+	}
 }

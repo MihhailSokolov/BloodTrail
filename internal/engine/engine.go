@@ -123,19 +123,25 @@ type Engine struct {
 	mapKindNames func(ids []snapshot.KindID) (graph.Kinds, error)
 
 	// cypherHydrationRaceHook, when non-nil, runs synchronously inside
-	// TryCypher immediately after collectEdgeIDs has determined that
-	// hydration is actually needed, and immediately before the
-	// hydrateEdgePropsByID call that performs it. Production code never sets
-	// this field -- the zero value is a complete no-op, so every real caller
-	// pays nothing for its existence.
+	// TryCypher immediately after collectEdgeIDs has determined whether
+	// hydration is needed at all -- either immediately before the
+	// hydrateEdgePropsByID call that performs it (when it is), or, when the
+	// result carries no edge/path column at all (nothing to hydrate), at the
+	// equivalent point on that pure-snapshot path instead, immediately
+	// before step 11's own unconditional recheck. Either way, it always
+	// fires exactly once per TryCypher call, at whichever point is that
+	// call's own last chance to force a race before its final freshness
+	// check. Production code never sets this field -- the zero value is a
+	// complete no-op, so every real caller pays nothing for its existence.
 	//
 	// It exists purely as an integration-test seam (see the root package's
-	// staleness_integration_test.go, TestCypherHydrationRecheck), installed
-	// via SetCypherHydrationRaceHookForTest, for forcing a write to land
-	// deterministically in the exact window step 10's snapshotStillCurrent
+	// staleness_integration_test.go, TestCypherHydrationRecheck and
+	// TestCypherStaleRecheckNoHydration), installed via
+	// SetCypherHydrationRaceHookForTest, for forcing a write to land
+	// deterministically in the exact window step 10/11's snapshotStillCurrent
 	// recheck (TryCypher's own doc) exists to catch: a single TryCypher call
 	// is one synchronous function with no other externally observable point
-	// between Execute completing and hydration starting for a caller outside
+	// between Execute completing and the final recheck for a caller outside
 	// this package to intervene at, short of a timing-dependent goroutine
 	// race against a real concurrent write. The hook body is free to call
 	// NoteWrite directly (the minimal way to reproduce a write's effect on
@@ -389,6 +395,18 @@ const (
 	// depends on PostgreSQL's own collation (string ordering), which this
 	// interpreter never attempts to reproduce locally.
 	reasonCollation = "collation"
+	// reasonPanic is TryCypher-only: safeExecuteCypher or
+	// buildCypherRowsResult (serve_cypher.go) recovered a panic that
+	// occurred while executing the query or materializing its result --
+	// the final review's I2 fail-safe backstop. This is deliberately never
+	// expected to fire in practice (every panic this recovers from would
+	// itself be a bug elsewhere in the interpreter/materialization layer),
+	// but its existence is what makes "a panic reaching TryCypher's caller
+	// after TryCypher has already returned true" impossible regardless of
+	// what future such bug might otherwise cause one -- an unrecoverable
+	// false serve, unlike every other decline reason here, which merely
+	// falls back to PostgreSQL.
+	reasonPanic = "panic"
 )
 
 // TryAllShortestPaths attempts to serve pq entirely from the engine's
@@ -417,13 +435,17 @@ func (e *Engine) TryAllShortestPaths(ctx context.Context, tx graph.Transaction, 
 	return hydrated, true
 }
 
-// cypherServedLogMessage is the exact Debug-level message TryCypher logs
-// whenever it serves a query entirely from the interpreter/snapshot, so an
-// e2e/observability test can grep for it (mirroring servePathQuery's own
-// "bloodtrail: path engine served" convention, but under its own distinct
-// marker: unlike that pipeline, TryCypher no longer routes through
-// servePathQuery at all, so the two entry points' served events need their
-// own separate markers to stay distinguishable in the log).
+// cypherServedLogMessage is the exact message TryCypher logs, at Debug --
+// the spec'd level for cypher serving, one level quieter than
+// servePathQuery's own Info "bloodtrail: path engine served" line (a cypher
+// query is expected to run far more often than a shortest-path one, the
+// same volume argument serve_builder.go's own Debug-level served line makes)
+// -- whenever it serves a query entirely from the interpreter/snapshot, so
+// an e2e/observability test can grep for it. It gets its own distinct
+// marker text rather than reusing servePathQuery's: unlike that pipeline,
+// TryCypher no longer routes through servePathQuery at all, so the two
+// entry points' served events need to stay independently distinguishable
+// in the log regardless of level.
 const cypherServedLogMessage = "bloodtrail: cypher engine served"
 
 // TryCypher attempts to serve text (a Cypher query string, as sent to
@@ -456,16 +478,22 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //  1. cfg.Enabled -- decline reasonDisabled, matching servePathQuery's own
 //     identical first check: an operator disabling the engine must disable
 //     every serving path, cypher included, not just TryAllShortestPaths.
+//
 //  2. len(params) > 0 -- decline reasonParams.
+//
 //  3. text fails to parse (frontend.ParseCypher, the same zero-filter
 //     *frontend.Context and dawgs Cypher frontend the real pg-backed
 //     driver's own compileText uses) -- decline reasonUnsupported, logging
 //     only the reason, never the parse error's own content (see
 //     reasonUnsupported's doc).
+//
 //  4. no snapshot has ever been adopted (e.Fresh() returns a nil snapshot)
 //     -- decline reasonNoSnapshot.
+//
 //  5. interpret.Plan(rq, snap) not ok -- decline reasonUnsupported.
+//
 //  6. snap.MultiGraph -- decline reasonMultiGraph.
+//
 //  7. translateGateOK(ctx, cypher.Copy(rq), snap) false -- decline
 //     reasonTranslateGate. A *copy* of rq is handed to the gate, never rq
 //     itself: dawgs' own translator's optimizer can mutate the AST it is
@@ -474,30 +502,58 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //     rq's own WHERE expression nodes for interpret.Execute to evaluate at
 //     step 8 -- handing the gate rq itself could silently corrupt those
 //     nodes out from under Execute before it ever runs. See
-//     TestTryCypherGateCannotCorruptServedResult for the regression test
-//     proving this can never leak into a served result.
+//     TestTranslateGateOKCopyLeavesOriginalASTUntouched and
+//     TestQueryIRIndependentOfASTCopyMutation (gate_test.go) for the
+//     regression tests proving this can never leak into a served result.
+//
 //  8. the snapshot captured at step 4 is no longer fresh (a write landed
 //     while steps 5-7 ran) -- decline reasonStale. Deliberately checked
 //     here, after the gate rather than immediately after step 4, per the
 //     milestone's pinned pipeline order: whether to even attempt planning
 //     and gating a query does not depend on freshness, only whether to
 //     actually execute it against snap does.
-//  9. interpret.Execute -- its sentinel errors map to specific reasons (see
-//     cypherExecReason); any other error declines reasonError.
+//
+//  9. interpret.Execute, run via safeExecuteCypher (serve_cypher.go) rather
+//     than called directly -- its sentinel errors map to specific reasons
+//     (see cypherExecReason), any other error declines reasonError, and a
+//     recovered PANIC (the final review's I2 fail-safe backstop: this
+//     interpreter is not proven panic-free by construction, and a panic
+//     reaching a caller after TryCypher has already returned true would be
+//     an unrecoverable false serve) declines reasonPanic.
+//
 //  10. Collect every database edge id any OutEdge/OutPath column in the
 //     result references (collectEdgeIDs); if any exist, hydrate their
 //     properties (hydrateEdgePropsByID) and re-check snap is still current
 //     (snapshotStillCurrent) -- decline reasonHydration/reasonStale on
 //     failure, exactly the same "did a write land while we were doing I/O"
 //     recheck servePathQuery's own step 7 performs, applied here only when
-//     hydration actually did I/O. A pure-snapshot result (no edge/path
-//     column at all) skips this recheck entirely: nothing after step 8
-//     touched anything that could go stale. cypherHydrationRaceHook (see its
-//     own doc) fires immediately before hydrateEdgePropsByID whenever this
-//     branch is taken, purely as a test seam for forcing this exact race.
+//     hydration actually did I/O. cypherHydrationRaceHook (see its own doc)
+//     fires immediately before hydrateEdgePropsByID whenever this branch is
+//     taken, purely as a test seam for forcing this exact race.
 //
-// A successful serve builds a cypherRowsResult (serve_cypher.go) over the
-// executed interpret.ResultSet and logs cypherServedLogMessage at Debug.
+//  11. Unconditional final recheck (snapshotStillCurrent(snap) again,
+//     regardless of whether step 10 hydrated anything or even ran) --
+//     decline reasonStale on failure. interpret.Execute itself does no I/O,
+//     but it is not instantaneous either: a write can land, and a newer
+//     snapshot be adopted, at any point between step 8's check and here,
+//     even along the pure-snapshot path (no edge/path column at all) that
+//     never reaches step 10's own recheck. snap stays internally consistent
+//     regardless (immutable once built), but serving from a snapshot that
+//     is no longer current would silently return data pg's own read at this
+//     same moment would no longer produce.
+//
+//  12. Build the served result via buildCypherRowsResult (serve_cypher.go),
+//     which -- the same I2 fail-safe as step 9 -- eagerly materializes
+//     every row right there, under its own recover, rather than the lazy,
+//     one-row-at-a-time materialization a graph.Result normally performs
+//     inside Next(): a panic during materialization must be caught HERE,
+//     before TryCypher returns true, not later inside some caller's own
+//     Next() loop after TryCypher already committed to serving. Declines
+//     reasonPanic on failure; rows are already capped at maxCypherRows, so
+//     materializing all of them upfront costs nothing eager evaluation
+//     wouldn't have cost lazily anyway.
+//
+// A successful serve logs cypherServedLogMessage at Debug.
 func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text string, params map[string]any) (graph.Result, bool) {
 	start := time.Now()
 
@@ -545,7 +601,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	rs, err := interpret.Execute(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
 		return nil, false
@@ -565,9 +621,38 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 			e.decline(ctx, reasonStale, nil)
 			return nil, false
 		}
+	} else if e.cypherHydrationRaceHook != nil {
+		// A pure-snapshot result (no edge/path column, so nothing to
+		// hydrate) never reaches the branch above -- fire the identical
+		// test seam here instead, its own last chance to force a race
+		// before step 11's unconditional recheck below. See
+		// cypherHydrationRaceHook's own doc.
+		e.cypherHydrationRaceHook()
 	}
 
-	result := newCypherRowsResult(snap, rs, projectionValueKinds(q), edgeProps)
+	// Unconditional recheck, regardless of whether hydration ran: Execute
+	// itself does no I/O, but it is not instantaneous either (an expensive
+	// query can spend real wall-clock time against its work budget), so a
+	// write can land -- and a newer snapshot be adopted -- at any point
+	// between step 8's pre-execution freshness check and here. snap itself
+	// stays internally consistent either way (immutable once built), but
+	// serving from it once it is no longer current would silently return
+	// data pg's own read at this same moment would no longer produce. This
+	// is deliberately a SEPARATE check from the hydration branch's own one
+	// above (not a replacement for it): that one catches staleness
+	// introduced specifically by hydrateEdgePropsByID's own I/O as early as
+	// possible; this one is the unconditional backstop for every path,
+	// hydration or not.
+	if !e.snapshotStillCurrent(snap) {
+		e.decline(ctx, reasonStale, nil)
+		return nil, false
+	}
+
+	result, ok := buildCypherRowsResult(snap, rs, projectionValueKinds(q), edgeProps)
+	if !ok {
+		e.decline(ctx, reasonPanic, nil)
+		return nil, false
+	}
 
 	e.cfg.Log.DebugContext(ctx, cypherServedLogMessage,
 		slog.String("op", "cypher"),

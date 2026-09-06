@@ -20,6 +20,7 @@ package engine
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -145,6 +146,8 @@ func collectEdgeIDs(snap *snapshot.Snapshot, rs *interpret.ResultSet) []uint64 {
 // for that one internal case.
 func cypherExecReason(err error) string {
 	switch {
+	case errors.Is(err, errCypherPanic):
+		return reasonPanic
 	case errors.Is(err, interpret.ErrBudget):
 		return reasonBudget
 	case errors.Is(err, interpret.ErrCollation):
@@ -156,6 +159,41 @@ func cypherExecReason(err error) string {
 	default:
 		return reasonError
 	}
+}
+
+// errCypherPanic is safeExecuteCypher's own sentinel, wrapped (via %w, so
+// errors.Is still finds it) around whatever recover() returned, letting
+// cypherExecReason (above) recognize a recovered panic as a distinct
+// decline reason (reasonPanic) rather than folding it into the generic
+// reasonError bucket -- see the final review's finding I2.
+var errCypherPanic = errors.New("interpret: recovered panic during Execute")
+
+// executeCypher is interpret.Execute, called through this package-level
+// variable rather than directly so a test can substitute a function that
+// deliberately panics -- proving safeExecuteCypher's recover (below)
+// actually converts that into errCypherPanic, without needing to first find
+// a genuinely poisonous (*interpret.Query, interpret.Env) pair that
+// provokes a real panic from outside the interpret package. Production
+// code never reassigns this.
+var executeCypher = interpret.Execute
+
+// safeExecuteCypher runs executeCypher (interpret.Execute in production)
+// under a recover, converting any panic into a plain error (wrapping
+// errCypherPanic) rather than letting it propagate out of TryCypher and
+// crash whatever goroutine is holding TryCypher's caller -- finding I2's
+// fail-safe backstop. This package's interpreter is not proven panic-free
+// by construction (unlike interpret.Plan, which already carries its own
+// top-level recover), so this and buildCypherRowsResult's identical
+// recover on the materialization side (below) together make "a panic
+// reaching a caller after TryCypher has already returned true" impossible
+// regardless of what future interpreter bug might otherwise cause one.
+func safeExecuteCypher(env *interpret.Env, q *interpret.Query, b interpret.Budgets) (rs *interpret.ResultSet, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			rs, err = nil, fmt.Errorf("%w: %v", errCypherPanic, r)
+		}
+	}()
+	return executeCypher(env, q, b)
 }
 
 // --- Node/edge/path materialization -----------------------------------
@@ -468,68 +506,99 @@ func materializeScalar(v any, vk valueKind) any {
 // cypherRowsResult implements graph.Result over an interpret.ResultSet
 // that has already been fully computed by interpret.Execute -- one row per
 // ResultSet.Rows entry, each interpret.OutVal materialized into a *graph.
-// Node/*graph.Relationship/graph.Path/converted-scalar column on demand.
+// Node/*graph.Relationship/graph.Path/converted-scalar column.
 //
-// Materialization happens lazily, one row at a time, inside Next() rather
-// than all upfront in the constructor: rs.Rows is already fully resident in
-// memory (interpret.Execute's own contract -- "a served Query's results are
-// fully materialized before any row is emitted", interpret/plan.go's Query
-// doc), so there is no correctness reason to convert every row before the
-// first Next() call, and a caller that stops draining early (unusual for
-// ops.FetchByQuery, which always drains to completion, but not guaranteed)
-// saves the conversion cost for the rows it never asked for. This is a
-// deliberate departure from rowResult's "read live off the snapshot's CSR
-// arrays exactly as the caller pulls" framing (rowresult.go) only in that
-// the *source* here (rs.Rows) is already fully materialized data rather
-// than a live iterator -- the row-at-a-time *conversion* discipline is the
-// same in spirit.
+// Materialization happens EAGERLY, for every row, inside the constructor
+// (newCypherRowsResult) rather than lazily inside Next() -- a deliberate
+// change from this type's original design, per the final review's finding
+// I2: TryCypher builds this result under buildCypherRowsResult's own
+// recover (below), specifically so that a panic anywhere in
+// materialization is caught THERE, before TryCypher ever returns true, not
+// later inside some caller's own Next() loop after TryCypher has already
+// committed to serving -- at which point a panic would be an unrecoverable
+// false serve, not a graceful decline. rs.Rows is already fully resident in
+// memory and capped at maxCypherRows (interpret.Execute's own contract),
+// so converting every row upfront costs no more than converting them all
+// lazily would have anyway for the overwhelmingly common case (ops.
+// FetchByQuery always drains a result to completion); the only real
+// tradeoff given up is doing that conversion work for a row a caller might
+// have abandoned before reaching, which -- unlike the panic safety this
+// buys -- has never been a documented guarantee of this type.
 //
 // The zero value is not useful; construct with newCypherRowsResult.
 type cypherRowsResult struct {
 	snap      *snapshot.Snapshot
-	rows      [][]interpret.OutVal
 	keys      []string
-	kinds     []valueKind // index-aligned with rows[i]/keys, from projectionValueKinds
+	kinds     []valueKind // index-aligned with the original rows/keys, from projectionValueKinds
 	edgeProps map[uint64]*graph.Properties
+
+	// materialized holds every row's already-converted []any values,
+	// index-aligned with keys -- computed once, eagerly, by
+	// newCypherRowsResult (see this type's own doc for why).
+	materialized [][]any
 
 	// idx is the current row, starting one before the first (-1) --
 	// mirroring pathResult/rowResult's identical "Next() advances before
 	// checking bounds" convention (result.go, rowresult.go).
 	idx int
-	// cur holds the current row's materialized values, or nil before the
-	// first Next() call or after Next() has returned false.
-	cur []any
 }
 
-// newCypherRowsResult wraps rs as a graph.Result. kinds must be index-
-// aligned with rs.Keys/rs.Rows[i] -- the caller (Task 13's pipeline) is
-// expected to have produced it via projectionValueKinds(q) against the same
-// *interpret.Query that planned rs. edgeProps supplies every path/edge
-// column's relationship properties (Task 11's hydration, keyed by database
-// edge id) and may be nil or incomplete: edgePropsFor's missing-entry
-// fallback (an empty, non-nil *graph.Properties) covers both cases, so a
-// test may pass nil to exercise column shapes without hydrating anything.
+// newCypherRowsResult wraps rs as a graph.Result, eagerly materializing
+// every row right here (see cypherRowsResult's own doc for why). kinds must
+// be index-aligned with rs.Keys/rs.Rows[i] -- the caller is expected to have
+// produced it via projectionValueKinds(q) against the same *interpret.Query
+// that planned rs. edgeProps supplies every path/edge column's relationship
+// properties (Task 11's hydration, keyed by database edge id) and may be
+// nil or incomplete: edgePropsFor's missing-entry fallback (an empty,
+// non-nil *graph.Properties) covers both cases, so a test may pass nil to
+// exercise column shapes without hydrating anything.
+//
+// Callers reached from TryCypher's own pipeline must go through
+// buildCypherRowsResult instead of calling this directly, so that a panic
+// during the eager materialization this performs is recovered rather than
+// escaping to TryCypher's caller (finding I2) -- this function itself does
+// NOT recover anything, matching every other constructor in this package;
+// test code that calls it directly (as several serve_cypher_test.go cases
+// do, deliberately exercising known-good fixtures) gets an ordinary panic
+// on a genuine bug, same as before this fix.
 func newCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) graph.Result {
-	return &cypherRowsResult{
+	r := &cypherRowsResult{
 		snap:      snap,
-		rows:      rs.Rows,
 		keys:      rs.Keys,
 		kinds:     kinds,
 		edgeProps: edgeProps,
 		idx:       -1,
 	}
+
+	r.materialized = make([][]any, len(rs.Rows))
+	for i, row := range rs.Rows {
+		r.materialized[i] = r.materializeRow(row)
+	}
+
+	return r
 }
 
-// Next advances to the next row, materializing it into r.cur, and reports
-// whether one exists.
+// buildCypherRowsResult wraps newCypherRowsResult's own eager row
+// materialization under a recover, converting any panic there into
+// ok == false rather than letting it escape TryCypher -- see
+// cypherRowsResult's own doc and finding I2. This is the constructor
+// TryCypher's pipeline actually calls; newCypherRowsResult itself stays
+// available, unwrapped, for test code exercising known-good fixtures.
+func buildCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) (result graph.Result, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			result, ok = nil, false
+		}
+	}()
+	return newCypherRowsResult(snap, rs, kinds, edgeProps), true
+}
+
+// Next advances to the next row and reports whether one exists. Every
+// row's values were already materialized eagerly by newCypherRowsResult
+// (see that constructor's own doc for why); this just walks r.materialized.
 func (r *cypherRowsResult) Next() bool {
 	r.idx++
-	if r.idx < 0 || r.idx >= len(r.rows) {
-		r.cur = nil
-		return false
-	}
-	r.cur = r.materializeRow(r.rows[r.idx])
-	return true
+	return r.idx >= 0 && r.idx < len(r.materialized)
 }
 
 // materializeRow converts one already-planned row of interpret.OutVal into
@@ -577,12 +646,15 @@ func (r *cypherRowsResult) Keys() []string {
 	return r.keys
 }
 
-// Values returns the current row's materialized values, computed by the
-// most recent Next(). Calling Values() before any Next() call, or after
-// Next() has returned false, returns nil -- matching pathResult/rowResult's
-// identical convention.
+// Values returns the current row's already-materialized values (computed
+// eagerly by newCypherRowsResult, not on demand here). Calling Values()
+// before any Next() call, or after Next() has returned false, returns nil
+// -- matching pathResult/rowResult's identical convention.
 func (r *cypherRowsResult) Values() []any {
-	return r.cur
+	if r.idx < 0 || r.idx >= len(r.materialized) {
+		return nil
+	}
+	return r.materialized[r.idx]
 }
 
 // Mapper returns a graph.ValueMapper recognizing this result's own

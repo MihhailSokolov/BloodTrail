@@ -976,6 +976,123 @@ func TestCypherHydrationRecheck(t *testing.T) {
 		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
 }
 
+// cypherStaleRecheckNodeKind is TestCypherStaleRecheckNoHydration's own
+// fixture kind.
+var cypherStaleRecheckNodeKind = graph.StringKind("CypherStaleRecheckNode")
+
+// TestCypherStaleRecheckNoHydration is the final review's I1 regression:
+// TryCypher's step-11 UNCONDITIONAL post-execution snapshotStillCurrent
+// recheck (engine.go's own pipeline doc) must fire even for a
+// pure-snapshot result -- one with no edge/path column at all, so
+// collectEdgeIDs never finds anything to hydrate and step 10's own
+// hydration-branch recheck never runs. Before this fix, TryCypher declined
+// staleness only for the pre-execution Fresh() check (step 8) and the
+// hydration-branch recheck (step 10) -- a query with neither shape could
+// silently serve a result computed against a snapshot a write had already
+// invalidated, if that write landed in the window between Execute
+// completing and the result being handed back, however narrow that window
+// is in practice.
+//
+// Mirrors TestCypherHydrationRecheck's own approach exactly, but for the
+// no-hydration path: since a single synchronous TryCypher call has no
+// externally observable point in that window for a test to intervene at
+// short of a genuinely racing concurrent write, this reuses the identical
+// cypherHydrationRaceHook seam, which -- per its own doc, extended by this
+// same fix -- now also fires immediately before step 11's check on the
+// no-hydration path specifically (there being no hydration branch to fire
+// it from instead). The query itself (a plain property read, no
+// edge/path/path column) is planned and executed entirely correctly
+// against a still-fresh snapshot before the hook ever fires, so only step
+// 11's own recheck is under test: TryCypher must decline (reasonStale)
+// rather than hand back a result computed against a since-invalidated
+// snapshot, and the fallback must still return the correct (post-write)
+// value from PostgreSQL directly.
+func TestCypherStaleRecheckNoHydration(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	defer func() { _ = bt.Close(ctx) }()
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	var nodeID graph.ID
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties().Set("name", "before"), cypherStaleRecheckNodeKind)
+		if err != nil {
+			return err
+		}
+		nodeID = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("fixture setup WriteTransaction: %v", err)
+	}
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("engine reports stale immediately after RebuildNow")
+	}
+
+	text := fmt.Sprintf(`MATCH (n:CypherStaleRecheckNode) WHERE id(n) = %d RETURN n.name`, nodeID)
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "baseline: plain property-read cypher query serves",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "before")
+
+	// The write under test: lands (via the race hook) after Execute has
+	// already run against a fresh snapshot, but before TryCypher hands the
+	// result back -- exactly the window step 11 exists to catch, here
+	// reached via the no-hydration branch since this query has no
+	// edge/path column at all. The write ALSO changes name to "after", so
+	// the fallback's answer is independently verifiable as PostgreSQL's own
+	// live read (not some cached pre-write value).
+	d.engine.SetCypherHydrationRaceHookForTest(func() {
+		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+			return tx.UpdateNode(&graph.Node{ID: nodeID, Properties: graph.NewProperties().Set("name", "after")})
+		}); err != nil {
+			t.Fatalf("race-hook WriteTransaction: %v", err)
+		}
+	})
+	t.Cleanup(func() { d.engine.SetCypherHydrationRaceHookForTest(nil) })
+
+	requireDecline(t, buf, "stale", "no-hydration recheck: a write lands between Execute and the result being returned, so the query declines and falls back to PostgreSQL, returning the live (new) value",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
+
+	// Disarm before rebuilding: RebuildNow itself never reaches TryCypher's
+	// serving pipeline at all, but leaving the hook armed past its one
+	// intended call would silently force every future cypher query in this
+	// test (there are none below) to decline too.
+	d.engine.SetCypherHydrationRaceHookForTest(nil)
+
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow (post-race): %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("post-race: engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: plain property-read cypher query serves again, reflecting the new value",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
+}
+
 // cypherMultiGraphNodeKind/cypherMultiGraphSecondKind are
 // TestCypherMultiGraphGuard's own fixture kinds -- one for the node living
 // in the driver's default graph, one for the node in the second, unrelated
