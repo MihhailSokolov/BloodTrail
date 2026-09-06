@@ -581,25 +581,94 @@ func assertStringSequence(t *testing.T, label string, got, want []string) {
 	}
 }
 
+// canonNode/canonEdge/canonPath and canonicalizePath/renderPathSignatures
+// port internal/engine/engine_integration_test.go's identical canonNode/
+// canonEdge/canonPath/canonicalize/renderSet comparator into this package
+// for the final review's finding I3: the original assertCorpusResultsMatch
+// (git history) compared node id SETS and edge id SETS only, flattened
+// across every row of a result -- dropping node/edge PROPERTIES entirely,
+// and (since a set collapses duplicates) any PATH MULTIPLICITY difference
+// too (e.g. the same node reached by three distinct paths on one side but
+// two on the other could render an identical id set). Cannot import
+// engine_integration_test.go's own versions directly: package engine's
+// canonicalize/renderSet/canonNode/canonEdge/canonPath are all unexported,
+// invisible outside that package even via Go's internal/ import-path rules
+// (which gate import paths, not identifier visibility) -- so this is a
+// deliberate duplicate, kept in sync by eye, of the exact same node id+
+// props / edge kind+props / path-ordered (not sorted within a path)
+// rendering, over graph.Path/graph.PathSet, a public dawgs type both files
+// operate on identically.
+type canonNode struct {
+	ID    uint64         `json:"id"`
+	Props map[string]any `json:"props"`
+}
+type canonEdge struct {
+	Kind  string         `json:"kind"`
+	Props map[string]any `json:"props"`
+}
+type canonPath struct {
+	Nodes []canonNode `json:"nodes"`
+	Edges []canonEdge `json:"edges"`
+}
+
+func canonicalizePath(p graph.Path) canonPath {
+	cp := canonPath{Nodes: make([]canonNode, len(p.Nodes)), Edges: make([]canonEdge, len(p.Edges))}
+	for i, n := range p.Nodes {
+		cp.Nodes[i] = canonNode{ID: uint64(n.ID), Props: n.Properties.MapOrEmpty()}
+	}
+	for i, e := range p.Edges {
+		cp.Edges[i] = canonEdge{Kind: e.Kind.String(), Props: e.Properties.MapOrEmpty()}
+	}
+	return cp
+}
+
+// renderPathSignatures canonicalizes and JSON-marshals every path in ps
+// (encoding/json sorts map keys, so this is deterministic per path), one
+// signature string per path, in ENCOUNTER order. Unlike
+// engine_integration_test.go's own renderSet, this deliberately does NOT
+// additionally sort the resulting slice: assertStringSequence (the ordered
+// comparison below) needs exact encounter order preserved, while
+// assertStringMultiset (the unordered one) already sorts its own copies of
+// whatever it is handed internally -- so one unsorted rendering correctly
+// serves both callers, and a duplicate path (multiplicity) is preserved as
+// a duplicate string in both cases rather than silently collapsed.
+func renderPathSignatures(ps graph.PathSet) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		b, err := json.Marshal(canonicalizePath(p))
+		if err != nil {
+			panic(fmt.Sprintf("bloodtrail: renderPathSignatures: marshal canonical path: %v", err))
+		}
+		out[i] = string(b)
+	}
+	return out
+}
+
 // assertCorpusResultsMatch compares got (the bloodtrail-side result)
-// against want (the pg oracle's) per this suite's brief: node sets by id,
-// edge sets by id, literals by (scalarSignature-normalized) deep equality --
-// ordered sequences instead of set/multiset comparisons when ordered is
-// true (see hasOrderBy).
+// against want (the pg oracle's): paths by canonical node-id+properties/
+// edge-kind+properties rendering (renderPathSignatures/canonicalizePath --
+// see their own doc for why this replaced the original id-set-only
+// comparison, finding I3), plus an explicit path-COUNT assertion (a
+// friendlier, more specific failure message than relying solely on the
+// rendered-signature comparison happening to also catch a count mismatch),
+// and literals by (scalarSignature-normalized) deep equality -- ordered
+// sequences instead of set/multiset comparisons when ordered is true (see
+// hasOrderBy).
 func assertCorpusResultsMatch(t *testing.T, ordered bool, got, want ops.QueryResult) {
 	t.Helper()
 
-	gotNodes, wantNodes := extractNodeIDs(got), extractNodeIDs(want)
-	gotEdges, wantEdges := extractEdgeIDs(got), extractEdgeIDs(want)
+	if len(got.Paths) != len(want.Paths) {
+		t.Errorf("path count mismatch: got %d paths, want %d", len(got.Paths), len(want.Paths))
+	}
+
+	gotPaths, wantPaths := renderPathSignatures(got.Paths), renderPathSignatures(want.Paths)
 	gotLits, wantLits := extractLiteralSignatures(got), extractLiteralSignatures(want)
 
 	if ordered {
-		assertStringSequence(t, "nodes", idSequence(gotNodes), idSequence(wantNodes))
-		assertStringSequence(t, "edges", idSequence(gotEdges), idSequence(wantEdges))
+		assertStringSequence(t, "paths", gotPaths, wantPaths)
 		assertStringSequence(t, "literals", gotLits, wantLits)
 	} else {
-		assertStringMultiset(t, idSet(gotNodes), idSet(wantNodes), "node id set")
-		assertStringMultiset(t, idSet(gotEdges), idSet(wantEdges), "edge id set")
+		assertStringMultiset(t, gotPaths, wantPaths, "path set (node id+props, edge kind+props, path-ordered)")
 		assertStringMultiset(t, gotLits, wantLits, "literals")
 	}
 }
