@@ -261,6 +261,36 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "collect used as projected value", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs RETURN xs`, want: false},
 		{name: "collect alias used outside membership", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE xs = b RETURN b`, want: false},
 		{name: "collect alias positive IN", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE b IN xs RETURN b`, want: true},
+
+		// Every other position a CollectMembership alias's own IN-comparison
+		// can legally appear in, alongside the bare form above: Plan's
+		// checkExpr threads a "predicatePosition" flag through exactly the
+		// AST shapes the executor's own evalWhereWithMembership recursion
+		// also passes through unmodified (Parenthetical/Negation/
+		// Conjunction/Disjunction), so the membership bypass stays legal
+		// through every one of them.
+		{name: "collect alias IN parenthesized", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE (b IN xs) RETURN b`, want: true},
+		{name: "collect alias IN inside conjunction", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE b.name = 'x' AND b IN xs RETURN b`, want: true},
+		{name: "collect alias IN inside disjunction", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE b.name = 'x' OR b IN xs RETURN b`, want: true},
+		{name: "collect alias NOT IN (negation)", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE NOT b IN xs RETURN b`, want: true},
+		{name: "collect alias NOT (IN) parenthesized negation", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE NOT (b IN xs) RETURN b`, want: true},
+
+		// Finding 2 (2026-09-05 review): checkInOperands used to accept a
+		// CollectMembership alias appearing in ANY partial of a comparison
+		// chain, but the executor's tryMembershipComparison only ever
+		// recognizes a single-Partial *cypher.Comparison reachable directly
+		// from evalWhereWithMembership's own boolean-structural recursion --
+		// a served-but-unexecutable mismatch (a safe ErrUnsupported abort at
+		// runtime, but not a clean plan-time reject). Both shapes below
+		// parse as one Comparison with the membership IN nested as a mere
+		// *value* operand of another Comparison (Cypher's grammar binds IN
+		// tighter than the relational operators, so `u = c IN xs` is `u =
+		// (c IN xs)`, not a flat two-Partial chain) -- eval.go's EvalValue
+		// has no case for a *cypher.Comparison at all, so neither shape's
+		// nested membership check is ever reachable by the executor's
+		// structural recursion, regardless of how it parses.
+		{name: "collect alias IN chained after equality rejected", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (u:User),(c:User) WHERE u = c IN xs RETURN u`, want: false},
+		{name: "collect alias IN chained before equality rejected", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (c:User) WHERE c IN xs = true RETURN c`, want: false},
 		{name: "plain named path projected", cypher: `MATCH p = (a:User)-[:X]->(b:User) RETURN p`, want: true},
 		{name: "named path used in WHERE rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) WHERE p = a RETURN a`, want: false},
 		{name: "id nested in arithmetic rejected", cypher: `MATCH (n:User) RETURN id(n) + 1 AS x`, want: false},

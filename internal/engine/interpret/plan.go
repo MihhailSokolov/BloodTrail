@@ -646,7 +646,7 @@ func planPart(snap *snapshot.Snapshot, regexes map[string]*regexp.Regexp, carrie
 
 	for _, conjunct := range whereConjuncts {
 		pb.touched = map[string]bool{}
-		if !pb.checkExpr(conjunct) {
+		if !pb.checkExpr(conjunct, true) {
 			return Part{}, nil, false
 		}
 		if !pb.pushdown(conjunct) {
@@ -1323,32 +1323,49 @@ func objectIDEqualsLiteral(propSide, litSide cypher.Expression, sym string) (str
 // FilterExpression/IDInCollection, or any other AST shape -- falls through
 // to the implicit default-deny (no case matches, `default: return false`).
 //
+// predicatePosition tracks whether expr is reachable, in the executor, via
+// EvalPredicate/evalWhereWithMembership's own boolean-structural recursion
+// (true) or only via EvalValue (false) -- see checkInOperands' own doc
+// comment for why this distinction is load-bearing for the one place a
+// CollectMembership alias may legally appear. It starts true only for a
+// Part's own top-level WHERE conjunct (planPart's call below) and threads
+// unchanged through exactly the AST shapes evalWhereWithMembership's own
+// recursion also passes through unmodified -- Parenthetical, Negation,
+// Conjunction, Disjunction, ExclusiveDisjunction -- becoming false the
+// moment expr is validated as a mere *value* operand of something else (a
+// Comparison's own operands, a function argument, an arithmetic operand, a
+// list element, a RETURN/WITH item): eval.go's EvalValue has no case for a
+// *cypher.Comparison at all (it hits ErrUnsupported), so any Comparison
+// nested in one of those positions can never be reached by
+// EvalPredicate/evalWhereWithMembership's structural walk, regardless of
+// its own shape.
+//
 // As a side effect, every *cypher.Variable node checkExpr accepts is
 // recorded into pb.touched (reset by the caller before each top-level
 // item), which pushdown/RETURN-item bookkeeping then reads to learn which
 // symbols the just-validated expression referenced.
-func (pb *partBuilder) checkExpr(expr cypher.Expression) bool {
+func (pb *partBuilder) checkExpr(expr cypher.Expression, predicatePosition bool) bool {
 	switch e := expr.(type) {
 	case nil:
 		return true
 
 	case *cypher.Parenthetical:
-		return e != nil && pb.checkExpr(e.Expression)
+		return e != nil && pb.checkExpr(e.Expression, predicatePosition)
 
 	case *cypher.Negation:
-		return e != nil && pb.checkExpr(e.Expression)
+		return e != nil && pb.checkExpr(e.Expression, predicatePosition)
 
 	case *cypher.Conjunction:
-		return e != nil && pb.checkExprList(e.GetAll())
+		return e != nil && pb.checkExprList(e.GetAll(), predicatePosition)
 
 	case *cypher.Disjunction:
-		return e != nil && pb.checkExprList(e.GetAll())
+		return e != nil && pb.checkExprList(e.GetAll(), predicatePosition)
 
 	case *cypher.ExclusiveDisjunction:
-		return e != nil && pb.checkExprList(e.GetAll())
+		return e != nil && pb.checkExprList(e.GetAll(), predicatePosition)
 
 	case *cypher.Comparison:
-		return pb.checkComparison(e)
+		return pb.checkComparison(e, predicatePosition)
 
 	case *cypher.KindMatcher:
 		return pb.checkKindMatcher(e)
@@ -1374,7 +1391,10 @@ func (pb *partBuilder) checkExpr(expr cypher.Expression) bool {
 		return pb.checkPropertyLookup(e)
 
 	case *cypher.ListLiteral:
-		return e != nil && pb.checkExprList(*e)
+		// A list's own elements are always value operands (`[a, b, c]` has
+		// no predicate position inside it), regardless of predicatePosition
+		// at the ListLiteral itself.
+		return e != nil && pb.checkExprList(*e, false)
 
 	case *cypher.FunctionInvocation:
 		return pb.checkFunction(e)
@@ -1383,16 +1403,17 @@ func (pb *partBuilder) checkExpr(expr cypher.Expression) bool {
 		return pb.checkArithmetic(e)
 
 	case *cypher.UnaryAddOrSubtractExpression:
-		return e != nil && pb.checkExpr(e.Right)
+		// An arithmetic operand is always a value position.
+		return e != nil && pb.checkExpr(e.Right, false)
 
 	default:
 		return false
 	}
 }
 
-func (pb *partBuilder) checkExprList(exprs []cypher.Expression) bool {
+func (pb *partBuilder) checkExprList(exprs []cypher.Expression, predicatePosition bool) bool {
 	for _, e := range exprs {
-		if !pb.checkExpr(e) {
+		if !pb.checkExpr(e, predicatePosition) {
 			return false
 		}
 	}
@@ -1418,10 +1439,18 @@ func checkLiteralShape(lit *cypher.Literal) bool {
 // default-deny means a future dawgs operator constant this file has not
 // been updated for rejects automatically rather than silently mis-checking
 // it) rejects.
-func (pb *partBuilder) checkComparison(cmp *cypher.Comparison) bool {
+func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition bool) bool {
 	if cmp == nil || len(cmp.Partials) == 0 {
 		return false
 	}
+	// singlePartial, together with predicatePosition, gates checkInOperands'
+	// CollectMembership bypass: that bypass is only sound for a comparison
+	// consisting of exactly this one IN partial (Plan's own IR truly is
+	// `<nodeVar> IN <alias>` and nothing else), never for a chained
+	// comparison (`a op1 b op2 c`, Cypher sugar for `(a op1 b) AND (b op2
+	// c)`) that merely has the membership shape as one of several partials
+	// -- see checkInOperands' own doc comment.
+	singlePartial := len(cmp.Partials) == 1
 	left := cmp.Left
 	for _, partial := range cmp.Partials {
 		if partial == nil {
@@ -1429,7 +1458,7 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison) bool {
 		}
 		switch partial.Operator {
 		case cypher.OperatorIn:
-			if !pb.checkInOperands(left, partial.Right) {
+			if !pb.checkInOperands(left, partial.Right, predicatePosition && singlePartial) {
 				return false
 			}
 		case cypher.OperatorRegexMatch:
@@ -1441,7 +1470,13 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison) bool {
 			cypher.OperatorGreaterThan, cypher.OperatorGreaterThanOrEqualTo,
 			cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains,
 			cypher.OperatorIs, cypher.OperatorIsNot:
-			if !pb.checkExpr(left) || !pb.checkExpr(partial.Right) {
+			// Every non-IN/regex operator's operands are plain value
+			// positions -- eval.go's evalPartialComparison calls EvalValue
+			// on both sides regardless of predicatePosition here, so a
+			// nested Comparison in either operand (e.g. the membership
+			// shape used as a value, `x = c IN exclude`) can never be
+			// reached by EvalPredicate's structural recursion.
+			if !pb.checkExpr(left, false) || !pb.checkExpr(partial.Right, false) {
 				return false
 			}
 		default:
@@ -1462,13 +1497,41 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison) bool {
 // legal *only* here, and only when left is itself a bare, bound node
 // variable (the id-set the alias holds is a set of node ids; comparing
 // anything else against it -- a property value, an edge, a path -- is not
-// the membership test pg's translation produces). Every other IN shape
-// (a literal list, a list-valued property, ...) is checked the ordinary
-// way, which itself rejects a collect-alias variable appearing in the wrong
-// position (e.g. as the *left* operand, or anywhere outside this bypass).
-func (pb *partBuilder) checkInOperands(left, right cypher.Expression) bool {
+// the membership test pg's translation produces), and only when
+// membershipAllowed is true. membershipAllowed is
+// `predicatePosition && singlePartial` at the call site: this IN must be
+// the *entire* comparison (no other Partials chained onto it), AND that
+// comparison must itself be reachable, in the executor, as a genuine
+// boolean-predicate leaf -- i.e. only through Part.Where's own top-level
+// conjunct or a chain of pure Parenthetical/Negation/Conjunction/
+// Disjunction/ExclusiveDisjunction wrapping it (see checkExpr's
+// predicatePosition doc). Both conditions matter, and for the same reason:
+// the executor's own interception (pipeline.go's tryMembershipComparison) is
+// only ever reached from evalWhereWithMembership's boolean-structural
+// recursion, which never looks inside a Comparison's own operands -- so a
+// membership comparison nested there is invisible to it regardless of shape.
+// Two concrete shapes this rejects, both accepted before this gate existed:
+//   - `u = c IN exclude` -- parses as ONE Comparison (`u = <c IN exclude>`),
+//     not a flat two-Partial chain (Cypher's grammar binds IN tighter than
+//     `=`): the outer `=`'s own operand check runs checkExpr(right, false),
+//     so the nested `c IN exclude` Comparison is checked with
+//     predicatePosition=false and rejected here, correctly -- eval.go's
+//     EvalValue (what the outer `=`'s evalPartialComparison calls on that
+//     operand) has no case for a *cypher.Comparison at all.
+//   - `c IN exclude = true` -- symmetric nesting the other way (`<c IN
+//     exclude> = true`): same rejection, same reason.
+//
+// Every other IN shape (a literal list, a list-valued property, a
+// membership comparison used as a value anywhere, ...) is checked the
+// ordinary way, which itself rejects a collect-alias variable appearing in
+// the wrong position (e.g. as the *left* operand, or anywhere outside this
+// bypass).
+func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membershipAllowed bool) bool {
 	if rv, ok := unwrapParens(right).(*cypher.Variable); ok && rv != nil {
 		if pb.known[rv.Symbol] == symCollectAlias {
+			if !membershipAllowed {
+				return false
+			}
 			lv, ok := unwrapParens(left).(*cypher.Variable)
 			if !ok || lv == nil || pb.known[lv.Symbol] != symNode {
 				return false
@@ -1478,7 +1541,7 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression) bool {
 			return true
 		}
 	}
-	return pb.checkExpr(left) && pb.checkExpr(right)
+	return pb.checkExpr(left, false) && pb.checkExpr(right, false)
 }
 
 // checkRegexOperands validates `left =~ right`: left is checked the
@@ -1491,7 +1554,7 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression) bool {
 // whole Query) keyed by its decoded text, so an identical pattern appearing
 // more than once in the query compiles exactly once.
 func (pb *partBuilder) checkRegexOperands(left, right cypher.Expression) bool {
-	if !pb.checkExpr(left) {
+	if !pb.checkExpr(left, false) {
 		return false
 	}
 	lit, ok := asLiteral(right)
@@ -1630,13 +1693,13 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 		return true
 
 	case cypher.ToLowerFunction, cypher.ToUpperFunction:
-		return len(fi.Arguments) == 1 && pb.checkExpr(fi.Arguments[0])
+		return len(fi.Arguments) == 1 && pb.checkExpr(fi.Arguments[0], false)
 
 	case cypher.CoalesceFunction:
 		if len(fi.Arguments) == 0 {
 			return false
 		}
-		return pb.checkExprList(fi.Arguments)
+		return pb.checkExprList(fi.Arguments, false)
 
 	case cypher.ListSizeFunction:
 		// size() serves list-property arguments only (a bare list variable,
@@ -1652,10 +1715,10 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 		if !ok || pl == nil {
 			return false
 		}
-		return pb.checkExpr(pl)
+		return pb.checkExpr(pl, false)
 
 	case cypher.StringSplitToArrayFunction:
-		return len(fi.Arguments) == 2 && pb.checkExpr(fi.Arguments[0]) && pb.checkExpr(fi.Arguments[1])
+		return len(fi.Arguments) == 2 && pb.checkExpr(fi.Arguments[0], false) && pb.checkExpr(fi.Arguments[1], false)
 
 	default:
 		return false
@@ -1670,7 +1733,7 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 // on the very first row, wasting the whole materialization pass before
 // falling back to delegation anyway.
 func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
-	if ae == nil || !pb.checkExpr(ae.Left) {
+	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
 	}
 	for _, p := range ae.Partials {
@@ -1682,7 +1745,7 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		default:
 			return false
 		}
-		if !pb.checkExpr(p.Right) {
+		if !pb.checkExpr(p.Right, false) {
 			return false
 		}
 	}
@@ -1860,7 +1923,7 @@ func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases 
 			// ever calling EvalValue for it.
 			pb.touched[pv.Symbol] = true
 			itemKind = symPath
-		} else if !pb.checkExpr(item.Expression) || !isValueShape(item.Expression) {
+		} else if !pb.checkExpr(item.Expression, false) || !isValueShape(item.Expression) {
 			return Projection{}, nil, 0, -1, false
 		} else if isVar && pv != nil {
 			// A bare Variable's own projected kind is whatever it was bound

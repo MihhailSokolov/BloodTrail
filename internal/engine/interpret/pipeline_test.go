@@ -337,3 +337,102 @@ RETURN c`
 	}
 	assertRowSet(t, rs, want)
 }
+
+// --- work accounting: one canonical charge per served row -------------------
+
+// TestPipelineWorkAccountingSinglePartNoDoubleCharge pins the exact
+// Budgets.MaxWork unit count for a trivial single-Part query with a WHERE
+// clause, exercising the exact double-charge this test guards against: a row
+// that survives filterRows and is then admitted as a final row must be
+// charged exactly once for that (via workMeter.addFinalRow), not once more
+// by filterRows itself for surviving the predicate.
+//
+// The snapshot has 3 User nodes; scanAnchor's own two-tier accounting
+// (Budgets' doc comment: "+1 per node visited ... +1 per row produced
+// anywhere") charges 2 work units per node visited by the kind-bitmap anchor
+// (1 visit + 1 for the row it produces, all 3 satisfy the trivial :User
+// constraint) = 6, regardless of this fix. Of those 3 rows, exactly 2 survive
+// `WHERE n.enabled = true` and are admitted as final rows, each charged
+// exactly once by addFinalRow = 2. Total: 6 + 2 = 8. Before this fix,
+// filterRows' own per-survivor spend(1) added a second charge for each of
+// those same 2 survivors, making the (wrong) pre-fix total 10.
+func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, map[string]any{"enabled": true}},
+			{2, []snapshot.KindID{kindUser}, map[string]any{"enabled": true}},
+			{3, []snapshot.KindID{kindUser}, map[string]any{"enabled": false}},
+		},
+		nil,
+	)
+
+	q := planQuery(t, snap, `MATCH (n:User) WHERE n.enabled = true RETURN n`)
+	meter := &workMeter{budget: Budgets{MaxRows: 1000, MaxWork: 1_000_000}}
+	rs, err := runQuery(&Env{Snap: snap}, q, meter)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rs.Rows))
+	}
+	if meter.work != 8 {
+		t.Fatalf("meter.work = %d, want 8 (6 scanAnchor + 2 addFinalRow, no filterRows double charge)", meter.work)
+	}
+	if meter.finalRows != 2 {
+		t.Fatalf("meter.finalRows = %d, want 2", meter.finalRows)
+	}
+}
+
+// TestPipelineWorkAccountingCarriedPartNoDoubleCharge pins the exact
+// Budgets.MaxWork unit count for a 2-Part WITH query whose Part[1] has its
+// own real pattern (not the empty-pattern short circuit), exercising
+// runCarriedPart's own merge step -- the other half of this fix, alongside
+// filterRows.
+//
+// The snapshot has 3 User nodes: node 1 is Part[0]'s sole match (its
+// objectid anchor -- see TestExecObjectIDAnchor -- visits exactly that one
+// node: 1 visit + 1 produced = 2). `WITH n` passes that single row through
+// unchanged (runWithPassThrough's own, unrelated per-row charge: 1). Part[1]
+// (`MATCH (m:User)`) re-scans all 3 User nodes for that one carried row (kind
+// -bitmap anchor: 2 work units per node x 3 = 6), merges each of those 3 rows
+// with the carried row (runCarriedPart's merge step -- charges nothing of
+// its own, per this fix), and `WHERE m.flag = true` keeps exactly 1 of the 3
+// merged rows, admitted once as a final row (addFinalRow: 1). Total:
+// 2 + 1 + 6 + 1 = 10. Before this fix, runCarriedPart's own per-merged-row
+// spend(1) added 3 (one per merged row, regardless of WHERE), and filterRows'
+// per-survivor spend(1) added 1 more for the single WHERE survivor, making
+// the (wrong) pre-fix total 15.
+func TestPipelineWorkAccountingCarriedPartNoDoubleCharge(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, map[string]any{"objectid": "anchor"}},
+			{2, []snapshot.KindID{kindUser}, map[string]any{"flag": true}},
+			{3, []snapshot.KindID{kindUser}, map[string]any{"flag": false}},
+		},
+		nil,
+	)
+
+	q := planQuery(t, snap, `MATCH (n:User) WHERE n.objectid = 'anchor' WITH n MATCH (m:User) WHERE m.flag = true RETURN n, m`)
+	meter := &workMeter{budget: Budgets{MaxRows: 1000, MaxWork: 1_000_000}}
+	rs, err := runQuery(&Env{Snap: snap}, q, meter)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rs.Rows))
+	}
+	if meter.work != 10 {
+		t.Fatalf("meter.work = %d, want 10 (2 anchor + 1 WITH pass-through + 6 Part[1] scan + 1 addFinalRow, no filterRows/runCarriedPart double charge)", meter.work)
+	}
+	if meter.finalRows != 1 {
+		t.Fatalf("meter.finalRows = %d, want 1", meter.finalRows)
+	}
+}

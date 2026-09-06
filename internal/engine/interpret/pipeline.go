@@ -134,7 +134,7 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err = filterRows(env, rows, part0.Where, meter, nil)
+	rows, err = filterRows(env, rows, part0.Where, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +165,7 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		}
 
 		collectAliases := collectAliasNames(part0.With.Aggregates)
-		rows, err = filterRows(env, merged, part1.Where, meter, collectAliases)
+		rows, err = filterRows(env, merged, part1.Where, collectAliases)
 		if err != nil {
 			return nil, err
 		}
@@ -220,7 +220,14 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 // whatever id-sets its own Row.Scalar bindings carry for those alias names)
 // instead of eval.go's generic EvalPredicate -- see this file's package doc
 // comment.
-func filterRows(env *Env, rows []*Row, expr cypher.Expression, meter *workMeter, collectAliases []string) ([]*Row, error) {
+//
+// filterRows spends no work of its own: every row it is handed already paid
+// its "produced" charge wherever it was actually produced (matchPart's own
+// scanAnchor/expandStep/cartesianJoin, or runWithStage's grouping), and a row
+// surviving a boolean predicate test is not a new "row produced" event --
+// see runQuery's own doc comment on addFinalRow for the single canonical
+// point where a served row is charged.
+func filterRows(env *Env, rows []*Row, expr cypher.Expression, collectAliases []string) ([]*Row, error) {
 	if expr == nil {
 		return rows, nil
 	}
@@ -254,9 +261,6 @@ func filterRows(env *Env, rows []*Row, expr cypher.Expression, meter *workMeter,
 		if t != TriTrue {
 			continue
 		}
-		if err := meter.spend(1); err != nil {
-			return nil, err
-		}
 		out = append(out, r)
 	}
 	return out, nil
@@ -272,6 +276,15 @@ func filterRows(env *Env, rows []*Row, expr cypher.Expression, meter *workMeter,
 // answer "zero components, zero rows", which is wrong for a no-op pattern --
 // an empty pattern passes every carried row through unchanged, exactly like
 // a cross join against a single-row, zero-column table.
+//
+// The merge step itself spends no separate work unit: part's own matchPart
+// call already charged for producing r (its own scanAnchor/expandStep/
+// cartesianJoin accounting), and cloneRow+mergeRowInto's O(bindings) copy is
+// not itself a "row produced" event under Budgets' documented model -- the
+// merged row is charged exactly once, if and when it survives to become a
+// final row (see runQuery's addFinalRow call). Charging it again here, for
+// every merged row regardless of whether WHERE or a later stage keeps it,
+// would double-count against that single canonical charge.
 func runCarriedPart(env *Env, part *Part, meter *workMeter, seed *Row) ([]*Row, error) {
 	if len(part.Nodes) == 0 {
 		return []*Row{cloneRow(seed)}, nil
@@ -284,9 +297,6 @@ func runCarriedPart(env *Env, part *Part, meter *workMeter, seed *Row) ([]*Row, 
 	for _, r := range rows {
 		nr := cloneRow(seed)
 		mergeRowInto(nr, r)
-		if err := meter.spend(1); err != nil {
-			return nil, err
-		}
 		out = append(out, nr)
 	}
 	return out, nil
