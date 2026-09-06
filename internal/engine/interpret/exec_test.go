@@ -833,3 +833,32 @@ func TestExecChainSingleFixedStepNamedPath(t *testing.T) {
 
 	assertPathSigs(t, snap, `MATCH p = (a:User)-[:X]->(b:User) RETURN p`, 0, []string{"N:1,2,|E:500,"})
 }
+
+// TestExecChainNamedVarLengthStepDeclines: a named var-length relationship
+// inside a mixed chain (e.g., `(a:X)-[r:X*1..]->(b:X)-[:X]->(c:X)`) must be
+// declined with errUnsupportedStep, matching the policy enforced by the
+// standalone expandVarLengthComponent.
+func TestExecChainNamedVarLengthStepDeclines(t *testing.T) {
+	const (
+		kindX snapshot.KindID = 1
+		kindY snapshot.KindID = 2
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindX: "X", kindY: "Y"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindX}, nil},
+			{2, []snapshot.KindID{kindX}, nil},
+			{3, []snapshot.KindID{kindX}, nil},
+		},
+		[]execEdgeSpec{
+			{100, 1, 2, kindY},
+			{101, 2, 3, kindY},
+		},
+	)
+
+	q := planQuery(t, snap, `MATCH (a:X)-[r:X*1..]->(b:X)-[:Y]->(c:X) RETURN a`)
+	_, err := Execute(&Env{Snap: snap}, q, generousBudget)
+	if err == nil {
+		t.Fatalf("Execute with named var-length step inside chain: expected error, got nil")
+	}
+}

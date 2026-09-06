@@ -23,8 +23,9 @@
 // PostgreSQL, which is always correct.
 //
 // projectItem has an explicit OutPath case for a bare path-variable RETURN
-// item, reading whatever expand.go's Task 8 functions bound via
-// Row.SetPathVar (always a *PathVal in this package, see expand.go).
+// item, reading whatever expand.go's Task 8 functions or this file's
+// assembleChainPathVal (Task 8b) bound via Row.SetPathVar (always a *PathVal
+// in this package).
 package interpret
 
 import (
@@ -87,10 +88,11 @@ type OutVal struct {
 
 // PathVal is a materialized path value: an alternating node/edge sequence,
 // Nodes[i] connected to Nodes[i+1] by Edges[i]. Declared here because
-// ResultSet/OutVal need the type; nothing in this file ever constructs one
-// (see the package doc's Task 8 seam) -- an empty PathVal (both slices nil)
-// is the eventual representation of a zero-length `*0..` path, per the
-// design doc, but that shape is likewise Task 8's to produce.
+// ResultSet/OutVal need the type; this file's assembleChainPathVal (Task 8b)
+// constructs them for named paths in mixed fixed/variable-length chains, while
+// expand.go's Task 8 functions construct them for standalone variable-length
+// and shortest-path patterns. An empty PathVal (both slices nil) is the
+// eventual representation of a zero-length `*0..` path, per the design doc.
 type PathVal struct {
 	Nodes []snapshot.NodeID
 	Edges []EdgeRef
@@ -607,6 +609,10 @@ func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int
 				return nil, err
 			}
 			continue
+		}
+
+		if step.EdgeSym != "" {
+			return nil, errUnsupportedStep
 		}
 
 		next := make([]*Row, 0, len(rows))
