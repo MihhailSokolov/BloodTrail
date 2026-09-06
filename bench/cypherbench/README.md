@@ -111,8 +111,9 @@ for the full decision logic, table-tested independent of any database).
 `collect_antijoin_prebuilt`'s pg baseline is a full-trail enumeration over a
 700,000-member group: on one recorded 5M-scale attempt it ran for over two
 hours without finishing, entirely unrelated to how fast the engine itself
-answers the same query. Without a limit, this one shape's pg baseline alone
-would make `-enforce`'s full run unusable at realistic scale.
+answers the same query. The density is realistic — see
+[../adgen/README.md](../adgen/README.md). Without a limit, this one shape's
+pg baseline alone would make `-enforce`'s full run unusable at realistic scale.
 
 `-pg-cap` (default `120s`) bounds every pg-baseline call -- warmup and every
 timed run -- to that wall-clock budget, via `context.WithTimeout` wrapped

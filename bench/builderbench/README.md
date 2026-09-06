@@ -38,7 +38,8 @@ calls per driver:
 2. **Group-members BFS**: `traversal.BreadthFirst` +
    `traversal.LightweightDriver`, following `MemberOf` edges inbound from
    the graph's highest-in-degree group (found with one SQL query at
-   startup) -- every node transitively a member of that group.
+   startup) -- every node transitively a member of that group. The density
+   is realistic — see [../adgen/README.md](../adgen/README.md).
 3. **Node count + full drain**: `Nodes().Filter(Kind(Node(),
    User)).Count()`, and the same filter's `FetchIDs()` fully drained.
 4. **The `DeleteTransitEdges` shape**: `Relationships().Filter(And(KindIn(

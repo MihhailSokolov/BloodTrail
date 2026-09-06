@@ -75,6 +75,33 @@ with a generous [8, 12] edges/node tolerance band at `-users 100000` (fast,
 no database needed) rather than asserting an exact ratio, since the ACL/
 nesting categories are randomized.
 
+### Density realism
+
+The ~25M `MemberOf` edges out of ~48.9M total edges (>50% of all edges)
+reflects realistic Active Directory group-membership structure. The benchmark
+hub -- a single 700k-member group in the `-users 2800000 -domains 4` run --
+is the per-domain Domain Users group, created by `generateDomainEdges`
+(line 532-535 in generate.go): every user gets one guaranteed `MemberOf`
+edge to this hub by construction. In real Active Directory, every user is a
+member of the domain's Domain Users group via its primaryGroupID, and both
+SharpHound and BloodHound materialize this as an explicit `MemberOf` edge.
+
+Beyond the hub, each user gets `extraMemberOfPerUser` (8) additional `MemberOf`
+edges to random groups, yielding ~9 memberships per user (1 hub + 8 extra).
+Real enterprise Active Directory commonly assigns 10 or more group memberships
+per user -- the number is high enough that Kerberos token-bloat and PAC
+(Privileged Attribute Certificate) size limits are a real concern in
+production deployments. The ~9 figure here is the *low* end of realistic
+enterprise group-membership density.
+
+When every user carries ~9 `MemberOf` edges and group-nesting adds further
+transitive memberships, `MemberOf` dominates the overall edge count. This is
+exactly what real BloodHound graph imports show: real graphs are `MemberOf`-heavy
+because real Active Directory is. The generated shapes are therefore authentic
+stress cases for pathfinding algorithms: a 700k-in-degree group and group-member
+BFS are genuinely bottlenecks in real BloodHound operations, not artifacts of
+the generator's construction.
+
 Generation is a pure, deterministic function of `Spec{Users, Seed}`
 (`generate.go`'s `Generate`): the same `-users`/`-seed` pair always produces
 the same graph *structure* -- same node/edge counts, same objectids, same
