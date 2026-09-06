@@ -101,6 +101,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -399,7 +400,20 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		if rowCap <= 0 {
 			return nil, ErrBudget
 		}
-		q.Limit = rowCap + 1
+		limit := int64(rowCap) + 1
+		// Push the user's own LIMIT into traverse's own enumeration cutoff
+		// instead of always shipping the full rowCap+1 -- safe exactly when
+		// there is nothing left for the post-executor Part.Where pass below
+		// to filter (noResidualWhere), since only then is every dense path
+		// traverse.AllShortestPaths returns guaranteed to survive unfiltered
+		// into the final result (see shortestPathBudget's own doc comment on
+		// why this differs from folding MaxRows in here directly). Never
+		// widens the cap past rowCap+1: a target the budget cannot afford
+		// still declines exactly as before.
+		if meter.limitTargetSet && meter.limitTarget >= 0 && meter.limitTarget < limit && noResidualWhere(part, step) {
+			limit = meter.limitTarget
+		}
+		q.Limit = int(limit)
 		q.MemoryLimit = memLimit
 	}
 
@@ -417,6 +431,13 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		// outright (ErrBudget) rather than silently serve the first rowCap
 		// and drop the rest -- see shortestPathBudget's own doc comment on
 		// the all-or-nothing materialization invariant this preserves.
+		//
+		// This still fires only when the BUDGET, not the user's own LIMIT,
+		// is what cut enumeration short: whenever the pushdown above set
+		// q.Limit to meter.limitTarget (<= rowCap by construction), dense can
+		// never exceed rowCap in the first place, so this branch simply never
+		// triggers for that case -- len(dense) == the user's target is a
+		// success, served below, with no extra branch needed to say so.
 		return nil, ErrBudget
 	}
 
@@ -499,6 +520,26 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 // admitting a non-fitting one -- Query's own documented all-or-nothing
 // materialization invariant applies here exactly as it does to every other
 // evaluator error in this package.
+//
+// expandShortestPathComponent additionally narrows that same rowCap+1 down
+// to the query's own user-written LIMIT (when eligible -- see its own
+// noResidualWhere gate) precisely because doing so sidesteps the exact
+// pre/post-Where unit mismatch this comment just spent two paragraphs ruling
+// MaxRows out over: MaxRows is unsafe to fold in here unconditionally
+// because it counts POST-filter rows while dense is PRE-filter, and Plan can
+// leave a residual cross-symbol conjunct (`s.prop = t.prop`) neither this
+// function nor resolveEndpoint has any way to evaluate before Path
+// materialization. The user's own LIMIT has no such mismatch ONLY when that
+// same residual-conjunct case is absent (noResidualWhere's own check): with
+// nothing left for Part.Where to filter, every dense Path this component
+// produces is already guaranteed to survive into the final result, so
+// stopping traversal once LIMIT many exist is equivalent to enumerating
+// everything and truncating afterward -- exactly the property MaxRows
+// cannot offer here without that same guarantee. This is why the two
+// caps -- MaxRows (never used, mismatched by default) and the user's own
+// LIMIT (used, but gated behind confirming the same mismatch cannot occur
+// for this specific query) -- get such different treatment despite looking
+// like the same "row count" idea at a glance.
 //
 // unbounded is true (rowCap and memLimit meaningless) when Budgets.MaxWork
 // itself is unset, matching traverse.Query.Limit/MemoryLimit's own "0 =>
@@ -798,6 +839,73 @@ func endpointsIntersect(total int, roots, terminals traverse.Endpoint) bool {
 		return true
 	})
 	return found
+}
+
+// noResidualWhere reports whether part.Where's complete conjunct set (Part's
+// own doc: Where is always the Part's complete and sufficient WHERE
+// expression, never merely "whatever pushdown left over") is fully accounted
+// for by step's own endpoint resolution, so Execute's post-executor
+// Part.Where pass over this component's produced rows can never actually
+// reject one of them -- the precondition the LIMIT pushdown below needs: a
+// row traverse.AllShortestPaths never got a chance to enumerate (because
+// enumeration stopped once the user's own LIMIT was reached) must never turn
+// out to be one Part.Where would have kept while a row that WAS enumerated
+// gets filtered out, which would silently under-serve the query relative to
+// full enumeration followed by filtering and LIMIT.
+//
+// plan.go's planPart flattens every WHERE conjunct (including inline-map-
+// desugared equalities) into one slice, walks it once to populate both
+// Part.Where (via rebuildConjunction, ANDing the same slice back together)
+// and every single-symbol conjunct's NodeConstraint.Predicates entry
+// (pushdown) -- the identical conjunct value, not a copy, ends up in both
+// places. So re-flattening part.Where (flattenTopLevelConjuncts, the same
+// function planPart itself used to build that slice in the first place) and
+// checking each resulting conjunct for reference equality against
+// step.FromSym's/step.ToSym's own Predicates exactly recovers "did pushdown
+// already consume this piece", with no need to re-walk or duplicate
+// pushdown's own symbol-touch tracking. The one other shape pushdown leaves
+// out of every NodeConstraint.Predicates entirely -- the s<>t/id(s)<>id(t)
+// endpoint inequality finalizeShortestPaths reads directly out of the
+// conjunct list to set step.HasExplicitEndpointInequality -- is recognized
+// here the same structural way that function does (variableInequality/
+// idInequality), since that conjunct becomes traverse.Query.ExcludeSelf
+// instead of a Predicates entry.
+//
+// Any other conjunct -- one touching some other symbol entirely (a wholly
+// separate MATCH pattern's own predicate sharing this Part), or one touching
+// both of step's endpoints together (e.g. `s.group = t.group`, which cannot
+// be a single-symbol Predicates entry for either) -- is never accounted for
+// by either check, correctly making this false: the pushdown must stay off
+// whenever any such conjunct exists, regardless of how small or large its
+// eventual filtering effect turns out to be.
+func noResidualWhere(part *Part, step *Step) bool {
+	fromNC, toNC := part.Nodes[step.FromSym], part.Nodes[step.ToSym]
+	for _, c := range flattenTopLevelConjuncts(part.Where) {
+		if predicateBelongsTo(fromNC, c) || predicateBelongsTo(toNC, c) {
+			continue
+		}
+		if variableInequality(c, step.FromSym, step.ToSym) || idInequality(c, step.FromSym, step.ToSym) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// predicateBelongsTo reports whether c is, by reference (see
+// noResidualWhere's own doc comment for why identity rather than structural
+// equality is exactly right here), one of nc's own pushed single-symbol
+// Predicates.
+func predicateBelongsTo(nc *NodeConstraint, c cypher.Expression) bool {
+	if nc == nil {
+		return false
+	}
+	for _, p := range nc.Predicates {
+		if p == c {
+			return true
+		}
+	}
+	return false
 }
 
 // kindMaskFor builds the *snapshot.KindMask traverse.Query.Kinds expects from

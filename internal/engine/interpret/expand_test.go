@@ -709,6 +709,141 @@ func TestExpandShortestPathKindsOnlySideNotMaterialized(t *testing.T) {
 	}
 }
 
+// TestExpandShortestPathLimitPushdownServesWithinBudget: mirrors
+// TestExpandShortestPathBudgetDeclinesOnHighFanOut's fixture -- one root and
+// one target joined by many (fanOut) distinct co-equal shortest paths -- but
+// runs it through the full runQuery pipeline with a `LIMIT 3` appended, no
+// ORDER BY/DISTINCT and no residual WHERE beyond the endpoint inequality.
+// Under the same tiny MaxWork the un-limited query legitimately declines
+// ErrBudget with (more true paths exist than the remaining work budget could
+// ever admit -- confirmed directly below as a baseline), reaching traverse's
+// own Query.Limit with the user's LIMIT instead of the full rowCap+1 lets
+// enumeration stop the moment 3 dense paths exist, comfortably inside
+// budget, so the query must SERVE exactly 3 rows rather than decline.
+func TestExpandShortestPathLimitPushdownServesWithinBudget(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+	nodes := []execNodeSpec{
+		{id: 1, kinds: []snapshot.KindID{kindRoot}},
+		{id: 2, kinds: []snapshot.KindID{kindTarget}},
+	}
+	var edges []execEdgeSpec
+	nextEdgeID := uint64(1)
+	const fanOut = 200
+	for i := uint64(0); i < fanOut; i++ {
+		mid := 100 + i
+		nodes = append(nodes, execNodeSpec{id: mid})
+		edges = append(edges,
+			execEdgeSpec{id: nextEdgeID, start: 1, end: mid, kind: kindE},
+			execEdgeSpec{id: nextEdgeID + 1, start: mid, end: 2, kind: kindE},
+		)
+		nextEdgeID += 2
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	budget := Budgets{MaxRows: 1_000_000, MaxWork: 10}
+
+	// Baseline: the identical query with no LIMIT still declines ErrBudget
+	// under this tiny MaxWork -- proof the budget really is the binding
+	// constraint this test's own LIMIT must overcome, not something already
+	// fixed elsewhere (or too generous a budget to exercise anything).
+	baseErr := execExpectErr(t, snap, `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`, budget)
+	if !errors.Is(baseErr, ErrBudget) {
+		t.Fatalf("no-LIMIT baseline: error = %v, want ErrBudget", baseErr)
+	}
+
+	rs := mustExec(t, snap, `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p LIMIT 3`, budget)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rs.Rows))
+	}
+}
+
+// TestExpandShortestPathLimitPushdownStillDeclinesOnResidualWhere: the same
+// high-fan-out fixture and the same LIMIT as
+// TestExpandShortestPathLimitPushdownServesWithinBudget, but with an
+// additional residual cross-symbol WHERE conjunct (`s.group = t.group`) Plan
+// cannot push into either endpoint's own NodeConstraint.Predicates. The
+// pushdown must stay off for this query -- serving a truncated first-3-dense
+// prefix here could silently drop paths Part.Where's own post-executor pass
+// would have kept while enumeration never even reached them -- so this must
+// still decline ErrBudget exactly like the no-LIMIT case, not silently
+// under-serve fewer than 3 correct rows.
+func TestExpandShortestPathLimitPushdownStillDeclinesOnResidualWhere(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+	nodes := []execNodeSpec{
+		{id: 1, kinds: []snapshot.KindID{kindRoot}, props: map[string]any{"group": "A"}},
+		{id: 2, kinds: []snapshot.KindID{kindTarget}, props: map[string]any{"group": "A"}},
+	}
+	var edges []execEdgeSpec
+	nextEdgeID := uint64(1)
+	const fanOut = 200
+	for i := uint64(0); i < fanOut; i++ {
+		mid := 100 + i
+		nodes = append(nodes, execNodeSpec{id: mid})
+		edges = append(edges,
+			execEdgeSpec{id: nextEdgeID, start: 1, end: mid, kind: kindE},
+			execEdgeSpec{id: nextEdgeID + 1, start: mid, end: 2, kind: kindE},
+		)
+		nextEdgeID += 2
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	err := execExpectErr(t, snap,
+		`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s.group = t.group AND s<>t RETURN p LIMIT 3`,
+		Budgets{MaxRows: 1_000_000, MaxWork: 10})
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("error = %v, want ErrBudget (residual WHERE must block the LIMIT pushdown)", err)
+	}
+}
+
+// TestExpandShortestPathLimitPushdownStillDeclinesWhenLimitExceedsBudget:
+// same fixture again, but with a LIMIT larger than the tiny MaxWork budget
+// could ever admit -- min(target, rowCap+1) must still floor at rowCap+1, so
+// this declines ErrBudget exactly as the un-limited query does: the BUDGET,
+// not the user's LIMIT, is the binding constraint here, and the pushdown
+// must never treat a large LIMIT as license to widen the budget's own cap.
+func TestExpandShortestPathLimitPushdownStillDeclinesWhenLimitExceedsBudget(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"}
+	nodes := []execNodeSpec{
+		{id: 1, kinds: []snapshot.KindID{kindRoot}},
+		{id: 2, kinds: []snapshot.KindID{kindTarget}},
+	}
+	var edges []execEdgeSpec
+	nextEdgeID := uint64(1)
+	const fanOut = 200
+	for i := uint64(0); i < fanOut; i++ {
+		mid := 100 + i
+		nodes = append(nodes, execNodeSpec{id: mid})
+		edges = append(edges,
+			execEdgeSpec{id: nextEdgeID, start: 1, end: mid, kind: kindE},
+			execEdgeSpec{id: nextEdgeID + 1, start: mid, end: 2, kind: kindE},
+		)
+		nextEdgeID += 2
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	err := execExpectErr(t, snap,
+		`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p LIMIT 1000`,
+		Budgets{MaxRows: 1_000_000, MaxWork: 10})
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("error = %v, want ErrBudget (a LIMIT the budget cannot afford must still decline)", err)
+	}
+}
+
 // --- shortestPath / allShortestPaths budget wiring --------------------------
 
 // TestExpandShortestPathBudget exercises shortestPathBudget's arithmetic

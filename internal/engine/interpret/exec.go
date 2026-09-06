@@ -130,11 +130,30 @@ type ResultSet struct {
 // workMeter accumulates Budgets.MaxWork's generic work-unit counter and
 // Budgets.MaxRows' exact final-row count over the course of one Execute
 // call. See Budgets' doc comment for the exact accounting/checking policy.
+//
+// limitTarget/limitTargetSet thread runQuery's own LIMIT-early-termination
+// target (pipeline.go's limitTarget(q)) down to a component executor that
+// has no direct access to the Query itself -- expandShortestPathComponent
+// (expand.go) receives only (env, meter, part, step), several calls below
+// runQuery, so the meter (which already reaches every producer) carries
+// this instead of widening that call chain's signatures. runQuery sets
+// both fields exactly once, unconditionally, at the top of its own body;
+// every other caller that builds a workMeter directly (every test that
+// calls a component executor without going through runQuery, plus any
+// future one) leaves limitTargetSet at its zero value (false), which
+// every reader of these fields must treat identically to
+// pipeline.go's own limitTarget(q) returning -1: "no LIMIT pushdown here,
+// run the unlimited path". Do NOT repurpose limitTarget's zero value
+// (0) as that sentinel -- 0 is a legitimate target (a literal `LIMIT 0`),
+// so only limitTargetSet distinguishes "unset" from "eligible with target
+// zero".
 type workMeter struct {
-	budget    Budgets
-	work      int64
-	unchecked int64
-	finalRows int
+	budget         Budgets
+	work           int64
+	unchecked      int64
+	limitTarget    int64
+	limitTargetSet bool
+	finalRows      int
 }
 
 // spend adds units to the work counter, checking it against

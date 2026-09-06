@@ -138,6 +138,14 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	// meter.work alike -- is unchanged by this feature.
 	target := limitTarget(q)
 
+	// Threaded onto meter (unconditionally, every call) so a component
+	// executor several calls below this one -- expand.go's
+	// expandShortestPathComponent, which has no direct access to q itself
+	// -- can also push this same target into its own traverse.Query.Limit.
+	// See workMeter's own doc comment for why limitTargetSet, not a -1
+	// sentinel on limitTarget alone, is what every reader must check.
+	meter.limitTarget, meter.limitTargetSet = target, target >= 0
+
 	part0 := &q.Parts[0]
 	var rows []*Row
 	var err error
