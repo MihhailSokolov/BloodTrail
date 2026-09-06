@@ -313,22 +313,28 @@ func declineReason(logTail string) string {
 
 // expectedDelegations lists corpus queries allowed to delegate to
 // PostgreSQL (decline bloodtrail's in-memory Cypher interpreter) instead of
-// being served, keyed by "<source>/<name>" (source is "agt", "agi", or
-// "selector"; name is the entry's own "name" field). Every entry must carry
-// a one-line reason. The milestone target is an empty map -- see
-// task-16-report.md for the investigation behind each entry below; none of
-// these is a trivial fix (this suite's one budgeted inline-fix round went
-// to the two genuine bugs task-16-report.md documents fixing elsewhere
-// instead), so each is a real, structural gap flagged for the controller
-// rather than silently patched.
+// being served, keyed by corpusQueryKey's "<source>/<name>#<index>" form
+// (source is "agt", "agi", or "selector"; name is the entry's own "name"
+// field; index disambiguates two or more corpus entries that happen to
+// share the same source+name -- e.g. agt.json's and agi.json's two,
+// differently-queried "Disabled Tier Zero / High Value principals" entries
+// -- since name alone is not always unique within one file). Every entry
+// must carry a one-line reason, and assertAllowlistKeysUnambiguous asserts
+// every key here matches exactly one corpus query. The milestone target is
+// an empty map -- see task-16-report.md for the investigation behind each
+// entry below; none of these is a trivial fix (this suite's one budgeted
+// inline-fix round went to the one genuine bug task-16-report.md documents
+// fixing elsewhere instead -- graphtest.CorpusSchema's missing
+// DefaultGraph), so each is a real, structural gap flagged for the
+// controller rather than silently patched.
 var expectedDelegations = map[string]string{
 	// interpret's Plan/Execute (internal/engine/interpret) has no handling
 	// anywhere for cypher.PatternPredicate at all (confirmed by grep: zero
 	// references in the package) -- a bare relationship pattern used as a
 	// WHERE-clause boolean predicate, e.g. "WHERE (n)-[:Kind]-(m)", is an
 	// entire unimplemented Cypher feature, not a bug to patch inline.
-	"agt/Cross-forest trusts with abusable configuration": "WHERE-clause pattern predicate (cypher.PatternPredicate) has no interpret support at all",
-	"agi/Cross-forest trusts with abusable configuration": "WHERE-clause pattern predicate (cypher.PatternPredicate) has no interpret support at all",
+	"agt/Cross-forest trusts with abusable configuration#0": "WHERE-clause pattern predicate (cypher.PatternPredicate) has no interpret support at all",
+	"agi/Cross-forest trusts with abusable configuration#0": "WHERE-clause pattern predicate (cypher.PatternPredicate) has no interpret support at all",
 
 	// eval.go's applyArithmetic has a doc comment stating plainly: "Cypher
 	// also defines `+` for string/list concatenation, but the brief scopes
@@ -340,7 +346,7 @@ var expectedDelegations = map[string]string{
 	// at runtime on its first WHERE evaluation
 	// ('CN=ADMINSDHOLDER,...' + n.distinguishedname), which
 	// applyArithmetic reports as ErrUnsupported -> reasonUnsupported.
-	"selector/AdminSDHolder": "WHERE clause concatenates strings via '+'; eval.go's applyArithmetic is deliberately numeric-only",
+	"selector/AdminSDHolder#0": "WHERE clause concatenates strings via '+'; eval.go's applyArithmetic is deliberately numeric-only",
 
 	// MATCH p=shortestPath((s)-[:<~64 AD pathfinding kinds>*1..]->(t:Tag_Tier_Zero))
 	// WHERE s<>t -- s is completely unconstrained (every node in the graph
@@ -354,8 +360,8 @@ var expectedDelegations = map[string]string{
 	// blindly to paper over one worst-case corpus query, with no broader
 	// perf investigation, was judged out of scope for this suite's one
 	// budgeted inline-fix round.
-	"agt/Shortest paths to Tier Zero / High Value targets": "unconstrained multi-source unbounded-length shortestPath exceeds interpret.Execute's MaxWork budget",
-	"agi/Shortest paths to Tier Zero / High Value targets": "unconstrained multi-source unbounded-length shortestPath exceeds interpret.Execute's MaxWork budget",
+	"agt/Shortest paths to Tier Zero / High Value targets#0": "unconstrained multi-source unbounded-length shortestPath exceeds interpret.Execute's MaxWork budget",
+	"agi/Shortest paths to Tier Zero / High Value targets#0": "unconstrained multi-source unbounded-length shortestPath exceeds interpret.Execute's MaxWork budget",
 }
 
 // knownAmbiguousQueries lists corpus queries whose shortestPath(...) this
@@ -384,20 +390,45 @@ var expectedDelegations = map[string]string{
 // decline, no serving bug) -- only the suite's default exact-edge-identity
 // comparison is too strict for a query whose own semantics permit more
 // than one right answer.
+//
+// Keyed the same way as expectedDelegations (corpusQueryKey's
+// "<source>/<name>#<index>"), and covered by the same
+// assertAllowlistKeysUnambiguous guard.
 var knownAmbiguousQueries = map[string]string{
-	"agt/Shortest paths to privileged roles":    "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
-	"agi/Shortest paths to privileged roles":    "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
-	"agt/Shortest paths to Azure Subscriptions": "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
-	"agi/Shortest paths to Azure Subscriptions": "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
+	"agt/Shortest paths to privileged roles#0":    "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
+	"agi/Shortest paths to privileged roles#0":    "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
+	"agt/Shortest paths to Azure Subscriptions#0": "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
+	"agi/Shortest paths to Azure Subscriptions#0": "azTenant1 AZContains both azUser1 and azgroup1, each one hop from the query's only reachable target",
 }
 
 // corpusQuery is one entry TestPrebuiltCorpusDifferential runs, pulled from
 // agt.json/agi.json (commonSearchEntry) or selectors.json (selectorEntry)
 // and flattened to a common shape.
+//
+// index is the 0-based occurrence count of this entry among every corpus
+// entry sharing the same source+name seen so far (assigned in file order by
+// activeCorpusQueries' newCorpusQuery helper) -- name alone is not always
+// unique within one file: both agt.json and agi.json each carry two,
+// differently-queried entries named "Disabled Tier Zero / High Value
+// principals" (one against `Base`/AD, one against `AZBase`/Azure,
+// distinguished only by their "subheader" field, which corpusQuery does not
+// otherwise carry). index exists purely so corpusQueryKey can build an
+// unambiguous allowlist key for every entry, including these.
 type corpusQuery struct {
 	source string
 	name   string
 	query  string
+	index  int
+}
+
+// corpusQueryKey returns q's key into expectedDelegations and
+// knownAmbiguousQueries: "<source>/<name>#<index>". Also used as q's t.Run
+// subtest name, so that two same-named corpus entries (see corpusQuery's own
+// doc) get distinct, stable subtest names instead of relying on go test's
+// own automatic "#01" disambiguation suffix -- which would otherwise be
+// visually indistinguishable from this key's own "#0"/"#1" suffix.
+func corpusQueryKey(q corpusQuery) string {
+	return fmt.Sprintf("%s/%s#%d", q.source, q.name, q.index)
 }
 
 // activeCorpusQueries returns every non-disabled, non-probe query across
@@ -409,6 +440,16 @@ func activeCorpusQueries(t *testing.T) (queries []corpusQuery, probe commonSearc
 	agt := loadCommonSearches(t, "testdata/prebuilt/agt.json")
 	agi := loadCommonSearches(t, "testdata/prebuilt/agi.json")
 	selectors := loadSelectors(t, "testdata/prebuilt/selectors.json")
+
+	// nameCounts tracks, per "<source>/<name>", how many corpusQuery entries
+	// have already been assigned that pair -- corpusQuery.index below.
+	nameCounts := make(map[string]int)
+	newCorpusQuery := func(source, name, query string) corpusQuery {
+		base := source + "/" + name
+		index := nameCounts[base]
+		nameCounts[base]++
+		return corpusQuery{source: source, name: name, query: query, index: index}
+	}
 
 	var probeFound bool
 	for _, e := range agt {
@@ -423,7 +464,7 @@ func activeCorpusQueries(t *testing.T) (queries []corpusQuery, probe commonSearc
 		if e.Disabled {
 			continue
 		}
-		queries = append(queries, corpusQuery{source: "agt", name: e.Name, query: e.Query})
+		queries = append(queries, newCorpusQuery("agt", e.Name, e.Query))
 	}
 	if !probeFound {
 		t.Fatalf("agt.json: no probe entry found")
@@ -433,23 +474,52 @@ func activeCorpusQueries(t *testing.T) (queries []corpusQuery, probe commonSearc
 		if e.Disabled {
 			continue
 		}
-		queries = append(queries, corpusQuery{source: "agi", name: e.Name, query: e.Query})
+		queries = append(queries, newCorpusQuery("agi", e.Name, e.Query))
 	}
 
 	for _, s := range selectors {
-		queries = append(queries, corpusQuery{source: "selector", name: s.Name, query: s.Query})
+		queries = append(queries, newCorpusQuery("selector", s.Name, s.Query))
 	}
 
 	return queries, probe
 }
 
+// assertAllowlistKeysUnambiguous fails the suite if any key in allowlist
+// (expectedDelegations or knownAmbiguousQueries, named by label purely for
+// the failure message) does not identify exactly one entry of queries under
+// corpusQueryKey -- either zero (a stale or mistyped key, silently inert)
+// or, the bug this specifically guards against, more than one (two or more
+// corpus entries sharing a source+name -- see corpusQuery's own doc --
+// colliding on one allowlist slot without corpusQueryKey's index
+// disambiguator).
+func assertAllowlistKeysUnambiguous(t *testing.T, queries []corpusQuery, allowlist map[string]string, label string) {
+	t.Helper()
+
+	counts := make(map[string]int, len(queries))
+	for _, q := range queries {
+		counts[corpusQueryKey(q)]++
+	}
+
+	for key := range allowlist {
+		switch n := counts[key]; {
+		case n == 0:
+			t.Errorf("%s[%q]: matches no corpus query -- stale or mistyped key", label, key)
+		case n > 1:
+			t.Errorf("%s[%q]: matches %d corpus queries, want exactly 1 -- allowlist keys must be unambiguous", label, key, n)
+		}
+	}
+}
+
 // hasOrderBy reports whether query's text contains an ORDER BY clause,
 // case-insensitively (matching Cypher's own keyword case-insensitivity).
-// Exactly one corpus query has one -- "Kerberoastable users with most admin
-// privileges", identical text in both agt.json and agi.json -- whose result
-// order (by a derived adminCount, descending) is semantically meaningful, so
-// that query's comparisons run as ordered sequences instead of the default
-// set/multiset ones every other query gets.
+// Exactly one corpus query has one today -- orderedCorpusQueryName,
+// identical text in both agt.json and agi.json -- whose result order (by a
+// derived adminCount, descending) is semantically meaningful, so that
+// query's comparisons run as ordered sequences instead of the default
+// set/multiset ones every other query gets. See orderedCorpusQueryName's own
+// doc for how ties in that sort key are handled, and
+// TestPrebuiltCorpusDifferential's inventory check for what happens if a
+// second ORDER BY query ever joins the corpus.
 func hasOrderBy(query string) bool {
 	return strings.Contains(strings.ToUpper(query), "ORDER BY")
 }
@@ -583,18 +653,196 @@ func runCorpusQuery(t *testing.T, ctx context.Context, db graph.Database, query 
 	return result, qerr
 }
 
+// orderedCorpusQueryName is the corpus's one query today whose ORDER BY
+// makes its result order semantically meaningful: "Kerberoastable users
+// with most admin privileges" (identical text in agt.json and agi.json --
+// see hasOrderBy). Its own "RETURN u ORDER BY adminCount DESC LIMIT 100"
+// never projects adminCount itself, and this fixture ties 5 of its 6
+// qualifying users at adminCount=10 -- so plain exact-sequence comparison
+// between two independently implemented engines would depend on each
+// engine's own incidental same-key iteration order among the tied rows, not
+// on anything ORDER BY itself guarantees. assertOrderedCorpusResult routes
+// exactly this query through tie-aware, sort-key-group comparison instead
+// (assertOrderedByAdminCountGroups); any other ORDER BY query (there are
+// none today) falls back to assertCorpusResultsMatch's plain exact-sequence
+// comparison -- but TestPrebuiltCorpusDifferential separately asserts, as a
+// suite-level inventory check, that no such other query exists yet. That
+// inventory check is a deliberate tripwire: a future corpus update
+// introducing a second ORDER BY query would otherwise silently inherit the
+// exact-sequence fallback -- which may be exactly as tie-fragile as this one
+// was -- without anyone deciding whether it needs its own group-aware
+// treatment too.
+const orderedCorpusQueryName = "Kerberoastable users with most admin privileges"
+
+// adminCountQuery reproduces orderedCorpusQueryName's own MATCH/WITH clause
+// (see testdata/prebuilt/agt.json / agi.json) with "RETURN u, adminCount" in
+// place of "RETURN u ... ORDER BY adminCount DESC LIMIT 100": the same
+// computation, with its sort key exposed as a second projected value so
+// adminCountSignatures can determine, per qualifying user, the adminCount
+// that put them where the corpus query put them. Kept in sync with the
+// corpus JSON by eye (there is exactly one call site); orderedCorpusQueryName
+// names the exact corpus entries to diff this against by hand if either
+// ever changes.
+const adminCountQuery = `
+MATCH (u:User)
+WHERE u.hasspn = true
+  AND u.enabled = true
+  AND NOT u.objectid ENDS WITH '-502'
+  AND NOT COALESCE(u.gmsa, false) = true
+  AND NOT COALESCE(u.msa, false) = true
+MATCH (u)-[:MemberOf|AdminTo*1..]->(c:Computer)
+WITH DISTINCT u, COUNT(c) AS adminCount
+RETURN u, adminCount
+`
+
+// adminCountSignatures runs adminCountQuery against db (the pg oracle, in
+// practice -- an independent source of truth for the sort key
+// orderedCorpusQueryName's own "RETURN u" never exposes) and returns a map
+// from each qualifying user's graph.ID (string form, matching
+// idSequence/idSet) to a scalarSignature-normalized rendering of that user's
+// adminCount.
+//
+// Correlating each row's node (u) with that same row's literal (adminCount)
+// relies on adminCountQuery returning exactly one node and one literal per
+// row: ops.FetchByQuery accumulates nodes across *all* rows of a result into
+// one shared graph.Path rather than resetting per row (see extractNodeIDs'
+// own doc), so node and literal slices are not row-aligned for an arbitrary
+// query -- but they are here, because every row of this specific query
+// contributes exactly one of each, appended in the same order
+// queryResult.Next() visits rows, so the i-th extracted node and the i-th
+// extracted literal always come from the same row.
+func adminCountSignatures(t *testing.T, ctx context.Context, db graph.Database) map[string]string {
+	t.Helper()
+
+	result, err := runCorpusQuery(t, ctx, db, adminCountQuery)
+	if err != nil {
+		t.Fatalf("adminCountQuery: %v", err)
+	}
+
+	ids := idSequence(extractNodeIDs(result))
+	sigs := extractLiteralSignatures(result)
+	if len(ids) != len(sigs) {
+		t.Fatalf("adminCountQuery: got %d user ids but %d adminCount literals (want exactly one of each per row, in lockstep)", len(ids), len(sigs))
+	}
+
+	out := make(map[string]string, len(ids))
+	for i, id := range ids {
+		out[id] = sigs[i]
+	}
+	return out
+}
+
+// sortKeyGroup is one consecutive run of equal sort-key values within an
+// ordered corpus result's node-id sequence -- e.g. every user tied at
+// adminCount=10, in whatever relative order one engine happened to emit
+// them.
+type sortKeyGroup struct {
+	key string
+	ids []string // set semantics within the group; encounter order is not meaningful
+}
+
+// groupConsecutiveBySortKey partitions ids (in encounter order) into
+// sortKeyGroup runs, looking up each id's sort-key value in keyOf. This is
+// the tie-aware comparison unit ORDER BY actually promises: the *sequence*
+// of groups -- which key, how many members, in what order relative to other
+// groups -- is significant, but *within* one tied group, membership is a
+// set: which specific id landed in which position inside the tie is not
+// something ORDER BY (or this suite) can hold either engine to.
+func groupConsecutiveBySortKey(t *testing.T, label string, ids []string, keyOf map[string]string) []sortKeyGroup {
+	t.Helper()
+
+	var groups []sortKeyGroup
+	for _, id := range ids {
+		key, ok := keyOf[id]
+		if !ok {
+			t.Fatalf("%s: returned user id %s has no adminCount from the independent oracle query -- fixture/query mismatch", label, id)
+		}
+		if n := len(groups); n > 0 && groups[n-1].key == key {
+			groups[n-1].ids = append(groups[n-1].ids, id)
+		} else {
+			groups = append(groups, sortKeyGroup{key: key, ids: []string{id}})
+		}
+	}
+	return groups
+}
+
+// assertOrderedByAdminCountGroups is orderedCorpusQueryName's tie-aware
+// replacement for plain exact-sequence comparison: it derives each returned
+// user's adminCount independently (adminCountSignatures), partitions both
+// sides' returned node-id sequences into consecutive equal-adminCount runs
+// (groupConsecutiveBySortKey), and asserts the *sequence of groups* matches
+// -- same key, same size, same relative order -- while each group's own
+// membership is compared as a set. That is exactly what "ORDER BY adminCount
+// DESC" guarantees when the fixture ties 5 of its 6 qualifying users at
+// adminCount=10: which of the tied users is emitted first is unspecified,
+// but the tied block as a whole must appear together, in the right position
+// relative to any untied rows -- unlike this suite's previous plain
+// exact-sequence comparison, which happened to pass only because both
+// engines' incidental iteration order over the tied group agreed.
+//
+// orderedCorpusQueryName's own "RETURN u" projects neither edges nor
+// literals, so both are asserted empty here rather than silently skipped --
+// a future edit widening that RETURN clause should make this function fail
+// loudly instead of quietly stop checking something it once checked.
+func assertOrderedByAdminCountGroups(t *testing.T, ctx context.Context, oracleDB graph.Database, got, want ops.QueryResult) {
+	t.Helper()
+
+	keyOf := adminCountSignatures(t, ctx, oracleDB)
+
+	gotGroups := groupConsecutiveBySortKey(t, "bloodtrail", idSequence(extractNodeIDs(got)), keyOf)
+	wantGroups := groupConsecutiveBySortKey(t, "oracle", idSequence(extractNodeIDs(want)), keyOf)
+
+	if len(gotGroups) != len(wantGroups) {
+		t.Fatalf("adminCount group-sequence mismatch: got %d groups, want %d\n got:  %+v\nwant: %+v", len(gotGroups), len(wantGroups), gotGroups, wantGroups)
+	}
+	for i := range gotGroups {
+		if gotGroups[i].key != wantGroups[i].key {
+			t.Errorf("group %d: adminCount key mismatch: got %s, want %s", i, gotGroups[i].key, wantGroups[i].key)
+			continue
+		}
+		assertStringMultiset(t, gotGroups[i].ids, wantGroups[i].ids, fmt.Sprintf("group %d (adminCount %s) membership", i, gotGroups[i].key))
+	}
+
+	if gotEdges, wantEdges := extractEdgeIDs(got), extractEdgeIDs(want); len(gotEdges) != 0 || len(wantEdges) != 0 {
+		t.Errorf("orderedCorpusQueryName unexpectedly returned edges (got %d, want %d); this comparison only handles its current RETURN u shape", len(gotEdges), len(wantEdges))
+	}
+	if len(got.Literals) != 0 || len(want.Literals) != 0 {
+		t.Errorf("orderedCorpusQueryName unexpectedly returned literals (got %d, want %d); this comparison only handles its current RETURN u shape", len(got.Literals), len(want.Literals))
+	}
+}
+
+// assertOrderedCorpusResult compares got against want for a corpus query
+// whose ORDER BY makes its result sequence semantically meaningful,
+// dispatching by name: see orderedCorpusQueryName's own doc for why only
+// that one name gets tie-aware group comparison, with every other name
+// falling back to assertCorpusResultsMatch's plain exact-sequence
+// comparison.
+func assertOrderedCorpusResult(t *testing.T, ctx context.Context, oracleDB graph.Database, name string, got, want ops.QueryResult) {
+	t.Helper()
+
+	if name == orderedCorpusQueryName {
+		assertOrderedByAdminCountGroups(t, ctx, oracleDB, got, want)
+		return
+	}
+
+	assertCorpusResultsMatch(t, true, got, want)
+}
+
 // TestPrebuiltCorpusDifferential is milestone 4's Task 16 exit criterion --
-// see this file's Task 16 section doc above for the full design. Per
-// non-disabled, non-probe query across agt.json, agi.json, and
-// selectors.json (222 entries), this:
+// see this file's Task 16 section doc above for the full design. Before
+// running anything, it guards both allowlists (assertAllowlistKeysUnambiguous
+// on expectedDelegations and knownAmbiguousQueries) and the ORDER BY
+// inventory (orderedCorpusQueryName's own doc). Then, per non-disabled,
+// non-probe query across agt.json, agi.json, and selectors.json (222
+// entries), this:
 //
 //  1. runs the query through the bloodtrail driver (served, if at all, from
 //     a snapshot forced fresh via a manual engine.RebuildNow over Task 15's
 //     internal/graphtest.LoadCorpusFixture) and through a raw pg driver
 //     oracle on the same database, both via ops.FetchByQuery;
-//  2. compares node id sets, edge id sets, and literal values (ordered
-//     sequences instead, for the one corpus query with an ORDER BY --
-//     hasOrderBy);
+//  2. compares node id sets, edge id sets, and literal values -- tie-aware
+//     sort-key-group comparison instead, for the one corpus query with an
+//     ORDER BY (hasOrderBy, assertOrderedCorpusResult);
 //  3. asserts the bloodtrail side actually served the query (a
 //     cypherServedMarker log delta), unless the query is named in
 //     expectedDelegations;
@@ -681,6 +929,34 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 		t.Fatalf("active corpus query count = %d, want %d (see task-14-brief.md's counts)", len(queries), wantActive)
 	}
 
+	// Guard both allowlists before running anything: every key in either map
+	// must identify exactly one corpus query under corpusQueryKey (see
+	// assertAllowlistKeysUnambiguous's own doc) -- catching, for instance, a
+	// key that collides across two corpus entries sharing a source+name.
+	assertAllowlistKeysUnambiguous(t, queries, expectedDelegations, "expectedDelegations")
+	assertAllowlistKeysUnambiguous(t, queries, knownAmbiguousQueries, "knownAmbiguousQueries")
+
+	// Inventory tripwire for orderedCorpusQueryName (see its own doc): every
+	// ORDER BY query in the corpus today must be that one, named query. If a
+	// future corpus update adds a second, genuinely different ORDER BY
+	// query, this must fail loudly here rather than let that query silently
+	// fall back to assertOrderedCorpusResult's plain exact-sequence
+	// comparison unnoticed.
+	var orderedQueryCount int
+	for _, q := range queries {
+		if !hasOrderBy(q.query) {
+			continue
+		}
+		orderedQueryCount++
+		if q.name != orderedCorpusQueryName {
+			t.Fatalf("corpus query %q (%s) has an ORDER BY clause but is not orderedCorpusQueryName (%q); a new ordered corpus query needs a deliberate decision on tie-safety (see orderedCorpusQueryName's doc) before this suite can trust it to either group-aware or exact-sequence comparison", q.name, corpusQueryKey(q), orderedCorpusQueryName)
+		}
+	}
+	const wantOrderedQueryCount = 2 // orderedCorpusQueryName, once each in agt.json and agi.json
+	if orderedQueryCount != wantOrderedQueryCount {
+		t.Fatalf("found %d corpus queries with ORDER BY named %q, want %d (agt + agi) -- corpus shape changed; re-check whether assertOrderedByAdminCountGroups still applies", orderedQueryCount, orderedCorpusQueryName, wantOrderedQueryCount)
+	}
+
 	var (
 		nonEmptyCount int
 		undelegated   int // active, non-allowlisted queries that declined
@@ -688,7 +964,7 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 
 	for _, q := range queries {
 		q := q
-		key := q.source + "/" + q.name
+		key := corpusQueryKey(q)
 
 		t.Run(key, func(t *testing.T) {
 			ordered := hasOrderBy(q.query)
@@ -719,8 +995,10 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 			if reason, ambiguous := knownAmbiguousQueries[key]; ambiguous {
 				t.Logf("comparing node ids only: known shortestPath tie (%s)", reason)
 				assertStringMultiset(t, idSet(extractNodeIDs(gotResult)), idSet(extractNodeIDs(wantResult)), "node id set")
+			} else if ordered {
+				assertOrderedCorpusResult(t, ctx, oracleDB, q.name, gotResult, wantResult)
 			} else {
-				assertCorpusResultsMatch(t, ordered, gotResult, wantResult)
+				assertCorpusResultsMatch(t, false, gotResult, wantResult)
 			}
 
 			if len(wantResult.Paths) > 0 || len(wantResult.Literals) > 0 {
