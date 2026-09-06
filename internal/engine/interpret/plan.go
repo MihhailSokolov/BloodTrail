@@ -1472,6 +1472,9 @@ func (pb *partBuilder) checkExpr(expr cypher.Expression, predicatePosition bool)
 	case *cypher.KindMatcher:
 		return pb.checkKindMatcher(e)
 
+	case *cypher.PatternPredicate:
+		return pb.checkPatternPredicate(e)
+
 	case *cypher.Variable:
 		if e == nil {
 			return false
@@ -1705,6 +1708,123 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 	}
 	pb.touched[v.Symbol] = true
 	return true
+}
+
+// checkPatternPredicate validates a WHERE-clause bare relationship pattern
+// used as a boolean predicate (`WHERE (n)-[:K]->(m)`, or negated via
+// `WHERE NOT (n)-[:K]->(m)` -- checkExpr's *cypher.Negation case already
+// recurses here unchanged, and eval.go's evalNegation composes with
+// whatever Tri this returns the ordinary way, so NOT needs no special
+// handling of its own).
+//
+// This package accepts only the one shape pg's own translation supports
+// for it (verified against dawgs@v0.8.0's cypher/models/pgsql/translate/
+// predicate.go): a SINGLE, FIXED-LENGTH relationship step between two node
+// patterns that are BARE REFERENCES to already-pattern-bound node
+// variables. The grammar for a pattern predicate is exactly one
+// oC_RelationshipsPattern -- oC_NodePattern (oC_PatternElementChain)+ --
+// which can itself be a multi-hop chain (`(a)-[:X]->(b)-[:Y]->(c)`, 5
+// PatternElements: Node, Rel, Node, Rel, Node); pg's own
+// translatePatternPredicate rejects any such chain that resolves to more
+// or less than one internal PatternPart with "expected exactly one pattern
+// part for pattern predicate", which this package mirrors far more simply
+// as len(PatternElements) == 3 (exactly one relationship, i.e. one hop):
+// PatternPredicateVisitor (frontend/pattern.go) flattens the whole chain
+// into one PatternElements slice regardless of hop count, so any chain
+// longer than one hop produces more than 3 elements and rejects here --
+// delegating the whole query to PostgreSQL is this package's only fallback
+// for that shape either way, so declining at Plan time rather than at
+// translate time costs nothing.
+//
+// Also rejected, all deliberately conservative narrowings this package's
+// required corpus never needs (REJECTED delegates to PostgreSQL, which is
+// always safe, per the milestone's own established convention):
+//   - Range != nil (`(n)-[:K*1..]->(m)` inside a pattern predicate): pg's
+//     own buildPatternPredicates rejects this outright ("expansion in
+//     pattern predicate not supported"), so this package must too rather
+//     than silently plan a shape pg itself cannot translate.
+//   - A named relationship variable (`(n)-[r:K]->(m)`): existence-only
+//     evaluation (evalPatternPredicate) never binds anything from inside a
+//     pattern predicate, matching pg's own semantics (a pattern predicate
+//     only ever contributes a boolean, never a projectable value) -- a
+//     named variable here would be dead syntax at best, so this package
+//     declines rather than silently drop a binding a caller might expect.
+//   - rel.Properties (an inline map on the relationship): mirrors
+//     buildStep's own identical rejection for an ordinary MATCH step (this
+//     package's snapshot has no edge property store to check one against).
+//   - Either node pattern carrying its own Kinds/Properties, or a fresh
+//     (not-already-known) or anonymous node variable: this package's
+//     required corpus always writes both endpoints as bare references to
+//     variables the outer MATCH already bound (e.g. `WHERE
+//     (n)-[:K]-(m)` after `MATCH (n:Domain)...(m:Domain)`); pg's own
+//     translation *does* appear to support introducing a fresh/anonymous
+//     node inside a pattern predicate (a genuine existential subquery over
+//     a new variable, not merely a semi-join against an existing binding),
+//     but this package implements nothing to resolve a fresh node's own
+//     constraints inside evalPatternPredicate's pure two-endpoint adjacency
+//     check, so that broader shape stays planner-rejected rather than
+//     mis-served.
+func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
+	if pp == nil || len(pp.PatternElements) != 3 {
+		return false
+	}
+
+	from, ok := pb.checkPatternPredicateEndpoint(pp.PatternElements[0])
+	if !ok {
+		return false
+	}
+	rel, isRel := pp.PatternElements[1].Element.(*cypher.RelationshipPattern)
+	if !isRel || rel == nil || rel.Range != nil || rel.Variable != nil || rel.Properties != nil {
+		return false
+	}
+	to, ok := pb.checkPatternPredicateEndpoint(pp.PatternElements[2])
+	if !ok {
+		return false
+	}
+
+	switch rel.Direction {
+	case graph.DirectionOutbound, graph.DirectionInbound, graph.DirectionBoth:
+	default:
+		return false
+	}
+	for _, k := range rel.Kinds {
+		if _, ok := pb.snap.Kinds.ID(k.String()); !ok {
+			return false
+		}
+	}
+
+	// A two-symbol predicate never pushes into either symbol's own
+	// NodeConstraint.Predicates (pushdown, below, only pushes when exactly
+	// one symbol is touched) -- it stays a residual Part.Where conjunct,
+	// evaluated once the whole row is assembled, exactly like any other
+	// cross-symbol WHERE conjunct (e.g. `s.prop = t.prop`). from == to
+	// (`(n)-[:K]-(n)`) still marks exactly one symbol touched, which *does*
+	// push into that single symbol's own Predicates -- also correct,
+	// since resolveEndpointSet's per-candidate EvalPredicate call handles a
+	// self-referencing predicate the same way any other single-symbol one
+	// works.
+	pb.touched[from] = true
+	pb.touched[to] = true
+	return true
+}
+
+// checkPatternPredicateEndpoint validates one PatternPredicate.PatternElements
+// entry as a bare reference to an already-pattern-bound node variable (see
+// checkPatternPredicate's own doc for why: no fresh/anonymous nodes, no
+// re-stated Kinds/Properties), returning its symbol.
+func (pb *partBuilder) checkPatternPredicateEndpoint(el *cypher.PatternElement) (sym string, ok bool) {
+	if el == nil {
+		return "", false
+	}
+	np, isNode := el.Element.(*cypher.NodePattern)
+	if !isNode || np == nil || np.Variable == nil || len(np.Kinds) > 0 || np.Properties != nil {
+		return "", false
+	}
+	k, known := pb.known[np.Variable.Symbol]
+	if !known || k != symNode {
+		return "", false
+	}
+	return np.Variable.Symbol, true
 }
 
 // checkPropertyLookup validates `atom.prop`: atom must be either a node

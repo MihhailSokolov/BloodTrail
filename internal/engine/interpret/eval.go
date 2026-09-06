@@ -271,6 +271,12 @@ func EvalPredicate(env *Env, row *Row, expr cypher.Expression) (Tri, error) {
 		}
 		return evalKindMatcher(env, row, typed)
 
+	case *cypher.PatternPredicate:
+		if typed == nil {
+			return TriNull, ErrUnsupported
+		}
+		return evalPatternPredicate(env, row, typed)
+
 	default:
 		// Anything else (a bare PropertyLookup, Variable, FunctionInvocation,
 		// or Literal used directly as a WHERE conjunct, e.g. `WHERE n.flag`)
@@ -810,6 +816,94 @@ func matchKinds(env *Env, have []snapshot.KindID, want graph.Kinds, exclusive bo
 func containsKindID(have []snapshot.KindID, k snapshot.KindID) bool {
 	for _, h := range have {
 		if h == k {
+			return true
+		}
+	}
+	return false
+}
+
+// evalPatternPredicate evaluates a WHERE-clause bare relationship pattern
+// used as a boolean predicate -- `(n)-[:K]->(m)`, or negated via evalNegation's
+// own generic "evaluate positively, then Tri.Not()" path -- as a pure
+// existence check: does at least one edge whose kind is in rel.Kinds (empty
+// meaning "any kind", edgeKindOK's own convention) connect the two
+// row-bound endpoints in the pattern's declared direction?
+//
+// checkPatternPredicate (plan.go) has already validated pp's shape at plan
+// time -- exactly one fixed-length step between two already-bound node
+// variables, every named kind resolvable against this same snapshot -- so
+// every failure mode below (a type assertion failing, row.Node missing a
+// symbol, a kind name not resolving) is expected to be unreachable against
+// any Query this package's own Plan produced; each still returns
+// ErrUnsupported defensively (delegate to PostgreSQL) rather than panic,
+// matching this file's own established convention (e.g. evalKindMatcher)
+// of never trusting an unconditional type assertion in evaluator code.
+//
+// The result is always TriTrue or TriFalse, never TriNull: per the
+// milestone brief's own pin, a pattern predicate's existence check has
+// nothing to be NULL about (no property lookup is ever involved -- only
+// row-bound node identity and a snapshot-resolved kind mask), matching
+// pg's own translation, which lowers this to `EXISTS(SELECT 1 FROM edge
+// WHERE ...)` -- a SQL boolean, never SQL NULL.
+func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri, error) {
+	if len(pp.PatternElements) != 3 {
+		return TriNull, ErrUnsupported
+	}
+	fromNode, isNode := pp.PatternElements[0].Element.(*cypher.NodePattern)
+	rel, isRel := pp.PatternElements[1].Element.(*cypher.RelationshipPattern)
+	toNode, isNode2 := pp.PatternElements[2].Element.(*cypher.NodePattern)
+	if !isNode || !isRel || !isNode2 || fromNode == nil || rel == nil || toNode == nil {
+		return TriNull, ErrUnsupported
+	}
+	if fromNode.Variable == nil || toNode.Variable == nil {
+		return TriNull, ErrUnsupported
+	}
+
+	fromID, ok := row.Node(fromNode.Variable.Symbol)
+	if !ok {
+		return TriNull, ErrUnsupported
+	}
+	toID, ok := row.Node(toNode.Variable.Symbol)
+	if !ok {
+		return TriNull, ErrUnsupported
+	}
+
+	kinds := make([]snapshot.KindID, 0, len(rel.Kinds))
+	for _, k := range rel.Kinds {
+		id, found := env.Snap.Kinds.ID(k.String())
+		if !found {
+			return TriNull, ErrUnsupported
+		}
+		kinds = append(kinds, id)
+	}
+
+	switch rel.Direction {
+	case graph.DirectionOutbound:
+		return boolToTri(hasAdjacentEdge(env, fromID, toID, kinds)), nil
+	case graph.DirectionInbound:
+		return boolToTri(hasAdjacentEdge(env, toID, fromID, kinds)), nil
+	case graph.DirectionBoth:
+		return boolToTri(hasAdjacentEdge(env, fromID, toID, kinds) || hasAdjacentEdge(env, toID, fromID, kinds)), nil
+	default:
+		return TriNull, ErrUnsupported
+	}
+}
+
+// hasAdjacentEdge reports whether src has at least one outgoing edge to dst
+// whose kind is in kinds (edgeKindOK's own "empty means any" convention,
+// reused directly so this file and exec.go's adjacency() never disagree on
+// what "kind matches" means): the same (start, end, kind) forward-CSR data
+// adjacency() walks to grow a row's candidate set, but read directly here
+// as a targeted probe against one already-known (src, dst) pair rather than
+// a full candidate enumeration -- a pattern predicate never produces a new,
+// unbound row the way a MATCH step's own adjacency walk does, so
+// adjacency()'s row-growing machinery (and the *workMeter it requires) does
+// not apply; see evalPatternPredicate's own doc for why this file's other
+// evaluator functions are consistently unmetered.
+func hasAdjacentEdge(env *Env, src, dst snapshot.NodeID, kinds []snapshot.KindID) bool {
+	targets, edgeKinds := env.Snap.Out(src)
+	for i, t := range targets {
+		if t == dst && edgeKindOK(kinds, edgeKinds[i]) {
 			return true
 		}
 	}

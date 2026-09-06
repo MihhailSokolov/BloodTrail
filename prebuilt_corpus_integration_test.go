@@ -328,14 +328,6 @@ func declineReason(logTail string) string {
 // DefaultGraph), so each is a real, structural gap flagged for the
 // controller rather than silently patched.
 var expectedDelegations = map[string]string{
-	// interpret's Plan/Execute (internal/engine/interpret) has no handling
-	// anywhere for cypher.PatternPredicate at all (confirmed by grep: zero
-	// references in the package) -- a bare relationship pattern used as a
-	// WHERE-clause boolean predicate, e.g. "WHERE (n)-[:Kind]-(m)", is an
-	// entire unimplemented Cypher feature, not a bug to patch inline.
-	"agt/Cross-forest trusts with abusable configuration#0": "WHERE-clause pattern predicate (cypher.PatternPredicate) has no interpret support at all",
-	"agi/Cross-forest trusts with abusable configuration#0": "WHERE-clause pattern predicate (cypher.PatternPredicate) has no interpret support at all",
-
 	// eval.go's applyArithmetic has a doc comment stating plainly: "Cypher
 	// also defines `+` for string/list concatenation, but the brief scopes
 	// this evaluator to numeric arithmetic only" -- a deliberate, already-

@@ -1070,6 +1070,89 @@ func TestEvalKindMatcher(t *testing.T) {
 	})
 }
 
+// --- Pattern predicates (gap (a), task 16b) ---------------------------------
+
+// TestEvalPatternPredicate exercises evalPatternPredicate directly against
+// the fixture's one real edge (950 -[:MemberOf]-> 900): both symbols
+// already bound in the Row, per checkPatternPredicate's own plan-time
+// restriction, so every case here binds "n"=950 and "m"=900 (or the
+// reverse) via f.tworow and evaluates a WHERE-clause pattern predicate
+// parsed from real Cypher text.
+func TestEvalPatternPredicate(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+	row := f.tworow("n", 950, "m", 900)
+
+	cases := []struct {
+		name  string
+		query string
+		want  Tri
+	}{
+		{"outbound match", "MATCH (n)-[:MemberOf]->(m) WHERE (n)-[:MemberOf]->(m) RETURN n", TriTrue},
+		{"outbound reversed does not match", "MATCH (n)-[:MemberOf]->(m) WHERE (m)-[:MemberOf]->(n) RETURN n", TriFalse},
+		{"inbound match (reversed direction arrow)", "MATCH (n)-[:MemberOf]->(m) WHERE (m)<-[:MemberOf]-(n) RETURN n", TriTrue},
+		{"inbound no match", "MATCH (n)-[:MemberOf]->(m) WHERE (n)<-[:MemberOf]-(m) RETURN n", TriFalse},
+		{"undirected matches the existing forward edge", "MATCH (n)-[:MemberOf]->(m) WHERE (n)-[:MemberOf]-(m) RETURN n", TriTrue},
+		{"undirected matches regardless of which side is written first", "MATCH (n)-[:MemberOf]->(m) WHERE (m)-[:MemberOf]-(n) RETURN n", TriTrue},
+		{"NOT on a true predicate is false", "MATCH (n)-[:MemberOf]->(m) WHERE NOT (n)-[:MemberOf]->(m) RETURN n", TriFalse},
+		{"NOT on a false predicate is true", "MATCH (n)-[:MemberOf]->(m) WHERE NOT (m)-[:MemberOf]->(n) RETURN n", TriTrue},
+		{"wrong kind does not match", "MATCH (n)-[:MemberOf]->(m) WHERE (n)-[:User]->(m) RETURN n", TriFalse},
+		{"kind alternation matches via the second kind", "MATCH (n)-[:MemberOf]->(m) WHERE (n)-[:User|MemberOf]->(m) RETURN n", TriTrue},
+		{"no kind restriction matches any kind", "MATCH (n)-[:MemberOf]->(m) WHERE (n)-->(m) RETURN n", TriTrue},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := EvalPredicate(env, row, whereExprOf(t, c.query))
+			if err != nil {
+				t.Fatalf("EvalPredicate(%q): unexpected error: %v", c.query, err)
+			}
+			if got != c.want {
+				t.Fatalf("EvalPredicate(%q) = %s, want %s", c.query, got, c.want)
+			}
+		})
+	}
+}
+
+// TestEvalPatternPredicateSelfReferenceNoSelfLoop: `(n)-[:K]->(n)` (both
+// pattern-predicate endpoints the same already-bound symbol) asks whether n
+// has a self-loop of kind K -- node 950 has none (its only edge is to a
+// distinct node, 900), so this must be false, not an error or a vacuous
+// true from some accidental "n always relates to itself" shortcut.
+func TestEvalPatternPredicateSelfReferenceNoSelfLoop(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+	row := f.row("n", 950)
+
+	got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE (n)-[:MemberOf]->(n) RETURN n"))
+	if err != nil {
+		t.Fatalf("EvalPredicate: unexpected error: %v", err)
+	}
+	if got != TriFalse {
+		t.Fatalf("EvalPredicate = %s, want TriFalse", got)
+	}
+}
+
+// TestEvalPatternPredicateNeverNull pins the milestone brief's own rule
+// directly: a pattern predicate's result is always TriTrue or TriFalse,
+// never TriNull, regardless of any node property (there is none inspected
+// here at all -- see evalPatternPredicate's own doc comment) -- unlike an
+// ordinary property comparison, which propagates NULL for an absent
+// property (TestEvalBooleanCombinators' own "AND with one absent operand"
+// case, just above, pins that contrasting behavior for comparison).
+func TestEvalPatternPredicateNeverNull(t *testing.T) {
+	f := newFixture(t)
+	env := f.env()
+	row := f.tworow("n", 100, "m", 300) // neither node has any properties at all, and no edge connects them
+
+	got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n)-[:MemberOf]->(m) WHERE (n)-[:MemberOf]->(m) RETURN n"))
+	if err != nil {
+		t.Fatalf("EvalPredicate: unexpected error: %v", err)
+	}
+	if got != TriFalse {
+		t.Fatalf("EvalPredicate = %s, want TriFalse (never TriNull)", got)
+	}
+}
+
 // --- Conjunction / Disjunction / XOR / NOT -----------------------------------
 
 func TestEvalBooleanCombinators(t *testing.T) {

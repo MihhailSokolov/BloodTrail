@@ -262,6 +262,27 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "unwind", cypher: `UNWIND [1,2,3] AS x RETURN x`, want: false},
 		{name: "quantifier", cypher: `MATCH (n:User) WHERE ANY(x IN n.spns WHERE x = 'a') RETURN n`, want: false},
 		{name: "pattern predicate", cypher: `MATCH (n:User) WHERE (n)-[:X]->() RETURN n`, want: false},
+
+		// Gap (a) fix (task 16b): the narrow WHERE-clause pattern-predicate
+		// shape pg itself supports for a single fixed-length step between
+		// two already-bound node variables -- see checkPatternPredicate's
+		// own doc comment for the full accept/reject rationale, pinned
+		// against dawgs@v0.8.0's translate/predicate.go.
+		{name: "pattern predicate both endpoints bound outbound ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->(m) RETURN n`, want: true},
+		{name: "pattern predicate negated ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE NOT (n)-[:X]->(m) RETURN n`, want: true},
+		{name: "pattern predicate undirected ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]-(m) RETURN n`, want: true},
+		{name: "pattern predicate inbound ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)<-[:X]-(m) RETURN n`, want: true},
+		{name: "pattern predicate kind alternation ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X|Y]->(m) RETURN n`, want: true},
+		{name: "pattern predicate no kind restriction ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-->(m) RETURN n`, want: true},
+		{name: "pattern predicate self-reference ok", cypher: `MATCH (n:User) WHERE (n)-[:X]->(n) RETURN n`, want: true},
+		{name: "pattern predicate unknown kind rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:NoSuchKind]->(m) RETURN n`, want: false},
+		{name: "pattern predicate expansion rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X*1..]->(m) RETURN n`, want: false},
+		{name: "pattern predicate multi-hop chain rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer),(o:User) WHERE (n)-[:X]->(m)-[:X]->(o) RETURN n`, want: false},
+		{name: "pattern predicate named relationship variable rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[r:X]->(m) RETURN n`, want: false},
+		{name: "pattern predicate relationship inline map rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X {a:1}]->(m) RETURN n`, want: false},
+		{name: "pattern predicate anonymous endpoint rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->() RETURN n`, want: false},
+		{name: "pattern predicate fresh endpoint variable rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->(z) RETURN n`, want: false},
+		{name: "pattern predicate endpoint re-labeled in predicate rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->(m:Group) RETURN n`, want: false},
 		{name: "list comprehension", cypher: `MATCH (n:User) RETURN [x IN n.spns] AS s`, want: false},
 		{name: "unknown function", cypher: `MATCH (n:User) RETURN keys(n)`, want: false},
 		{name: "min", cypher: `MATCH (n:User) RETURN min(n.x)`, want: false},
