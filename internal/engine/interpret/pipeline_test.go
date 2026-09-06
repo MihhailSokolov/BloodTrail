@@ -583,3 +583,347 @@ func TestPipelineWorkAccountingCarriedPartNoDoubleCharge(t *testing.T) {
 		t.Fatalf("meter.finalRows = %d, want 1", meter.finalRows)
 	}
 }
+
+// --- LIMIT early termination -------------------------------------------------
+
+// TestLimitTarget pins limitTarget's exact eligibility/target arithmetic in
+// isolation, ahead of any behavioral (runQuery-level) test.
+func TestLimitTarget(t *testing.T) {
+	tests := []struct {
+		name string
+		q    *Query
+		want int64
+	}{
+		{"no LIMIT written", &Query{Limit: -1}, -1},
+		{"LIMIT only", &Query{Limit: 10}, 10},
+		{"LIMIT with SKIP", &Query{Limit: 10, Skip: 5}, 15},
+		{"LIMIT with ORDER BY", &Query{Limit: 10, Order: []OrderKey{{Symbol: "x"}}}, -1},
+		{"LIMIT with RETURN DISTINCT", &Query{Limit: 10, Returning: Projection{Distinct: true}}, -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitTarget(tc.q); got != tc.want {
+				t.Fatalf("limitTarget(%+v) = %d, want %d", tc.q, got, tc.want)
+			}
+		})
+	}
+}
+
+// buildManyEnabledUsers builds n User nodes (ids 1..n), each with
+// enabled=true, for LIMIT early-termination tests that need a candidate pool
+// LARGER than limitChunk (1024): with fewer anchor candidates than one
+// chunk, scanAnchorVisit would exhaust the whole anchor set (and produce its
+// one, unconditional trailing flush) before the chunk-boundary check inside
+// runComponentLimited ever runs even once -- no early stop, and no work
+// reduction, would be observable at all. This is deliberately NOT the small
+// fixture size the rest of this file's tests use.
+func buildManyEnabledUsers(t *testing.T, n int) *snapshot.Snapshot {
+	t.Helper()
+	const kindUser snapshot.KindID = 1
+	nodes := make([]execNodeSpec, n)
+	for i := 0; i < n; i++ {
+		nodes[i] = execNodeSpec{uint64(i + 1), []snapshot.KindID{kindUser}, map[string]any{"enabled": true}}
+	}
+	return buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+}
+
+// TestLimitEarlyTermination is this feature's basic case: every anchor
+// candidate survives WHERE, so an unlimited run over the full pool and a
+// LIMIT 3 run both return real work-vs-row-count numbers to compare -- the
+// LIMIT run must stop scanning once 3 post-Where rows exist, spending
+// strictly less meter.work than the unlimited baseline measured for the
+// identical query (minus LIMIT) run first.
+func TestLimitEarlyTermination(t *testing.T) {
+	const n = 3000
+	snap := buildManyEnabledUsers(t, n)
+
+	baseline := &workMeter{budget: generousBudget}
+	baseRS, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n:User) WHERE n.enabled = true RETURN n`), baseline)
+	if err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+	if len(baseRS.Rows) != n {
+		t.Fatalf("baseline row count = %d, want %d (sanity: every node matches WHERE)", len(baseRS.Rows), n)
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n:User) WHERE n.enabled = true RETURN n LIMIT 3`), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
+	}
+	if limited.work >= baseline.work {
+		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d", limited.work, baseline.work)
+	}
+}
+
+// TestLimitEarlyTerminationSkipCountsTowardTarget pins limitTarget's
+// Skip+Limit arithmetic end to end: SKIP rows are produced (and later
+// discarded by applySkipLimit) exactly like the unlimited path already does,
+// so they must still count toward how many post-filter rows the chunked
+// driver secures before stopping -- a driver that only counted Limit itself
+// would stop 2 rows too early here, under-returning after SKIP trims them.
+func TestLimitEarlyTerminationSkipCountsTowardTarget(t *testing.T) {
+	const n = 3000
+	snap := buildManyEnabledUsers(t, n)
+
+	baseline := &workMeter{budget: generousBudget}
+	if _, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n:User) WHERE n.enabled = true RETURN n`), baseline); err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n:User) WHERE n.enabled = true RETURN n SKIP 2 LIMIT 3`), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (SKIP 2 LIMIT 3 over %d uniformly-matching rows)", len(rs.Rows), n)
+	}
+	if limited.work >= baseline.work {
+		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d (SKIP must count toward the early-termination target)", limited.work, baseline.work)
+	}
+}
+
+// TestLimitEarlyTerminationSparseMatchesDoesNotUnderReturn is the regression
+// test for expand.go's own documented shortestPath trap, applied to this
+// driver: counting PRE-filter anchor rows (or any other pre-Where quantity)
+// toward the target under-returns whenever most anchor candidates fail
+// WHERE. 2000 nodes -- more than one limitChunk (1024) batch's worth -- but
+// only the LAST 5 (highest ids, visited last: scanAnchorVisit's full-range
+// branch iterates ascending dense ids) satisfy WHERE. The first full batch
+// (ids 1..1024) is entirely filtered away (zero survivors); a driver that
+// wrongly counted the 1024 scanned anchor rows themselves against the
+// target would conclude "enough" right there and stop with zero result
+// rows, never reaching the batch the 5 real matches live in.
+//
+// The node pattern here is deliberately unconstrained (`(n)`, no label at
+// all), so the anchor scan runs through scanAnchorVisit's full-range/
+// default candidate source -- this package's other LIMIT early-termination
+// tests all anchor on a `:User` kind bitmap instead, so this is also this
+// suite's one exercise of that fourth candidate-source branch.
+func TestLimitEarlyTerminationSparseMatchesDoesNotUnderReturn(t *testing.T) {
+	const n = 2000
+	const sparseSurvivors = 5
+
+	nodes := make([]execNodeSpec, n)
+	for i := 0; i < n; i++ {
+		nodes[i] = execNodeSpec{uint64(i + 1), nil, map[string]any{"flag": i >= n-sparseSurvivors}}
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{}, nodes, nil)
+
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n) WHERE n.flag = true RETURN n LIMIT 3`), &workMeter{budget: generousBudget})
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (LIMIT 3 over %d sparse survivors out of %d candidates): %v", len(rs.Rows), sparseSurvivors, n, rowKeys(rs.Rows))
+	}
+}
+
+// TestLimitWithOrderByTakesFullPath is the negative-eligibility counterpart
+// to the above: ORDER BY makes limitTarget return -1 (this package's own
+// deterministic pre-sort materialization order is not the order sorting
+// would produce, so an early-stopped scan could keep the wrong rows), and an
+// ineligible query must take EXACTLY the pre-existing, unlimited code path
+// -- asserted here as meter.work being not merely "close to" but IDENTICAL
+// between an ORDER BY/LIMIT run and the same MATCH/RETURN with neither.
+func TestLimitWithOrderByTakesFullPath(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+	nodes := make([]execNodeSpec, 10)
+	for i := 0; i < 10; i++ {
+		nodes[i] = execNodeSpec{uint64(i + 1), []snapshot.KindID{kindUser}, nil}
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+
+	baseline := &workMeter{budget: generousBudget}
+	if _, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n:User) RETURN n, id(n) AS rid`), baseline); err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (n:User) RETURN n, id(n) AS rid ORDER BY rid LIMIT 3`), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
+	}
+	if limited.work != baseline.work {
+		t.Fatalf("meter.work = %d, want %d (ORDER BY must take the unlimited path unchanged)", limited.work, baseline.work)
+	}
+}
+
+// TestLimitWithDistinctTakesFullPath is TestLimitWithOrderByTakesFullPath's
+// RETURN DISTINCT counterpart: limitTarget returns -1 because DISTINCT's own
+// dedup counts deduped PROJECTED rows, a quantity this pre-projection driver
+// cannot track, so the whole query must fall through to the unchanged
+// unlimited path.
+func TestLimitWithDistinctTakesFullPath(t *testing.T) {
+	const (
+		kindUser  snapshot.KindID = 1
+		kindGroup snapshot.KindID = 2
+		kindE     snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User", kindGroup: "Group", kindE: "E"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, nil},
+			{2, []snapshot.KindID{kindUser}, nil},
+			{3, []snapshot.KindID{kindUser}, nil},
+			{500, []snapshot.KindID{kindGroup}, nil},
+		},
+		[]execEdgeSpec{
+			{9000, 1, 500, kindE},
+			{9001, 2, 500, kindE},
+			{9002, 3, 500, kindE},
+		},
+	)
+
+	baseline := &workMeter{budget: generousBudget}
+	if _, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (a:User)-[:E]->(b:Group) RETURN b`), baseline); err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, `MATCH (a:User)-[:E]->(b:Group) RETURN DISTINCT b LIMIT 1`), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1 (RETURN DISTINCT ... LIMIT 1 over 3 rows all sharing one group)", len(rs.Rows))
+	}
+	if limited.work != baseline.work {
+		t.Fatalf("meter.work = %d, want %d (RETURN DISTINCT must take the unlimited path unchanged)", limited.work, baseline.work)
+	}
+}
+
+// TestLimitEarlyTerminationCarriedPart exercises the OTHER wiring point
+// (runQuery's seed loop, Part[1] after a WITH boundary): Stage 0's own
+// aggregate (COUNT) always runs to completion first (this package's own
+// documented rule -- aggregates only ever attach to Part[0]'s WITH, and
+// carrying that stage's own row set forward is unaffected by any LIMIT on
+// the final RETURN), grouping into 3 carried rows (one per Group). Stage 1's
+// own pattern (`MATCH (m:User)`) is then re-run once per carried row on the
+// unlimited path -- the seed loop here must instead stop AFTER however many
+// of those 3 seeds are actually needed to secure LIMIT 2's target, skipping
+// the rest entirely (each seed's own Part[1] scan touches a large,
+// independent User pool, so skipping even one is a measurable saving).
+func TestLimitEarlyTerminationCarriedPart(t *testing.T) {
+	const (
+		kindUser     snapshot.KindID = 1
+		kindGroup    snapshot.KindID = 2
+		kindMemberOf snapshot.KindID = 10
+	)
+
+	var nodes []execNodeSpec
+	var edges []execEdgeSpec
+	// 3 groups, each with exactly one member -- enough for WITH's per-group
+	// COUNT(x) to have something to count; the count value itself is not
+	// what this test is about.
+	// buildExecSnapshot's underlying builder requires strictly increasing
+	// database ids across the whole AddNode sequence, so every group is
+	// added before any member (rather than interleaved group/member pairs).
+	for g := 1; g <= 3; g++ {
+		nodes = append(nodes, execNodeSpec{uint64(1000 + g), []snapshot.KindID{kindGroup}, nil})
+	}
+	for g := 1; g <= 3; g++ {
+		groupID := uint64(1000 + g)
+		memberID := uint64(2000 + g)
+		nodes = append(nodes, execNodeSpec{memberID, []snapshot.KindID{kindUser}, nil})
+		edges = append(edges, execEdgeSpec{uint64(9_000_000 + g), memberID, groupID, kindMemberOf})
+	}
+	// A pool of unrelated Users that Part[1]'s own `MATCH (m:User)` re-scans
+	// once PER carried seed on the unlimited path -- large enough that
+	// skipping two of the three seeds (this test's whole point) is a
+	// measurable saving, without needing anywhere near limitChunk (1024)
+	// candidates: the saving here comes from skipping whole seeds, not from
+	// a within-seed chunk boundary.
+	const plainUsers = 300
+	for i := 0; i < plainUsers; i++ {
+		nodes = append(nodes, execNodeSpec{uint64(4000 + i), []snapshot.KindID{kindUser}, nil})
+	}
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User", kindGroup: "Group", kindMemberOf: "MemberOf"},
+		nodes, edges,
+	)
+
+	query := `MATCH (x:User)-[:MemberOf]->(g:Group)
+WITH g, count(x) AS c
+MATCH (m:User)
+RETURN g, m, c`
+
+	baseline := &workMeter{budget: generousBudget}
+	if _, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query), baseline); err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query+"\nLIMIT 2"), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (LIMIT 2)", len(rs.Rows))
+	}
+	if limited.work >= baseline.work {
+		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d (stage 1's seed loop must stop once enough seeds are processed, not run all 3)", limited.work, baseline.work)
+	}
+}
+
+// TestLimitEarlyTerminationVarLength exercises the chunked driver's
+// single-var-length-step dispatch (expandVarLengthComponentFrom, via
+// runComponentFrom/componentAnchorSym): a large `:User` anchor pool, each
+// with a one-hop MemberOf trail (satisfying `*1..2`) to a single shared
+// Group, so a LIMIT 3 run should stop after roughly one anchor-scan batch
+// instead of walking every user's own trail.
+func TestLimitEarlyTerminationVarLength(t *testing.T) {
+	const (
+		kindUser     snapshot.KindID = 1
+		kindGroup    snapshot.KindID = 2
+		kindMemberOf snapshot.KindID = 10
+	)
+	const n = 2000
+	const groupID = uint64(1)
+
+	nodes := []execNodeSpec{{groupID, []snapshot.KindID{kindGroup}, nil}}
+	var edges []execEdgeSpec
+	for i := 0; i < n; i++ {
+		userID := uint64(1000 + i)
+		nodes = append(nodes, execNodeSpec{userID, []snapshot.KindID{kindUser}, nil})
+		edges = append(edges, execEdgeSpec{uint64(9_000_000 + i), userID, groupID, kindMemberOf})
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User", kindGroup: "Group", kindMemberOf: "MemberOf"}, nodes, edges)
+
+	query := `MATCH (a:User)-[:MemberOf*1..2]->(b:Group) RETURN a`
+
+	baseline := &workMeter{budget: generousBudget}
+	baseRS, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query), baseline)
+	if err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+	if len(baseRS.Rows) != n {
+		t.Fatalf("baseline row count = %d, want %d (sanity: every user has exactly one qualifying trail)", len(baseRS.Rows), n)
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query+" LIMIT 3"), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
+	}
+	if limited.work >= baseline.work {
+		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d", limited.work, baseline.work)
+	}
+}

@@ -97,6 +97,7 @@ package interpret
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
 	"sort"
 
@@ -130,12 +131,21 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		return nil, errUnsupportedStep
 	}
 
+	// target is -1 for a query LIMIT early termination must never touch (see
+	// limitTarget's own doc): every branch below that consults it treats -1
+	// as "run exactly the pre-LIMIT-early-termination code", so an
+	// ineligible query's observable behavior -- rows, errors, and
+	// meter.work alike -- is unchanged by this feature.
+	target := limitTarget(q)
+
 	part0 := &q.Parts[0]
-	rows, err := matchPart(env, part0, meter)
-	if err != nil {
-		return nil, err
+	var rows []*Row
+	var err error
+	if len(q.Parts) == 1 && target >= 0 {
+		rows, err = matchPartLimited(env, meter, part0, target)
+	} else {
+		rows, err = matchPartPlain(env, meter, part0)
 	}
-	rows, err = filterRows(env, rows, part0.Where, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -155,20 +165,45 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		if groupKeysOverlapNodes(part0.With.GroupKeys, part1.Nodes) {
 			return nil, errUnsupportedStep
 		}
+		collectAliases := collectAliasNames(part0.With.Aggregates)
+
+		var comp1 component
+		var anchor1 string
+		var limited bool
+		if target >= 0 {
+			comp1, anchor1, limited = limitEligibleComponent(env, meter, part1)
+		}
 
 		merged := make([]*Row, 0, len(rows))
-		for _, seed := range rows {
-			got, err := runCarriedPart(env, part1, meter, seed)
+		if limited {
+			for _, seed := range rows {
+				remaining := target - int64(len(merged))
+				if remaining <= 0 {
+					// Enough seeds already secured target rows -- every
+					// remaining seed's own Part[1] match is skipped
+					// entirely, unlike the unlimited path below, which
+					// always runs every seed.
+					break
+				}
+				got, err := runComponentLimited(env, meter, part1, comp1, anchor1, seed, collectAliases, remaining)
+				if err != nil {
+					return nil, err
+				}
+				merged = append(merged, got...)
+			}
+			rows = merged
+		} else {
+			for _, seed := range rows {
+				got, err := runCarriedPart(env, part1, meter, seed)
+				if err != nil {
+					return nil, err
+				}
+				merged = append(merged, got...)
+			}
+			rows, err = filterRows(env, merged, part1.Where, collectAliases)
 			if err != nil {
 				return nil, err
 			}
-			merged = append(merged, got...)
-		}
-
-		collectAliases := collectAliasNames(part0.With.Aggregates)
-		rows, err = filterRows(env, merged, part1.Where, collectAliases)
-		if err != nil {
-			return nil, err
 		}
 	} else if len(q.Parts) == 2 {
 		return nil, errUnsupportedStep
@@ -334,6 +369,242 @@ func collectAliasNames(aggs []WithAggregate) []string {
 		}
 	}
 	return out
+}
+
+// --- LIMIT early termination -------------------------------------------------
+
+// limitTarget returns how many post-filter final-part rows the query needs
+// before production may stop, or -1 when LIMIT early termination must not
+// apply at all -- every caller treats -1 as "run the unlimited path,
+// unchanged".
+//
+// ORDER BY needs every row: under a LIMIT, sorting first is what decides
+// WHICH rows survive, so stopping the scan early (before every candidate has
+// even been produced) could keep the wrong ones. RETURN DISTINCT counts
+// deduped PROJECTED rows (dedupProjected, above) -- a quantity this
+// pre-projection driver has no way to track, since two distinct matched rows
+// can project to the identical output tuple. SKIP rows are produced and
+// then discarded by applySkipLimit, exactly like today's unlimited path
+// already does -- so they still count toward how many post-filter rows must
+// exist before stopping.
+func limitTarget(q *Query) int64 {
+	if q.Limit < 0 || len(q.Order) > 0 || q.Returning.Distinct {
+		return -1
+	}
+	return q.Skip + q.Limit
+}
+
+// limitChunk is the number of anchor rows scanAnchorVisit collects per batch
+// on the LIMIT early-termination path (runComponentLimited) before that
+// batch is run through the component's own expansion and Where filtering:
+// large enough to amortize the fixed cost of running that pipeline once per
+// batch rather than once per row, small enough that overshooting the target
+// by a whole batch's worth of extra rows (see runComponentLimited's own doc)
+// stays cheap relative to the millions of rows this feature exists to avoid
+// ever materializing.
+const limitChunk = 1024
+
+// matchPartPlain runs part's pattern match and Where filter exactly as the
+// pre-LIMIT-early-termination code always did: matchPart, then filterRows
+// with no collect-membership aliases (Part[0] never carries any -- those are
+// only ever bound by a PRECEDING Part's WITH, and Part[0] has none). Both
+// runQuery's own non-eligible cases and matchPartLimited's own fallback (a
+// single-part shape limitEligibleComponent declines) route through this one
+// function, so every ineligible query -- and every eligible-looking one that
+// still isn't actually servable by the chunked driver -- gets exactly the
+// same treatment it always got.
+func matchPartPlain(env *Env, meter *workMeter, part *Part) ([]*Row, error) {
+	rows, err := matchPart(env, part, meter)
+	if err != nil {
+		return nil, err
+	}
+	return filterRows(env, rows, part.Where, nil)
+}
+
+// matchPartLimited is runQuery's single-part (no WITH boundary) entry point
+// into LIMIT early termination: when part's pattern qualifies
+// (limitEligibleComponent), it runs the chunked driver (runComponentLimited)
+// with no seed and no collect-membership aliases -- matching matchPartPlain's
+// own Part[0] call above; otherwise it falls back to matchPartPlain
+// unchanged. Callers only reach this at all when limitTarget(q) >= 0 and
+// len(q.Parts) == 1 -- see runQuery.
+func matchPartLimited(env *Env, meter *workMeter, part *Part, target int64) ([]*Row, error) {
+	if comp, anchor, ok := limitEligibleComponent(env, meter, part); ok {
+		return runComponentLimited(env, meter, part, comp, anchor, nil, nil, target)
+	}
+	return matchPartPlain(env, meter, part)
+}
+
+// limitEligibleComponent reports whether part's own pattern-match phase can
+// run through the chunked driver (runComponentLimited) instead of
+// matchPartPlain/runCarriedPart, and if so, which single component and
+// anchor symbol (componentAnchorSym) to scan.
+//
+// Two checks are structural, straight from this feature's own eligibility
+// rule: part's pattern must resolve to exactly one connected component
+// (matchPart's own cartesianJoin has no way to stop early once a second,
+// disjoint component is cartesian-joined against the first -- an early stop
+// on one component's own anchor scan says nothing about how many rows an
+// independent second component would eventually contribute), and that
+// component must carry no shortestPath/allShortestPaths step
+// (expandShortestPathComponent resolves both pattern endpoints as complete
+// node sets up front rather than growing rows from one symbol's anchor scan
+// -- see runComponentFrom's own doc comment for why it has no "given anchor
+// rows" tail for that shape at all; such a component is still served
+// correctly, just via the ordinary matchPart/runComponent fallback, which
+// does dispatch to expandShortestPathComponent).
+//
+// The third check is a zero-cost PROBE, not a hand-duplicated copy of every
+// precondition runComponentFrom's own dispatch enforces (uniformPathSym's
+// PathSym agreement, isStrictLinearChain, expandVarLengthComponentFrom's own
+// EdgeSym/FromSym==ToSym guard): every one of those checks is decided purely
+// from part/comp's own static shape, never from anchorRows' actual content
+// or count, and every loop inside runComponentFrom's own tails
+// (runComponentTreeFrom/expandStep/expandChainComponentFrom/
+// expandVarLengthComponentFrom) is keyed on anchorRows' length -- so calling
+// runComponentFrom with a nil anchorRows slice reaches the identical decline
+// (if any), with every one of those loops iterating zero times, spending
+// exactly zero meter.spend calls either way. This matters because, unlike
+// runComponent (which checks every one of these preconditions BEFORE ever
+// calling scanAnchor), a caller of runComponentFrom directly -- this chunked
+// driver -- would otherwise only discover such a decline AFTER a real,
+// meter-charged scanAnchorVisit batch had already run: the unlimited path's
+// own equivalent decline never spends that anchor-scan work at all (see
+// expandVarLengthComponentFrom's own doc comment for the specific
+// EdgeSym/FromSym==ToSym case this guards against). A probe failure falls
+// back to matchPartPlain/runCarriedPart, which reach the identical decline
+// via runComponent -- so a query this probe rejects still ends up declined
+// (or served) exactly as it always was.
+func limitEligibleComponent(env *Env, meter *workMeter, part *Part) (comp component, anchor string, ok bool) {
+	comps := groupComponents(part)
+	if len(comps) != 1 {
+		return component{}, "", false
+	}
+	comp = comps[0]
+	if hasShortestStep(part, comp.stepIdxs) {
+		return component{}, "", false
+	}
+	if _, err := runComponentFrom(env, meter, part, comp, nil); err != nil {
+		return component{}, "", false
+	}
+	return comp, componentAnchorSym(env, part, comp), true
+}
+
+// componentAnchorSym reports the symbol runComponentFrom's own dispatch
+// (see its doc comment) treats an anchorRows chunk as bound to for comp: the
+// component's own leftmost chain symbol (part.Chains[comp.stepIdxs[0]].
+// FromSym) for a special-step (var-length/shortestPath) or named-path
+// component -- exactly the symbol expandVarLengthComponent/
+// expandChainComponent themselves scan on the unlimited path -- or
+// chooseAnchor's own cost-ranked pick otherwise (the general BFS component,
+// including a single isolated node symbol, where chooseAnchor over a
+// one-element syms list trivially returns that element).
+//
+// This does not itself validate that comp is actually servable this way --
+// limitEligibleComponent's own probe call does that. A component
+// runComponentFrom would ultimately decline (e.g. isStrictLinearChain
+// failing) still gets an anchor symbol name back here; it is simply never
+// used, since the caller's probe already rejected the component first.
+func componentAnchorSym(env *Env, part *Part, comp component) string {
+	stepIdxs := comp.stepIdxs
+	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
+	if pathUniform && (hasSpecialStep(part, stepIdxs) || pathSym != "") {
+		return part.Chains[stepIdxs[0]].FromSym
+	}
+	return chooseAnchor(env, part.Nodes, comp.syms)
+}
+
+// runComponentLimited produces post-Where rows for one eligible component
+// (limitEligibleComponent's own decision), stopping the underlying anchor
+// scan once at least target such rows have accumulated, or once the anchor
+// scan itself runs out first, whichever happens sooner.
+//
+// Anchor rows are scanned via scanAnchorVisit in batches of limitChunk, each
+// batch expanded through runComponentFrom (runComponent's own dispatch,
+// replayed over a given anchor-row chunk) and then Where-filtered through
+// this file's own filterRows -- the SAME two stages the unlimited path
+// applies to every row (matchPart's own runComponent call, then this file's
+// filterRows call), just chunked instead of run once over the whole anchor
+// set. This is exactly why the target is counted against len(acc) -- rows
+// that have ALREADY cleared both stages -- rather than the number of anchor
+// rows scanned so far: an anchor row is not a result row until it has
+// cleared every filtering stage the unlimited path applies to it too, and
+// counting anchor rows (or any other pre-filter quantity) instead would
+// under-return whenever most anchor candidates fail Where (see this
+// package's own sparse-tail test).
+//
+// seed is non-nil for the carried (stage-1, after a WITH) case: each
+// produced batch is cloned-and-merged with seed (cloneRow + mergeRowInto)
+// BEFORE filtering, exactly like runCarriedPart's own per-row merge on the
+// unlimited path, so a Where conjunct referencing a carried symbol (e.g.
+// `NOT c IN exclude`) sees it; collectAliases is threaded through to
+// filterRows unchanged, for the identical reason runQuery passes it to its
+// own post-WITH filterRows call. seed is nil for the single-part case
+// (matchPartLimited), where filterRows runs with no collectAliases, matching
+// matchPartPlain's own Part[0] call.
+//
+// The returned row count may exceed target: the batch that finally reaches
+// it is never truncated mid-flush, and the anchor scan's own trailing
+// partial batch (flushed once scanAnchorVisit returns nil -- the scan ran
+// out on its own, rather than being stopped via errStopScan) is flushed
+// unconditionally too, without re-checking target (there is nothing left to
+// scan regardless). Both overshoots are intentional: the caller's own
+// applySkipLimit trims the eventual overshoot down to exactly q.Skip+q.Limit
+// rows later, precisely as it already trims the unlimited path's own (much
+// larger) full row set today.
+func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component, anchor string, seed *Row, collectAliases []string, target int64) ([]*Row, error) {
+	var acc []*Row
+	chunk := make([]*Row, 0, limitChunk)
+
+	flush := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		rows, err := runComponentFrom(env, meter, part, comp, chunk)
+		chunk = chunk[:0]
+		if err != nil {
+			return err
+		}
+		if seed != nil {
+			for i, r := range rows {
+				nr := cloneRow(seed)
+				mergeRowInto(nr, r)
+				rows[i] = nr
+			}
+		}
+		rows, err = filterRows(env, rows, part.Where, collectAliases)
+		if err != nil {
+			return err
+		}
+		acc = append(acc, rows...)
+		return nil
+	}
+
+	scanErr := scanAnchorVisit(env, meter, anchor, part.Nodes[anchor], func(r *Row) error {
+		chunk = append(chunk, r)
+		if len(chunk) < limitChunk {
+			return nil
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+		if int64(len(acc)) >= target {
+			return errStopScan
+		}
+		return nil
+	})
+	if scanErr != nil && !errors.Is(scanErr, errStopScan) {
+		return nil, scanErr
+	}
+	if scanErr == nil {
+		// The anchor scan ran out on its own rather than being stopped via
+		// errStopScan: flush whatever partial batch remains (there is
+		// nothing left to scan regardless of whether it reaches target).
+		if err := flush(); err != nil {
+			return nil, err
+		}
+	}
+	return acc, nil
 }
 
 // --- WITH stage: grouping, aggregation, plain pass-through ------------------

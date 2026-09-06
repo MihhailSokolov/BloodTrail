@@ -380,6 +380,17 @@ type OrderKey struct {
 // successfully, delegate only the rest" execution model would violate this
 // contract and require re-auditing every acceptance decision in this file
 // that currently relies on it.
+//
+// Under a final LIMIT with no ORDER BY and no RETURN DISTINCT, the executor
+// may stop producing rows once SKIP+LIMIT post-filter rows exist
+// (runComponentLimited, pipeline.go). Rows past that cutoff are then never
+// evaluated, so an evaluator error lurking there aborts nothing -- the query
+// still serves. This matches PostgreSQL, which streams under LIMIT and also
+// never evaluates rows past its own cutoff; both outcomes (serve N rows, or
+// raise the error) sit inside pg's own nondeterministic behavior envelope for
+// such a query. Every row that IS emitted still went through this
+// invariant's full evaluation above, so emitted content never diverges from
+// what the unlimited path could also have produced.
 type Query struct {
 	Parts     []Part
 	Returning Projection
