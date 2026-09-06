@@ -5,11 +5,14 @@ packaged as a [DAWGS](https://github.com/SpecterOps/DAWGS) driver, so that attac
 analysis and every other graph query stay fast on large Active Directory environments
 and ordinary hardware.
 
-**Status:** milestone 3 (query-builder serving). Shortest paths, all shortest paths, and
-BloodHound's own pre-built shortest-path searches are served from an in-memory replica when
-it is fresh, and so is a defined set of structural node/relationship queries BloodHound's
-query builder issues -- entity panel listings and analysis's own structural scans among
-them. Every other read still goes to PostgreSQL.
+**Status:** milestone 4 (Cypher interpreter). Shortest paths, all shortest paths, and a
+defined set of structural node/relationship queries BloodHound's query builder issues are
+served from an in-memory replica when it is fresh, and so, now, is a much broader surface of
+Cypher itself -- property predicates and scans, point lookups, `shortestPath`/
+`allShortestPaths` patterns, and a range of aggregations -- reached through a real Cypher
+interpreter rather than pattern-matching a handful of recognized shapes. Every query the
+interpreter cannot (or should not) answer from memory delegates to PostgreSQL, exactly as
+before.
 
 ## Why
 
@@ -28,13 +31,17 @@ arrays, and a single CPU core sweeps every edge in under a second. See
 - BloodTrail is a DAWGS driver, selected with `graph_driver: "bloodtrail"`. BloodHound's
   ingest, analysis, API and UI are unchanged; they talk to the same `graph.Database`
   interface as before.
-- The driver keeps a replica of the graph's *topology* in memory: dense ids, forward
-  and reverse adjacency with an edge id and kind per entry, and kind bitmaps -- what
-  milestone 2's shortest-path queries need, and, as of milestone 3, also what a defined
-  set of structural node/relationship queries need. It holds no node or edge
-  properties; a served result's properties are hydrated from PostgreSQL per query
-  instead. See [In-memory path engine](#in-memory-path-engine) and
-  [Query-builder serving](#query-builder-serving) for what is actually served from the
+- The driver keeps a replica of the graph in memory: dense ids, forward and reverse
+  adjacency with an edge id and kind per entry, and kind bitmaps -- what milestone 2's
+  shortest-path queries and milestone 3's structural node/relationship queries need --
+  plus, as of milestone 4, every node's own property bag and an objectid index, so the
+  Cypher interpreter can evaluate property predicates and point lookups without a
+  PostgreSQL round trip. A served result's *edge* properties are still hydrated from
+  PostgreSQL per query (edges carry no properties in the replica -- see
+  [Cypher interpreter](#cypher-interpreter)'s Memory note for why). See
+  [In-memory path engine](#in-memory-path-engine),
+  [Query-builder serving](#query-builder-serving), and
+  [Cypher interpreter](#cypher-interpreter) for what is actually served from the
   replica today.
 - PostgreSQL remains the system of record. Writes go to PostgreSQL first; the replica
   itself is rebuilt wholesale from PostgreSQL by a poller (after every completed
@@ -44,12 +51,9 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
   rollback.
-- **Planned, not yet built** (see [Roadmap](#roadmap)): columnar properties and
-  property indexes in the replica itself; an interpreter that executes pre-built and
-  user Cypher queries beyond the shapes recognized today directly against DAWGS's
-  Cypher syntax tree; write-through updates to the replica on commit instead of a
-  poller-driven rebuild; and loading/restoring the replica from a snapshot file on
-  startup.
+- **Planned, not yet built** (see [Roadmap](#roadmap)): write-through updates to the
+  replica on commit instead of a poller-driven rebuild, and loading/restoring the
+  replica from a snapshot file on startup.
 
 ## In-memory path engine
 
@@ -60,18 +64,19 @@ of PostgreSQL whenever it safely can, and always falls back to PostgreSQL otherw
 are correct regardless of the replica's state.
 
 - **What is served.** `GET /api/v2/graphs/shortest-path` (BloodHound's `FetchAllShortestPaths`
-  call, built from `start_node`/`end_node` object IDs and an optional relationship-kind filter)
-  and any Cypher sent to `POST /api/v2/graphs/cypher` that matches BloodHound's own
-  `shortestPath(...)` / `allShortestPaths(...)` shape: a single `MATCH` with one shortest-path
-  pattern, an optional `WHERE` built from endpoint kind/property predicates and an `s <> t`
-  exclusion, and a `RETURN` of just the path with an optional `LIMIT`. Every other read --
-  entity panels, node search, tagging, a Cypher query outside that shape -- is unaffected and
-  always goes to PostgreSQL, exactly as in milestone 1.
+  call, built from `start_node`/`end_node` object IDs and an optional relationship-kind filter).
+  A Cypher `shortestPath(...)`/`allShortestPaths(...)` sent to `POST /api/v2/graphs/cypher` is
+  also served from memory, but as of milestone 4 that goes through the general-purpose Cypher
+  interpreter described in [Cypher interpreter](#cypher-interpreter), not a narrow
+  shortestPath-only recognizer (milestone 2's original recognizer for this shape has since been
+  retired in its favor). Every other read -- entity panels, node search, tagging -- is
+  unaffected and always goes to PostgreSQL, exactly as in milestone 1.
 
-- **Freshness and fallback.** The engine keeps a compressed in-memory replica (node and edge
-  ids and kinds only -- no properties; a served result's properties are hydrated from
-  PostgreSQL per query), rebuilt from PostgreSQL after every completed analysis run and again
-  after a write once the ingest/analysis pipeline goes idle.
+- **Freshness and fallback.** The engine keeps a compressed in-memory replica (node/edge ids,
+  kinds, and, as of milestone 4, node property bags; edge properties are still hydrated from
+  PostgreSQL per query -- see [Cypher interpreter](#cypher-interpreter)), rebuilt from
+  PostgreSQL after every completed analysis run and again after a write once the
+  ingest/analysis pipeline goes idle.
   A query is served from memory only if the engine is enabled, a snapshot exists, that snapshot
   is still current (no write has landed since it was built), the query's endpoints resolve
   inside it, and the traversal fits the request's own memory budget. Any of these failing --
@@ -106,10 +111,12 @@ are correct regardless of the replica's state.
   every successful rebuild), `bloodtrail: snapshot rebuild refused: exceeds memory limit`
   (Warn, rate-limited), `bloodtrail: path engine served` (Info, once per shortest-path query
   actually answered from memory), `bloodtrail: path engine declined` (Debug, with a `reason`
-  attr, whenever a shortest-path query fell back to PostgreSQL), and their query-builder
-  counterparts `bloodtrail: builder engine served` / `bloodtrail: builder engine declined`
-  (both Debug -- a structural query runs far more often than a shortest-path one, so these
-  stay one level quieter).
+  attr, whenever a shortest-path query fell back to PostgreSQL), their query-builder
+  counterparts `bloodtrail: builder engine served` / `bloodtrail: builder engine declined`,
+  and their Cypher-interpreter counterparts `bloodtrail: cypher engine served` /
+  `bloodtrail: cypher engine declined` (all three of these last pairs Debug -- a structural
+  or Cypher query runs far more often than a shortest-path one, so these stay one level
+  quieter).
 
 ## Query-builder serving
 
@@ -134,11 +141,14 @@ it, BloodTrail answers it from memory instead of PostgreSQL:
   to one endpoint's id.
 
 Property predicates -- anything that filters or projects a node or relationship's
-*property* rather than its id or kind -- always go to PostgreSQL: the replica holds no
-properties, unchanged from milestone 2. So does any query shaped differently from the
-above -- more than one chained filter, an ordering/offset/limit the engine doesn't
-implement, or a caller-supplied row projection -- the same "engine declines, PostgreSQL
-always answers correctly" contract the path engine already has.
+*property* rather than its id or kind -- always go to PostgreSQL through this
+query-builder path: the recognized builder shapes above are id/kind-only, unchanged
+from milestone 3, even though the replica itself gained node property bags in
+milestone 4 for the [Cypher interpreter](#cypher-interpreter)'s own use. So does any
+query shaped differently from the above -- more than one chained filter, an
+ordering/offset/limit the engine doesn't implement, or a caller-supplied row
+projection -- the same "engine declines, PostgreSQL always answers correctly" contract
+the path engine already has.
 
 - **Kind-scoped freshness.** Every write is now recorded against the specific node and
   edge kinds it actually touched, not only as a blanket "something changed." A builder
@@ -156,13 +166,99 @@ always answers correctly" contract the path engine already has.
 - **Memory.** Serving relationship queries needs a bit more than the path engine's bare
   topology: each edge's own database id (~8 bytes), a reverse-index pointer back to it
   (~4 bytes), and a small permutation array to look an edge up by that id (~4 bytes) --
-  roughly 16 bytes per edge on top of milestone 2's layout. At 5 million nodes and 50
-  million edges, budget about 1.7 GB resident, up from milestone 2's ~0.9 GB.
-  `BLOODTRAIL_MEMORY_LIMIT` (see Configuration above) caps this the same way it always
-  has: a rebuild that would exceed it is refused, and the engine keeps serving (or
-  falling back from) whatever snapshot it already had.
+  roughly 16 bytes per edge on top of milestone 2's layout. Milestone 4 adds node
+  properties and an objectid index on top of that in turn -- see
+  [Cypher interpreter](#cypher-interpreter)'s own Memory note for the full formula and
+  the measured total at 5 million nodes / 48.9 million edges. `BLOODTRAIL_MEMORY_LIMIT`
+  (see Configuration above) caps the whole replica the same way it always has: a
+  rebuild that would exceed it is refused, and the engine keeps serving (or falling
+  back from) whatever snapshot it already had.
 
 See [bench/builderbench](bench/builderbench) for the measurement.
+
+## Cypher interpreter
+
+Milestone 4 replaces the narrow shortestPath/allShortestPaths-only Cypher recognizer
+milestone 2 shipped with a real interpreter (`internal/engine/interpret`): it plans and
+executes a meaningful subset of Cypher directly against the in-memory replica, rather
+than pattern-matching a handful of hand-recognized query shapes. This is what backs
+`POST /api/v2/graphs/cypher` -- both a user's own Cypher and every pre-built/selector
+query BloodHound's UI ships.
+
+- **What is served.** `MATCH` patterns filtered or projected by node/relationship
+  property predicates (equality, comparisons, `ENDS WITH`/`STARTS WITH`/`CONTAINS`,
+  boolean combinations), a property point lookup (including one served from the
+  replica's own objectid index), fixed and variable-length relationship patterns
+  including `shortestPath(...)`/`allShortestPaths(...)`, and a range of aggregations
+  (`COUNT`, `COLLECT` and the anti-join pattern it commonly feeds -- `WITH COLLECT(...)
+  AS x ... WHERE NOT n IN x`) and `ORDER BY` where the ordering is unambiguous without
+  PostgreSQL's own collation. See `bench/cypherbench` for five representative shapes
+  measured end to end, and the root package's `*_corpus_integration_test.go` /
+  `random_cypher_differential_integration_test.go` for the differential suites that
+  pin this behavior against a live PostgreSQL oracle across BloodHound's own pre-built
+  query corpus and randomly generated Cypher alike.
+- **What always delegates.** Any query the interpreter's planner does not recognize at
+  all; any query bound `$parameters` (BloodHound's own cypher endpoint never sends
+  these, so a non-empty `params` map can only mean something this interpreter has no
+  way to honor); any updating clause (`CREATE`/`MERGE`/`DELETE`/`SET`/`REMOVE` -- this
+  interpreter is read-only); a comparison or `ORDER BY` whose result depends on
+  PostgreSQL's own string collation; and a numeric-list `IN` check the interpreter
+  cannot evaluate without PostgreSQL's own numeric casting rules. Exactly as
+  elsewhere, every decline falls back to PostgreSQL and always returns a correct
+  result -- the only difference is latency.
+- **The translate gate.** Because the interpreter is a reimplementation of a Cypher
+  subset rather than a wrapper around dawgs' own PostgreSQL translator, nothing
+  inherently guarantees the two agree on which queries are servable. Before executing
+  a query the interpreter *did* accept, BloodTrail asks dawgs' real translator the same
+  question a PostgreSQL-backed serve would eventually ask -- without a database round
+  trip -- and declines (delegating to PostgreSQL as usual) if the translator would have
+  rejected it. This closes the gap between "the interpreter thinks it can answer this"
+  and "PostgreSQL would actually have accepted this query at all," so a served result
+  can never diverge from what PostgreSQL itself would have produced.
+- **Freshness.** Unlike milestone 3's kind-scoped builder-query freshness, Cypher
+  serving uses the coarser whole-generation rule shortest-path queries already have:
+  the replica must be the current, unmodified snapshot from the moment planning starts
+  through the moment execution finishes -- any write landing in between, anywhere in
+  the graph, makes the engine decline and PostgreSQL answers instead. A Cypher query
+  can touch far more of the schema than a single builder-query shape's own kind
+  constraints can express, so this milestone keeps the simpler, stricter rule rather
+  than trying to derive per-query kind scopes for arbitrary Cypher.
+- **Budgets.** A served query is capped at 100,000 result rows and a generous internal
+  work-unit budget (node/adjacency inspections during execution), and an unbounded
+  variable-length relationship pattern (a bare `*`, `*1..`, `*..`) is capped at 15 hops
+  -- mirroring dawgs' own default traversal depth cap. Exceeding either budget declines
+  the query (falling back to PostgreSQL) rather than serving a truncated result.
+- **The multi-graph guard.** The interpreter has no notion of which graph a query is
+  scoped to -- unlike the path engine's own endpoint-resolution machinery, which only
+  ever walks the one snapshot it was given -- so if `LoadSnapshot` detects the database
+  holds more than one graph with nodes in it (`Snapshot.MultiGraph`), Cypher serving is
+  disabled entirely for that snapshot: every query delegates to PostgreSQL rather than
+  risk silently answering across a graph boundary PostgreSQL itself would respect. A
+  single-graph BloodHound deployment (the normal case) is unaffected.
+- **Memory.** The replica's per-node/per-edge topology cost is unchanged from milestone
+  3 (~20 bytes/node, ~34 bytes/edge, including the builder-query indices above); on top
+  of that, milestone 4 adds:
+  - **Property bags**: roughly the property values' own raw JSON size times ~1.1
+    (interned property names and small per-value framing overhead) plus about 24 bytes
+    of fixed per-node overhead.
+  - **The objectid index**: about 40 bytes per node (a hash-map entry plus its NodeID
+    value; the objectid string itself is not duplicated -- it aliases the same bytes
+    already counted in the property bag above).
+  - **The (global) kind name table**: negligible -- one entry per distinct node/edge
+    kind name in the whole database, not per node or edge.
+
+  **Measured total**, 5 million nodes / 48.9 million edges (`bench/adgen`'s synthetic
+  Active Directory graph, with realistic per-node property bags): the whole replica's
+  `ApproxBytes` -- topology and builder-query indices, property bags, the objectid
+  index, and the kind name table together -- comes to 4,038,143,672 bytes, about
+  3851 MiB (roughly 3.76 GiB).
+
+`BLOODTRAIL_MEMORY_LIMIT` bounds the whole replica -- topology, builder-query indices,
+properties, and the objectid index together -- exactly as it always has: a rebuild that
+would exceed it is refused, and the engine keeps serving (or falling back from)
+whatever snapshot it already had.
+
+See [bench/cypherbench](bench/cypherbench) for the measurement.
 
 ## Installing on an existing BloodHound CE deployment
 
@@ -232,13 +328,14 @@ v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
 ## Repository layout
 
 ```
-internal/engine/     The in-memory engine: snapshot rebuild/poller, kind-scoped
-                     freshness marks, endpoint resolution and traversal, builder-query
-                     serving, and Cypher/Criteria recognition
-bench/csrbench/      CSR traversal micro-benchmark (self-contained Go module)
-bench/adgen/         Generates a synthetic AD-shaped graph and loads it into PostgreSQL
-bench/pathbench/     Benchmarks the in-memory path engine against a loaded graph
-bench/builderbench/  Benchmarks query-builder serving against a loaded graph
+internal/engine/       The in-memory engine: snapshot rebuild/poller, kind-scoped
+                       freshness marks, endpoint resolution and traversal, builder-query
+                       serving, and the Cypher interpreter (internal/engine/interpret)
+bench/csrbench/        CSR traversal micro-benchmark (self-contained Go module)
+bench/adgen/           Generates a synthetic AD-shaped graph and loads it into PostgreSQL
+bench/pathbench/       Benchmarks the in-memory path engine against a loaded graph
+bench/builderbench/    Benchmarks query-builder serving against a loaded graph
+bench/cypherbench/     Benchmarks Cypher-interpreter serving against a loaded graph
 ```
 
 ## Upstream versions
