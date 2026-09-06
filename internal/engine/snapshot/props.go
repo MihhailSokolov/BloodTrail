@@ -236,6 +236,36 @@ type parsedProp struct {
 	bytes []byte // raw payload for kindString (content) / kindArray / kindObject (raw JSON)
 }
 
+// ParsedProps is a node's property bag, already parsed and validated by
+// ParseProps, ready to be staged via Builder.AddParsedNode. It carries no
+// exported fields: the only thing a caller outside this package can do with
+// one is hand it to AddParsedNode.
+//
+// ParseProps/AddParsedNode exist to split AddNode's two halves -- JSON
+// parsing (pure, CPU-bound, safe to run concurrently) and committing into
+// the Builder's shared arena/intern table (stateful, must run on one
+// goroutine, in strictly ascending databaseID order) -- so a caller loading
+// many nodes can parallelize the first half across a worker pool while
+// keeping the second on a single, ordered goroutine. See
+// internal/engine/load.go's loadNodes for the intended pipeline shape.
+type ParsedProps struct {
+	parsed []parsedProp
+}
+
+// ParseProps parses and validates propsJSON exactly as AddNode does
+// internally (see parseNodeProps), without touching any Builder state.
+// Unlike AddNode, it is safe to call concurrently from multiple goroutines
+// -- it allocates and returns fresh state, touching nothing shared -- which
+// is the whole point: pair it with Builder.AddParsedNode to parallelize
+// property-bag parsing ahead of Builder's own serial, ordered commit step.
+func ParseProps(propsJSON []byte) (ParsedProps, error) {
+	parsed, err := parseNodeProps(propsJSON)
+	if err != nil {
+		return ParsedProps{}, err
+	}
+	return ParsedProps{parsed: parsed}, nil
+}
+
 // parseNodeProps decodes a node's jsonb property bag into parsedProp
 // values. propsJSON may be nil or empty, meaning no properties. Malformed
 // JSON is impossible in practice (jsonb guarantees valid JSON on the way

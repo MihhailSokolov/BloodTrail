@@ -62,13 +62,45 @@ func NewBuilder(graphID int32) *Builder {
 // i.e. "{}", means no properties); it is parsed and validated before any
 // Builder state is mutated, so a decode error (see parseNodeProps) also
 // leaves the node unstaged, exactly like the ascending-id check above.
+//
+// AddNode does both of ParseProps's and AddParsedNode's jobs on one
+// goroutine (parse then commit); a caller loading many nodes and wanting to
+// parallelize the parse half across a worker pool should call those two
+// directly instead -- see AddParsedNode's doc.
 func (b *Builder) AddNode(databaseID uint64, kinds []KindID, propsJSON []byte) error {
-	if n := len(b.ids); n > 0 && databaseID <= b.ids[n-1] {
-		return fmt.Errorf("snapshot: AddNode: databaseID %d is not strictly greater than previous %d", databaseID, b.ids[n-1])
-	}
 	parsed, err := parseNodeProps(propsJSON)
 	if err != nil {
 		return fmt.Errorf("snapshot: AddNode: databaseID %d: %w", databaseID, err)
+	}
+	if err := b.addParsedNode(databaseID, kinds, parsed); err != nil {
+		return fmt.Errorf("snapshot: AddNode: %w", err)
+	}
+	return nil
+}
+
+// AddParsedNode is AddNode's commit-only half: it stages a node whose
+// property bag was already parsed and validated by the package-level
+// ParseProps, typically off the hot path in a worker pool (see ParseProps's
+// doc for why). Like AddNode, databaseID must be strictly greater than
+// every previously staged node's databaseID.
+//
+// AddParsedNode is not safe to call concurrently -- with itself, with
+// AddNode, or with any other Builder method -- since it mutates the
+// Builder's shared state (the id/kind arrays, the property intern table,
+// and the shared arena) exactly as AddNode's commit half does. Concurrency
+// belongs entirely on the ParseProps side, ahead of a single, ordered
+// stream of AddParsedNode calls.
+func (b *Builder) AddParsedNode(databaseID uint64, kinds []KindID, props ParsedProps) error {
+	return b.addParsedNode(databaseID, kinds, props.parsed)
+}
+
+// addParsedNode is AddNode's and AddParsedNode's shared commit step: the
+// ascending-id check, staging id/kinds, and committing already-parsed
+// properties. See AddNode's and AddParsedNode's docs for the ordering and
+// concurrency contract this relies on.
+func (b *Builder) addParsedNode(databaseID uint64, kinds []KindID, parsed []parsedProp) error {
+	if n := len(b.ids); n > 0 && databaseID <= b.ids[n-1] {
+		return fmt.Errorf("databaseID %d is not strictly greater than previous %d", databaseID, b.ids[n-1])
 	}
 
 	b.ids = append(b.ids, databaseID)

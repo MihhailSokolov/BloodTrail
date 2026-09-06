@@ -217,3 +217,110 @@ func TestPropStoreNodeByObjectIDDuplicateTieBreak(t *testing.T) {
 		t.Fatalf(`NodeByObjectID("shared-id") = %d, want 1 (the later-inserted node)`, id)
 	}
 }
+
+// TestParsePropsAddParsedNodeMatchesAddNode checks that staging nodes via
+// ParseProps+AddParsedNode -- the split, worker-pool-friendly path
+// loadNodes uses to parallelize property-bag parsing -- produces a
+// semantically identical Snapshot to staging the same nodes via AddNode
+// directly, covering every JSON value kind (string, bool, number, null,
+// array, object) plus the objectid index.
+//
+// This compares NodeMap output (and GraphIDs/objectid-index membership)
+// rather than the two Snapshots themselves via reflect.DeepEqual: property
+// names are interned into PropIDs in the order parseNodeProps's internal
+// map range happens to visit them, which Go deliberately randomizes per
+// map, so two separately-built Snapshots holding equivalent property bags
+// can legitimately assign the same name different PropIDs. That is a
+// pre-existing property of parseNodeProps (shared by AddNode itself, not
+// something ParseProps/AddParsedNode introduces), so the right equivalence
+// check is "resolves to the same values," not "identical internal
+// encoding."
+func TestParsePropsAddParsedNodeMatchesAddNode(t *testing.T) {
+	const node0JSON = `{"objectid":"S-1-X","name":"A","enabled":true,"lastlogon":1725500000,"spns":["a/b","c/d"],"weird":null,"nested":{"a":1}}`
+
+	nodes := []struct {
+		id        uint64
+		propsJSON string
+	}{
+		{10, node0JSON},
+		{20, `{}`},
+		{30, `{"objectid":"S-1-Y","enabled":false}`},
+	}
+
+	bAddNode := NewBuilder(1)
+	bAddNode.SetKinds(map[KindID]string{1: "User"})
+	for _, n := range nodes {
+		mustAddNodeJSON(t, bAddNode, n.id, []KindID{1}, n.propsJSON)
+	}
+	want, err := bAddNode.Build()
+	if err != nil {
+		t.Fatalf("Build (AddNode path): %v", err)
+	}
+
+	bParsed := NewBuilder(1)
+	bParsed.SetKinds(map[KindID]string{1: "User"})
+	for _, n := range nodes {
+		parsed, err := ParseProps([]byte(n.propsJSON))
+		if err != nil {
+			t.Fatalf("ParseProps(%d): %v", n.id, err)
+		}
+		if err := bParsed.AddParsedNode(n.id, []KindID{1}, parsed); err != nil {
+			t.Fatalf("AddParsedNode(%d): %v", n.id, err)
+		}
+	}
+	got, err := bParsed.Build()
+	if err != nil {
+		t.Fatalf("Build (ParseProps/AddParsedNode path): %v", err)
+	}
+
+	if !reflect.DeepEqual(want.GraphIDs, got.GraphIDs) {
+		t.Fatalf("GraphIDs differ: AddNode=%v AddParsedNode=%v", want.GraphIDs, got.GraphIDs)
+	}
+	for i := range nodes {
+		n := NodeID(i)
+		wantMap, gotMap := want.Props.NodeMap(n), got.Props.NodeMap(n)
+		if !reflect.DeepEqual(wantMap, gotMap) {
+			t.Fatalf("node %d: NodeMap differs: AddNode=%#v AddParsedNode=%#v", n, wantMap, gotMap)
+		}
+	}
+	for _, objectID := range []string{"S-1-X", "S-1-Y"} {
+		wantNode, wantOK := want.Props.NodeByObjectID(objectID)
+		gotNode, gotOK := got.Props.NodeByObjectID(objectID)
+		if wantOK != gotOK || wantNode != gotNode {
+			t.Fatalf("NodeByObjectID(%q): AddNode=(%d,%t) AddParsedNode=(%d,%t)", objectID, wantNode, wantOK, gotNode, gotOK)
+		}
+	}
+}
+
+// TestParsePropsMalformedJSON checks that ParseProps surfaces a JSON decode
+// error rather than panicking or silently dropping data, mirroring
+// TestAddNodePropsMalformedJSON's coverage of AddNode's own parse half.
+func TestParsePropsMalformedJSON(t *testing.T) {
+	if _, err := ParseProps([]byte(`{not valid json`)); err == nil {
+		t.Fatal("ParseProps with malformed properties JSON: want error, got nil")
+	}
+}
+
+// TestAddParsedNodeOutOfOrder mirrors TestAddNodeOutOfOrder for the
+// AddParsedNode path: a non-ascending databaseID is rejected, and a failed
+// add leaves the Builder's ascending-id state untouched (a corrected retry
+// with the same databaseID succeeds).
+func TestAddParsedNodeOutOfOrder(t *testing.T) {
+	b := NewBuilder(1)
+	empty, err := ParseProps(nil)
+	if err != nil {
+		t.Fatalf("ParseProps(nil): %v", err)
+	}
+	if err := b.AddParsedNode(100, []KindID{1}, empty); err != nil {
+		t.Fatalf("AddParsedNode(100) unexpected error: %v", err)
+	}
+	if err := b.AddParsedNode(100, []KindID{1}, empty); err == nil {
+		t.Fatal("AddParsedNode(100) again: want error for non-ascending id, got nil")
+	}
+	if err := b.AddParsedNode(50, []KindID{1}, empty); err == nil {
+		t.Fatal("AddParsedNode(50) after 100: want error for non-ascending id, got nil")
+	}
+	if err := b.AddParsedNode(200, []KindID{1}, empty); err != nil {
+		t.Fatalf("AddParsedNode(200) retry after failed adds: %v", err)
+	}
+}

@@ -8,10 +8,12 @@ package engine
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs/drivers/pg"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
@@ -96,15 +98,61 @@ func loadKinds(ctx context.Context, tx pgx.Tx, builder *snapshot.Builder) error 
 	return nil
 }
 
+// pendingNode is one row loadNodes has scanned off the wire but not yet
+// committed into the Builder: its cheap fields (id, kinds) alongside a
+// buffered result channel a parse worker fills in once it has decoded
+// propsJSON. See loadNodes's doc for the pipeline this is part of.
+type pendingNode struct {
+	databaseID uint64
+	kindIDs    []snapshot.KindID
+	propsJSON  []byte
+	result     chan nodePropsParseResult
+}
+
+// nodePropsParseResult is a parse worker's outcome for one pendingNode:
+// either the parsed property bag, or the error parsing it hit.
+type nodePropsParseResult struct {
+	parsed snapshot.ParsedProps
+	err    error
+}
+
 // loadNodes streams every node of graphID, ordered by id, into builder. The
 // ascending id order is required: it becomes the Builder's dense NodeID
 // assignment.
 //
-// Each row's properties column (jsonb) is scanned directly into a []byte and
-// handed to Builder.AddNode as-is: pgx returns jsonb's wire text verbatim,
-// which is already valid JSON, so nothing needs stripping or re-encoding.
-// This keeps the scan single-pass -- kinds and properties are both read off
-// the same row, with no second query needed to backfill property bags.
+// Each row's properties column (jsonb) is scanned directly into a []byte;
+// pgx returns jsonb's wire text verbatim (already valid JSON, and, per
+// pgtype's JSON codec, a fresh copy per row -- safe to keep past the next
+// Scan call), so nothing needs stripping or re-encoding before it reaches
+// snapshot.ParseProps. This keeps the row scan itself single-pass and
+// strictly serial (required: it is the one thing here that cannot
+// parallelize, since pgx.Rows is a single cursor) -- kinds and properties
+// are both read off the same row, with no second query needed to backfill
+// property bags.
+//
+// What *does* parallelize is the CPU-bound half of what used to be one
+// synchronous Builder.AddNode call per row: parsing/validating each node's
+// JSON property bag (snapshot.ParseProps) is pure and independent
+// node-to-node, so it runs on a small worker pool fed by the row scan,
+// while Builder.AddParsedNode -- the stateful commit into the Builder's
+// shared arena and intern table, which must stay on one goroutine in
+// strict ascending-id order -- runs on a single consumer goroutine that
+// drains results in the exact order the rows were scanned. Concretely,
+// three goroutine roles, wired by errgroup so a failure anywhere cancels
+// the rest promptly instead of leaking or deadlocking:
+//
+//   - the producer (this call's own row-scan loop): for each row, builds a
+//     pendingNode carrying a fresh 1-buffered result channel, sends it to
+//     the workers via jobs, then sends the same pendingNode to order;
+//   - a small pool of parse workers, each draining jobs and calling
+//     snapshot.ParseProps on propsJSON, then delivering the outcome on that
+//     pendingNode's own result channel (never blocking, since it is
+//     1-buffered and only that one pendingNode is ever sent on it);
+//   - the consumer: drains order (i.e. rows, in scan order), blocks on each
+//     pendingNode's result, and calls builder.AddParsedNode -- the only
+//     Builder call in this whole pipeline, so Builder's single-goroutine
+//     contract is honored exactly as it was when AddNode was called
+//     directly from this loop.
 func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.Builder) error {
 	rows, err := tx.Query(ctx, "SELECT id, kind_ids, properties FROM node WHERE graph_id = $1 ORDER BY id", graphID)
 	if err != nil {
@@ -112,24 +160,78 @@ func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 	}
 	defer rows.Close()
 
-	for rows.Next() {
-		var (
-			id        int64
-			kindIDs   []snapshot.KindID
-			propsJSON []byte
-		)
-		if err := rows.Scan(&id, &kindIDs, &propsJSON); err != nil {
-			return fmt.Errorf("engine: LoadSnapshot: scan node: %w", err)
-		}
-		if err := builder.AddNode(uint64(id), kindIDs, propsJSON); err != nil {
-			return fmt.Errorf("engine: LoadSnapshot: add node: %w", err)
-		}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("engine: LoadSnapshot: node rows: %w", err)
+	const queueDepth = 4 // per worker, for both jobs and order
+
+	jobs := make(chan *pendingNode, workers*queueDepth)
+	order := make(chan *pendingNode, workers*queueDepth)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		defer close(jobs)
+		defer close(order)
+
+		for rows.Next() {
+			var (
+				id        int64
+				kindIDs   []snapshot.KindID
+				propsJSON []byte
+			)
+			if err := rows.Scan(&id, &kindIDs, &propsJSON); err != nil {
+				return fmt.Errorf("engine: LoadSnapshot: scan node: %w", err)
+			}
+
+			p := &pendingNode{
+				databaseID: uint64(id),
+				kindIDs:    kindIDs,
+				propsJSON:  propsJSON,
+				result:     make(chan nodePropsParseResult, 1),
+			}
+			select {
+			case jobs <- p:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+			select {
+			case order <- p:
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("engine: LoadSnapshot: node rows: %w", err)
+		}
+		return nil
+	})
+
+	for i := 0; i < workers; i++ {
+		g.Go(func() error {
+			for p := range jobs {
+				parsed, err := snapshot.ParseProps(p.propsJSON)
+				p.result <- nodePropsParseResult{parsed: parsed, err: err}
+			}
+			return nil
+		})
 	}
 
-	return nil
+	g.Go(func() error {
+		for p := range order {
+			res := <-p.result
+			if res.err != nil {
+				return fmt.Errorf("engine: LoadSnapshot: add node: databaseID %d: %w", p.databaseID, res.err)
+			}
+			if err := builder.AddParsedNode(p.databaseID, p.kindIDs, res.parsed); err != nil {
+				return fmt.Errorf("engine: LoadSnapshot: add node: %w", err)
+			}
+		}
+		return nil
+	})
+
+	return g.Wait()
 }
 
 // loadEdges streams every edge of graphID into builder. Edges may arrive in
