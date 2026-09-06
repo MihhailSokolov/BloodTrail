@@ -436,6 +436,21 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 	if err != nil {
 		return nil, err
 	}
+	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, rows)
+}
+
+// runComponentTreeFrom is runComponent's own tree-walk/closing-edge
+// expansion (see its doc comment above) factored out so it can run over an
+// anchorRows chunk a caller already collected for anchor -- via scanAnchor
+// (runComponent's own use, below) or, for a future chunked LIMIT driver, via
+// scanAnchorVisit stopped early with errStopScan -- instead of always
+// starting a scan of its own. anchor must be the same symbol anchorRows is
+// keyed on (chooseAnchor's pick, when the caller is runComponent itself);
+// stepIdxs is the component's Steps, unfiltered -- runComponentTreeFrom
+// rediscovers which of them are "tree" vs. "closing" itself via the same
+// BFS runComponent always ran.
+func runComponentTreeFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, anchor string, anchorRows []*Row) ([]*Row, error) {
+	rows := anchorRows
 	if len(stepIdxs) == 0 {
 		return rows, nil
 	}
@@ -451,6 +466,7 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 	queue := []string{anchor}
 	processed := make(map[int]bool, len(stepIdxs))
 	var closing []int
+	var err error
 
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -495,6 +511,52 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 	}
 
 	return rows, nil
+}
+
+// runComponentFrom replays runComponent's own dispatch (see its doc comment
+// above -- every numbered branch there except #2) over anchorRows, a chunk
+// of comp's own anchor rows a caller already collected (via scanAnchor or,
+// for a future chunked LIMIT driver, scanAnchorVisit), instead of running a
+// scanAnchor of its own: the single entry point that driver needs per
+// chunk, covering all three non-shortestPath component executors
+// (fixed-length/BFS, chain, var-length) behind one call.
+//
+// Branch #2 (a shortestPath/allShortestPaths component) is deliberately
+// NOT reproduced here: expandShortestPathComponent resolves both pattern
+// endpoints as complete node sets up front (see its own doc) rather than
+// growing rows from one symbol's anchor scan, so it has no "given anchor
+// rows" tail to dispatch to at all -- callers must route that shape through
+// runComponent/expandShortestPathComponent directly, exactly as matchPart
+// already does.
+func runComponentFrom(env *Env, meter *workMeter, part *Part, comp component, anchorRows []*Row) ([]*Row, error) {
+	stepIdxs := comp.stepIdxs
+	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
+	if !pathUniform {
+		return nil, errUnsupportedStep
+	}
+
+	if hasSpecialStep(part, stepIdxs) {
+		if hasShortestStep(part, stepIdxs) {
+			return nil, errUnsupportedStep
+		}
+		if len(stepIdxs) == 1 {
+			return expandVarLengthComponentFrom(env, meter, part, &part.Chains[stepIdxs[0]], anchorRows)
+		}
+		if !isStrictLinearChain(part, stepIdxs) {
+			return nil, errUnsupportedStep
+		}
+		return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, anchorRows)
+	}
+
+	if pathSym != "" {
+		if !isStrictLinearChain(part, stepIdxs) {
+			return nil, errUnsupportedStep
+		}
+		return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, anchorRows)
+	}
+
+	anchor := chooseAnchor(env, part.Nodes, comp.syms)
+	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, anchorRows)
 }
 
 // hasSpecialStep reports whether any of part.Chains[stepIdxs] is a
@@ -641,6 +703,20 @@ func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int
 	if err != nil {
 		return nil, err
 	}
+	return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, rows)
+}
+
+// expandChainComponentFrom is expandChainComponent's own step-by-step
+// expansion (see its doc comment above), factored out so it can grow an
+// anchorRows chunk a caller already collected for the chain's own leftmost
+// symbol (part.Chains[stepIdxs[0]].FromSym) instead of always starting a
+// scanAnchor of its own. Each step still runs through the same fixed
+// (expandStep) or variable-length (expandVarLengthTrailsForSeed) expansion
+// in chain order, and pathSym's PathVal assembly (assembleChainPathVal)
+// still runs last, over the fully-grown rows -- unchanged by this split.
+func expandChainComponentFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string, anchorRows []*Row) ([]*Row, error) {
+	rows := anchorRows
+	var err error
 
 	for _, idx := range stepIdxs {
 		step := &part.Chains[idx]
@@ -874,9 +950,14 @@ func smallestKindBitmap(env *Env, kinds []snapshot.KindID) *snapshot.Bitset {
 	return best
 }
 
-// scanAnchor produces sym's initial row set: one row per node id
-// nodeSatisfiesConstraint(nc) admits, drawn from whichever candidate source
-// rankOf picked (a single id() lookup, a single objectid lookup, the
+// errStopScan tells scanAnchorVisit to stop producing anchor rows. It is
+// a control-flow sentinel, not a failure: scanAnchorVisit returns it
+// unchanged so callers can distinguish a deliberate stop from an error.
+var errStopScan = errors.New("interpret: stop anchor scan")
+
+// scanAnchorVisit streams sym's initial row set through visit, one row per
+// node id nodeSatisfiesConstraint(nc) admits, drawn from whichever candidate
+// source rankOf picked (a single id() lookup, a single objectid lookup, the
 // smallest AND-ed kind bitmap, or every node in the snapshot). Every
 // candidate visited -- regardless of source -- spends one work unit and is
 // independently checked against the *complete* nc (not just whatever
@@ -889,9 +970,15 @@ func smallestKindBitmap(env *Env, kinds []snapshot.KindID) *snapshot.Bitset {
 // (inspect the candidate, then charge again for each one that becomes a
 // row) -- so the anchor scan that seeds a component is not a silent
 // exception to that accounting.
-func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*Row, error) {
-	var rows []*Row
-	visit := func(id snapshot.NodeID) error {
+//
+// visit returning errStopScan stops the scan cleanly -- e.g. a chunked
+// caller that only wants the next N anchor rows -- and scanAnchorVisit
+// returns that sentinel unchanged rather than wrapping or swallowing it, so
+// the caller can tell a deliberate stop apart from a genuine evaluator
+// error (any other non-nil return from visit aborts the scan the same way
+// and is likewise returned unchanged).
+func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint, visit func(*Row) error) error {
+	admit := func(id snapshot.NodeID) error {
 		if err := meter.spend(1); err != nil {
 			return err
 		}
@@ -903,15 +990,14 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 		if err := meter.spend(1); err != nil {
 			return err
 		}
-		rows = append(rows, r)
-		return nil
+		return visit(r)
 	}
 
 	switch {
 	case nc != nil && len(nc.IDs) > 0:
 		if id, ok := env.Snap.Dense(nc.IDs[0]); ok {
-			if err := visit(id); err != nil {
-				return nil, err
+			if err := admit(id); err != nil {
+				return err
 			}
 		}
 
@@ -921,8 +1007,8 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 		// (NodesByObjectID), not just an arbitrary witness -- see its doc.
 		if ids, ok := env.Snap.Props.NodesByObjectID(*nc.ObjectIDAnchor); ok {
 			for _, id := range ids {
-				if err := visit(id); err != nil {
-					return nil, err
+				if err := admit(id); err != nil {
+					return err
 				}
 			}
 		}
@@ -930,25 +1016,41 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 	case nc != nil && len(nc.Kinds) > 0:
 		var iterErr error
 		smallestKindBitmap(env, nc.Kinds).Iterate(func(id snapshot.NodeID) bool {
-			if err := visit(id); err != nil {
+			if err := admit(id); err != nil {
 				iterErr = err
 				return false
 			}
 			return true
 		})
 		if iterErr != nil {
-			return nil, iterErr
+			return iterErr
 		}
 
 	default:
 		n := env.Snap.NodeCount()
 		for i := 0; i < n; i++ {
-			if err := visit(snapshot.NodeID(i)); err != nil {
-				return nil, err
+			if err := admit(snapshot.NodeID(i)); err != nil {
+				return err
 			}
 		}
 	}
 
+	return nil
+}
+
+// scanAnchor produces sym's initial row set (see scanAnchorVisit's doc for
+// the exact candidate-source/work-accounting contract). A thin
+// append-collecting wrapper over scanAnchorVisit: its own visit callback
+// never returns errStopScan, so scanAnchorVisit's return value here is
+// always either nil or a genuine evaluator error, never the sentinel.
+func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*Row, error) {
+	var rows []*Row
+	if err := scanAnchorVisit(env, meter, sym, nc, func(r *Row) error {
+		rows = append(rows, r)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 	return rows, nil
 }
 

@@ -1055,3 +1055,166 @@ func TestExecChainNamedVarLengthStepDeclines(t *testing.T) {
 		t.Fatalf("Execute with named var-length step inside chain: expected error, got nil")
 	}
 }
+
+// --- refactor characterization: anchor visitor + component-tail split ------
+
+// TestRefactorCharacterization pins end-to-end row counts for one query per
+// non-shortestPath component class (bare scan, fixed chain, var-length)
+// BEFORE the anchor-visitor/component-tail split, so the split can be
+// verified byte-identical: same query, same snapshot, same row counts,
+// after. Row counts below are read off an actual run against this fixture,
+// not derived by hand -- see the milestone-4.5 Task 1 brief for the fixture
+// (6 User nodes 1..6, edges 1->2->3 and 4->5, all :MemberOf).
+func TestRefactorCharacterization(t *testing.T) {
+	const kindUser, kindMemberOf snapshot.KindID = 1, 2
+
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User", kindMemberOf: "MemberOf"},
+		[]execNodeSpec{{1, []snapshot.KindID{kindUser}, nil}, {2, []snapshot.KindID{kindUser}, nil},
+			{3, []snapshot.KindID{kindUser}, nil}, {4, []snapshot.KindID{kindUser}, nil},
+			{5, []snapshot.KindID{kindUser}, nil}, {6, []snapshot.KindID{kindUser}, nil}},
+		[]execEdgeSpec{{1, 1, 2, kindMemberOf}, {2, 2, 3, kindMemberOf}, {3, 4, 5, kindMemberOf}},
+	)
+
+	for _, tc := range []struct {
+		query    string
+		wantRows int
+	}{
+		{`MATCH (n:User) RETURN n`, 6},                               // bare scan
+		{`MATCH (a:User)-[:MemberOf]->(b:User) RETURN a, b`, 3},      // fixed chain
+		{`MATCH (a:User)-[:MemberOf*1..2]->(b:User) RETURN a, b`, 4}, // var-length
+	} {
+		rs := mustExec(t, snap, tc.query, generousBudget)
+		if len(rs.Rows) != tc.wantRows {
+			t.Fatalf("%s -> %d rows, want %d", tc.query, len(rs.Rows), tc.wantRows)
+		}
+	}
+}
+
+// TestRunComponentFromDispatchMatchesRunComponent exercises runComponentFrom
+// -- the single per-chunk call the brief's Task 2 driver will make -- across
+// every branch of runComponent's own dispatch it reproduces (general fixed
+// BFS/closing, a multi-step chain via hasSpecialStep, a single var-length
+// step, and a named-path chain), checking each one reproduces both the exact
+// row set AND the exact meter.work total runComponent/scanAnchor already
+// produce for the identical query when fed the identical scanAnchor-sourced
+// anchor rows. runComponentFrom is not wired into any production call path
+// yet (Task 2 does that) and its tails are otherwise only exercised
+// indirectly through runComponent/expandChainComponent/
+// expandVarLengthComponent, so without this, its own dispatch switch would
+// have zero coverage.
+func TestRunComponentFromDispatchMatchesRunComponent(t *testing.T) {
+	check := func(t *testing.T, snap *snapshot.Snapshot, query, anchorSym string) {
+		t.Helper()
+		env := &Env{Snap: snap}
+		part := &planQuery(t, snap, query).Parts[0]
+		comps := groupComponents(part)
+		if len(comps) != 1 {
+			t.Fatalf("%s: got %d components, want 1", query, len(comps))
+		}
+		comp := comps[0]
+
+		baseline := &workMeter{budget: generousBudget}
+		want, err := runComponent(env, baseline, part, comp.syms, comp.stepIdxs)
+		if err != nil {
+			t.Fatalf("%s: runComponent: %v", query, err)
+		}
+
+		split := &workMeter{budget: generousBudget}
+		anchorRows, err := scanAnchor(env, split, anchorSym, part.Nodes[anchorSym])
+		if err != nil {
+			t.Fatalf("%s: scanAnchor(%q): %v", query, anchorSym, err)
+		}
+		got, err := runComponentFrom(env, split, part, comp, anchorRows)
+		if err != nil {
+			t.Fatalf("%s: runComponentFrom: %v", query, err)
+		}
+
+		wantKeys, gotKeys := rowKeys(rowsToOutVals(t, want)), rowKeys(rowsToOutVals(t, got))
+		if len(wantKeys) != len(gotKeys) {
+			t.Fatalf("%s: runComponentFrom row count = %d, want %d", query, len(gotKeys), len(wantKeys))
+		}
+		for i := range wantKeys {
+			if wantKeys[i] != gotKeys[i] {
+				t.Fatalf("%s: runComponentFrom rows = %v, want %v", query, gotKeys, wantKeys)
+			}
+		}
+		if split.work != baseline.work {
+			t.Fatalf("%s: runComponentFrom meter.work = %d, want %d (scanAnchor + runComponent's own accounting, unchanged by the split)", query, split.work, baseline.work)
+		}
+	}
+
+	t.Run("general fixed BFS", func(t *testing.T) {
+		const kindUser, kindMemberOf snapshot.KindID = 1, 2
+		snap := buildExecSnapshot(t,
+			map[snapshot.KindID]string{kindUser: "User", kindMemberOf: "MemberOf"},
+			[]execNodeSpec{{1, []snapshot.KindID{kindUser}, nil}, {2, []snapshot.KindID{kindUser}, nil}, {3, []snapshot.KindID{kindUser}, nil}},
+			[]execEdgeSpec{{1, 1, 2, kindMemberOf}, {2, 2, 3, kindMemberOf}},
+		)
+		check(t, snap, `MATCH (a:User)-[:MemberOf]->(b:User) RETURN a, b`, "a")
+	})
+
+	t.Run("single var-length step", func(t *testing.T) {
+		const kindUser, kindMemberOf snapshot.KindID = 1, 2
+		snap := buildExecSnapshot(t,
+			map[snapshot.KindID]string{kindUser: "User", kindMemberOf: "MemberOf"},
+			[]execNodeSpec{{1, []snapshot.KindID{kindUser}, nil}, {2, []snapshot.KindID{kindUser}, nil}, {3, []snapshot.KindID{kindUser}, nil}},
+			[]execEdgeSpec{{1, 1, 2, kindMemberOf}, {2, 2, 3, kindMemberOf}},
+		)
+		check(t, snap, `MATCH (a:User)-[:MemberOf*1..2]->(b:User) RETURN a, b`, "a")
+	})
+
+	t.Run("multi-step chain via hasSpecialStep", func(t *testing.T) {
+		const (
+			kindRoot snapshot.KindID = 1
+			kindMid  snapshot.KindID = 2
+			kindF    snapshot.KindID = 10
+			kindE    snapshot.KindID = 11
+		)
+		snap := buildExecSnapshot(t,
+			map[snapshot.KindID]string{kindRoot: "Root", kindMid: "Mid", kindF: "F", kindE: "E"},
+			[]execNodeSpec{
+				{1, []snapshot.KindID{kindRoot}, nil},
+				{2, []snapshot.KindID{kindMid}, nil},
+				{3, []snapshot.KindID{kindMid}, nil},
+			},
+			[]execEdgeSpec{{1, 1, 2, kindF}, {2, 2, 3, kindE}},
+		)
+		check(t, snap, `MATCH (a:Root)-[:F]->(m:Mid)-[:E*1..2]->(b:Mid) RETURN a, b`, "a")
+	})
+
+	t.Run("named-path chain", func(t *testing.T) {
+		const kindUser, kindMemberOf snapshot.KindID = 1, 2
+		snap := buildExecSnapshot(t,
+			map[snapshot.KindID]string{kindUser: "User", kindMemberOf: "MemberOf"},
+			[]execNodeSpec{{1, []snapshot.KindID{kindUser}, nil}, {2, []snapshot.KindID{kindUser}, nil}},
+			[]execEdgeSpec{{1, 1, 2, kindMemberOf}},
+		)
+		check(t, snap, `MATCH p = (a:User)-[:MemberOf]->(b:User) RETURN p`, "a")
+	})
+}
+
+// rowsToOutVals renders each row's own node bindings as OutVals, sorted by
+// symbol name for a deterministic rowKey, purely so this test can compare
+// row sets with rowKey/rowKeys -- runComponent/runComponentFrom's own
+// []*Row output has no OutVal form of its own. Reaches into Row's
+// unexported nodes map directly (same package, see cloneRow's identical
+// reasoning) rather than adding an exported enumeration method purely for
+// this test's need.
+func rowsToOutVals(t *testing.T, rows []*Row) [][]OutVal {
+	t.Helper()
+	out := make([][]OutVal, len(rows))
+	for i, r := range rows {
+		keys := make([]string, 0, len(r.nodes))
+		for k := range r.nodes {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		vals := make([]OutVal, len(keys))
+		for j, k := range keys {
+			vals[j] = OutVal{Kind: OutNode, Node: r.nodes[k]}
+		}
+		out[i] = vals
+	}
+	return out
+}

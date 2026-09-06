@@ -179,10 +179,33 @@ func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step
 		return nil, err
 	}
 
+	return expandVarLengthComponentFrom(env, meter, part, step, seeds)
+}
+
+// expandVarLengthComponentFrom is expandVarLengthComponent's own per-seed
+// trail expansion (see its doc comment above), factored out so it can grow
+// an anchorRows chunk a caller already collected for step.FromSym instead of
+// always starting a scanAnchor of its own -- one call to
+// expandVarLengthTrailsForSeed per seed row, exactly as expandVarLengthComponent
+// itself always ran.
+//
+// The EdgeSym/FromSym==ToSym precondition expandVarLengthComponent checks
+// before ever scanning an anchor is deliberately re-checked here too, not
+// hoisted out and left solely to that caller: a future caller reaching this
+// tail directly (e.g. a chunked LIMIT driver handed anchorRows for a step it
+// never itself validated) must get the same errUnsupportedStep decline
+// expandVarLengthComponent would have given it, rather than silently
+// expanding a shape this package's Row/EdgeRef model cannot represent (see
+// expandVarLengthComponent's own doc for why).
+func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *Step, anchorRows []*Row) ([]*Row, error) {
+	if step.EdgeSym != "" || step.FromSym == step.ToSym {
+		return nil, errUnsupportedStep
+	}
+
 	toNC := part.Nodes[step.ToSym]
 
 	var out []*Row
-	for _, seed := range seeds {
+	for _, seed := range anchorRows {
 		rows, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, seed, step.PathSym)
 		if err != nil {
 			return nil, err
