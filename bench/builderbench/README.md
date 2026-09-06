@@ -155,7 +155,7 @@ against `shapeThreshold.engineAbsoluteCap`:
 | Shape                            | Engine abs. cap (pg_capped path) | Why                                                                                 |
 |-----------------------------------|:---------------------------------:|-----------------------------------------------------------------------------------------|
 | `fetch_directed_graph_memberof`   | 15s                                | Conservative estimate for a full 5M-scale `MemberOf` scan; unmeasured as of this task, see below. |
-| `group_members_bfs`               | **5s**                             | The brief's explicit bound for this shape's engine p50 at 5M -- the whole reason `-pg-cap` exists. |
+| `group_members_bfs`               | **5s**                             | A controller-suggested estimate like the other four caps, to be validated by the first real 5M run (Task-21-equivalent), same status as its siblings. |
 | `node_count_user`                 | 2s                                 | Headroom over a bounded in-memory count; not expected to ever need this path.       |
 | `node_fetchids_user`              | 5s                                 | Headroom over a bounded id drain; not expected to ever need this path.              |
 | `delete_transit_edges_admin_to`   | 5s                                 | Headroom over a bounded edge-id drain; not expected to ever need this path.          |

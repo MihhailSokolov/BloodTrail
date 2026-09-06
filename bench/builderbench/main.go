@@ -217,8 +217,9 @@ type shapeThreshold struct {
 //     is a per-node query storm (one BFS layer's worth of individual
 //     MemberOf lookups against PostgreSQL) that runs for hours at 5M,
 //     entirely unrelated to how fast the engine itself answers the same
-//     traversal in memory. 5s is the brief's own explicit bound for the
-//     engine's absolute p50 at 5M.
+//     traversal in memory. 5s is a controller-suggested estimate like the
+//     other four caps, to be validated by the first real 5M run
+//     (Task-21-equivalent), same status as its siblings.
 //   - node_count_user, node_fetchids_user, delete_transit_edges_admin_to:
 //     minRatio 5x (unchanged). These are bounded, filtered scans (a single
 //     kind's node count/id list, or one derived edge kind's id list
@@ -983,13 +984,19 @@ func (r *benchResult) report(enforce bool) bool {
 		if s.matchChecked {
 			matchStr = fmt.Sprintf("%t", s.match)
 		}
-		fmt.Printf("builderbench: %-32s pg_capped=%-5t ratio=%7.2fx match=%-5s min_ratio=%.1fx %s\n",
-			s.name, s.pgCapped, ratio, matchStr, th.minRatio, passFail(ok))
+		ratioStr := fmt.Sprintf("%.2fx", ratio)
+		ratioStrMachine := fmt.Sprintf("%.3f", ratio)
+		if s.pgCapped {
+			ratioStr = "n/a   "
+			ratioStrMachine = "n/a"
+		}
+		fmt.Printf("builderbench: %-32s pg_capped=%-5t ratio=%6s match=%-5s min_ratio=%.1fx %s\n",
+			s.name, s.pgCapped, ratioStr, matchStr, th.minRatio, passFail(ok))
 		for _, reason := range reasons {
 			fmt.Printf("builderbench:   - %s\n", reason)
 		}
-		fmt.Printf("BUILDERBENCH_SHAPE name=%s bt_p50_ms=%.3f bt_p95_ms=%.3f pg_p50_ms=%.3f pg_p95_ms=%.3f ratio=%.3f min_ratio=%.2f match_checked=%t match=%t pg_capped=%t engine_abs_cap_ms=%.3f bt_size=%d pg_size=%d ok=%t\n",
-			s.name, floatMillis(btp50), floatMillis(btp95), floatMillis(pgp50), floatMillis(pgp95), ratio, th.minRatio,
+		fmt.Printf("BUILDERBENCH_SHAPE name=%s bt_p50_ms=%.3f bt_p95_ms=%.3f pg_p50_ms=%.3f pg_p95_ms=%.3f ratio=%s min_ratio=%.2f match_checked=%t match=%t pg_capped=%t engine_abs_cap_ms=%.3f bt_size=%d pg_size=%d ok=%t\n",
+			s.name, floatMillis(btp50), floatMillis(btp95), floatMillis(pgp50), floatMillis(pgp95), ratioStrMachine, th.minRatio,
 			s.matchChecked, s.match, s.pgCapped, floatMillis(th.engineAbsoluteCap), s.btSize, s.pgSize, ok)
 	}
 
