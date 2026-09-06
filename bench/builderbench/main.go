@@ -52,7 +52,7 @@
 //
 // Usage:
 //
-//	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-enforce]
+//	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-enforce]
 //
 // builderbench never imports bench/adgen (a generator, not a library) and
 // never writes to the database (beyond a scratch datapipe_status row it
@@ -64,16 +64,44 @@
 // Every shape prints a human-readable line and a machine-greppable
 // BUILDERBENCH_* summary line (grep '^BUILDERBENCH_'), ending in
 // BUILDERBENCH_RESULT PASS or FAIL. With -enforce, builderbench exits
-// nonzero if any shape's p50 ratio is below enforceRatio (5x) or if its two
-// drivers' results mismatched -- see benchResult.report's doc for why a 5x
-// ratio is itself proof the engine actually served the query rather than
-// silently delegating. CI must never pass -enforce. Any other failure (a
+// nonzero if any shape fails evaluateShape's decision -- see that
+// function's doc and shapeThresholds' doc for the per-shape ratio/absolute
+// bars this checks. CI must never pass -enforce. Any other failure (a
 // database error, an empty graph, a driver that returns an outright error)
 // aborts the run with a nonzero exit regardless of -enforce.
+//
+// # Per-shape thresholds and the pg wall-clock cap
+//
+// Not every shape can fairly be held to the same "engine is 5x faster than
+// delegating" bar, and not every shape's pg baseline can even be measured
+// at production scale without turning the whole run into a multi-hour
+// storm. Two mechanisms handle this -- see shapeThresholds' doc and
+// runPGCapped's doc for the full rationale, and the README's "Per-shape
+// enforce thresholds" and "-pg-cap" sections for the operator-facing
+// summary:
+//
+//   - shapeThresholds gives each shape its own minimum p50 ratio.
+//     fetch_directed_graph_memberof is row-volume-bound (it always visits
+//     every MemberOf edge and every endpoint node, however fast the engine
+//     is at doing so), so its bar is 1.2x, not 5x. Every other shape keeps
+//     the original 5x bar.
+//   - runPGCapped bounds every pg-baseline call (warmup and timed) to
+//     -pg-cap (default 120s) via context.WithTimeout wrapped around the
+//     query itself, so a single pathologically slow pg query is cut off
+//     mid-execution rather than merely skipped on the next loop iteration.
+//     Once a shape's pg baseline trips this cap, its remaining pg runs (and
+//     its bt/pg size-match check, if the cap tripped before that check ever
+//     ran) are skipped, pg_capped=true is recorded, and evaluateShape judges
+//     the shape on the engine's absolute p50 alone against
+//     shapeThreshold.engineAbsoluteCap -- there is no pg measurement left to
+//     compute a ratio against. This is what makes group_members_bfs
+//     runnable at 5M: its per-node pg query storm would otherwise run for
+//     hours.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -130,9 +158,102 @@ var (
 )
 
 // enforceRatio is the minimum p50 ratio (delegated / served) -enforce
-// requires of every shape -- see benchResult.report's doc for why this
-// number itself doubles as evidence the engine served the query at all.
+// requires of every shape except fetch_directed_graph_memberof -- see
+// evaluateShape's doc for why this number itself doubles as evidence the
+// engine served the query at all, and shapeThresholds' doc for why
+// fetch_directed_graph_memberof is the deliberate exception.
 const enforceRatio = 5.0
+
+// fetchDirectedGraphMinRatio is fetch_directed_graph_memberof's own,
+// weaker, p50 ratio bar -- see shapeThresholds' doc.
+const fetchDirectedGraphMinRatio = 1.2
+
+// defaultPGCap is -pg-cap's default: the per-shape wall-clock budget a pg
+// baseline call (warmup or timed) gets before runPGCapped cuts it off and
+// the shape is recorded pg_capped=true. 120s comfortably exceeds every
+// shape's expected pg latency at realistic scale except group_members_bfs's
+// per-node query storm (which is exactly the case this cap exists to catch
+// -- see runPGCapped's doc), while still being short enough that a capped
+// run's total wall time stays bounded.
+const defaultPGCap = 120 * time.Second
+
+// shapeThreshold is one shape's -enforce policy: the minimum p50 ratio
+// (delegated pg / served bt) required when the pg baseline was actually
+// measured, and the maximum absolute bt (engine) p50 allowed when it could
+// not be (pg_capped=true, see runPGCapped's doc) -- there is no pg
+// measurement left to compute a ratio against in that case, so the engine
+// is judged on its own wall-clock time instead.
+type shapeThreshold struct {
+	minRatio          float64
+	engineAbsoluteCap time.Duration
+}
+
+// shapeThresholds holds every benchmarked shape's shapeThreshold, keyed by
+// shapeSpec.name (see execute's shapes slice). Every entry here must have a
+// matching shapeSpec, and vice versa -- thresholdFor falls back to a
+// conservative default and warns on stderr if a shape is ever benchmarked
+// without a threshold entry (a maintenance bug, not a runtime condition
+// this package expects), rather than panicking mid-report.
+//
+// Rationale, shape by shape:
+//
+//   - fetch_directed_graph_memberof: minRatio 1.2x, not 5x. This shape is
+//     row-volume-bound: container.FetchDirectedGraph must visit every
+//     MemberOf edge and every endpoint node to build its in-memory
+//     container.DirectedGraph regardless of which driver answers the
+//     query, so the engine's advantage over delegating is bounded by how
+//     much cheaper "read from an in-memory adjacency structure" is than
+//     "read from PostgreSQL rows" for the same total volume -- not by
+//     avoiding a network round trip or a query planner, the way the
+//     smaller/filtered shapes below can. Measured 1.47x at 5M in the
+//     milestone-3 run this task defers from: honest physics for this
+//     shape, not a bug to chase with a uniform bar. engineAbsoluteCap 15s
+//     is a conservative estimate for a full 5M-scale MemberOf scan should
+//     its own pg baseline ever need capping (unmeasured as of this task --
+//     see the README's "Where these numbers come from" note); Task 21's
+//     real 5M run is expected to confirm or tighten it.
+//   - group_members_bfs: minRatio 5x (unchanged), engineAbsoluteCap 5s.
+//     This is the shape the pg wall-clock cap exists for: its pg baseline
+//     is a per-node query storm (one BFS layer's worth of individual
+//     MemberOf lookups against PostgreSQL) that runs for hours at 5M,
+//     entirely unrelated to how fast the engine itself answers the same
+//     traversal in memory. 5s is the brief's own explicit bound for the
+//     engine's absolute p50 at 5M.
+//   - node_count_user, node_fetchids_user, delete_transit_edges_admin_to:
+//     minRatio 5x (unchanged). These are bounded, filtered scans (a single
+//     kind's node count/id list, or one derived edge kind's id list
+//     between Base-kind endpoints) with no reason to expect a pg baseline
+//     slow enough to need capping at any realistic scale -- their
+//     engineAbsoluteCap values (2s/5s/5s) are conservative headroom for
+//     the rare case a future, much larger corpus does trip the cap, not a
+//     bound anyone expects to hit in practice.
+var shapeThresholds = map[string]shapeThreshold{
+	"fetch_directed_graph_memberof": {minRatio: fetchDirectedGraphMinRatio, engineAbsoluteCap: 15 * time.Second},
+	"group_members_bfs":             {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},
+	"node_count_user":               {minRatio: enforceRatio, engineAbsoluteCap: 2 * time.Second},
+	"node_fetchids_user":            {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},
+	"delete_transit_edges_admin_to": {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},
+}
+
+// defaultShapeThreshold is thresholdFor's fallback for a shape name absent
+// from shapeThresholds -- a maintenance bug (a shapeSpec added without a
+// matching threshold entry), not a condition normal operation should ever
+// reach. Deliberately conservative (the original uniform 5x bar) so such a
+// bug fails loud via a stderr warning and a stricter-than-necessary bar,
+// rather than silently passing.
+var defaultShapeThreshold = shapeThreshold{minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second}
+
+// thresholdFor returns name's shapeThreshold, warning on stderr and
+// returning defaultShapeThreshold if name has none -- see shapeThresholds'
+// doc.
+func thresholdFor(name string) shapeThreshold {
+	if th, ok := shapeThresholds[name]; ok {
+		return th
+	}
+	fmt.Fprintf(os.Stderr, "builderbench: WARNING: shape %q has no shapeThresholds entry; using the default %.1fx/%s bar\n",
+		name, defaultShapeThreshold.minRatio, defaultShapeThreshold.engineAbsoluteCap)
+	return defaultShapeThreshold
+}
 
 // bfsWorkers is the traversal.New worker count for shape 2's group-members
 // BFS. dawgs v0.8.0 has a known internal data race in multi-worker
@@ -168,7 +289,8 @@ func run(args []string) int {
 	var (
 		dsn     = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
 		runs    = fs.Int("runs", 5, "number of warmed-up, timed runs per shape per driver")
-		enforce = fs.Bool("enforce", false, "exit nonzero if any shape's p50 ratio < 5x or its two drivers' results mismatch (never pass this in CI)")
+		pgCap   = fs.Duration("pg-cap", defaultPGCap, "per-shape wall-clock cap on the pg baseline (warmup and timed runs); a pg query exceeding this mid-execution is cut off via context.WithTimeout and the shape is recorded pg_capped=true and judged on the engine's absolute p50 alone (see README)")
+		enforce = fs.Bool("enforce", false, "exit nonzero if any shape fails its per-shape enforce threshold (never pass this in CI)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -182,8 +304,12 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "builderbench: -runs must be positive")
 		return 2
 	}
+	if *pgCap <= 0 {
+		fmt.Fprintln(os.Stderr, "builderbench: -pg-cap must be positive")
+		return 2
+	}
 
-	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs})
+	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, pgCap: *pgCap})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "builderbench: %v\n", err)
 		return 1
@@ -198,8 +324,9 @@ func run(args []string) int {
 
 // config holds run's parsed flags that execute needs.
 type config struct {
-	dsn  string
-	runs int
+	dsn   string
+	runs  int
+	pgCap time.Duration
 }
 
 // shapeSpec is one benchmarked query shape: a name for reporting and a
@@ -219,7 +346,22 @@ type shapeResult struct {
 	name string
 
 	btSize, pgSize int64
-	match          bool
+
+	// matchChecked is true once the bt/pg size-metric warmup comparison
+	// actually ran (i.e. the pg baseline wasn't already capped before it
+	// got the chance -- see measureShape). match is only meaningful when
+	// matchChecked is true; see evaluateShape's doc for why a capped shape
+	// skips this check entirely rather than reporting a spurious mismatch.
+	matchChecked bool
+	match        bool
+
+	// pgCapped is true once runPGCapped has cut off this shape's pg
+	// baseline (during warmup or any timed run) for exceeding -pg-cap --
+	// see runPGCapped's doc. Once set, measureShape stops issuing further
+	// pg runs for this shape; pgDurations may be empty (capped during
+	// warmup) or a short prefix of the requested run count (capped partway
+	// through the timed loop).
+	pgCapped bool
 
 	btDurations []time.Duration
 	pgDurations []time.Duration
@@ -235,27 +377,70 @@ func (r shapeResult) pgP50P95() (time.Duration, time.Duration) {
 	return percentile(r.pgDurations, 0.50), percentile(r.pgDurations, 0.95)
 }
 
-// ratio is the delegated/served p50 speed ratio: how many times faster the
-// bloodtrail driver's p50 is than the plain pg driver's p50. A bt p50 of
-// zero (never observed in practice, but guarded rather than divided by)
-// reports +Inf unless pg's p50 is also zero, in which case the two are
-// declared equal (ratio 1).
-func (r shapeResult) ratio() float64 {
-	btp50, _ := r.btP50P95()
-	pgp50, _ := r.pgP50P95()
-	if btp50 <= 0 {
-		if pgp50 <= 0 {
+// ratioOf is the delegated/served p50 speed ratio: how many times faster
+// btP50 is than pgP50. A btP50 of zero (never observed in practice, but
+// guarded rather than divided by) reports +Inf unless pgP50 is also zero,
+// in which case the two are declared equal (ratio 1). Pure: no I/O, no
+// globals -- see evaluateShape's doc for why this and evaluateShape are
+// kept as free functions over plain durations rather than shapeResult
+// methods, and main_test.go's TestRatioOf for its table tests.
+func ratioOf(btP50, pgP50 time.Duration) float64 {
+	if btP50 <= 0 {
+		if pgP50 <= 0 {
 			return 1
 		}
 		return math.Inf(1)
 	}
-	return float64(pgp50) / float64(btp50)
+	return float64(pgP50) / float64(btP50)
 }
 
-// ok reports whether this shape satisfies -enforce: its two drivers' size
-// metrics matched, and its p50 ratio meets enforceRatio.
-func (r shapeResult) ok() bool {
-	return r.match && r.ratio() >= enforceRatio
+// evaluateShape is -enforce's pure per-shape decision function: given one
+// shape's measured p50 durations and its correctness/capped flags, plus the
+// shapeThreshold it must clear, it returns whether the shape passes and,
+// when it does not, the specific reasons why (report prints these; a
+// caller only interested in pass/fail can ignore the second return value).
+// It performs no I/O and reads no global state beyond the threshold value
+// passed in explicitly, so it is table-tested directly against synthetic
+// durations in main_test.go's TestEvaluateShape without a database --
+// mirroring pathbench's own run/execute split, taken one step further here
+// since this shape's decision logic has per-shape parameters worth testing
+// in isolation.
+//
+// When pgCapped is true, the pg baseline was never (fully) measured -- its
+// wall-clock cap tripped, see runPGCapped's doc -- so there is no pg
+// result left to compute a ratio against or to match btSize/pgSize
+// against: both of those checks are skipped entirely (not scored as a
+// failure) and the shape is judged solely on whether btP50 clears
+// th.engineAbsoluteCap. This is deliberate, not a gap: matching against a
+// result that was never obtained is impossible, and penalizing a shape for
+// pg's slowness (rather than the engine's) would defeat the point of
+// capping it in the first place.
+//
+// When pgCapped is false, matchChecked is expected true (measureShape's
+// warmup always runs before any capping can happen when uncapped) --
+// evaluateShape still checks matchChecked defensively rather than
+// asserting it, since a caller bug that left it false should fail the
+// shape's enforce check rather than silently skip a check that was
+// supposed to run.
+func evaluateShape(btP50, pgP50 time.Duration, matchChecked, match, pgCapped bool, th shapeThreshold) (ok bool, reasons []string) {
+	if pgCapped {
+		if btP50 > th.engineAbsoluteCap {
+			reasons = append(reasons, fmt.Sprintf("pg_capped: engine p50 %s exceeds absolute cap %s", fmtMillis(btP50), fmtMillis(th.engineAbsoluteCap)))
+		}
+		return len(reasons) == 0, reasons
+	}
+
+	if !matchChecked {
+		reasons = append(reasons, "bt/pg size match was never checked")
+	} else if !match {
+		reasons = append(reasons, "bt/pg size metric mismatch")
+	}
+
+	if ratio := ratioOf(btP50, pgP50); ratio < th.minRatio {
+		reasons = append(reasons, fmt.Sprintf("p50 ratio %.2fx below required %.2fx", ratio, th.minRatio))
+	}
+
+	return len(reasons) == 0, reasons
 }
 
 // benchResult accumulates every phase's measurements for report to print.
@@ -271,6 +456,8 @@ type benchResult struct {
 	rootID       uint64
 	rootObjectID string
 	rootInDegree int64
+
+	pgCap time.Duration
 
 	shapes []shapeResult
 }
@@ -332,7 +519,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 		return nil, fmt.Errorf("map kind %q: %w", kindGroup, err)
 	}
 
-	result := &benchResult{}
+	result := &benchResult{pgCap: cfg.pgCap}
 
 	fmt.Println("builderbench: measuring snapshot build cost (also the wait budget below) ...")
 	buildStart := time.Now()
@@ -430,7 +617,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 
 	for _, spec := range shapes {
 		fmt.Printf("\n=== shape: %s ===\n", spec.name)
-		sr, err := measureShape(ctx, spec, bt, oracle, cfg.runs)
+		sr, err := measureShape(ctx, spec, bt, oracle, cfg.runs, cfg.pgCap)
 		if err != nil {
 			return nil, fmt.Errorf("shape %s: %w", spec.name, err)
 		}
@@ -447,19 +634,36 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 // oracle block) -- collecting only their durations, since the correctness
 // check already ran once above and repeating it every timed iteration
 // would just re-measure the same thing at proportional extra cost.
-func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database, runs int) (shapeResult, error) {
+//
+// Every oracle (pg) call, warmup included, goes through runPGCapped rather
+// than timeOnce directly: the first time pgCap trips (warmup or any timed
+// run), result.pgCapped is set and every remaining pg call for this shape
+// is skipped -- see shapeResult.pgCapped's doc. bt is never capped: it's
+// the thing being measured, and the whole point of -pg-cap is that pg's
+// baseline, not the engine, is what can blow up unboundedly for a shape
+// like group_members_bfs.
+func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database, runs int, pgCap time.Duration) (shapeResult, error) {
 	result := shapeResult{name: spec.name}
 
 	_, btSize, err := timeOnce(ctx, bt, spec.run)
 	if err != nil {
 		return result, fmt.Errorf("bloodtrail warmup: %w", err)
 	}
-	_, pgSize, err := timeOnce(ctx, oracle, spec.run)
+	result.btSize = btSize
+
+	_, pgSize, capped, err := runPGCapped(ctx, oracle, spec.run, pgCap)
 	if err != nil {
 		return result, fmt.Errorf("pg warmup: %w", err)
 	}
-	result.btSize, result.pgSize = btSize, pgSize
-	result.match = btSize == pgSize
+	if capped {
+		result.pgCapped = true
+		fmt.Printf("builderbench: %s: pg baseline warmup exceeded -pg-cap=%s -- pg_capped=true, skipping remaining pg runs and the bt/pg size-match check for this shape\n",
+			spec.name, pgCap)
+	} else {
+		result.pgSize = pgSize
+		result.matchChecked = true
+		result.match = btSize == pgSize
+	}
 
 	for i := 0; i < runs; i++ {
 		d, _, err := timeOnce(ctx, bt, spec.run)
@@ -468,12 +672,21 @@ func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database
 		}
 		result.btDurations = append(result.btDurations, d)
 	}
-	for i := 0; i < runs; i++ {
-		d, _, err := timeOnce(ctx, oracle, spec.run)
-		if err != nil {
-			return result, fmt.Errorf("pg run %d: %w", i, err)
+
+	if !result.pgCapped {
+		for i := 0; i < runs; i++ {
+			d, _, capped, err := runPGCapped(ctx, oracle, spec.run, pgCap)
+			if err != nil {
+				return result, fmt.Errorf("pg run %d: %w", i, err)
+			}
+			if capped {
+				result.pgCapped = true
+				fmt.Printf("builderbench: %s: pg run %d exceeded -pg-cap=%s mid-run -- pg_capped=true, skipping remaining pg runs for this shape\n",
+					spec.name, i, pgCap)
+				break
+			}
+			result.pgDurations = append(result.pgDurations, d)
 		}
-		result.pgDurations = append(result.pgDurations, d)
 	}
 
 	return result, nil
@@ -485,6 +698,36 @@ func timeOnce(ctx context.Context, db graph.Database, run func(context.Context, 
 	t0 := time.Now()
 	value, err := run(ctx, db)
 	return time.Since(t0), value, err
+}
+
+// runPGCapped runs run against oracle (the plain pg driver) once, bounded
+// to pgCap via context.WithTimeout wrapped directly around the call --
+// not a timer between iterations -- so a single pathologically slow query
+// is cut off mid-execution: dawgs' pg driver (drivers/pg/transaction.go)
+// forwards the caller's context straight to pgx's Query/Exec/QueryRow,
+// which sends PostgreSQL a real cancellation request when that context's
+// deadline fires, actually aborting the in-flight statement server-side
+// rather than merely giving up on waiting for it client-side.
+//
+// When the deadline fires, capped is true and d/size are zero-valued; err
+// is nil in that case (a capped run is an expected, handled outcome for
+// this package, not a failure to propagate -- see the package doc's
+// "pg wall-clock cap" section). Any other error is a genuine failure the
+// caller should still treat as fatal, exactly as an uncapped call would.
+//
+// The capped/not-capped distinction is decided by capCtx.Err(), the
+// context this function itself created and controls, not by pattern-
+// matching run's returned error string -- robust regardless of exactly how
+// pgx/the pg driver choose to wrap a cancellation.
+func runPGCapped(ctx context.Context, oracle graph.Database, run func(context.Context, graph.Database) (int64, error), pgCap time.Duration) (d time.Duration, size int64, capped bool, err error) {
+	capCtx, cancel := context.WithTimeout(ctx, pgCap)
+	defer cancel()
+
+	d, size, err = timeOnce(capCtx, oracle, run)
+	if err != nil && errors.Is(capCtx.Err(), context.DeadlineExceeded) {
+		return 0, 0, true, nil
+	}
+	return d, size, false, err
 }
 
 // shapeFetchDirectedGraph is shape 1: container.FetchDirectedGraph over
@@ -709,36 +952,48 @@ func dropDatapipeStatusTable(ctx context.Context, pool *pgxpool.Pool) error {
 }
 
 // report prints every shape's enforcement line and the final PASS/FAIL
-// line, returning whether every shape satisfied enforceRatio.ok()
-// (independent of whether -enforce was actually passed -- run decides
-// whether that return value changes the exit code).
+// line, returning whether every shape satisfied evaluateShape (independent
+// of whether -enforce was actually passed -- run decides whether that
+// return value changes the exit code).
 //
-// A shape's p50 ratio meeting enforceRatio (5x) is itself strong evidence
-// the bloodtrail driver actually served the query from its in-memory
-// snapshot rather than silently delegating to PostgreSQL: a 5x speedup
-// purely from query planning or connection reuse against the same
+// For an uncapped shape, a p50 ratio meeting its shapeThreshold.minRatio
+// (5x for every shape but fetch_directed_graph_memberof) is itself strong
+// evidence the bloodtrail driver actually served the query from its
+// in-memory snapshot rather than silently delegating to PostgreSQL: a 5x
+// speedup purely from query planning or connection reuse against the same
 // PostgreSQL tables, with no in-memory structure involved at all, is not
 // achievable -- delegating is delegating, on the same database, at
-// essentially the same cost either way. So -enforce's ratio check doubles
-// as the "did it actually serve" check the task brief considered and
-// rejected exporting a hook for.
+// essentially the same cost either way. fetch_directed_graph_memberof's
+// weaker 1.2x bar and every shape's pg_capped=true path give up that extra
+// assurance deliberately -- see shapeThresholds' and evaluateShape's docs
+// for why.
 func (r *benchResult) report(enforce bool) bool {
 	allOK := true
 
-	fmt.Printf("\n=== enforce thresholds (checked=%t, min_p50_ratio=%.1fx) ===\n", enforce, enforceRatio)
+	fmt.Printf("\n=== enforce thresholds (checked=%t, pg_cap=%s) ===\n", enforce, fmtSeconds(r.pgCap))
 	for _, s := range r.shapes {
+		th := thresholdFor(s.name)
 		btp50, btp95 := s.btP50P95()
 		pgp50, pgp95 := s.pgP50P95()
-		ratio := s.ratio()
-		ok := s.ok()
+		ratio := ratioOf(btp50, pgp50)
+		ok, reasons := evaluateShape(btp50, pgp50, s.matchChecked, s.match, s.pgCapped, th)
 		allOK = allOK && ok
 
-		fmt.Printf("builderbench: %-32s ratio=%7.2fx match=%-5t %s\n", s.name, ratio, s.match, passFail(ok))
-		fmt.Printf("BUILDERBENCH_SHAPE name=%s bt_p50_ms=%.3f bt_p95_ms=%.3f pg_p50_ms=%.3f pg_p95_ms=%.3f ratio=%.3f match=%t bt_size=%d pg_size=%d ok=%t\n",
-			s.name, floatMillis(btp50), floatMillis(btp95), floatMillis(pgp50), floatMillis(pgp95), ratio, s.match, s.btSize, s.pgSize, ok)
+		matchStr := "skip"
+		if s.matchChecked {
+			matchStr = fmt.Sprintf("%t", s.match)
+		}
+		fmt.Printf("builderbench: %-32s pg_capped=%-5t ratio=%7.2fx match=%-5s min_ratio=%.1fx %s\n",
+			s.name, s.pgCapped, ratio, matchStr, th.minRatio, passFail(ok))
+		for _, reason := range reasons {
+			fmt.Printf("builderbench:   - %s\n", reason)
+		}
+		fmt.Printf("BUILDERBENCH_SHAPE name=%s bt_p50_ms=%.3f bt_p95_ms=%.3f pg_p50_ms=%.3f pg_p95_ms=%.3f ratio=%.3f min_ratio=%.2f match_checked=%t match=%t pg_capped=%t engine_abs_cap_ms=%.3f bt_size=%d pg_size=%d ok=%t\n",
+			s.name, floatMillis(btp50), floatMillis(btp95), floatMillis(pgp50), floatMillis(pgp95), ratio, th.minRatio,
+			s.matchChecked, s.match, s.pgCapped, floatMillis(th.engineAbsoluteCap), s.btSize, s.pgSize, ok)
 	}
 
-	fmt.Printf("BUILDERBENCH_ENFORCE checked=%t ok=%t min_ratio=%.1f\n", enforce, allOK, enforceRatio)
+	fmt.Printf("BUILDERBENCH_ENFORCE checked=%t ok=%t pg_cap_ms=%.3f\n", enforce, allOK, floatMillis(r.pgCap))
 	if allOK {
 		fmt.Println("BUILDERBENCH_RESULT PASS")
 	} else {
@@ -748,17 +1003,33 @@ func (r *benchResult) report(enforce bool) bool {
 }
 
 // printShapeResult prints one shape's human-readable detail: both drivers'
-// size metric and whether they matched, every timed run's duration, and
-// the p50/p95/ratio summary.
+// size metric and whether they matched (or, if pg_capped, that the match
+// check never ran), every timed run's duration, and the p50/p95/ratio
+// summary.
 func printShapeResult(r shapeResult) {
-	fmt.Printf("builderbench: %s: bt_size=%d pg_size=%d match=%t\n", r.name, r.btSize, r.pgSize, r.match)
+	if r.pgCapped {
+		fmt.Printf("builderbench: %s: bt_size=%d pg_size=(capped, not measured) pg_capped=true -- bt/pg match check skipped\n", r.name, r.btSize)
+	} else {
+		fmt.Printf("builderbench: %s: bt_size=%d pg_size=%d match=%t pg_capped=false\n", r.name, r.btSize, r.pgSize, r.match)
+	}
 	fmt.Printf("builderbench: %s: bt runs (ms): %s\n", r.name, fmtDurationsMs(r.btDurations))
-	fmt.Printf("builderbench: %s: pg runs (ms): %s\n", r.name, fmtDurationsMs(r.pgDurations))
+	fmt.Printf("builderbench: %s: pg runs (ms): %s%s\n", r.name, fmtDurationsMs(r.pgDurations), pgCappedSuffix(r))
 
 	btp50, btp95 := r.btP50P95()
 	pgp50, pgp95 := r.pgP50P95()
 	fmt.Printf("builderbench: %s: bt p50=%s p95=%s | pg p50=%s p95=%s | ratio(pg/bt)=%.2fx\n",
-		r.name, fmtMillis(btp50), fmtMillis(btp95), fmtMillis(pgp50), fmtMillis(pgp95), r.ratio())
+		r.name, fmtMillis(btp50), fmtMillis(btp95), fmtMillis(pgp50), fmtMillis(pgp95), ratioOf(btp50, pgp50))
+}
+
+// pgCappedSuffix annotates printShapeResult's "pg runs" line when r's pg
+// baseline was cut off partway through the timed-run loop, so a short
+// pgDurations slice (fewer entries than -runs) reads as "capped", not as a
+// silent bug.
+func pgCappedSuffix(r shapeResult) string {
+	if !r.pgCapped {
+		return ""
+	}
+	return " (pg_capped=true; remaining runs skipped)"
 }
 
 // stringKinds converts kind name strings to graph.Kinds, matching

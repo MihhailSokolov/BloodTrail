@@ -5,6 +5,7 @@
 /bin/
 /dist/
 /pathbench
+/builderbench
 bench/csrbench/csrbench
 
 # Benchmark and render scratch
