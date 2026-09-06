@@ -740,6 +740,56 @@ func TestGenerateGroupPropertyBag(t *testing.T) {
 	assertRatioWithin(t, "group admincount", groupAdminCount, groupCount, 0.04, 0.18)
 }
 
+// TestGenerateDistinguishedNameLengths asserts that generated User and
+// Computer nodes carry realistic-length distinguishedname (DN) values
+// averaging 80-100 bytes, per the README's claim of ~90 byte DNs. This
+// test ensures the DN construction captures realistic organizational
+// depth (multiple OU levels, varied DC suffixes) that approximates
+// real Active Directory directory paths. Users=5000 is used to make
+// the measured mean stable without slowing the test suite.
+func TestGenerateDistinguishedNameLengths(t *testing.T) {
+	g := Generate(Spec{Users: 5000, Seed: 21})
+
+	var (
+		userDNBytes, computerDNBytes int
+		userCount, computerCount     int
+	)
+
+	for _, n := range g.Nodes {
+		switch {
+		case containsKind(n.Kinds, "User"):
+			userCount++
+			dn := assertStringProp(t, n, "distinguishedname")
+			userDNBytes += len(dn)
+		case containsKind(n.Kinds, "Computer"):
+			computerCount++
+			dn := assertStringProp(t, n, "distinguishedname")
+			computerDNBytes += len(dn)
+		}
+	}
+
+	if userCount == 0 {
+		t.Fatalf("no User nodes found")
+	}
+	if computerCount == 0 {
+		t.Fatalf("no Computer nodes found")
+	}
+
+	userDNMean := float64(userDNBytes) / float64(userCount)
+	computerDNMean := float64(computerDNBytes) / float64(computerCount)
+
+	// Assert both user and computer DN means are in [75, 110] byte range
+	if userDNMean < 75 || userDNMean > 110 {
+		t.Errorf("mean User DN length = %.1f bytes, want in [75, 110]", userDNMean)
+	}
+	if computerDNMean < 75 || computerDNMean > 110 {
+		t.Errorf("mean Computer DN length = %.1f bytes, want in [75, 110]", computerDNMean)
+	}
+
+	t.Logf("mean User DN length across %d nodes: %.1f bytes", userCount, userDNMean)
+	t.Logf("mean Computer DN length across %d nodes: %.1f bytes", computerCount, computerDNMean)
+}
+
 // BenchmarkGenerate measures Generate's per-call wall-clock cost at a
 // moderate scale, including the per-node property-bag construction task 19
 // added -- the task brief's concern is that this "should not blow

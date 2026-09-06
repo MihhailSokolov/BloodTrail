@@ -399,12 +399,24 @@ func principalCommonProps(objectID, name, dn, sam string, rng *rand.Rand, now ti
 	}
 }
 
+// userTierOUs provides organizational variety in User node DN construction:
+// selecting from these tier OUs (seeded randomly) creates realistic depth in
+// the DN while keeping all users' DNs in a consistent namespace.
+var userTierOUs = []string{
+	"OU=Tier1,OU=Managed Accounts",
+	"OU=Tier2,OU=Managed Accounts",
+	"OU=Tier3,OU=Standard Accounts",
+	"OU=Tier1,OU=Service Accounts",
+	"OU=Tier2,OU=Service Accounts",
+}
+
 // newUserNode builds a User node: the shared principal bag (see
 // principalCommonProps) plus the three Kerberos/password-policy flags the
 // task brief calls out specifically for users.
 func newUserNode(objectID, name, domainDN string, rng *rand.Rand, now time.Time) Node {
 	local := localPart(name, "@")
-	dn := fmt.Sprintf("CN=%s,OU=Users,OU=Corp Accounts,%s", local, domainDN)
+	tierOU := userTierOUs[rng.Intn(len(userTierOUs))]
+	dn := fmt.Sprintf("CN=%s,OU=Users,%s,OU=Corp Accounts,%s", local, tierOU, domainDN)
 	props := principalCommonProps(objectID, name, dn, strings.ToLower(local), rng, now)
 	props["hasspn"] = rng.Float64() < 0.02
 	props["dontreqpreauth"] = rng.Float64() < 0.01
@@ -413,11 +425,23 @@ func newUserNode(objectID, name, domainDN string, rng *rand.Rand, now time.Time)
 	return Node{ObjectID: objectID, Kinds: []string{KindBase, KindUser}, Props: props}
 }
 
+// computerTierOUs provides organizational variety in Computer node DN construction:
+// selecting from these tier OUs (seeded randomly) creates realistic depth in
+// the DN while keeping all computers' DNs in a consistent namespace.
+var computerTierOUs = []string{
+	"OU=Tier1,OU=Workstations",
+	"OU=Tier2,OU=Workstations",
+	"OU=Tier3,OU=Workstations",
+	"OU=Tier1,OU=Servers",
+	"OU=Tier2,OU=Servers",
+}
+
 // newComputerNode builds a Computer node: the shared principal bag plus
 // operatingsystem/haslaps.
 func newComputerNode(objectID, name, domainDN string, rng *rand.Rand, now time.Time) Node {
 	local := localPart(name, ".")
-	dn := fmt.Sprintf("CN=%s,OU=Computers,OU=Corp Assets,%s", local, domainDN)
+	tierOU := computerTierOUs[rng.Intn(len(computerTierOUs))]
+	dn := fmt.Sprintf("CN=%s,OU=Computers,%s,OU=Corp Assets,%s", local, tierOU, domainDN)
 	sam := strings.ToUpper(local) + "$"
 	props := principalCommonProps(objectID, name, dn, sam, rng, now)
 	props["operatingsystem"] = pickOperatingSystem(rng)
