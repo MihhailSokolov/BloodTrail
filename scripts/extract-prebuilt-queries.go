@@ -1,5 +1,25 @@
+// Copyright 2026 Specter Ops, Inc.
+//
+// Licensed under the Apache License, Version 2.0
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // SPDX-License-Identifier: Apache-2.0
 
+// The activeDirectoryPathfindingEdges/azurePathfindingEdges kind lists and
+// the interpolations map below are ported verbatim from SpecterOps'
+// BloodHound CE (packages/javascript/bh-shared-ui/src/graphSchema.ts and
+// constants.ts, both Apache-2.0), hence the header above; see testdata/
+// prebuilt/NOTICE for the full provenance of everything this tool extracts.
+//
 // Command extract-prebuilt-queries pulls BloodHound CE's pre-built Cypher
 // query corpus out of an upstream checkout and writes it as JSON fixtures
 // under testdata/prebuilt/, for the Cypher interpreter's differential
@@ -132,9 +152,9 @@ var interpolations = map[string]string{
 }
 
 func init() {
-	// Self-check the ported kind lists against the counts task-14's brief
-	// (and graphSchema.ts itself) documents, so a transcription slip fails
-	// immediately rather than silently shipping a wrong edge list.
+	// Self-check the ported kind lists against graphSchema.ts' own documented
+	// counts, so a transcription slip fails immediately rather than silently
+	// shipping a wrong edge list.
 	if got := len(activeDirectoryPathfindingEdges); got != 64 {
 		panic(fmt.Sprintf("activeDirectoryPathfindingEdges: got %d kinds, want 64", got))
 	}
@@ -239,8 +259,8 @@ func fatalf(format string, args ...any) {
 	os.Exit(1)
 }
 
-// checkCounts asserts the corpus shape task-14's brief documents, mirroring
-// (and running ahead of) the integration test's own count assertions --
+// checkCounts asserts the corpus' documented shape, mirroring (and running
+// ahead of) the integration test's own count assertions --
 // catching an extraction mistake here, at generation time, rather than only
 // at `go test`. agt.json holds 92 entries total: the 91-entry CommonSearches
 // export (one disabled) plus the 1-entry UncommonSearches probe, folded in
