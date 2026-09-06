@@ -95,7 +95,8 @@ var randomCypherBoolPool = []bool{true, false}
 
 // randomCypherArrayPool covers a plain string array, one whose elements
 // themselves carry metacharacters, an empty array, a singleton, and a
-// case-varied pair -- exercised by tmplArrayMembership's `IN n.tags`.
+// case-varied pair -- exercised by the `... IN n.tags` template's own
+// randomCypherPickTagCandidate.
 var randomCypherArrayPool = [][]string{
 	{"a", "b"},
 	{"a%b", "c_d"},
@@ -370,6 +371,45 @@ func randomCypherPickNumber(rng *rand.Rand) float64 {
 	return randomCypherNumberPool[rng.Intn(len(randomCypherNumberPool))]
 }
 
+// randomCypherTagPool flattens every distinct string appearing anywhere in
+// randomCypherArrayPool, for randomCypherPickTagCandidate below. Kept
+// separate from randomCypherStringPool: the two pools are otherwise
+// entirely disjoint (no element of one appears in the other), which made
+// the `... IN n.tags` template (below) permanently unsatisfiable before
+// this fix -- randomCypherPickString could only ever produce a value that
+// is not, and never was, an element of any node's actual "tags" array, so
+// that predicate always evaluated false for every row regardless of the
+// RNG draw, silently never exercising the true-membership code path at
+// all (the final review's finding I7).
+var randomCypherTagPool = func() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, arr := range randomCypherArrayPool {
+		for _, s := range arr {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}()
+
+// randomCypherPickTagCandidate is randomCypherPickString's counterpart for
+// the `... IN n.tags` template: three times out of four, a value actually
+// present in some node's "tags" array (randomCypherTagPool), so the
+// membership predicate regularly matches at least one node; one time out
+// of four, a value guaranteed absent from every tags array, exercising the
+// "no rows" case too -- the identical 3-in-4/1-in-4 split
+// randomCypherPickString/randomCypherPickNumber already use, just drawing
+// from the pool this specific predicate can actually be satisfied against.
+func randomCypherPickTagCandidate(rng *rand.Rand) string {
+	if rng.Intn(4) == 0 {
+		return fmt.Sprintf("nowhere-in-tags-%d", rng.Intn(1_000_000))
+	}
+	return randomCypherTagPool[rng.Intn(len(randomCypherTagPool))]
+}
+
 // Negative literals in `=`/`<>` templates (history): this suite used to
 // restrict `=`/`<>` number literals to non-negative values only, via a
 // since-removed randomCypherPickNonNegativeNumber helper (math.Abs over
@@ -489,7 +529,7 @@ var randomCypherTemplates = []randomCypherTemplate{
 		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val > %s RETURN DISTINCT n.flag AS flag`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)))
 	},
 	func(rng *rand.Rand) string {
-		return fmt.Sprintf(`MATCH (n:%s) WHERE %s IN n.tags RETURN n`, randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
+		return fmt.Sprintf(`MATCH (n:%s) WHERE %s IN n.tags RETURN n`, randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickTagCandidate(rng)))
 	},
 
 	// Single-Part (still a bare SinglePartQuery, per planStages): two MATCH
@@ -565,6 +605,31 @@ const (
 	// comment together if the template set changes enough to move the
 	// observed count.
 	randomCypherServedFloor = 170
+	// randomCypherNonEmptyFloor is this suite's anti-vacuity floor (I7,
+	// final review): at least this many of the 200 queries must return at
+	// least one row/literal against the independent pg oracle, mirroring
+	// dawgs_corpus_integration_test.go's own totalEngineServed floor idiom.
+	// Exists specifically because a template drawing its literal candidates
+	// from a value pool disjoint from what the property it compares against
+	// actually holds is permanently unsatisfiable (always zero rows)
+	// regardless of the RNG draw -- exactly what the `... IN n.tags`
+	// template did before randomCypherPickTagCandidate replaced its
+	// randomCypherPickString draw -- silently never exercising the
+	// true-membership code path at all, with nothing before this floor
+	// existed to catch a future regression doing the same to some other
+	// template. Pinned at 120, comfortably below the 135/200 (67.5%) this
+	// suite's fixed fixture/template/seed set deterministically returns as
+	// of 2026-09-06 (`go test -tags integration -run
+	// TestRandomCypherDifferential -v`, "returned at least one row/literal
+	// against the oracle" -- reproduced identically across repeated runs,
+	// same determinism argument as randomCypherServedFloor's own doc):
+	// several templates deliberately draw a "definitely absent" candidate
+	// one time in four (randomCypherPickString/Number/TagCandidate's own
+	// 3-in-4/1-in-4 split), plus var-length/count-aggregation templates
+	// whose own match rate is lower still, so 100% (or even the low-90s)
+	// was never the right target here -- only a large, sudden drop would
+	// indicate a newly-unsatisfiable template.
+	randomCypherNonEmptyFloor = 120
 )
 
 // TestRandomCypherDifferential is Task 17's adversarial random Cypher
@@ -638,8 +703,9 @@ func TestRandomCypherDifferential(t *testing.T) {
 	oracleDB := graph.Database(oracle)
 
 	var (
-		servedCount int
-		totalCount  int
+		servedCount   int
+		nonEmptyCount int
+		totalCount    int
 	)
 
 	for seed := int64(1); seed <= randomCypherDifferentialSeeds; seed++ {
@@ -677,17 +743,32 @@ func TestRandomCypherDifferential(t *testing.T) {
 				if served {
 					servedCount++
 				}
+				// Anti-vacuity, per query template rather than per whole
+				// suite (prebuilt_corpus_integration_test.go's own 60%
+				// floor is a suite-wide average): the oracle's own result is
+				// the independent authority for "did this random draw
+				// actually produce a satisfiable predicate", exactly
+				// mirroring dawgs_corpus_integration_test.go's
+				// totalEngineServed tally/floor idiom, one level down (I7).
+				if len(wantResult.Paths) > 0 || len(wantResult.Literals) > 0 {
+					nonEmptyCount++
+				}
 			})
 		}
 	}
 
 	t.Logf("served %d/%d queries (%.1f%%) via the in-memory engine; the rest delegated to PostgreSQL",
 		servedCount, totalCount, 100*float64(servedCount)/float64(totalCount))
+	t.Logf("random Cypher differential: %d/%d queries (%.1f%%) returned at least one row/literal against the oracle",
+		nonEmptyCount, totalCount, 100*float64(nonEmptyCount)/float64(totalCount))
 
 	if totalCount != randomCypherDifferentialTotalQueries {
 		t.Fatalf("ran %d queries, want %d", totalCount, randomCypherDifferentialTotalQueries)
 	}
 	if servedCount < randomCypherServedFloor {
 		t.Errorf("served only %d/%d queries via the engine, want >= %d (see randomCypherServedFloor's doc) -- a regression may have made the interpreter decline far more broadly than expected", servedCount, totalCount, randomCypherServedFloor)
+	}
+	if nonEmptyCount < randomCypherNonEmptyFloor {
+		t.Errorf("only %d/%d queries returned any rows, want >= %d (see randomCypherNonEmptyFloor's doc) -- a template may have become unsatisfiable (e.g. two disjoint value pools, as finding I7 found for the `IN n.tags` template)", nonEmptyCount, totalCount, randomCypherNonEmptyFloor)
 	}
 }
