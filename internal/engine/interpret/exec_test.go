@@ -1062,9 +1062,9 @@ func TestExecChainNamedVarLengthStepDeclines(t *testing.T) {
 // non-shortestPath component class (bare scan, fixed chain, var-length)
 // BEFORE the anchor-visitor/component-tail split, so the split can be
 // verified byte-identical: same query, same snapshot, same row counts,
-// after. Row counts below are read off an actual run against this fixture,
-// not derived by hand -- see the milestone-4.5 Task 1 brief for the fixture
-// (6 User nodes 1..6, edges 1->2->3 and 4->5, all :MemberOf).
+// after. Row counts below are empirically derived from execution against
+// a test fixture of 6 User nodes (IDs 1..6) with edges 1->2->3 and 4->5
+// (all labeled :MemberOf), verifying that the split produces identical counts.
 func TestRefactorCharacterization(t *testing.T) {
 	const kindUser, kindMemberOf snapshot.KindID = 1, 2
 
