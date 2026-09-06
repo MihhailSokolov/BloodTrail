@@ -531,10 +531,10 @@ func TestCypherRowsResultErrorAndClose(t *testing.T) {
 	result.Close() // must not panic
 }
 
-// --- I2: panic backstops ----------------------------------------------------
+// --- panic backstops ---------------------------------------------------------
 
-// TestSafeExecuteCypherRecoversPanic is the final review's I2 regression for
-// the execution side: safeExecuteCypher must convert a panic anywhere
+// TestSafeExecuteCypherRecoversPanic is a regression test for the
+// execution side: safeExecuteCypher must convert a panic anywhere
 // inside interpret.Execute into an ordinary error (wrapping errCypherPanic,
 // which cypherExecReason then maps to reasonPanic) rather than letting it
 // propagate to its own caller -- TryCypher, and beyond it, whatever
@@ -547,7 +547,7 @@ func TestSafeExecuteCypherRecoversPanic(t *testing.T) {
 	orig := executeCypher
 	t.Cleanup(func() { executeCypher = orig })
 	executeCypher = func(*interpret.Env, *interpret.Query, interpret.Budgets) (*interpret.ResultSet, error) {
-		panic("injected panic for I2 regression test")
+		panic("injected panic for the panic-backstop regression test")
 	}
 
 	rs, err := safeExecuteCypher(&interpret.Env{}, &interpret.Query{}, interpret.Budgets{})
@@ -562,7 +562,7 @@ func TestSafeExecuteCypherRecoversPanic(t *testing.T) {
 	}
 }
 
-// TestBuildCypherRowsResultRecoversPanic is I2's regression for the
+// TestBuildCypherRowsResultRecoversPanic is a regression test for the
 // materialization side: buildCypherRowsResult must recover a panic during
 // newCypherRowsResult's eager row materialization and report ok == false,
 // rather than letting it escape to TryCypher's own caller. Unlike the

@@ -581,9 +581,9 @@ func assertStringSequence(t *testing.T, label string, got, want []string) {
 
 // canonNode/canonEdge/canonPath and canonicalizePath/renderPathSignatures
 // port internal/engine/engine_integration_test.go's identical canonNode/
-// canonEdge/canonPath/canonicalize/renderSet comparator into this package
-// for the final review's finding I3: the original assertCorpusResultsMatch
-// (git history) compared node id SETS and edge id SETS only, flattened
+// canonEdge/canonPath/canonicalize/renderSet comparator into this package:
+// the original assertCorpusResultsMatch (git history) compared node id SETS
+// and edge id SETS only, flattened
 // across every row of a result -- dropping node/edge PROPERTIES entirely,
 // and (since a set collapses duplicates) any PATH MULTIPLICITY difference
 // too (e.g. the same node reached by three distinct paths on one side but
@@ -646,7 +646,7 @@ func renderPathSignatures(ps graph.PathSet) []string {
 // against want (the pg oracle's): paths by canonical node-id+properties/
 // edge-kind+properties rendering (renderPathSignatures/canonicalizePath --
 // see their own doc for why this replaced the original id-set-only
-// comparison, finding I3), plus an explicit path-COUNT assertion (a
+// comparison), plus an explicit path-COUNT assertion (a
 // friendlier, more specific failure message than relying solely on the
 // rendered-signature comparison happening to also catch a count mismatch),
 // and literals by (scalarSignature-normalized) deep equality -- ordered

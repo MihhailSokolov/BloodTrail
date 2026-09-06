@@ -258,7 +258,7 @@ func TestExecObjectIDAnchor(t *testing.T) {
 	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: want}})})
 }
 
-// --- duplicate-objectid anchors must not drop rows (C1) ---------------------
+// --- duplicate-objectid anchors must not drop rows --------------------------
 //
 // PostgreSQL enforces no uniqueness constraint on the `objectid` property,
 // so real BloodHound data can (and does) contain more than one node sharing

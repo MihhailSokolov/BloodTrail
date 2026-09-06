@@ -980,7 +980,7 @@ func TestCypherHydrationRecheck(t *testing.T) {
 // fixture kind.
 var cypherStaleRecheckNodeKind = graph.StringKind("CypherStaleRecheckNode")
 
-// TestCypherStaleRecheckNoHydration is the final review's I1 regression:
+// TestCypherStaleRecheckNoHydration is a regression test:
 // TryCypher's step-11 UNCONDITIONAL post-execution snapshotStillCurrent
 // recheck (engine.go's own pipeline doc) must fire even for a
 // pure-snapshot result -- one with no edge/path column at all, so

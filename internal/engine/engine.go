@@ -397,8 +397,8 @@ const (
 	reasonCollation = "collation"
 	// reasonPanic is TryCypher-only: safeExecuteCypher or
 	// buildCypherRowsResult (serve_cypher.go) recovered a panic that
-	// occurred while executing the query or materializing its result --
-	// the final review's I2 fail-safe backstop. This is deliberately never
+	// occurred while executing the query or materializing its result -- a
+	// fail-safe backstop. This is deliberately never
 	// expected to fire in practice (every panic this recovers from would
 	// itself be a bug elsewhere in the interpreter/materialization layer),
 	// but its existence is what makes "a panic reaching TryCypher's caller
@@ -516,7 +516,7 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //  9. interpret.Execute, run via safeExecuteCypher (serve_cypher.go) rather
 //     than called directly -- its sentinel errors map to specific reasons
 //     (see cypherExecReason), any other error declines reasonError, and a
-//     recovered PANIC (the final review's I2 fail-safe backstop: this
+//     recovered PANIC (a fail-safe backstop: this
 //     interpreter is not proven panic-free by construction, and a panic
 //     reaching a caller after TryCypher has already returned true would be
 //     an unrecoverable false serve) declines reasonPanic.

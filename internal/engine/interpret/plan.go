@@ -113,10 +113,10 @@ type Step struct {
 	// WRITTEN order (t, then s). A named path's PathVal is otherwise always
 	// assembled in traversal order (expand.go's expandVarLengthTrailsForSeed/
 	// expandShortestPathComponent), which is exactly right for a forward
-	// arrow but backward for one of these -- see reversePathVal's own doc
-	// (the final review's I3 fix) for why every PathVal built from a
-	// Reversed step's own expansion must have its Nodes/Edges order flipped
-	// before it is ever handed to a caller (RETURN p), to match Cypher's
+	// arrow but backward for one of these -- see reversePathVal's own doc for
+	// why every PathVal built from a Reversed step's own expansion must have
+	// its Nodes/Edges order flipped before it is ever handed to a caller
+	// (RETURN p), to match Cypher's
 	// (and pg's) own "node sequence follows the pattern as written"
 	// semantics regardless of which way any one edge happens to point.
 	// Always false for a step reached through expandChainComponent
@@ -538,7 +538,7 @@ func countAliasSet(wc WithClause) map[string]bool {
 // package's own post-JSON numeric representation), or a `COUNT(...) AS
 // name` WithAggregate (countAggregate always produces a float64). See
 // partBuilder.numericScalars' own doc for why the next Part's
-// checkComparison (relationalComparisonSafe, finding C5) needs this: a bare
+// checkComparison (relationalComparisonSafe) needs this: a bare
 // reference to such an alias has no numeric-literal AST shape of its own
 // for isStaticallyNumericScalar to recognize directly.
 func numericScalarSet(wc WithClause) map[string]bool {
@@ -634,7 +634,7 @@ type partBuilder struct {
 	// whose literal is itself numeric, or a `COUNT(...) AS name`
 	// WithAggregate (countAggregate always produces a float64 -- see its own
 	// doc). Empty for Part[0] (nothing has been carried into it yet).
-	// relationalComparisonSafe (finding C5) consults this so that a bare
+	// relationalComparisonSafe consults this so that a bare
 	// reference to such a carried alias -- the corpus's own `WITH 60 AS
 	// days ... WHERE m.threshold > days` shape -- counts as statically
 	// numeric even though, as a bare *cypher.Variable, it carries no
@@ -1631,8 +1631,8 @@ func checkLiteralShape(lit *cypher.Literal) bool {
 //	n.x = (5)      -> ((properties ->> 'x'))::int8 = (5)                         -- cast (bare parens too)
 //	n.x = 5 + 0    -> ((properties ->> 'x'))::int8 = 5 + 0                       -- cast (genuine arithmetic)
 //
-// A follow-up probe (the final review's finding C4) found the identical
-// split for a STRING operand, confirmed the same way:
+// A follow-up probe found the identical split for a STRING operand,
+// confirmed the same way:
 //
 //	n.x = '5'      -> ((properties -> 'x'))::jsonb = to_jsonb(('5')::text)::jsonb -- native jsonb equality
 //	n.x = ('5')    -> ((properties ->> 'x'))::text = ('5')                        -- cast (bare parens)
@@ -1798,9 +1798,9 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 	return true
 }
 
-// relationalComparisonSafe implements the final review's finding C5:
-// whether a `<`/`<=`/`>`/`>=` comparison between left and right is safe for
-// this evaluator to serve, or must delegate.
+// relationalComparisonSafe decides whether a `<`/`<=`/`>`/`>=` comparison
+// between left and right is safe for this evaluator to serve, or must
+// delegate.
 //
 // Unlike `=`/`<>` (checkComparison's own doc: a bare-literal-only
 // native-jsonb path, everything else falling to a cast), dawgs' translator
@@ -1817,15 +1817,15 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 //     literal on either side to hint a cast type from, dawgs falls back to
 //     comparing both sides as raw jsonb via PostgreSQL's own jsonb `<`
 //     operator -- ordered by jsonb's type-rank system (the identical
-//     Null/String/Number/Bool/Array/Object ranking behind finding C2's
-//     ORDER BY divergence), not by OrderCompare's structural numeric-only
+//     Null/String/Number/Bool/Array/Object ranking behind planOrder's own
+//     ORDER BY divergence note), not by OrderCompare's structural numeric-only
 //     rule. The two can disagree on any row where either property is not a
 //     number.
 //   - A coalesce()-wrapped or arithmetic-wrapped property operand
 //     (`coalesce(n.x, 0) < 5`, `n.x + 1 > 5`): the cast target dawgs picks
 //     for the WHOLE wrapped expression is derived from its own static type
 //     analysis (the same coalesce/`+`-operand typing this package already
-//     has to reason about for finding C4/the `+` concat-vs-numeric split --
+//     has to reason about for the `+` concat-vs-numeric split --
 //     see classifyAddOperand's doc), which this function does not attempt
 //     to re-derive for a relational context; rather than risk an unproven
 //     cast-type mismatch, every such shape delegates.
@@ -1847,7 +1847,7 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 // a WRONG row, and real BloodHound data never puts a string in a timestamp
 // property.
 //
-// isStaticallyNumericScalar (shared with finding C2's ORDER BY fix) is
+// isStaticallyNumericScalar (shared with planOrder's own ORDER BY use) is
 // exactly the right notion of "statically numeric" here too: it accepts a
 // numeric literal, id()/size()/datetime() epoch accessors, and arithmetic
 // built only from those, plus -- given pb.numericScalars, threaded through
@@ -1892,8 +1892,8 @@ func isBarePropertyLookup(expr cypher.Expression) bool {
 // string literal value while NOT itself being -- with zero unwrapping -- a
 // bare `*cypher.Literal`. This is exactly the shape whose translation
 // diverges from a true bare literal's (checkComparison's own doc has the
-// full derivation and the confirmed SQL for every case below, including the
-// string-literal table finding C4 added): a
+// full derivation and the confirmed SQL for every case below, including its
+// own string-literal table): a
 // `*cypher.UnaryAddOrSubtractExpression` of EITHER sign at any nesting depth
 // (`+5`, `-5`, `-(-5)`, ...), a bare `*cypher.Parenthetical` around a
 // literal with no sign at all (`(5)`, `('5')`, `((5))`), and genuine

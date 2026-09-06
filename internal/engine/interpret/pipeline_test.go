@@ -164,7 +164,7 @@ RETURN c`
 // --- sortRows over a string-valued alias: ErrCollation abort ----------------
 //
 // Plan itself never constructs an OrderKey for a string-valued alias any
-// more (see planOrder's doc on the final review's C2 fix: ORDER BY now
+// more (see planOrder's own doc: ORDER BY now
 // requires a count-aggregate alias or a statically-numeric scalar, and a
 // property lookup like `n.name` is neither) -- so this exercises sortRows
 // directly, bypassing Plan/Execute entirely, to keep proving the plumbing
@@ -219,8 +219,8 @@ func TestPipelineDistinctNodeDedupByID(t *testing.T) {
 	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: g}})})
 }
 
-// TestPipelineDistinctKeepsAbsentAndExplicitNullApart is the C3 (final
-// review) regression: PostgreSQL's DISTINCT groups an absent property
+// TestPipelineDistinctKeepsAbsentAndExplicitNullApart is a regression test:
+// PostgreSQL's DISTINCT groups an absent property
 // (jsonb `->` on a missing key -> SQL NULL) separately from a genuinely
 // stored JSON null (a non-NULL 'null'::jsonb value) -- SQL NULL groups with
 // SQL NULL, and 'null'::jsonb groups with 'null'::jsonb, but the two never
@@ -279,7 +279,7 @@ func TestPipelineDistinctKeepsAbsentAndExplicitNullApart(t *testing.T) {
 	}
 }
 
-// TestGroupKeyDistinguishesAbsentFromPresentNullScalar is C3's grouping-key
+// TestGroupKeyDistinguishesAbsentFromPresentNullScalar is the grouping-key
 // counterpart to TestPipelineDistinctKeepsAbsentAndExplicitNullApart above:
 // appendSymbolKey (used to build both WITH's GroupKeys group key and
 // COUNT(DISTINCT scalar)'s dedup key) must not collapse a scalar symbol

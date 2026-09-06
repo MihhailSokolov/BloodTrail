@@ -749,8 +749,8 @@ func convertPath(env *Env, p traverse.Path) (*PathVal, error) {
 
 // reversePathVal reverses pv's Nodes and Edges slices in place, turning a
 // PathVal built in graph-TRAVERSAL order into one describing the identical
-// path in the opposite node sequence -- the final review's I3 fix for a
-// step whose ORIGINAL Cypher pattern used a backward arrow (`<-`):
+// path in the opposite node sequence -- needed for a step whose ORIGINAL
+// Cypher pattern used a backward arrow (`<-`):
 // buildStep normalizes such a step by swapping FromSym/ToSym so the
 // recorded Step.Direction always matches the graph's own forward-CSR
 // traversal direction (Step.Reversed's own doc), which means every PathVal

@@ -365,7 +365,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "order by edge alias rejected", cypher: `MATCH (a:User)-[r:X]->(b:User) RETURN r ORDER BY r`, want: false},
 		{name: "order by path alias rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) RETURN p ORDER BY p`, want: false},
 
-		// C2 (final review): a bare property-lookup alias rejects, even
+		// A bare property-lookup alias rejects, even
 		// though its runtime value is a plain scalar -- a differential
 		// probe against a live pg database found that dawgs' SQL
 		// translation sorts a jsonb-typed (untyped) property alias via
@@ -556,7 +556,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "less-than property vs unary-plus literal still accepted", cypher: `MATCH (n:User) WHERE n.x < +5 RETURN n`, want: true},
 		{name: "less-than property vs parenthesized literal still accepted", cypher: `MATCH (n:User) WHERE n.x < (5) RETURN n`, want: true},
 
-		// C4 (final review): isBareScalarLiteral only covered numeric/bool,
+		// isBareScalarLiteral only covered numeric/bool,
 		// so a wrapped STRING literal slipped through this same reject --
 		// dawgs' translator takes the identical divergent cast route for a
 		// wrapped string operand that it does for a wrapped numeric one
@@ -569,15 +569,15 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "equality parenthesized string literal vs property (operands swapped) rejected", cypher: `MATCH (n:User) WHERE ('5') = n.x RETURN n`, want: false},
 		{name: "equality property vs bare string literal still accepted", cypher: `MATCH (n:User) WHERE n.x = '5' RETURN n`, want: true},
 		{name: "inequality property vs bare string literal still accepted", cypher: `MATCH (n:User) WHERE n.x <> 'a' RETURN n`, want: true},
-		// Relational (`<`) comparisons are governed by C5's own,
-		// numeric-only relationalComparisonSafe, not C4's bare-literal
-		// reject -- a non-numeric literal on the other side (wrapped or
-		// not) always rejects for `<`/`<=`/`>`/`>=`, since dawgs has no
-		// bare-literal-only native path for those operators at all (see
-		// relationalComparisonSafe's own doc).
-		{name: "less-than property vs parenthesized string literal rejected (C5)", cypher: `MATCH (n:User) WHERE n.x < ('5') RETURN n`, want: false},
+		// Relational (`<`) comparisons are governed by
+		// relationalComparisonSafe's own numeric-only rule, not the
+		// bare-literal reject above -- a non-numeric literal on the other
+		// side (wrapped or not) always rejects for `<`/`<=`/`>`/`>=`, since
+		// dawgs has no bare-literal-only native path for those operators at
+		// all (see relationalComparisonSafe's own doc).
+		{name: "less-than property vs parenthesized string literal rejected", cypher: `MATCH (n:User) WHERE n.x < ('5') RETURN n`, want: false},
 
-		// C5 (final review): dawgs has no bare-literal-only native path for
+		// dawgs has no bare-literal-only native path for
 		// `<`/`<=`/`>`/`>=` at all -- unlike `=`/`<>`, EVERY relational
 		// comparison casts, confirmed identical for `n.x < 5`, `n.x < -5`,
 		// `n.x < +5`, and `n.x < (5)`. Two shapes were found to cast

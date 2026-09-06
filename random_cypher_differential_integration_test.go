@@ -380,7 +380,7 @@ func randomCypherPickNumber(rng *rand.Rand) float64 {
 // is not, and never was, an element of any node's actual "tags" array, so
 // that predicate always evaluated false for every row regardless of the
 // RNG draw, silently never exercising the true-membership code path at
-// all (the final review's finding I7).
+// all.
 var randomCypherTagPool = func() []string {
 	seen := map[string]bool{}
 	var out []string
@@ -605,8 +605,8 @@ const (
 	// comment together if the template set changes enough to move the
 	// observed count.
 	randomCypherServedFloor = 170
-	// randomCypherNonEmptyFloor is this suite's anti-vacuity floor (I7,
-	// final review): at least this many of the 200 queries must return at
+	// randomCypherNonEmptyFloor is this suite's anti-vacuity floor: at
+	// least this many of the 200 queries must return at
 	// least one row/literal against the independent pg oracle, mirroring
 	// dawgs_corpus_integration_test.go's own totalEngineServed floor idiom.
 	// Exists specifically because a template drawing its literal candidates
@@ -749,7 +749,7 @@ func TestRandomCypherDifferential(t *testing.T) {
 				// the independent authority for "did this random draw
 				// actually produce a satisfiable predicate", exactly
 				// mirroring dawgs_corpus_integration_test.go's
-				// totalEngineServed tally/floor idiom, one level down (I7).
+				// totalEngineServed tally/floor idiom, one level down.
 				if len(wantResult.Paths) > 0 || len(wantResult.Literals) > 0 {
 					nonEmptyCount++
 				}
@@ -769,6 +769,6 @@ func TestRandomCypherDifferential(t *testing.T) {
 		t.Errorf("served only %d/%d queries via the engine, want >= %d (see randomCypherServedFloor's doc) -- a regression may have made the interpreter decline far more broadly than expected", servedCount, totalCount, randomCypherServedFloor)
 	}
 	if nonEmptyCount < randomCypherNonEmptyFloor {
-		t.Errorf("only %d/%d queries returned any rows, want >= %d (see randomCypherNonEmptyFloor's doc) -- a template may have become unsatisfiable (e.g. two disjoint value pools, as finding I7 found for the `IN n.tags` template)", nonEmptyCount, totalCount, randomCypherNonEmptyFloor)
+		t.Errorf("only %d/%d queries returned any rows, want >= %d (see randomCypherNonEmptyFloor's doc) -- a template may have become unsatisfiable (e.g. two disjoint value pools, as previously happened to the `IN n.tags` template)", nonEmptyCount, totalCount, randomCypherNonEmptyFloor)
 	}
 }

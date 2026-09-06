@@ -165,7 +165,7 @@ func cypherExecReason(err error) string {
 // errors.Is still finds it) around whatever recover() returned, letting
 // cypherExecReason (above) recognize a recovered panic as a distinct
 // decline reason (reasonPanic) rather than folding it into the generic
-// reasonError bucket -- see the final review's finding I2.
+// reasonError bucket.
 var errCypherPanic = errors.New("interpret: recovered panic during Execute")
 
 // executeCypher is interpret.Execute, called through this package-level
@@ -180,7 +180,7 @@ var executeCypher = interpret.Execute
 // safeExecuteCypher runs executeCypher (interpret.Execute in production)
 // under a recover, converting any panic into a plain error (wrapping
 // errCypherPanic) rather than letting it propagate out of TryCypher and
-// crash whatever goroutine is holding TryCypher's caller -- finding I2's
+// crash whatever goroutine is holding TryCypher's caller -- a
 // fail-safe backstop. This package's interpreter is not proven panic-free
 // by construction (unlike interpret.Plan, which already carries its own
 // top-level recover), so this and buildCypherRowsResult's identical
@@ -510,8 +510,8 @@ func materializeScalar(v any, vk valueKind) any {
 //
 // Materialization happens EAGERLY, for every row, inside the constructor
 // (newCypherRowsResult) rather than lazily inside Next() -- a deliberate
-// change from this type's original design, per the final review's finding
-// I2: TryCypher builds this result under buildCypherRowsResult's own
+// change from this type's original design: TryCypher builds this result
+// under buildCypherRowsResult's own
 // recover (below), specifically so that a panic anywhere in
 // materialization is caught THERE, before TryCypher ever returns true, not
 // later inside some caller's own Next() loop after TryCypher has already
@@ -556,7 +556,7 @@ type cypherRowsResult struct {
 // Callers reached from TryCypher's own pipeline must go through
 // buildCypherRowsResult instead of calling this directly, so that a panic
 // during the eager materialization this performs is recovered rather than
-// escaping to TryCypher's caller (finding I2) -- this function itself does
+// escaping to TryCypher's caller -- this function itself does
 // NOT recover anything, matching every other constructor in this package;
 // test code that calls it directly (as several serve_cypher_test.go cases
 // do, deliberately exercising known-good fixtures) gets an ordinary panic
@@ -581,7 +581,7 @@ func newCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds
 // buildCypherRowsResult wraps newCypherRowsResult's own eager row
 // materialization under a recover, converting any panic there into
 // ok == false rather than letting it escape TryCypher -- see
-// cypherRowsResult's own doc and finding I2. This is the constructor
+// cypherRowsResult's own doc. This is the constructor
 // TryCypher's pipeline actually calls; newCypherRowsResult itself stays
 // available, unwrapped, for test code exercising known-good fixtures.
 func buildCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) (result graph.Result, ok bool) {

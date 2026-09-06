@@ -500,7 +500,7 @@ func TestExpandShortestPathMatchesTraverseDirectly(t *testing.T) {
 			})
 	})
 
-	// I3 (final review): the identical pattern written with a backward
+	// The identical pattern written with a backward
 	// arrow (`(t)<-[...]-  (s)`) must render p's node/edge sequence in the
 	// pattern's WRITTEN order (t first, then s) -- the exact reverse of the
 	// forward-arrow cases above, which is also the exact reverse of the
@@ -516,8 +516,8 @@ func TestExpandShortestPathMatchesTraverseDirectly(t *testing.T) {
 	})
 }
 
-// TestExpandVarLengthBackwardArrowNamedPathWrittenOrder is I3's (final
-// review) regression for the standalone (non-shortestPath) var-length case:
+// TestExpandVarLengthBackwardArrowNamedPathWrittenOrder is a regression
+// test for the standalone (non-shortestPath) var-length case:
 // a named path pattern written with a backward arrow
 // (`(b:Target)<-[:E*1..3]-(a:Root)`) must render p's Nodes/Edges in the
 // pattern's WRITTEN order -- b first, then the intermediate node(s), then a
