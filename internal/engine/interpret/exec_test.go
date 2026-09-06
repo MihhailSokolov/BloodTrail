@@ -499,3 +499,337 @@ func TestExecClosingStepCycle(t *testing.T) {
 	}
 	assertRowSet(t, rs, want)
 }
+
+// --- Task 8b: mixed fixed/var-length chains + named-path assembly ---------
+//
+// BloodHound's prebuilt queries routinely mix fixed and variable-length
+// steps in one pattern chain (e.g. `(c:Computer)-[:HasSession]->(u:User)-
+// [:MemberOf*1..]->(g:Group)`), including multiple variable-length steps per
+// chain, and 66 of them bind a named path over a plain (non-shortestPath)
+// pattern and `RETURN p`. exec.go's expandChainComponent (dispatched from
+// runComponent whenever a component has 2+ Steps with at least one
+// variable-length Step and no shortestPath Step, or carries a uniform
+// PathSym) is what closes this gap; see expandChainComponent's own doc
+// comment for the "always walk left-to-right from the chain's own leftmost
+// symbol" anchoring choice this section's tests exercise.
+
+// TestExecChainMixedFixedVarWithoutNamedPath: deliverable 1 in isolation --
+// a mixed fixed-then-var chain with no path variable at all must still
+// execute correctly (both the 1-hop and 2-hop MemberOf extensions from the
+// same HasSession-bound user), and a decoy HasSession target with no further
+// MemberOf edges must contribute nothing.
+func TestExecChainMixedFixedVarWithoutNamedPath(t *testing.T) {
+	const (
+		kindComputer snapshot.KindID = 1
+		kindUser     snapshot.KindID = 2
+		kindGroup    snapshot.KindID = 3
+		kindSession  snapshot.KindID = 10
+		kindMemberOf snapshot.KindID = 11
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{
+			kindComputer: "Computer", kindUser: "User", kindGroup: "Group",
+			kindSession: "HasSession", kindMemberOf: "MemberOf",
+		},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindComputer}, nil}, // c
+			{2, []snapshot.KindID{kindUser}, nil},     // u
+			{3, []snapshot.KindID{kindGroup}, nil},    // g1 (1 hop)
+			{4, []snapshot.KindID{kindGroup}, nil},    // g2 (2 hops, via g1)
+			{5, []snapshot.KindID{kindComputer}, nil}, // decoy computer
+			{6, []snapshot.KindID{kindUser}, nil},     // decoy user: HasSession but no MemberOf at all
+		},
+		[]execEdgeSpec{
+			{100, 1, 2, kindSession},
+			{101, 2, 3, kindMemberOf},
+			{102, 3, 4, kindMemberOf},
+			{103, 5, 6, kindSession},
+		},
+	)
+
+	rs := mustExec(t, snap, `MATCH (c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group) RETURN g`, generousBudget)
+
+	g1, _ := snap.Dense(3)
+	g2, _ := snap.Dense(4)
+	want := []string{
+		rowKey([]OutVal{{Kind: OutNode, Node: g1}}),
+		rowKey([]OutVal{{Kind: OutNode, Node: g2}}),
+	}
+	assertRowSet(t, rs, want)
+}
+
+// TestExecChainFixedThenVarReturnPathContent: fixed step (HasSession) then a
+// variable-length step (MemberOf*1..), named path -- hardcoded expected
+// PathVal edge signatures for both the 1-hop and 2-hop rows. A wrong-kind
+// decoy edge off the fixed step's own anchor must not participate (proving
+// the fixed step's own edge-kind filter still applies inside
+// expandChainComponent's reuse of expandStep).
+func TestExecChainFixedThenVarReturnPathContent(t *testing.T) {
+	const (
+		kindComputer snapshot.KindID = 1
+		kindUser     snapshot.KindID = 2
+		kindGroup    snapshot.KindID = 3
+		kindSession  snapshot.KindID = 10
+		kindMemberOf snapshot.KindID = 11
+		kindOwns     snapshot.KindID = 12
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{
+			kindComputer: "Computer", kindUser: "User", kindGroup: "Group",
+			kindSession: "HasSession", kindMemberOf: "MemberOf", kindOwns: "Owns",
+		},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindComputer}, nil}, // c
+			{2, []snapshot.KindID{kindUser}, nil},     // u
+			{3, []snapshot.KindID{kindGroup}, nil},    // g1
+			{4, []snapshot.KindID{kindGroup}, nil},    // g2
+			{5, nil, nil},                             // decoy target of a wrong-kind edge from c
+		},
+		[]execEdgeSpec{
+			{10, 1, 2, kindSession},  // c -HasSession-> u
+			{11, 2, 3, kindMemberOf}, // u -MemberOf-> g1 (depth 1)
+			{12, 3, 4, kindMemberOf}, // g1 -MemberOf-> g2 (depth 2)
+			{13, 1, 5, kindOwns},     // c -Owns-> decoy: wrong kind, must not participate
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group) RETURN p`, 0,
+		[]string{
+			"N:1,2,3,|E:10,11,",
+			"N:1,2,3,4,|E:10,11,12,",
+		})
+}
+
+// TestExecChainVarThenFixedReturnPathContent: a variable-length step
+// (MemberOf*1..) then a fixed step (AdminTo), named path. Only the depth-2
+// var-length landing spot (g2) carries an AdminTo edge, so the depth-1
+// landing spot (g1) must NOT survive into the final result even though it
+// satisfies the var-length step's own Group constraint on its own -- proving
+// the fixed step's own admission check still runs per var-length candidate.
+// A wrong-kind decoy edge off the chain's own anchor must not leak through
+// either.
+func TestExecChainVarThenFixedReturnPathContent(t *testing.T) {
+	const (
+		kindUser     snapshot.KindID = 1
+		kindGroup    snapshot.KindID = 2
+		kindComputer snapshot.KindID = 3
+		kindMemberOf snapshot.KindID = 10
+		kindAdminTo  snapshot.KindID = 11
+		kindOwns     snapshot.KindID = 12
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{
+			kindUser: "User", kindGroup: "Group", kindComputer: "Computer",
+			kindMemberOf: "MemberOf", kindAdminTo: "AdminTo", kindOwns: "Owns",
+		},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, nil},     // u
+			{2, []snapshot.KindID{kindGroup}, nil},    // g1 (depth 1, no AdminTo of its own)
+			{3, []snapshot.KindID{kindGroup}, nil},    // g2 (depth 2, has AdminTo)
+			{4, []snapshot.KindID{kindComputer}, nil}, // c
+			{5, []snapshot.KindID{kindGroup}, nil},    // decoy group, wrong-kind edge from u
+		},
+		[]execEdgeSpec{
+			{20, 1, 2, kindMemberOf},
+			{21, 2, 3, kindMemberOf},
+			{22, 3, 4, kindAdminTo},
+			{23, 1, 5, kindOwns},
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (u:User)-[:MemberOf*1..]->(g:Group)-[:AdminTo]->(c:Computer) RETURN p`, 0,
+		[]string{"N:1,2,3,4,|E:20,21,22,"})
+}
+
+// TestExecChainVarFixedVarLeadingZeroLengthSkipsStep: a 3-step var->fixed->
+// var chain whose LEADING step is `*0..`. u1 satisfies both the "u" pattern
+// (User) and the "g" pattern (Group) directly and has no outgoing MemberOf
+// edges at all, so the leading step's only surviving row is its zero-length
+// one (g merges into u1 itself); the assembled path must SKIP that step
+// entirely (no extra node/edge for it) rather than emit a spurious
+// self-referencing hop. u2 -- User but not Group, and with no edges either
+// -- proves the zero-length merge genuinely depends on satisfying the
+// target constraint rather than firing unconditionally (it contributes zero
+// rows).
+func TestExecChainVarFixedVarLeadingZeroLengthSkipsStep(t *testing.T) {
+	const (
+		kindUser  snapshot.KindID = 1
+		kindGroup snapshot.KindID = 2
+		kindCT    snapshot.KindID = 3
+		kindCA    snapshot.KindID = 4
+		kindA     snapshot.KindID = 10 // MemberOf
+		kindB     snapshot.KindID = 11 // Enroll
+		kindC     snapshot.KindID = 12 // PublishedTo
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{
+			kindUser: "User", kindGroup: "Group", kindCT: "CertTemplate", kindCA: "CA",
+			kindA: "MemberOf", kindB: "Enroll", kindC: "PublishedTo",
+		},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser, kindGroup}, nil}, // u1: satisfies BOTH u and g -- the zero-length case
+			{2, []snapshot.KindID{kindCT}, nil},              // ct1
+			{3, []snapshot.KindID{kindCA}, nil},              // ca1
+			{4, []snapshot.KindID{kindUser}, nil},            // u2: decoy, User only (not Group), no edges
+		},
+		[]execEdgeSpec{
+			{100, 1, 2, kindB}, // u1 -Enroll-> ct1
+			{101, 2, 3, kindC}, // ct1 -PublishedTo-> ca1
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (u:User)-[:MemberOf*0..]->(g:Group)-[:Enroll]->(ct:CertTemplate)-[:PublishedTo*1..]->(ca:CA) RETURN p`, 0,
+		[]string{"N:1,2,3,|E:100,101,"})
+}
+
+// TestExecChainSameEdgeReusedAcrossDifferentVarStepsAllowed: two adjacent
+// variable-length steps (a-[*1..3]->m-[*1..3]->b) whose only qualifying
+// trails happen to reuse the SAME physical edge (X->Y) once in each step's
+// own trail. Trail-edge uniqueness is scoped to a single step's own DFS
+// (see expand.go's package doc, unchanged by Task 8b's refactor into
+// expandVarLengthTrailsForSeed) -- never across steps of the same chain --
+// so this row must survive, with the shared edge's id appearing TWICE in
+// the assembled path's own Edges list. The companion "forbidden WITHIN one
+// step" half of this pin is already covered, unchanged, by
+// TestExpandVarLengthEdgeReuseForbiddenTriangleWithChord.
+func TestExecChainSameEdgeReusedAcrossDifferentVarStepsAllowed(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindMid    snapshot.KindID = 2
+		kindTarget snapshot.KindID = 3
+		kindE      snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindRoot: "Root", kindMid: "Mid", kindTarget: "Target", kindE: "E"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindRoot}, nil},   // a
+			{2, nil, nil},                           // X
+			{3, nil, nil},                           // Y
+			{4, []snapshot.KindID{kindMid}, nil},    // m
+			{5, []snapshot.KindID{kindTarget}, nil}, // b
+		},
+		[]execEdgeSpec{
+			{200, 1, 2, kindE}, // a -> X
+			{201, 2, 3, kindE}, // X -> Y: the edge reused by both steps' trails
+			{202, 3, 4, kindE}, // Y -> m
+			{203, 4, 2, kindE}, // m -> X: back edge, lets step 2 reach X again
+			{204, 3, 5, kindE}, // Y -> b
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (a:Root)-[:E*1..3]->(m:Mid)-[:E*1..3]->(b:Target) RETURN p`, 0,
+		[]string{"N:1,2,3,4,2,3,5,|E:200,201,202,203,201,204,"})
+}
+
+// TestExecChainBudgetExhaustionMidChain: a fixed step (a -F-> m) followed by
+// a variable-length step from m into an 8-node clique, under a work budget
+// far too small for the clique's own fan-out (mirroring
+// TestExpandVarLengthBudgetExhaustion's proven scale) -- Execute must abort
+// with ErrBudget partway through the chain's SECOND step, not merely at the
+// very end.
+func TestExecChainBudgetExhaustionMidChain(t *testing.T) {
+	const (
+		kindRoot snapshot.KindID = 1
+		kindMid  snapshot.KindID = 2
+		kindE    snapshot.KindID = 10
+		kindF    snapshot.KindID = 11
+	)
+	kinds := map[snapshot.KindID]string{kindRoot: "Root", kindMid: "Mid", kindE: "E", kindF: "F"}
+	nodes := []execNodeSpec{
+		{1, []snapshot.KindID{kindRoot}, nil}, // a
+		{2, []snapshot.KindID{kindMid}, nil},  // m (also a clique member below)
+	}
+	for i := uint64(3); i <= 9; i++ {
+		nodes = append(nodes, execNodeSpec{id: i})
+	}
+	edges := []execEdgeSpec{{1000, 1, 2, kindF}} // a -F-> m
+
+	nextID := uint64(1)
+	for u := uint64(2); u <= 9; u++ {
+		for v := uint64(2); v <= 9; v++ {
+			if u == v {
+				continue
+			}
+			edges = append(edges, execEdgeSpec{nextID, u, v, kindE})
+			nextID++
+		}
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	err := execExpectErr(t, snap,
+		`MATCH p = (a:Root)-[:F]->(m:Mid)-[:E*1..4]->(b) RETURN p`,
+		Budgets{MaxRows: 1_000_000, MaxWork: 1200})
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("Execute() error = %v, want ErrBudget", err)
+	}
+}
+
+// TestExecChainThreeStepFixedVarFixedReturnPathContent: a 3-step mixed chain
+// (fixed A, then var B*1.., then fixed C) whose var-length step lands on two
+// distinct depths (both satisfying the middle kind), each independently
+// continuing through the trailing fixed step -- both resulting rows' full
+// PathVal content is asserted exactly.
+func TestExecChainThreeStepFixedVarFixedReturnPathContent(t *testing.T) {
+	const (
+		kindK1 snapshot.KindID = 1
+		kindK2 snapshot.KindID = 2
+		kindK3 snapshot.KindID = 3
+		kindK4 snapshot.KindID = 4
+		kindA  snapshot.KindID = 10
+		kindB  snapshot.KindID = 11
+		kindC  snapshot.KindID = 12
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{
+			kindK1: "K1", kindK2: "K2", kindK3: "K3", kindK4: "K4",
+			kindA: "A", kindB: "B", kindC: "C",
+		},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindK1}, nil},
+			{2, []snapshot.KindID{kindK2}, nil},
+			{3, []snapshot.KindID{kindK3}, nil},
+			{4, []snapshot.KindID{kindK4}, nil},
+			{5, []snapshot.KindID{kindK3}, nil},
+			{6, []snapshot.KindID{kindK4}, nil},
+		},
+		[]execEdgeSpec{
+			{100, 1, 2, kindA},
+			{101, 2, 3, kindB},
+			{102, 3, 4, kindC},
+			{103, 3, 5, kindB},
+			{104, 5, 6, kindC},
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (n1:K1)-[:A]->(n2:K2)-[:B*1..]->(n3:K3)-[:C]->(n4:K4) RETURN p`, 0,
+		[]string{
+			"N:1,2,3,4,|E:100,101,102,",
+			"N:1,2,3,5,6,|E:100,101,103,104,",
+		})
+}
+
+// TestExecChainSingleFixedStepNamedPath: the simplest of the corpus's 66
+// plain-pattern named-path queries -- one fixed hop, no var-length at all --
+// bridging plan_test.go's existing plan-only "plain named path projected"
+// acceptance case with an actual execution/PathVal assertion.
+func TestExecChainSingleFixedStepNamedPath(t *testing.T) {
+	const (
+		kindUser snapshot.KindID = 1
+		kindX    snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User", kindX: "X"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, nil},
+			{2, []snapshot.KindID{kindUser}, nil},
+		},
+		[]execEdgeSpec{{500, 1, 2, kindX}},
+	)
+
+	assertPathSigs(t, snap, `MATCH p = (a:User)-[:X]->(b:User) RETURN p`, 0, []string{"N:1,2,|E:500,"})
+}

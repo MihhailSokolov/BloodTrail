@@ -179,17 +179,77 @@ func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step
 	}
 
 	toNC := part.Nodes[step.ToSym]
-	minDepth, maxHops := step.Range.Min, step.Range.Max
 
 	var out []*Row
 	for _, seed := range seeds {
-		root, _ := seed.Node(step.FromSym)
+		rows, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, seed, step.PathSym)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rows...)
+	}
 
-		if minDepth == 0 && nodeSatisfiesConstraint(env, toNC, root) {
+	return out, nil
+}
+
+// expandVarLengthTrailsForSeed grows exactly one seed row across step (a
+// variable-length Step), producing one output row per emitted trail --
+// factored out of expandVarLengthComponent (the standalone single-var-step
+// dispatch above, which calls this once per scanAnchor-produced seed) so
+// exec.go's expandChainComponent (Task 8b's mixed fixed/var-length chain
+// executor) can reuse the identical trail-DFS semantics to grow a row that
+// already carries earlier steps' own bindings, instead of a freshly scanned
+// seed -- see this file's package doc for the exact pinned semantics
+// (trail/depth/*0../first-edge-self-loop/multiplicity), all unchanged by
+// this refactor.
+//
+// pathArcKey, when non-empty, additionally binds each output row's own
+// per-step trail as a *PathVal under that key -- expandVarLengthComponent
+// passes step.PathSym itself (preserving its exact pre-Task-8b behavior:
+// this is the whole standalone pattern's own path), while
+// expandChainComponent passes a synthetic per-step key (pathStepArcKey,
+// exec.go) instead, since a var-length step's own PathSym (when the whole
+// chain is named) belongs to the WHOLE chain, not just this one step's
+// segment -- see assembleChainPathVal's doc. "" skips binding entirely,
+// matching a caller with no path to assemble.
+func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+	root, _ := seed.Node(step.FromSym)
+	minDepth, maxHops := step.Range.Min, step.Range.Max
+
+	var out []*Row
+
+	if minDepth == 0 && nodeSatisfiesConstraint(env, toNC, root) {
+		nr := cloneRow(seed)
+		nr.SetNode(step.ToSym, root)
+		if pathArcKey != "" {
+			nr.SetPathVar(pathArcKey, &PathVal{})
+		}
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+		out = append(out, nr)
+	}
+
+	if maxHops <= 0 {
+		return out, nil
+	}
+
+	stack := []trailFrame{{nodes: []snapshot.NodeID{root}}}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		depth := len(cur.edges)
+		curNode := cur.nodes[depth]
+
+		if depth >= 1 && depth >= minDepth && nodeSatisfiesConstraint(env, toNC, curNode) {
 			nr := cloneRow(seed)
-			nr.SetNode(step.ToSym, root)
-			if step.PathSym != "" {
-				nr.SetPathVar(step.PathSym, &PathVal{})
+			nr.SetNode(step.ToSym, curNode)
+			if pathArcKey != "" {
+				nr.SetPathVar(pathArcKey, &PathVal{
+					Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
+					Edges: append([]EdgeRef(nil), cur.edges...),
+				})
 			}
 			if err := meter.spend(1); err != nil {
 				return nil, err
@@ -197,63 +257,35 @@ func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step
 			out = append(out, nr)
 		}
 
-		if maxHops <= 0 {
+		if depth == maxHops || (depth == 1 && cur.firstIsSelfLoop) {
 			continue
 		}
 
-		stack := []trailFrame{{nodes: []snapshot.NodeID{root}}}
-		for len(stack) > 0 {
-			cur := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-
-			depth := len(cur.edges)
-			curNode := cur.nodes[depth]
-
-			if depth >= 1 && depth >= minDepth && nodeSatisfiesConstraint(env, toNC, curNode) {
-				nr := cloneRow(seed)
-				nr.SetNode(step.ToSym, curNode)
-				if step.PathSym != "" {
-					nr.SetPathVar(step.PathSym, &PathVal{
-						Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
-						Edges: append([]EdgeRef(nil), cur.edges...),
-					})
-				}
-				if err := meter.spend(1); err != nil {
-					return nil, err
-				}
-				out = append(out, nr)
+		cands, err := adjacency(env, meter, step, curNode, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cands {
+			if !edgeKindOK(step.EdgeKinds, c.kind) {
+				continue
 			}
-
-			if depth == maxHops || (depth == 1 && cur.firstIsSelfLoop) {
+			if containsFwd(cur.edges, c.fwd) {
 				continue
 			}
 
-			cands, err := adjacency(env, meter, step, curNode, true)
-			if err != nil {
-				return nil, err
-			}
-			for _, c := range cands {
-				if !edgeKindOK(step.EdgeKinds, c.kind) {
-					continue
-				}
-				if containsFwd(cur.edges, c.fwd) {
-					continue
-				}
+			nextNodes := make([]snapshot.NodeID, depth+2)
+			copy(nextNodes, cur.nodes)
+			nextNodes[depth+1] = c.other
 
-				nextNodes := make([]snapshot.NodeID, depth+2)
-				copy(nextNodes, cur.nodes)
-				nextNodes[depth+1] = c.other
+			nextEdges := make([]EdgeRef, depth+1)
+			copy(nextEdges, cur.edges)
+			nextEdges[depth] = EdgeRef{Fwd: c.fwd}
 
-				nextEdges := make([]EdgeRef, depth+1)
-				copy(nextEdges, cur.edges)
-				nextEdges[depth] = EdgeRef{Fwd: c.fwd}
-
-				stack = append(stack, trailFrame{
-					nodes:           nextNodes,
-					edges:           nextEdges,
-					firstIsSelfLoop: cur.firstIsSelfLoop || (depth == 0 && c.other == curNode),
-				})
-			}
+			stack = append(stack, trailFrame{
+				nodes:           nextNodes,
+				edges:           nextEdges,
+				firstIsSelfLoop: cur.firstIsSelfLoop || (depth == 0 && c.other == curNode),
+			})
 		}
 	}
 

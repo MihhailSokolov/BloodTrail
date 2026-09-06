@@ -29,6 +29,7 @@ package interpret
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
@@ -322,31 +323,63 @@ func mergeRowInto(dst, src *Row) {
 // `(a)-->(b), (b)-->(a)` reusing "a"/"b", or a self-loop pattern
 // `(a)-->(a)`) to a verification pass once the whole tree has been walked.
 //
-// Task 8 dispatch: a component consisting of exactly one Step that is
-// variable-length (Range != nil) or shortestPath/allShortestPaths (Shortest
-// != ShortestNone) is handed to expand.go's dedicated expansion instead --
-// neither shape grows an existing row set one adjacency hop at a time the
-// way expandStep does (a var-length Step enumerates a whole DFS of trails
-// per seed; a shortestPath Step resolves both endpoints to complete node
-// sets before ever calling into the snapshot's adjacency at all), so they do
-// not fit this function's tree/closing-edge BFS model. A component that
-// *mixes* such a Step with any other Step (e.g. `(a)-[:E*1..2]->(b),
-// (a)-[:F]->(c)`, sharing "a") is declined outright (errUnsupportedStep):
-// composing expand.go's own row-set-producing model with this function's
-// bound-symbol-growing model is unverified and not needed by any required
-// shape, so this declines rather than guess. Every shape in this task's
-// required test corpus is a single, standalone var-length or shortestPath
-// pattern -- exactly the case handled here.
+// Dispatch, in order:
+//
+//  1. Every Step in the component must agree on PathSym (uniformPathSym) --
+//     a mix of a named-path Step with an unnamed one (or two differently
+//     named ones) can only arise from a comma-joined pattern part sharing a
+//     symbol with a named `MATCH p = ...` part, a shape no required corpus
+//     query needs; declined outright.
+//  2. A component containing a shortestPath/allShortestPaths Step
+//     (Shortest != ShortestNone) must consist of exactly that one Step --
+//     see Task 8b's plan.go shortestStepsAreIsolated, which now also
+//     rejects this shape at plan time -- and dispatches to
+//     expandShortestPathComponent, which resolves both endpoints as
+//     complete, pre-adjacency node sets and has no way to honor a further
+//     chain hanging off either one.
+//  3. A component consisting of exactly one variable-length Step (Range !=
+//     nil) dispatches to expandVarLengthComponent, unchanged since Task 8.
+//  4. A component with two or more Steps, at least one variable-length, no
+//     shortestPath: Task 8b's mixed fixed/var-length chain shape (e.g.
+//     `(c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group)`).
+//     Dispatches to expandChainComponent, which requires the component to
+//     be a strict left-to-right chain (isStrictLinearChain) -- declining
+//     anything else (a cycle, a "star" from one bound symbol) rather than
+//     guess, since a variable-length Step can only ever be expanded forward
+//     from its own FromSym (Direction is always Outbound for Range != nil).
+//  5. Otherwise: every Step is fixed-length. A named path (PathSym != "")
+//     also requires isStrictLinearChain and dispatches to
+//     expandChainComponent (so RETURN p's PathVal assembly logic lives in
+//     one place); an unnamed pure-fixed component falls through to this
+//     function's own general BFS/closing-edge walk below, exactly as
+//     before Task 8b -- zero behavior change for every existing shape.
 func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdxs []int) ([]*Row, error) {
+	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
+	if !pathUniform {
+		return nil, errUnsupportedStep
+	}
+
 	if hasSpecialStep(part, stepIdxs) {
-		if len(stepIdxs) != 1 {
+		if hasShortestStep(part, stepIdxs) {
+			if len(stepIdxs) != 1 {
+				return nil, errUnsupportedStep
+			}
+			return expandShortestPathComponent(env, meter, part, &part.Chains[stepIdxs[0]])
+		}
+		if len(stepIdxs) == 1 {
+			return expandVarLengthComponent(env, meter, part, &part.Chains[stepIdxs[0]])
+		}
+		if !isStrictLinearChain(part, stepIdxs) {
 			return nil, errUnsupportedStep
 		}
-		step := &part.Chains[stepIdxs[0]]
-		if step.Shortest != ShortestNone {
-			return expandShortestPathComponent(env, meter, part, step)
+		return expandChainComponent(env, meter, part, stepIdxs, pathSym)
+	}
+
+	if pathSym != "" {
+		if !isStrictLinearChain(part, stepIdxs) {
+			return nil, errUnsupportedStep
 		}
-		return expandVarLengthComponent(env, meter, part, step)
+		return expandChainComponent(env, meter, part, stepIdxs, pathSym)
 	}
 
 	anchor := chooseAnchor(env, part.Nodes, syms)
@@ -397,7 +430,7 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 				boundSym, unboundSym = st.ToSym, st.FromSym
 			}
 
-			rows, err = expandStep(env, meter, rows, st, boundSym, unboundSym, boundIsFrom, part.Nodes[unboundSym])
+			rows, err = expandStep(env, meter, rows, st, boundSym, unboundSym, boundIsFrom, part.Nodes[unboundSym], "")
 			if err != nil {
 				return nil, err
 			}
@@ -426,6 +459,239 @@ func hasSpecialStep(part *Part, stepIdxs []int) bool {
 		}
 	}
 	return false
+}
+
+// hasShortestStep reports whether any of part.Chains[stepIdxs] is a
+// shortestPath/allShortestPaths Step.
+func hasShortestStep(part *Part, stepIdxs []int) bool {
+	for _, idx := range stepIdxs {
+		if part.Chains[idx].Shortest != ShortestNone {
+			return true
+		}
+	}
+	return false
+}
+
+// uniformPathSym reports the single PathSym value every Step in stepIdxs
+// agrees on (possibly "", meaning none of them are part of a named path),
+// and false if they disagree (a mix of "" and a name, or two different
+// names) -- a shape that can only arise from a comma-joined pattern part
+// sharing a symbol with a named `MATCH p = ...` part, which addPatternPart
+// never produces on its own (PathSym is set uniformly across every Step of
+// one named PatternPart). An empty stepIdxs (an isolated node component)
+// trivially agrees on "".
+func uniformPathSym(part *Part, stepIdxs []int) (string, bool) {
+	if len(stepIdxs) == 0 {
+		return "", true
+	}
+	sym := part.Chains[stepIdxs[0]].PathSym
+	for _, idx := range stepIdxs[1:] {
+		if part.Chains[idx].PathSym != sym {
+			return "", false
+		}
+	}
+	return sym, true
+}
+
+// isStrictLinearChain reports whether stepIdxs (already in ascending
+// Part.Chains order -- ie. pattern order, see groupComponents' doc) forms a
+// SIMPLE, LEFT-TO-RIGHT chain with no branching and no repeated symbol: the
+// component's own seed symbol is part.Chains[stepIdxs[0]].FromSym, and every
+// step's own ToSym must be a symbol never seen before (ruling out both a
+// same-step self-loop and a cycle back to an earlier symbol), while every
+// step after the first must start exactly where the previous one ended
+// (part.Chains[stepIdxs[i-1]].ToSym == part.Chains[stepIdxs[i]].FromSym).
+//
+// This is deliberately NOT a general "is this pattern graph a simple path"
+// test up to reordering/reorientation: buildStep normalizes an inbound
+// arrow (`<-`) by swapping FromSym/ToSym so the recorded Step direction
+// always matches the *traversal* direction, which means a chain written
+// with a backward arrow (`(a)<-[:X]-(b)-->(c)`) does NOT satisfy
+// step[i].ToSym == step[i+1].FromSym even though it is, structurally, still
+// a linear a-b-c pattern -- both of that shape's Steps end up with FromSym
+// "b". expandChainComponent's own anchoring (always scan
+// stepIdxs[0].FromSym, then walk strictly forward) has no way to compose a
+// variable-length Step's forward-only expansion with such a shape anyway
+// (see expandChainComponent's own doc), so this check declines it outright
+// rather than attempt a general chain-reordering algorithm no required
+// corpus shape (every migrated BloodHound pattern chain is written with
+// only forward arrows) needs.
+func isStrictLinearChain(part *Part, stepIdxs []int) bool {
+	if len(stepIdxs) == 0 {
+		return true
+	}
+	seen := map[string]bool{part.Chains[stepIdxs[0]].FromSym: true}
+	for i, idx := range stepIdxs {
+		step := &part.Chains[idx]
+		if step.FromSym == step.ToSym {
+			return false
+		}
+		if i > 0 && part.Chains[stepIdxs[i-1]].ToSym != step.FromSym {
+			return false
+		}
+		if seen[step.ToSym] {
+			return false
+		}
+		seen[step.ToSym] = true
+	}
+	return len(seen) == len(stepIdxs)+1
+}
+
+// pathStepArcKey returns the internal-only Row binding key
+// expandChainComponent/expandStep/expandVarLengthTrailsForSeed use to
+// recover step index idx's own specific contribution to a named path once
+// every step of the chain has bound its own piece (see
+// assembleChainPathVal): a single EdgeRef for a fixed step (used only when
+// that step's own relationship is anonymous -- an anonymous relationship
+// binds no EdgeSym at all, so there would otherwise be no way to recover
+// exactly which of possibly several parallel edges produced this particular
+// row), or a whole per-step trail *PathVal for a variable-length step (a
+// var-length step's OWN PathSym, when it has one, names the path for the
+// WHOLE chain, not this one step's own segment, so a separate key is needed
+// regardless of whether the step is named). "$" can never collide with a
+// real Cypher identifier -- see partBuilder.symbolFor's identical reasoning
+// at plan time.
+func pathStepArcKey(stepIdx int) string {
+	return "$patharc" + itoa(stepIdx)
+}
+
+// expandChainComponent executes a component of one or more Steps -- none
+// shortestPath -- that isStrictLinearChain has already confirmed forms a
+// simple left-to-right chain: runComponent's Task 8b dispatch target for
+// both a mixed fixed/var-length multi-step chain (e.g.
+// `(c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group)`) and,
+// when pathSym != "", a chain that needs its whole traversal-order PathVal
+// assembled for a `RETURN p` projection (see assembleChainPathVal) --
+// including a PURE fixed-length named-path chain, so path assembly lives in
+// exactly one place rather than being duplicated into runComponent's
+// general BFS/closing-edge walk below.
+//
+// Anchoring (documented per the brief's explicit "simplest correct approach
+// is fine" allowance): this does NOT run runComponent's general
+// BFS-from-cost-optimal-anchor algorithm. A variable-length Step can only
+// ever be expanded forward from its own FromSym (buildStep: Direction is
+// always Outbound for Range != nil; expandVarLengthTrailsForSeed/adjacency
+// always walk boundIsFrom == true), so composing it with an
+// arbitrary-direction BFS would be unneeded complexity no required shape
+// needs. Instead, this function always scans stepIdxs[0]'s own FromSym --
+// the chain's own leftmost symbol -- as the sole anchor (via scanAnchor, so
+// the existing id/objectid/kind/full-scan cost-tiered heuristic still
+// applies to *how* that one symbol is scanned, just not to *which* symbol is
+// chosen), then walks every step of the chain, in order, growing every row
+// by exactly one step at a time: a fixed step via expandStep, a
+// variable-length step via expandVarLengthTrailsForSeed (expand.go, factored
+// out of expandVarLengthComponent so both dispatch paths share the identical
+// trail-DFS semantics). Trail-edge uniqueness stays scoped to each
+// variable-length step's own call (a fresh DFS per step, per row) --
+// distinct variable-length steps of the same chain may legally reuse the
+// same physical edge in their own trails, mirroring dawgs' own per-expansion
+// recursive CTE (see expand.go's package doc).
+func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string) ([]*Row, error) {
+	startSym := part.Chains[stepIdxs[0]].FromSym
+	rows, err := scanAnchor(env, meter, startSym, part.Nodes[startSym])
+	if err != nil {
+		return nil, err
+	}
+
+	for _, idx := range stepIdxs {
+		step := &part.Chains[idx]
+		toNC := part.Nodes[step.ToSym]
+		arcKey := ""
+		if pathSym != "" {
+			arcKey = pathStepArcKey(idx)
+		}
+
+		if step.Range == nil {
+			rows, err = expandStep(env, meter, rows, step, step.FromSym, step.ToSym, true, toNC, arcKey)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		next := make([]*Row, 0, len(rows))
+		for _, r := range rows {
+			grown, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, r, arcKey)
+			if err != nil {
+				return nil, err
+			}
+			next = append(next, grown...)
+		}
+		rows = next
+	}
+
+	if pathSym != "" {
+		for _, r := range rows {
+			pv, err := assembleChainPathVal(r, part, stepIdxs)
+			if err != nil {
+				return nil, err
+			}
+			r.SetPathVar(pathSym, pv)
+		}
+	}
+
+	return rows, nil
+}
+
+// assembleChainPathVal builds one fully matched row's whole named-path
+// PathVal from stepIdxs (already confirmed by isStrictLinearChain to be a
+// simple left-to-right chain, in pattern order): the chain's own leftmost
+// node (part.Chains[stepIdxs[0]].FromSym) seeds Nodes[0], and each
+// subsequent step's own segment -- a fixed step's single edge (its EdgeSym
+// binding if the relationship is named, else the internal pathStepArcKey
+// binding expandStep left for exactly this purpose), or a variable-length
+// step's whole per-row trail (bound under pathStepArcKey by
+// expandVarLengthTrailsForSeed) -- appends only its own NEW node(s) (the
+// node it starts from is already the path's current last node) plus its own
+// edge(s), in order. A zero-length `*0..` segment's trail carries no nodes
+// at all (PathVal's own doc: both slices nil for the zero-length case), so
+// it appends nothing -- "the path skips the step", exactly like the two
+// endpoints it merged were the same node all along.
+func assembleChainPathVal(r *Row, part *Part, stepIdxs []int) (*PathVal, error) {
+	startSym := part.Chains[stepIdxs[0]].FromSym
+	startID, ok := r.Node(startSym)
+	if !ok {
+		return nil, fmt.Errorf("interpret: assembleChainPathVal: symbol %q not bound", startSym)
+	}
+	pv := &PathVal{Nodes: []snapshot.NodeID{startID}}
+
+	for _, idx := range stepIdxs {
+		step := &part.Chains[idx]
+
+		if step.Range == nil {
+			toID, ok := r.Node(step.ToSym)
+			if !ok {
+				return nil, fmt.Errorf("interpret: assembleChainPathVal: symbol %q not bound", step.ToSym)
+			}
+			edgeKey := step.EdgeSym
+			if edgeKey == "" {
+				edgeKey = pathStepArcKey(idx)
+			}
+			edge, ok := r.Edge(edgeKey)
+			if !ok {
+				return nil, fmt.Errorf("interpret: assembleChainPathVal: step %d edge %q not bound", idx, edgeKey)
+			}
+			pv.Nodes = append(pv.Nodes, toID)
+			pv.Edges = append(pv.Edges, edge)
+			continue
+		}
+
+		seg, ok := r.PathVar(pathStepArcKey(idx))
+		if !ok {
+			return nil, fmt.Errorf("interpret: assembleChainPathVal: step %d trail not bound", idx)
+		}
+		segPV, ok := seg.(*PathVal)
+		if !ok || segPV == nil {
+			return nil, fmt.Errorf("interpret: assembleChainPathVal: step %d trail has unexpected type %T", idx, seg)
+		}
+		if len(segPV.Nodes) == 0 {
+			continue
+		}
+		pv.Nodes = append(pv.Nodes, segPV.Nodes[1:]...)
+		pv.Edges = append(pv.Edges, segPV.Edges...)
+	}
+
+	return pv, nil
 }
 
 // --- anchor selection ------------------------------------------------------
@@ -769,8 +1035,13 @@ func edgeKindOK(want []snapshot.KindID, have snapshot.KindID) bool {
 // structural check -- see NodeConstraint's doc comment on why pattern-
 // position kind labels have no WHERE-clause counterpart to fall back on),
 // and emits one new row per surviving candidate binding unboundSym (and, if
-// named, step.EdgeSym).
-func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, unboundSym string, boundIsFrom bool, unboundNC *NodeConstraint) ([]*Row, error) {
+// named, step.EdgeSym). pathArcKey, when non-empty, additionally binds the
+// surviving candidate's own specific edge under that key too (see
+// pathStepArcKey's doc) -- expandChainComponent's own mechanism for
+// recovering an anonymous fixed step's exact edge instance once the whole
+// chain has been walked; "" (every call site outside expandChainComponent)
+// skips this entirely, matching a caller with no path to assemble.
+func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, unboundSym string, boundIsFrom bool, unboundNC *NodeConstraint, pathArcKey string) ([]*Row, error) {
 	var out []*Row
 	for _, r := range rows {
 		boundID, _ := r.Node(boundSym)
@@ -789,6 +1060,9 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			nr.SetNode(unboundSym, c.other)
 			if step.EdgeSym != "" {
 				nr.SetEdge(step.EdgeSym, EdgeRef{Fwd: c.fwd})
+			}
+			if pathArcKey != "" {
+				nr.SetEdge(pathArcKey, EdgeRef{Fwd: c.fwd})
 			}
 			if err := meter.spend(1); err != nil {
 				return nil, err

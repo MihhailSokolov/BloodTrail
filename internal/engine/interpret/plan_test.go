@@ -164,6 +164,20 @@ MATCH p = (c:Computer)-[:HasSession]->(:User)-[:MemberOf*1..]->(g:Group)
 WHERE g.objectid ENDS WITH '-512' AND NOT c IN exclude
 RETURN p
 LIMIT 1000`
+
+	// corpusMixedChainPathQuery and corpusADCSMixedVarChainQuery are Task 8b's
+	// own gap-defining corpus shapes (see the task's own brief): a named path
+	// over a fixed-then-var chain, and an ADCS-shaped chain with TWO
+	// var-length steps ("*0.." leading, a fixed "*1"-implicit trailing hop)
+	// separated by fixed hops. Both must plan+serve now that exec.go's
+	// expandChainComponent exists; TestExecChain* (exec_test.go) exercises
+	// their actual execution/PathVal content.
+	corpusMixedChainPathQuery = `MATCH p = (c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group)
+RETURN p
+LIMIT 1000`
+
+	corpusADCSMixedVarChainQuery = `MATCH p = (u)-[:MemberOf*0..]->(g)-[:Enroll]->(ct:CertTemplate)-[:PublishedTo]->(ca:CA)
+RETURN p`
 )
 
 func testSnapshot(t *testing.T, corpusTexts []string) *snapshot.Snapshot {
@@ -201,7 +215,7 @@ func TestPlanServeDelegateMatrix(t *testing.T) {
 	for _, q := range corpus {
 		texts = append(texts, q.Cypher)
 	}
-	texts = append(texts, corpusAggregationQuery, corpusCollectAntiJoinQuery)
+	texts = append(texts, corpusAggregationQuery, corpusCollectAntiJoinQuery, corpusMixedChainPathQuery, corpusADCSMixedVarChainQuery)
 
 	snap := testSnapshot(t, texts)
 
@@ -214,6 +228,8 @@ func TestPlanServeDelegateMatrix(t *testing.T) {
 	cases = append(cases,
 		planTestCase{name: "corpus aggregation query", cypher: corpusAggregationQuery, want: true},
 		planTestCase{name: "COLLECT anti-join query", cypher: corpusCollectAntiJoinQuery, want: true},
+		planTestCase{name: "Task 8b: mixed fixed+var named-path chain", cypher: corpusMixedChainPathQuery, want: true},
+		planTestCase{name: "Task 8b: ADCS-shaped multi-var-length chain", cypher: corpusADCSMixedVarChainQuery, want: true},
 		planTestCase{name: "standalone *0..", cypher: `MATCH (n)-[:X*0..]->(m) RETURN n`, want: true},
 		planTestCase{name: "inline property map", cypher: `MATCH (n:User {name:'X'}) RETURN n`, want: true},
 
@@ -293,6 +309,11 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "collect alias IN chained before equality rejected", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (c:User) WHERE c IN xs = true RETURN c`, want: false},
 		{name: "plain named path projected", cypher: `MATCH p = (a:User)-[:X]->(b:User) RETURN p`, want: true},
 		{name: "named path used in WHERE rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) WHERE p = a RETURN a`, want: false},
+
+		// Task 8b: a named path symbol must not cross a WITH boundary --
+		// planWith's plain-variable-carry-over branch already rejects a
+		// symPath kind (checked here, not merely reasoned about).
+		{name: "named path symbol carried across WITH boundary rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) WITH p MATCH (c:User) RETURN c`, want: false},
 		{name: "id nested in arithmetic rejected", cypher: `MATCH (n:User) RETURN id(n) + 1 AS x`, want: false},
 		{name: "bare id call ok", cypher: `MATCH (n:User) RETURN id(n) AS x`, want: true},
 		{name: "size nested in function rejected", cypher: `MATCH (n:User) RETURN toString(size(n.spns)) AS x`, want: false},
@@ -336,6 +357,23 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// supported, joining by identity).
 		{name: "edge symbol reused across steps in one chain rejected", cypher: `MATCH (a:User)-[r:X]->(b:User)-[r:X]->(c:User) RETURN a`, want: false},
 		{name: "edge symbol reused across pattern parts rejected", cypher: `MATCH (a:User)-[r:X]->(b:User) MATCH (c:User)-[r:X]->(d:User) RETURN a`, want: false},
+
+		// Task 8b: mixed fixed/var-length chains within one component are
+		// now servable (see plan_test.go's TestPlanServeDelegateMatrix and
+		// exec_test.go/expand_test.go for the executed shapes), but
+		// shortestPath must stay isolated -- sharing a symbol with ANY other
+		// Step in the same Part, even one from a separate comma-joined
+		// PatternPart, rejects (shortestStepsAreIsolated).
+		{
+			name:   "shortestPath step shares symbol with a longer chain rejected",
+			cypher: `MATCH (a:X)-[:X]->(b:X), p = shortestPath((b)-[:X*1..]->(c:X)) RETURN a`,
+			want:   false,
+		},
+		{
+			name:   "shortestPath isolated in its own component still ok",
+			cypher: `MATCH (a:X)-[:X]->(b:X), p = shortestPath((s:X)-[:X*1..]->(t:X)) WHERE s<>t RETURN a`,
+			want:   true,
+		},
 	}
 
 	runPlanGolden(t, snap, cases)

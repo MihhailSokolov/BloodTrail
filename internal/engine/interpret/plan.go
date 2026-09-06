@@ -1101,14 +1101,80 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 // finalizeShortestPaths runs after every pattern and WHERE conjunct in the
 // Part has been processed: for every shortestPath/allShortestPaths Step it
 // sets HasExplicitEndpointInequality and enforces the endpoint-constraint
-// rule (see its own doc below).
+// rule (see its own doc below), plus the Task 8b mixing restriction (see
+// shortestStepsAreIsolated).
 func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression) bool {
+	if !pb.shortestStepsAreIsolated() {
+		return false
+	}
 	for _, idx := range pb.shortestSteps {
 		step := &pb.chains[idx]
 		step.HasExplicitEndpointInequality = hasEndpointInequality(whereConjuncts, step.FromSym, step.ToSym)
 
 		if !pb.isConstrained(step.FromSym) && !pb.isConstrained(step.ToSym) {
 			return false
+		}
+	}
+	return true
+}
+
+// shortestStepsAreIsolated reports whether every shortestPath()/
+// allShortestPaths() Step recorded so far (pb.shortestSteps) shares no
+// pattern-connectivity component -- transitively, via Step FromSym/ToSym,
+// exactly like exec.go's own groupComponents union-find -- with any OTHER
+// Step in this Part.
+//
+// addShortestPathPart already restricts a shortestPath()/allShortestPaths()
+// call itself to a single, exactly-3-element PatternPart (it cannot span
+// more than one relationship), but Cypher's comma-separated pattern list can
+// still legally write it alongside an ordinary chain that happens to reuse
+// one of its own endpoint symbols (e.g. `MATCH (a)-->(b),
+// shortestPath((b)-[*1..]->(c))`), pulling both into the SAME connected
+// component the executor would compute. Task 8b's chain executor
+// (expandChainComponent) and the standalone shortestPath executor
+// (expandShortestPathComponent) are mutually exclusive: a shortestPath Step
+// resolves both endpoints as complete, pre-adjacency node sets before ever
+// touching adjacency, and has no way to additionally honor a further chain
+// hanging off either endpoint. Rather than let such a query plan
+// successfully only to have the executor discover the same fact after a
+// full anchor scan (runComponent's own len(stepIdxs) != 1 decline), this
+// rejects the shape at plan time.
+func (pb *partBuilder) shortestStepsAreIsolated() bool {
+	if len(pb.shortestSteps) == 0 {
+		return true
+	}
+
+	parent := map[string]string{}
+	var find func(string) string
+	find = func(s string) string {
+		if _, ok := parent[s]; !ok {
+			parent[s] = s
+			return s
+		}
+		if parent[s] != s {
+			parent[s] = find(parent[s])
+		}
+		return parent[s]
+	}
+	union := func(a, b string) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	for i := range pb.chains {
+		union(pb.chains[i].FromSym, pb.chains[i].ToSym)
+	}
+
+	for _, idx := range pb.shortestSteps {
+		root := find(pb.chains[idx].FromSym)
+		for j := range pb.chains {
+			if j == idx {
+				continue
+			}
+			if find(pb.chains[j].FromSym) == root {
+				return false
+			}
 		}
 	}
 	return true
