@@ -961,6 +961,72 @@ func TestExecChainSingleFixedStepNamedPath(t *testing.T) {
 	assertPathSigs(t, snap, `MATCH p = (a:User)-[:X]->(b:User) RETURN p`, 0, []string{"N:1,2,|E:500,"})
 }
 
+// TestExecChainSingleReversedFixedStepNamedPath is a regression test for the
+// bug this fix addresses: the identical fixture/pattern as
+// TestExecChainSingleFixedStepNamedPath above, but written with a backward
+// arrow (`(b:User)<-[:X]-(a:User)`). This is still a one-step chain
+// (isStrictLinearChain trivially accepts a single step -- see its own doc),
+// so it still reaches expandChainComponent/assembleChainPathVal, but
+// buildStep's inbound-arrow swap now sets Reversed=true and normalizes
+// FromSym=a/ToSym=b (the executor still walks the same physical edge
+// 1->2). Before this fix, assembleChainPathVal always emitted the PathVal
+// in TRAVERSAL order (a, then b: "N:1,2,..."), silently disagreeing with
+// both Cypher's and pg's own "node sequence follows the pattern as
+// written" semantics, which put b first here. Mirrors
+// TestExpandVarLengthBackwardArrowNamedPathWrittenOrder's own coverage of
+// the same written-order requirement for the variable-length case.
+func TestExecChainSingleReversedFixedStepNamedPath(t *testing.T) {
+	const (
+		kindUser snapshot.KindID = 1
+		kindX    snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User", kindX: "X"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindUser}, nil},
+			{2, []snapshot.KindID{kindUser}, nil},
+		},
+		[]execEdgeSpec{{500, 1, 2, kindX}},
+	)
+
+	assertPathSigs(t, snap, `MATCH p = (b:User)<-[:X]-(a:User) RETURN p`, 0, []string{"N:2,1,|E:500,"})
+}
+
+// TestAssembleChainPathValMultiStepReversedDeclines is a direct unit test of
+// assembleChainPathVal's own defensive guard: a multi-step stepIdxs slice
+// carrying a Reversed step anywhere in it must decline with
+// errUnsupportedStep, never attempt to splice it.
+//
+// This shape cannot actually arise from planning a real `MATCH p = ...`
+// query -- isStrictLinearChain's own continuity test (previous step's ToSym
+// == next step's FromSym) can never hold for a Reversed step at any
+// position but stepIdxs[0] of a single-step chain (a Reversed step's own
+// FromSym is always that step's freshly-introduced pattern variable, never
+// a symbol a previous step could have already bound -- see Step.Reversed's
+// and this guard's own doc comments, plan.go/exec.go). So this test
+// constructs the Part/Row directly, bypassing Plan entirely, to verify the
+// guard itself rather than relying on isStrictLinearChain continuing to
+// make the shape unreachable.
+func TestAssembleChainPathValMultiStepReversedDeclines(t *testing.T) {
+	part := &Part{
+		Chains: []Step{
+			{FromSym: "a", ToSym: "b", Reversed: true},
+			{FromSym: "b", ToSym: "c"},
+		},
+	}
+	row := NewRow()
+	row.SetNode("a", 1)
+	row.SetNode("b", 2)
+	row.SetNode("c", 3)
+	row.SetEdge(pathStepArcKey(0), EdgeRef{})
+	row.SetEdge(pathStepArcKey(1), EdgeRef{})
+
+	_, err := assembleChainPathVal(row, part, []int{0, 1})
+	if !errors.Is(err, errUnsupportedStep) {
+		t.Fatalf("assembleChainPathVal with a multi-step Reversed chain: got err %v, want errUnsupportedStep", err)
+	}
+}
+
 // TestExecChainNamedVarLengthStepDeclines: a named var-length relationship
 // inside a mixed chain (e.g., `(a:X)-[r:X*1..]->(b:X)-[:X]->(c:X)`) must be
 // declined with errUnsupportedStep, matching the policy enforced by the

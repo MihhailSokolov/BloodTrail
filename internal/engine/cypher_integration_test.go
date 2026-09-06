@@ -144,6 +144,19 @@ func TestTryCypherDifferential(t *testing.T) {
 	propEdgeKind := graph.StringKind("PropEdge")
 	propNodeKind := graph.StringKind("PropNode")
 
+	// Regression coverage for the reversed-single-step named-path fix
+	// (assembleChainPathVal, exec.go): a named path whose one-step pattern
+	// is written with a backward arrow, mirroring the corpus's own common
+	// `(g:Group)<-[:MemberOf]-(u:User)` shape. groupKind/userKind/
+	// memberOfKind are unique to this fixture (no collision with
+	// hydrateFixturePath's own kind names), so the differential case below
+	// matches exactly this one pair -- letting assertSameSet's canonicalized
+	// per-path node ORDER comparison catch a regression directly, not just
+	// the node/edge set.
+	groupKind := graph.StringKind("Group")
+	userKind := graph.StringKind("User")
+	memberOfKind := graph.StringKind("MemberOf")
+
 	// Critical finding 1c's required differential coverage: a multi-label
 	// pattern endpoint ((s:MultiA:MultiB)) combined with a lifted predicate
 	// (forcing the Criteria path rather than the already-correct bitmap
@@ -284,6 +297,20 @@ func TestTryCypherDifferential(t *testing.T) {
 			return err
 		}
 
+		// Reversed-single-step named-path case: one User MemberOf one
+		// Group, queried as `(g:Group)<-[:MemberOf]-(u:User)` below.
+		reversedGroupNode, err := tx.CreateNode(graph.NewProperties(), groupKind)
+		if err != nil {
+			return err
+		}
+		reversedUserNode, err := tx.CreateNode(graph.NewProperties(), userKind)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.CreateRelationshipByIDs(reversedUserNode.ID, reversedGroupNode.ID, memberOfKind, graph.NewProperties()); err != nil {
+			return err
+		}
+
 		return nil
 	}); err != nil {
 		t.Fatalf("seed property fixture: %v", err)
@@ -357,6 +384,21 @@ func TestTryCypherDifferential(t *testing.T) {
 			// count exactly.
 			name: "duplicate objectid anchor returns every match",
 			text: `MATCH (n:PropNode) WHERE n.objectid = 'DUP-OID' RETURN n`,
+		},
+		{
+			// Regression coverage for the assembleChainPathVal fix: a
+			// one-step named path written with a backward arrow
+			// (buildStep's inbound-arrow swap sets Step.Reversed=true) must
+			// still render its PathVal in the pattern's WRITTEN order (g,
+			// then u), matching the pg oracle -- not the executor's own
+			// internal TRAVERSAL order (u, then g), which is what this bug
+			// produced before the fix. assertSameSet's canonicalize keeps
+			// each path's own node order intact (only the SET of paths is
+			// order-independent), so a regression here would show up as a
+			// path-set mismatch even though both sides agree on which
+			// node/edge instances are involved.
+			name: "reversed single-step named path renders pattern-written order",
+			text: `MATCH p = (g:Group)<-[:MemberOf]-(u:User) RETURN p LIMIT 5`,
 		},
 		{
 			// Task 13's required "path query asserting hydrated edge

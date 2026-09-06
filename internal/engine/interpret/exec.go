@@ -700,7 +700,48 @@ func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int
 // at all (PathVal's own doc: both slices nil for the zero-length case), so
 // it appends nothing -- "the path skips the step", exactly like the two
 // endpoints it merged were the same node all along.
+//
+// The loop below always walks stepIdxs in TRAVERSAL order (each step's own
+// FromSym/ToSym, which buildStep normalizes to match graph traversal
+// direction, not necessarily the order the pattern was WRITTEN in -- see
+// Step.Reversed's own doc). For a plain forward chain those two orders
+// coincide and the loop's output is already correct. A single-step chain
+// whose one step is Reversed (`MATCH p = (t)<-[:R]-(s) RETURN p`, a
+// one-step chain that trivially satisfies isStrictLinearChain -- see its
+// own doc) is the one shape where they diverge: the loop below would
+// otherwise emit [s, t] (traversal order) where Cypher's (and pg's) own
+// "node sequence follows the pattern as written" semantics require [t, s].
+// This is corrected below by reusing reversePathVal (expand.go), exactly
+// the same fix expandVarLengthTrailsForSeed/expandShortestPathComponent
+// already apply for a standalone Reversed step.
+//
+// A Reversed step at any OTHER position -- i.e. a multi-step chain
+// (len(stepIdxs) > 1) carrying a Reversed step anywhere in it -- can never
+// actually reach here: isStrictLinearChain's own continuity test
+// (stepIdxs[i-1].ToSym == stepIdxs[i].FromSym) requires a Reversed step's
+// FromSym (always that step's own freshly-introduced pattern variable, per
+// Step.Reversed's doc) to equal the previous step's ToSym, which cannot
+// happen for a genuinely continuing chain -- so no required corpus shape,
+// nor any shape isStrictLinearChain actually admits, needs multi-step
+// splicing to account for per-step reversal at all. The guard below makes
+// that structural fact an explicit, checked precondition instead of an
+// emergent property of isStrictLinearChain's own logic (which could
+// silently stop holding under a future change to it): without this guard, a
+// var-length Reversed step's own per-step trail -- already flipped into
+// pattern-written order by expandVarLengthTrailsForSeed's own
+// step.Reversed handling before this function ever reads it back out via
+// pathStepArcKey -- would be spliced in assuming TRAVERSAL order (this
+// function's segPV.Nodes[1:]/segPV.Edges append below), silently corrupting
+// the assembled path rather than failing loudly.
 func assembleChainPathVal(r *Row, part *Part, stepIdxs []int) (*PathVal, error) {
+	if len(stepIdxs) > 1 {
+		for _, idx := range stepIdxs {
+			if part.Chains[idx].Reversed {
+				return nil, errUnsupportedStep
+			}
+		}
+	}
+
 	startSym := part.Chains[stepIdxs[0]].FromSym
 	startID, ok := r.Node(startSym)
 	if !ok {
@@ -742,6 +783,15 @@ func assembleChainPathVal(r *Row, part *Part, stepIdxs []int) (*PathVal, error) 
 		}
 		pv.Nodes = append(pv.Nodes, segPV.Nodes[1:]...)
 		pv.Edges = append(pv.Edges, segPV.Edges...)
+	}
+
+	if len(stepIdxs) == 1 && part.Chains[stepIdxs[0]].Reversed {
+		// The one-step-chain, Reversed==true case this function's own doc
+		// comment above flags: pv was just built in traversal order (this
+		// step's FromSym first); flip it to pattern-written order, exactly
+		// like expandVarLengthTrailsForSeed/expandShortestPathComponent
+		// already do for a standalone Reversed step.
+		reversePathVal(pv)
 	}
 
 	return pv, nil

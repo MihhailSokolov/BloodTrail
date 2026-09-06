@@ -120,12 +120,21 @@ type Step struct {
 	// (RETURN p), to match Cypher's
 	// (and pg's) own "node sequence follows the pattern as written"
 	// semantics regardless of which way any one edge happens to point.
-	// Always false for a step reached through expandChainComponent
-	// (isStrictLinearChain's own doc explains why a Reversed step can never
-	// satisfy its "each step starts where the last one ended" chain test),
-	// so this only ever matters for a standalone single-step component
-	// (expandVarLengthComponent) or a shortestPath/allShortestPaths Step
-	// (expandShortestPathComponent).
+	// A step reached through expandChainComponent (exec.go) can carry
+	// Reversed too, but only when it is the chain's OWN single step -- a
+	// one-step chain (e.g. `MATCH p = (t)<-[:R]-(s) RETURN p`) trivially
+	// satisfies isStrictLinearChain's "each step starts where the last one
+	// ended" continuity test (there being no previous step to satisfy it
+	// against), and assembleChainPathVal (exec.go) applies the same
+	// pattern-order correction for that case that
+	// expandVarLengthTrailsForSeed/expandShortestPathComponent apply below.
+	// A Reversed step at any OTHER position of a MULTI-step chain can never
+	// reach expandChainComponent: isStrictLinearChain's continuity test
+	// requires a Reversed step's own FromSym (always that step's freshly
+	// introduced pattern variable) to equal the previous step's ToSym,
+	// which no continuing chain can satisfy -- assembleChainPathVal guards
+	// this explicitly (errUnsupportedStep) rather than relying on it as an
+	// emergent property of isStrictLinearChain's own logic.
 	Reversed bool
 }
 
