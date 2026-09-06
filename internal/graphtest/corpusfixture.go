@@ -1114,6 +1114,41 @@ func seedFillerPopulation(s *corpusSeed) {
 	}
 }
 
+// CorpusSchema returns the graph.Schema LoadCorpusFixture asserts internally
+// -- the full node/edge kind closure the pre-built Cypher corpus references
+// (see this file's package doc), declared under GraphName. Exported so a
+// caller that opens a *second* driver instance against the same underlying
+// database -- e.g. milestone 4's Task 16 differential suite, which opens
+// both the bloodtrail driver and a raw pg oracle driver sharing one
+// connection pool -- can assert the identical schema on that instance too:
+// each *pg.Driver (bloodtrail.Driver's own embedded one included) keeps its
+// own in-memory kind-id cache (dawgs' pg.SchemaManager), populated only from
+// whatever has been asserted through that specific instance (or self-healed
+// via a slower fetch-on-first-miss the first time a query references an
+// as-yet-uncached kind). Calling this on every driver instance up front
+// avoids relying on that self-heal path at all.
+//
+// DefaultGraph is set here (it was not, before Task 16), for the same
+// per-instance reason: which graph is "the" default is itself instance
+// state (pg.Driver.SetDefaultGraph/AssertDefaultGraph), not a database-wide
+// setting, so a *pg.Driver instance that never had a default graph asserted
+// through it -- any instance other than the one graphtest.OpenPG itself
+// constructs and returns, e.g. bloodtrail.Driver's own embedded pg.Driver,
+// built by dawgs.Open, or a second, explicit pg.DriverName instance opened
+// against the same pool -- fails every query against it outright ("driver
+// operation requires a graph target to be set") until something asserts
+// one. Task 15's own TestLoadCorpusFixtureSelfCheck never noticed this gap:
+// it calls LoadCorpusFixture on the very same *pg.Driver graphtest.OpenPG
+// just constructed (and therefore already defaulted), never a second
+// instance -- Task 16 does, so the gap became this function's problem to
+// close rather than something worth touching that test over.
+func CorpusSchema() graph.Schema {
+	return graph.Schema{
+		Graphs:       []graph.Graph{{Name: GraphName, Nodes: corpusKinds(corpusNodeKindNames), Edges: corpusKinds(corpusEdgeKindNames)}},
+		DefaultGraph: graph.Graph{Name: GraphName},
+	}
+}
+
 // LoadCorpusFixture seeds a deterministic BloodHound-shaped graph into d's
 // default graph through the pg driver's write-transaction (nodes) and
 // batch (relationships) APIs, covering the major families of
@@ -1150,11 +1185,7 @@ func LoadCorpusFixture(t testing.TB, d *pg.Driver) CorpusFixture {
 	seedAzure(seed)
 	seedFillerPopulation(seed)
 
-	schema := graph.Schema{Graphs: []graph.Graph{{
-		Name:  GraphName,
-		Nodes: corpusKinds(corpusNodeKindNames),
-		Edges: corpusKinds(corpusEdgeKindNames),
-	}}}
+	schema := CorpusSchema()
 	if err := d.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("graphtest: LoadCorpusFixture: assert schema: %v", err)
 	}
