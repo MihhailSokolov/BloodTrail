@@ -95,18 +95,28 @@ func (b *Builder) AddParsedNode(databaseID uint64, kinds []KindID, props ParsedP
 }
 
 // addParsedNode is AddNode's and AddParsedNode's shared commit step: the
-// ascending-id check, staging id/kinds, and committing already-parsed
-// properties. See AddNode's and AddParsedNode's docs for the ordering and
+// ascending-id check, committing already-parsed properties, and staging
+// id/kinds. See AddNode's and AddParsedNode's docs for the ordering and
 // concurrency contract this relies on.
+//
+// commitNodeProps runs BEFORE id/kinds are staged, deliberately: its only
+// failure mode (internProp's PropID-wrap guard -- see its own doc) must
+// leave this node completely unstaged, the same "no partial mutation on
+// error" contract AddNode's own doc promises for a parse failure --
+// reversing the order would instead leave b.ids/b.kindsFlat/b.kindOffsets
+// one node ahead of b.propOffsets, corrupting every subsequent Value/
+// NodeMap lookup's row alignment for the rest of this Builder's life.
 func (b *Builder) addParsedNode(databaseID uint64, kinds []KindID, parsed []parsedProp) error {
 	if n := len(b.ids); n > 0 && databaseID <= b.ids[n-1] {
 		return fmt.Errorf("databaseID %d is not strictly greater than previous %d", databaseID, b.ids[n-1])
+	}
+	if err := b.commitNodeProps(parsed); err != nil {
+		return err
 	}
 
 	b.ids = append(b.ids, databaseID)
 	b.kindsFlat = append(b.kindsFlat, kinds...)
 	b.kindOffsets = append(b.kindOffsets, uint32(len(b.kindsFlat)))
-	b.commitNodeProps(parsed)
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"unsafe"
 )
@@ -373,11 +374,36 @@ func parseNodeProps(propsJSON []byte) ([]parsedProp, error) {
 	return out, nil
 }
 
+// maxPropID is the largest value PropID (a uint16) can hold, and therefore
+// the largest number of distinct property names minus one -- math.MaxUint16
+// distinct names (ids 0..maxPropID) is exactly as many as a PropID can ever
+// represent.
+const maxPropID = math.MaxUint16
+
 // internProp returns the PropID for name, interning it (assigning the next
 // dense id) if this is the first time name has been seen by this Builder.
-func (b *Builder) internProp(name string) PropID {
+// Returns an error, refusing to intern name at all, if this Builder has
+// already interned math.MaxUint16+1 distinct names (PropID's own full
+// range): assigning one more would silently wrap PropID(len(b.propNames))
+// back to an id already in use, aliasing two entirely different property
+// names under the same PropID -- every subsequent Value/NodeMap lookup for
+// either name would then read whichever one happened to sort first for a
+// given node, a silent correctness corruption, not merely a missing
+// feature. A database with more than 65536 distinct property names across
+// an entire graph is not something real BloodHound data is expected to
+// ever produce, but this Builder had no
+// guard against it at all before this fix -- failing loudly here instead
+// means Build (and therefore LoadSnapshot) simply refuses the snapshot,
+// which leaves the engine with nothing to serve from, so every query
+// delegates to PostgreSQL -- this package's and the wider engine's usual
+// "reject at build/plan time, delegate" posture, applied one layer
+// earlier than usual.
+func (b *Builder) internProp(name string) (PropID, error) {
 	if id, ok := b.propIDs[name]; ok {
-		return id
+		return id, nil
+	}
+	if len(b.propNames) > maxPropID {
+		return 0, fmt.Errorf("snapshot: internProp: more than %d distinct property names (PropID, a uint16, would wrap)", maxPropID+1)
 	}
 	if b.propIDs == nil {
 		b.propIDs = make(map[string]PropID)
@@ -385,18 +411,28 @@ func (b *Builder) internProp(name string) PropID {
 	id := PropID(len(b.propNames))
 	b.propNames = append(b.propNames, name)
 	b.propIDs[name] = id
-	return id
+	return id, nil
 }
 
 // commitNodeProps interns each parsed property's name, appends its payload
 // (if any) to the Builder's shared arena, sorts the node's entries by
 // PropID, and appends them to the Builder's flat entries/offsets arrays.
 // Called only after parseNodeProps has already validated the whole bag, so
-// this step cannot itself fail.
-func (b *Builder) commitNodeProps(parsed []parsedProp) {
+// the only way this can now fail is internProp's own PropID-wrap guard
+// (see its doc) -- and on that error, nothing here has yet been appended to
+// b.propEntries/b.propOffsets (entries is a local slice, only committed
+// to Builder state once the whole loop succeeds), so the Builder's
+// property-storage state is left exactly as it was before this call, the
+// same "no partial mutation on error" contract AddNode's own doc promises
+// for a parse failure.
+func (b *Builder) commitNodeProps(parsed []parsedProp) error {
 	entries := make([]propEntry, len(parsed))
 	for i, pp := range parsed {
-		e := propEntry{prop: b.internProp(pp.name), kind: pp.kind, num: pp.num}
+		propID, err := b.internProp(pp.name)
+		if err != nil {
+			return err
+		}
+		e := propEntry{prop: propID, kind: pp.kind, num: pp.num}
 		switch pp.kind {
 		case propKindString, propKindArray, propKindObject:
 			e.ref = uint32(len(b.propArena))
@@ -409,6 +445,7 @@ func (b *Builder) commitNodeProps(parsed []parsedProp) {
 
 	b.propEntries = append(b.propEntries, entries...)
 	b.propOffsets = append(b.propOffsets, uint32(len(b.propEntries)))
+	return nil
 }
 
 // buildPropStore finalizes the Builder's staged property data (copied, not

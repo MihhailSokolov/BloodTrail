@@ -3,6 +3,7 @@ package snapshot
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -328,6 +329,72 @@ func TestParsePropsAddParsedNodeMatchesAddNode(t *testing.T) {
 func TestParsePropsMalformedJSON(t *testing.T) {
 	if _, err := ParseProps([]byte(`{not valid json`)); err == nil {
 		t.Fatal("ParseProps with malformed properties JSON: want error, got nil")
+	}
+}
+
+// TestInternPropWrapGuard is the regression test for internProp's PropID-
+// wrap guard: PropID is a uint16, so at most maxPropID+1 (65536) distinct
+// property names can ever be represented across one Builder's whole
+// lifetime -- interning a 65537th distinct name would otherwise silently
+// wrap PropID(len(b.propNames)) back to an id already assigned to some
+// earlier name, aliasing the two together and corrupting every subsequent
+// Value/NodeMap lookup for both. AddNode must instead refuse outright the
+// instant that would happen, leaving the offending node (and every
+// property this call would have interned) completely unstaged -- a
+// snapshot Build never even gets attempted with a wrapped PropID in it,
+// since a real loader (LoadSnapshot) treats any AddNode error as fatal and
+// abandons the whole Builder, which is what makes the engine end up with
+// no snapshot to serve from at all (every query then delegates to
+// PostgreSQL) rather than one silently corrupted in this specific way.
+//
+// One property name per node (all distinct, ascending databaseIDs) drives
+// this through the real AddNode entry point rather than internProp
+// directly, so the test also exercises addParsedNode's ordering fix (the
+// property-commit step must run, and can fail, before id/kinds are
+// staged) -- not just internProp's own bounds check in isolation.
+func TestInternPropWrapGuard(t *testing.T) {
+	b := NewBuilder(1)
+
+	var (
+		lastErr    error
+		staged     int
+		wantStaged = maxPropID + 1 // exactly 65536 distinct names fit
+	)
+	for i := 0; i <= maxPropID+1; i++ {
+		propsJSON := []byte(fmt.Sprintf(`{"p%d":1}`, i))
+		if err := b.AddNode(uint64(i+1), nil, propsJSON); err != nil {
+			lastErr = err
+			break
+		}
+		staged++
+	}
+
+	if lastErr == nil {
+		t.Fatalf("AddNode: want an error once more than %d distinct property names have been interned, got nil (staged %d nodes)", wantStaged, staged)
+	}
+	if staged != wantStaged {
+		t.Fatalf("staged %d nodes before AddNode errored, want exactly %d (the last name PropID can represent)", staged, wantStaged)
+	}
+
+	// The failed call must have left the Builder exactly as it was before
+	// it: Build succeeds over just the wantStaged nodes actually staged,
+	// with no trace of the rejected (wantStaged+1)th node or its property.
+	snap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build after the rejected call: %v", err)
+	}
+	if snap.NodeCount() != wantStaged {
+		t.Fatalf("NodeCount() = %d, want %d (the rejected node must not have been staged)", snap.NodeCount(), wantStaged)
+	}
+	if _, ok := snap.Props.IDByName(fmt.Sprintf("p%d", wantStaged)); ok {
+		t.Fatalf("IDByName(%q) found, want not found (this name was never successfully interned)", fmt.Sprintf("p%d", wantStaged))
+	}
+
+	// A retry with a name already interned (not a new, 65537th one) must
+	// still succeed -- the guard blocks new names past the limit, not
+	// every future AddNode call outright.
+	if err := b.AddNode(uint64(wantStaged+2), nil, []byte(`{"p0":2}`)); err != nil {
+		t.Fatalf("AddNode with an already-interned property name after the guard fired: %v", err)
 	}
 }
 
