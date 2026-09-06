@@ -11,7 +11,7 @@ every measured call goes through `graph.Transaction.Query` exactly as
 BloodHound's own cypher endpoint does.
 
 ```
-go run ./bench/cypherbench -dsn <pg dsn> [-runs 5] [-enforce]
+go run ./bench/cypherbench -dsn <pg dsn> [-runs 5] [-pg-cap 120s] [-enforce]
 ```
 
 Or, against `BLOODTRAIL_TEST_PG`:
@@ -73,27 +73,79 @@ its own pre-built-corpus fixture.
 
 ## `-enforce`
 
-With `-enforce`, `cypherbench` exits nonzero if any shape fails its p50
-ratio bar (delegated pg / served bt) or if the two drivers' result row
-counts ever disagree:
-
-| Shape                        | Minimum p50 ratio |
-|-------------------------------|--------------------|
-| `rid_suffix_scan`             | 5x                 |
-| `flag_scan`                   | 5x                 |
-| `objectid_point_lookup`       | 1x                 |
-| `shortest_path_prebuilt`      | 5x                 |
-| `collect_antijoin_prebuilt`   | 5x                 |
-
-`objectid_point_lookup`'s bar is weaker than the rest: a single-row equality
-lookup against jsonb's own indexing on `properties->>'objectid'` is already
-fast on the pg side, so there is no full scan or traversal for the engine's
-in-memory objectid index to out-run the way there is for the other four
-shapes -- the spec only requires the engine not be *slower*.
+With `-enforce`, `cypherbench` exits nonzero if any shape fails its own
+**per-shape threshold** -- see the table below -- or (for a shape whose pg
+baseline wasn't capped, see `-pg-cap` below) if the two drivers' result row
+counts ever disagree.
 
 **CI must never pass `-enforce`.** Any other failure (a database error, an
 empty graph, a driver that returns an outright error) aborts the run with a
 nonzero exit regardless of `-enforce`.
+
+### Per-shape enforce thresholds
+
+Most shapes require the p50 ratio (delegated pg / served bt) to clear
+**5x**: at the same PostgreSQL tables and essentially the same per-query
+cost either way, a 5x speedup is not achievable by two drivers that both
+just forward to PostgreSQL, so clearing 5x is itself strong evidence the
+bloodtrail driver actually served the query from its in-memory snapshot.
+`rid_suffix_scan` and `objectid_point_lookup` are the deliberate exceptions:
+
+| Shape                        | Min p50 ratio | Engine abs. cap (pg_capped path) | Why                                                                                                                                                          |
+|--------------------------------|:-------------:|:---------------------------------:|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `rid_suffix_scan`              | **1.5x**      | 2s                                 | PostgreSQL's `kind_ids` GIN index already narrows the `ENDS WITH` scan to roughly the same row count the engine itself walks, so both sides do comparable work -- measured 2.03x steady-state, 5x was an optimistic bar. |
+| `flag_scan`                    | 5x            | 2s (provisional)                   | Standard bar: a bounded, filtered two-property scan.                                                                                                        |
+| `objectid_point_lookup`        | **1x**        | 1s                                 | A single-row equality lookup against jsonb's own indexing on `properties->>'objectid'` is already fast on the pg side, so there is no full scan or traversal for the engine's in-memory objectid index to out-run -- the spec only requires the engine not be *slower*. |
+| `shortest_path_prebuilt`       | 5x            | 10s (provisional)                  | Standard bar: BloodHound's own pre-built "Shortest paths to Domain Admins" query.                                                                           |
+| `collect_antijoin_prebuilt`    | 5x            | 30s (provisional)                  | Standard bar; also gated by `-pg-cap` below, since its pg baseline is a full-trail group enumeration.                                                       |
+
+"Provisional" caps are conservative estimates, not numbers validated against
+a real capped pg run -- see `-pg-cap` below and the `shapeThresholds` doc in
+`main.go` for the full rationale. These live in `main.go`'s `shapeThresholds`
+map, keyed by shape name, next to `evaluateShape` -- the pure function that
+actually applies them (see its doc and `main_test.go`'s `TestEvaluateShape`
+for the full decision logic, table-tested independent of any database).
+
+### `-pg-cap`: bounding a runaway pg baseline
+
+`collect_antijoin_prebuilt`'s pg baseline is a full-trail enumeration over a
+700,000-member group: on one recorded 5M-scale attempt it ran for over two
+hours without finishing, entirely unrelated to how fast the engine itself
+answers the same query. Without a limit, this one shape's pg baseline alone
+would make `-enforce`'s full run unusable at realistic scale.
+
+`-pg-cap` (default `120s`) bounds every pg-baseline call -- warmup and every
+timed run -- to that wall-clock budget, via `context.WithTimeout` wrapped
+directly around the query itself (`runPGCypherCapped` in `main.go`), not a
+timer between iterations: dawgs' pg driver forwards the caller's context
+straight to pgx's `Query`/`Exec`, which sends PostgreSQL a real cancellation
+request when the deadline fires, so a single pathologically slow query is
+cut off mid-execution, not merely abandoned before the next one starts.
+
+The first time a shape's pg baseline exceeds `-pg-cap`, `cypherbench`:
+
+- records `pg_capped=true` for that shape (`CYPHERBENCH_<SHAPE>` and the
+  human-readable line both carry it),
+- skips every remaining pg run for that shape (no more monster queries), and
+- **skips the bt/pg result-row-count check** if the cap tripped before the
+  warmup comparison ever completed -- matching a result you never obtained
+  is impossible, so the check is reported as skipped (`match=skip` /
+  `match_checked=false`), never as a false mismatch. If the cap instead
+  trips partway through the *timed* run loop (after a successful warmup),
+  the match check already ran and its real result is still reported.
+
+With no pg measurement left, `evaluateShape` judges a `pg_capped=true` shape
+on the **bloodtrail driver's own absolute p50** instead of a ratio, against
+`shapeThreshold.engineAbsoluteCap` -- see the table above.
+
+Forcing the capped path for a smoke test (e.g. `-pg-cap 1ms`) makes every
+shape's pg baseline trip immediately, which is a convenient way to verify
+the whole `pg_capped=true` code path end to end without waiting for a real
+slow query:
+
+```
+go run ./bench/cypherbench -dsn "$BLOODTRAIL_TEST_PG" -pg-cap 1ms
+```
 
 ## Measured at 5M (`bench/adgen`'s 4.76M-node / ~48.9M-edge graph)
 
@@ -119,8 +171,9 @@ graph size, on the shapes benchmarked so far.
 
 ## Flags
 
-| Flag       | Default | Meaning                                                   |
-|------------|---------|------------------------------------------------------------|
-| `-dsn`     | (none)  | PostgreSQL connection string. Required.                    |
-| `-runs`    | `5`     | Number of warmed-up, timed runs per shape per driver.       |
-| `-enforce` | `false` | Exit nonzero on a threshold miss (never pass this in CI).   |
+| Flag       | Default | Meaning                                                              |
+|------------|---------|------------------------------------------------------------------------|
+| `-dsn`     | (none)  | PostgreSQL connection string. Required.                               |
+| `-runs`    | `5`     | Number of warmed-up, timed runs per shape per driver.                 |
+| `-pg-cap`  | `120s`  | Per-shape wall-clock cap on the pg baseline; see `-pg-cap` above.      |
+| `-enforce` | `false` | Exit nonzero on a per-shape threshold/match miss (never pass this in CI). |

@@ -29,8 +29,10 @@ bench-builder: ## run the builder-query benchmark against BLOODTRAIL_TEST_PG
 
 # Requires a PostgreSQL reachable at BLOODTRAIL_TEST_PG, already loaded with a
 # graph (see bench/adgen). -enforce fails the build if Cypher serving isn't
-# at least 5x faster than delegating to PostgreSQL (1x for the objectid
-# point lookup); never pass -enforce in CI (see bench/cypherbench).
+# at least 5x faster than delegating to PostgreSQL (1.5x for rid_suffix_scan,
+# 1x for the objectid point lookup); a pg baseline that runs past -pg-cap
+# (120s default) is capped and judged on the engine's own absolute p50
+# instead; never pass -enforce in CI (see bench/cypherbench).
 bench-cypher: ## run the cypher-interpreter benchmark against BLOODTRAIL_TEST_PG
 	go run ./bench/cypherbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
 

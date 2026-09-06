@@ -3,11 +3,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/specterops/dawgs/graph"
 )
 
 // TestRatioOf table-tests ratioOf's pure delegated/served speed-ratio
@@ -45,62 +49,93 @@ func TestRatioOf(t *testing.T) {
 }
 
 // TestEvaluateShape table-tests evaluateShape, -enforce's pure per-shape
-// decision function: independently and jointly, a result-count mismatch and
-// a below-threshold p50 ratio must each surface their own reason, and a
-// shape's own minRatio (5x for four shapes, 1x for the objectid point
-// lookup -- see minRatioFor's doc) is respected rather than a single global
-// bar.
+// decision function, across every branch its doc describes: an uncapped
+// shape's ratio and match checks (independently and together), the
+// per-shape threshold difference (a 5x bar vs. objectid_point_lookup's 1x),
+// and the pg_capped path's absolute-bound-only judgment that skips
+// ratio/match entirely -- mirroring bench/builderbench's identically
+// structured TestEvaluateShape for its own pg-capped evaluateShape.
 func TestEvaluateShape(t *testing.T) {
+	fiveX := shapeThreshold{minRatio: 5.0, engineAbsoluteCap: 5 * time.Second}
+	oneX := shapeThreshold{minRatio: 1.0, engineAbsoluteCap: 1 * time.Second}
+
 	const ms = time.Millisecond
 
 	cases := []struct {
 		name         string
 		btP50, pgP50 time.Duration
+		matchChecked bool
 		match        bool
-		minRatio     float64
+		pgCapped     bool
+		th           shapeThreshold
 		wantOK       bool
 		wantReasons  int
 	}{
 		{
-			name:  "passes at exactly the ratio bar and matching counts",
-			btP50: 10 * ms, pgP50: 50 * ms, match: true, minRatio: 5.0,
-			wantOK: true, wantReasons: 0,
+			name:  "uncapped: passes at exactly the ratio bar and matching counts",
+			btP50: 10 * ms, pgP50: 50 * ms, matchChecked: true, match: true, pgCapped: false,
+			th: fiveX, wantOK: true, wantReasons: 0,
 		},
 		{
-			name:  "fails when ratio is just below the bar",
-			btP50: 10 * ms, pgP50: 49 * ms, match: true, minRatio: 5.0,
-			wantOK: false, wantReasons: 1,
+			name:  "uncapped: fails when ratio is just below the bar",
+			btP50: 10 * ms, pgP50: 49 * ms, matchChecked: true, match: true, pgCapped: false,
+			th: fiveX, wantOK: false, wantReasons: 1,
 		},
 		{
-			name:  "fails on count mismatch even with a comfortable ratio",
-			btP50: 10 * ms, pgP50: 100 * ms, match: false, minRatio: 5.0,
-			wantOK: false, wantReasons: 1,
+			name:  "uncapped: fails on count mismatch even with a comfortable ratio",
+			btP50: 10 * ms, pgP50: 100 * ms, matchChecked: true, match: false, pgCapped: false,
+			th: fiveX, wantOK: false, wantReasons: 1,
 		},
 		{
-			name:  "fails on both mismatch and ratio, reporting both reasons",
-			btP50: 10 * ms, pgP50: 10 * ms, match: false, minRatio: 5.0,
-			wantOK: false, wantReasons: 2,
+			name:  "uncapped: fails on both mismatch and ratio, reporting both reasons",
+			btP50: 10 * ms, pgP50: 10 * ms, matchChecked: true, match: false, pgCapped: false,
+			th: fiveX, wantOK: false, wantReasons: 2,
 		},
 		{
-			name:  "objectid point lookup's 1x bar passes where 5x would have failed",
-			btP50: 10 * ms, pgP50: 12 * ms, match: true, minRatio: 1.0,
-			wantOK: true, wantReasons: 0,
+			name:  "uncapped: matchChecked false fails even when match is (spuriously) true",
+			btP50: 10 * ms, pgP50: 50 * ms, matchChecked: false, match: true, pgCapped: false,
+			th: fiveX, wantOK: false, wantReasons: 1,
 		},
 		{
-			name:  "objectid point lookup still fails below its own 1x bar",
-			btP50: 10 * ms, pgP50: 9 * ms, match: true, minRatio: 1.0,
-			wantOK: false, wantReasons: 1,
+			name:  "uncapped: objectid point lookup's 1x bar passes where 5x would have failed",
+			btP50: 10 * ms, pgP50: 12 * ms, matchChecked: true, match: true, pgCapped: false,
+			th: oneX, wantOK: true, wantReasons: 0,
 		},
 		{
-			name:  "exactly at the ratio bar passes (>=, not strictly greater)",
-			btP50: 10 * ms, pgP50: 10 * ms, match: true, minRatio: 1.0,
-			wantOK: true, wantReasons: 0,
+			name:  "uncapped: objectid point lookup still fails below its own 1x bar",
+			btP50: 10 * ms, pgP50: 9 * ms, matchChecked: true, match: true, pgCapped: false,
+			th: oneX, wantOK: false, wantReasons: 1,
+		},
+		{
+			name:  "uncapped: exactly at the ratio bar passes (>=, not strictly greater)",
+			btP50: 10 * ms, pgP50: 10 * ms, matchChecked: true, match: true, pgCapped: false,
+			th: oneX, wantOK: true, wantReasons: 0,
+		},
+		{
+			name:  "capped: passes when engine p50 clears the absolute cap, ignoring match/ratio entirely",
+			btP50: 500 * ms, pgP50: 0, matchChecked: false, match: false, pgCapped: true,
+			th: fiveX, wantOK: true, wantReasons: 0,
+		},
+		{
+			name:  "capped: passes even if match/ratio inputs look bad -- they must be ignored",
+			btP50: 500 * ms, pgP50: 1 * ms, matchChecked: true, match: false, pgCapped: true,
+			th: fiveX, wantOK: true, wantReasons: 0,
+		},
+		{
+			name:  "capped: fails when engine p50 exceeds the absolute cap",
+			btP50: 6 * time.Second, pgP50: 0, matchChecked: false, match: false, pgCapped: true,
+			th: fiveX, wantOK: false, wantReasons: 1,
+		},
+		{
+			name:  "capped: exactly at the cap passes (strict greater-than only)",
+			btP50: 5 * time.Second, pgP50: 0, matchChecked: false, match: false, pgCapped: true,
+			th: fiveX, wantOK: true, wantReasons: 0,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ok, reasons := evaluateShape(c.btP50, c.pgP50, c.match, c.minRatio)
+			ok, reasons := evaluateShape(c.btP50, c.pgP50, c.matchChecked, c.match, c.pgCapped, c.th)
 			if ok != c.wantOK {
 				t.Errorf("ok = %v, want %v (reasons: %v)", ok, c.wantOK, reasons)
 			}
@@ -111,12 +146,12 @@ func TestEvaluateShape(t *testing.T) {
 	}
 }
 
-// TestMinRatioForKnownShapesHaveEntries confirms every shape execute
-// actually benchmarks has a shapeMinRatio entry -- the maintenance bug
-// minRatioFor's own doc warns about, caught at test time rather than via a
-// stderr warning at run time (mirroring builderbench's identical
+// TestThresholdForKnownShapesHaveEntries confirms every shape execute
+// actually benchmarks has a shapeThresholds entry -- the maintenance bug
+// thresholdFor's own doc warns about, caught at test time rather than via a
+// stderr warning at run time (mirroring bench/builderbench's identical
 // TestThresholdFor_KnownShapesHaveEntries).
-func TestMinRatioForKnownShapesHaveEntries(t *testing.T) {
+func TestThresholdForKnownShapesHaveEntries(t *testing.T) {
 	knownShapes := []string{
 		shapeRIDSuffixScan,
 		shapeFlagScan,
@@ -125,32 +160,211 @@ func TestMinRatioForKnownShapesHaveEntries(t *testing.T) {
 		shapeCollectAntiJoinPrebuilt,
 	}
 	for _, name := range knownShapes {
-		if _, ok := shapeMinRatio[name]; !ok {
-			t.Errorf("shapeMinRatio has no entry for %q", name)
+		if _, ok := shapeThresholds[name]; !ok {
+			t.Errorf("shapeThresholds has no entry for %q", name)
 		}
 	}
 }
 
-// TestObjectIDPointLookupHasWeakerBar locks in the spec's specific
-// requirement: every shape needs 5x except the objectid point lookup, which
-// only needs 1x (a point lookup is fast on both sides -- see the package
-// doc).
-func TestObjectIDPointLookupHasWeakerBar(t *testing.T) {
-	got, ok := shapeMinRatio[shapeObjectIDPointLookup]
-	if !ok {
-		t.Fatal("objectid_point_lookup missing from shapeMinRatio")
+// TestThresholdForUnknownShapeFallsBackSafely mirrors
+// bench/builderbench's identical test: a shape name absent from
+// shapeThresholds (a maintenance bug, not a runtime condition normal
+// operation should reach) must fall back to defaultShapeThreshold rather
+// than panicking mid-report.
+func TestThresholdForUnknownShapeFallsBackSafely(t *testing.T) {
+	th := thresholdFor("some_shape_that_does_not_exist")
+	if th != defaultShapeThreshold {
+		t.Errorf("thresholdFor(unknown) = %+v, want defaultShapeThreshold %+v", th, defaultShapeThreshold)
 	}
-	if got != pointLookupMinRatio {
-		t.Errorf("shapeMinRatio[objectid_point_lookup] = %v, want %v", got, pointLookupMinRatio)
+}
+
+// TestObjectIDPointLookupHasWeakerBar locks in the spec's per-shape intent:
+// objectid_point_lookup needs at least 1x (a point lookup is fast on both
+// sides -- see the package doc), rid_suffix_scan needs exactly 1.5x (its own
+// weaker bar -- see shapeThresholds' doc for why 5x was too optimistic a
+// bar for this specific shape), and every other shape needs exactly the
+// standard 5x.
+func TestObjectIDPointLookupHasWeakerBar(t *testing.T) {
+	pointLookup, ok := shapeThresholds[shapeObjectIDPointLookup]
+	if !ok {
+		t.Fatal("objectid_point_lookup missing from shapeThresholds")
+	}
+	if pointLookup.minRatio < 1.0 {
+		t.Errorf("shapeThresholds[objectid_point_lookup].minRatio = %v, want >= 1.0", pointLookup.minRatio)
 	}
 
-	for name, ratio := range shapeMinRatio {
-		if name == shapeObjectIDPointLookup {
+	ridSuffix, ok := shapeThresholds[shapeRIDSuffixScan]
+	if !ok {
+		t.Fatal("rid_suffix_scan missing from shapeThresholds")
+	}
+	if ridSuffix.minRatio != ridSuffixScanMinRatio {
+		t.Errorf("shapeThresholds[rid_suffix_scan].minRatio = %v, want %v", ridSuffix.minRatio, ridSuffixScanMinRatio)
+	}
+
+	for name, th := range shapeThresholds {
+		switch name {
+		case shapeObjectIDPointLookup, shapeRIDSuffixScan:
 			continue
+		default:
+			if th.minRatio != enforceRatio {
+				t.Errorf("%s minRatio = %v, want the standard enforceRatio %v", name, th.minRatio, enforceRatio)
+			}
 		}
-		if ratio != enforceRatio {
-			t.Errorf("%s minRatio = %v, want the standard enforceRatio %v", name, ratio, enforceRatio)
+	}
+}
+
+// fakeResult is a minimal graph.Result test double for
+// runPGCypherCapped's fast-query test: rows counts down from n to 0 across
+// successive Next() calls, mimicking runCypherOnce's row-drain loop without
+// a real query. The embedded nil graph.Result means every method besides
+// Next/Error/Close panics (a nil-interface method call) if ever reached --
+// runCypherOnce never calls them, so a panic here would mean this fake
+// leaked into a code path it wasn't meant to cover.
+type fakeResult struct {
+	graph.Result
+	rows int
+	err  error
+}
+
+func (r *fakeResult) Next() bool {
+	if r.rows > 0 {
+		r.rows--
+		return true
+	}
+	return false
+}
+
+func (r *fakeResult) Error() error { return r.err }
+func (r *fakeResult) Close()       {}
+
+// fakeTransaction is a minimal graph.Transaction test double: Query returns
+// a fixed graph.Result regardless of its arguments, since these tests only
+// care about the row count runCypherOnce derives from draining it. Every
+// other method is left unimplemented via the embedded nil
+// graph.Transaction, matching fakeResult's rationale above.
+type fakeTransaction struct {
+	graph.Transaction
+	result graph.Result
+}
+
+func (f fakeTransaction) Query(string, map[string]any) graph.Result { return f.result }
+
+// fakeOracle is a minimal graph.Database test double for
+// runPGCypherCapped's tests: only ReadTransaction is exercised by
+// runCypherOnce (the function runPGCypherCapped wraps), via the injected
+// readTransaction closure -- exactly the role builderbench's own test
+// closures (passed straight to its generic runPGCapped) play, one layer
+// down here since cypherbench's runPGCypherCapped has no injectable run
+// parameter of its own (see its doc) and always calls runCypherOnce
+// internally. Every other graph.Database method is left unimplemented via
+// the embedded nil interface, matching fakeResult/fakeTransaction's
+// rationale.
+type fakeOracle struct {
+	graph.Database
+	readTransaction func(ctx context.Context, txDelegate graph.TransactionDelegate) error
+}
+
+func (f fakeOracle) ReadTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, _ ...graph.TransactionOption) error {
+	return f.readTransaction(ctx, txDelegate)
+}
+
+// TestRunPGCypherCapped_CutsOffASlowQuery exercises runPGCypherCapped's
+// core contract -- a query exceeding pgCap is cut off and reported as
+// capped=true, nil-err -- without a database: fakeOracle's readTransaction
+// closure below simulates a slow pg query by blocking on ctx.Done() or a
+// timer, exactly the shape a real dawgs pg call takes (the caller's context
+// determines whether the call returns early). Mirrors
+// bench/builderbench's TestRunPGCapped_CutsOffASlowQuery.
+func TestRunPGCypherCapped_CutsOffASlowQuery(t *testing.T) {
+	oracle := fakeOracle{readTransaction: func(ctx context.Context, _ graph.TransactionDelegate) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			return nil
 		}
+	}}
+
+	size, d, capped, err := runPGCypherCapped(context.Background(), oracle, "MATCH (n) RETURN n", 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("runPGCypherCapped returned err %v, want nil (a capped run is not an error)", err)
+	}
+	if !capped {
+		t.Fatalf("capped = false, want true (pgCap should have cut the 200ms run off at 20ms)")
+	}
+	if size != 0 || d != 0 {
+		t.Errorf("size=%d d=%s, want both zero-valued on a capped run", size, d)
+	}
+}
+
+// TestRunPGCypherCapped_FastQueryIsNotCapped confirms a query that finishes
+// comfortably inside pgCap is reported normally: capped=false, and its real
+// duration/row count come through -- fakeOracle's readTransaction here
+// actually invokes the txDelegate against a 3-row fakeResult, so size's
+// pass-through is checked against a real, non-zero value rather than just
+// its zero-ness.
+func TestRunPGCypherCapped_FastQueryIsNotCapped(t *testing.T) {
+	oracle := fakeOracle{readTransaction: func(_ context.Context, txDelegate graph.TransactionDelegate) error {
+		return txDelegate(fakeTransaction{result: &fakeResult{rows: 3}})
+	}}
+
+	size, d, capped, err := runPGCypherCapped(context.Background(), oracle, "MATCH (n) RETURN n", time.Second)
+	if err != nil {
+		t.Fatalf("runPGCypherCapped returned err %v, want nil", err)
+	}
+	if capped {
+		t.Fatalf("capped = true, want false (the run finished well inside pgCap)")
+	}
+	if size != 3 {
+		t.Errorf("size = %d, want 3", size)
+	}
+	if d < 0 {
+		t.Errorf("d = %s, want a non-negative duration", d)
+	}
+}
+
+// TestRunPGCypherCapped_GenuineErrorPropagates confirms a real failure
+// (anything other than the cap's own context deadline) is still returned
+// as an error -- runPGCypherCapped must not swallow a genuine driver error
+// just because it happens to look at ctx.Err() first.
+func TestRunPGCypherCapped_GenuineErrorPropagates(t *testing.T) {
+	boom := errors.New("boom: a genuine driver failure, not a timeout")
+	oracle := fakeOracle{readTransaction: func(context.Context, graph.TransactionDelegate) error {
+		return boom
+	}}
+
+	_, _, capped, err := runPGCypherCapped(context.Background(), oracle, "MATCH (n) RETURN n", time.Second)
+	if capped {
+		t.Fatalf("capped = true, want false: this failure has nothing to do with the wall-clock cap")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap %v", err, boom)
+	}
+}
+
+// TestRunPGCypherCapped_ParentCancellationIsNotMistakenForACap confirms
+// that runPGCypherCapped distinguishes its own pgCap deadline from the
+// caller's ctx being canceled for an unrelated reason: canceling ctx up
+// front (rather than letting pgCap itself expire) must propagate as a
+// genuine error, not report capped=true, since evaluateShape's pg_capped
+// path changes what gets judged and by which bound -- conflating "someone
+// canceled the whole benchmark" with "this shape's pg baseline was too
+// slow" would misreport why a run stopped.
+func TestRunPGCypherCapped_ParentCancellationIsNotMistakenForACap(t *testing.T) {
+	parentCtx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled before runPGCypherCapped even starts
+
+	oracle := fakeOracle{readTransaction: func(ctx context.Context, _ graph.TransactionDelegate) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+
+	_, _, capped, err := runPGCypherCapped(parentCtx, oracle, "MATCH (n) RETURN n", time.Second)
+	if capped {
+		t.Fatalf("capped = true, want false: the parent context was canceled, not runPGCypherCapped's own pgCap deadline")
+	}
+	if err == nil {
+		t.Fatal("err = nil, want the propagated cancellation error")
 	}
 }
 
