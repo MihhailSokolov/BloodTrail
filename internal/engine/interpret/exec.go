@@ -78,12 +78,30 @@ const (
 
 // OutVal is one projected RETURN column's value for one result row. Exactly
 // one of Node/Edge/Path/Scalar is meaningful, per Kind.
+//
+// ScalarAbsent (meaningful only when Kind == OutScalar) distinguishes an
+// absent property lookup (EvalValue's ok == false; Scalar left at its zero
+// value, nil) from a genuinely PRESENT JSON null (EvalValue's (nil, true) --
+// PropStore's own "stored null, distinguishable from absence" contract,
+// still nil here but ScalarAbsent == false). Both render identically as
+// null in the projected VALUE, so this flag exists purely for row-identity
+// purposes -- RETURN DISTINCT's dedup key and WITH grouping's group key
+// (pipeline.go's outValKey/appendSymbolKey) -- because PostgreSQL itself
+// treats them as different jsonb values for exactly those purposes: an
+// absent property renders as SQL NULL (jsonb's `->` on a missing key), and
+// SQL NULL groups/dedups together with every other SQL NULL; a stored JSON
+// null renders as the non-NULL value 'null'::jsonb, which groups/dedups
+// only with other 'null'::jsonb values, never with SQL NULL. Collapsing the
+// two into one dedup bucket (this package's original behavior, before this
+// field existed) under-counts DISTINCT/grouped rows relative to pg whenever
+// a query's result mixes both across different rows.
 type OutVal struct {
-	Kind   OutKind
-	Node   snapshot.NodeID
-	Edge   EdgeRef
-	Path   *PathVal
-	Scalar any
+	Kind         OutKind
+	Node         snapshot.NodeID
+	Edge         EdgeRef
+	Path         *PathVal
+	Scalar       any
+	ScalarAbsent bool
 }
 
 // PathVal is a materialized path value: an alternating node/edge sequence,
@@ -1243,7 +1261,8 @@ func projectItem(env *Env, r *Row, item ProjectionOutput) (OutVal, error) {
 		return OutVal{}, err
 	}
 	if !ok {
-		return OutVal{Kind: OutScalar, Scalar: nil}, nil
+		// Absent, not a present JSON null -- see OutVal.ScalarAbsent's doc.
+		return OutVal{Kind: OutScalar, Scalar: nil, ScalarAbsent: true}, nil
 	}
 	return OutVal{Kind: OutScalar, Scalar: val}, nil
 }
