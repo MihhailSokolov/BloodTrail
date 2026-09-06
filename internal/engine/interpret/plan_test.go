@@ -497,6 +497,41 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "equality coalesce-wrapped property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE coalesce(n.x, 0) = -5 RETURN n`, want: true},
 		{name: "equality size()-wrapped property vs negative literal still accepted", cypher: `MATCH (n:User) WHERE size(n.spns) = -5 RETURN n`, want: true},
 		{name: "equality two negative literals (no property lookup) still accepted", cypher: `MATCH (n:User) WHERE -5 = -5 RETURN n`, want: true},
+
+		// Finding (2026-09-06 review): isNegativeNumberLiteral (renamed
+		// isNonBareScalarLiteral) under-scoped the reject above to a literal
+		// negative number only -- but dawgs' rewriteJSONScalarEqualityOperand
+		// (checked directly by dumping translate.Translate's own generated
+		// SQL) only ever takes the native-jsonb route for a numeric/bool
+		// operand that is, with ZERO unwrapping, a bare cypher.Literal;
+		// EVERY other AST shape -- unary plus, not just unary minus; any
+		// nesting depth; a bare Parenthetical around a literal with no sign
+		// at all; and genuine multi-term arithmetic, parenthesized or not --
+		// takes the identical divergent cast route a bare negative literal
+		// does. Confirmed for every row below (each produces the same
+		// `((properties ->> 'x'))::int8 <op> ...` cast shape `n.x = -5`
+		// does, never the `to_jsonb(...)::jsonb` native shape `n.x = 5`
+		// does).
+		{name: "equality property vs unary-plus literal rejected", cypher: `MATCH (n:User) WHERE n.x = +5 RETURN n`, want: false},
+		{name: "inequality property vs unary-plus literal rejected", cypher: `MATCH (n:User) WHERE n.x <> +5 RETURN n`, want: false},
+		{name: "equality property vs parenthesized double negation rejected", cypher: `MATCH (n:User) WHERE n.x = -(-5) RETURN n`, want: false},
+		{name: "equality property vs bare-parenthesized positive literal rejected", cypher: `MATCH (n:User) WHERE n.x = (5) RETURN n`, want: false},
+		{name: "equality property vs doubly-parenthesized literal rejected", cypher: `MATCH (n:User) WHERE n.x = ((5)) RETURN n`, want: false},
+		{name: "equality property vs parenthesized unary-plus of negative literal rejected", cypher: `MATCH (n:User) WHERE n.x = +(-5) RETURN n`, want: false},
+		{name: "equality property vs bare literal arithmetic rejected", cypher: `MATCH (n:User) WHERE n.x = 5 + 0 RETURN n`, want: false},
+		{name: "equality property vs parenthesized literal arithmetic rejected", cypher: `MATCH (n:User) WHERE n.x = (5 + 0) RETURN n`, want: false},
+		{name: "equality unary-plus literal vs property (operands swapped) rejected", cypher: `MATCH (n:User) WHERE +5 = n.x RETURN n`, want: false},
+
+		// Existing accepts must stay green under the broadened check: a bare
+		// literal (any sign, either operator) is still the safe, native-jsonb
+		// shape, and `<`/`<=`/`>`/`>=` remain untouched regardless of operand
+		// shape (dawgs' translator's default case always takes the cast
+		// route for those operators, sign- and wrapping-independent).
+		{name: "equality property vs bare literal still accepted (regression)", cypher: `MATCH (n:User) WHERE n.x = 5 RETURN n`, want: true},
+		{name: "less-than property vs negative literal still accepted (regression)", cypher: `MATCH (n:User) WHERE n.x < -5 RETURN n`, want: true},
+		{name: "inequality property vs bare literal still accepted (regression)", cypher: `MATCH (n:User) WHERE n.x <> 5 RETURN n`, want: true},
+		{name: "less-than property vs unary-plus literal still accepted", cypher: `MATCH (n:User) WHERE n.x < +5 RETURN n`, want: true},
+		{name: "less-than property vs parenthesized literal still accepted", cypher: `MATCH (n:User) WHERE n.x < (5) RETURN n`, want: true},
 	}
 
 	runPlanGolden(t, snap, cases)
