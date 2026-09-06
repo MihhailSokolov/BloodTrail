@@ -523,12 +523,11 @@ func fetchNodeByID(t *testing.T, ctx context.Context, db graph.Database, id grap
 // that share an ancestor (any two children of the same node, which this
 // fixture's very first BFS level already produces) and race on that
 // ancestor's size, a data race in dawgs itself with nothing to do with this
-// package's own driver wrapping. -race would (correctly) flag that race
-// under go test's -race requirement (task-9-brief.md), so this helper avoids
-// it by never running more than one traversal worker; a single worker still
-// drives every one of shallowFetchRelationships' Filter/OrderBy/Query calls
-// through the wrapped driver exactly as multiple workers would, just
-// serially, which is all this task needs to exercise.
+// package's own driver wrapping. -race would (correctly) flag that race, so
+// this helper avoids it by never running more than one traversal worker; a
+// single worker still drives every one of shallowFetchRelationships'
+// Filter/OrderBy/Query calls through the wrapped driver exactly as multiple
+// workers would, just serially, which is all this needs to exercise.
 //
 // The traversal.UniquePathSegmentFilter wrapper collects every segment's
 // node into a traversal.NodeCollector and unconditionally allows further

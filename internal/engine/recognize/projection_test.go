@@ -11,7 +11,7 @@ import (
 )
 
 // TestFromReturning_Accepts covers the three canonical query.Returning
-// shapes named in task-5-brief.md's evidence base: container/fetch.go's
+// shapes BloodHound's own upstream code actually issues: container/fetch.go's
 // bulk edge-list fetch and traversal/traversal.go's shallowFetchRelationships
 // outbound/inbound step projections.
 func TestFromReturning_Accepts(t *testing.T) {

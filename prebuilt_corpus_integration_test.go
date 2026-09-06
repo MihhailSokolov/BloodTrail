@@ -2,29 +2,27 @@
 
 //go:build integration
 
-// This file is Task 14 of the milestone-4 plan: count/shape assertions over
-// the pre-built Cypher query corpus extracted from an upstream BloodHound CE
-// checkout (scripts/extract-prebuilt-queries.go) into testdata/prebuilt/
-// {agt,agi,selectors}.json -- see testdata/prebuilt/NOTICE for provenance
-// and that script's package doc for exactly what each file holds and why.
+// This file holds count/shape assertions over the pre-built Cypher query
+// corpus extracted from an upstream BloodHound CE checkout (scripts/
+// extract-prebuilt-queries.go) into testdata/prebuilt/{agt,agi,selectors}.
+// json -- see testdata/prebuilt/NOTICE for provenance and that script's
+// package doc for exactly what each file holds and why -- plus
+// TestPrebuiltCorpusDifferential, which runs every enabled query against a
+// live engine/oracle pair (see its own doc for the full design).
 //
-// The loader helpers below (loadCommonSearches/loadSelectors and the
-// commonSearchEntry/selectorEntry types) are deliberately factored out for
-// Task 16's differential suite to build on top of: this file only asserts
-// the corpus' *shape* -- exact counts, the disabled/probe markers, the
+// The loader helpers (loadCommonSearches/loadSelectors and the
+// commonSearchEntry/selectorEntry types) are shared by both: the shape
+// assertions above -- exact counts, the disabled/probe markers, the
 // absence of Cypher bind parameters (this is a fixed, canned corpus of demo
 // queries, never caller-parameterized), and syntactic validity via the same
 // frontend.ParseCypher the engine's own interpreter uses (see
-// write_observer.go's parseCypherFrontend). Task 16 will additionally run
-// every enabled query against a live engine/oracle pair.
+// write_observer.go's parseCypherFrontend) -- and the differential suite.
 //
 // File placement mirrors dawgs_corpus_integration_test.go and
 // builder_differential_matrix_integration_test.go: package bloodtrail, not
-// bloodtrail_test, even though this file itself never touches Driver's
-// unexported engine field -- Task 16's differential suite almost certainly
-// will (to force a deterministic snapshot rebuild the way those two files
-// do), and there is no benefit to churning the package declaration once
-// this file already has line-item history under the other name.
+// bloodtrail_test, since the differential suite forces a deterministic
+// snapshot rebuild through Driver's own unexported engine field, the same
+// way those two files do.
 package bloodtrail
 
 import (
@@ -139,9 +137,9 @@ func assertFailsToParse(t *testing.T, label, query string) {
 	}
 }
 
-// TestPrebuiltCorpusCounts is milestone 4's task-14 exit criterion: the
-// pre-built query corpus extracted from upstream BloodHound CE has the
-// exact shape task-14's brief documents --
+// TestPrebuiltCorpusCounts asserts the pre-built query corpus extracted
+// from upstream BloodHound CE has the exact shape scripts/extract-prebuilt-
+// queries.go's own doc comment documents --
 //
 //   - agt.json: 92 entries total -- the 91-entry CommonSearches export (one
 //     disabled, the many-to-many "Shortest paths from Owned objects to Tier
@@ -323,16 +321,15 @@ func declineReason(logTail string) string {
 // every key here matches exactly one corpus query -- a guard that keeps
 // working correctly over an empty map too (nothing to be ambiguous about).
 //
-// Empty as of task 16b: Task 16 originally flagged five entries here (all
-// genuine, investigated interpreter scope gaps, not one-line bugs -- see
-// task-16-report.md for that investigation and task-16b-report.md for what
-// closed each one): WHERE-clause pattern predicates (closed by
-// checkPatternPredicate/evalPatternPredicate, plan.go/eval.go), `+` string
-// concatenation (closed by applyAdd, eval.go), and an unconstrained,
-// unbounded shortestPath to Tag_Tier_Zero declining ErrBudget (root-caused
-// to traverse.AllShortestPaths' own PairBudget/SideBudget strategy dispatch
-// genuinely refusing the shape on this fixture -- not a Task 8 budget-unit
-// bug -- and closed via traverse.Query's new per-call SideBudget/PairBudget
+// Empty: this corpus previously surfaced five genuine, investigated
+// interpreter scope gaps here (not one-line bugs), all since closed:
+// WHERE-clause pattern predicates (closed by checkPatternPredicate/
+// evalPatternPredicate, plan.go/eval.go), `+` string concatenation (closed
+// by applyAdd, eval.go), and an unconstrained, unbounded shortestPath to
+// Tag_Tier_Zero declining ErrBudget (root-caused to
+// traverse.AllShortestPaths' own PairBudget/SideBudget strategy dispatch
+// genuinely refusing the shape on this fixture -- not a budget-unit bug --
+// and closed via traverse.Query's new per-call SideBudget/PairBudget
 // overrides, plus a planner fix for a predicate-only shortestPath endpoint
 // the agi variant of the same query also needed).
 var expectedDelegations = map[string]string{}
@@ -351,7 +348,7 @@ var expectedDelegations = map[string]string{}
 // two-hop routes are equally short, so bloodtrail and the pg oracle are
 // each free to (and empirically do) pick a different one of the tied
 // first hops -- confirmed by inspecting the actual edge id mismatch against
-// the seeded fixture data (see task-16-report.md) rather than assumed.
+// the seeded fixture data rather than assumed.
 //
 // Queries in this map skip the edge-id-set and literal comparisons
 // (assertCorpusResultsMatch) and are instead compared by node id set only
@@ -406,7 +403,8 @@ func corpusQueryKey(q corpusQuery) string {
 
 // activeCorpusQueries returns every non-disabled, non-probe query across
 // agt.json, agi.json, and selectors.json, plus the one probe entry found
-// along the way (agt.json's "Query Parse Error" -- task-14-brief.md).
+// along the way (agt.json's deliberately malformed "Query Parse Error"
+// entry -- see scripts/extract-prebuilt-queries.go's own doc comment).
 func activeCorpusQueries(t *testing.T) (queries []corpusQuery, probe commonSearchEntry) {
 	t.Helper()
 
@@ -968,7 +966,7 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 
 	const wantActive = 222
 	if len(queries) != wantActive {
-		t.Fatalf("active corpus query count = %d, want %d (see task-14-brief.md's counts)", len(queries), wantActive)
+		t.Fatalf("active corpus query count = %d, want %d (see TestPrebuiltCorpusCounts for the corpus' full shape)", len(queries), wantActive)
 	}
 
 	// Guard both allowlists before running anything: every key in either map

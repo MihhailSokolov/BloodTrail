@@ -2,8 +2,8 @@
 
 // Command extract-prebuilt-queries pulls BloodHound CE's pre-built Cypher
 // query corpus out of an upstream checkout and writes it as JSON fixtures
-// under testdata/prebuilt/, for milestone 4's differential testing (see
-// task-14 of the milestone-4 plan).
+// under testdata/prebuilt/, for the Cypher interpreter's differential
+// testing against these exact real-world queries.
 //
 // Three sources, all read from the checkout root passed as the single
 // command-line argument:

@@ -2,33 +2,33 @@
 
 //go:build integration
 
-// This file is Task 17 of the milestone-4 plan: a second randomized
-// differential family, alongside internal/engine/random_differential_
-// integration_test.go's milestone-2 path-query suite (TestRandomDifferential,
-// which exercises TryAllShortestPaths over graphtest.LoadRandom's plain,
-// property-free 60-node graphs) and prebuilt_corpus_integration_test.go's
-// fixed, hand-curated corpus (TestPrebuiltCorpusDifferential). Here the
-// query text itself is randomly generated -- single- and two-Part read
-// Cypher over a small, deliberately adversarial property fixture -- and
-// checked against the plain pg driver, both via the *bloodtrail.Driver
-// wrapper's own engine-then-delegate serving policy.
+// This file is a second randomized differential family, alongside
+// internal/engine/random_differential_integration_test.go's path-query
+// suite (TestRandomDifferential, which exercises TryAllShortestPaths over
+// graphtest.LoadRandom's plain, property-free 60-node graphs) and
+// prebuilt_corpus_integration_test.go's fixed, hand-curated corpus
+// (TestPrebuiltCorpusDifferential). Here the query text itself is randomly
+// generated -- single- and two-Part read Cypher over a small, deliberately
+// adversarial property fixture -- and checked against the plain pg driver,
+// both via the *bloodtrail.Driver wrapper's own engine-then-delegate
+// serving policy.
 //
 // # File placement: package bloodtrail, not internal/engine
 //
-// Task 17's brief names internal/engine/random_differential_integration_
-// test.go as this suite's home, but "run through the bloodtrail driver"
-// (the wrapper's ReadTransaction -> wrappedTransaction.Query -> TryCypher-
-// then-fallback policy, transaction.go) needs the actual *bloodtrail.Driver
-// type, which internal/engine cannot import (this root package already
-// imports internal/engine; the reverse would be a cycle). Every existing
+// Running through the bloodtrail driver -- rather than the engine package
+// directly, the way internal/engine/random_differential_integration_test.go
+// does -- exercises the wrapper's own ReadTransaction -> wrappedTransaction.
+// Query -> TryCypher-then-fallback policy (transaction.go), which needs the
+// actual *bloodtrail.Driver type, one internal/engine cannot import (this
+// root package already imports internal/engine; the reverse would be a
+// cycle). Every existing
 // suite with the identical need -- a live engine/oracle pair compared
 // through the real driver, with a deterministic d.engine.RebuildNow and the
 // cypherServedMarker log-capture plumbing -- already lives here instead
 // (dawgs_corpus_integration_test.go, builder_differential_matrix_
 // integration_test.go, prebuilt_corpus_integration_test.go's own placement
-// doc explains the same reasoning at length). This file follows that
-// precedent rather than the brief's literal path; see task-17-report.md for
-// the explicit call-out.
+// doc explains the same reasoning at length). This file follows that same
+// precedent.
 package bloodtrail
 
 import (
@@ -302,13 +302,12 @@ func cypherStringLiteral(s string) string {
 // (e.g. -3.5), on the oracle side only (the in-memory interpreter has no
 // notion of pg's per-literal cast inference and just compares float64s
 // uniformly, so it disagrees with what PostgreSQL itself would have
-// produced for the exact same query against this exact data -- see
-// task-17-report.md's divergence write-up). Always emitting a real literal
-// routes every comparison through pg's `::double precision` cast instead,
-// which accepts every value this fixture ever stores (int-shaped or not),
-// sidestepping the mismatch entirely -- a fix to this suite's own literal
-// rendering, not to the interpreter or the gate (see the report for why
-// this is a template-design fix rather than a production bug).
+// produced for the exact same query against this exact data). Always
+// emitting a real literal routes every comparison through pg's
+// `::double precision` cast instead, which accepts every value this
+// fixture ever stores (int-shaped or not), sidestepping the mismatch
+// entirely -- a fix to this suite's own literal rendering (a template-
+// design fix), not to the interpreter or the gate.
 func cypherNumberLiteral(f float64) string {
 	s := strconv.FormatFloat(f, 'f', -1, 64)
 	if !strings.ContainsRune(s, '.') {
@@ -382,8 +381,7 @@ func randomCypherPickNumber(rng *rand.Rand) float64 {
 // disagreeing on whether a property present as an explicit JSON null (this
 // fixture's own "val" trap) counts as a definite "not equal" (native jsonb:
 // yes) or NULL (cast: no, same as a missing property) -- confirmed by
-// dumping translate.Translate's generated SQL for both shapes; see
-// task-17-report.md's divergence-2 write-up for the original discovery.
+// dumping translate.Translate's generated SQL for both shapes.
 //
 // That workaround is gone: interpret/plan.go's checkComparison now rejects
 // (delegates) any `=`/`<>` between a bare property lookup and a negative
@@ -483,10 +481,10 @@ var randomCypherTemplates = []randomCypherTemplate{
 	// (prebuilt_corpus_integration_test.go) compares literals by "Key=Value"
 	// together -- so an unaliased scalar RETURN would fail on a pure naming
 	// mismatch that has nothing to do with the query's actual answer. This
-	// was discovered running this exact suite (see task-17-report.md); every
-	// corpus query TestPrebuiltCorpusDifferential already runs happens to
-	// RETURN a node/path variable (never reaching the Key-sensitive literal
-	// branch at all), so this gap was never hit before.
+	// was discovered running this exact suite; every corpus query
+	// TestPrebuiltCorpusDifferential already runs happens to RETURN a
+	// node/path variable (never reaching the Key-sensitive literal branch at
+	// all), so this gap was never hit before.
 	func(rng *rand.Rand) string {
 		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val > %s RETURN DISTINCT n.flag AS flag`, randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)))
 	},

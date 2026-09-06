@@ -1680,11 +1680,11 @@ func checkLiteralShape(lit *cypher.Literal) bool {
 // choice moot for every shape it covers: Plan() declines the whole query
 // before Execute() ever runs, so asLiteral is never reached with any of
 // these operands paired against a bare property lookup. See eval.go's
-// evalLiteralComparison doc for the evaluator-side derivation, and
-// task-17-report.md (milestone-4 sdd notes) for the original discovery (as
-// `n.val <> -100.0`, worked around at the time by restricting the random
-// differential suite's own literal generation -- this reject supersedes
-// that workaround, see the generator's own history).
+// evalLiteralComparison doc for the evaluator-side derivation. This was
+// originally discovered as `n.val <> -100.0` failing the random
+// differential suite, worked around at the time by restricting that
+// suite's own literal generation -- this reject supersedes that workaround,
+// see the generator's own history.
 //
 // `<`/`<=`/`>`/`>=` are unaffected by any of this -- the same translator
 // function's default case always takes the cast route for those operators

@@ -12,7 +12,7 @@ import (
 )
 
 // Kinds shared across this file's tests, named after the upstream shapes
-// they stand in for (see task-4-brief.md's evidence base).
+// they stand in for.
 var (
 	kAdUser     = graph.StringKind("User")
 	kAdComputer = graph.StringKind("Computer")
@@ -28,8 +28,8 @@ var (
 	kMeta2      = graph.StringKind("Meta2")
 )
 
-// TestFromNodeCriteria_Accepts covers every upstream node-only shape called
-// out in task-4-brief.md's evidence base, plus the structural variants
+// TestFromNodeCriteria_Accepts covers every upstream node-only shape
+// BloodHound's own code actually issues, plus the structural variants
 // (nested conjunctions, multiple independent KindMatcher conjuncts, the
 // AllOf=true/IsExclusive=true mapping, and id() intersection) that exercise
 // FromNodeCriteria's documented contract.
@@ -134,8 +134,8 @@ func TestFromNodeCriteria_Accepts(t *testing.T) {
 }
 
 // TestFromNodeCriteria_Rejects covers every shape FromNodeCriteria must
-// decline: the task-4-brief.md-mandated rejections (Negation, Or, property
-// lookups, a wrong-symbol id() conjunct) plus the structural default-deny
+// decline: mandated rejections (Negation, Or, property lookups, a
+// wrong-symbol id() conjunct) plus the structural default-deny
 // cases (unknown symbol, empty-Kinds KindMatcher, non-=/IN comparison
 // operator, nil/non-Expression criteria, a typed-nil Conjunction).
 func TestFromNodeCriteria_Rejects(t *testing.T) {
@@ -220,7 +220,7 @@ func TestFromNodeCriteria_Rejects(t *testing.T) {
 }
 
 // TestFromRelCriteria_Accepts covers every upstream relationship-pattern
-// shape called out in task-4-brief.md's evidence base (traversal step,
+// shape BloodHound's own code actually issues (traversal step,
 // DeleteTransitEdges, LocalToComputer, FetchDirectedGraph, first-degree ACL
 // principals, and a bare id list), plus the structural variants that
 // exercise FromRelCriteria's documented contract.
@@ -351,9 +351,9 @@ func TestFromRelCriteria_Accepts(t *testing.T) {
 }
 
 // TestFromRelCriteria_Rejects covers every shape FromRelCriteria must
-// decline: the task-4-brief.md-mandated rejections (a wrong-symbol "n"
-// conjunct, property lookups, Negation, Disjunction, a second relationship
-// KindMatcher) plus the structural default-deny cases.
+// decline: mandated rejections (a wrong-symbol "n" conjunct, property
+// lookups, Negation, Disjunction, a second relationship KindMatcher) plus
+// the structural default-deny cases.
 func TestFromRelCriteria_Rejects(t *testing.T) {
 	unknownSymbolID := &cypher.FunctionInvocation{Name: "id", Arguments: []cypher.Expression{&cypher.Variable{Symbol: "x"}}}
 

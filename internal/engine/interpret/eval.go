@@ -529,12 +529,12 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 // for two real nodes that share every property) would otherwise compare
 // "equal" via PropEq's structural jsonbEqual, when real Cypher/pg compares
 // two node (or relationship) values by identity. This is exactly the shape
-// task-8-brief.md's shortestPath self-pair rule depends on
-// (`WHERE s<>t`, s and t both bare node variables) -- and, per task-6's own
-// report ("The COLLECT-membership execution gap"), an instance of a
-// documented pattern this codebase already flags: identity-based semantics
-// over a node variable must be special-cased structurally before falling
-// through to generic property-value comparison.
+// shortestPath's own self-pair rule depends on (`WHERE s<>t`, s and t both
+// bare node variables) -- and, like the identical "COLLECT-membership
+// execution gap" pipeline.go documents, an instance of a pattern this
+// codebase already flags: identity-based semantics over a node variable
+// must be special-cased structurally before falling through to generic
+// property-value comparison.
 //
 // ok is false (deferring to the generic PropEq path, unchanged) for every
 // other shape -- either operand not a bare Variable, either operand not

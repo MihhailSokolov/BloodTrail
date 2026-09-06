@@ -62,7 +62,7 @@
 //
 // --- COLLECT membership: the structural rewrite -----------------------------
 //
-// Per task-6-report.md's "COLLECT-membership execution gap" finding: a
+// This closes the "COLLECT-membership execution gap": a
 // CollectMembershipAgg's alias is bound to an id-set (idSet, a
 // map[uint64]struct{} of database node ids -- NULL ids never enter, though
 // this package's own matched rows never produce one, since it implements no

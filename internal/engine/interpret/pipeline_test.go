@@ -116,12 +116,11 @@ LIMIT 2`
 // including the *0.. range from the corpus query (plan_test.go's
 // corpusCollectAntiJoinQuery) for the first MATCH. The corpus's own second
 // MATCH mixes a fixed-length step with a var-length step in one connected
-// component, a shape expand.go's runComponent declines outright regardless
-// of this task (task-8-report.md's documented "mixed-Step component" scope
-// decline) -- so this test's own second Part uses a plain, single-step
-// pattern instead, preserving exactly the COLLECT-anti-join mechanism this
-// task owns without depending on a shape a different, already-frozen task
-// declined.
+// component, a shape expand.go's runComponent declines outright (a
+// documented "mixed-Step component" scope decline) -- so this test's own
+// second Part uses a plain, single-step pattern instead, preserving exactly
+// the COLLECT-anti-join mechanism under test without depending on a shape
+// that decline rejects.
 func TestPipelineCollectMembershipAntiJoinEndToEnd(t *testing.T) {
 	const (
 		kindUser     snapshot.KindID = 1

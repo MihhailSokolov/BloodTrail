@@ -82,8 +82,8 @@
 // in-memory node sets FIRST (resolveEndpointSet, reusing scanAnchor's own
 // id/objectid/kind-bitmap/full-scan anchoring plus each endpoint's pushed,
 // single-symbol WHERE predicates -- this is the in-memory replacement for
-// milestone-2's live-PG endpoint resolution, see task-8-brief.md), and only
-// then handed to traverse.AllShortestPaths as one Roots x Terminals query.
+// the live-PG endpoint resolution an earlier milestone used), and only then
+// handed to traverse.AllShortestPaths as one Roots x Terminals query.
 // This mirrors dawgs' own translation: a shortestPath()/allShortestPaths()
 // call compiles to a single recursive-CTE search seeded from *two* resolved
 // node sets, not a chain of per-row hops.

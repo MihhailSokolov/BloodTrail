@@ -517,8 +517,8 @@ var (
 )
 
 // TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind is the end-to-end
-// regression test for the finding this fix addresses (task-11-report.md,
-// "Fix round 1"): a BatchOperation's UpdateNodes call that sets a node's
+// regression test for a real staleness-tracking gap: a BatchOperation's
+// UpdateNodes call that sets a node's
 // Kinds field to include a novel kind -- WITHOUT also setting AddedKinds,
 // the one detail every existing caller in this codebase happens to always
 // pair together, but nothing in graph.Batch's documented contract requires
