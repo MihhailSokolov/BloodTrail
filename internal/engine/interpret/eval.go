@@ -1484,18 +1484,18 @@ type addOperandKind int
 
 const (
 	// addOther is any operand pg would statically type as something other
-	// than Text and other than an untyped property lookup: a numeric or
-	// boolean literal, an arithmetic sub-expression, id()/labels()/type()/
-	// datetime()'s epoch accessors, coalesce(), split(), or any other
-	// function call this evaluator supports. Treated as "not statically
+	// than Text and other than an untyped/unresolvable operand: a numeric
+	// or boolean literal, an arithmetic sub-expression, id()/datetime()'s
+	// epoch accessors, or any other function call this evaluator supports
+	// that isn't specifically called out below. Treated as "not statically
 	// Text, and not a property lookup" by applyAdd/nextAddKind below.
 	addOther addOperandKind = iota
 
 	// addStaticText is any operand pg statically types as Text: a string
 	// literal, or a call to one of the text-returning functions this
-	// evaluator itself implements -- toLower()/toUpper(), both emitted as
-	// `CastType: pgsql.Text` FunctionCalls by dawgs' own translation
-	// (cypher/models/pgsql/translate/function.go).
+	// evaluator itself implements -- toLower()/toUpper()/type(), all
+	// emitted as `CastType: pgsql.Text` FunctionCalls by dawgs' own
+	// translation (cypher/models/pgsql/translate/function.go).
 	addStaticText
 
 	// addPropertyLookup is a bare `atom.prop` read of a node's own
@@ -1509,14 +1509,87 @@ const (
 	// by the time applyAdd runs against any query Plan actually accepted,
 	// at most one operand of the chain's first `+` is ever this kind.
 	addPropertyLookup
+
+	// addUnresolved is a coalesce() call none of whose arguments carry a
+	// pg-known type -- e.g. `coalesce(n.a, n.b)`, every argument a bare
+	// property lookup (see classifyCoalesceOperand's doc for the full
+	// derivation against dawgs' translateCoalesceFunction). This is
+	// deliberately NOT the same bucket as addPropertyLookup, even though
+	// both ultimately trace back to "pg has no static type for this":
+	// a bare property lookup's safety depends on what it's paired with in
+	// the SAME `+` (rewritePropertyLookupOperands casts it to match a
+	// known-typed partner -- see checkArithmetic's doc), but an unresolved
+	// coalesce's own arguments were ALREADY rewritten (or, here, left
+	// unrewritten) by translateCoalesceFunction before the outer `+` is
+	// ever reached, entirely independent of whatever it's added to -- so
+	// pairing it with a known-typed operand does not rescue it the way it
+	// rescues a bare property lookup. checkArithmetic (plan.go) rejects a
+	// `+` with an addUnresolved operand UNLESS the other operand is
+	// addStaticText (the one case pg itself resolves unconditionally, Text
+	// winning regardless of the other side -- see isConcatenationOperation).
+	addUnresolved
 )
 
 // classifyAddOperand inspects expr's own AST shape (after unwrapping any
 // Parentheticals) to produce one addOperandKind. Shared, unmodified, by
-// checkArithmetic (plan.go, the plan-time "both property lookups" reject)
-// and evalArithmetic/applyAdd here (the eval-time concat-vs-numeric
-// dispatch), so the two can never disagree about which bucket one operand
-// falls into.
+// checkArithmetic (plan.go, the plan-time rejects) and evalArithmetic/
+// applyAdd here (the eval-time concat-vs-numeric dispatch), so the two can
+// never disagree about which bucket one operand falls into.
+//
+// # Audit: every classifyAddOperand call site's actual pg static type
+//
+// A follow-up review of this function's original coalesce() handling (see
+// classifyCoalesceOperand's own doc for the fix itself) asked for every
+// OTHER function this evaluator recognizes to be re-verified directly
+// against dawgs@v0.8.0's translator, not assumed from this function's own
+// prior comments. Each row below cites the exact dawgs function.go case
+// that fixes the operand's CastType (or, for coalesce, derives it), and
+// notes whether a classification gap here could ever surface as a served,
+// WRONG value (as opposed to a spurious-but-harmless decline):
+//
+//   - id()            pgsql.Int8, a known non-Text type (IdentityFunction
+//     case, translateFunction: `CompoundIdentifier{..., ColumnID}`, and
+//     InferExpressionType's own CompoundIdentifier/ColumnID case). addOther
+//     is correct. evalIDFunction always returns a Go float64 -- consistent.
+//   - toLower()/toUpper()  pgsql.Text (ToLowerFunction/ToUpperFunction
+//     cases, both `CastType: pgsql.Text`). addStaticText is correct,
+//     unchanged.
+//   - type()          pgsql.Text (EdgeTypeFunction case: wraps kind_name()
+//     in a `CastType: pgsql.Text` FunctionCall) -- the exact same shape as
+//     toLower/toUpper. THIS WAS A GAP: previously bucketed addOther by this
+//     function's fallthrough default, now fixed to addStaticText. Because
+//     evalTypeFunction always returns a genuine Go string, the old gap
+//     never produced a WRONG served number (applyAdd's numeric branch
+//     already bails ErrRuntimeCast on any present runtime string) -- but it
+//     spuriously declined queries pg would concatenate correctly, e.g.
+//     `type(r) + n.name` over two real strings (see TestEvalStringConcatenation's
+//     regression test for the fix, and checkArithmetic's own doc for why
+//     the plan-time behavior is unaffected either way).
+//   - labels()         pgsql.TextArray (NodeLabelsFunction case,
+//     translateNodeLabelsExpression: a TypeCast to TextArray).
+//     isConcatenationOperation checks IsArrayType() BEFORE the Text check,
+//     so pg treats any array-typed `+` operand as list concatenation
+//     unconditionally -- a third semantics this package implements nowhere
+//     (no addListConcat kind, no runtime list-append/element-cast). Left as
+//     addOther, deliberately: evalLabelsFunction always returns a Go
+//     []any, which can satisfy neither applyAdd's `.(string)` check (the
+//     addStaticText branch) nor its `.(float64)` check (the numeric
+//     default branch) -- so ANY use of labels() as a `+` operand this
+//     package would ever actually reach at eval time bails (ErrRuntimeCast
+//     if paired with an addStaticText operand, ErrUnsupported otherwise),
+//     regardless of which static bucket it is filed under. Safe by
+//     construction, not by a correct type mirror -- flagged here for
+//     whoever next loosens either of those two type assertions in
+//     applyAdd, since doing so would silently remove this accidental
+//     guard.
+//   - split()          pgsql.TextArray (StringSplitToArrayFunction case) --
+//     the identical array rule and the identical "safe by construction"
+//     argument as labels() above (evalSplitFunction also always returns a
+//     Go []any). Left as addOther, unchanged.
+//   - coalesce()       NOT a single fixed type -- derived from its own
+//     arguments by translateCoalesceFunction. See classifyCoalesceOperand's
+//     own doc for the full derivation; this is the Important finding this
+//     fix closes.
 func classifyAddOperand(expr cypher.Expression) addOperandKind {
 	expr = unwrapParens(expr)
 
@@ -1529,8 +1602,10 @@ func classifyAddOperand(expr cypher.Expression) addOperandKind {
 
 	if fi, isFunc := expr.(*cypher.FunctionInvocation); isFunc && fi != nil {
 		switch strings.ToLower(fi.Name) {
-		case cypher.ToLowerFunction, cypher.ToUpperFunction:
+		case cypher.ToLowerFunction, cypher.ToUpperFunction, cypher.EdgeTypeFunction:
 			return addStaticText
+		case cypher.CoalesceFunction:
+			return classifyCoalesceOperand(fi)
 		default:
 			return addOther
 		}
@@ -1550,18 +1625,119 @@ func classifyAddOperand(expr cypher.Expression) addOperandKind {
 	return addOther
 }
 
+// classifyCoalesceOperand classifies a coalesce(...) call the same way
+// dawgs' translateCoalesceFunction (cypher/models/pgsql/translate/
+// function.go, lines ~1071-1131) derives its STATIC pgsql type: that
+// function pops each argument, skips any whose InferExpressionType is not
+// IsKnown() ("Properties have no type information and should be skipped" --
+// its own comment), and assigns the coalesce call's CastType to the first
+// KNOWN type it finds among the rest (erroring if a later argument's known
+// type disagrees, a genuinely malformed-Cypher edge case this function does
+// not separately detect -- see below). This is a per-argument OR, not an
+// ALL: a single known-typed argument decides the whole call's type, no
+// matter how many other arguments are bare, untyped property lookups.
+//
+//   - ANY argument classifies addStaticText -> the whole call is
+//     addStaticText, exactly mirroring isConcatenationOperation's own
+//     unconditional "either operand's type is Text" rule (checked before
+//     its "both sides are dynamic property lookups" carve-out) --
+//     `coalesce(n.score, 'default')` is statically Text in pg regardless of
+//     what n.score holds, so `coalesce(n.score, 'default') + 1`
+//     CONCATENATES in pg, never numerically adds.
+//   - Else, ANY argument classifies as a known non-Text type (addOther --
+//     a numeric/boolean literal, id(), arithmetic, etc.) -> the whole call
+//     is addOther: `coalesce(n.a, 5)` gets pg's CastType = the numeric
+//     literal's type (the property argument is simply skipped by the type
+//     scan), so `coalesce(n.a, 5) + 1` really is numeric addition in pg,
+//     regardless of whether n.a happens to hold a number this row.
+//   - Else (every argument is addPropertyLookup, or is itself an
+//     addUnresolved nested coalesce -- i.e. NO argument carries any known
+//     type at all) -> addUnresolved. This is the one case that needed
+//     tracing through dawgs source rather than assumed: translateCoalesceFunction
+//     leaves such a call's CastType at its zero value, pgsql.UnsetDataType
+//     ("" -- see pgtypes.go). When the outer `+` later calls
+//     InferExpressionType on this FunctionCall, the `pgsql.TypeHinted` case
+//     returns that CastType VERBATIM -- pgsql.UnsetDataType, NOT
+//     pgsql.UnknownDataType. isConcatenationOperation's own "both sides are
+//     dynamic property lookups -> concatenate" carve-out requires literal
+//     equality with pgsql.UnknownDataType (`lOperandType ==
+//     pgsql.UnknownDataType`) AND `isPropertyLookup(lOperand)` -- a
+//     FunctionCall is never that shape, so an unresolved coalesce fails
+//     BOTH conditions and never qualifies for that carve-out, regardless of
+//     what it is paired with. It also never receives
+//     rewritePropertyLookupOperands' cast-injection, which only ever
+//     rewrites an operand that is DIRECTLY a property-lookup-shaped
+//     BinaryExpression -- a coalesce FunctionCall wrapping property lookups
+//     internally is never that shape either, no matter which side of the
+//     `+` it sits on. So pg falls through to plain arithmetic `+` over
+//     whatever the coalesce's own unrewritten property-lookup arguments
+//     default to (`->>`, i.e. genuine SQL text) -- `text + integer` has no
+//     PostgreSQL operator, so this shape errors outright in real pg,
+//     unconditionally, regardless of what the underlying properties
+//     actually hold at runtime. Reproducing that would mean either
+//     guessing at whether pg errors (a much larger surface than this
+//     package's established "no unpinned rendering reproduction"
+//     convention already declines elsewhere -- applyAdd's own doc, again)
+//     or risking a served numeric answer for a query real pg refuses to run
+//     at all -- worse than the original finding's silent-wrong-number bug,
+//     not merely a repeat of it. checkArithmetic (plan.go) therefore
+//     rejects the whole query whenever an addUnresolved operand appears in
+//     a `+` without an addStaticText partner (see checkArithmetic's own
+//     doc); this delegates to PostgreSQL, which then either concatenates
+//     correctly (if paired with Text) or raises its own genuine error --
+//     never a value this package invented.
+//
+// Not handled: two arguments with DIFFERENT known types (e.g.
+// `coalesce(5, 'x')`) makes translateCoalesceFunction itself error out at
+// translation time ("types in coalesce function must match") -- a
+// malformed-Cypher shape this function does not specially detect, so it
+// picks whichever known type it happens to see, exactly as pg's own
+// first-known-type-wins loop would before its later mismatch check fires.
+// This is not a silent-wrong-answer risk: whichever branch above is taken,
+// applyAdd's own runtime type assertions (a coalesce built from
+// deliberately mismatched argument types can only ever concretely evaluate
+// to ONE of them per row) still bail (ErrRuntimeCast/ErrUnsupported) rather
+// than serve a number pg's own comparator error
+// (newFunctionCallComparatorError) would have refused to produce -- and
+// this exact shape has no corpus query, so declining costs nothing.
+func classifyCoalesceOperand(fi *cypher.FunctionInvocation) addOperandKind {
+	sawKnownNonText := false
+	for _, arg := range fi.Arguments {
+		switch classifyAddOperand(arg) {
+		case addStaticText:
+			return addStaticText
+		case addPropertyLookup, addUnresolved:
+			// No type information from this argument -- keep scanning
+			// (mirrors translateCoalesceFunction's own "properties have no
+			// type information and should be skipped").
+		default:
+			sawKnownNonText = true
+		}
+	}
+	if sawKnownNonText {
+		return addOther
+	}
+	return addUnresolved
+}
+
 // nextAddKind folds the running addOperandKind forward across one
 // arithmetic step, for evalArithmetic's own chain-tracking use (see its doc
 // comment): any operator other than `+` always yields a definite number
 // (subtraction/multiplication/division/modulo have no Cypher/pg
 // concatenation analog at all), and a `+` step itself yields addStaticText
 // exactly when applyAdd would take (or did take) its concatenation branch --
-// i.e. either input operand is itself addStaticText. A property-lookup
-// input is never carried forward as addPropertyLookup past the first step:
-// once folded into a `+`, the accumulated result is no longer a literal
-// PropertyLookup AST node, exactly like pg's own nested BinaryExpression
-// tree (see checkArithmetic's doc for why the "both property lookups"
-// plan-time reject only ever needs to look at the chain's first `+`).
+// i.e. either input operand is itself addStaticText. Neither a
+// property-lookup nor an unresolved-coalesce input is ever carried forward
+// past the first step that introduces it: once folded into a `+`, the
+// accumulated result is no longer a literal PropertyLookup or
+// FunctionInvocation AST node, exactly like pg's own nested
+// BinaryExpression tree (see checkArithmetic's doc for why its "both
+// property lookups"/"unresolved coalesce" plan-time rejects only ever need
+// to look at each `+` step as it is introduced, not at some later folded
+// position). A step that folds an addUnresolved operand together with an
+// addStaticText partner (the only combination checkArithmetic ever accepts
+// for it) correctly yields addStaticText here too, so a chain like
+// `coalesce(n.a,n.b) + 'x' + n.c` keeps concatenating all the way through.
 func nextAddKind(op cypher.Operator, aKind, bKind addOperandKind) addOperandKind {
 	if op != cypher.OperatorAdd {
 		return addOther
@@ -1631,10 +1807,13 @@ func applyArithmetic(aKind addOperandKind, a any, aOk bool, op cypher.Operator, 
 // it defaults an all-property `+` to concatenation rather than arithmetic,
 // unconditionally, regardless of what the properties hold at runtime).
 // Array-typed operands also concatenate (list concatenation) under pg's
-// rule; out of scope here, since none of this evaluator's supported
-// functions produce an array-typed result that would also classify as
-// addStaticText or addPropertyLookup (split() is addOther, deliberately --
-// see classifyAddOperand's doc).
+// rule; out of scope here (no addListConcat kind, no runtime list-append) --
+// split()/labels() are both actually array-typed in pg (see
+// classifyAddOperand's own audit table) but stay classified addOther here,
+// safely: their Go runtime shape ([]any) can never satisfy either this
+// function's `.(string)` check or its `.(float64)` check, so any reachable
+// use bails rather than ever computing a wrong list-concatenation or
+// numeric result.
 //
 // aKind/bKind are the operands' STATIC addOperandKind (classifyAddOperand,
 // folded through a chain by evalArithmetic/nextAddKind) -- not anything
@@ -1673,15 +1852,16 @@ func applyArithmetic(aKind addOperandKind, a any, aOk bool, op cypher.Operator, 
 //     this package's own repeated "REJECTED is safe" precedent (e.g.
 //     expandShortestPathComponent's identical preference for a spurious
 //     decline over a guessed answer).
-//   - Neither operand is addStaticText, but BOTH are addPropertyLookup: per
-//     checkArithmetic's own doc, Plan already rejects this exact shape for
-//     any query this evaluator is actually asked to run -- reached anyway
-//     (e.g. a direct EvalValue call bypassing Plan, in a test), this bails
-//     ErrUnsupported defensively rather than guess at either
-//     interpretation, matching this file's established convention for a
-//     plan-guaranteed-unreachable shape (e.g. evalPatternPredicate's
-//     identical defensive ErrUnsupported for a shape checkPatternPredicate
-//     already validated away).
+//   - Neither operand is addStaticText, but BOTH are addPropertyLookup, OR
+//     either operand is addUnresolved (an all-property-argument coalesce()
+//     call, classifyCoalesceOperand's doc): per checkArithmetic's own doc,
+//     Plan already rejects both of these exact shapes for any query this
+//     evaluator is actually asked to run -- reached anyway (e.g. a direct
+//     EvalValue call bypassing Plan, in a test), this bails ErrUnsupported
+//     defensively rather than guess at either interpretation, matching this
+//     file's established convention for a plan-guaranteed-unreachable shape
+//     (e.g. evalPatternPredicate's identical defensive ErrUnsupported for a
+//     shape checkPatternPredicate already validated away).
 //   - Otherwise (NUMERIC semantics, matching pg's own "neither side is
 //     Text, and not both are untyped property lookups" fallthrough, which
 //     pg renders as an arithmetic `+` and therefore expects both sides to
@@ -1709,6 +1889,18 @@ func applyAdd(aKind addOperandKind, a any, bKind addOperandKind, b any) (any, bo
 		return aStr + bStr, true, nil
 
 	case aKind == addPropertyLookup && bKind == addPropertyLookup:
+		return nil, false, ErrUnsupported
+
+	case aKind == addUnresolved || bKind == addUnresolved:
+		// checkArithmetic (plan.go) rejects a `+` with an addUnresolved
+		// operand unless its partner is addStaticText -- a combination
+		// already handled by the case above, since that case's `||` fires
+		// first whenever either side is addStaticText. Reaching this case
+		// therefore means an addUnresolved operand paired with anything
+		// else, a shape Plan never accepts for a served query (see
+		// classifyCoalesceOperand's doc for why pg itself cannot safely
+		// resolve it either) -- bail defensively, same convention as the
+		// addPropertyLookup&&addPropertyLookup case above.
 		return nil, false, ErrUnsupported
 
 	default:

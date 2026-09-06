@@ -732,6 +732,128 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
+	// coalesce() (review finding, this task): classifyCoalesceOperand
+	// (eval.go) derives coalesce's static addOperandKind from its own
+	// arguments, mirroring dawgs' translateCoalesceFunction. A string
+	// literal argument gives the whole call a known Text type
+	// (addStaticText) -- PlanRejectMatrix's "coalesce with a
+	// string-literal argument accepted" pins that this is accepted at plan
+	// time; these two subtests pin the resulting eval-time CONCAT
+	// semantics, in both directions:
+	t.Run("coalesce(prop,'lit')+lit concatenates when coalesce evaluates to a string", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN coalesce(n.name, 'default') + '!'"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != "AZUREADKERBEROS.TEST.LOCAL!" {
+			t.Fatalf("got %#v, want %q", val, "AZUREADKERBEROS.TEST.LOCAL!")
+		}
+	})
+
+	// The headline case the finding named directly: `coalesce(n.score,
+	// 'default')` is statically Text in pg (the string-literal argument),
+	// so `+ 1` takes CONCAT semantics -- and node 850's n.score is present
+	// and numeric (42.0, not a string), so this must BAIL ErrRuntimeCast,
+	// never silently add to 43 the way the old addOther classification
+	// would have (numeric semantics, 42+1=43 -- exactly the wrong-answer
+	// shape this fix closes).
+	t.Run("coalesce(prop,'lit')+1 bails ErrRuntimeCast when coalesce evaluates to a number (the 42-score case)", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN coalesce(n.score, 'default') + 1"))
+		if !errors.Is(err, ErrRuntimeCast) {
+			t.Fatalf("err = %v, want ErrRuntimeCast (got a served value instead of bailing -- exactly the silent-wrong-answer shape this fix closes)", err)
+		}
+	})
+
+	// coalesce(prop, 5): the numeric-literal argument gives the whole call
+	// a known non-Text type (addOther), so `+ 1` takes NUMERIC semantics --
+	// correct whether the property is present (score=42, 850) or absent
+	// (falls back to the literal 5, 100).
+	t.Run("coalesce(prop,5)+1 adds numerically when the property is present", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 850), returnExprOf(t, "MATCH (n) RETURN coalesce(n.score, 5) + 1"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != float64(43) {
+			t.Fatalf("got %#v, want 43", val)
+		}
+	})
+
+	t.Run("coalesce(prop,5)+1 adds numerically when the property is absent (falls back to the literal)", func(t *testing.T) {
+		val, ok, err := EvalValue(env, f.row("n", 100), returnExprOf(t, "MATCH (n) RETURN coalesce(n.score, 5) + 1"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != float64(6) {
+			t.Fatalf("got %#v, want 6", val)
+		}
+	})
+
+	// coalesce(n.a, m.b): every argument a bare property lookup, no
+	// pg-known type anywhere (addUnresolved) -- TestPlanRejectMatrix's
+	// "coalesce of all bare properties rejected" pins that Plan rejects
+	// this shape outright, so a served query never reaches this. Called
+	// directly here anyway (bypassing Plan, as every other test in this
+	// function does), applyAdd's defensive addUnresolved branch bails
+	// ErrUnsupported rather than guess -- see classifyCoalesceOperand's own
+	// doc for why pg itself cannot safely resolve this shape either,
+	// regardless of what it is paired with.
+	t.Run("coalesce(allprops)+1 bails ErrUnsupported (defensive; Plan rejects this shape)", func(t *testing.T) {
+		row := f.tworow("n", 200, "m", 960)
+		_, _, err := EvalValue(env, row, returnExprOf(t, "MATCH (n),(m) RETURN coalesce(n.name, m.name) + 1"))
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("err = %v, want ErrUnsupported", err)
+		}
+	})
+
+	// type() (audit, this task): EdgeTypeFunction is statically Text in pg
+	// (function.go's `CastType: pgsql.Text`, the identical shape to
+	// toLower()/toUpper()) -- classifyAddOperand previously fell through to
+	// its addOther default for type(), which never served a WRONG numeric
+	// answer (evalTypeFunction always returns a genuine Go string, and the
+	// numeric branch already bails ErrRuntimeCast on any present runtime
+	// string) but DID spuriously decline a query pg would concatenate
+	// correctly. This is the concrete case that changes: both operands are
+	// genuine runtime strings, so this must now succeed.
+	t.Run("type()+string-prop concatenates (fix: type() is statically Text, not addOther)", func(t *testing.T) {
+		row := NewRow()
+		row.SetNode("n", f.dense[200])
+		fwd, found := f.snap.EdgeByID(5000)
+		if !found {
+			t.Fatal("EdgeByID(5000) not found")
+		}
+		row.SetEdge("r", EdgeRef{Fwd: fwd})
+
+		val, ok, err := EvalValue(env, row, returnExprOf(t, "MATCH (n)-[r]->() RETURN type(r) + n.name"))
+		if err != nil || !ok {
+			t.Fatalf("got err=%v ok=%v", err, ok)
+		}
+		if val != "MemberOfAZUREADKERBEROS.TEST.LOCAL" {
+			t.Fatalf("got %#v, want %q", val, "MemberOfAZUREADKERBEROS.TEST.LOCAL")
+		}
+	})
+
+	// split()/labels() (audit, this task): both are array-typed in pg
+	// (TextArray), a third `+` semantics (list concatenation) this package
+	// implements nowhere -- left classified addOther, safe by construction
+	// rather than by a correct type mirror, since evalSplitFunction/
+	// evalLabelsFunction always return a Go []any, which can satisfy
+	// neither applyAdd's `.(string)` nor its `.(float64)` check. Both must
+	// bail ErrUnsupported (numeric-default branch: neither operand is
+	// statically Text, so the []any hits the final `.(float64)` check).
+	t.Run("split()+number bails ErrUnsupported (array-typed operand, list concat not implemented)", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 200), returnExprOf(t, "MATCH (n) RETURN split(n.name, '.') + 1"))
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("err = %v, want ErrUnsupported", err)
+		}
+	})
+
+	t.Run("labels()+number bails ErrUnsupported (array-typed operand, list concat not implemented)", func(t *testing.T) {
+		_, _, err := EvalValue(env, f.row("n", 900), returnExprOf(t, "MATCH (n) RETURN labels(n) + 1"))
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("err = %v, want ErrUnsupported", err)
+		}
+	})
+
 	// The corpus shape itself (selector/AdminSDHolder): a concatenation
 	// result feeding an equality comparison. An absent right-hand property
 	// must make the whole comparison NULL (the brief's own pinned rule:

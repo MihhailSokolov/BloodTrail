@@ -1964,38 +1964,70 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 }
 
 // checkArithmetic validates +, -, *, /, % over a chained
-// ArithmeticExpression (mirrors eval.go's evalArithmetic folding). `^`
-// (OperatorPowerOf) is a real dawgs operator constant but eval.go's
-// applyArithmetic has no case for it, so it is deliberately excluded here
-// too -- accepting it in Plan would guarantee a runtime ErrUnsupported bail
-// on the very first row, wasting the whole materialization pass before
-// falling back to delegation anyway.
+// ArithmeticExpression (mirrors eval.go's evalArithmetic folding, including
+// its curKind fold -- see below). `^` (OperatorPowerOf) is a real dawgs
+// operator constant but eval.go's applyArithmetic has no case for it, so it
+// is deliberately excluded here too -- accepting it in Plan would guarantee
+// a runtime ErrUnsupported bail on the very first row, wasting the whole
+// materialization pass before falling back to delegation anyway.
 //
-// One additional rejection, specific to `+`: pg's own translation
-// statically types two raw property lookups added together as string
-// concatenation, unconditionally, regardless of what they hold at runtime
-// (isConcatenationOperation's "both operands are property lookups" branch --
-// see applyAdd's doc comment in eval.go for the full pg-parity investigation
-// and the review finding this closes: `n.score + n.score` over numeric
-// scores used to silently serve a numeric 84 where pg returns the
-// concatenated string "4242"). Reproducing pg's choice would mean rendering
-// an arbitrary JSON scalar exactly as pg's own jsonb `->>` operator does,
-// which this package's established "no unpinned rendering reproduction"
-// convention declines to attempt (see applyAdd's doc again) -- and no
-// corpus query needs this shape -- so it is simplest and safest to delegate
-// the whole query here instead of ever computing a per-row answer for it.
+// Two additional rejections, both specific to `+`, both delegating the
+// whole query rather than ever risking a per-row wrong (or pg-refused)
+// answer:
 //
-// This can only ever apply to the chain's very first `+` (ae.Left paired
-// with ae.Partials[0].Right): a flat Cypher arithmetic chain folds
-// left-associatively, so for every later `+` the true left operand is
-// whatever the preceding folds already produced -- never, itself, a literal
-// PropertyLookup AST node -- exactly mirroring why pg's own nested
-// pgsql.BinaryExpression tree can only ever see two literal property-lookup
-// operands at that same first position.
+//  1. Two raw property lookups added together: pg's own translation
+//     statically types this as string concatenation, unconditionally,
+//     regardless of what they hold at runtime (isConcatenationOperation's
+//     "both operands are property lookups" branch -- see applyAdd's doc
+//     comment in eval.go for the full pg-parity investigation and the
+//     review finding this closes: `n.score + n.score` over numeric scores
+//     used to silently serve a numeric 84 where pg returns the
+//     concatenated string "4242"). Reproducing pg's choice would mean
+//     rendering an arbitrary JSON scalar exactly as pg's own jsonb `->>`
+//     operator does, which this package's established "no unpinned
+//     rendering reproduction" convention declines to attempt (see
+//     applyAdd's doc again) -- and no corpus query needs this shape.
+//
+//     This can only ever apply to the chain's very first `+` (ae.Left
+//     paired with ae.Partials[0].Right): a flat Cypher arithmetic chain
+//     folds left-associatively, so for every later `+` the true left
+//     operand is whatever the preceding folds already produced -- never,
+//     itself, a literal PropertyLookup AST node -- exactly mirroring why
+//     pg's own nested pgsql.BinaryExpression tree can only ever see two
+//     literal property-lookup operands at that same first position. (The
+//     curKind fold below guarantees this structurally -- nextAddKind never
+//     produces addPropertyLookup as a folded result -- so the `i == 0`
+//     guard is a belt-and-suspenders match of the doc's own reasoning, not
+//     load-bearing.)
+//
+//  2. An addUnresolved operand (a coalesce() call none of whose arguments
+//     carry a pg-known type -- classifyCoalesceOperand's doc, eval.go) NOT
+//     paired with an addStaticText partner, at ANY position in the chain --
+//     unlike rejection 1, this one is NOT limited to the first `+`. A bare
+//     property lookup's safety at position i>0 is structural (it can never
+//     independently BE a property lookup there -- see above), but an
+//     addUnresolved coalesce is a literal FunctionInvocation AST node that
+//     can appear as ANY p.Right (or, at i==0, as ae.Left) regardless of
+//     position, and its own safety depends only on whether pg statically
+//     resolves ITS type -- which never depends on chain position, only on
+//     its own arguments. Checking this correctly at i>0 needs the actual
+//     folded left-hand kind up to that point (curKind below), not just
+//     ae.Left/Partials[0] in isolation, because pg's Text-always-wins rule
+//     (isConcatenationOperation checks `lOperandType == Text ||
+//     rOperandType == Text` before anything else) means an addUnresolved
+//     operand IS safe when paired with a running fold that is itself
+//     addStaticText (e.g. `'x' + coalesce(n.a,n.b)` genuinely concatenates
+//     in pg) but NOT safe paired with anything else (addUnresolved's own
+//     doc has the full derivation: such a coalesce's arguments were never
+//     rewritten to a resolved type by translateCoalesceFunction, so pg
+//     falls through to a bare `+` over their default `->>` text rendering,
+//     which has no PostgreSQL operator against a non-text partner and
+//     genuinely errors in real pg, regardless of runtime values).
 func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
 	}
+	curKind := classifyAddOperand(ae.Left)
 	for i, p := range ae.Partials {
 		if p == nil {
 			return false
@@ -2008,11 +2040,19 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		if !pb.checkExpr(p.Right, false) {
 			return false
 		}
-		if i == 0 && p.Operator == cypher.OperatorAdd &&
-			classifyAddOperand(ae.Left) == addPropertyLookup &&
-			classifyAddOperand(p.Right) == addPropertyLookup {
-			return false
+		rKind := classifyAddOperand(p.Right)
+
+		if p.Operator == cypher.OperatorAdd {
+			if i == 0 && curKind == addPropertyLookup && rKind == addPropertyLookup {
+				return false
+			}
+			if curKind != addStaticText && rKind != addStaticText &&
+				(curKind == addUnresolved || rKind == addUnresolved) {
+				return false
+			}
 		}
+
+		curKind = nextAddKind(p.Operator, curKind, rKind)
 	}
 	return true
 }

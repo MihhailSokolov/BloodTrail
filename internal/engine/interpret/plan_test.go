@@ -423,6 +423,47 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "arithmetic + both operands property lookups rejected", cypher: `MATCH (n:User),(m:Computer) RETURN n.a + m.b AS x`, want: false},
 		{name: "arithmetic + same property lookup added to itself rejected", cypher: `MATCH (n:User) RETURN n.score + n.score AS x`, want: false},
 		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) RETURN n.a + 1 AS x`, want: true},
+
+		// Fix (review finding, this task): classifyAddOperand used to bucket
+		// EVERY coalesce() call as addOther (numeric), but pg's own
+		// translateCoalesceFunction derives coalesce's STATIC type from its
+		// arguments -- see classifyCoalesceOperand's doc (eval.go) for the
+		// full derivation this rejection and the two accept rows below
+		// mirror. `coalesce(n.a, n.b) + 1`, every argument a bare property
+		// lookup, has no pg-known type at all (addUnresolved) -- pg falls
+		// through to a bare `+` over the coalesce's own unrewritten,
+		// default-text-rendered arguments, which genuinely has no
+		// PostgreSQL operator and errors outright, regardless of runtime
+		// values -- so this rejects at plan time instead of ever risking a
+		// served answer for a query real pg refuses to run at all.
+		{name: "arithmetic + coalesce of all bare properties rejected (addUnresolved)", cypher: `MATCH (n:User) RETURN coalesce(n.a, n.b) + 1 AS x`, want: false},
+		// coalesce(prop, 'lit'): the string-literal argument gives the whole
+		// call a known type (Text), so it classifies addStaticText, same as
+		// a bare string literal -- accepted (see eval_test.go for the
+		// concat-semantics runtime behavior this then takes).
+		{name: "arithmetic + coalesce with a string-literal argument accepted (addStaticText)", cypher: `MATCH (n:User) RETURN coalesce(n.score, 'default') + 1 AS x`, want: true},
+		// coalesce(prop, 5): the numeric-literal argument gives the whole
+		// call a known, non-Text type, so it classifies addOther, same as a
+		// bare numeric literal -- accepted, numeric semantics.
+		{name: "arithmetic + coalesce with a numeric-literal argument accepted (addOther)", cypher: `MATCH (n:User) RETURN coalesce(n.score, 5) + 1 AS x`, want: true},
+
+		// Audit (this task): `type(r)` is statically Text in pg
+		// (EdgeTypeFunction's `CastType: pgsql.Text`, dawgs' function.go),
+		// the same shape as toLower()/toUpper() -- classifyAddOperand now
+		// buckets it addStaticText too, so a `+` naming it is still
+		// accepted at plan time (unchanged: checkArithmetic never rejected
+		// this shape either before or after the fix, only its eval-time
+		// static/dynamic dispatch changed -- see eval_test.go's
+		// TestEvalStringConcatenation for the behavior this actually
+		// changes).
+		{name: "arithmetic + type() with a property lookup accepted (addStaticText)", cypher: `MATCH ()-[r]->(),(n:User) RETURN type(r) + n.name AS x`, want: true},
+		// split()/labels() are array-typed in pg but this package implements
+		// no list-concatenation semantics for `+` -- classifyAddOperand
+		// leaves both addOther (audit table, eval.go); accepted at plan
+		// time exactly as before, always safely bailing at eval time
+		// instead (see eval_test.go).
+		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN split(n.name, ',') + 1 AS x`, want: true},
+		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN labels(n) + 1 AS x`, want: true},
 	}
 
 	runPlanGolden(t, snap, cases)
