@@ -498,7 +498,7 @@ func extractSelectors(path string) ([]selectorEntry, error) {
 
 	incoming, err := extractIncomingForestTrustBuildersSelector(src)
 	if err != nil {
-		return nil, fmt.Errorf("Incoming Forest Trust Builders selector: %w", err)
+		return nil, fmt.Errorf("incoming forest trust builders selector: %w", err)
 	}
 	selectors = append(selectors, incoming)
 
