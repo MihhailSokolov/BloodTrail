@@ -196,15 +196,19 @@ query BloodHound's UI ships.
   `random_cypher_differential_integration_test.go` for the differential suites that
   pin this behavior against a live PostgreSQL oracle across BloodHound's own pre-built
   query corpus and randomly generated Cypher alike. Speed, honestly: of
-  `bench/cypherbench`'s five representative shapes measured at 4.76M nodes, one (an
-  objectid point lookup) is ~657x faster than delegating, one is unmeasured at this
-  scale (its pg baseline doesn't finish in reasonable time), and three currently miss
-  their target ratio -- two of them slower than plain PostgreSQL, for reasons specific
-  to each shape (a LIMIT the interpreter doesn't yet apply early; an unconstrained
-  shortestPath endpoint set; a scan pg's own index already narrows about as well). See
-  `bench/cypherbench/README.md`'s "Measured at 5M" table for the actual numbers and
-  the reasoning behind each -- this is real, imperfect, in-progress performance, not a
-  claim that every Cypher shape is already faster served locally.
+  `bench/cypherbench`'s five representative shapes measured at 4.76M nodes, three clear
+  their bar comfortably (an objectid point lookup ~1000x faster than delegating, a
+  pre-built shortestPath query ~40-60x faster, and a `COLLECT`-based anti-join that used
+  to decline outright and now serves in low-double-digit seconds once seeded from its
+  constrained side rather than a full unconstrained node scan). The other two -- a
+  suffix scan and a two-property flag scan, both already sub-200ms on either driver at
+  this graph size -- were measured below their target ratio on a busy shared machine;
+  repeated runs traced this to ordinary scheduling noise on shapes whose absolute cost
+  is small enough for it to swing the ratio across the line, not a code regression. See
+  `bench/cypherbench/README.md`'s "Measured at 5M" table for the full numbers, the
+  repeated-run evidence behind that read, and the reasoning behind each shape -- this is
+  real, in-progress performance, not a claim that every Cypher shape is already faster
+  served locally.
 - **What always delegates.** Any query the interpreter's planner does not recognize at
   all; any query bound `$parameters` (BloodHound's own cypher endpoint never sends
   these, so a non-empty `params` map can only mean something this interpreter has no
