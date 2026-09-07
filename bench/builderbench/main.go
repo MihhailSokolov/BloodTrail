@@ -52,7 +52,7 @@
 //
 // Usage:
 //
-//	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-enforce]
+//	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce]
 //
 // builderbench never imports bench/adgen (a generator, not a library) and
 // never writes to the database (beyond a scratch datapipe_status row it
@@ -177,6 +177,24 @@ const fetchDirectedGraphMinRatio = 1.2
 // run's total wall time stays bounded.
 const defaultPGCap = 120 * time.Second
 
+// defaultBTCap is -bt-cap's default: the per-shape wall-clock budget an
+// engine-side (bt) call -- warmup or timed -- gets before runBTCapped aborts
+// the whole run. Mirrors bench/cypherbench's identical constant and
+// rationale: this is a fail-fast safety net, not a measurement judgment the
+// way -pg-cap's pg_capped is -- bt is the thing this benchmark exists to
+// measure, so a bt call that has not returned within 15 minutes has almost
+// certainly not been quietly slow but instead been declined by the engine
+// and silently delegated to PostgreSQL, which can then run for an unbounded
+// time. See bench/cypherbench/main.go's defaultBTCap doc for the milestone
+// 4.5 task-6b incident this flag exists to catch (there, on cypherbench's
+// own collect_antijoin_prebuilt shape; builderbench's shapes have not shown
+// this, but the same silent-decline-then-unbounded-delegate failure mode
+// could in principle hit any bt-served shape here too, hence the identical
+// guard). 15 minutes comfortably exceeds every shape's measured bt-side
+// latency (including group_members_bfs's own ~34s p50) while still bounding
+// a wrongly-hanging run to a human-noticeable wait.
+const defaultBTCap = 15 * time.Minute
+
 // shapeThreshold is one shape's -enforce policy: the minimum p50 ratio
 // (delegated pg / served bt) required when the pg baseline was actually
 // measured, and the maximum absolute bt (engine) p50 allowed when it could
@@ -291,6 +309,7 @@ func run(args []string) int {
 		dsn     = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
 		runs    = fs.Int("runs", 5, "number of warmed-up, timed runs per shape per driver")
 		pgCap   = fs.Duration("pg-cap", defaultPGCap, "per-shape wall-clock cap on the pg baseline (warmup and timed runs); a pg query exceeding this mid-execution is cut off via context.WithTimeout and the shape is recorded pg_capped=true and judged on the engine's absolute p50 alone (see README)")
+		btCap   = fs.Duration("bt-cap", defaultBTCap, "per-shape wall-clock cap on the engine-side bt call (warmup and timed runs); a bt call exceeding this mid-execution is cut off via context.WithTimeout and ABORTS THE WHOLE RUN (nonzero exit) -- a fail-fast safety net, never a recorded data point, for when the engine declines and silently delegates to an unbounded PostgreSQL query (see README)")
 		enforce = fs.Bool("enforce", false, "exit nonzero if any shape fails its per-shape enforce threshold (never pass this in CI)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -309,8 +328,12 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "builderbench: -pg-cap must be positive")
 		return 2
 	}
+	if *btCap <= 0 {
+		fmt.Fprintln(os.Stderr, "builderbench: -bt-cap must be positive")
+		return 2
+	}
 
-	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, pgCap: *pgCap})
+	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, pgCap: *pgCap, btCap: *btCap})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "builderbench: %v\n", err)
 		return 1
@@ -328,6 +351,7 @@ type config struct {
 	dsn   string
 	runs  int
 	pgCap time.Duration
+	btCap time.Duration
 }
 
 // shapeSpec is one benchmarked query shape: a name for reporting and a
@@ -618,7 +642,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 
 	for _, spec := range shapes {
 		fmt.Printf("\n=== shape: %s ===\n", spec.name)
-		sr, err := measureShape(ctx, spec, bt, oracle, cfg.runs, cfg.pgCap)
+		sr, err := measureShape(ctx, spec, bt, oracle, cfg.runs, cfg.pgCap, cfg.btCap)
 		if err != nil {
 			return nil, fmt.Errorf("shape %s: %w", spec.name, err)
 		}
@@ -639,14 +663,16 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 // Every oracle (pg) call, warmup included, goes through runPGCapped rather
 // than timeOnce directly: the first time pgCap trips (warmup or any timed
 // run), result.pgCapped is set and every remaining pg call for this shape
-// is skipped -- see shapeResult.pgCapped's doc. bt is never capped: it's
-// the thing being measured, and the whole point of -pg-cap is that pg's
-// baseline, not the engine, is what can blow up unboundedly for a shape
-// like group_members_bfs.
-func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database, runs int, pgCap time.Duration) (shapeResult, error) {
+// is skipped -- see shapeResult.pgCapped's doc. Every bt call, warmup
+// included, goes through runBTCapped instead of timeOnce directly too --
+// unlike pg's own graceful pgCapped bookkeeping, a btCap trip aborts the
+// whole run immediately (runBTCapped returns a hard error, not a bool) --
+// see defaultBTCap's and runBTCapped's own docs for why a "capped" bt call
+// can never be a mere data point.
+func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database, runs int, pgCap, btCap time.Duration) (shapeResult, error) {
 	result := shapeResult{name: spec.name}
 
-	_, btSize, err := timeOnce(ctx, bt, spec.run)
+	_, btSize, err := runBTCapped(ctx, bt, spec.run, btCap, spec.name)
 	if err != nil {
 		return result, fmt.Errorf("bloodtrail warmup: %w", err)
 	}
@@ -667,7 +693,7 @@ func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database
 	}
 
 	for i := 0; i < runs; i++ {
-		d, _, err := timeOnce(ctx, bt, spec.run)
+		d, _, err := runBTCapped(ctx, bt, spec.run, btCap, spec.name)
 		if err != nil {
 			return result, fmt.Errorf("bloodtrail run %d: %w", i, err)
 		}
@@ -729,6 +755,42 @@ func runPGCapped(ctx context.Context, oracle graph.Database, run func(context.Co
 		return 0, 0, true, nil
 	}
 	return d, size, false, err
+}
+
+// runBTCapped runs run against bt once via timeOnce, bounded to btCap via
+// context.WithTimeout wrapped directly around the call -- the same
+// context.WithTimeout-around-the-call-itself technique runPGCapped uses, so
+// a mid-execution deadline actually cancels the in-flight work server-side
+// rather than merely giving up on waiting for it client-side.
+//
+// Unlike runPGCapped, exceeding btCap is never a graceful, recordable
+// outcome: bt is the engine this benchmark exists to measure, so a bt call
+// that has not returned within btCap has almost certainly not been quietly
+// slow -- it means the engine declined and the driver silently fell through
+// to PostgreSQL, which can then run for an unbounded time -- exactly the
+// milestone-4.5 task-6b incident (see defaultBTCap's own doc). So
+// runBTCapped returns a hard, descriptive error naming both shapeName and
+// btCap instead of a "capped" bool: measureShape's caller propagates this
+// as a full run failure (nonzero exit), never a data point.
+//
+// The capped/genuine-error/parent-cancellation distinction is decided by
+// capCtx.Err(), the context this function itself created and controls --
+// not by pattern-matching run's returned error string -- exactly mirroring
+// runPGCapped's own doc: a genuine driver error is returned as itself, and
+// a parent ctx canceled for an unrelated reason (capCtx.Err() reporting
+// context.Canceled, not context.DeadlineExceeded, since the parent's
+// cancellation reaches the child before its own deadline ever fires)
+// propagates as that plain cancellation, never misreported as a bt-cap
+// trip.
+func runBTCapped(ctx context.Context, bt graph.Database, run func(context.Context, graph.Database) (int64, error), btCap time.Duration, shapeName string) (time.Duration, int64, error) {
+	capCtx, cancel := context.WithTimeout(ctx, btCap)
+	defer cancel()
+
+	d, size, err := timeOnce(capCtx, bt, run)
+	if err != nil && errors.Is(capCtx.Err(), context.DeadlineExceeded) {
+		return 0, 0, fmt.Errorf("shape %q: engine-side run exceeded -bt-cap=%s; the engine likely declined and delegated this query to PostgreSQL -- investigate the decline, do not wait", shapeName, btCap)
+	}
+	return d, size, err
 }
 
 // shapeFetchDirectedGraph is shape 1: container.FetchDirectedGraph over

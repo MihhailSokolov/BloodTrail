@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,5 +288,100 @@ func TestRunPGCapped_ParentCancellationIsNotMistakenForACap(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("err = nil, want the propagated cancellation error")
+	}
+}
+
+// TestRunBTCapped_CutsOffASlowRunAndFails exercises runBTCapped's core
+// contract -- unlike runPGCapped, an engine-side run exceeding btCap is
+// never a graceful, recordable outcome: it is the milestone-4.5 incident's
+// own failure mode (a decline silently delegating to an unbounded
+// PostgreSQL query), so runBTCapped must return a hard, descriptive error
+// naming both the shape and -bt-cap itself, not a "capped" bool a caller
+// could mistake for a data point.
+func TestRunBTCapped_CutsOffASlowRunAndFails(t *testing.T) {
+	slowRun := func(ctx context.Context, _ graph.Database) (int64, error) {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			return 99, nil
+		}
+	}
+
+	d, size, err := runBTCapped(context.Background(), nil, slowRun, 20*time.Millisecond, "some_shape")
+	if err == nil {
+		t.Fatal("runBTCapped returned nil err, want a hard failure (bt-cap must abort the run, never silently record a capped data point)")
+	}
+	if d != 0 || size != 0 {
+		t.Errorf("d=%s size=%d, want both zero-valued on a bt-cap failure", d, size)
+	}
+	if !strings.Contains(err.Error(), "some_shape") {
+		t.Errorf("err = %q, want it to name the shape %q", err.Error(), "some_shape")
+	}
+	if !strings.Contains(err.Error(), "bt-cap") {
+		t.Errorf("err = %q, want it to mention -bt-cap", err.Error())
+	}
+}
+
+// TestRunBTCapped_FastRunIsNotCapped confirms a run that finishes
+// comfortably inside btCap is reported normally: no error, real
+// duration/size passed through.
+func TestRunBTCapped_FastRunIsNotCapped(t *testing.T) {
+	fastRun := func(ctx context.Context, _ graph.Database) (int64, error) {
+		return 42, nil
+	}
+
+	d, size, err := runBTCapped(context.Background(), nil, fastRun, time.Second, "some_shape")
+	if err != nil {
+		t.Fatalf("runBTCapped returned err %v, want nil", err)
+	}
+	if size != 42 {
+		t.Errorf("size = %d, want 42", size)
+	}
+	if d < 0 {
+		t.Errorf("d = %s, want a non-negative duration", d)
+	}
+}
+
+// TestRunBTCapped_GenuineErrorPropagates confirms a real failure (anything
+// other than btCap's own context deadline) is still returned as itself --
+// runBTCapped must not rewrite a genuine driver error into the misleading
+// "engine likely declined" bt-cap message just because it happens to look
+// at ctx.Err() first.
+func TestRunBTCapped_GenuineErrorPropagates(t *testing.T) {
+	boom := errors.New("boom: a genuine driver failure, not a timeout")
+	failingRun := func(ctx context.Context, _ graph.Database) (int64, error) {
+		return 0, boom
+	}
+
+	_, _, err := runBTCapped(context.Background(), nil, failingRun, time.Second, "some_shape")
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap %v", err, boom)
+	}
+}
+
+// TestRunBTCapped_ParentCancellationIsNotMistakenForACap confirms that
+// runBTCapped distinguishes its own btCap deadline from the caller's ctx
+// being canceled for an unrelated reason (e.g. the whole process shutting
+// down): canceling ctx up front must propagate as the genuine
+// cancellation, not the "-bt-cap exceeded" message -- misreporting an
+// unrelated shutdown as "the engine likely declined" would send whoever
+// reads it chasing the wrong thing. Mirrors runPGCapped's own
+// identically-purposed test.
+func TestRunBTCapped_ParentCancellationIsNotMistakenForACap(t *testing.T) {
+	parentCtx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled before runBTCapped even starts
+
+	run := func(ctx context.Context, _ graph.Database) (int64, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+
+	_, _, err := runBTCapped(parentCtx, nil, run, time.Second, "some_shape")
+	if err == nil {
+		t.Fatal("err = nil, want the propagated cancellation error")
+	}
+	if strings.Contains(err.Error(), "bt-cap") {
+		t.Errorf("err = %q, want the plain cancellation error, not the bt-cap message (the parent context was canceled, not runBTCapped's own btCap deadline)", err.Error())
 	}
 }

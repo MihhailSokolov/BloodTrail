@@ -22,8 +22,9 @@ bench-path: ## run the path-engine benchmark against BLOODTRAIL_TEST_PG
 
 # Requires a PostgreSQL reachable at BLOODTRAIL_TEST_PG, already loaded with a
 # graph (see bench/adgen). -enforce fails the build if builder-query serving
-# isn't at least 5x faster than delegating to PostgreSQL; never pass -enforce
-# in CI (see bench/builderbench).
+# isn't at least 5x faster than delegating to PostgreSQL; an engine-side (bt)
+# call that runs past -bt-cap (15m default) ABORTS the whole run (nonzero
+# exit, never a data point); never pass -enforce in CI (see bench/builderbench).
 bench-builder: ## run the builder-query benchmark against BLOODTRAIL_TEST_PG
 	go run ./bench/builderbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
 

@@ -15,7 +15,7 @@ pg.DriverName, cfg)` on the same DSN and pool is the delegated baseline:
 plain PostgreSQL, no engine at all.
 
 ```
-go run ./bench/builderbench -dsn <pg dsn> [-runs 5] [-pg-cap 120s] [-enforce]
+go run ./bench/builderbench -dsn <pg dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce]
 ```
 
 Or, against `BLOODTRAIL_TEST_PG`:
@@ -218,6 +218,23 @@ and the run is judged entirely on each shape's `engineAbsoluteCap` --
 comfortably cleared at small scale, so this still reports
 `BUILDERBENCH_RESULT PASS` even with `-enforce`.
 
+### `-bt-cap`: a fail-fast watchdog on the engine side
+
+`-pg-cap` bounds the pg baseline; `-bt-cap` (default `15m`) bounds the
+**engine-side (bt) call** the same way, via `context.WithTimeout` wrapped
+directly around each bt call (`runBTCapped` in `main.go`) -- but unlike
+`-pg-cap`, tripping it is never a graceful, recordable outcome. It exists as
+a fail-fast safety net for the same failure mode `bench/cypherbench`'s
+identical flag was added to catch there (see that package's README for the
+2026-09 milestone-4.5 incident): a bt call that has not returned within
+`-bt-cap` has almost certainly not been quietly slow -- the engine declined
+and the driver silently fell through to PostgreSQL, which can then run
+unbounded. `runBTCapped` returns a hard error naming the shape and the cap,
+and the whole run **aborts with a nonzero exit** -- never a `bt_capped=true`
+data point the way `-pg-cap` records `pg_capped=true`. Seeing this abort
+means: stop and investigate the engine's decline, do not wait for the
+delegated fallback to finish.
+
 ## At large scale (the 5M-node workflow)
 
 Following `bench/adgen`'s own large-scale guidance:
@@ -241,4 +258,5 @@ the small-scale default -- `builderbench` prints exactly how long it waited
 | `-dsn`     | (none)  | PostgreSQL connection string. Required.                               |
 | `-runs`    | `5`     | Number of warmed-up, timed runs per shape per driver.                 |
 | `-pg-cap`  | `120s`  | Per-shape wall-clock cap on the pg baseline; see `-pg-cap` above.      |
+| `-bt-cap`  | `15m`   | Per-shape wall-clock cap on the engine-side bt call; ABORTS THE RUN on expiry (nonzero exit) -- see `-bt-cap` above. |
 | `-enforce` | `false` | Exit nonzero on a per-shape threshold/match miss (never pass this in CI). |
