@@ -661,11 +661,19 @@ func TestLimitEarlyTermination(t *testing.T) {
 }
 
 // TestLimitEarlyTerminationSkipCountsTowardTarget pins limitTarget's
-// Skip+Limit arithmetic end to end: SKIP rows are produced (and later
-// discarded by applySkipLimit) exactly like the unlimited path already does,
-// so they must still count toward how many post-filter rows the chunked
-// driver secures before stopping -- a driver that only counted Limit itself
-// would stop 2 rows too early here, under-returning after SKIP trims them.
+// Skip+Limit arithmetic end to end: over a `SKIP 2 LIMIT 3` query it checks
+// both that exactly 3 rows come back (SKIP+LIMIT applied correctly on top
+// of the chunked path, exactly like the unlimited path already produces)
+// and that real early termination happened (meter.work strictly below an
+// unlimited baseline's over the same 3000-row fixture) rather than a full
+// scan. It does NOT, despite appearances, distinguish a driver that counts
+// only LIMIT (3) toward the chunked target from one that correctly counts
+// SKIP+LIMIT (5): limitChunk is 1024, far larger than either quantity, and
+// every row in this fixture matches WHERE, so the very first chunk already
+// gathers well more than either target and the driver stops after that one
+// chunk regardless of which of the two it was aiming for -- a genuine
+// LIMIT-only bug would need a fixture where the two targets straddle a
+// chunk boundary to be caught here.
 func TestLimitEarlyTerminationSkipCountsTowardTarget(t *testing.T) {
 	const n = 3000
 	snap := buildManyEnabledUsers(t, n)
@@ -922,6 +930,71 @@ func TestLimitEarlyTerminationVarLength(t *testing.T) {
 
 	if len(rs.Rows) != 3 {
 		t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
+	}
+	if limited.work >= baseline.work {
+		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d", limited.work, baseline.work)
+	}
+}
+
+// TestLimitEarlyTerminationNamedPathChain exercises the chunked driver's
+// named-path/chain dispatch end to end: componentAnchorSym's pathSym != ""
+// branch picks the chain's own leftmost symbol as anchor (rather than
+// chooseAnchor's cost-ranked pick), and runComponentFrom's own pathSym != ""
+// branch (guarded by isStrictLinearChain) routes through
+// expandChainComponentFrom -- the same anchor/dispatch pairing
+// TestRunComponentFromDispatchMatchesRunComponent's "named-path chain"
+// subtest exercises directly, here driven through the full runQuery/LIMIT
+// path instead. A large :User anchor pool, each with a one-hop MemberOf
+// edge to a single shared Group, all under one named path `p`: a LIMIT 3
+// run must stop after roughly one anchor-scan batch instead of assembling
+// every user's own path, while every returned path must still be one that
+// the unlimited run itself produces.
+func TestLimitEarlyTerminationNamedPathChain(t *testing.T) {
+	const (
+		kindUser     snapshot.KindID = 1
+		kindGroup    snapshot.KindID = 2
+		kindMemberOf snapshot.KindID = 10
+	)
+	const n = 2000
+	const groupID = uint64(1)
+
+	nodes := []execNodeSpec{{groupID, []snapshot.KindID{kindGroup}, nil}}
+	var edges []execEdgeSpec
+	for i := 0; i < n; i++ {
+		userID := uint64(1000 + i)
+		nodes = append(nodes, execNodeSpec{userID, []snapshot.KindID{kindUser}, nil})
+		edges = append(edges, execEdgeSpec{uint64(9_000_000 + i), userID, groupID, kindMemberOf})
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User", kindGroup: "Group", kindMemberOf: "MemberOf"}, nodes, edges)
+
+	const query = `MATCH p = (a:User)-[:MemberOf]->(b:Group) RETURN p`
+
+	baseline := &workMeter{budget: generousBudget}
+	baseRS, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query), baseline)
+	if err != nil {
+		t.Fatalf("baseline runQuery: %v", err)
+	}
+	if len(baseRS.Rows) != n {
+		t.Fatalf("baseline row count = %d, want %d (sanity: every user has exactly one qualifying MemberOf edge)", len(baseRS.Rows), n)
+	}
+	wantSigs := make(map[string]bool, n)
+	for _, sig := range pathSigsAtColumn(t, snap, baseRS, 0) {
+		wantSigs[sig] = true
+	}
+
+	limited := &workMeter{budget: generousBudget}
+	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query+" LIMIT 3"), limited)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
+	}
+	for _, sig := range pathSigsAtColumn(t, snap, rs, 0) {
+		if !wantSigs[sig] {
+			t.Fatalf("limited path %q is not among the unlimited run's own %d paths", sig, n)
+		}
 	}
 	if limited.work >= baseline.work {
 		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d", limited.work, baseline.work)
