@@ -213,6 +213,14 @@ func containsFwd(edges []EdgeRef, fwd uint64) bool {
 // with no anchor rows at all) reading exactly the decline it always did.
 // Combining early termination with constrained-side seeding is a separate
 // piece of work needing its own stopping rule, not a variation on this one.
+//
+// User-visible consequence of that gap: a query eligible for the chunked
+// LIMIT driver (limitEligibleComponent) always takes the forward route
+// above and never reverse-seeds, even when its FromSym side is the
+// expensive one -- so adding a LIMIT to an otherwise-identical query can
+// make it budget-decline (interpret.ErrBudget) where the unlimited form
+// serves fine via reverse seeding, purely because the LIMIT made it take
+// the chunked path instead of this function's own dispatch.
 func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step) ([]*Row, error) {
 	if step.EdgeSym != "" || step.FromSym == step.ToSym {
 		return nil, errUnsupportedStep

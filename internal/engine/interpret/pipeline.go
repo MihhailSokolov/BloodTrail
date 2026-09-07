@@ -157,8 +157,8 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	// `WITH t, COUNT(s) AS n RETURN n LIMIT 1` truncating Part[0] to 1 row
 	// before COUNT ever sees the rest) or under-serve Part[1] entirely (a
 	// later MATCH joining against a value only some of Part[0]'s
-	// wrongly-dropped rows carried). This mirrors Task 2's own chunked
-	// driver just below, which already declines the analogous mistake for
+	// wrongly-dropped rows carried). This mirrors the chunked driver just
+	// below, which already declines the analogous mistake for
 	// Part[0]'s ordinary pattern match by restricting itself to
 	// len(q.Parts) == 1 (matchPartLimited is never called otherwise) --
 	// this gate closes the same gap for the meter-threaded path
@@ -601,6 +601,14 @@ func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component,
 			return nil
 		}
 		rows, err := runComponentFrom(env, meter, part, comp, chunk)
+		// chunk's backing array is reused by the next scan batch below; this
+		// is safe only because the acc = append(acc, rows...) below copies
+		// each *Row pointer into acc's own storage rather than aliasing rows
+		// (which, for an isolated-node component, IS chunk itself -- see
+		// runComponentTreeFrom's empty-stepIdxs passthrough) -- benign today,
+		// but any future change that lets acc alias rows/chunk instead of
+		// copying would silently corrupt already-accumulated rows once this
+		// backing array is overwritten.
 		chunk = chunk[:0]
 		if err != nil {
 			return err

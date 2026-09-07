@@ -201,8 +201,10 @@ query BloodHound's UI ships.
   pre-built shortestPath query ~40-60x faster, and a `COLLECT`-based anti-join that used
   to decline outright and now serves in low-double-digit seconds once seeded from its
   constrained side rather than a full unconstrained node scan). The other two -- a
-  suffix scan and a two-property flag scan, both already sub-200ms on either driver at
-  this graph size -- were measured below their target ratio on a busy shared machine;
+  suffix scan and a two-property flag scan -- keep bt itself fast at this graph size
+  (bt p50s of roughly 130-160ms and 11-17ms respectively), but pg's own baseline is
+  noisier and, for the suffix scan, ranges as high as ~1400ms across runs; both shapes
+  were measured below their target ratio on a busy shared machine;
   repeated runs traced this to ordinary scheduling noise on shapes whose absolute cost
   is small enough for it to swing the ratio across the line, not a code regression. See
   `bench/cypherbench/README.md`'s "Measured at 5M" table for the full numbers, the

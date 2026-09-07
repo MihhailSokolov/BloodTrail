@@ -164,9 +164,14 @@ against `shapeThreshold.engineAbsoluteCap`:
 **Where these numbers come from:** `group_members_bfs`'s 50s bound and the
 three bounded/filtered shapes' 2s/5s/5s bounds are now measured evidence
 from a real 4.76M-node/~48.9M-edge run (`bench/adgen -users 2800000
--domains 4`), each giving comfortable (>20x, and often >100x) headroom over
-its own measured bt p50. `fetch_directed_graph_memberof`'s 15s bound is the
-one exception: the same run measured its own bt p50 at ~37-45s -- *above*,
+-domains 4`). The three bounded/filtered shapes each get comfortable (>20x,
+and often >100x) headroom over their own measured bt p50; `group_members_bfs`
+is the odd one out even among these measured bounds -- its 50s cap is only
+~1.75x its own measured p50 (see the table above), a deliberately tight
+margin given how expensive a full BFS traversal already is at this scale,
+not the same order-of-magnitude cushion the cheaper shapes get for free.
+`fetch_directed_graph_memberof`'s 15s bound is a different kind of
+exception: the same run measured its own bt p50 at ~37-45s -- *above*,
 not below, its current cap -- because this shape's pg baseline has never
 actually exceeded `-pg-cap` at 5M scale (so the cap path has never been
 exercised for real). If it ever were exercised, this cap would incorrectly

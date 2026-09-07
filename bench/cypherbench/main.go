@@ -198,15 +198,18 @@ const defaultPGCap = 120 * time.Second
 // certainly not been quietly slow -- it has been declined by TryCypher (see
 // internal/engine/engine.go's own decline reasons) and silently delegated to
 // PostgreSQL instead, which can then run for an unbounded time. This is
-// exactly the milestone-4.5 task-6b incident: collect_antijoin_prebuilt's
+// exactly the 2026-09 5M-scale bench incident: collect_antijoin_prebuilt's
 // bt-side call declined with reason=budget (interpret.ErrBudget -- the
 // query's own first MATCH clause seeds from a completely unconstrained
 // pattern variable, forcing a full 4.76M-node scan-and-traverse that exceeds
-// interpret.Budgets.MaxWork -- see internal/engine/interpret/expand.go's
-// expandVarLengthComponent, which always seeds a variable-length step from
-// its own FromSym regardless of which endpoint is actually cheaper to seed
-// from), and the resulting delegated recursive CTE ran for 17.5 hours before
-// being killed by hand. 15 minutes comfortably exceeds every other shape's
+// interpret.Budgets.MaxWork -- at the time, internal/engine/interpret/
+// expand.go's expandVarLengthComponent always seeded a variable-length step
+// from its own FromSym regardless of which endpoint was actually cheaper to
+// seed from; a later change on this same branch added constrained-side
+// reverse seeding, see expand.go's varLengthReverseEligible for the
+// mechanism that now picks the cheaper endpoint instead), and the resulting
+// delegated recursive CTE ran for 17.5 hours before being killed by hand.
+// 15 minutes comfortably exceeds every other shape's
 // bt-side latency (all measured well under 2s at 5M scale) while still
 // bounding a wrongly-hanging run to a human-noticeable, not
 // human-workday-consuming, wait.
@@ -828,7 +831,7 @@ func runCypherOnce(ctx context.Context, db graph.Database, text string) (time.Du
 // slow -- it means TryCypher declined (see internal/engine/engine.go's own
 // decline reasons) and wrappedTransaction.Query silently fell through to
 // PostgreSQL, which can then run for an unbounded time -- exactly the
-// milestone-4.5 task-6b incident (see defaultBTCap's own doc). So
+// 2026-09 5M-scale bench incident (see defaultBTCap's own doc). So
 // runCypherOnceCapped returns a hard, descriptive error naming both
 // shapeName and btCap instead of a "capped" bool: measureShape's caller
 // propagates this as a full run failure (nonzero exit), never a data point.

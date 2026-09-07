@@ -186,8 +186,8 @@ const defaultPGCap = 120 * time.Second
 // measure, so a bt call that has not returned within 15 minutes has almost
 // certainly not been quietly slow but instead been declined by the engine
 // and silently delegated to PostgreSQL, which can then run for an unbounded
-// time. See bench/cypherbench/main.go's defaultBTCap doc for the milestone
-// 4.5 task-6b incident this flag exists to catch (there, on cypherbench's
+// time. See bench/cypherbench/main.go's defaultBTCap doc for the 2026-09
+// 5M-scale bench incident this flag exists to catch (there, on cypherbench's
 // own collect_antijoin_prebuilt shape; builderbench's shapes have not shown
 // this, but the same silent-decline-then-unbounded-delegate failure mode
 // could in principle hit any bt-served shape here too, hence the identical
@@ -228,10 +228,17 @@ type shapeThreshold struct {
 //     smaller/filtered shapes below can. Measured 1.47x at 5M in the
 //     milestone-3 run this task defers from: honest physics for this
 //     shape, not a bug to chase with a uniform bar. engineAbsoluteCap 15s
-//     is a conservative estimate for a full 5M-scale MemberOf scan should
-//     its own pg baseline ever need capping (unmeasured as of this task --
-//     see the README's "Where these numbers come from" note); Task 21's
-//     real 5M run is expected to confirm or tighten it.
+//     was a conservative estimate for a full 5M-scale MemberOf scan should
+//     its own pg baseline ever need capping; a real 5M run has since
+//     measured this shape's own bt p50 at 37.3s / 45.3s across attempts --
+//     *above*, not below, the 15s cap (see the README's "Where these
+//     numbers come from" note). The cap is therefore known-undersized as
+//     written; it has not actually failed a real run only because this
+//     shape's pg baseline has never itself exceeded -pg-cap at 5M scale,
+//     so the pg_capped path (the only path that consults
+//     engineAbsoluteCap) has never been exercised for this shape. A
+//     follow-up owns re-measuring and re-setting this cap the same
+//     evidence-based way group_members_bfs's was.
 //   - group_members_bfs: minRatio 5x (unchanged), engineAbsoluteCap 50s.
 //     This is the shape the pg wall-clock cap exists for: its pg baseline
 //     is a per-node query storm (one BFS layer's worth of individual
@@ -806,7 +813,7 @@ func runPGCapped(ctx context.Context, oracle graph.Database, run func(context.Co
 // that has not returned within btCap has almost certainly not been quietly
 // slow -- it means the engine declined and the driver silently fell through
 // to PostgreSQL, which can then run for an unbounded time -- exactly the
-// milestone-4.5 task-6b incident (see defaultBTCap's own doc). So
+// 2026-09 5M-scale bench incident (see defaultBTCap's own doc). So
 // runBTCapped returns a hard, descriptive error naming both shapeName and
 // btCap instead of a "capped" bool: measureShape's caller propagates this
 // as a full run failure (nonzero exit), never a data point.

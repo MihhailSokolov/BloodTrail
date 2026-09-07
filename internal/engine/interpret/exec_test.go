@@ -1092,17 +1092,18 @@ func TestRefactorCharacterization(t *testing.T) {
 }
 
 // TestRunComponentFromDispatchMatchesRunComponent exercises runComponentFrom
-// -- the single per-chunk call the brief's Task 2 driver will make -- across
-// every branch of runComponent's own dispatch it reproduces (general fixed
-// BFS/closing, a multi-step chain via hasSpecialStep, a single var-length
-// step, and a named-path chain), checking each one reproduces both the exact
-// row set AND the exact meter.work total runComponent/scanAnchor already
-// produce for the identical query when fed the identical scanAnchor-sourced
-// anchor rows. runComponentFrom is not wired into any production call path
-// yet (Task 2 does that) and its tails are otherwise only exercised
-// indirectly through runComponent/expandChainComponent/
-// expandVarLengthComponent, so without this, its own dispatch switch would
-// have zero coverage.
+// -- the single per-chunk call pipeline.go's chunked LIMIT driver
+// (runComponentLimited) makes -- across every branch of runComponent's own
+// dispatch it reproduces (general fixed BFS/closing, a multi-step chain via
+// hasSpecialStep, a single var-length step, and a named-path chain),
+// checking each one reproduces both the exact row set AND the exact
+// meter.work total runComponent/scanAnchor already produce for the
+// identical query when fed the identical scanAnchor-sourced anchor rows.
+// runComponentFrom's own tails are otherwise only exercised indirectly
+// through runComponent/expandChainComponent/expandVarLengthComponent (via
+// runComponentLimited's chunk-at-a-time calls), so without this test, its
+// own dispatch switch would have no coverage that isolates it from that
+// chunking behavior.
 func TestRunComponentFromDispatchMatchesRunComponent(t *testing.T) {
 	check := func(t *testing.T, snap *snapshot.Snapshot, query, anchorSym string) {
 		t.Helper()
