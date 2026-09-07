@@ -523,11 +523,22 @@ func limitEligibleComponent(env *Env, meter *workMeter, part *Part) (comp compon
 // (see its doc comment) treats an anchorRows chunk as bound to for comp: the
 // component's own leftmost chain symbol (part.Chains[comp.stepIdxs[0]].
 // FromSym) for a special-step (var-length/shortestPath) or named-path
-// component -- exactly the symbol expandVarLengthComponent/
-// expandChainComponent themselves scan on the unlimited path -- or
-// chooseAnchor's own cost-ranked pick otherwise (the general BFS component,
-// including a single isolated node symbol, where chooseAnchor over a
-// one-element syms list trivially returns that element).
+// component -- exactly the symbol expandVarLengthComponentFrom/
+// expandChainComponentFrom bind an injected chunk to -- or chooseAnchor's own
+// cost-ranked pick otherwise (the general BFS component, including a single
+// isolated node symbol, where chooseAnchor over a one-element syms list
+// trivially returns that element).
+//
+// That "leftmost chain symbol" is a property of the per-chunk TAIL this driver
+// calls, not of the unlimited path in general: the unlimited var-length
+// executor (expandVarLengthComponent, expand.go) may instead choose to seed
+// from the pattern's FAR endpoint and walk backward when that endpoint is
+// dramatically cheaper to resolve. It has a whole graph's worth of candidates
+// in front of it when it decides; a chunked driver, whose entire mechanism is
+// "scan a bounded slice of ONE symbol, expand it, stop early", has no
+// equivalent choice to make and never takes that route -- see
+// expandVarLengthComponent's own doc comment for why the decision is kept out
+// of the per-chunk tail entirely.
 //
 // This does not itself validate that comp is actually servable this way --
 // limitEligibleComponent's own probe call does that. A component

@@ -1,0 +1,665 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package interpret
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"testing"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
+)
+
+// --- helpers: run one standalone var-length component BOTH ways -------------
+
+// varLengthPartAndStep plans query against snap and returns Part[0] together
+// with its single standalone variable-length Step -- exactly the (part, step)
+// pair runComponent hands expandVarLengthComponent -- so a test can drive the
+// forward-seeded and the constrained-side-seeded executors directly, side by
+// side, over identical inputs.
+func varLengthPartAndStep(t *testing.T, snap *snapshot.Snapshot, query string) (*Part, *Step) {
+	t.Helper()
+	q := planQuery(t, snap, query)
+	if len(q.Parts) != 1 {
+		t.Fatalf("query %q: got %d Parts, want 1", query, len(q.Parts))
+	}
+	part := &q.Parts[0]
+	comps := groupComponents(part)
+	if len(comps) != 1 || len(comps[0].stepIdxs) != 1 {
+		t.Fatalf("query %q: unexpected component shape %+v", query, comps)
+	}
+	step := &part.Chains[comps[0].stepIdxs[0]]
+	if step.Range == nil {
+		t.Fatalf("query %q: component step is not variable-length", query)
+	}
+	return part, step
+}
+
+// varLengthRowSigs renders a standalone variable-length component's own output
+// rows as a sorted, comparable multiset: each row's two endpoint bindings by
+// database id plus, when the pattern names a path, that path's complete
+// node/edge signature (pathSig). Sorting makes the comparison order-
+// independent while keeping MULTIPLICITY significant -- two rows binding the
+// same endpoint pair via two distinct trails stay two separate entries.
+func varLengthRowSigs(t *testing.T, snap *snapshot.Snapshot, step *Step, rows []*Row) []string {
+	t.Helper()
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		from, okFrom := r.Node(step.FromSym)
+		to, okTo := r.Node(step.ToSym)
+		if !okFrom || !okTo {
+			t.Fatalf("row is missing an endpoint binding (%s bound: %v, %s bound: %v)", step.FromSym, okFrom, step.ToSym, okTo)
+		}
+		sig := fmt.Sprintf("%s=%d %s=%d", step.FromSym, snap.GraphIDs[from], step.ToSym, snap.GraphIDs[to])
+		if step.PathSym != "" {
+			v, ok := r.PathVar(step.PathSym)
+			if !ok {
+				t.Fatalf("row is missing path binding %q", step.PathSym)
+			}
+			pv, ok := v.(*PathVal)
+			if !ok {
+				t.Fatalf("path binding %q is %T, want *PathVal", step.PathSym, v)
+			}
+			sig += " " + pathSig(snap, pv)
+		}
+		out = append(out, sig)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// runVarLengthBothWays runs query's single variable-length component twice --
+// once through the plain forward expansion seeded from the pattern's own
+// FromSym, once through the constrained-side expansion seeded from ToSym and
+// walked backward over the reverse CSR -- over the identical planned
+// Part/Step, applying the Part's complete WHERE to each result exactly as the
+// pipeline does, and returns both surviving row multisets plus the work each
+// direction spent.
+//
+// Filtering both sides through Part.Where before comparing is what makes the
+// comparison meaningful rather than merely lenient: the constrained-side
+// executor additionally evaluates ToSym's own pushed single-symbol predicates
+// while selecting its seeds, so its RAW output legitimately omits rows whose
+// ToSym binding fails such a predicate -- rows the forward executor does
+// produce and Part.Where (which always carries those same conjuncts in full)
+// then discards. Post-WHERE is the only stage at which the two are required to
+// agree, and the only one any caller ever observes.
+func runVarLengthBothWays(t *testing.T, snap *snapshot.Snapshot, query string) (forward, reverse []string, forwardWork, reverseWork int64) {
+	t.Helper()
+	env := &Env{Snap: snap}
+	part, step := varLengthPartAndStep(t, snap, query)
+
+	fwdMeter := &workMeter{budget: generousBudget}
+	fwdRows, err := expandVarLengthComponentForward(env, fwdMeter, part, step)
+	if err != nil {
+		t.Fatalf("query %q: forward expansion: %v", query, err)
+	}
+	fwdRows, err = filterRows(env, fwdRows, part.Where, nil)
+	if err != nil {
+		t.Fatalf("query %q: forward filterRows: %v", query, err)
+	}
+
+	revMeter := &workMeter{budget: generousBudget}
+	revRows, err := expandVarLengthComponentReverse(env, revMeter, part, step)
+	if err != nil {
+		t.Fatalf("query %q: reverse expansion: %v", query, err)
+	}
+	revRows, err = filterRows(env, revRows, part.Where, nil)
+	if err != nil {
+		t.Fatalf("query %q: reverse filterRows: %v", query, err)
+	}
+
+	return varLengthRowSigs(t, snap, step, fwdRows), varLengthRowSigs(t, snap, step, revRows), fwdMeter.work, revMeter.work
+}
+
+// assertVarLengthDirectionsAgree asserts query's forward and constrained-side
+// expansions produce identical post-WHERE row multisets (see
+// runVarLengthBothWays), and -- so the comparison can never quietly become
+// vacuous -- that the dispatcher's own eligibility rule actually selects the
+// reverse route for this shape.
+func assertVarLengthDirectionsAgree(t *testing.T, snap *snapshot.Snapshot, query string) {
+	t.Helper()
+	env := &Env{Snap: snap}
+	part, step := varLengthPartAndStep(t, snap, query)
+	if !varLengthReverseEligible(env, part, step) {
+		t.Fatalf("query %q: varLengthReverseEligible = false; this harness only compares shapes the dispatcher actually reverses", query)
+	}
+
+	forward, reverse, _, _ := runVarLengthBothWays(t, snap, query)
+	if len(forward) != len(reverse) {
+		t.Fatalf("query %q: reverse produced %d rows, forward produced %d\nreverse: %v\nforward: %v", query, len(reverse), len(forward), reverse, forward)
+	}
+	for i := range forward {
+		if forward[i] != reverse[i] {
+			t.Fatalf("query %q: row multiset mismatch\nreverse: %v\nforward: %v", query, reverse, forward)
+		}
+	}
+}
+
+// --- fixtures ---------------------------------------------------------------
+
+const (
+	revKindSrc    snapshot.KindID = 1
+	revKindTarget snapshot.KindID = 2
+	revKindE      snapshot.KindID = 10
+	revKindF      snapshot.KindID = 11
+)
+
+var revKindTable = map[snapshot.KindID]string{
+	revKindSrc:    "Src",
+	revKindTarget: "Target",
+	revKindE:      "E",
+	revKindF:      "F",
+}
+
+// buildReverseEqualityFixture builds one deliberately awkward snapshot that
+// exercises, in a single graph, every trail-semantics corner the two
+// enumeration directions have to agree about:
+//
+//   - a diamond fan-in (node 1 reaches node 6 through both node 3 and node 4),
+//   - parallel edges of the same kind between the same ordered pair (2->6
+//     twice), which must stay two distinct trails,
+//   - a directed cycle (5->6->7->5) exercising the relationship-uniqueness
+//     rule in both walk directions,
+//   - a mid-trail self-loop (3->3),
+//   - a node carrying BOTH endpoint kinds (node 5), so `*0..` can bind the two
+//     pattern endpoints to the same node,
+//   - a second edge kind (2->3 via F) that a `[:E...]` pattern must exclude,
+//   - a Target node whose objectid does NOT match (node 7), so the
+//     constrained-side seed selection has something to reject,
+//   - an isolated node (8) reachable from nothing.
+func buildReverseEqualityFixture(t *testing.T) *snapshot.Snapshot {
+	t.Helper()
+	return buildExecSnapshot(t, revKindTable,
+		[]execNodeSpec{
+			{1, []snapshot.KindID{revKindSrc}, nil},
+			{2, []snapshot.KindID{revKindSrc}, nil},
+			{3, nil, nil},
+			{4, nil, nil},
+			{5, []snapshot.KindID{revKindSrc, revKindTarget}, map[string]any{"objectid": "T-516"}},
+			{6, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "T-516"}},
+			{7, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "T-999"}},
+			{8, nil, nil},
+		},
+		[]execEdgeSpec{
+			{100, 1, 3, revKindE},
+			{101, 3, 6, revKindE},
+			{102, 1, 4, revKindE},
+			{103, 4, 6, revKindE},
+			{104, 2, 6, revKindE},
+			{105, 2, 6, revKindE},
+			{106, 6, 7, revKindE},
+			{107, 3, 3, revKindE},
+			{108, 7, 5, revKindE},
+			{109, 5, 6, revKindE},
+			{110, 2, 3, revKindF},
+		},
+	)
+}
+
+// TestVarLengthReverseEqualsForwardAcrossShapes is this change's central
+// correctness guard: over one graph packed with trail-semantics corner cases
+// (buildReverseEqualityFixture), every reverse-eligible pattern spelling must
+// produce exactly the rows -- and, for a named path, exactly the node/edge
+// sequences -- the plain forward expansion produces for the same query.
+func TestVarLengthReverseEqualsForwardAcrossShapes(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+
+	for _, query := range []string{
+		// objectid equality anchor on the far endpoint.
+		`MATCH (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`,
+		`MATCH p = (s)-[:E*1..4]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`,
+		// Lower bounds: the zero-length arm, a plain 1, and a raised floor.
+		`MATCH p = (s)-[:E*0..2]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`,
+		`MATCH p = (s)-[:E*2..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`,
+		// A kind-constrained near endpoint, checked on every REACHED node.
+		`MATCH (s:Src)-[:E*0..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`,
+		// Backward-arrow spelling: the path must still render in the order the
+		// pattern was WRITTEN, regardless of which way either executor walked.
+		`MATCH p = (t:Target)<-[:E*1..3]-(s) WHERE t.objectid = 'T-516' RETURN p`,
+		// id() anchor on the far endpoint instead of an objectid.
+		`MATCH (s)-[:E*1..5]->(x) WHERE id(x) = 6 RETURN s, x`,
+		`MATCH p = (s)-[:E*1..5]->(x) WHERE id(x) = 6 RETURN p`,
+		// Edge-kind disjunction, and the far endpoint narrowed by a plain
+		// predicate rather than an anchor -- the shape that motivates this
+		// whole route (a wide, unconstrained near side; a kind bitmap cut down
+		// to a handful of nodes by a pushed single-symbol predicate).
+		`MATCH p = (s)-[:E|F*1..3]->(t:Target) WHERE t.objectid ENDS WITH '-516' RETURN p`,
+		`MATCH (s)-[:E*1..4]->(t:Target) WHERE t.objectid ENDS WITH '-516' RETURN s, t`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			assertVarLengthDirectionsAgree(t, snap, query)
+		})
+	}
+}
+
+// TestVarLengthReverseMultiplicity pins COLLECT-visible multiplicity through
+// the full pipeline, against hand-derived expectations: a reverse-seeded run
+// must emit one row per distinct TRAIL, never one row per endpoint pair, both
+// when the duplication comes from parallel edges and when it comes from two
+// different routes through the graph.
+func TestVarLengthReverseMultiplicity(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+
+	pair := func(from, to uint64) string {
+		t.Helper()
+		f, _ := snap.Dense(from)
+		to2, _ := snap.Dense(to)
+		return rowKey([]OutVal{{Kind: OutNode, Node: f}, {Kind: OutNode, Node: to2}})
+	}
+	requireReversed := func(t *testing.T, query string) {
+		t.Helper()
+		part, step := varLengthPartAndStep(t, snap, query)
+		if !varLengthReverseEligible(&Env{Snap: snap}, part, step) {
+			t.Fatalf("query %q: want reverse-eligible", query)
+		}
+	}
+
+	t.Run("parallel edges stay two rows", func(t *testing.T) {
+		// The two matching Targets are nodes 5 and 6. Node 6's in-edges are
+		// 3->6, 4->6, and the parallel pair 2->6/2->6; node 5's is 7->5.
+		const query = `MATCH (s)-[:E*1..1]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		requireReversed(t, query)
+		assertVarLengthDirectionsAgree(t, snap, query)
+		assertRowSet(t, mustExec(t, snap, query, generousBudget), []string{
+			pair(2, 6), pair(2, 6), // parallel edges 104 and 105
+			pair(3, 6),
+			pair(4, 6),
+			pair(5, 6),
+			pair(7, 5),
+		})
+	})
+
+	t.Run("two routes onto one pair stay two rows", func(t *testing.T) {
+		// 1-3-6 and 1-4-6 are two distinct length-2 trails onto the SAME
+		// endpoint pair. 3-3-6 is not among the answers: its first edge is the
+		// 3->3 self-loop, which a two-edge trail may never begin with.
+		const query = `MATCH (s)-[:E*2..2]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		requireReversed(t, query)
+		assertVarLengthDirectionsAgree(t, snap, query)
+		assertRowSet(t, mustExec(t, snap, query, generousBudget), []string{
+			pair(1, 6), pair(1, 6), // via node 3 and via node 4
+			pair(7, 6), // 7->5 then 5->6
+			pair(6, 5), // 6->7 then 7->5
+		})
+	})
+}
+
+// buildReverseSelfLoopFixture builds the first-edge-self-loop fixture: node 1
+// carries a self-loop AND is itself a matching Target, node 1 also points at a
+// second matching Target (node 2), and node 3 points into node 1.
+//
+// Forward expansion emits a trail whose FIRST edge is a self-loop at depth 1
+// but never extends it, so `[1 -(self)- 1 -> 2]` must NOT exist. Backward
+// expansion discovers that same first edge LAST, so it cannot prune the branch
+// (a self-loop reached deeper is legal and extendable, e.g. `[3 -> 1 -(self)-
+// 1]`); it has to suppress emission at exactly the moment the most recently
+// walked edge is a self-loop and the trail is already two or more edges long.
+func buildReverseSelfLoopFixture(t *testing.T) *snapshot.Snapshot {
+	t.Helper()
+	return buildExecSnapshot(t, revKindTable,
+		[]execNodeSpec{
+			{1, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "S-516"}},
+			{2, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "S-516"}},
+			{3, nil, nil},
+		},
+		[]execEdgeSpec{
+			{200, 1, 1, revKindE},
+			{201, 1, 2, revKindE},
+			{202, 3, 1, revKindE},
+		},
+	)
+}
+
+// TestVarLengthReverseFirstEdgeSelfLoopRule asserts both halves of the
+// first-edge self-loop rule survive backward discovery, against a hand-derived
+// expected trail set (not one computed by either executor).
+func TestVarLengthReverseFirstEdgeSelfLoopRule(t *testing.T) {
+	snap := buildReverseSelfLoopFixture(t)
+	const query = `MATCH p = (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'S-516' RETURN p`
+
+	env := &Env{Snap: snap}
+	part, step := varLengthPartAndStep(t, snap, query)
+	if !varLengthReverseEligible(env, part, step) {
+		t.Fatalf("query %q: want reverse-eligible", query)
+	}
+
+	assertVarLengthDirectionsAgree(t, snap, query)
+
+	// The hand-derived set. Note what is absent: "N:1,1,2,|E:200,201," -- the
+	// trail whose first edge is the self-loop and which is then extended --
+	// which a backward walk would happily enumerate without the suppression
+	// rule, and which forward expansion can never produce.
+	assertPathSigs(t, snap, query, 0, []string{
+		"N:1,1,|E:200,",             // depth-1 self-loop trail: emitted
+		"N:1,2,|E:201,",             // ordinary depth-1 trail
+		"N:3,1,|E:202,",             // ordinary depth-1 trail
+		"N:3,1,1,|E:202,200,",       // self-loop reached mid-trail: legal
+		"N:3,1,2,|E:202,201,",       // ordinary depth-2 trail
+		"N:3,1,1,2,|E:202,200,201,", // self-loop mid-trail, extended further
+	})
+}
+
+// TestVarLengthReverseZeroLengthBindsSameNode pins the `*0..` arm under
+// backward seeding: a zero-length row binds both pattern endpoints to the same
+// node, and is admitted only when that node satisfies the NEAR endpoint's own
+// constraint too -- the mirror image of the forward executor checking the FAR
+// endpoint's constraint on each seed.
+func TestVarLengthReverseZeroLengthBindsSameNode(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+
+	t.Run("unconstrained near endpoint admits every seed", func(t *testing.T) {
+		const query = `MATCH (s)-[:E*0..0]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		assertVarLengthDirectionsAgree(t, snap, query)
+
+		rs := mustExec(t, snap, query, generousBudget)
+		n5, _ := snap.Dense(5)
+		n6, _ := snap.Dense(6)
+		assertRowSet(t, rs, []string{
+			rowKey([]OutVal{{Kind: OutNode, Node: n5}, {Kind: OutNode, Node: n5}}),
+			rowKey([]OutVal{{Kind: OutNode, Node: n6}, {Kind: OutNode, Node: n6}}),
+		})
+	})
+
+	t.Run("kind-constrained near endpoint filters the seed", func(t *testing.T) {
+		// Node 5 carries both Src and Target; node 6 carries only Target, so
+		// only node 5 can satisfy `(s:Src)` at zero length.
+		const query = `MATCH (s:Src)-[:E*0..0]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		assertVarLengthDirectionsAgree(t, snap, query)
+
+		rs := mustExec(t, snap, query, generousBudget)
+		n5, _ := snap.Dense(5)
+		assertRowSet(t, rs, []string{
+			rowKey([]OutVal{{Kind: OutNode, Node: n5}, {Kind: OutNode, Node: n5}}),
+		})
+	})
+}
+
+// TestVarLengthReversePatternOrderPath pins path assembly under backward
+// discovery against hand-derived signatures for both arrow spellings: a
+// forward arrow renders FromSym first, a backward arrow renders the
+// pattern's own first-written endpoint first, in both cases regardless of the
+// direction the executor actually walked.
+func TestVarLengthReversePatternOrderPath(t *testing.T) {
+	snap := buildExecSnapshot(t, revKindTable,
+		[]execNodeSpec{
+			{1, []snapshot.KindID{revKindSrc}, nil},
+			{2, nil, nil},
+			{3, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "P-516"}},
+		},
+		[]execEdgeSpec{
+			{300, 1, 2, revKindE},
+			{301, 2, 3, revKindE},
+		},
+	)
+
+	t.Run("forward arrow", func(t *testing.T) {
+		const query = `MATCH p = (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'P-516' RETURN p`
+		assertVarLengthDirectionsAgree(t, snap, query)
+		assertPathSigs(t, snap, query, 0, []string{
+			"N:2,3,|E:301,",
+			"N:1,2,3,|E:300,301,",
+		})
+	})
+
+	t.Run("backward arrow", func(t *testing.T) {
+		const query = `MATCH p = (t:Target)<-[:E*1..3]-(s) WHERE t.objectid = 'P-516' RETURN p`
+		assertVarLengthDirectionsAgree(t, snap, query)
+		assertPathSigs(t, snap, query, 0, []string{
+			"N:3,2,|E:301,",
+			"N:3,2,1,|E:301,300,",
+		})
+	})
+}
+
+// TestVarLengthReverseMultiSeedDisjointComponents pins that every matching
+// far-endpoint seed is expanded, not just the first: two structurally
+// identical, mutually unreachable clusters each carry their own matching
+// Target.
+func TestVarLengthReverseMultiSeedDisjointComponents(t *testing.T) {
+	snap := buildExecSnapshot(t, revKindTable,
+		[]execNodeSpec{
+			{1, nil, nil},
+			{2, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "D1-516"}},
+			{11, nil, nil},
+			{12, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "D2-516"}},
+			{21, nil, nil},
+			{22, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "D3-999"}},
+		},
+		[]execEdgeSpec{
+			{400, 1, 2, revKindE},
+			{401, 11, 12, revKindE},
+			{402, 21, 22, revKindE},
+		},
+	)
+
+	const query = `MATCH (s)-[:E*1..2]->(t:Target) WHERE t.objectid ENDS WITH '-516' RETURN s, t`
+	assertVarLengthDirectionsAgree(t, snap, query)
+
+	rs := mustExec(t, snap, query, generousBudget)
+	n1, _ := snap.Dense(1)
+	n2, _ := snap.Dense(2)
+	n11, _ := snap.Dense(11)
+	n12, _ := snap.Dense(12)
+	assertRowSet(t, rs, []string{
+		rowKey([]OutVal{{Kind: OutNode, Node: n1}, {Kind: OutNode, Node: n2}}),
+		rowKey([]OutVal{{Kind: OutNode, Node: n11}, {Kind: OutNode, Node: n12}}),
+	})
+}
+
+// --- eligibility ------------------------------------------------------------
+
+// TestVarLengthReverseEligible pins the eligibility rule shape by shape: the
+// far endpoint must genuinely narrow (ids/objectid/pushed predicates), the
+// near endpoint must not (it is the wide side this route exists to avoid
+// enumerating), and the far side's own candidate source must be strictly
+// cheaper to enumerate than the near side's.
+func TestVarLengthReverseEligible(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+	env := &Env{Snap: snap}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{
+			name:  "wide near side, objectid-anchored far side",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`,
+			want:  true,
+		},
+		{
+			name:  "wide near side, predicate-narrowed kind bitmap far side",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) WHERE t.objectid ENDS WITH '-516' RETURN s, t`,
+			want:  true,
+		},
+		{
+			name:  "kind-constrained near side, id-anchored far side",
+			query: `MATCH (s:Src)-[:E*1..3]->(x) WHERE id(x) = 6 RETURN s, x`,
+			want:  true,
+		},
+		{
+			name:  "far side carries kinds only: nothing narrows it",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) RETURN s, t`,
+			want:  false,
+		},
+		{
+			name:  "far side wholly unconstrained",
+			query: `MATCH (s:Src)-[:E*1..3]->(t) RETURN s, t`,
+			want:  false,
+		},
+		{
+			// Deliberately arranged so the far side WOULD win the cost
+			// comparison on its own (an objectid anchor against a kind
+			// bitmap): only the "the near side already narrows" guard can
+			// reject this one, so it is what this case actually pins.
+			name:  "near side narrows too: it is already the cheap side",
+			query: `MATCH (s:Src)-[:E*1..3]->(t:Target) WHERE s.name STARTS WITH 'a' AND t.objectid = 'T-516' RETURN s, t`,
+			want:  false,
+		},
+		{
+			name:  "near side anchored by id(): already the cheap side",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) WHERE id(s) = 1 AND t.objectid = 'T-516' RETURN s, t`,
+			want:  false,
+		},
+		{
+			name:  "far side's candidate source is not cheaper than the near side's",
+			query: `MATCH (s:Target)-[:E*1..3]->(t:Src) WHERE t.objectid ENDS WITH '-516' RETURN s, t`,
+			want:  false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			part, step := varLengthPartAndStep(t, snap, tc.query)
+			if got := varLengthReverseEligible(env, part, step); got != tc.want {
+				t.Fatalf("varLengthReverseEligible(%q) = %v, want %v", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- work reduction ---------------------------------------------------------
+
+// buildReverseAsymmetricFixture builds the asymmetric shape this whole route
+// exists for: many unconstrained nodes, exactly one of which reaches the
+// single objectid-anchored Target. Forward expansion has to visit every one of
+// them (a full-snapshot anchor scan plus one expansion per node); backward
+// expansion starts from the one Target and walks a single edge.
+func buildReverseAsymmetricFixture(t *testing.T, wide int) *snapshot.Snapshot {
+	t.Helper()
+	nodes := make([]execNodeSpec, 0, wide+1)
+	for i := 1; i <= wide; i++ {
+		nodes = append(nodes, execNodeSpec{uint64(i), nil, nil})
+	}
+	nodes = append(nodes, execNodeSpec{9000, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "W-516"}})
+	return buildExecSnapshot(t, revKindTable, nodes,
+		[]execEdgeSpec{{5000, 1, 9000, revKindE}},
+	)
+}
+
+// TestVarLengthReverseSpendsFarLessWork calibrates the two directions against
+// each other on that asymmetric fixture rather than hard-coding either figure:
+// the reverse route must cost a small fraction of the forward route while
+// producing the identical rows.
+func TestVarLengthReverseSpendsFarLessWork(t *testing.T) {
+	const wide = 400
+	snap := buildReverseAsymmetricFixture(t, wide)
+	const query = `MATCH (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'W-516' RETURN s, t`
+
+	forward, reverse, forwardWork, reverseWork := runVarLengthBothWays(t, snap, query)
+	if len(forward) != 1 || len(reverse) != 1 || forward[0] != reverse[0] {
+		t.Fatalf("row multiset mismatch\nreverse: %v\nforward: %v", reverse, forward)
+	}
+	if forwardWork < 2*wide {
+		t.Fatalf("forward work = %d, want >= %d (the forward route must actually scan the wide side)", forwardWork, 2*wide)
+	}
+	if reverseWork*10 >= forwardWork {
+		t.Fatalf("reverse work = %d, want well under a tenth of the forward route's %d", reverseWork, forwardWork)
+	}
+}
+
+// TestVarLengthReverseDeclinesOnBudget pins that a genuinely huge BACKWARD
+// subgraph still declines cleanly rather than serving a truncated answer: an
+// 8-node clique whose one objectid-anchored Target is reachable backward from
+// everywhere, searched `*1..4` under a tiny work budget.
+func TestVarLengthReverseDeclinesOnBudget(t *testing.T) {
+	nodes := []execNodeSpec{{1, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "C-516"}}}
+	for i := uint64(2); i <= 8; i++ {
+		nodes = append(nodes, execNodeSpec{i, nil, nil})
+	}
+	var edges []execEdgeSpec
+	nextEdgeID := uint64(1)
+	for u := uint64(1); u <= 8; u++ {
+		for v := uint64(1); v <= 8; v++ {
+			if u == v {
+				continue
+			}
+			edges = append(edges, execEdgeSpec{nextEdgeID, u, v, revKindE})
+			nextEdgeID++
+		}
+	}
+	snap := buildExecSnapshot(t, revKindTable, nodes, edges)
+
+	const query = `MATCH p = (s)-[:E*1..4]->(t:Target) WHERE t.objectid = 'C-516' RETURN p`
+	env := &Env{Snap: snap}
+	part, step := varLengthPartAndStep(t, snap, query)
+	if !varLengthReverseEligible(env, part, step) {
+		t.Fatalf("query %q: want reverse-eligible", query)
+	}
+
+	err := execExpectErr(t, snap, query, Budgets{MaxRows: 1_000_000, MaxWork: 1200})
+	if !errors.Is(err, ErrBudget) {
+		t.Fatalf("Execute() error = %v, want ErrBudget", err)
+	}
+}
+
+// --- isolation from the chunked LIMIT driver --------------------------------
+
+// TestVarLengthReverseNotUsedByChunkedLimitDriver pins that the chunked LIMIT
+// early-termination driver keeps taking the forward route, byte for byte, over
+// a pattern the full executor WOULD reverse. The chunked driver grows a
+// caller-supplied chunk of FromSym anchor rows, so it structurally cannot host
+// a ToSym-seeded walk; the reversal decision therefore lives only inside the
+// full (non-chunked) executor, and this test is what keeps it there.
+//
+// The assertion is exact, not approximate: the whole query's work must equal
+// the forward decomposition it is built from -- one full FromSym anchor scan,
+// one forward trail walk per anchor row, and one final-row charge per surviving
+// row -- which is the identical figure the chunked driver produced before the
+// reverse route existed. A reverse-seeded chunk would come in far below it.
+//
+// That baseline is deliberately assembled from the FORWARD TRAIL PRIMITIVE
+// (expandVarLengthTrailsForSeed) rather than from the per-chunk component tail
+// the driver itself calls: a baseline built out of the very function under
+// test would move in lockstep with any mistake in it, and a comparison whose
+// two sides share a bug can never fail. The fixture is likewise sized past the
+// driver's own chunk size, so a per-chunk tail that ignored its anchor rows and
+// re-ran the whole component would show up as duplicated result rows here, not
+// merely as a different work total.
+func TestVarLengthReverseNotUsedByChunkedLimitDriver(t *testing.T) {
+	const wide = 2*limitChunk + 1
+	snap := buildReverseAsymmetricFixture(t, wide)
+	env := &Env{Snap: snap}
+
+	const base = `MATCH (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'W-516' RETURN s, t`
+	part, step := varLengthPartAndStep(t, snap, base)
+	if !varLengthReverseEligible(env, part, step) {
+		t.Fatalf("query %q: want reverse-eligible (otherwise this test proves nothing)", base)
+	}
+
+	// Reconstruct the forward figure from its own pieces.
+	fwd := &workMeter{budget: generousBudget}
+	anchorRows, err := scanAnchor(env, fwd, step.FromSym, part.Nodes[step.FromSym])
+	if err != nil {
+		t.Fatalf("scanAnchor: %v", err)
+	}
+	var rows []*Row
+	for _, seed := range anchorRows {
+		grown, err := expandVarLengthTrailsForSeed(env, fwd, step, part.Nodes[step.ToSym], seed, step.PathSym)
+		if err != nil {
+			t.Fatalf("expandVarLengthTrailsForSeed: %v", err)
+		}
+		rows = append(rows, grown...)
+	}
+	rows, err = filterRows(env, rows, part.Where, nil)
+	if err != nil {
+		t.Fatalf("filterRows: %v", err)
+	}
+	wantWork := fwd.work + int64(len(rows)) // one addFinalRow charge per surviving row
+	if wantWork < 2*int64(wide) {
+		t.Fatalf("forward baseline = %d, want at least the %d-unit near-side anchor scan", wantWork, 2*wide)
+	}
+
+	q := planQuery(t, snap, base+` LIMIT 5`)
+	meter := &workMeter{budget: generousBudget}
+	rs, err := runQuery(env, q, meter)
+	if err != nil {
+		t.Fatalf("runQuery: %v", err)
+	}
+	if len(rs.Rows) != len(rows) {
+		t.Fatalf("got %d rows, want %d", len(rs.Rows), len(rows))
+	}
+	if meter.work != wantWork {
+		t.Fatalf("meter.work = %d, want %d (the chunked LIMIT driver must still run the forward route unchanged)", meter.work, wantWork)
+	}
+}

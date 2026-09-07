@@ -68,11 +68,25 @@
 //     constraint -- there is no dawgs equivalent of "this row's kind
 //     matched early, stop recursing").
 //
+// None of the rules above says anything about which DIRECTION the graph is
+// walked in: every one of them is a property of the finished trail, not of the
+// order its edges were discovered. That is what lets a standalone
+// variable-length pattern whose far endpoint is far cheaper to resolve than
+// its near one be enumerated backward over the snapshot's reverse CSR instead,
+// seeded from that endpoint, producing the identical rows for a small fraction
+// of the work -- see varLengthReverseEligible for when that swap is taken and
+// expandVarLengthTrailsToSeed for the clause-by-clause argument that it
+// preserves every rule above (including the first-edge self-loop rule, the one
+// place where the two directions need visibly different bookkeeping to reach
+// the same answer).
+//
 // Work accounting matches exec.go's documented model exactly: adjacency()
 // already spends one work unit per adjacency slot inspected; this file adds
 // exactly one more per row actually emitted (the same "inspect, then charge
 // again for what survives" two-tier pattern expandStep/verifyClosingStep/
-// scanAnchor already use).
+// scanAnchor already use). Both enumeration directions charge at the same
+// points, so the reverse route's much lower total is a genuine reduction in
+// graph visited, not a gap in accounting.
 //
 // --- shortestPath/allShortestPaths execution ------------------------------
 //
@@ -177,11 +191,47 @@ func containsFwd(edges []EdgeRef, fwd uint64) bool {
 // via two distinct symbols each anchored to the same id() instead, which
 // this function already handles correctly through the ordinary ToSym
 // post-filter).
+//
+// Which of the pattern's two endpoints this function actually seeds from is
+// decided by varLengthReverseEligible (below), NOT fixed at FromSym: a pattern
+// whose far endpoint resolves to a handful of nodes while its near endpoint
+// matches everything (`(s)-[:MemberOf*0..]->(g:Group) WHERE g.objectid ENDS
+// WITH '-516'`) is dramatically cheaper to enumerate backward over the
+// snapshot's reverse CSR, and produces exactly the same rows. See
+// expandVarLengthTrailsToSeed's own doc comment for the trail-by-trail
+// argument that the two routes agree, and varLengthReverseEligible for when
+// the swap is taken at all.
+//
+// That decision deliberately lives HERE, in the full executor, and not in
+// expandVarLengthComponentFrom -- the tail a chunked LIMIT driver calls once
+// per batch of FromSym anchor rows it has already collected. Such a driver's
+// whole mechanism is "scan a bounded chunk of the near endpoint, expand it,
+// stop once enough rows survive"; a ToSym-seeded walk has no near-endpoint
+// chunk to be handed, would ignore the anchor rows it was given, and would
+// re-enumerate the entire pattern on every batch. Keeping the choice out of
+// that tail also leaves the driver's own zero-cost eligibility probe (a call
+// with no anchor rows at all) reading exactly the decline it always did.
+// Combining early termination with constrained-side seeding is a separate
+// piece of work needing its own stopping rule, not a variation on this one.
 func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step) ([]*Row, error) {
 	if step.EdgeSym != "" || step.FromSym == step.ToSym {
 		return nil, errUnsupportedStep
 	}
 
+	if varLengthReverseEligible(env, part, step) {
+		return expandVarLengthComponentReverse(env, meter, part, step)
+	}
+	return expandVarLengthComponentForward(env, meter, part, step)
+}
+
+// expandVarLengthComponentForward is the ordinary route: scan the pattern's
+// own FromSym for seed rows, then grow each one forward across step. Split out
+// of expandVarLengthComponent purely so the dispatch above reads as a choice
+// between two named, independently testable routes -- the behavior here is
+// exactly what expandVarLengthComponent always did, including the fact that
+// the EdgeSym/FromSym==ToSym decline above happens BEFORE any anchor scan is
+// charged for.
+func expandVarLengthComponentForward(env *Env, meter *workMeter, part *Part, step *Step) ([]*Row, error) {
 	seeds, err := scanAnchor(env, meter, step.FromSym, part.Nodes[step.FromSym])
 	if err != nil {
 		return nil, err
@@ -331,6 +381,278 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 				nodes:           nextNodes,
 				edges:           nextEdges,
 				firstIsSelfLoop: cur.firstIsSelfLoop || (depth == 0 && c.other == curNode),
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// --- var-length trail expansion, seeded from the constrained side ----------
+
+// varLengthReverseEligible reports whether step -- a standalone
+// variable-length pattern whose EdgeSym/self-pattern preconditions the caller
+// has already checked -- is cheaper to enumerate backward from its far
+// endpoint than forward from its near one.
+//
+// The cost test is a comparison of the two endpoints' own CANDIDATE SOURCES
+// (anchorRank: an id() lookup beats an objectid lookup beats the smallest
+// AND-ed kind bitmap beats a full node scan, ties broken by bitmap
+// population), not a fixed "N times smaller" multiple of their sizes.
+//
+// A fixed multiple is the obvious alternative and it is wrong here, in both
+// directions. Too high a multiple rejects the exact shape this route exists
+// for: in an Active-Directory-shaped graph roughly one node in eight is a
+// Group, so `(s)-[:MemberOf*0..]->(g:Group) WHERE g.objectid ENDS WITH '-516'`
+// -- whose far side really resolves to a handful of nodes once the pushed
+// predicate runs -- separates its two candidate SOURCES by well under an order
+// of magnitude, even though the near side is every node in the graph and the
+// far side ends up being four of them. Too low a multiple is not safe either,
+// since a raw size ratio says nothing about how much a pushed predicate will
+// cut the far side down. The tier comparison sidesteps both: it is exactly the
+// ordering the ordinary anchor chooser already trusts to pick a component's
+// cheapest starting symbol, applied to the same question here.
+//
+// Two further conditions make that comparison sound rather than merely
+// plausible:
+//
+//   - The far endpoint must genuinely NARROW -- carry ids, an objectid anchor,
+//     or pushed single-symbol predicates -- not merely carry kind labels. A
+//     kinds-only far endpoint contributes no filtering beyond what its own
+//     candidate source already enumerates, so seeding from it buys nothing
+//     while giving up the near side's structure.
+//   - The near endpoint must NOT narrow. If it does, it is already the cheap
+//     side and the ordinary forward route is the right one.
+//
+// Together these bound the cost of being wrong. The far side's candidate
+// source is, by the tier comparison, never more expensive to enumerate than
+// the near side's -- which the forward route pays unconditionally -- so
+// choosing this route can cost at most one extra pass over a strictly smaller
+// candidate set (the pushed predicates evaluated while seeding), never an
+// unbounded gamble. And when this function declines, the forward route runs
+// having spent nothing at all: every input to the decision is read from
+// constraint metadata and live kind-bitmap populations, with no metered work
+// of its own, so an ineligible pattern's row set, error behavior and work
+// total are all exactly what they were before this route existed.
+//
+// The direction requirement is defensive rather than load-bearing: an
+// undirected variable-length pattern is already rejected at plan time (a
+// compiled Step with a Range always carries an outbound direction), but this
+// route walks the reverse CSR unconditionally once chosen, so it states the
+// precondition it actually relies on rather than inheriting it.
+func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
+	if step.Direction != graph.DirectionOutbound {
+		return false
+	}
+	fromNC, toNC := part.Nodes[step.FromSym], part.Nodes[step.ToSym]
+	if !endpointNarrows(toNC) || endpointNarrows(fromNC) {
+		return false
+	}
+	return rankOf(env, toNC).better(rankOf(env, fromNC))
+}
+
+// endpointNarrows reports whether nc actually cuts its symbol's candidate set
+// below whatever its candidate source already enumerates: explicit ids, an
+// objectid anchor, or pushed single-symbol WHERE predicates. Kind labels alone
+// do not count -- the kind bitmap IS the candidate source for a kinds-only
+// constraint, so re-checking it filters nothing.
+func endpointNarrows(nc *NodeConstraint) bool {
+	return nc != nil && (len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || len(nc.Predicates) > 0)
+}
+
+// expandVarLengthComponentReverse enumerates step's trails backward: it
+// resolves the pattern's far endpoint (ToSym) to a concrete node-id set --
+// including that endpoint's own pushed single-symbol predicates, exactly the
+// way a shortestPath pattern's narrowing side is resolved -- and grows each of
+// those nodes backward over the snapshot's reverse CSR, binding the pattern's
+// near endpoint (FromSym) on every node it reaches.
+//
+// Applying ToSym's pushed predicates while seeding is what makes this route
+// worth taking at all (they are usually the entire reason the far side is
+// small), and it is safe because those predicates are a redundant copy of
+// conjuncts the owning Part's complete WHERE still carries: every row this
+// route declines to produce for failing one is a row the forward route
+// produces and the pipeline's own WHERE pass then discards. The two routes
+// therefore agree on exactly the quantity any caller observes -- the
+// post-WHERE result -- while this one avoids walking the graph for rows
+// destined to be thrown away.
+func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, step *Step) ([]*Row, error) {
+	fromNC := part.Nodes[step.FromSym]
+
+	seedIDs, err := resolveEndpointSet(env, meter, step.ToSym, part.Nodes[step.ToSym])
+	if err != nil {
+		return nil, err
+	}
+
+	var out []*Row
+	for _, id := range seedIDs {
+		seed := NewRow()
+		seed.SetNode(step.ToSym, id)
+		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rows...)
+	}
+
+	return out, nil
+}
+
+// reverseTrailFrame is one partial (or complete) trail on
+// expandVarLengthTrailsToSeed's explicit DFS stack, the mirror image of
+// trailFrame: nodes[0] is the walk's own seed (the pattern's FAR endpoint),
+// nodes[len(nodes)-1] is the frontier node currently under consideration as
+// the pattern's NEAR endpoint, and edges[i] is the EdgeRef traversed from
+// nodes[i+1] to nodes[i] -- i.e. both slices run in BACKWARD-DISCOVERY order,
+// the exact reverse of the pattern's own FromSym-to-ToSym order.
+//
+// lastIsSelfLoop records whether edges[len(edges)-1] -- the most recently
+// walked edge, and therefore the trail's FIRST edge in pattern order -- is a
+// self-loop. trailFrame's forward equivalent records the same fact about the
+// same edge; the difference is only when it becomes known. Walking forward,
+// the trail's first edge is chosen first and its self-loop-ness is fixed for
+// the rest of the branch; walking backward it changes at every step, which is
+// why this is recomputed per frame rather than propagated like trailFrame's
+// firstIsSelfLoop.
+type reverseTrailFrame struct {
+	nodes          []snapshot.NodeID
+	edges          []EdgeRef
+	lastIsSelfLoop bool
+}
+
+// expandVarLengthTrailsToSeed grows exactly one FAR-endpoint seed row backward
+// across step, producing one output row per emitted trail -- the mirror image
+// of expandVarLengthTrailsForSeed, and required to emit precisely the same set
+// of trails the whole-pattern forward enumeration would.
+//
+// That equality is not an aspiration; it follows from the fact that the pinned
+// forward semantics (see this file's package doc) characterize an emitted
+// trail entirely by LOCAL properties of the trail itself, with no dependence
+// on the order its edges were discovered in. A node sequence n0 -> ... -> nk
+// joined by edges e0 .. e(k-1) is emitted exactly when:
+//
+//   - every ei is distinct (trail semantics; compared by forward-CSR slot,
+//     which is unique per physical directed edge),
+//   - every ei's kind is admitted by the pattern's edge-kind list,
+//   - k is at most the resolved max depth and at least the min depth,
+//   - the near endpoint's own constraint holds at n0 and the far endpoint's at
+//     nk,
+//   - and, unless k is 1, e0 is not a self-loop.
+//
+// Each clause is checked below on the same trail the forward walk would have
+// checked it on. Three of them need care in this direction:
+//
+//   - Depth is counted in EDGES, identically either way, so the min/max bounds
+//     transfer unchanged.
+//   - The endpoint constraints swap roles: the seed set is chosen by the FAR
+//     endpoint's constraint (plus its pushed predicates, see
+//     expandVarLengthComponentReverse), and the NEAR endpoint's constraint is
+//     what each reached node is tested against.
+//   - The first-edge self-loop rule changes from a PRUNE into a SUPPRESSION,
+//     and this is the one genuine asymmetry. Walking forward, a trail whose
+//     first edge is a self-loop is emitted at depth 1 and its branch is then
+//     abandoned, so no trail of two or more edges can ever begin with one.
+//     Walking backward,
+//     that same first edge is the LAST one discovered, so there is no branch
+//     to abandon at the point the fact becomes known -- and abandoning it
+//     would be wrong anyway, since extending the walk one more edge makes the
+//     self-loop an interior edge, which is perfectly legal and does have to be
+//     emitted. So this loop keeps walking and instead declines to EMIT
+//     whenever the trail is two or more edges long and the edge just walked is
+//     a self-loop. The emitted set is identical; only the shape of the
+//     bookkeeping differs.
+//
+// pathArcKey behaves exactly as it does for the forward walk: when non-empty,
+// each output row additionally binds its own trail as a *PathVal under that
+// key.
+func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+	terminal, _ := seed.Node(step.ToSym)
+	minDepth, maxHops := step.Range.Min, step.Range.Max
+
+	var out []*Row
+
+	if minDepth == 0 && nodeSatisfiesConstraint(env, fromNC, terminal) {
+		nr := cloneRow(seed)
+		nr.SetNode(step.FromSym, terminal)
+		if pathArcKey != "" {
+			// Empty either way (the zero-length case), so neither the
+			// discovery-order flip below nor reversePathVal would change it.
+			nr.SetPathVar(pathArcKey, &PathVal{})
+		}
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+		out = append(out, nr)
+	}
+
+	if maxHops <= 0 {
+		return out, nil
+	}
+
+	stack := []reverseTrailFrame{{nodes: []snapshot.NodeID{terminal}}}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		depth := len(cur.edges)
+		curNode := cur.nodes[depth]
+
+		firstEdgeSelfLoopSuppressed := depth >= 2 && cur.lastIsSelfLoop
+		if depth >= 1 && depth >= minDepth && !firstEdgeSelfLoopSuppressed && nodeSatisfiesConstraint(env, fromNC, curNode) {
+			nr := cloneRow(seed)
+			nr.SetNode(step.FromSym, curNode)
+			if pathArcKey != "" {
+				pv := &PathVal{
+					Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
+					Edges: append([]EdgeRef(nil), cur.edges...),
+				}
+				if !step.Reversed {
+					// cur.nodes/cur.edges run in backward-discovery order (the
+					// far endpoint first), so pattern order -- which runs
+					// FromSym to ToSym -- is their exact reverse. A step whose
+					// original Cypher pattern used a backward arrow then needs
+					// one FURTHER flip, back to the order the pattern was
+					// written in (see reversePathVal's own doc); the two flips
+					// cancel, which is why discovery order is kept verbatim for
+					// exactly that case and flipped once for every other.
+					reversePathVal(pv)
+				}
+				nr.SetPathVar(pathArcKey, pv)
+			}
+			if err := meter.spend(1); err != nil {
+				return nil, err
+			}
+			out = append(out, nr)
+		}
+
+		if depth == maxHops {
+			continue
+		}
+
+		cands, err := adjacency(env, meter, step, curNode, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cands {
+			if !edgeKindOK(step.EdgeKinds, c.kind) {
+				continue
+			}
+			if containsFwd(cur.edges, c.fwd) {
+				continue
+			}
+
+			nextNodes := make([]snapshot.NodeID, depth+2)
+			copy(nextNodes, cur.nodes)
+			nextNodes[depth+1] = c.other
+
+			nextEdges := make([]EdgeRef, depth+1)
+			copy(nextEdges, cur.edges)
+			nextEdges[depth] = EdgeRef{Fwd: c.fwd}
+
+			stack = append(stack, reverseTrailFrame{
+				nodes:          nextNodes,
+				edges:          nextEdges,
+				lastIsSelfLoop: c.other == curNode,
 			})
 		}
 	}
@@ -783,8 +1105,7 @@ func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint)
 	if nc == nil {
 		return traverse.Endpoint{}, nil
 	}
-	narrowing := len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || len(nc.Predicates) > 0
-	if !narrowing {
+	if !endpointNarrows(nc) {
 		if len(nc.Kinds) == 0 {
 			// nc is non-nil but carries no constraint whatsoever: it means
 			// the same thing nc == nil does above, so it gets the same
