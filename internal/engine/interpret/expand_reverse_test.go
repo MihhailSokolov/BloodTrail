@@ -113,6 +113,31 @@ func runVarLengthBothWays(t *testing.T, snap *snapshot.Snapshot, query string) (
 	return varLengthRowSigs(t, snap, step, fwdRows), varLengthRowSigs(t, snap, step, revRows), fwdMeter.work, revMeter.work
 }
 
+// assertVarLengthRowsAgree asserts query's forward and constrained-side
+// expansions produce identical post-WHERE row multisets (see
+// runVarLengthBothWays), calling both executors directly regardless of
+// whether the dispatcher (varLengthReverseEligible) would actually pick the
+// reverse route for this shape. Most callers want assertVarLengthDirectionsAgree
+// instead, which adds that eligibility check as a non-vacuousness guard; this
+// version exists for fixtures that deliberately exercise
+// expandVarLengthComponentReverse's own correctness (e.g. its NEAR-endpoint
+// constraint check on each reached node) using a near side that the
+// dispatcher's scan-tier requirement now correctly refuses to reverse for
+// cost reasons -- see varLengthReverseEligible's doc comment on why a kind
+// bitmap near side, though not "narrowing", is still excluded.
+func assertVarLengthRowsAgree(t *testing.T, snap *snapshot.Snapshot, query string) {
+	t.Helper()
+	forward, reverse, _, _ := runVarLengthBothWays(t, snap, query)
+	if len(forward) != len(reverse) {
+		t.Fatalf("query %q: reverse produced %d rows, forward produced %d\nreverse: %v\nforward: %v", query, len(reverse), len(forward), reverse, forward)
+	}
+	for i := range forward {
+		if forward[i] != reverse[i] {
+			t.Fatalf("query %q: row multiset mismatch\nreverse: %v\nforward: %v", query, reverse, forward)
+		}
+	}
+}
+
 // assertVarLengthDirectionsAgree asserts query's forward and constrained-side
 // expansions produce identical post-WHERE row multisets (see
 // runVarLengthBothWays), and -- so the comparison can never quietly become
@@ -125,16 +150,7 @@ func assertVarLengthDirectionsAgree(t *testing.T, snap *snapshot.Snapshot, query
 	if !varLengthReverseEligible(env, part, step) {
 		t.Fatalf("query %q: varLengthReverseEligible = false; this harness only compares shapes the dispatcher actually reverses", query)
 	}
-
-	forward, reverse, _, _ := runVarLengthBothWays(t, snap, query)
-	if len(forward) != len(reverse) {
-		t.Fatalf("query %q: reverse produced %d rows, forward produced %d\nreverse: %v\nforward: %v", query, len(reverse), len(forward), reverse, forward)
-	}
-	for i := range forward {
-		if forward[i] != reverse[i] {
-			t.Fatalf("query %q: row multiset mismatch\nreverse: %v\nforward: %v", query, reverse, forward)
-		}
-	}
+	assertVarLengthRowsAgree(t, snap, query)
 }
 
 // --- fixtures ---------------------------------------------------------------
@@ -213,8 +229,6 @@ func TestVarLengthReverseEqualsForwardAcrossShapes(t *testing.T) {
 		// Lower bounds: the zero-length arm, a plain 1, and a raised floor.
 		`MATCH p = (s)-[:E*0..2]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`,
 		`MATCH p = (s)-[:E*2..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`,
-		// A kind-constrained near endpoint, checked on every REACHED node.
-		`MATCH (s:Src)-[:E*0..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`,
 		// Backward-arrow spelling: the path must still render in the order the
 		// pattern was WRITTEN, regardless of which way either executor walked.
 		`MATCH p = (t:Target)<-[:E*1..3]-(s) WHERE t.objectid = 'T-516' RETURN p`,
@@ -232,6 +246,24 @@ func TestVarLengthReverseEqualsForwardAcrossShapes(t *testing.T) {
 			assertVarLengthDirectionsAgree(t, snap, query)
 		})
 	}
+
+	// A kind-constrained near endpoint, checked on every REACHED node. This
+	// shape is no longer dispatcher-eligible (rankOf(fromNC).tier == tierKind,
+	// not tierScan -- see varLengthReverseEligible's doc comment on why a
+	// kind bitmap near side is excluded regardless of its size), so it is
+	// compared via assertVarLengthRowsAgree (calls both executors directly)
+	// rather than assertVarLengthDirectionsAgree, but the underlying
+	// primitive expandVarLengthComponentReverse must still enforce FromSym's
+	// constraint correctly on every node it reaches wherever it is invoked.
+	t.Run("kind-constrained near endpoint (not dispatcher-eligible; primitive correctness only)", func(t *testing.T) {
+		const query = `MATCH (s:Src)-[:E*0..3]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		env := &Env{Snap: snap}
+		part, step := varLengthPartAndStep(t, snap, query)
+		if varLengthReverseEligible(env, part, step) {
+			t.Fatalf("query %q: want reverse-ineligible (kind-constrained near side)", query)
+		}
+		assertVarLengthRowsAgree(t, snap, query)
+	})
 }
 
 // TestVarLengthReverseMultiplicity pins COLLECT-visible multiplicity through
@@ -365,8 +397,21 @@ func TestVarLengthReverseZeroLengthBindsSameNode(t *testing.T) {
 	t.Run("kind-constrained near endpoint filters the seed", func(t *testing.T) {
 		// Node 5 carries both Src and Target; node 6 carries only Target, so
 		// only node 5 can satisfy `(s:Src)` at zero length.
+		//
+		// This shape is no longer dispatcher-eligible (a kind-constrained
+		// near side is now categorically excluded -- see
+		// varLengthReverseEligible's doc comment), so mustExec below actually
+		// runs the ordinary forward route; assertVarLengthRowsAgree (not
+		// assertVarLengthDirectionsAgree) is used to additionally pin that
+		// expandVarLengthComponentReverse's own zero-length arm still checks
+		// the near endpoint's constraint correctly wherever it is invoked.
 		const query = `MATCH (s:Src)-[:E*0..0]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
-		assertVarLengthDirectionsAgree(t, snap, query)
+		env := &Env{Snap: snap}
+		part, step := varLengthPartAndStep(t, snap, query)
+		if varLengthReverseEligible(env, part, step) {
+			t.Fatalf("query %q: want reverse-ineligible (kind-constrained near side)", query)
+		}
+		assertVarLengthRowsAgree(t, snap, query)
 
 		rs := mustExec(t, snap, query, generousBudget)
 		n5, _ := snap.Dense(5)
@@ -475,9 +520,17 @@ func TestVarLengthReverseEligible(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "kind-constrained near side, id-anchored far side",
+			// A kind bitmap near side is not "narrowing" in endpointNarrows'
+			// sense, but it is still a bounded seed set whose members' own
+			// IN-DEGREE this rule cannot see -- exactly the shape
+			// TestVarLengthReverseRejectsHighInDegreeHub demonstrates can
+			// cost far more to reverse than to walk forward. Only a genuine
+			// full scan on the near side (no Kinds either) is eligible; see
+			// varLengthReverseEligible's own doc for why tierScan
+			// specifically is required, not just "does not narrow".
+			name:  "kind-constrained near side: bounded seed set, unbounded fan-out risk",
 			query: `MATCH (s:Src)-[:E*1..3]->(x) WHERE id(x) = 6 RETURN s, x`,
-			want:  true,
+			want:  false,
 		},
 		{
 			name:  "far side carries kinds only: nothing narrows it",
@@ -515,6 +568,112 @@ func TestVarLengthReverseEligible(t *testing.T) {
 				t.Fatalf("varLengthReverseEligible(%q) = %v, want %v", tc.query, got, tc.want)
 			}
 		})
+	}
+}
+
+// buildReverseHighInDegreeHubFixture builds the shape that defeats a cost
+// rule based solely on candidate-source tier: the near side resolves through
+// a KIND bitmap holding exactly one node (id 1, kind Src), which itself has
+// zero out-edges, so the forward route's own expansion work is negligible
+// once that one seed is found. The far side is anchored by id() -- not by
+// kind -- on a hub (id 2) with fanIn direct predecessors, and, one level
+// further back, fanIn more predecessors of THOSE (a second backward level),
+// so a reverse walk seeded from the hub visits on the order of 2*fanIn edges
+// before it can determine no trail reaches node 1 at all.
+//
+// A rule that only asks "does the near side narrow, and is the far side's
+// candidate SOURCE tier cheaper" cannot see any of this: an id() lookup
+// (tierID) is always a cheaper tier than a one-node kind bitmap (tierKind),
+// regardless of that bitmap's one member's in-degree. Requiring the near
+// side to additionally be a full scan (tierScan) is what rules this out --
+// see varLengthReverseEligible's doc comment.
+func buildReverseHighInDegreeHubFixture(t *testing.T, fanIn int) *snapshot.Snapshot {
+	t.Helper()
+	const hubID = 2
+	nodes := []execNodeSpec{
+		{1, []snapshot.KindID{revKindSrc}, nil}, // near side: 1-node kind bitmap, zero out-edges
+		{hubID, nil, nil},                       // far side: anchored by id(), not by kind
+	}
+	var edges []execEdgeSpec
+	nextEdgeID := uint64(1)
+	nextNodeID := uint64(hubID + 1)
+	for i := 0; i < fanIn; i++ {
+		p := nextNodeID
+		nextNodeID++
+		nodes = append(nodes, execNodeSpec{p, nil, nil})
+		edges = append(edges, execEdgeSpec{nextEdgeID, p, hubID, revKindE}) // p -> hub
+		nextEdgeID++
+
+		q := nextNodeID
+		nextNodeID++
+		nodes = append(nodes, execNodeSpec{q, nil, nil})
+		edges = append(edges, execEdgeSpec{nextEdgeID, q, p, revKindE}) // q -> p (second backward level)
+		nextEdgeID++
+	}
+	return buildExecSnapshot(t, revKindTable, nodes, edges)
+}
+
+// TestVarLengthReverseRejectsHighInDegreeHub pins the gap a tier-only cost
+// comparison leaves open: without also requiring the near side to be a full
+// scan, this exact shape (a one-node KIND bitmap near side, an id()-anchored
+// far side with hundreds of predecessors across two backward levels) would be
+// judged eligible on tier alone -- id() (tierID) beats a kind bitmap
+// (tierKind) regardless of size -- and reversed into a walk that visits
+// roughly 2*fanIn edges to answer a query the forward route settles in
+// essentially zero work (node 1's kind bitmap has exactly one member, which
+// has no out-edges at all).
+//
+// This asserts three things: (1) the rule now refuses eligibility outright,
+// (2) the magnitude of the regression it would otherwise reintroduce (the
+// reverse primitive, called directly, costs orders of magnitude more than
+// the forward one on this fixture), and (3) the actually-dispatched route
+// (expandVarLengthComponent) spends exactly the forward baseline's work and
+// returns exactly the forward baseline's rows -- not merely "less than
+// reverse would have."
+func TestVarLengthReverseRejectsHighInDegreeHub(t *testing.T) {
+	const fanIn = 500
+	snap := buildReverseHighInDegreeHubFixture(t, fanIn)
+	env := &Env{Snap: snap}
+	const query = `MATCH (s:Src)-[:E*1..3]->(x) WHERE id(x) = 2 RETURN s, x`
+
+	part, step := varLengthPartAndStep(t, snap, query)
+	if varLengthReverseEligible(env, part, step) {
+		t.Fatalf("query %q: want reverse-ineligible (kind-bitmap near side, not scan-tier)", query)
+	}
+
+	// Demonstrate the magnitude of the regression this rejection guards
+	// against: called directly (bypassing the now-corrected dispatcher), the
+	// reverse primitive costs far more than the forward one on this fixture.
+	fwdMeter := &workMeter{budget: generousBudget}
+	fwdRows, err := expandVarLengthComponentForward(env, fwdMeter, part, step)
+	if err != nil {
+		t.Fatalf("expandVarLengthComponentForward: %v", err)
+	}
+	revMeter := &workMeter{budget: generousBudget}
+	if _, err := expandVarLengthComponentReverse(env, revMeter, part, step); err != nil {
+		t.Fatalf("expandVarLengthComponentReverse: %v", err)
+	}
+	if revMeter.work <= fwdMeter.work*100 {
+		t.Fatalf("fixture does not demonstrate the regression: forward work = %d, reverse work = %d, want reverse to be at least two orders of magnitude larger", fwdMeter.work, revMeter.work)
+	}
+	t.Logf("forward work = %d, reverse work = %d (%.0fx)", fwdMeter.work, revMeter.work, float64(revMeter.work)/float64(fwdMeter.work))
+
+	// The actually-dispatched route must equal the forward baseline exactly,
+	// and rows must be correct: node 1 (the sole Src) has no out-edges, so no
+	// trail exists at all.
+	dispatchMeter := &workMeter{budget: generousBudget}
+	dispatchRows, err := expandVarLengthComponent(env, dispatchMeter, part, step)
+	if err != nil {
+		t.Fatalf("expandVarLengthComponent: %v", err)
+	}
+	if dispatchMeter.work != fwdMeter.work {
+		t.Fatalf("expandVarLengthComponent spent %d work, want exactly the forward baseline %d (the reverse route must not have been taken)", dispatchMeter.work, fwdMeter.work)
+	}
+	if len(dispatchRows) != len(fwdRows) {
+		t.Fatalf("expandVarLengthComponent returned %d rows, want %d (matching the forward route)", len(dispatchRows), len(fwdRows))
+	}
+	if len(fwdRows) != 0 {
+		t.Fatalf("fixture invariant broken: node 1 has no out-edges, so 0 trails should exist, got %d", len(fwdRows))
 	}
 }
 

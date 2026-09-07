@@ -413,7 +413,7 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 // ordering the ordinary anchor chooser already trusts to pick a component's
 // cheapest starting symbol, applied to the same question here.
 //
-// Two further conditions make that comparison sound rather than merely
+// Three further conditions make that comparison sound rather than merely
 // plausible:
 //
 //   - The far endpoint must genuinely NARROW -- carry ids, an objectid anchor,
@@ -423,17 +423,52 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     while giving up the near side's structure.
 //   - The near endpoint must NOT narrow. If it does, it is already the cheap
 //     side and the ordinary forward route is the right one.
+//   - The near endpoint's own candidate source must be a full scan
+//     (rankOf(...).tier == tierScan) -- not merely "not narrowing". A kind
+//     bitmap is "not narrowing" in endpointNarrows' sense (the bitmap IS its
+//     candidate source, so re-checking it filters nothing further), but it is
+//     still a BOUNDED seed set, and this whole comparison is silent about
+//     what happens AFTER seeding: the reverse walk's cost is driven by each
+//     far-side seed's IN-DEGREE, which has no relationship to how cheap that
+//     seed was to find, and which this package has no way to estimate before
+//     walking the edges themselves (unlike a candidate source's SIZE, nothing
+//     tracks in-degree ahead of time). A one-node kind bitmap whose lone node
+//     happens to be a hub with hundreds of predecessors -- e.g.
+//     `(c:Computer)-[:MemberOf*1..]->(g) WHERE g.objectid = '...'`, where `c`
+//     ranges over a small Computer kind bitmap rather than a full scan --
+//     would pass every OTHER condition here (far side narrows, near side does
+//     not, far side's tier beats near side's) while costing far more to
+//     reverse than to walk forward. Requiring a full scan specifically is the
+//     cheapest available way to rule this out: a full scan's cost is fixed at
+//     env.Snap.NodeCount() regardless of graph structure, so there is no
+//     structural surprise (like an unlucky seed's in-degree) left to be wrong
+//     about on the near side.
 //
-// Together these bound the cost of being wrong. The far side's candidate
-// source is, by the tier comparison, never more expensive to enumerate than
-// the near side's -- which the forward route pays unconditionally -- so
-// choosing this route can cost at most one extra pass over a strictly smaller
-// candidate set (the pushed predicates evaluated while seeding), never an
-// unbounded gamble. And when this function declines, the forward route runs
-// having spent nothing at all: every input to the decision is read from
-// constraint metadata and live kind-bitmap populations, with no metered work
-// of its own, so an ineligible pattern's row set, error behavior and work
-// total are all exactly what they were before this route existed.
+// What that leaves bounded, and what it does not:
+//
+//   - SEEDING is bounded. The far side's candidate source is, by the tier
+//     comparison, never a more expensive tier to enumerate than the near
+//     side's full scan -- so resolving the far side's seed set (including its
+//     pushed single-symbol predicates) costs at most one pass over a
+//     candidate source no larger than the one the forward route would have
+//     scanned anyway.
+//   - TRAVERSAL is NOT bounded by this function at all. Once seeded, the
+//     reverse walk fans out over the snapshot's reverse CSR by each seed's
+//     actual in-degree and (across further hops) the in-degree of everything
+//     it reaches; nothing computed here estimates or caps that. The only
+//     backstop is the work meter shared with every other path in this
+//     package: a walk that fans out too far spends past its remaining budget
+//     and returns ErrBudget from meter.spend, which the caller treats exactly
+//     like any other budget overrun -- a decline to PostgreSQL, never a wrong
+//     or truncated answer. The point of the conditions above is to make that
+//     decline RARE by only reversing when the near side is provably no
+//     cheaper to seed from, not to make an oversized reverse walk impossible.
+//
+// And when this function declines, the forward route runs having spent
+// nothing at all: every input to the decision is read from constraint
+// metadata and live kind-bitmap populations, with no metered work of its
+// own, so an ineligible pattern's row set, error behavior and work total are
+// all exactly what they were before this route existed.
 //
 // The direction requirement is defensive rather than load-bearing: an
 // undirected variable-length pattern is already rejected at plan time (a
@@ -448,7 +483,11 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 	if !endpointNarrows(toNC) || endpointNarrows(fromNC) {
 		return false
 	}
-	return rankOf(env, toNC).better(rankOf(env, fromNC))
+	fromRank := rankOf(env, fromNC)
+	if fromRank.tier != tierScan {
+		return false
+	}
+	return rankOf(env, toNC).better(fromRank)
 }
 
 // endpointNarrows reports whether nc actually cuts its symbol's candidate set
