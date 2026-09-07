@@ -52,7 +52,7 @@
 //
 // Usage:
 //
-//	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce]
+//	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce] [-cpuprofile <file>]
 //
 // builderbench never imports bench/adgen (a generator, not a library) and
 // never writes to the database (beyond a scratch datapipe_status row it
@@ -107,6 +107,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"time"
 
@@ -302,15 +303,19 @@ func main() {
 
 // run parses flags, executes the benchmark, prints its report, and returns
 // the process exit code. Kept separate from main so main can call os.Exit
-// with the returned code -- mirroring pathbench's run/main split.
+// with the returned code, and so cpuprofile's defers (StopCPUProfile)
+// always run before the process exits (os.Exit in main never runs deferred
+// calls) -- mirroring pathbench's run/main split and its cpuprofile pattern
+// exactly.
 func run(args []string) int {
 	fs := flag.NewFlagSet("builderbench", flag.ContinueOnError)
 	var (
-		dsn     = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
-		runs    = fs.Int("runs", 5, "number of warmed-up, timed runs per shape per driver")
-		pgCap   = fs.Duration("pg-cap", defaultPGCap, "per-shape wall-clock cap on the pg baseline (warmup and timed runs); a pg query exceeding this mid-execution is cut off via context.WithTimeout and the shape is recorded pg_capped=true and judged on the engine's absolute p50 alone (see README)")
-		btCap   = fs.Duration("bt-cap", defaultBTCap, "per-shape wall-clock cap on the engine-side bt call (warmup and timed runs); a bt call exceeding this mid-execution is cut off via context.WithTimeout and ABORTS THE WHOLE RUN (nonzero exit) -- a fail-fast safety net, never a recorded data point, for when the engine declines and silently delegates to an unbounded PostgreSQL query (see README)")
-		enforce = fs.Bool("enforce", false, "exit nonzero if any shape fails its per-shape enforce threshold (never pass this in CI)")
+		dsn        = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
+		runs       = fs.Int("runs", 5, "number of warmed-up, timed runs per shape per driver")
+		pgCap      = fs.Duration("pg-cap", defaultPGCap, "per-shape wall-clock cap on the pg baseline (warmup and timed runs); a pg query exceeding this mid-execution is cut off via context.WithTimeout and the shape is recorded pg_capped=true and judged on the engine's absolute p50 alone (see README)")
+		btCap      = fs.Duration("bt-cap", defaultBTCap, "per-shape wall-clock cap on the engine-side bt call (warmup and timed runs); a bt call exceeding this mid-execution is cut off via context.WithTimeout and ABORTS THE WHOLE RUN (nonzero exit) -- a fail-fast safety net, never a recorded data point, for when the engine declines and silently delegates to an unbounded PostgreSQL query (see README)")
+		enforce    = fs.Bool("enforce", false, "exit nonzero if any shape fails its per-shape enforce threshold (never pass this in CI)")
+		cpuprofile = fs.String("cpuprofile", "", "write a pprof CPU profile to this file")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -331,6 +336,24 @@ func run(args []string) int {
 	if *btCap <= 0 {
 		fmt.Fprintln(os.Stderr, "builderbench: -bt-cap must be positive")
 		return 2
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "builderbench: create cpuprofile: %v\n", err)
+			return 1
+		}
+		defer func() {
+			if cerr := f.Close(); cerr != nil {
+				fmt.Fprintf(os.Stderr, "builderbench: close cpuprofile: %v\n", cerr)
+			}
+		}()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "builderbench: start cpuprofile: %v\n", err)
+			return 1
+		}
+		defer pprof.StopCPUProfile()
 	}
 
 	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, pgCap: *pgCap, btCap: *btCap})
