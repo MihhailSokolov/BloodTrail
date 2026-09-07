@@ -32,7 +32,10 @@ bench-builder: ## run the builder-query benchmark against BLOODTRAIL_TEST_PG
 # at least 5x faster than delegating to PostgreSQL (1.5x for rid_suffix_scan,
 # 1x for the objectid point lookup); a pg baseline that runs past -pg-cap
 # (120s default) is capped and judged on the engine's own absolute p50
-# instead; never pass -enforce in CI (see bench/cypherbench).
+# instead; an engine-side (bt) call that runs past -bt-cap (15m default)
+# ABORTS the whole run (nonzero exit, never a data point) -- it almost
+# certainly means the engine declined and silently delegated to an unbounded
+# PostgreSQL query; never pass -enforce in CI (see bench/cypherbench).
 bench-cypher: ## run the cypher-interpreter benchmark against BLOODTRAIL_TEST_PG
 	go run ./bench/cypherbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
 

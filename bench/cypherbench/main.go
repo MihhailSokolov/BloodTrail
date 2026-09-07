@@ -48,7 +48,7 @@
 //
 // Usage:
 //
-//	go run ./bench/cypherbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-enforce]
+//	go run ./bench/cypherbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce]
 //
 // cypherbench never imports bench/adgen (a generator, not a library) and
 // never writes to the database (beyond a scratch datapipe_status row it
@@ -188,6 +188,29 @@ const pointLookupMinRatio = 1.0
 // doc's "pg wall-clock cap" section), while still keeping a capped run's
 // total wall time bounded.
 const defaultPGCap = 120 * time.Second
+
+// defaultBTCap is -bt-cap's default: the per-shape wall-clock budget an
+// engine-side (bt) call -- warmup or timed -- gets before runCypherOnceCapped
+// aborts the whole run. This is a fail-fast safety net, not a measurement
+// judgment the way -pg-cap's pg_capped is: unlike the pg oracle, the engine
+// serving from its in-memory snapshot is the thing this benchmark exists to
+// measure, so a bt call that has not returned within 15 minutes has almost
+// certainly not been quietly slow -- it has been declined by TryCypher (see
+// internal/engine/engine.go's own decline reasons) and silently delegated to
+// PostgreSQL instead, which can then run for an unbounded time. This is
+// exactly the milestone-4.5 task-6b incident: collect_antijoin_prebuilt's
+// bt-side call declined with reason=budget (interpret.ErrBudget -- the
+// query's own first MATCH clause seeds from a completely unconstrained
+// pattern variable, forcing a full 4.76M-node scan-and-traverse that exceeds
+// interpret.Budgets.MaxWork -- see internal/engine/interpret/expand.go's
+// expandVarLengthComponent, which always seeds a variable-length step from
+// its own FromSym regardless of which endpoint is actually cheaper to seed
+// from), and the resulting delegated recursive CTE ran for 17.5 hours before
+// being killed by hand. 15 minutes comfortably exceeds every other shape's
+// bt-side latency (all measured well under 2s at 5M scale) while still
+// bounding a wrongly-hanging run to a human-noticeable, not
+// human-workday-consuming, wait.
+const defaultBTCap = 15 * time.Minute
 
 // Shape names, used both for human-readable reporting and (upper-cased) for
 // each shape's CYPHERBENCH_<SHAPE> summary-line tag.
@@ -346,6 +369,7 @@ func run(args []string) int {
 		dsn     = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
 		runs    = fs.Int("runs", 5, "number of warmed-up, timed runs per shape per driver")
 		pgCap   = fs.Duration("pg-cap", defaultPGCap, "per-shape wall-clock cap on the pg baseline (warmup and timed runs); a pg query exceeding this mid-execution is cut off via context.WithTimeout and the shape is recorded pg_capped=true and judged on the engine's absolute p50 alone (see README)")
+		btCap   = fs.Duration("bt-cap", defaultBTCap, "per-shape wall-clock cap on the engine-side bt call (warmup and timed runs); a bt call exceeding this mid-execution is cut off via context.WithTimeout and ABORTS THE WHOLE RUN (nonzero exit) -- a fail-fast safety net, never a recorded data point, for when the engine declines and silently delegates to an unbounded PostgreSQL query (see README)")
 		enforce = fs.Bool("enforce", false, "exit nonzero if any shape fails its per-shape enforce threshold (never pass this in CI)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -364,8 +388,12 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "cypherbench: -pg-cap must be positive")
 		return 2
 	}
+	if *btCap <= 0 {
+		fmt.Fprintln(os.Stderr, "cypherbench: -bt-cap must be positive")
+		return 2
+	}
 
-	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, pgCap: *pgCap})
+	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, pgCap: *pgCap, btCap: *btCap})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cypherbench: %v\n", err)
 		return 1
@@ -383,6 +411,7 @@ type config struct {
 	dsn   string
 	runs  int
 	pgCap time.Duration
+	btCap time.Duration
 }
 
 // shapeSpec is one benchmarked Cypher shape: a name and the query text to
@@ -640,7 +669,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 
 	for _, spec := range shapes {
 		fmt.Printf("\n=== shape: %s ===\n", spec.name)
-		sr, err := measureShape(ctx, spec, bt, oracle, cfg.runs, cfg.pgCap)
+		sr, err := measureShape(ctx, spec, bt, oracle, cfg.runs, cfg.pgCap, cfg.btCap)
 		if err != nil {
 			return nil, fmt.Errorf("shape %s: %w", spec.name, err)
 		}
@@ -703,15 +732,17 @@ func buildPointLookupText(ctx context.Context, pool *pgxpool.Pool, graphID int32
 // Every oracle (pg) call, warmup included, goes through runPGCypherCapped
 // rather than runCypherOnce directly: the first time pgCap trips (warmup or
 // any timed run), result.pgCapped is set and every remaining pg call for
-// this shape is skipped -- see shapeResult.pgCapped's doc. bt is never
-// capped: it's the thing being measured, and the whole point of -pg-cap is
-// that pg's baseline, not the engine, is what can blow up unboundedly for a
-// shape like collect_antijoin_prebuilt. Mirrors bench/builderbench's
-// identically structured measureShape.
-func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database, runs int, pgCap time.Duration) (shapeResult, error) {
+// this shape is skipped -- see shapeResult.pgCapped's doc. Every bt call,
+// warmup included, goes through runCypherOnceCapped instead of runCypherOnce
+// directly too -- unlike pg's own graceful pgCapped bookkeeping, a btCap trip
+// aborts the whole run immediately (runCypherOnceCapped returns a hard
+// error, not a bool) -- see defaultBTCap's and runCypherOnceCapped's own
+// docs for why a "capped" bt call can never be a mere data point. Mirrors
+// bench/builderbench's identically structured measureShape.
+func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database, runs int, pgCap, btCap time.Duration) (shapeResult, error) {
 	result := shapeResult{name: spec.name}
 
-	_, btSize, err := runCypherOnce(ctx, bt, spec.text)
+	_, btSize, err := runCypherOnceCapped(ctx, bt, spec.text, btCap, spec.name)
 	if err != nil {
 		return result, fmt.Errorf("bloodtrail warmup: %w", err)
 	}
@@ -732,7 +763,7 @@ func measureShape(ctx context.Context, spec shapeSpec, bt, oracle graph.Database
 	}
 
 	for i := 0; i < runs; i++ {
-		d, _, err := runCypherOnce(ctx, bt, spec.text)
+		d, _, err := runCypherOnceCapped(ctx, bt, spec.text, btCap, spec.name)
 		if err != nil {
 			return result, fmt.Errorf("bloodtrail run %d: %w", i, err)
 		}
@@ -776,6 +807,44 @@ func runCypherOnce(ctx context.Context, db graph.Database, text string) (time.Du
 		return result.Error()
 	})
 	return time.Since(t0), count, err
+}
+
+// runCypherOnceCapped runs text against bt once via runCypherOnce, bounded
+// to btCap via context.WithTimeout wrapped directly around the call -- the
+// same context.WithTimeout-around-the-call-itself technique
+// runPGCypherCapped uses, so a mid-execution deadline actually cancels the
+// in-flight statement server-side (dawgs' pg driver forwards the context to
+// pgx) rather than merely giving up on waiting for it client-side.
+//
+// Unlike runPGCypherCapped, exceeding btCap is never a graceful, recordable
+// outcome: bt is the engine this benchmark exists to measure, so a bt call
+// that has not returned within btCap has almost certainly not been quietly
+// slow -- it means TryCypher declined (see internal/engine/engine.go's own
+// decline reasons) and wrappedTransaction.Query silently fell through to
+// PostgreSQL, which can then run for an unbounded time -- exactly the
+// milestone-4.5 task-6b incident (see defaultBTCap's own doc). So
+// runCypherOnceCapped returns a hard, descriptive error naming both
+// shapeName and btCap instead of a "capped" bool: measureShape's caller
+// propagates this as a full run failure (nonzero exit), never a data point.
+//
+// The capped/genuine-error/parent-cancellation distinction is decided by
+// capCtx.Err(), the context this function itself created and controls --
+// not by pattern-matching runCypherOnce's returned error string -- exactly
+// mirroring runPGCypherCapped's own doc: a genuine driver error is returned
+// as itself, and a parent ctx canceled for an unrelated reason (capCtx.Err()
+// reporting context.Canceled, not context.DeadlineExceeded, since the
+// parent's cancellation reaches the child before its own deadline ever
+// fires) propagates as that plain cancellation, never misreported as a
+// bt-cap trip.
+func runCypherOnceCapped(ctx context.Context, bt graph.Database, text string, btCap time.Duration, shapeName string) (time.Duration, int64, error) {
+	capCtx, cancel := context.WithTimeout(ctx, btCap)
+	defer cancel()
+
+	d, size, err := runCypherOnce(capCtx, bt, text)
+	if err != nil && errors.Is(capCtx.Err(), context.DeadlineExceeded) {
+		return 0, 0, fmt.Errorf("shape %q: engine-side run exceeded -bt-cap=%s; the engine likely declined and delegated this query to PostgreSQL -- investigate the decline, do not wait", shapeName, btCap)
+	}
+	return d, size, err
 }
 
 // runPGCypherCapped runs text against oracle (the plain pg driver) once via

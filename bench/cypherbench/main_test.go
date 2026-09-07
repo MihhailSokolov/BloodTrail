@@ -8,6 +8,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -365,6 +366,115 @@ func TestRunPGCypherCapped_ParentCancellationIsNotMistakenForACap(t *testing.T) 
 	}
 	if err == nil {
 		t.Fatal("err = nil, want the propagated cancellation error")
+	}
+}
+
+// fakeBT is a minimal graph.Database test double for runCypherOnceCapped's
+// tests -- structurally identical to fakeOracle (same embedded-nil-panics-
+// if-reached rationale), named separately so a reader sees at a glance
+// which side of the bt/oracle distinction a given test's fake stands in
+// for.
+type fakeBT struct {
+	graph.Database
+	readTransaction func(ctx context.Context, txDelegate graph.TransactionDelegate) error
+}
+
+func (f fakeBT) ReadTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, _ ...graph.TransactionOption) error {
+	return f.readTransaction(ctx, txDelegate)
+}
+
+// TestRunCypherOnceCapped_CutsOffASlowRunAndFails exercises
+// runCypherOnceCapped's core contract -- unlike runPGCypherCapped, an
+// engine-side run exceeding btCap is never a graceful, recordable outcome:
+// it is the milestone-4.5 incident's own failure mode (a decline silently
+// delegating to an unbounded PostgreSQL query), so runCypherOnceCapped must
+// return a hard, descriptive error naming both the shape and -bt-cap
+// itself, not a "capped" bool a caller could mistake for a data point.
+func TestRunCypherOnceCapped_CutsOffASlowRunAndFails(t *testing.T) {
+	bt := fakeBT{readTransaction: func(ctx context.Context, _ graph.TransactionDelegate) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			return nil
+		}
+	}}
+
+	d, size, err := runCypherOnceCapped(context.Background(), bt, "MATCH (n) RETURN n", 20*time.Millisecond, "some_shape")
+	if err == nil {
+		t.Fatal("runCypherOnceCapped returned nil err, want a hard failure (bt-cap must abort the run, never silently record a capped data point)")
+	}
+	if d != 0 || size != 0 {
+		t.Errorf("d=%s size=%d, want both zero-valued on a bt-cap failure", d, size)
+	}
+	if !strings.Contains(err.Error(), "some_shape") {
+		t.Errorf("err = %q, want it to name the shape %q", err.Error(), "some_shape")
+	}
+	if !strings.Contains(err.Error(), "bt-cap") {
+		t.Errorf("err = %q, want it to mention -bt-cap", err.Error())
+	}
+}
+
+// TestRunCypherOnceCapped_FastRunIsNotCapped confirms a run that finishes
+// comfortably inside btCap is reported normally: no error, real
+// duration/size passed through.
+func TestRunCypherOnceCapped_FastRunIsNotCapped(t *testing.T) {
+	bt := fakeBT{readTransaction: func(_ context.Context, txDelegate graph.TransactionDelegate) error {
+		return txDelegate(fakeTransaction{result: &fakeResult{rows: 3}})
+	}}
+
+	d, size, err := runCypherOnceCapped(context.Background(), bt, "MATCH (n) RETURN n", time.Second, "some_shape")
+	if err != nil {
+		t.Fatalf("runCypherOnceCapped returned err %v, want nil", err)
+	}
+	if size != 3 {
+		t.Errorf("size = %d, want 3", size)
+	}
+	if d < 0 {
+		t.Errorf("d = %s, want a non-negative duration", d)
+	}
+}
+
+// TestRunCypherOnceCapped_GenuineErrorPropagates confirms a real failure
+// (anything other than btCap's own context deadline) is still returned as
+// itself -- runCypherOnceCapped must not rewrite a genuine driver error
+// into the misleading "engine likely declined" bt-cap message just because
+// it happens to look at ctx.Err() first.
+func TestRunCypherOnceCapped_GenuineErrorPropagates(t *testing.T) {
+	boom := errors.New("boom: a genuine driver failure, not a timeout")
+	bt := fakeBT{readTransaction: func(context.Context, graph.TransactionDelegate) error {
+		return boom
+	}}
+
+	_, _, err := runCypherOnceCapped(context.Background(), bt, "MATCH (n) RETURN n", time.Second, "some_shape")
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap %v", err, boom)
+	}
+}
+
+// TestRunCypherOnceCapped_ParentCancellationIsNotMistakenForACap confirms
+// that runCypherOnceCapped distinguishes its own btCap deadline from the
+// caller's ctx being canceled for an unrelated reason (e.g. the whole
+// process shutting down): canceling ctx up front must propagate as the
+// genuine cancellation, not the "-bt-cap exceeded" message -- misreporting
+// an unrelated shutdown as "the engine likely declined" would send whoever
+// reads it chasing the wrong thing. Mirrors runPGCypherCapped's own
+// identically-purposed test.
+func TestRunCypherOnceCapped_ParentCancellationIsNotMistakenForACap(t *testing.T) {
+	parentCtx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled before runCypherOnceCapped even starts
+
+	bt := fakeBT{readTransaction: func(ctx context.Context, _ graph.TransactionDelegate) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+
+	_, _, err := runCypherOnceCapped(parentCtx, bt, "MATCH (n) RETURN n", time.Second, "some_shape")
+	if err == nil {
+		t.Fatal("err = nil, want the propagated cancellation error")
+	}
+	if strings.Contains(err.Error(), "bt-cap") {
+		t.Errorf("err = %q, want the plain cancellation error, not the bt-cap message (the parent context was canceled, not runCypherOnceCapped's own btCap deadline)", err.Error())
 	}
 }
 

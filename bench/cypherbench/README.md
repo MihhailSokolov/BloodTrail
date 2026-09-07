@@ -11,7 +11,7 @@ every measured call goes through `graph.Transaction.Query` exactly as
 BloodHound's own cypher endpoint does.
 
 ```
-go run ./bench/cypherbench -dsn <pg dsn> [-runs 5] [-pg-cap 120s] [-enforce]
+go run ./bench/cypherbench -dsn <pg dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce]
 ```
 
 Or, against `BLOODTRAIL_TEST_PG`:
@@ -148,6 +148,31 @@ slow query:
 go run ./bench/cypherbench -dsn "$BLOODTRAIL_TEST_PG" -pg-cap 1ms
 ```
 
+### `-bt-cap`: a fail-fast watchdog on the engine side
+
+`-pg-cap` bounds the pg baseline; `-bt-cap` (default `15m`) bounds the
+**engine-side (bt) call** the same way, via `context.WithTimeout` wrapped
+directly around each bt call (`runCypherOnceCapped` in `main.go`) -- but
+unlike `-pg-cap`, tripping it is never a graceful, recordable outcome. It is
+a fail-fast safety net for the exact incident this flag was added to catch:
+during a 2026-09 milestone-4.5 5M-scale run, `collect_antijoin_prebuilt`'s
+own bt-side call declined (`internal/engine.TryCypher`'s `reason=budget` --
+its first `MATCH` clause seeds from a completely unconstrained pattern
+variable, forcing a full 4.76M-node scan-and-traverse that exceeds
+`interpret.Budgets.MaxWork`) and silently fell through to PostgreSQL, whose
+equivalent recursive CTE then ran for 17.5 hours before being killed by
+hand -- with nothing in the benchmark to notice or stop it.
+
+A bt call that has not returned within `-bt-cap` has almost certainly hit
+exactly this: a decline, not ordinary slowness, since serving from the
+in-memory snapshot is what this benchmark exists to measure in the first
+place. So `runCypherOnceCapped` returns a hard error naming the shape and
+the cap, and the whole run **aborts with a nonzero exit** -- never a
+`bt_capped=true` data point the way `-pg-cap` records `pg_capped=true`.
+Seeing this abort means: stop, go read `internal/engine`'s decline-reason
+log (`BLOODTRAIL_LOG_LEVEL=debug`), and investigate why the engine declined
+-- do not wait for the delegated fallback to finish.
+
 ## Measured at 5M (`bench/adgen`'s 4.76M-node / ~48.9M-edge graph)
 
 Honestly: only one of the five shapes clears its bar by a wide margin, one
@@ -177,4 +202,5 @@ graph size, on the shapes benchmarked so far.
 | `-dsn`     | (none)  | PostgreSQL connection string. Required.                               |
 | `-runs`    | `5`     | Number of warmed-up, timed runs per shape per driver.                 |
 | `-pg-cap`  | `120s`  | Per-shape wall-clock cap on the pg baseline; see `-pg-cap` above.      |
+| `-bt-cap`  | `15m`   | Per-shape wall-clock cap on the engine-side bt call; ABORTS THE RUN on expiry (nonzero exit) -- see `-bt-cap` above. |
 | `-enforce` | `false` | Exit nonzero on a per-shape threshold/match miss (never pass this in CI). |
