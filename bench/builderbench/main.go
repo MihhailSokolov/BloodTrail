@@ -192,8 +192,9 @@ const defaultPGCap = 120 * time.Second
 // this, but the same silent-decline-then-unbounded-delegate failure mode
 // could in principle hit any bt-served shape here too, hence the identical
 // guard). 15 minutes comfortably exceeds every shape's measured bt-side
-// latency (including group_members_bfs's own ~34s p50) while still bounding
-// a wrongly-hanging run to a human-noticeable wait.
+// latency (including group_members_bfs's own ~27s p50, validated by a real
+// 5M-node/~48.9M-edge run) while still bounding a wrongly-hanging run to a
+// human-noticeable wait.
 const defaultBTCap = 15 * time.Minute
 
 // shapeThreshold is one shape's -enforce policy: the minimum p50 ratio
@@ -231,14 +232,28 @@ type shapeThreshold struct {
 //     its own pg baseline ever need capping (unmeasured as of this task --
 //     see the README's "Where these numbers come from" note); Task 21's
 //     real 5M run is expected to confirm or tighten it.
-//   - group_members_bfs: minRatio 5x (unchanged), engineAbsoluteCap 5s.
+//   - group_members_bfs: minRatio 5x (unchanged), engineAbsoluteCap 50s.
 //     This is the shape the pg wall-clock cap exists for: its pg baseline
 //     is a per-node query storm (one BFS layer's worth of individual
 //     MemberOf lookups against PostgreSQL) that runs for hours at 5M,
 //     entirely unrelated to how fast the engine itself answers the same
-//     traversal in memory. 5s is a controller-suggested estimate like the
-//     other four caps, to be validated by the first real 5M run
-//     (Task-21-equivalent), same status as its siblings.
+//     traversal in memory -- it exceeds -pg-cap on every 5M-scale attempt,
+//     so this cap is always the deciding factor for this shape. 50s is
+//     measured evidence, not a guess: two independent 5M-scale runs (one
+//     under a -cpuprofile) both measured bt p50 within a second of 27.0s
+//     (26967.91ms and 27077.85ms), so 50s is that p50 x ~1.75, rounded,
+//     replacing an earlier invented 5s. A CPU profile of the -cpuprofile
+//     run found no single obviously-fixable per-node cost to chase: the
+//     shape's own call path (traversal.BreadthFirst/LightweightDriver down
+//     through Engine.TryRelQueryRows/resolveRelSpec/denseIDBitmap) accounts
+//     for only ~1.3% of the profiled run's total on-CPU samples, dwarfed by
+//     GC background scanning of the loaded snapshot's multi-GB heap (a
+//     process-wide cost shared by every shape, not specific to this one)
+//     and by fetch_directed_graph_memberof's own much larger allocation
+//     volume running immediately before it in the same process. With no
+//     dominant fixable cost to point to, the cap is set from evidence
+//     rather than from a code change -- see the README's cap-rationale
+//     section for the same numbers.
 //   - node_count_user, node_fetchids_user, delete_transit_edges_admin_to:
 //     minRatio 5x (unchanged). These are bounded, filtered scans (a single
 //     kind's node count/id list, or one derived edge kind's id list
@@ -249,7 +264,7 @@ type shapeThreshold struct {
 //     bound anyone expects to hit in practice.
 var shapeThresholds = map[string]shapeThreshold{
 	"fetch_directed_graph_memberof": {minRatio: fetchDirectedGraphMinRatio, engineAbsoluteCap: 15 * time.Second},
-	"group_members_bfs":             {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},
+	"group_members_bfs":             {minRatio: enforceRatio, engineAbsoluteCap: 50 * time.Second},
 	"node_count_user":               {minRatio: enforceRatio, engineAbsoluteCap: 2 * time.Second},
 	"node_fetchids_user":            {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},
 	"delete_transit_edges_admin_to": {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},

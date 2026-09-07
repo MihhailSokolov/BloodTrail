@@ -244,35 +244,41 @@ type shapeThreshold struct {
 // Rationale, shape by shape:
 //
 //   - rid_suffix_scan: minRatio 1.5x, not 5x -- see ridSuffixScanMinRatio's
-//     doc. engineAbsoluteCap 2s is comfortable headroom over its measured
-//     ~5M-scale cost.
-//   - flag_scan: minRatio 5x (unchanged).
+//     doc. engineAbsoluteCap 2s is comfortable headroom (>10x) over its
+//     measured 5M-scale bt p50 (~130-160ms across repeated runs).
+//   - flag_scan: minRatio 5x (unchanged). engineAbsoluteCap 2s is
+//     comfortable headroom (>100x) over its measured 5M-scale bt p50
+//     (~11-17ms).
 //   - objectid_point_lookup: minRatio 1x -- see pointLookupMinRatio's doc.
 //     engineAbsoluteCap 1s is comfortable headroom over an indexed
-//     single-row lookup.
-//   - shortest_path_prebuilt, collect_antijoin_prebuilt: minRatio 5x
-//     (unchanged). collect_antijoin_prebuilt is the shape the pg wall-clock
-//     cap exists for: its pg baseline (a full trail enumeration over a
-//     700,000-member group) ran for over two hours without finishing on one
-//     recorded 5M-scale attempt, entirely unrelated to how fast the engine
-//     itself answers the same query.
+//     single-row lookup (measured bt p50 well under 1ms).
+//   - shortest_path_prebuilt: minRatio 5x (unchanged). engineAbsoluteCap
+//     10s is comfortable headroom (>25x) over its measured 5M-scale bt p50
+//     (~260-370ms).
+//   - collect_antijoin_prebuilt: minRatio 5x (unchanged, though never
+//     actually the deciding factor -- see below). This is the shape the pg
+//     wall-clock cap exists for: its pg baseline (a full trail enumeration
+//     over a 700,000-member group) exceeds -pg-cap's 120s budget on every
+//     5M-scale attempt, so it is always judged on engineAbsoluteCap alone.
+//     30s is >=1.75x headroom over its measured 5M-scale bt p50
+//     (~9.5-14.5s across repeated runs) -- itself only possible because the
+//     query is now seeded from the constrained Group side rather than a
+//     full unconstrained node scan; see
+//     internal/engine/interpret/expand.go's varLengthReverseEligible. Before
+//     that change this shape declined outright (reason=budget) rather than
+//     serving at all, so there was no bt p50 to measure.
 //
-// flag_scan's, shortest_path_prebuilt's, and collect_antijoin_prebuilt's
-// engineAbsoluteCap values (2s/10s/30s respectively) are each marked
-// provisional below: none of the three has ever actually been observed
-// tripping -pg-cap, so these are conservative estimates rather than
-// measured evidence, unlike rid_suffix_scan's and objectid_point_lookup's
-// caps (comfortable headroom over an already-measured ratio) or
-// collect_antijoin_prebuilt's minRatio bar (kept at the standard 5x
-// pending its own separate engine-side measurement).
+// Every engineAbsoluteCap above is measured evidence, not a guess: each was
+// checked against a real 5M-node/~48.9M-edge run (bench/adgen -users
+// 2800000 -domains 4), repeated across three separate invocations to
+// confirm the headroom holds under ordinary machine-load variance -- see
+// the README's "Measured at 5M" table for the full numbers this rationale
+// is built from.
 var shapeThresholds = map[string]shapeThreshold{
-	shapeRIDSuffixScan: {minRatio: ridSuffixScanMinRatio, engineAbsoluteCap: 2 * time.Second},
-	// provisional -- validated by the first 5M run with pg-capping
-	shapeFlagScan:            {minRatio: enforceRatio, engineAbsoluteCap: 2 * time.Second},
-	shapeObjectIDPointLookup: {minRatio: pointLookupMinRatio, engineAbsoluteCap: 1 * time.Second},
-	// provisional -- validated by the first 5M run with pg-capping
-	shapeShortestPathPrebuilt: {minRatio: enforceRatio, engineAbsoluteCap: 10 * time.Second},
-	// provisional -- validated by the first 5M run with pg-capping
+	shapeRIDSuffixScan:           {minRatio: ridSuffixScanMinRatio, engineAbsoluteCap: 2 * time.Second},
+	shapeFlagScan:                {minRatio: enforceRatio, engineAbsoluteCap: 2 * time.Second},
+	shapeObjectIDPointLookup:     {minRatio: pointLookupMinRatio, engineAbsoluteCap: 1 * time.Second},
+	shapeShortestPathPrebuilt:    {minRatio: enforceRatio, engineAbsoluteCap: 10 * time.Second},
 	shapeCollectAntiJoinPrebuilt: {minRatio: enforceRatio, engineAbsoluteCap: 30 * time.Second},
 }
 
