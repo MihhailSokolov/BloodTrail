@@ -43,10 +43,10 @@ var Version = "dev"
 // *pg.Driver's own WriteTransaction (Run, WipeGraph), ReadTransaction
 // (SetDefaultGraph), or a raw pooled connection (the two Delete* methods),
 // never to this package's own WriteTransaction override, so without an
-// explicit override here none of the five would ever reach
-// engine.NoteWrite(). OptimizeStorage and AssertSchema/kind assertion are
-// deliberately left promoted unmodified: neither one changes graph data the
-// engine's snapshot could go stale over.
+// explicit override here none of the five would ever reach engine.Apply().
+// OptimizeStorage and AssertSchema/kind assertion are deliberately left
+// promoted unmodified: neither one changes graph data the engine's replica
+// would have to reflect.
 type Driver struct {
 	*pg.Driver
 	settings Settings
@@ -198,19 +198,23 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // WriteTransaction runs txDelegate against the embedded PostgreSQL driver --
 // writes always go straight to PostgreSQL, the system of record -- with the
 // delegate's tx wrapped in an observingTransaction (write_observer.go) that
-// records, into a single WriteScope shared for the life of this call,
-// exactly which node and edge kinds the delegate's calls touched. On success
-// that scope is handed to engine.NoteWrite, invalidating only the kinds the
-// write actually reached instead of the whole snapshot -- a call whose
-// scope stays empty (touched nothing this package's tracking recognizes,
-// e.g. a transaction that only read) still bumps the engine's generation
-// counter (NoteWrite's own doc), so Fresh()'s plain staleness check is
-// unaffected by this change.
+// records, into a single WriteScope shared for the life of this call, both
+// which kinds the delegate's calls touched and the change log (ChangeSet)
+// naming every key they wrote. On success that scope is handed to
+// engine.Apply, which reads those keys back from PostgreSQL and publishes
+// the resulting delta into the in-memory replica before this method returns
+// -- so the very next query already sees this transaction's writes.
+//
+// Apply is called only on success, deliberately: a WriteTransaction that
+// returns an error rolled back, leaving PostgreSQL exactly as it was, so
+// there is no committed effect to replay. (BatchOperation differs -- see its
+// own doc -- because a batch's earlier chunks are already durable by the
+// time a later one fails.)
 //
 // observer is declared once, outside the delegate closure below, then
 // reconstructed fresh inside it on every invocation -- matching
 // BatchOperation's "declared outside, built inside" pattern (see its doc).
-// This method's final NoteWrite call reads observer.scope's *current* value,
+// This method's final Apply call reads observer.scope's *current* value,
 // which observingTransaction.Commit may have already reset to a fresh,
 // still-accumulating WriteScope (by a delegate-issued mid-transaction commit)
 // by the time txDelegate returns. Reading through observer, rather than a
@@ -222,12 +226,12 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
 	var observer *observingTransaction
 	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {
-		observer = &observingTransaction{Transaction: tx, scope: engine.NewWriteScope(), eng: d.engine}
+		observer = &observingTransaction{Transaction: tx, scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
 		return txDelegate(observer)
 	}, options...); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(observer.scope)
+	d.engine.Apply(ctx, observer.scope)
 	return nil
 }
 
@@ -236,22 +240,30 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 // graph.Transaction: the delegate's batch is wrapped in an observingBatch
 // (write_observer.go), which also gets d.engine directly -- unlike a
 // transaction, a batch documents that Commit may be called mid-delegate to
-// flush early and keep receiving operations, so observingBatch.Commit calls
-// NoteWrite itself at that moment instead of waiting for this method's own
-// call below. observer is declared once, outside the delegate closure below,
-// so that this method's final NoteWrite call reads observer.scope's *current*
-// value -- which observingBatch.Commit may have already reset to a fresh,
-// still-accumulating WriteScope by the time batchDelegate returns.
+// flush early and keep receiving operations, so observingBatch.Commit applies
+// its own accumulated scope at that moment instead of waiting for this
+// method's own call below. observer is declared once, outside the delegate
+// closure below, so that this method's final Apply call reads observer.scope's
+// *current* value -- which observingBatch.Commit may have already reset to a
+// fresh, still-accumulating WriteScope by the time batchDelegate returns.
+//
+// Apply runs whether or not the delegate reported an error, unlike
+// WriteTransaction's success-only call: a batch executes each operation
+// immediately rather than inside one long-lived transaction, so whatever
+// chunks flushed before the failure are already durable in PostgreSQL, and
+// skipping the apply would leave the replica missing them. Applying is safe
+// for the operations that did NOT land, too, because read-back reads
+// PostgreSQL's own committed state per key -- a key whose write never landed
+// simply reads back as it already was (or as absent), never as the write
+// that failed.
 func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDelegate, options ...graph.BatchOption) error {
-	observer := &observingBatch{scope: engine.NewWriteScope(), eng: d.engine}
-	if err := d.Driver.BatchOperation(ctx, func(batch graph.Batch) error {
+	observer := &observingBatch{scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
+	err := d.Driver.BatchOperation(ctx, func(batch graph.Batch) error {
 		observer.Batch = batch
 		return batchDelegate(observer)
-	}, options...); err != nil {
-		return err
-	}
-	d.engine.NoteWrite(observer.scope)
-	return nil
+	}, options...)
+	d.engine.Apply(ctx, observer.scope)
+	return err
 }
 
 // Close stops the engine's poller before closing the embedded PostgreSQL
@@ -268,14 +280,15 @@ func (d *Driver) Close(ctx context.Context) error {
 // (a concrete, same-package call), which would never reach Driver's override
 // above and so would never invalidate the engine's snapshot without this.
 //
-// The scope handed to NoteWrite has TouchAll() called on it -- touching
-// every node and edge kind, exactly like the nil scope this used to pass --
-// plus a ChangeSet fallback record: raw Cypher run outside a transaction is
-// exactly as opaque to this package's tracking as observingTransaction.
-// Query's own mutating-Cypher sniff (write_observer.go) already treats a
-// mutating statement inside a transaction, so the two are recorded the same
-// way. See marks_test.go's TestNoteWriteTouchAllScopeMatchesNilScope for the
-// verification that a TouchAll scope and a nil scope stamp identical marks.
+// The scope handed to Apply has TouchAll() called on it -- touching every
+// node and edge kind, exactly like the nil scope this used to pass -- plus a
+// ChangeSet fallback record: raw Cypher run outside a transaction is exactly
+// as opaque to this package's tracking as observingTransaction.Query's own
+// mutating-Cypher sniff (write_observer.go) already treats a mutating
+// statement inside a transaction, so the two are recorded the same way. That
+// fallback record is what makes Apply give up on replaying this write
+// narrowly and rebuild the replica instead (engine.enterFallback), which is
+// the only sound answer for a write nothing in this package can describe.
 func (d *Driver) Run(ctx context.Context, query string, parameters map[string]any) error {
 	if err := d.Driver.Run(ctx, query, parameters); err != nil {
 		return err
@@ -283,18 +296,17 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 	scope := engine.NewWriteScope()
 	scope.TouchAll()
 	scope.Changes().RecordFallback("Run: raw Cypher outside a transaction escapes changelog tracking")
-	d.engine.NoteWrite(scope)
+	d.engine.Apply(ctx, scope)
 	return nil
 }
 
 // WipeGraph truncates the graph through the embedded PostgreSQL driver and
 // notifies the engine of the write once it completes successfully. Without
 // this override -- BloodHound's "clear database" action -- the engine would
-// keep serving shortest paths through data PostgreSQL no longer has, until
-// an unrelated write or analysis run happened to advance the write
-// generation. See Run's doc for why an override is needed at all, and for
-// why the scope handed to NoteWrite is a TouchAll scope carrying a
-// ChangeSet fallback rather than a bare nil.
+// keep serving shortest paths through data PostgreSQL no longer has. See
+// Run's doc for why an override is needed at all, and for why the scope
+// handed to Apply is a TouchAll scope carrying a ChangeSet fallback rather
+// than a bare nil.
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
 	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
 		return err
@@ -302,7 +314,7 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 	scope := engine.NewWriteScope()
 	scope.TouchAll()
 	scope.Changes().RecordFallback("WipeGraph: full graph truncation escapes changelog tracking")
-	d.engine.NoteWrite(scope)
+	d.engine.Apply(ctx, scope)
 	return nil
 }
 
@@ -319,7 +331,7 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 // indefinitely (nothing else advances the write generation on its own).
 //
 // A TouchAll scope carrying a ChangeSet fallback is used, exactly like
-// Run/WipeGraph: retargeting the default graph changes which nodes, edges,
+// Run/WipeGraph (so Apply rebuilds rather than guesses): retargeting the default graph changes which nodes, edges,
 // and kinds "the graph" even refers to, which is outside anything this
 // package's kind-scoped write tracking (engine/marks.go, write_observer.go's
 // WriteScope) reasons about -- the same "outside what kind-scoped tracking
@@ -333,7 +345,7 @@ func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) e
 	scope := engine.NewWriteScope()
 	scope.TouchAll()
 	scope.Changes().RecordFallback("SetDefaultGraph: default graph retarget escapes changelog tracking")
-	d.engine.NoteWrite(scope)
+	d.engine.Apply(ctx, scope)
 	return nil
 }
 
@@ -357,7 +369,7 @@ func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds,
 	scope.TouchAllNodes()
 	scope.TouchAllEdges()
 	scope.Changes().RecordDeleteNodesByKinds(includeAny, excludeAny)
-	d.engine.NoteWrite(scope)
+	d.engine.Apply(ctx, scope)
 	return nil
 }
 
@@ -376,6 +388,6 @@ func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kin
 	scope := engine.NewWriteScope()
 	scope.TouchEdgeKinds(kinds)
 	scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
-	d.engine.NoteWrite(scope)
+	d.engine.Apply(ctx, scope)
 	return nil
 }

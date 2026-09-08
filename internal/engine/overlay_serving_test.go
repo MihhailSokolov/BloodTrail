@@ -806,3 +806,49 @@ func TestOverlayRelScanReverseDirection(t *testing.T) {
 	}
 	assertTriples(t, got, want)
 }
+
+// TestOverlayPropertyLookupSeesDeltaOnlyPropertyName is a regression test
+// for a silent wrong answer that write-through makes reachable in ordinary
+// use: a written-through update can add a property name the base snapshot's
+// PropStore never interned (nobody carried that key when the snapshot was
+// loaded). Reading such a property through the PropIDByName+PropValue pair
+// misses -- there is no base PropID for a segment-only name -- and the query
+// returns null for a value PostgreSQL plainly holds. evalPropertyLookup
+// therefore resolves by NAME (View.PropValueByName), which answers from the
+// node's effective segment state.
+//
+// Both halves matter, so both are asserted: the brand-new name must be
+// readable, and a name the base already interned must keep reading the
+// delta's value rather than the stale base one.
+func TestOverlayPropertyLookupSeesDeltaOnlyPropertyName(t *testing.T) {
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(overlayChainKinds)
+	if err := b.AddNode(10, []snapshot.KindID{1}, []byte(`{"known":"base"}`)); err != nil {
+		t.Fatalf("AddNode(10): %v", err)
+	}
+	base, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if _, interned := base.Props.IDByName("novel"); interned {
+		t.Fatalf("fixture precondition failed: the base snapshot already interned the delta-only property name")
+	}
+
+	sb := &snapshot.SegmentBuilder{}
+	if err := sb.AddNodeState(10, []snapshot.KindID{1}, []byte(`{"known":"delta","novel":"added"}`)); err != nil {
+		t.Fatalf("AddNodeState(10): %v", err)
+	}
+	view := snapshot.NewView(base).WithSegment(sb.Build())
+
+	rs := mustPlanAndExecute(t, view, `MATCH (n:N) RETURN n.novel AS novel, n.known AS known`, overlayBudget)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rs.Rows))
+	}
+	if got := rs.Rows[0][0].Scalar; got != "added" {
+		t.Fatalf("n.novel = %#v, want \"added\" -- a property name only the delta knows must still resolve", got)
+	}
+	if got := rs.Rows[0][1].Scalar; got != "delta" {
+		t.Fatalf("n.known = %#v, want \"delta\" (the delta's value, not the base's)", got)
+	}
+}

@@ -2,25 +2,35 @@
 
 //go:build integration
 
-// This file is Task 11 of the milestone-3 plan: an end-to-end integration
-// suite proving kind-scoped staleness through the REAL driver write paths
-// (WriteTransaction, BatchOperation), not through internal/engine's own
-// white-box unit tests, which call Engine.NoteWrite directly and never
-// exercise observingTransaction/observingBatch (write_observer.go) at all.
+// This file is an end-to-end integration suite for BloodTrail's write-through
+// model, driven through the REAL driver write paths (WriteTransaction,
+// BatchOperation) rather than through internal/engine's own white-box unit
+// tests, which call the engine's applier directly and never exercise
+// observingTransaction/observingBatch (write_observer.go) at all.
+//
+// # What it proves
+//
+// Every write this package recognizes is replayed into the in-memory replica
+// before the writing call returns, so the very next query is SERVED from the
+// replica -- and served correctly. The suite grew up asserting the opposite
+// (a write invalidated the kinds it touched, and those queries delegated to
+// PostgreSQL until the next rebuild); those assertions were inverted, not
+// deleted, so each write shape still has a test naming it, now asserting the
+// stronger property. Two things are asserted for every shape: the served-log
+// marker fired for that exact call, and the value returned equals what the
+// write actually produced. A third, cross-cutting one runs per test: the
+// engine's RebuildCount must not move, since a rebuild would make a served
+// answer prove nothing about write-through.
 //
 // # File placement: root package, not internal/engine
 //
-// The task brief called for this file to live at
-// internal/engine/staleness_integration_test.go. It lives here instead, at
-// the repository root as part of package bloodtrail, for an unavoidable
-// reason: the write paths under test -- observingTransaction,
-// observingBatch, and Driver.WriteTransaction/BatchOperation themselves --
-// are defined in the root package (driver.go, write_observer.go), and the
-// root package imports internal/engine (for engine.Engine, engine.WriteScope,
-// engine.New). internal/engine therefore cannot import the root package to
-// drive writes through Driver.WriteTransaction/BatchOperation -- doing so
-// would be an import cycle. Putting this file in the root package instead
-// resolves that: the root package already imports internal/engine, so a test
+// The write paths under test -- observingTransaction, observingBatch, and
+// Driver.WriteTransaction/BatchOperation themselves -- are defined in the
+// root package (driver.go, write_observer.go), and the root package imports
+// internal/engine (for engine.Engine, engine.WriteScope, engine.New).
+// internal/engine therefore cannot import the root package to drive writes
+// through Driver.WriteTransaction/BatchOperation -- that would be an import
+// cycle. Putting this file in the root package instead resolves it: a test
 // here can freely construct a *bloodtrail.Driver via dawgs.Open and drive
 // real writes through it.
 //
@@ -29,32 +39,24 @@
 // Being in package bloodtrail (not bloodtrail_test) gives this file
 // unexported access to Driver's own `engine *engine.Engine` field, which
 // bloodtrail_test-package tests (engine_serving_integration_test.go) cannot
-// reach directly. That access is used below for two genuinely useful,
-// exported-method calls: d.engine.RebuildNow (a deterministic, on-demand
-// rebuild -- no need to wire up a datapipe_status table and wait on the
-// poller) and d.engine.Fresh (the plain whole-generation freshness bit).
+// reach directly. That access is used below for three exported-method calls:
+// d.engine.RebuildNow (a deterministic, on-demand rebuild -- no need to wire
+// up a datapipe_status table and wait on the poller), d.engine.Fresh (is the
+// engine serving at all), and d.engine.RebuildCount (has any rebuild
+// happened).
 //
-// It does NOT, however, unlock the kind-scoped predicates that actually
-// decide staleness (nodeKindsClean, edgeKindsClean, allNodesClean,
-// allEdgesClean, in internal/engine/marks.go): those are unexported
-// identifiers of package engine, and Go's visibility rules make them
-// inaccessible from ANY other package, including this one -- "same package"
-// for an unexported identifier means internal/engine itself, not "any
-// package that happens to hold a value of an exported type from it". So the
-// proof this file builds is deliberately a black-box one: every flow issues
-// a real query through the real driver and observes, by exactly how much (0
-// or 1), the exact Debug/Info log line the engine emits precisely when it
-// serves a query from its in-memory snapshot --
-// "bloodtrail: builder engine served" for structural node/relationship
-// queries (serve_builder.go's servedOp) and "bloodtrail: path engine served"
-// for shortest-path queries (engine.go's TryAllShortestPaths) -- alongside
-// the returned value's own correctness. A marker delta of 1 plus a correct
-// result means "served from the snapshot, and the snapshot was right to
-// serve it"; a delta of 0 plus a correct result means "declined and fell
-// through to PostgreSQL, and PostgreSQL was consulted correctly". That is
-// the same style of evidence engine_serving_integration_test.go's existing
-// TestNodeQueryServesFromLiveDriver/TestEngineServesFromLiveDriver already
-// rely on, just assembled here into one continuous, kind-scoped narrative.
+// Everything else stays a black-box proof: every flow issues a real query
+// through the real driver and observes, by exactly how much (0 or 1), the
+// exact Debug/Info log line the engine emits precisely when it serves a query
+// from its in-memory replica -- "bloodtrail: builder engine served" for
+// structural node/relationship queries (serve_builder.go's servedOp),
+// "bloodtrail: path engine served" for shortest-path queries (engine.go's
+// TryAllShortestPaths), and "bloodtrail: cypher engine served" for Cypher
+// text (engine.go's cypherServedLogMessage) -- alongside the returned value's
+// own correctness. A marker delta of 1 plus a correct result means "served
+// from the replica, and the replica was right to serve it"; a delta of 0 plus
+// a correct result means "declined and fell through to PostgreSQL, and
+// PostgreSQL was consulted correctly".
 package bloodtrail
 
 import (
@@ -247,58 +249,55 @@ func shortestPathCount(t *testing.T, ctx context.Context, db graph.Database, sta
 	return count
 }
 
-// TestKindScopedStalenessEndToEnd is Task 11's deliverable: five sequential
-// flows, each building on the previous one's dirt, proving that a write
-// through the real driver invalidates exactly the kinds it touched --
-// leaving every other kind free to keep serving from the in-memory
-// snapshot -- while a shortest-path query (whose freshness check is the
-// coarser, whole-snapshot Fresh(), not the kind-scoped marks) goes stale on
-// ANY write at all. See this file's own top-of-file doc for why the evidence
-// below is a black-box one (log marker deltas plus result correctness)
-// rather than calls into the engine's own unexported freshness predicates.
+// TestWriteThroughEndToEnd is this file's central deliverable: five
+// sequential flows proving that a write through the real driver is visible
+// to the very next query, served from the in-memory replica, with no rebuild
+// anywhere in between.
+//
+// This test used to assert the opposite -- that a write invalidated the kinds
+// it touched and forced those queries to delegate to PostgreSQL until the
+// next rebuild. Write-through (internal/engine/apply.go) removed the premise:
+// every committed write is read back from PostgreSQL and published into the
+// replica before the writing call returns, so a query issued immediately
+// afterward is served, and served correctly. The evidence is the same
+// black-box kind this file has always used (log marker deltas plus result
+// correctness), now asserting a delta of 1 where it once asserted 0.
 //
 // Fixture shape (all built once, up front, through bt.WriteTransaction, so
 // every kind's baseline state is exactly known rather than inferred):
 //
 //   - StalenessNodeA: a1, a2, joined by one StalenessEdgeA edge.
 //   - StalenessNodeB: b1, b2, with NO edge yet -- flow 2 creates one.
-//   - StalenessNodeC: c1, c2, joined by one StalenessEdgeC edge -- this pair
-//     stays completely untouched by every write below, making it this
-//     test's "nothing here changed" witness for both the relationship-count
-//     flows (3, 4) and, via c1, the node-tagging flow (4).
+//   - StalenessNodeC: c1, c2, joined by one StalenessEdgeC edge.
 //
 // The five flows:
 //
-//  1. Rebuild, then kind-A relationship Count serves (and a shortest-path
-//     query between a1 and a2 also serves, establishing the path-serving
-//     baseline flow 2 contrasts against).
-//  2. A WriteTransaction creates a kind-B edge. Kind-A Count still serves
-//     (kind-A untouched); kind-B Count now delegates (just written) but
-//     still answers correctly; the SAME a1/a2 shortest-path query -- whose
-//     kind (A) was not touched by this write -- now ALSO delegates, because
-//     path-serving freshness (Fresh(), the plain write-generation counter)
-//     has no kind-scoped exception the way the builder-serving path does.
-//  3. A BatchOperation deletes the one kind-A edge. Kind-A now delegates too
-//     (its only edge just vanished); kind-B still delegates (dirty since
-//     flow 2, untouched by this write); kind-C, never touched, still serves.
-//  4. A BatchOperation runs UpdateNodes on c1 with AddedKinds=[Tag] --
-//     simulating an analysis pass tagging one existing node. Only the Tag
-//     node kind dirties: a node Count on Tag delegates, a node Count on the
-//     wholly unrelated kind A still serves, and kind-C's relationship Count
-//     is unaffected (a node-kind write has nothing to say about edge marks).
-//  5. A manual rebuild. Every one of kind-A/kind-B/Tag's counts serves
-//     again, each agreeing with the exact value this test's own writes
-//     produced.
-func TestKindScopedStalenessEndToEnd(t *testing.T) {
+//  1. One rebuild (the only one this test ever performs), then kind-A
+//     relationship Count and an a1->a2 shortest-path query both serve.
+//  2. A WriteTransaction creates a kind-B edge. The kind-B Count -- the
+//     query whose own kind was just written -- serves immediately, and
+//     returns 1; kind-A's Count and the a1/a2 path query, untouched by the
+//     write, keep serving too.
+//  3. A BatchOperation deletes the one kind-A edge. Kind-A's Count now serves
+//     0, and the a1->a2 shortest path serves 0 paths -- the delete reached
+//     the replica's adjacency, not just its counters -- while kind-B and
+//     kind-C keep serving 1 each.
+//  4. A BatchOperation tags c1 with an added node kind. The Tag node Count
+//     serves 1 immediately, the unrelated kind-A node Count still serves 2,
+//     and kind-C's relationship Count is unaffected.
+//  5. No rebuild happened anywhere in flows 2-4 (RebuildCount unchanged since
+//     flow 1). A manual rebuild is then run purely as a differential check:
+//     every count above must be identical when answered from a snapshot
+//     loaded from scratch, proving the deltas the replica accumulated agree
+//     with PostgreSQL's own state.
+func TestWriteThroughEndToEnd(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
 	// An hour-long poll interval means the poller's own ticker will not
 	// fire even once during this test's lifetime, so every rebuild observed
 	// below is the direct, deterministic result of this test's own
-	// d.engine.RebuildNow calls -- no datapipe_status table, and no race
-	// against a background rebuild, needed at all. Must be set before
-	// dawgs.Open: Settings are read from the environment exactly once, at
-	// Open time.
+	// d.engine.RebuildNow calls. Must be set before dawgs.Open: Settings are
+	// read from the environment exactly once, at Open time.
 	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
@@ -388,28 +387,26 @@ func TestKindScopedStalenessEndToEnd(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	// === Flow 1: rebuild, then kind-A relationship Count and a shortest-path
-	// query both serve from the fresh snapshot. ===
+	// === Flow 1: one rebuild, then kind-A relationship Count and a
+	// shortest-path query both serve. ===
 
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow (flow 1): %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("flow 1: engine reports stale immediately after RebuildNow")
+		t.Fatalf("flow 1: engine is not serving immediately after RebuildNow")
 	}
+	rebuilds := d.engine.RebuildCount()
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 1: kind-A relationship count serves",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindA) }, 1)
 
-	requireMarkerDelta(t, buf, servedMarker, 1, "flow 1: a1->a2 shortest-path query serves (baseline for flow 2's contrast)",
+	requireMarkerDelta(t, buf, servedMarker, 1, "flow 1: a1->a2 shortest-path query serves",
 		func() int { return shortestPathCount(t, ctx, bt, a1ID, a2ID) }, 1)
 
-	// === Flow 2: a WriteTransaction creates one kind-B edge. Kind-A keeps
-	// serving (untouched); kind-B now delegates (just written) but still
-	// answers correctly; the SAME shortest-path query that just served in
-	// flow 1 now ALSO delegates, since Fresh() (whole-generation) has no
-	// kind-scoped carve-out the way the builder-serving path does -- the
-	// documented difference this flow exists to demonstrate. ===
+	// === Flow 2: a WriteTransaction creates one kind-B edge. The kind-B
+	// count -- the query whose own kind was just written -- serves it
+	// immediately; kind A and the path query are unaffected. ===
 
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		_, err := tx.CreateRelationshipByIDs(b1ID, b2ID, stalenessEdgeKindB, graph.NewProperties())
@@ -418,23 +415,23 @@ func TestKindScopedStalenessEndToEnd(t *testing.T) {
 		t.Fatalf("WriteTransaction (create kind-B edge, flow 2): %v", err)
 	}
 
-	if _, fresh := d.engine.Fresh(); fresh {
-		t.Fatalf("flow 2: engine still reports fresh after a write; Fresh() must go stale on any write (whole-generation)")
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("flow 2: engine stopped serving after a write; write-through must keep it serving")
 	}
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 2: kind-A relationship count still serves (kind-A untouched by the kind-B write)",
-		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindA) }, 1)
-
-	requireMarkerDelta(t, buf, builderServedMarker, 0, "flow 2: kind-B relationship count delegates (kind-B just written)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 2: kind-B relationship count serves the just-written edge",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindB) }, 1)
 
-	requireMarkerDelta(t, buf, servedMarker, 0, "flow 2: shortest-path query now delegates too (whole-generation staleness, unlike the kind-scoped builder path above)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 2: kind-A relationship count still serves",
+		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindA) }, 1)
+
+	requireMarkerDelta(t, buf, servedMarker, 1, "flow 2: shortest-path query still serves",
 		func() int { return shortestPathCount(t, ctx, bt, a1ID, a2ID) }, 1)
 
-	// === Flow 3: a BatchOperation deletes the one kind-A edge (present in
-	// the snapshot flow 1 built). Kind-A now delegates too; kind-B still
-	// delegates (dirty since flow 2, untouched by this write); kind-C,
-	// never touched by anything so far, still serves. ===
+	// === Flow 3: a BatchOperation deletes the one kind-A edge. Both the
+	// kind-A count and the a1->a2 path query must reflect the deletion
+	// immediately -- the tombstone reached the replica's adjacency, not just
+	// its per-kind counters. ===
 
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.DeleteRelationship(edgeAID)
@@ -442,10 +439,13 @@ func TestKindScopedStalenessEndToEnd(t *testing.T) {
 		t.Fatalf("BatchOperation (delete kind-A edge, flow 3): %v", err)
 	}
 
-	requireMarkerDelta(t, buf, builderServedMarker, 0, "flow 3: kind-A relationship count now delegates (its only edge was just deleted)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 3: kind-A relationship count serves 0 (its only edge was just deleted)",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindA) }, 0)
 
-	requireMarkerDelta(t, buf, builderServedMarker, 0, "flow 3: kind-B relationship count still delegates (dirty since flow 2)",
+	requireMarkerDelta(t, buf, servedMarker, 1, "flow 3: a1->a2 shortest path serves 0 paths (the edge is gone from the replica's adjacency)",
+		func() int { return shortestPathCount(t, ctx, bt, a1ID, a2ID) }, 0)
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 3: kind-B relationship count still serves",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindB) }, 1)
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 3: kind-C relationship count still serves (never touched)",
@@ -456,13 +456,8 @@ func TestKindScopedStalenessEndToEnd(t *testing.T) {
 	// node. Kinds is set alongside AddedKinds so the write actually lands
 	// (dawgs' pg driver batch path reads Kinds, not AddedKinds, as the set of
 	// kinds to union in -- see NodeUpdateParameters.Append in
-	// drivers/pg/batch.go -- while bloodtrail's own kind-scoped dirty-marking
-	// reads AddedKinds/DeletedKinds, see touchNodeKindDelta in
-	// write_observer.go; setting both keeps this test correct regardless of
-	// that library-internal asymmetry). Only the Tag node kind dirties: a
-	// node Count on Tag delegates, a node Count on the wholly unrelated kind
-	// A still serves, and kind-C's relationship Count is unaffected -- a
-	// node-kind write has nothing to say about any edge mark. ===
+	// drivers/pg/batch.go). The Tag node count must serve the new kind
+	// immediately. ===
 
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.UpdateNodes([]*graph.Node{{
@@ -475,84 +470,79 @@ func TestKindScopedStalenessEndToEnd(t *testing.T) {
 		t.Fatalf("BatchOperation (UpdateNodes AddedKinds, flow 4): %v", err)
 	}
 
-	requireMarkerDelta(t, buf, builderServedMarker, 0, "flow 4: added-tag node count delegates (c1 was just tagged)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 4: added-tag node count serves the just-added kind",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessNodeKindTag) }, 1)
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 4: unrelated node kind (A) still serves",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessNodeKindA) }, 2)
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 4: kind-C relationship count still serves (edge queries unaffected by a node-kind write)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 4: kind-C relationship count still serves",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindC) }, 1)
 
-	// === Flow 5: a manual rebuild picks up every write from flows 2-4 at
-	// once. Kind-A, kind-B, and the Tag node kind all serve again, each
-	// agreeing with the exact value this test's own writes produced. ===
+	// === Flow 5: not one rebuild happened across flows 2-4 -- every answer
+	// above came from the replica the writes themselves updated. A rebuild
+	// now serves as the differential check: a snapshot loaded from scratch
+	// must agree with every one of those answers. ===
+
+	if got := d.engine.RebuildCount(); got != rebuilds {
+		t.Fatalf("flow 5: RebuildCount = %d, want %d -- no rebuild may happen for a written-through write", got, rebuilds)
+	}
 
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow (flow 5): %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("flow 5: engine reports stale immediately after RebuildNow")
+		t.Fatalf("flow 5: engine is not serving immediately after RebuildNow")
 	}
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: kind-A relationship count serves again post-rebuild",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: kind-A relationship count agrees post-rebuild",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindA) }, 0)
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: kind-B relationship count serves again post-rebuild",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: kind-B relationship count agrees post-rebuild",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindB) }, 1)
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: added-tag node count serves again post-rebuild",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 5: added-tag node count agrees post-rebuild",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessNodeKindTag) }, 1)
+
+	requireMarkerDelta(t, buf, servedMarker, 1, "flow 5: a1->a2 shortest path agrees post-rebuild",
+		func() int { return shortestPathCount(t, ctx, bt, a1ID, a2ID) }, 0)
 }
 
 // stalenessUpsertBaseKind / stalenessUpsertNovelKind are this file's own
-// fixture kinds for TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind
+// fixture kinds for TestBatchUpdateNodesKindsOnlyUpsertServesImmediately
 // below, distinct from stalenessNodeKind*/stalenessEdgeKind* above for the
 // same isolation reason those give: this test builds and rebuilds its own
-// driver instance, independent of TestKindScopedStalenessEndToEnd, so its
-// counts must never be able to collide with that test's fixture.
+// driver instance, independent of TestWriteThroughEndToEnd, so its counts
+// must never be able to collide with that test's fixture.
 var (
 	stalenessUpsertBaseKind  = graph.StringKind("StalenessUpsertBase")
 	stalenessUpsertNovelKind = graph.StringKind("StalenessUpsertNovel")
 )
 
-// TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind is the end-to-end
-// regression test for a real staleness-tracking gap: a BatchOperation's
-// UpdateNodes call that sets a node's
-// Kinds field to include a novel kind -- WITHOUT also setting AddedKinds,
-// the one detail every existing caller in this codebase happens to always
-// pair together, but nothing in graph.Batch's documented contract requires
-// -- must still be seen as a write to that novel kind.
+// TestBatchUpdateNodesKindsOnlyUpsertServesImmediately is the write-through
+// form of a real staleness-tracking regression: a BatchOperation's
+// UpdateNodes call that sets a node's Kinds field to include a novel kind --
+// WITHOUT also setting AddedKinds, the one detail every existing caller in
+// this codebase happens to always pair together, but nothing in graph.Batch's
+// documented contract requires -- must still be seen as a write to that
+// novel kind.
 //
-// Before this fix, observingBatch.UpdateNodes only ever looked at
-// AddedKinds/DeletedKinds (touchNodeKindDelta), so a Kinds-only change like
-// this recorded an Empty() scope: NoteWrite saw nothing to mark, even though
-// dawgs' pg batch driver actually unions the full Kinds field into the
-// database row regardless (NodeUpdateParameters.Append/FormatNodesUpdate,
-// see engine.WriteScope.UpsertNodeKinds' doc for the verified SQL). A node
-// Count on the novel kind would then incorrectly report itself "clean"
-// against the pre-write snapshot generation, match this kind's bitmap in a
-// snapshot where the kind never even existed (empty bitmap, since
-// NodesOfKind is nil-safe -- serve_builder.go), and serve 0 instead of the
-// correct 1: served, but silently wrong. This test's central assertion is
-// therefore not just "declines" but "declines AND returns the right value",
-// via requireMarkerDelta's combined check.
+// dawgs' pg batch driver unions the full Kinds field into the database row
+// regardless (NodeUpdateParameters.Append/FormatNodesUpdate, see
+// engine.WriteScope.UpsertNodeKinds' doc for the verified SQL), so the node
+// genuinely becomes StalenessUpsertNovel. The original failure this test was
+// written for was subtle and silent: a node Count on the novel kind matched
+// that kind's (empty) bitmap in a snapshot where the kind never existed and
+// served 0 instead of 1 -- served, but wrong.
 //
-// This test proves the fix end-to-end through the real driver, independent
-// of and in addition to TestKindScopedStalenessEndToEnd's flow 4 (which
-// exercises the AddedKinds-paired shape every caller uses today and so never
-// would have caught this gap): a node created with StalenessUpsertBase is
-// later updated via BatchOperation.UpdateNodes with Kinds = [Base, Novel]
-// and AddedKinds left nil/empty. A node Count on the novel kind must
-// delegate to PostgreSQL immediately after (the builder-serving marker must
-// NOT fire) and must still answer correctly (1); a node Count on the
-// already-present base kind must keep serving from the snapshot the whole
-// time, since UpsertNodeKinds' snapshot set-difference must not dirty a kind
-// the node already carried before this write (marks_test.go's
-// TestNoteWriteUpsertNodeKindsNovelKindDirtiesOnlyThatKind is this same
-// claim's white-box unit-test counterpart). A manual rebuild afterward must
-// make the novel kind's count serve too.
-func TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind(t *testing.T) {
+// Under write-through the correct answer is stronger than the "declines
+// until a rebuild" the test used to assert: the batch's UpdateNodes records
+// the node id in its ChangeSet, the applier reads that row back -- kind_ids
+// and all -- and republishes it, so the novel-kind Count serves 1
+// immediately. The base kind must keep serving 1 throughout, and no rebuild
+// may happen; a manual rebuild at the end is the differential check that the
+// replica's answer matches a from-scratch load.
+func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
 	t.Setenv(EnvEnginePollInterval, "1h")
@@ -593,17 +583,13 @@ func TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind(t *testing.T) {
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow (baseline): %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("baseline: engine reports stale immediately after RebuildNow")
-	}
+	rebuilds := d.engine.RebuildCount()
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: base-kind node count serves",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertBaseKind) }, 1)
 
-	// The write this test guards against: Kinds gains a novel kind with
-	// AddedKinds left empty. dawgs' pg batch driver still unions Kinds into
-	// the database row (NodeUpdateParameters.Append), so this node genuinely
-	// becomes StalenessUpsertNovel too -- the engine must not miss that.
+	// The write under test: Kinds gains a novel kind with AddedKinds left
+	// empty.
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.UpdateNodes([]*graph.Node{{
 			ID:         baseID,
@@ -614,48 +600,38 @@ func TestBatchUpdateNodesKindsOnlyUpsertDirtiesExactKind(t *testing.T) {
 		t.Fatalf("BatchOperation (Kinds-only upsert): %v", err)
 	}
 
-	requireMarkerDelta(t, buf, builderServedMarker, 0, "novel-kind node count delegates immediately after the Kinds-only upsert, and still answers correctly",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "novel-kind node count serves the Kinds-only upsert immediately, and answers correctly",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertNovelKind) }, 1)
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "base-kind node count still serves (Base was already present in the snapshot; the upsert's set-difference must not dirty it)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "base-kind node count still serves (the node kept its original kind too)",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertBaseKind) }, 1)
+
+	if got := d.engine.RebuildCount(); got != rebuilds {
+		t.Fatalf("RebuildCount = %d, want %d -- the upsert must be served without any rebuild", got, rebuilds)
+	}
 
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow (post-upsert): %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("post-upsert: engine reports stale immediately after RebuildNow")
-	}
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "novel-kind node count serves again post-rebuild",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "novel-kind node count agrees post-rebuild",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertNovelKind) }, 1)
 }
 
-// --- Task 18: Cypher-serving staleness/guard integration tests -----------
+// --- Cypher-serving integration tests ------------------------------------
 //
-// The three tests below extend this file's kind-scoped staleness narrative
-// to engine.TryCypher, whose own freshness model is deliberately coarser
-// than the builder-serving path's (see engine.go's own doc: TryCypher's
-// interpreter has no notion of which kinds a query touches, so it can only
-// ever ask the plain, whole-generation Fresh() bit -- the same bit
-// TestKindScopedStalenessEndToEnd's flow 2 already showed a shortest-path
-// query is bound by too). TestCypherStalenessPropertyOnlyWrite goes one
-// step further than that flow: a pure property write never touches any
-// kind mark at all (write_observer.go's touchNodeKindDelta), so it is
-// exactly the write class that leaves a kind-scoped builder query serving
-// right through it while a Cypher read of that same property must not.
-// TestCypherHydrationRecheck exercises TryCypher's own step-10
-// post-hydration recheck, forced deterministically via a small test-only
-// seam added to internal/engine/engine.go (SetCypherHydrationRaceHookForTest)
-// -- no existing seam already forced this exact race for either serving
-// path, so this task adds the minimal one TryCypher needs, mirroring the
-// same "capture a snapshot, then check it's still current after I/O"
-// pattern servePathQuery's own step 7 already establishes.
-// TestCypherMultiGraphGuard covers the one TryCypher-only decline this file
-// had not yet exercised: Snapshot.MultiGraph, set by LoadSnapshot's global
-// probeMultiGraph, has nothing to do with kind-scoped or whole-generation
-// staleness at all, so it gets its own dedicated database state (a second,
-// unrelated graph) rather than reusing any write-based flow above.
+// The four tests below extend this file's write-through narrative to
+// engine.TryCypher. Three of them assert the same "the next query serves the
+// write" property the builder-serving tests above do, across the shapes that
+// used to be the hardest for the retired freshness model to get right: a
+// pure property write (which touched no kind at all, so nothing kind-scoped
+// ever noticed it), an edge write under a query that also hydrates edge
+// properties from PostgreSQL, and a stream of writes landing while queries
+// run concurrently. TestCypherMultiGraphGuard covers the one TryCypher-only
+// decline that has nothing to do with writes at all: Snapshot.MultiGraph,
+// set by LoadSnapshot's global probeMultiGraph, so it gets its own dedicated
+// database state (a second, unrelated graph) rather than reusing any
+// write-based flow above.
 
 // cypherStringValue runs text -- a Cypher query returning exactly one row
 // with exactly one string-valued column -- through db and returns that
@@ -744,36 +720,30 @@ func requireDecline[T comparable](t *testing.T, buf *lockedBuffer, wantReason st
 	}
 }
 
-// cypherStalenessNodeKind is TestCypherStalenessPropertyOnlyWrite's own
-// fixture kind, distinctly named for the same collision-avoidance reason
+// cypherStalenessNodeKind is TestCypherPropertyOnlyWriteServesImmediately's
+// own fixture kind, distinctly named for the same collision-avoidance reason
 // stalenessNodeKind*/stalenessUpsert* above are.
 var cypherStalenessNodeKind = graph.StringKind("CypherStalenessNode")
 
-// TestCypherStalenessPropertyOnlyWrite is Task 18's first deliverable: a
-// pure property write -- graph.Transaction.UpdateNode with neither
-// AddedKinds nor DeletedKinds set -- records nothing at all onto the
-// WriteScope write_observer.go's touchNodeKindDelta builds
-// (TestObservingTransactionUpdateNodePropertyOnlyLeavesScopeEmpty pins this
-// down at the unit level; this test proves the end-to-end consequence). A
-// kind-scoped builder query is therefore still "clean" against it and keeps
-// serving right through the write -- but engine.NoteWrite bumps the
-// write-generation counter unconditionally, before it even looks at
-// whether scope is empty (marks.go's noteResolved, step 1 of its own doc),
-// so TryCypher's coarser, whole-generation Fresh() check goes stale on this
-// exact write anyway. This is a strictly narrower trigger than
-// TestKindScopedStalenessEndToEnd's flow 2 (which at least dirtied kind-B's
-// own mark): a pure property write dirties no kind's mark whatsoever, yet
-// still must flip Cypher serving to delegation.
+// TestCypherPropertyOnlyWriteServesImmediately covers the narrowest write
+// shape there is: graph.Transaction.UpdateNode with neither AddedKinds nor
+// DeletedKinds set changes only a property value, touching no kind anywhere.
+//
+// That shape used to be the sharpest illustration of the old two-model
+// freshness split -- a kind-scoped builder query kept serving straight
+// through it, while a Cypher read of that very property had to delegate,
+// because TryCypher could only ask the coarse whole-generation freshness
+// bit. Write-through collapses both models into one: the transaction records
+// the node id, the applier reads the row back and republishes its property
+// bag, and the Cypher read serves the NEW value immediately.
 //
 // Flow: seed one CypherStalenessNode with name="before", rebuild, confirm
 // both a Cypher property read and a kind-scoped node Count serve. The
-// property-only write sets name="after". The Cypher read must now delegate
-// to PostgreSQL -- and must return the NEW value, proving the fallback
-// actually consults live data rather than any cached answer -- while the
-// kind-scoped node Count keeps serving the unchanged count throughout, the
-// two-freshness-models contrast this test exists to pin down. A manual
-// rebuild afterward restores Cypher serving, now reflecting "after".
-func TestCypherStalenessPropertyOnlyWrite(t *testing.T) {
+// property-only write sets name="after". The Cypher read must now serve
+// "after" -- from the replica, not from PostgreSQL -- with no rebuild in
+// between, while the kind-scoped node Count keeps serving its unchanged
+// count.
+func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
 	t.Setenv(EnvEnginePollInterval, "1h")
@@ -814,9 +784,7 @@ func TestCypherStalenessPropertyOnlyWrite(t *testing.T) {
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow (baseline): %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("baseline: engine reports stale immediately after RebuildNow")
-	}
+	rebuilds := d.engine.RebuildCount()
 
 	text := fmt.Sprintf(`MATCH (n:CypherStalenessNode) WHERE id(n) = %d RETURN n.name`, nodeID)
 
@@ -826,74 +794,68 @@ func TestCypherStalenessPropertyOnlyWrite(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: kind-scoped node count serves",
 		func() int64 { return nodeCountByKind(t, ctx, bt, cypherStalenessNodeKind) }, 1)
 
-	// The write under test: properties only, no AddedKinds/DeletedKinds --
-	// touchNodeKindDelta records nothing onto scope for this call, so the
-	// CypherStalenessNode kind mark never dirties.
+	// The write under test: properties only, no AddedKinds/DeletedKinds.
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		return tx.UpdateNode(&graph.Node{ID: nodeID, Properties: graph.NewProperties().Set("name", "after")})
 	}); err != nil {
 		t.Fatalf("WriteTransaction (property-only update): %v", err)
 	}
 
-	if _, fresh := d.engine.Fresh(); fresh {
-		t.Fatalf("engine still reports fresh after a property-only write; Fresh() must go stale on any write (whole-generation)")
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("engine stopped serving after a property-only write; write-through must keep it serving")
 	}
 
-	requireMarkerDelta(t, buf, cypherServedMarker, 0, "after property-only write: cypher property read delegates, and still returns the live (new) value",
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after the property-only write: the cypher read serves the NEW value from the replica",
 		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "after property-only write: kind-scoped node count still serves (no kind mark was ever touched)",
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "after the property-only write: kind-scoped node count still serves",
 		func() int64 { return nodeCountByKind(t, ctx, bt, cypherStalenessNodeKind) }, 1)
+
+	if got := d.engine.RebuildCount(); got != rebuilds {
+		t.Fatalf("RebuildCount = %d, want %d -- a property-only write must be served without any rebuild", got, rebuilds)
+	}
 
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow (post-write): %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("post-write: engine reports stale immediately after RebuildNow")
-	}
 
-	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: cypher property read serves again, reflecting the new value",
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: the cypher read agrees with the replica's own answer",
 		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
 }
 
 // cypherHydrationNodeKind and cypherHydrationEdgeKind are
-// TestCypherHydrationRecheck's own fixture kinds.
+// TestCypherShortestPathServesEdgeWritesImmediately's own fixture kinds.
 var (
 	cypherHydrationNodeKind = graph.StringKind("CypherHydrationNode")
 	cypherHydrationEdgeKind = graph.StringKind("CypherHydrationEdge")
 )
 
-// TestCypherHydrationRecheck is Task 18's second deliverable: proving
-// TryCypher's step-10 post-hydration snapshotStillCurrent recheck
-// (engine.go's own pipeline doc) actually declines when a write lands in
-// the narrow window between interpret.Execute completing and
-// hydrateEdgePropsByID's own PostgreSQL round trip -- the same race
-// servePathQuery's step 7 exists to catch on the shortest-path side, here
-// exercised on the Cypher side instead.
+// TestCypherShortestPathServesEdgeWritesImmediately is the edge-side
+// counterpart to the property-write test above, and covers the one serving
+// path that still performs a PostgreSQL round trip after executing:
+// TryCypher's edge-property hydration (engine.go's step 10). Edges are the
+// one thing the replica holds structurally but not fully -- their property
+// bags are read from PostgreSQL on demand -- so a path query over a
+// written-through edge exercises the delta and that round trip together.
 //
-// A single synchronous TryCypher call has no externally observable point
-// between those two steps for a caller outside package engine to
-// intervene at, short of a timing-dependent goroutine race against a real
-// concurrent write -- so this test forces it deterministically instead, via
-// a minimal seam this task adds to internal/engine/engine.go,
-// SetCypherHydrationRaceHookForTest (see that method's own doc): installed
-// just before the one call under test, it runs synchronously the moment
-// TryCypher determines this query's result needs edge-property hydration,
-// immediately before hydrateEdgePropsByID's own query -- calling
-// engine.NoteWrite(nil) right there reproduces, deterministically, exactly
-// what a genuinely concurrent write landing in that instant would do to
-// the write-generation counter.
+// This test used to force a write into the window between execution and
+// hydration, through a test-only seam, and assert that TryCypher noticed and
+// declined. That recheck is gone with the freshness model it belonged to: a
+// View is immutable and was current when the query captured it, and a write
+// landing mid-query publishes a NEW View for the next query rather than
+// making this one wrong. What is asserted instead is the property that
+// recheck was standing in for -- every write is visible to the next query:
 //
-// The query itself (a one-edge shortestPath) is planned and executed
-// entirely correctly against a still-fresh snapshot -- Plan, the translate
-// gate, and Execute all run, and complete, before the hook ever fires --
-// so the only thing under test is step 10's own recheck: TryCypher must
-// decline (reasonStale) rather than hand back a result computed against a
-// snapshot a write has since invalidated, and wrappedTransaction.Query must
-// fall through to PostgreSQL, which -- since nothing about the database
-// itself actually changed; NoteWrite(nil) only advances the engine's own
-// in-memory counter -- must still find the exact same one path.
-func TestCypherHydrationRecheck(t *testing.T) {
+//  1. baseline: the s->e shortestPath serves one path;
+//  2. the edge is deleted through a batch: the same query serves ZERO paths,
+//     immediately;
+//  3. a fresh edge is created between the same endpoints: the query serves
+//     one path again -- and this time the edge exists only in the replica's
+//     delta, so hydrating its properties by its brand-new database id is
+//     part of what is being proven.
+//
+// No rebuild happens across any of it.
+func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
 	t.Setenv(EnvEnginePollInterval, "1h")
@@ -919,7 +881,10 @@ func TestCypherHydrationRecheck(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 
-	var startID, endID graph.ID
+	var (
+		startID, endID graph.ID
+		edgeID         graph.ID
+	)
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		s, err := tx.CreateNode(graph.NewProperties(), cypherHydrationNodeKind)
 		if err != nil {
@@ -929,10 +894,11 @@ func TestCypherHydrationRecheck(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.CreateRelationshipByIDs(s.ID, e.ID, cypherHydrationEdgeKind, graph.NewProperties()); err != nil {
+		rel, err := tx.CreateRelationshipByIDs(s.ID, e.ID, cypherHydrationEdgeKind, graph.NewProperties().Set("weight", "one"))
+		if err != nil {
 			return err
 		}
-		startID, endID = s.ID, e.ID
+		startID, endID, edgeID = s.ID, e.ID, rel.ID
 		return nil
 	}); err != nil {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
@@ -941,73 +907,71 @@ func TestCypherHydrationRecheck(t *testing.T) {
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("engine reports stale immediately after RebuildNow")
-	}
+	rebuilds := d.engine.RebuildCount()
 
 	text := fmt.Sprintf(`MATCH p = shortestPath((s)-[:CypherHydrationEdge*1..]->(e)) WHERE id(s) = %d AND id(e) = %d RETURN p`, startID, endID)
 
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "baseline: shortestPath cypher query serves",
 		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
 
-	// Arm the race hook for exactly the one call below: the moment TryCypher
-	// determines this query's result needs edge-property hydration, force a
-	// write to land first, deterministically hitting step 10's recheck.
-	d.engine.SetCypherHydrationRaceHookForTest(func() { d.engine.NoteWrite(nil) })
-	t.Cleanup(func() { d.engine.SetCypherHydrationRaceHookForTest(nil) })
+	// (2) Delete the only edge: the path must vanish from the replica at once.
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.DeleteRelationship(edgeID)
+	}); err != nil {
+		t.Fatalf("BatchOperation (delete the edge): %v", err)
+	}
 
-	requireDecline(t, buf, "stale", "hydration recheck: a write lands between Execute and hydration, so the query declines and falls back to PostgreSQL, still returning the correct path",
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after deleting the edge: the shortestPath query serves zero paths",
+		func() int { return cypherPathCount(t, ctx, bt, text) }, 0)
+
+	// (3) Re-create it: the path is back, this time through an edge that
+	// exists only in the replica's delta -- hydrating its properties by its
+	// brand-new database id is part of what serving it requires.
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		_, err := tx.CreateRelationshipByIDs(startID, endID, cypherHydrationEdgeKind, graph.NewProperties().Set("weight", "two"))
+		return err
+	}); err != nil {
+		t.Fatalf("WriteTransaction (re-create the edge): %v", err)
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after re-creating the edge: the shortestPath query serves one path again, over a delta-only edge",
 		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
 
-	// Disarm before rebuilding: RebuildNow itself never reaches
-	// TryCypher's hydration branch, but leaving the hook armed past its one
-	// intended call would silently force every future hydrating query in
-	// this test (there are none below) to decline too.
-	d.engine.SetCypherHydrationRaceHookForTest(nil)
+	if got := d.engine.RebuildCount(); got != rebuilds {
+		t.Fatalf("RebuildCount = %d, want %d -- edge writes must be served without any rebuild", got, rebuilds)
+	}
 
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
-		t.Fatalf("RebuildNow (post-race): %v", err)
-	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("post-race: engine reports stale immediately after RebuildNow")
+		t.Fatalf("RebuildNow (post-write): %v", err)
 	}
 
-	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: shortestPath cypher query serves again",
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: the shortestPath query agrees with the replica's own answer",
 		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
 }
 
-// cypherStaleRecheckNodeKind is TestCypherStaleRecheckNoHydration's own
-// fixture kind.
+// cypherStaleRecheckNodeKind is
+// TestCypherServesConsistentlyDuringConcurrentWrites' own fixture kind.
 var cypherStaleRecheckNodeKind = graph.StringKind("CypherStaleRecheckNode")
 
-// TestCypherStaleRecheckNoHydration is a regression test:
-// TryCypher's step-11 UNCONDITIONAL post-execution snapshotStillCurrent
-// recheck (engine.go's own pipeline doc) must fire even for a
-// pure-snapshot result -- one with no edge/path column at all, so
-// collectEdgeIDs never finds anything to hydrate and step 10's own
-// hydration-branch recheck never runs. Before this fix, TryCypher declined
-// staleness only for the pre-execution Fresh() check (step 8) and the
-// hydration-branch recheck (step 10) -- a query with neither shape could
-// silently serve a result computed against a snapshot a write had already
-// invalidated, if that write landed in the window between Execute
-// completing and the result being handed back, however narrow that window
-// is in practice.
+// TestCypherServesConsistentlyDuringConcurrentWrites is the concurrency
+// half of the same claim, for a pure-snapshot query (a property read with no
+// edge or path column, so nothing to hydrate).
 //
-// Mirrors TestCypherHydrationRecheck's own approach exactly, but for the
-// no-hydration path: since a single synchronous TryCypher call has no
-// externally observable point in that window for a test to intervene at
-// short of a genuinely racing concurrent write, this reuses the identical
-// cypherHydrationRaceHook seam, which -- per its own doc, extended by this
-// same fix -- now also fires immediately before step 11's check on the
-// no-hydration path specifically (there being no hydration branch to fire
-// it from instead). The query itself (a plain property read, no
-// edge/path/path column) is planned and executed entirely correctly
-// against a still-fresh snapshot before the hook ever fires, so only step
-// 11's own recheck is under test: TryCypher must decline (reasonStale)
-// rather than hand back a result computed against a since-invalidated
-// snapshot, and the fallback must still return the correct (post-write)
-// value from PostgreSQL directly.
-func TestCypherStaleRecheckNoHydration(t *testing.T) {
+// It replaces a test that used a seam to force a write into the window
+// between execution and the result being returned, and asserted TryCypher
+// declined. Write-through removes that recheck along with the model it
+// belonged to, so what matters now is what the recheck was protecting
+// against: a query running while writes land must never return a torn or
+// invented answer. Each query executes against whichever immutable View it
+// captured, so its answer must be one of the values actually written -- and
+// once the writer has finished, the next query must see the final one.
+//
+// The writer goroutine walks a known sequence of property values while the
+// reader issues the same Cypher property read over and over; every read must
+// be SERVED from the replica (never delegated) and must return a value from
+// that known set. A final read after the writer joins must return the last
+// value written, and no rebuild may have happened anywhere.
+func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
 	t.Setenv(EnvEnginePollInterval, "1h")
@@ -1048,49 +1012,60 @@ func TestCypherStaleRecheckNoHydration(t *testing.T) {
 	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("engine reports stale immediately after RebuildNow")
-	}
+	rebuilds := d.engine.RebuildCount()
 
 	text := fmt.Sprintf(`MATCH (n:CypherStaleRecheckNode) WHERE id(n) = %d RETURN n.name`, nodeID)
 
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "baseline: plain property-read cypher query serves",
 		func() string { return cypherStringValue(t, ctx, bt, text) }, "before")
 
-	// The write under test: lands (via the race hook) after Execute has
-	// already run against a fresh snapshot, but before TryCypher hands the
-	// result back -- exactly the window step 11 exists to catch, here
-	// reached via the no-hydration branch since this query has no
-	// edge/path column at all. The write ALSO changes name to "after", so
-	// the fallback's answer is independently verifiable as PostgreSQL's own
-	// live read (not some cached pre-write value).
-	d.engine.SetCypherHydrationRaceHookForTest(func() {
-		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
-			return tx.UpdateNode(&graph.Node{ID: nodeID, Properties: graph.NewProperties().Set("name", "after")})
-		}); err != nil {
-			t.Fatalf("race-hook WriteTransaction: %v", err)
+	const writes = 12
+
+	allowed := map[string]struct{}{"before": {}}
+	for i := 1; i <= writes; i++ {
+		allowed[fmt.Sprintf("v%d", i)] = struct{}{}
+	}
+	last := fmt.Sprintf("v%d", writes)
+
+	writerErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= writes; i++ {
+			value := fmt.Sprintf("v%d", i)
+			if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+				return tx.UpdateNode(&graph.Node{ID: nodeID, Properties: graph.NewProperties().Set("name", value)})
+			}); err != nil {
+				writerErr <- fmt.Errorf("concurrent write %q: %w", value, err)
+				return
+			}
 		}
-	})
-	t.Cleanup(func() { d.engine.SetCypherHydrationRaceHookForTest(nil) })
+		writerErr <- nil
+	}()
 
-	requireDecline(t, buf, "stale", "no-hydration recheck: a write lands between Execute and the result being returned, so the query declines and falls back to PostgreSQL, returning the live (new) value",
-		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
-
-	// Disarm before rebuilding: RebuildNow itself never reaches TryCypher's
-	// serving pipeline at all, but leaving the hook armed past its one
-	// intended call would silently force every future cypher query in this
-	// test (there are none below) to decline too.
-	d.engine.SetCypherHydrationRaceHookForTest(nil)
-
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
-		t.Fatalf("RebuildNow (post-race): %v", err)
-	}
-	if _, fresh := d.engine.Fresh(); !fresh {
-		t.Fatalf("post-race: engine reports stale immediately after RebuildNow")
+	for i := 0; i < writes*2; i++ {
+		before := markerCount(buf, cypherServedMarker)
+		got := cypherStringValue(t, ctx, bt, text)
+		if delta := markerCount(buf, cypherServedMarker) - before; delta != 1 {
+			t.Fatalf("concurrent read %d: cypher served marker delta %d, want 1 -- a write landing mid-flight must not stop the engine serving", i, delta)
+		}
+		if _, ok := allowed[got]; !ok {
+			t.Fatalf("concurrent read %d returned %q, which was never written", i, got)
+		}
 	}
 
-	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-rebuild: plain property-read cypher query serves again, reflecting the new value",
-		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
+	wg.Wait()
+	if err := <-writerErr; err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after the concurrent writer finished: the next read serves the final value",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, last)
+
+	if got := d.engine.RebuildCount(); got != rebuilds {
+		t.Fatalf("RebuildCount = %d, want %d -- concurrent writes must be served without any rebuild", got, rebuilds)
+	}
 }
 
 // cypherMultiGraphNodeKind/cypherMultiGraphSecondKind are
@@ -1104,18 +1079,16 @@ var (
 	cypherMultiGraphSecondGraphName = "bloodtrail_test_second_graph"
 )
 
-// TestCypherMultiGraphGuard is Task 18's third deliverable: TryCypher must
-// decline reasonMultiGraph the instant LoadSnapshot's probeMultiGraph
+// TestCypherMultiGraphGuard: TryCypher must decline reasonMultiGraph the
+// instant LoadSnapshot's probeMultiGraph
 // (internal/engine/load.go) finds a second graph holding at least one node
 // anywhere in the database -- regardless of whether that second graph has
 // anything to do with the query being asked, since the interpreter has no
 // notion of which graph a query is scoped to at all (engine.go's own doc
-// for reasonMultiGraph). The kind-scoped builder-serving path carries no
-// such guard (serve_builder.go never inspects Snapshot.MultiGraph), so a
-// builder query on the very same default-graph fixture must keep serving,
-// completely unaffected -- this milestone's now-familiar contrast between
-// the two serving paths, drawn here along the MultiGraph axis instead of a
-// freshness one.
+// for reasonMultiGraph). The builder-serving path carries no such guard
+// (serve_builder.go never inspects Snapshot.MultiGraph), so a builder query
+// on the very same default-graph fixture must keep serving, completely
+// unaffected -- the one place the two serving paths still differ.
 //
 // The second graph is created directly through the raw pg driver (not the
 // wrapped bloodtrail one) via WithGraph, which dawgs' own SchemaManager.

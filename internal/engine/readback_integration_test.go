@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -64,7 +65,14 @@ func TestReadBack(t *testing.T) {
 	rbNodeKind := graph.StringKind("RBNode")
 	rbEdgeKind := graph.StringKind("RBEdge")
 	neverRegisteredKind := graph.StringKind("NeverRegisteredKind")
-	runtimeKind := graph.StringKind("RuntimeKind")
+	// Suffixed with this run's own nanosecond timestamp, deliberately: the
+	// `kind` table is global and permanent (WipeGraph truncates nodes and
+	// edges, never kinds), so a fixed name would already be registered from
+	// an earlier run of this suite and would therefore be present in the
+	// snapshot's own kind table BEFORE the assertion below re-registers it
+	// -- making resolvedKinds legitimately empty and this test pass only
+	// ever on a pristine database.
+	runtimeKind := graph.StringKind(fmt.Sprintf("RuntimeKind%d", time.Now().UnixNano()))
 
 	if _, err := pgDriver.AssertKinds(ctx, graph.Kinds{rbNodeKind, rbEdgeKind}); err != nil {
 		t.Fatalf("assert seed kinds: %v", err)

@@ -20,28 +20,22 @@ import (
 // engine.go, which TryAllShortestPaths/TryCypher continue to use unchanged.
 const (
 	// reasonNoKindConstraint fires when a recognize.NodeSpec carries zero
-	// kind constraints -- including one that constrains only by id(): a
-	// spec's kind-scoped staleness proof (see resolveNodeSpec's doc) is
-	// built entirely from ConstraintKinds(), so a spec with no constraints
-	// at all has nothing to check freshness against and is declined
-	// outright rather than served on a freshness guarantee that cannot be
-	// established. An id-only node query is expected to be rare enough in
-	// practice (BloodHound's builder queries always pair id() filters with a
-	// kind filter) that delegating it to PostgreSQL costs little.
+	// kind constraints -- including one that constrains only by id().
+	// resolveNodeSpec builds its match set by intersecting one bitmap per
+	// kind constraint, so a spec naming none has no bitmap to start from at
+	// all (resolveConstraintBitmaps answers "unconstrained", which is not a
+	// match set): it is declined outright rather than given a fabricated
+	// everything-matches bitmap. An id-only node query is expected to be
+	// rare enough in practice (BloodHound's builder queries always pair
+	// id() filters with a kind filter) that delegating it to PostgreSQL
+	// costs little.
 	//
 	// recognize.RelSpec has no equivalent minimum (see resolveRelSpec's
-	// doc): a RelSpec's freshness proof falls back to "every recorded kind
-	// entry must be clean" whenever a dimension is left unconstrained
-	// (edgeKindsClean/nodeKindsClean's own empty-kinds contract), which is
-	// always establishable, so this reason never fires for one.
+	// doc): a relationship scan walks the adjacency itself, with the kind
+	// mask and endpoint bitmaps as optional filters, so a fully
+	// unconstrained RelSpec is a well-defined full scan rather than a
+	// missing match set.
 	reasonNoKindConstraint = "no_kind_constraint"
-
-	// reasonKindStale fires when a spec's own constrained kinds are not
-	// clean against the serving snapshot's generation (allNodesClean &&
-	// nodeKindsClean, or their edge equivalents for Task 7): some write
-	// landed, after the snapshot was built, that touched a kind this spec's
-	// answer depends on.
-	reasonKindStale = "kind_stale"
 
 	// reasonUnsupportedOrder is TryRelQueryRows-only: orderByEdgeID was
 	// requested but spec anchors neither endpoint (spec.StartIDs and
@@ -115,50 +109,39 @@ func (e *Engine) servedOp(ctx context.Context, op string, start time.Time, extra
 	e.cfg.Log.DebugContext(ctx, "bloodtrail: builder engine served", attrs...)
 }
 
-// serveGate is the first two checks shared by every builder-serving entry
-// point: TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds here, and Task 7's
-// rel-query siblings. It reports cfg.Enabled (reasonDisabled) and a non-nil
-// current snapshot (reasonNoSnapshot) -- exactly the same two reasons, in
-// the same order, as servePathQuery's own step 1.
+// serveGate is the gate shared by every builder-serving entry point:
+// TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds here, and the rel-query
+// siblings below. It reports cfg.Enabled (reasonDisabled), a non-nil current
+// View (reasonNoSnapshot), and the engine being in stateServing rather than
+// fallback (reasonFallback) -- exactly the same three reasons, in the same
+// order, as servePathQuery's own step 1, via the same serveState helper.
 //
-// Freshness is deliberately NOT checked here, unlike servePathQuery's
-// combined Fresh() call: whether a snapshot is fresh enough to serve a
-// structural query depends on which specific kinds that query constrains
-// (spec.ConstraintKinds()), which only the caller knows. A snapshot can be
-// stale for one spec (its constrained kind was just written) while still
-// perfectly servable for another (an unrelated kind elsewhere in the graph
-// changed) -- collapsing that down to Fresh()'s single blanket bool would
-// force declining specs that are, in fact, safe to serve. Every caller must
-// therefore run its own kind-scoped freshness check (allNodesClean +
-// nodeKindsClean, or the edge equivalents) after this gate passes and
-// before executing.
+// No freshness check follows it in any caller, and none is needed: with
+// write-through (apply.go), the View this returns already reflects every
+// write committed before this call -- each one published its own delta
+// before its writing call returned -- so there is no "is this snapshot
+// behind" question left to ask, per spec or otherwise. The kind-scoped
+// marks gates every caller used to run after this gate are gone with it.
 //
-// Design note on staleness, for this gate and every caller built on it:
-// unlike servePathQuery, none of TryNodeCount/TryNodeFetchIDs/
-// TryNodeFetchKinds re-validates the snapshot after computing its answer.
-// servePathQuery's step-7 recheck exists because that pipeline's own work
-// (graph traversal, then a PostgreSQL round trip to hydrate the resulting
-// dense paths) can run long enough for a concurrent write to land
-// mid-computation, and a result that mixes two generations would be
-// silently wrong. The builder-serving path has no equivalent window: every
-// value it returns -- a bitset built purely from NodesOfKind/KindOffsets/
-// NodeKinds, a count of its set bits, the GraphIDs each set bit maps to --
-// is derived exclusively from fields already frozen on the one immutable
-// snapshot instance in hand, with no live external round trip in between
-// that a concurrent write could invalidate partway through. A write that
-// lands after the freshness check below can only ever be observed on the
-// *next* call (via the marks it stamps), never corrupt the answer already
-// in flight, so a post-execution recheck here would catch nothing a
-// pre-execution one hasn't already ruled out.
+// Nor does any caller re-validate after computing its answer: every value
+// the builder-serving path returns -- a bitset built from NodesOfKind/
+// KindIDsOf, a count of its set bits, the GraphIDs each set bit maps to --
+// is derived exclusively from the one immutable View in hand, so a write
+// landing mid-computation publishes a new View for the NEXT query rather
+// than corrupting this one.
 func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool) {
 	if !e.cfg.Enabled {
 		e.declineOp(ctx, op, reasonDisabled, nil)
 		return nil, false
 	}
 
-	snap := e.snap.Load()
+	snap, serving := e.serveState()
 	if snap == nil {
 		e.declineOp(ctx, op, reasonNoSnapshot, nil)
+		return nil, false
+	}
+	if !serving {
+		e.declineOp(ctx, op, reasonFallback, nil)
 		return nil, false
 	}
 
@@ -176,12 +159,7 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 //     failure is ambiguous between "kind genuinely doesn't exist" and "the
 //     lookup itself failed", so it is never silently treated as "matches
 //     nothing").
-//  4. spec.ConstraintKinds()' freshness against snap.Generation
-//     (allNodesClean && nodeKindsClean; reasonKindStale otherwise) -- run
-//     only after kind mapping succeeds, so a spec naming an unknown kind is
-//     always declined reasonError rather than reasonKindStale, even if the
-//     snapshot also happens to be stale.
-//  5. The matching dense-NodeID bitset itself: each KindConstraint's
+//  4. The matching dense-NodeID bitset itself: each KindConstraint's
 //     any-of union or all-of intersection of NodesOfKind bitmaps
 //     (matchConstraint), every constraint's result intersected with the
 //     next (intersectBitmaps), and -- if spec.IDs is non-nil -- intersected
@@ -212,11 +190,6 @@ func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.
 	matches, err := e.resolveConstraintBitmaps(ctx, snap, spec.Constraints)
 	if err != nil {
 		e.declineOp(ctx, op, reasonError, err)
-		return nil, nil, false
-	}
-
-	if !e.allNodesClean(snap.Generation()) || !e.nodeKindsClean(snap.Generation(), spec.ConstraintKinds()) {
-		e.declineOp(ctx, op, reasonKindStale, nil)
 		return nil, nil, false
 	}
 
@@ -399,28 +372,15 @@ func (e *Engine) TryNodeFetchIDs(ctx context.Context, spec recognize.NodeSpec) (
 // success. It returns (nil, false) under the same conditions as
 // TryNodeCount (see resolveNodeSpec's doc), plus two more:
 //
-//   - Any node kind, anywhere in the snapshot, is not clean relative to
-//     snap.Generation (reasonKindStale), checked via
-//     e.allNodeKindsClean(snap.Generation) immediately after resolveNodeSpec
-//     succeeds. This is deliberately stricter than TryNodeCount/
-//     TryNodeFetchIDs, whose own freshness needs are already fully covered
-//     by resolveNodeSpec's nodeKindsClean(spec.ConstraintKinds()) check: a
-//     count or an id listing depends only on which nodes carry (or don't
-//     carry) spec's own constrained kinds, so a write touching some other,
-//     unconstrained kind can never change either answer. A kind LISTING is
-//     different -- it reports every kind each matching node carries, not
-//     just whether it carries one of spec's constrained kinds. A write that
-//     adds or removes an UNNAMED kind on a node that still matches spec
-//     (e.g. an analysis pass tagging an already-matching User with an extra
-//     kind) changes the correct answer to this specific query, with no
-//     effect at all on spec.ConstraintKinds()' own cleanliness -- exactly
-//     the gap resolveNodeSpec's gate alone cannot see, and exactly what
-//     upstream's GetPrimaryNodeKindCounts (which calls FetchKinds, not
-//     Count, for this reason) actually consumes. So this method alone, among
-//     the three sharing resolveNodeSpec, must also require every node kind
-//     in the whole snapshot to be clean, not just spec's own.
 //   - failing to resolve the KindIDs actually carried by the matching nodes
 //     back to their graph.Kind names declines reasonError.
+//
+// It once additionally required every node kind in the whole snapshot to be
+// mark-clean, because a kind LISTING exposes kinds the spec never constrains
+// by, and a write touching one of those would have gone uncaught by
+// resolveNodeSpec's own spec-scoped freshness check. Write-through removes
+// the premise entirely: the View this serves from already carries every
+// committed kind change, named by the spec or not.
 //
 // Every distinct KindID carried by any matching node is resolved to its
 // graph.Kind name via one batched e.mapKindNames call (resolveMatchingKindNames),
@@ -435,11 +395,6 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 
 	matches, snap, ok := e.resolveNodeSpec(ctx, opNodeKinds, spec)
 	if !ok {
-		return nil, false
-	}
-
-	if !e.allNodeKindsClean(snap.Generation()) {
-		e.declineOp(ctx, opNodeKinds, reasonKindStale, nil)
 		return nil, false
 	}
 
@@ -527,18 +482,16 @@ func resolveKindNameMap(ids []snapshot.KindID, resolve func([]snapshot.KindID) (
 }
 
 // ---------------------------------------------------------------------------
-// Task 7: relationship-query serving.
+// Relationship-query serving.
 //
 // TryRelCount, TryRelFetchIDs, TryRelFetchTriples, TryRelFetchKinds, and
 // TryRelQueryRows all serve a recognize.RelSpec entirely from the current
-// snapshot's CSR arrays, sharing one gate (resolveRelSpec) and one scan
+// View's adjacency, sharing one gate (resolveRelSpec) and one scan
 // (relScanIter) the same way TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds
 // share resolveNodeSpec above. Unlike the node-spec side, a RelSpec needs no
 // constraint minimum: a fully unconstrained relationship query (nil
-// StartIDs/EndIDs, empty EdgeKinds, no endpoint kind constraints) is
-// servable whenever the snapshot is clean, since edgeKindsClean/
-// allNodeKindsClean's empty-kinds case already means "every recorded kind
-// entry must be clean" -- there is no analogue to resolveNodeSpec's
+// StartIDs/EndIDs, empty EdgeKinds, no endpoint kind constraints) is a
+// well-defined full scan, so there is no analogue to resolveNodeSpec's
 // reasonNoKindConstraint decline here.
 // ---------------------------------------------------------------------------
 
@@ -605,19 +558,7 @@ type relPlan struct {
 //     mapKind failure along the way declines reasonError, exactly like
 //     resolveNodeSpec's step 3 -- an unmappable kind is never silently
 //     treated as "matches nothing" (see matchConstraint's doc).
-//  3. Freshness, checked only after every kind name above has resolved
-//     successfully (so an unknown kind always declines reasonError rather
-//     than reasonKindStale, even against a snapshot that also happens to be
-//     stale -- resolveNodeSpec's step 4 makes the same ordering choice):
-//     allEdgesClean(g) && edgeKindsClean(g, spec.EdgeKinds) always, plus --
-//     only if spec.StartConstraints or spec.EndConstraints is non-empty --
-//     allNodesClean(g) && nodeKindsClean(g, spec.NodeConstraintKinds()). g
-//     is snap.Generation. Unlike servePathQuery, there is no post-execution
-//     recheck: see serveGate's doc for why a builder-serving answer, once
-//     computed from fields already frozen on one immutable snapshot
-//     instance, can never be corrupted by a write that lands after this
-//     check -- the same argument applies unchanged to a relationship scan.
-//  4. spec.StartIDs/EndIDs Dense-mapped into startAnchor/endAnchor via
+//  3. spec.StartIDs/EndIDs Dense-mapped into startAnchor/endAnchor via
 //     denseIDBitmap, preserving the nil ("unconstrained")-vs-non-nil
 //     ("anchored, possibly to zero ids") distinction (relPlan's own doc).
 //
@@ -644,17 +585,6 @@ func (e *Engine) resolveRelSpec(ctx context.Context, op string, spec recognize.R
 	if err != nil {
 		e.declineOp(ctx, op, reasonError, err)
 		return nil, false
-	}
-
-	if !e.allEdgesClean(snap.Generation()) || !e.edgeKindsClean(snap.Generation(), spec.EdgeKinds) {
-		e.declineOp(ctx, op, reasonKindStale, nil)
-		return nil, false
-	}
-	if len(spec.StartConstraints) > 0 || len(spec.EndConstraints) > 0 {
-		if !e.allNodesClean(snap.Generation()) || !e.nodeKindsClean(snap.Generation(), spec.NodeConstraintKinds()) {
-			e.declineOp(ctx, op, reasonKindStale, nil)
-			return nil, false
-		}
 	}
 
 	var startAnchor, endAnchor *snapshot.Bitset
@@ -1221,26 +1151,12 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 //     can be the entire edge set, which the real upstream orderByEdgeID
 //     callers (traversal's paging order) never ask a full-scan query for
 //     anyway.
-//   - For a step projection (proj != recognize.ProjectionStartEnd), any node
-//     kind anywhere in the snapshot is not clean relative to plan.snap.
-//     Generation (reasonKindStale). A step projection's row carries the far
-//     node's own kinds column (TryNodeFetchKinds' identical concern, see its
-//     doc), which resolveRelSpec's own gate does not fully cover:
-//     resolveRelSpec only checks node-kind cleanliness at all when
-//     spec.StartConstraints or spec.EndConstraints is non-empty, and even
-//     then only for spec.NodeConstraintKinds() -- the kinds the query
-//     filters BY, not every kind a far node might carry and this row type
-//     then EXPOSES. A step projection's far endpoint is typically
-//     unconstrained by kind at all (the common shape: "every outbound step
-//     from this one known node"), so a write that adds or removes some
-//     unrelated kind on a far node already in the match set would otherwise
-//     go completely uncaught, leaving this method's kind columns
-//     stale-as-fresh. So, exactly like TryNodeFetchKinds, a step projection
-//     additionally requires allNodesClean && allNodeKindsClean, deliberately
-//     stronger than resolveRelSpec's own check. ProjectionStartEnd's row is
-//     a bare id pair exposing no kind information at all, so it needs no
-//     such check and stays exactly as permissive as resolveRelSpec's own
-//     gate already allows.
+//
+// A step projection once additionally required every node kind in the
+// snapshot to be mark-clean, since its row carries the far node's own kinds
+// column (TryNodeFetchKinds' identical, now equally retired, concern):
+// write-through removes the premise, because the View this serves from
+// already carries every committed kind change.
 //
 // When orderByEdgeID is honored, newRelScanIter's relIterator is fully
 // drained (drainRelIter) and sorted ascending by edge id before rowResult is
@@ -1290,12 +1206,6 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 
 	var kindNames map[snapshot.KindID]graph.Kind
 	if proj != recognize.ProjectionStartEnd {
-		g := plan.snap.Generation()
-		if !e.allNodesClean(g) || !e.allNodeKindsClean(g) {
-			e.declineOp(ctx, opRelRows, reasonKindStale, nil)
-			return nil, false
-		}
-
 		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID(), func(snapshot.KindID) bool { return true }), e.mapKindNames)
 		if err != nil {
 			e.declineOp(ctx, opRelRows, reasonError, err)

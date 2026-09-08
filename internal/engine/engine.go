@@ -46,17 +46,23 @@ type Config struct {
 	Log *slog.Logger
 }
 
-// Engine is BloodTrail's in-memory path-finding engine: a snapshot.Snapshot
-// rebuilt from PostgreSQL on demand (RebuildNow), served for
-// TryAllShortestPaths calls only while it is fresh enough for correctness
-// (Fresh, NoteWrite).
+// Engine is BloodTrail's in-memory graph replica: a snapshot.Snapshot loaded
+// from PostgreSQL (RebuildNow), kept current by replaying every committed
+// write into it as a delta segment (Apply, apply.go), and served for
+// TryAllShortestPaths/TryCypher/the builder-serving entry points while the
+// engine is in stateServing.
+//
+// The replica is never knowingly stale: a write either replays into it
+// before the writing call returns, or -- when it cannot be replayed --
+// trips the engine into stateFallback, where every query goes to PostgreSQL
+// until a background rebuild restores a trustworthy snapshot (enterFallback).
 //
 // The zero value is not usable; construct with New. Every exported method is
-// safe for concurrent use. The current snapshot and the write-generation
-// counter are both stored atomically: RebuildNow is expected to run from a
-// single poller goroutine at a time, but concurrent TryAllShortestPaths
-// calls from many request goroutines -- including calls concurrent with a
-// RebuildNow or a NoteWrite -- are expected and safe.
+// safe for concurrent use. The current View is stored atomically and
+// published only under applyMu, so concurrent queries from many request
+// goroutines -- including queries concurrent with an Apply or a RebuildNow --
+// are expected and safe: each one runs against whichever immutable View it
+// loaded.
 type Engine struct {
 	pgDriver *pg.Driver
 	pool     *pgxpool.Pool
@@ -64,6 +70,40 @@ type Engine struct {
 
 	snap       atomic.Pointer[snapshot.View]
 	generation atomic.Uint64
+
+	// state is the serving state (stateServing/stateFallback, apply.go),
+	// read by every serving entry point through serveState and written by
+	// enterFallback and the fallback recovery goroutine. Its zero value is
+	// stateServing: a fresh Engine is willing to serve, and is stopped from
+	// actually doing so only by having no snapshot yet.
+	state atomic.Int32
+
+	// applyMu serializes Apply calls with each other and with a rebuild's
+	// own publish step (adoptRebuiltView), so that two writes can never
+	// derive Views from the same base and drop one another's delta, and a
+	// rebuild can never overwrite a delta it did not include.
+	applyMu sync.Mutex
+
+	// applyEpoch counts Apply calls. A rebuild reads it before it starts
+	// loading and compares it again before publishing (adoptRebuiltView):
+	// an unchanged value proves no write was applied while the load ran, and
+	// therefore that the freshly loaded snapshot cannot be missing one.
+	applyEpoch atomic.Uint64
+
+	// fallbackRebuilding is set while the single fallback recovery goroutine
+	// (runFallbackRebuild) is running, so a burst of failing writes starts
+	// one rebuild rather than one per write.
+	fallbackRebuilding atomic.Bool
+
+	// bgCtx/bgCancel scope the engine's own background work (today: the
+	// fallback recovery goroutine) to the engine's lifetime rather than to
+	// any one caller's request context: the write whose failure tripped the
+	// fallback has long returned by the time recovery finishes, and its
+	// ctx being cancelled says nothing about whether the replica should
+	// recover. Stop cancels bgCtx, which is what makes an in-flight
+	// recovery goroutine exit promptly.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 
 	// marks is the kind-scoped complement to generation above: which kind
 	// names NoteWrite has touched, and at which generation. See marks.go.
@@ -84,10 +124,13 @@ type Engine struct {
 
 	// rebuildAttempts counts every RebuildNow call that actually reached
 	// LoadSnapshot, refused or not. Nothing in production reads it; it
-	// exists purely for white-box test observability (poller_integration_
-	// test.go) of the poller's retry-suppression fix, which the "refusal
-	// warning" log alone cannot distinguish from a repeated LoadSnapshot
-	// attempt whose warning happened to be rate-limited (refusalLogInterval).
+	// exists purely for test observability -- white-box, for the poller's
+	// retry-suppression behavior (poller_integration_test.go), which the
+	// "refusal warning" log alone cannot distinguish from a repeated
+	// LoadSnapshot attempt whose warning happened to be rate-limited
+	// (refusalLogInterval), and black-box, through RebuildCount, for the
+	// write-through tests' central claim that a write is served without any
+	// rebuild at all.
 	rebuildAttempts atomic.Uint64
 
 	// pollStop and pollDone coordinate Start/Stop's poller goroutine
@@ -121,60 +164,17 @@ type Engine struct {
 	// direction -- needed by TryNodeFetchKinds to render its
 	// graph.KindsResult output.
 	mapKindNames func(ids []snapshot.KindID) (graph.Kinds, error)
-
-	// cypherHydrationRaceHook, when non-nil, runs synchronously inside
-	// TryCypher immediately after collectEdgeIDs has determined whether
-	// hydration is needed at all -- either immediately before the
-	// hydrateEdgePropsByID call that performs it (when it is), or, when the
-	// result carries no edge/path column at all (nothing to hydrate), at the
-	// equivalent point on that pure-snapshot path instead, immediately
-	// before step 11's own unconditional recheck. Either way, it always
-	// fires exactly once per TryCypher call, at whichever point is that
-	// call's own last chance to force a race before its final freshness
-	// check. Production code never sets this field -- the zero value is a
-	// complete no-op, so every real caller pays nothing for its existence.
-	//
-	// It exists purely as an integration-test seam (see the root package's
-	// staleness_integration_test.go, TestCypherHydrationRecheck and
-	// TestCypherStaleRecheckNoHydration), installed via
-	// SetCypherHydrationRaceHookForTest, for forcing a write to land
-	// deterministically in the exact window step 10/11's snapshotStillCurrent
-	// recheck (TryCypher's own doc) exists to catch: a single TryCypher call
-	// is one synchronous function with no other externally observable point
-	// between Execute completing and the final recheck for a caller outside
-	// this package to intervene at, short of a timing-dependent goroutine
-	// race against a real concurrent write. The hook body is free to call
-	// NoteWrite directly (the minimal way to reproduce a write's effect on
-	// the write-generation counter) or drive a real write through the root
-	// package's own Driver -- pgxpool hands out independent connections, so
-	// a write issued from here would not deadlock against the read
-	// transaction TryCypher itself is running under.
-	cypherHydrationRaceHook func()
-}
-
-// SetCypherHydrationRaceHookForTest installs (or, given nil, clears) fn as
-// the engine's cypherHydrationRaceHook -- see that field's own doc for what
-// it is and why it exists. Exported so an integration test in another
-// package (the root package's staleness_integration_test.go) can install
-// it.
-//
-// Not safe to call concurrently with an in-flight TryCypher call: this
-// field is a plain, unsynchronized func value, deliberately not an
-// atomic.Pointer, since its only intended caller is test code that arranges
-// its own happens-before ordering (set the hook, then issue the one TryCypher
-// call it is meant to intercept, all from the same goroutine).
-func (e *Engine) SetCypherHydrationRaceHookForTest(fn func()) {
-	e.cypherHydrationRaceHook = fn
 }
 
 // New constructs an Engine bound to pgDriver/pool. It does not load a
-// snapshot: TryAllShortestPaths declines every call (reason "no_snapshot")
-// until RebuildNow succeeds at least once.
+// snapshot: every serving entry point declines (reason "no_snapshot") until
+// RebuildNow succeeds at least once.
 func New(pgDriver *pg.Driver, pool *pgxpool.Pool, cfg Config) *Engine {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
 	e := &Engine{pgDriver: pgDriver, pool: pool, cfg: cfg}
+	e.bgCtx, e.bgCancel = context.WithCancel(context.Background())
 	e.mapKind = func(ctx context.Context, kind graph.Kind) (int16, error) {
 		return e.pgDriver.KindMapper().MapKind(ctx, kind)
 	}
@@ -182,92 +182,118 @@ func New(pgDriver *pg.Driver, pool *pgxpool.Pool, cfg Config) *Engine {
 	return e
 }
 
-// Generation returns the engine's current write-generation counter, the same
-// value NoteWrite advances and snapshotStillCurrent compares snapshots
-// against. It exists purely for test observability (the root package's
-// driver tests assert a mutating capability method bumps this on success and
-// leaves it unchanged on error) -- nothing in the engine's own serving path
-// needs to read it from outside the package.
+// Generation returns the engine's current write-generation counter, which
+// NoteWrite (marks.go) still advances on every write. Nothing in the serving
+// path reads it any more -- write-through (apply.go) replaced staleness
+// checks with the SERVING/FALLBACK state -- so it survives only as interim
+// bookkeeping for the poller and for the root package's driver tests, which
+// assert a mutating capability method bumps it on success and leaves it
+// unchanged on error.
 func (e *Engine) Generation() uint64 {
 	return e.generation.Load()
 }
 
-// Fresh returns the engine's current snapshot and whether it is fresh:
-// non-nil and stamped with the write-generation counter's current value.
-//
-// The first return value distinguishes why a stale result is stale: nil
-// means no snapshot has ever been adopted (RebuildNow has never succeeded,
-// or every attempt so far exceeded MemoryLimit); a non-nil, not-fresh result
-// means a snapshot exists but a NoteWrite landed after it was built.
-func (e *Engine) Fresh() (*snapshot.View, bool) {
-	snap := e.snap.Load()
-	if snap == nil {
-		return nil, false
-	}
-	return snap, e.snapshotStillCurrent(snap)
+// RebuildCount returns how many times the engine has loaded a snapshot from
+// PostgreSQL (every RebuildNow call that reached LoadSnapshot, adopted or
+// not). It exists for test observability: the write-through tests' central
+// claim is that a write is served from the replica with no rebuild in
+// between, which is exactly "this count did not change".
+func (e *Engine) RebuildCount() uint64 {
+	return e.rebuildAttempts.Load()
 }
 
-// snapshotStillCurrent reports whether snap's own Generation still matches
-// the engine's live write-generation counter.
+// Fresh returns the engine's current View and whether the engine is
+// currently willing to serve from it: a snapshot has been adopted and the
+// engine is in stateServing.
 //
-// This is the predicate both Fresh (for whatever snapshot e.snap currently
-// holds) and TryAllShortestPaths' step-6 recheck (for the specific snapshot
-// pointer captured at step 1 and used for the entire computation) need --
-// and they are not interchangeable via a second Fresh() call: Fresh() reads
-// e.snap.Load() itself, so after a concurrent RebuildNow adopts a new
-// snapshot, a second Fresh() call judges that *different*, newly-adopted
-// snapshot instead of the one the caller actually served results from. A
-// new snapshot's Generation can coincidentally match the live counter (e.g.
-// generation 5->6, then RebuildNow adopts a snapshot stamped 6) even though
-// the original snap is now stale -- exactly the "results may mix two eras"
-// case the step-6 check exists to catch. Passing the captured snap
-// explicitly, rather than re-deriving it, is what makes the check correct.
-func (e *Engine) snapshotStillCurrent(snap *snapshot.View) bool {
-	return snap.Generation() == e.generation.Load()
+// The first return value distinguishes the two reasons a false comes back:
+// nil means no snapshot has ever been adopted (no rebuild has succeeded, or
+// every attempt so far exceeded MemoryLimit); a non-nil View with false means
+// the engine is in fallback, replaying-into-the-replica having failed for
+// some write, until the recovery rebuild completes (apply.go).
+//
+// Its one production caller left is the poller, whose "the snapshot needs
+// rebuilding" rules read it (poller.go). Serving paths use serveState
+// instead, which answers the same question without the poller's framing.
+func (e *Engine) Fresh() (*snapshot.View, bool) {
+	return e.serveState()
+}
+
+// serveState returns the View a query should run against, and whether the
+// engine may serve that query at all: a snapshot must have been adopted, and
+// the engine must be in stateServing.
+//
+// This is the single serving gate every entry point shares. It replaced the
+// generation/marks freshness checks retired with write-through: a published
+// View already reflects every committed write (Apply publishes before the
+// writing call returns), so there is no staleness left for a query to check
+// against -- only whether the replica is trustworthy at all right now.
+//
+// The View is returned even when ok is false, so a caller can tell
+// "no snapshot yet" (nil) from "in fallback" (non-nil) when choosing its
+// decline reason.
+func (e *Engine) serveState() (*snapshot.View, bool) {
+	view := e.snap.Load()
+	return view, view != nil && e.state.Load() == stateServing
 }
 
 // RebuildNow loads a fresh snapshot.Snapshot from PostgreSQL and, if its
-// approximate size fits within cfg.MemoryLimit, adopts it atomically as the
-// engine's current snapshot.
+// approximate size fits within cfg.MemoryLimit and no write was applied
+// while it was loading, adopts it atomically as the engine's current View.
+//
+// It is the thin, error-only wrapper every caller outside this file uses;
+// rebuildOnce carries the whole implementation, plus the "was it actually
+// adopted" answer that only the fallback recovery goroutine (apply.go) needs.
+func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp time.Time) error {
+	_, err := e.rebuildOnce(ctx, trigger, analysisStamp)
+	return err
+}
+
+// rebuildOnce is RebuildNow's implementation, additionally reporting whether
+// the freshly loaded snapshot was actually adopted as the engine's current
+// View. adopted is false, with a nil error, in the two ways a successful load
+// can still fail to be published: it exceeded cfg.MemoryLimit, or a write was
+// applied while it was loading (see adoptRebuiltView).
 //
 // trigger names why this call is happening (triggerStartup, triggerAnalysis,
-// triggerIdleStale, or triggerAnalyzing from the poller, or triggerManual
-// for every other caller); it is logged verbatim in the "trigger" attr on
-// both the success and memory-limit-refusal log lines below, so log
-// consumers can tell a poller-driven rebuild from a manual one.
-// analysisStamp is stamped onto the snapshot's AnalysisStamp field before
-// the memory-limit check (so it is set
+// triggerIdleStale, or triggerAnalyzing from the poller, triggerFallback from
+// the fallback recovery goroutine, or triggerManual for every other caller);
+// it is logged verbatim in the "trigger" attr on the success, refusal, and
+// not-adopted log lines below, so log consumers can tell a poller-driven
+// rebuild from a recovery or manual one. analysisStamp is stamped onto the
+// snapshot's AnalysisStamp field before the memory-limit check (so it is set
 // whether or not the snapshot is actually adopted -- irrelevant either way
 // for a dropped snapshot, but keeping the assignment unconditional avoids a
 // second, easy-to-forget branch); callers with no meaningful reading (every
-// caller but the poller) pass the zero time.Time, leaving AnalysisStamp
-// zero, same as before this parameter existed.
+// caller but the poller) pass the zero time.Time.
 //
 // The new snapshot's Generation is stamped with the write-generation
-// counter's value as read at the very start of this call, before
-// LoadSnapshot's own read transaction begins: any write that lands
-// concurrently with the load is therefore still correctly reflected as
-// having invalidated the freshly adopted snapshot (Fresh will report it
-// stale), rather than silently missing that write.
+// counter's value as read at the very start of this call. Nothing in the
+// serving path reads it any more (write-through replaced staleness with the
+// SERVING/FALLBACK state), but the poller still compares generations, so the
+// stamp stays until the poller does.
 //
 // A snapshot whose ApproxBytes() exceeds a nonzero cfg.MemoryLimit is
-// dropped rather than adopted: whatever snapshot was previously current (nil
-// or otherwise) stays current, and the refusal is remembered via overBudget
-// for the poller (poller.go) to act on. This is not treated as a RebuildNow
-// failure -- the load itself succeeded -- so the error return stays nil.
+// dropped rather than adopted: whatever View was previously current (nil or
+// otherwise) stays current, and the refusal is remembered via overBudget for
+// the poller (poller.go) to act on. This is not treated as a failure -- the
+// load itself succeeded -- so the error return stays nil.
 //
 // The refusal warning itself is rate-limited (shouldLogRefusal), the same
 // way the poller's own query-error warning is (queryErrorLogInterval): the
 // very first refusal always logs, and any later refusal logs again only if
 // at least refusalLogInterval has passed since the last one logged --
 // regardless of whether the calls in between were the poller retrying the
-// exact same reading or genuinely new attempts (e.g. rule (c) retrying
-// after a new write lands while a prior refusal is still in effect). This
-// caps log volume for a sustained over-budget condition without depending
-// on decideRebuild's own retry gating to do it alone.
-func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp time.Time) error {
+// exact same reading or genuinely new attempts. This caps log volume for a
+// sustained over-budget condition without depending on decideRebuild's own
+// retry gating to do it alone.
+func (e *Engine) rebuildOnce(ctx context.Context, trigger string, analysisStamp time.Time) (bool, error) {
 	start := time.Now()
 	generation := e.generation.Load()
+	// Read BEFORE the load begins: see adoptRebuiltView for why an unchanged
+	// epoch at publish time proves this snapshot cannot be missing an applied
+	// write.
+	epoch := e.applyEpoch.Load()
 	// Deferred (not incremented up front) so that by the time a test
 	// observes rebuildAttempts advance, this call's logging decision
 	// (shouldLogRefusal or the InfoContext below) has already run --
@@ -278,7 +304,7 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 
 	snap, err := LoadSnapshot(ctx, e.pgDriver, e.pool)
 	if err != nil {
-		return fmt.Errorf("engine: RebuildNow: %w", err)
+		return false, fmt.Errorf("engine: RebuildNow: %w", err)
 	}
 	snap.Generation = generation
 	snap.AnalysisStamp = analysisStamp
@@ -295,11 +321,17 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 				slog.String("trigger", trigger),
 			)
 		}
-		return nil
+		return false, nil
 	}
 	e.overBudget.Store(false)
 
-	e.snap.Store(snapshot.NewView(snap))
+	if !e.adoptRebuiltView(ctx, snapshot.NewView(snap), epoch) {
+		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot rebuild not adopted: a write was applied while it loaded",
+			slog.String("trigger", trigger),
+			slog.Duration("duration", time.Since(start)),
+		)
+		return false, nil
+	}
 
 	e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot rebuilt",
 		slog.Int("nodes", snap.NodeCount()),
@@ -308,7 +340,55 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 		slog.Duration("duration", time.Since(start)),
 		slog.String("trigger", trigger),
 	)
-	return nil
+	return true, nil
+}
+
+// adoptRebuiltView publishes view as the engine's current View, but only if
+// no Apply has run since epoch was read -- which rebuildOnce reads before it
+// starts loading.
+//
+// This is what keeps a rebuild from silently discarding a written-through
+// delta. A rebuild's snapshot reflects PostgreSQL as of the moment its read
+// transaction began; a write that commits after that moment is invisible to
+// it, while that write's own Apply has already published (or is about to
+// publish) a delta segment over the OLD View. Storing the rebuilt snapshot
+// unconditionally would drop that segment and serve a replica missing a
+// committed write.
+//
+// The epoch comparison is the proof, and it is conservative in the safe
+// direction. Apply bumps applyEpoch before it does anything else, and it can
+// only run after its write has committed; so an unchanged epoch means every
+// write applied so far had already committed before this load's read
+// transaction began, and is therefore included in the loaded snapshot. A
+// changed epoch may or may not mean a write is actually missing -- an Apply
+// for a write that committed before the load began also changes it -- so the
+// rebuild is simply retried, never wrongly published.
+//
+// Publishing under applyMu is what makes the check meaningful: it serializes
+// with Apply's own publish, so no Apply can slip between the comparison and
+// the Store.
+//
+// Adoption is also what ENDS a fallback, whoever triggered the rebuild --
+// the recovery goroutine, the poller, or a manual call. The reasoning is the
+// same epoch argument: an adopted snapshot holds every write committed before
+// its load began, and the epoch check rules out any write applied since, so
+// the replica is complete and current again regardless of which write
+// originally tripped the fallback. Tying recovery to adoption rather than to
+// one goroutine is what keeps "the engine is serving again" a property of
+// the data, not of who happened to reload it.
+func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoch uint64) bool {
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
+	if e.applyEpoch.Load() != epoch {
+		return false
+	}
+	e.snap.Store(view)
+
+	if e.state.CompareAndSwap(stateFallback, stateServing) {
+		e.cfg.Log.InfoContext(ctx, "bloodtrail: fallback exited")
+	}
+	return true
 }
 
 // refusalLogInterval rate-limits RebuildNow's "snapshot rebuild refused"
@@ -336,9 +416,18 @@ func (e *Engine) shouldLogRefusal() bool {
 // Decline reasons TryAllShortestPaths and TryCypher log at Debug under the
 // "reason" attr.
 const (
-	reasonDisabled     = "disabled"
-	reasonNoSnapshot   = "no_snapshot"
-	reasonStale        = "stale"
+	reasonDisabled   = "disabled"
+	reasonNoSnapshot = "no_snapshot"
+	// reasonFallback fires whenever the engine is in stateFallback (apply.go):
+	// some write could not be replayed into the in-memory replica, so the
+	// replica is not known to match PostgreSQL and nothing may be served from
+	// it until the recovery rebuild completes. It is the single reason that
+	// replaced the retired freshness declines ("stale", from the
+	// write-generation check, and "kind_stale", from the kind-scoped marks):
+	// with write-through, a published View already reflects every committed
+	// write, so a query is never declined for being behind -- only for the
+	// replica being untrustworthy as a whole.
+	reasonFallback     = "fallback"
 	reasonUnresolvable = "unresolvable"
 	reasonTooLarge     = "too_large"
 	reasonMemoryLimit  = "memory_limit"
@@ -456,7 +545,7 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 // decline below either means the interpreter never claimed to support this
 // shape, or means dawgs' own PostgreSQL translator itself would not accept
 // it either (translateGateOK), or means only PostgreSQL can settle the
-// question authoritatively (a stale snapshot, a collation-dependent
+// question authoritatively (an engine in fallback, a collation-dependent
 // comparison).
 //
 // tx is accepted purely to keep this signature identical to
@@ -487,8 +576,8 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //     only the reason, never the parse error's own content (see
 //     reasonUnsupported's doc).
 //
-//  4. no snapshot has ever been adopted (e.Fresh() returns a nil snapshot)
-//     -- decline reasonNoSnapshot.
+//  4. no snapshot has ever been adopted (serveState returns a nil View) --
+//     decline reasonNoSnapshot.
 //
 //  5. interpret.Plan(rq, snap) not ok -- decline reasonUnsupported.
 //
@@ -506,12 +595,17 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //     TestQueryIRIndependentOfASTCopyMutation (gate_test.go) for the
 //     regression tests proving this can never leak into a served result.
 //
-//  8. the snapshot captured at step 4 is no longer fresh (a write landed
-//     while steps 5-7 ran) -- decline reasonStale. Deliberately checked
-//     here, after the gate rather than immediately after step 4, per the
-//     milestone's pinned pipeline order: whether to even attempt planning
-//     and gating a query does not depend on freshness, only whether to
-//     actually execute it against snap does.
+//  8. the engine is in fallback (serveState's own bool, captured at step 4
+//     alongside the View) -- decline reasonFallback. Deliberately checked
+//     here, after the gate rather than immediately after step 4, preserving
+//     the pipeline order the retired freshness check had: whether to even
+//     attempt planning and gating a query does not depend on the serving
+//     state, only whether to actually execute it against snap does. There is
+//     no re-check after this one: with write-through, snap is not a
+//     might-be-behind copy that a concurrent write invalidates mid-query --
+//     it is an immutable View that was current when this call captured it,
+//     and a write landing during execution publishes a NEW View for the next
+//     query rather than making this one wrong.
 //
 //  9. interpret.Execute, run via safeExecuteCypher (serve_cypher.go) rather
 //     than called directly -- its sentinel errors map to specific reasons
@@ -523,26 +617,11 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //
 //  10. Collect every database edge id any OutEdge/OutPath column in the
 //     result references (collectEdgeIDs); if any exist, hydrate their
-//     properties (hydrateEdgePropsByID) and re-check snap is still current
-//     (snapshotStillCurrent) -- decline reasonHydration/reasonStale on
-//     failure, exactly the same "did a write land while we were doing I/O"
-//     recheck servePathQuery's own step 7 performs, applied here only when
-//     hydration actually did I/O. cypherHydrationRaceHook (see its own doc)
-//     fires immediately before hydrateEdgePropsByID whenever this branch is
-//     taken, purely as a test seam for forcing this exact race.
+//     properties (hydrateEdgePropsByID) -- decline reasonHydration on
+//     failure. Edge properties are the one thing the replica does not hold,
+//     so this round trip reads them straight from PostgreSQL.
 //
-//  11. Unconditional final recheck (snapshotStillCurrent(snap) again,
-//     regardless of whether step 10 hydrated anything or even ran) --
-//     decline reasonStale on failure. interpret.Execute itself does no I/O,
-//     but it is not instantaneous either: a write can land, and a newer
-//     snapshot be adopted, at any point between step 8's check and here,
-//     even along the pure-snapshot path (no edge/path column at all) that
-//     never reaches step 10's own recheck. snap stays internally consistent
-//     regardless (immutable once built), but serving from a snapshot that
-//     is no longer current would silently return data pg's own read at this
-//     same moment would no longer produce.
-//
-//  12. Build the served result via buildCypherRowsResult (serve_cypher.go),
+//  11. Build the served result via buildCypherRowsResult (serve_cypher.go),
 //     which -- the same recovered-panic fail-safe as step 9 -- eagerly materializes
 //     every row right there, under its own recover, rather than the lazy,
 //     one-row-at-a-time materialization a graph.Result normally performs
@@ -573,7 +652,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	snap, fresh := e.Fresh()
+	snap, serving := e.serveState()
 	if snap == nil {
 		e.decline(ctx, reasonNoSnapshot, nil)
 		return nil, false
@@ -596,8 +675,8 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	if !fresh {
-		e.decline(ctx, reasonStale, nil)
+	if !serving {
+		e.decline(ctx, reasonFallback, nil)
 		return nil, false
 	}
 
@@ -609,43 +688,17 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 
 	var edgeProps map[uint64]*graph.Properties
 	if edgeIDs := collectEdgeIDs(snap, rs); len(edgeIDs) > 0 {
-		if e.cypherHydrationRaceHook != nil {
-			e.cypherHydrationRaceHook()
-		}
+		// Edge properties are the one part of an edge the replica does not
+		// hold, so they are read from PostgreSQL directly. No post-I/O
+		// re-check follows: snap is an immutable View that was current when
+		// this call captured it, and a write landing during this round trip
+		// publishes a new View for the next query rather than invalidating
+		// this one -- the write-through model's whole point (apply.go).
 		edgeProps, err = hydrateEdgePropsByID(ctx, e.pool, snap.Base().GraphID, edgeIDs)
 		if err != nil {
 			e.decline(ctx, reasonHydration, err)
 			return nil, false
 		}
-		if !e.snapshotStillCurrent(snap) {
-			e.decline(ctx, reasonStale, nil)
-			return nil, false
-		}
-	} else if e.cypherHydrationRaceHook != nil {
-		// A pure-snapshot result (no edge/path column, so nothing to
-		// hydrate) never reaches the branch above -- fire the identical
-		// test seam here instead, its own last chance to force a race
-		// before step 11's unconditional recheck below. See
-		// cypherHydrationRaceHook's own doc.
-		e.cypherHydrationRaceHook()
-	}
-
-	// Unconditional recheck, regardless of whether hydration ran: Execute
-	// itself does no I/O, but it is not instantaneous either (an expensive
-	// query can spend real wall-clock time against its work budget), so a
-	// write can land -- and a newer snapshot be adopted -- at any point
-	// between step 8's pre-execution freshness check and here. snap itself
-	// stays internally consistent either way (immutable once built), but
-	// serving from it once it is no longer current would silently return
-	// data pg's own read at this same moment would no longer produce. This
-	// is deliberately a SEPARATE check from the hydration branch's own one
-	// above (not a replacement for it): that one catches staleness
-	// introduced specifically by hydrateEdgePropsByID's own I/O as early as
-	// possible; this one is the unconditional backstop for every path,
-	// hydration or not.
-	if !e.snapshotStillCurrent(snap) {
-		e.decline(ctx, reasonStale, nil)
-		return nil, false
 	}
 
 	result, ok := buildCypherRowsResult(snap, rs, projectionValueKinds(q), edgeProps)
@@ -670,8 +723,8 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 // on the false path).
 //
 // Pipeline:
-//  1. cfg.Enabled, then Fresh() -- decline "disabled" / "no_snapshot" /
-//     "stale".
+//  1. cfg.Enabled, then serveState() -- decline "disabled" / "no_snapshot" /
+//     "fallback".
 //  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
 //     "unresolvable" on error, including a kindMapper.MapKind failure for a
 //     Kinds-constrained endpoint -- see resolveKindsEndpoint's doc).
@@ -686,22 +739,21 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 //     "error").
 //  6. Hydrate the resulting dense paths into graph.Path values (decline
 //     "hydration" on error).
-//  7. Re-check that the exact snapshot captured at step 1 is still current
-//     (snapshotStillCurrent(snap), not a fresh Fresh() call): a write that
-//     landed while steps 2-6 ran could mean the served result mixes two
-//     generations, so a generation change on that specific snapshot declines
-//     the whole call even though the work already completed -- even if a
-//     concurrent RebuildNow has since adopted a newer snapshot that itself
-//     reports fresh.
+//
+// There is no post-execution re-check: snap is an immutable View that was
+// current the moment step 1 captured it, and every committed write publishes
+// a new View of its own (apply.go) rather than invalidating an in-flight
+// query's. The retired generation re-check existed because a snapshot could
+// silently fall behind PostgreSQL mid-query; with write-through it cannot.
 func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
 	if !e.cfg.Enabled {
 		e.decline(ctx, reasonDisabled, nil)
 		return nil, false
 	}
 
-	snap, fresh := e.Fresh()
-	if !fresh {
-		reason := reasonStale
+	snap, serving := e.serveState()
+	if !serving {
+		reason := reasonFallback
 		if snap == nil {
 			reason = reasonNoSnapshot
 		}
@@ -763,11 +815,6 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 	hydrated, err := hydratePaths(ctx, e.pool, kindMapper, snap, dense)
 	if err != nil {
 		e.decline(ctx, reasonHydration, err)
-		return nil, false
-	}
-
-	if !e.snapshotStillCurrent(snap) {
-		e.decline(ctx, reasonStale, nil)
 		return nil, false
 	}
 

@@ -54,10 +54,12 @@ func TestPollerDrivesRebuilds(t *testing.T) {
 		t.Fatalf("first build's AnalysisStamp = %v, want %v", snap1.Base().AnalysisStamp, stamp1)
 	}
 
-	// A write outside the poller's own rebuild invalidates the snapshot the
-	// poller just adopted.
-	eng.NoteWrite(nil)
-
+	// The newer stamp lands FIRST, and only then is the snapshot marked as
+	// needing a rebuild. The poll loop runs concurrently with both
+	// statements, so a tick landing in between would otherwise be free to
+	// satisfy rule (c) (needs-rebuild + idle) against the OLD stamp, adopt a
+	// snapshot still carrying stamp1, and leave the wait below returning
+	// that one instead of the stamp2 rebuild this test is about.
 	stamp2 := stamp1.Add(time.Hour)
 	if _, err := pool.Exec(ctx,
 		`UPDATE datapipe_status SET last_complete_analysis_at = $1, updated_at = now() WHERE singleton`,
@@ -65,6 +67,10 @@ func TestPollerDrivesRebuilds(t *testing.T) {
 	); err != nil {
 		t.Fatalf("update datapipe_status: %v", err)
 	}
+
+	// A write outside the poller's own rebuild leaves the snapshot needing
+	// one.
+	markNeedsRebuild(eng)
 
 	// The poller must pick up the newer stamp (rule (b)) and rebuild again,
 	// which also happens to clear the staleness NoteWrite introduced.
@@ -146,7 +152,7 @@ func TestPollerAnalyzingPhaseRebuild(t *testing.T) {
 	); err != nil {
 		t.Fatalf("update datapipe_status: %v", err)
 	}
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 
 	// Rule (d) must fire even though the datapipe is analyzing rather than
 	// idle: wait for the triggerAnalyzing rebuild itself (keyed off the same
@@ -251,7 +257,7 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`); err != nil {
 		t.Fatalf("flip to analyzing: %v", err)
 	}
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 
 	// rule (d) must fire (1st rebuild of the episode). Waiting on the
 	// triggerAnalyzing tally itself -- the same observable the check right
@@ -270,7 +276,7 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 	// A second write, still analyzing (no status change to race against
 	// here, so no reordering concern): rule (d) fires again (2nd rebuild,
 	// cap now at 2/2 for this episode).
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 	waitForTriggerCount(t, handler, triggerAnalyzing, 2, 2*time.Second)
 	if _, fresh := eng.Fresh(); !fresh {
 		t.Fatalf("Fresh() reports stale after the second analyzing rebuild")
@@ -285,7 +291,7 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 	// one -- generous relative to pollInterval to avoid flaking on scheduler
 	// jitter, but still short enough that this assertion resolves quickly
 	// when the cap is (correctly) holding, and fails promptly when it isn't.
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 	time.Sleep(6 * pollInterval)
 	if n := eng.rebuildAttempts.Load(); n != 3 {
 		t.Fatalf("rebuildAttempts = %d after a third write while analyzing and capped, want exactly 3 (rule (d) must not exceed maxAnalyzingRebuilds)", n)
@@ -294,7 +300,7 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 		t.Fatalf("triggerAnalyzing count = %d after the capped third write, want still 2", n)
 	}
 	if _, fresh := eng.Fresh(); fresh {
-		t.Fatalf("Fresh() reports fresh after the capped third write; it must still be stale since rule (d) refused to rebuild")
+		t.Fatalf("Fresh() reports fresh after the capped third write; it must still report needing a rebuild since rule (d) refused to run one")
 	}
 
 	// --- Prove the cap is per-episode: leave analyzing and come back. ---
@@ -328,7 +334,7 @@ func TestPollerAnalyzingCapAndReset(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE datapipe_status SET status = 'analyzing', updated_at = now() WHERE singleton`); err != nil {
 		t.Fatalf("flip back to analyzing: %v", err)
 	}
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 
 	// If resetAnalyzingRebuilds had not cleared st.analyzingRebuilds while
 	// status read "idle" above, the counter would still read 2 (last
@@ -395,6 +401,27 @@ func createDatapipeStatusTable(t *testing.T, pool *pgxpool.Pool) {
 
 // waitForFreshSnapshot polls eng.Fresh() until it reports a fresh snapshot
 // or timeout elapses, failing the test on timeout.
+// markNeedsRebuild puts eng into the state the poller's rules (c) and (d)
+// fire on, standing in for what a write used to do to the engine's own view
+// of its snapshot.
+//
+// Both halves are needed, and neither is a stand-in for the other. Advancing
+// the write-generation counter (NoteWrite) is what lifts a remembered
+// memory-limit refusal (refusalLifted, poller.go), which is still keyed on
+// that counter. The fallback state is what Fresh() -- and therefore
+// decideRebuild's own !fresh input -- now reads: since write-through
+// (apply.go), a write publishes itself into the replica rather than leaving
+// it behind, so nothing a plain write does makes a snapshot need rebuilding
+// any more; only an unreplayable one does, by tripping this state.
+//
+// It deliberately does not go through Apply, which would ALSO start a
+// recovery rebuild of its own -- exactly the rebuild these tests are trying
+// to attribute to one specific poller rule.
+func markNeedsRebuild(eng *Engine) {
+	eng.NoteWrite(nil)
+	eng.state.Store(stateFallback)
+}
+
 func waitForFreshSnapshot(t *testing.T, eng *Engine, timeout time.Duration) *snapshot.View {
 	t.Helper()
 
@@ -612,7 +639,7 @@ func TestPollerMemoryLimitRefusalDoesNotSpamRetries(t *testing.T) {
 	// already guaranteed recorded -- checking the log count immediately
 	// afterward, with no separate wait, is then race-free.
 	graphtest.LoadDataset(t, pgDriver, adcsFixturePath)
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 
 	waitForAttempts(t, eng, baseline+1, 2*time.Second)
 	if n := handler.count(refusalWarnMsg); n != 1 {
@@ -647,7 +674,7 @@ func TestPollerMemoryLimitRefusalDoesNotSpamRetries(t *testing.T) {
 	// climbs to baseline+2, but the log count stays at 1 -- the two halves
 	// of the fix (decideRebuild's gate vs. RebuildNow's log rate limit)
 	// each doing exactly their own job.
-	eng.NoteWrite(nil)
+	markNeedsRebuild(eng)
 
 	waitForAttempts(t, eng, baseline+2, 2*time.Second)
 	if n := handler.count(refusalWarnMsg); n != 1 {

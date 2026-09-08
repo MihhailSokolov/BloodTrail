@@ -3,6 +3,7 @@
 package bloodtrail
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/specterops/dawgs/cypher/frontend"
@@ -78,6 +79,14 @@ type observingTransaction struct {
 
 	scope *engine.WriteScope
 	eng   *engine.Engine
+
+	// ctx is the context Driver.WriteTransaction was called with, carried
+	// here purely so a mid-transaction Commit's engine.Apply call (which
+	// reads written keys back from PostgreSQL) runs under the caller's own
+	// deadline and cancellation rather than an unbounded one. It may be nil
+	// -- unit tests construct this type directly, and nothing else on it
+	// needs a context -- which applyContext turns into context.Background().
+	ctx context.Context
 }
 
 // wrote reports whether this transaction has recorded any write onto scope
@@ -246,26 +255,47 @@ func (t *observingTransaction) Raw(query string, parameters map[string]any) grap
 func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transaction {
 	t.scope.TouchAll()
 	t.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
-	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng}
+	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng, ctx: t.ctx}
 }
 
-// Commit flushes the accumulated scope to the engine (eng.NoteWrite), then
+// Commit applies the accumulated scope to the engine (eng.Apply), then
 // resets scope to a fresh, empty WriteScope, before delegating to the inner
 // transaction's own Commit. Under the pinned dawgs pg driver, a delegate that
 // calls tx.Commit() mid-transaction will cause the outer WriteTransaction's
 // final Commit to return ErrTxClosed; writes persist, and this override
-// ensures invalidation is recorded at the commit point. This override is
-// therefore defensive today: it guards against the mid-transaction commit
-// scenario, matching observingBatch.Commit's pattern, though that scenario's
-// actual feasibility under the pg driver remains unverified (Driver.
-// WriteTransaction still calls NoteWrite once more after the delegate returns,
-// reading this transaction's *current* scope value at that point -- which by
-// then may be a different *WriteScope than the one this method reset it to
-// here, exactly as intended).
+// ensures the replica is brought up to date at the commit point. This
+// override is therefore defensive today: it guards against the
+// mid-transaction commit scenario, matching observingBatch.Commit's pattern,
+// though that scenario's actual feasibility under the pg driver remains
+// unverified (Driver.WriteTransaction still calls Apply once more after the
+// delegate returns, reading this transaction's *current* scope value at that
+// point -- which by then may be a different *WriteScope than the one this
+// method reset it to here, exactly as intended).
+//
+// Apply runs BEFORE the inner Commit, which is the pre-existing ordering
+// this override has always had, and is deliberately kept: read-back reads
+// committed state, so a scope applied ahead of the commit that makes its
+// writes visible can only under-report them -- never report a write that
+// then rolls back. The outer Driver.WriteTransaction's own Apply call, made
+// after the whole delegate returns and the transaction has committed,
+// reconciles whatever this early call could not yet see, since read-back is
+// keyed by id rather than by delta.
 func (t *observingTransaction) Commit() error {
-	t.eng.NoteWrite(t.scope)
+	t.eng.Apply(applyContext(t.ctx), t.scope)
 	t.scope = engine.NewWriteScope()
 	return t.Transaction.Commit()
+}
+
+// applyContext returns ctx, or context.Background() when ctx is nil -- the
+// case for an observingTransaction/observingBatch constructed directly by a
+// unit test rather than by Driver.WriteTransaction/BatchOperation. An apply
+// with no caller context of its own is still worth performing; it simply has
+// no deadline to inherit.
+func applyContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 // touchNodeKindDelta marks scope with node's AddedKinds and DeletedKinds
@@ -748,6 +778,10 @@ type observingBatch struct {
 
 	scope *engine.WriteScope
 	eng   *engine.Engine
+
+	// ctx is Driver.BatchOperation's own context, carried for the same
+	// reason (and with the same nil tolerance) as observingTransaction.ctx.
+	ctx context.Context
 }
 
 // wrote reports whether this batch has recorded any write onto scope since
@@ -1111,11 +1145,11 @@ func recordRelationshipUpsertIdentity(scope *engine.WriteScope, update graph.Rel
 func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 	b.scope.TouchAll()
 	b.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
-	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), scope: b.scope, eng: b.eng}
+	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), scope: b.scope, eng: b.eng, ctx: b.ctx}
 }
 
-// Commit flushes scope to the engine immediately -- eng.NoteWrite(scope),
-// then a fresh WriteScope for whatever this batch does next -- before
+// Commit flushes scope to the engine immediately -- eng.Apply(scope), then
+// a fresh WriteScope for whatever this batch does next -- before
 // delegating to the inner batch's own Commit. A batch is documented to
 // support being committed mid-delegate and continuing to receive more
 // operations afterward (graph.Batch's own doc on Commit: "calls to commit
@@ -1125,21 +1159,21 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // makes "commit, then keep writing" work at the pg level for a batch in a
 // way it is not documented, or verified, to for a plain WriteTransaction),
 // so a caller relying on that to make an early chunk of a large batch
-// visible needs the engine's snapshot invalidated at that same moment, not
-// held back until Driver.BatchOperation's own NoteWrite call after the
-// whole batch delegate returns. observingTransaction.Commit
-// (write_observer.go above) overrides Commit for the same
-// "don't leave a flush invisible" reason, without relying on -- or needing
-// -- that same continue-after-commit guarantee.
+// visible needs the engine's replica brought up to date at that same moment,
+// not held back until Driver.BatchOperation's own Apply call after the whole
+// batch delegate returns. observingTransaction.Commit (write_observer.go
+// above) overrides Commit for the same "don't leave a flush invisible"
+// reason, without relying on -- or needing -- that same
+// continue-after-commit guarantee.
 //
-// Driver.BatchOperation still calls NoteWrite once more after the
-// delegate returns (driver.go), reporting whatever scope accumulated since
-// this Commit call (or the whole batch, if Commit was never called
-// mid-delegate) -- reading b.scope's current value at that point, which by
-// then may be a different *WriteScope than the one this method reset it to,
-// exactly as intended.
+// Driver.BatchOperation still calls Apply once more after the delegate
+// returns (driver.go), reporting whatever scope accumulated since this
+// Commit call (or the whole batch, if Commit was never called mid-delegate)
+// -- reading b.scope's current value at that point, which by then may be a
+// different *WriteScope than the one this method reset it to, exactly as
+// intended.
 func (b *observingBatch) Commit() error {
-	b.eng.NoteWrite(b.scope)
+	b.eng.Apply(applyContext(b.ctx), b.scope)
 	b.scope = engine.NewWriteScope()
 	return b.Batch.Commit()
 }

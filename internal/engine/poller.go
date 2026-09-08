@@ -124,6 +124,15 @@ func refusalLifted(st *pollState, stamp time.Time, generation uint64) bool {
 // current Fresh() result; generation is the engine's live write-generation
 // counter (Engine.generation) as observed this tick.
 //
+// Since write-through (apply.go), Fresh's bool no longer means "no write has
+// landed since this snapshot was built" -- a published View always reflects
+// every committed write -- but "the engine is in stateServing". So rules (c)
+// and (d) below now fire only while the engine is in fallback, where they
+// duplicate the recovery rebuild enterFallback already launched. That
+// duplication is harmless (both call the same RebuildNow, whose adoption is
+// serialized and idempotent) and short-lived: the poller is retired with the
+// rest of the freshness machinery.
+//
 // Rebuild when:
 //
 //	(a) no snapshot exists yet (snap == nil);
@@ -251,14 +260,24 @@ func (e *Engine) Start(ctx context.Context) {
 	go e.runPoller(ctx)
 }
 
-// Stop signals the poller goroutine to exit and waits for it to actually
-// exit before returning. Idempotent, and safe to call even if Start was
-// never called (or was a no-op because !cfg.Enabled).
+// Stop quiesces the engine's background work and returns once the poller
+// goroutine has actually exited. Idempotent, and safe to call even if Start
+// was never called (or was a no-op because !cfg.Enabled).
+//
+// It cancels the engine's own background context first (bgCtx, engine.go),
+// which is what tells the fallback recovery goroutine (apply.go) to stop
+// retrying; that goroutine is deliberately not waited for, since it may be
+// blocked on a slow PostgreSQL load and holds nothing a caller needs back --
+// its context being cancelled makes both its rebuild and its retry sleep
+// return promptly on their own.
 func (e *Engine) Stop() {
 	e.pollStopOnce.Do(func() {
+		if e.bgCancel != nil {
+			e.bgCancel()
+		}
 		if e.pollStop == nil {
-			// Start either was never called, or was a no-op: no goroutine
-			// exists to signal or wait for.
+			// Start either was never called, or was a no-op: no poller
+			// goroutine exists to signal or wait for.
 			return
 		}
 		close(e.pollStop)

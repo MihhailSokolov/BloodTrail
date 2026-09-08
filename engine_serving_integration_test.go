@@ -558,13 +558,14 @@ func bfsCollectNodeIDs(t *testing.T, ctx context.Context, db graph.Database, roo
 	return ids
 }
 
-// TestEngineServesFromLiveDriver is Task 13's core evidence: opened through
-// dawgs.Open(ctx, bloodtrail.DriverName, cfg) exactly as BloodHound would,
-// with a live datapipe_status row driving the poller, the driver must serve
-// both the Criteria/FetchAllShortestPaths API and cypher-text queries from
-// the in-memory engine once it has built a snapshot, keep answering
-// correctly (now delegated to PostgreSQL) the instant a write makes that
-// snapshot stale, and resume serving once the datapipe stamp advances.
+// TestEngineServesFromLiveDriver is the driver's core serving evidence:
+// opened through dawgs.Open(ctx, bloodtrail.DriverName, cfg) exactly as
+// BloodHound would, with a live datapipe_status row driving the poller, the
+// driver must serve both the Criteria/FetchAllShortestPaths API and
+// cypher-text queries from the in-memory engine once it has built a
+// snapshot, keep serving them correctly straight through a write (which
+// write-through publishes into the replica rather than invalidating it), and
+// keep serving them across a datapipe-stamp-driven rebuild.
 func TestEngineServesFromLiveDriver(t *testing.T) {
 	dsn := os.Getenv(testPGEnv)
 	if dsn == "" {
@@ -639,12 +640,14 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 		})
 	}
 
-	// --- Phase 3: a write through the driver invalidates the snapshot, but
-	// must not itself trigger a rebuild (status stays "running", so
-	// decideRebuild's idle-only rule (c) never fires) -- results stay
-	// correct via the PostgreSQL fallback until the datapipe stamp advances,
-	// which does trigger a rebuild and a fresh served line.
+	// --- Phase 3: a write through the driver is replayed into the replica
+	// rather than invalidating it, so the same query keeps being SERVED
+	// (not delegated) and keeps answering correctly -- and the write still
+	// must not itself trigger a rebuild: status stays "running", and with
+	// the replica current there is nothing for any decideRebuild rule to
+	// fire on either.
 	servedBefore := strings.Count(buf.String(), servedMarker)
+	rebuiltBefore := strings.Count(buf.String(), rebuiltMarker)
 
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		_, err := tx.CreateNode(graph.NewProperties(), graph.StringKind("ExtraNode"))
@@ -653,18 +656,23 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 		t.Fatalf("WriteTransaction (CreateNode): %v", err)
 	}
 
-	// Give the poller several ticks' worth of headroom to (incorrectly)
-	// rebuild if the taint/idle-gating logic were broken, then assert it
-	// did not, and that the query is still answered correctly (now
-	// delegated).
+	// Several poll intervals' worth of headroom for the poller to
+	// (incorrectly) rebuild, then assert it did not, and that the query is
+	// both still correct and still served from the replica.
 	time.Sleep(10 * 50 * time.Millisecond)
 	if got := shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"]); strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("post-write (delegated) paths differ\n got: %v\nwant: %v", got, want)
+		t.Fatalf("post-write paths differ\n got: %v\nwant: %v", got, want)
 	}
-	if servedAfter := strings.Count(buf.String(), servedMarker); servedAfter != servedBefore {
-		t.Fatalf("served line count changed from %d to %d after a write with no datapipe stamp advance", servedBefore, servedAfter)
+	if servedAfter := strings.Count(buf.String(), servedMarker); servedAfter <= servedBefore {
+		t.Fatalf("served line count stayed at %d after a write; the write-through replica must keep serving", servedBefore)
+	}
+	if rebuiltAfter := strings.Count(buf.String(), rebuiltMarker); rebuiltAfter != rebuiltBefore {
+		t.Fatalf("%q log count changed from %d to %d after a plain write; a replayable write must not cost a rebuild", rebuiltMarker, rebuiltBefore, rebuiltAfter)
 	}
 
+	// --- Phase 4: the datapipe stamp advances, the poller rebuilds, and the
+	// same query still serves the same correct answer from the fresh base.
+	servedBefore = strings.Count(buf.String(), servedMarker)
 	stamp2 := stamp1.Add(time.Hour)
 	updateDatapipeStamp(t, pool, stamp2)
 
@@ -675,6 +683,12 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 		t.Fatalf("post-rebuild paths differ\n got: %v\nwant: %v", got, want)
 	}
 }
+
+// rebuiltMarker is the exact message the engine logs (at Info) whenever it
+// actually adopts a freshly loaded snapshot -- duplicated here for the same
+// reason servedMarker is, so a test can assert that a write was served
+// WITHOUT one, which is the whole claim write-through makes.
+const rebuiltMarker = "bloodtrail: snapshot rebuilt"
 
 // TestEngineOffDelegatesEverythingAndNeverServes is phase 4: with
 // BLOODTRAIL_ENGINE=off, the driver must answer every query correctly by
@@ -744,17 +758,21 @@ func TestEngineOffDelegatesEverythingAndNeverServes(t *testing.T) {
 	}
 }
 
-// TestWipeGraphInvalidatesEngineSnapshot is Finding 1's integration
-// evidence: WipeGraph -- BloodHound's "clear database" action -- reaches
-// PostgreSQL through the embedded *pg.Driver's own internal WriteTransaction
-// call, never through Driver's own WriteTransaction override (embedding has
-// no virtual dispatch), so without Driver's own WipeGraph override
-// (driver.go) the engine would keep serving the pre-wipe snapshot
-// indefinitely. This mirrors TestEngineServesFromLiveDriver's phase 3 (a
-// plain WriteTransaction write) but for WipeGraph specifically: a query the
-// engine was serving before the wipe must not serve again (no new
-// servedMarker line) until the datapipe stamp advances and the poller
-// rebuilds, and the post-wipe result must be correct (empty) throughout.
+// TestWipeGraphInvalidatesEngineSnapshot is the integration evidence for
+// Driver's WipeGraph override: WipeGraph -- BloodHound's "clear database"
+// action -- reaches PostgreSQL through the embedded *pg.Driver's own
+// internal WriteTransaction call, never through Driver's own
+// WriteTransaction override (embedding has no virtual dispatch), so without
+// that override (driver.go) the engine would keep serving the pre-wipe
+// snapshot indefinitely.
+//
+// A truncation is not expressible as a delta -- nothing enumerates what it
+// removed -- so the override records a ChangeSet fallback, which is the one
+// path that still invalidates the whole replica: the engine enters fallback
+// (declining every query, so results come from PostgreSQL and are correct),
+// rebuilds once in the background against the now-empty graph, and resumes
+// serving. What must never happen, at any point in that sequence, is a query
+// answered from the pre-wipe snapshot.
 func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
 	dsn := os.Getenv(testPGEnv)
 	if dsn == "" {
@@ -809,36 +827,23 @@ func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
 		t.Fatalf("WipeGraph: %v", err)
 	}
 
-	// Several poll intervals' worth of headroom for the poller to
-	// (incorrectly) rebuild if WipeGraph's NoteWrite override were missing
-	// or broken; status stays "running" so rule (c) must not fire on its
-	// own, and no query has been issued yet to reach TryAllShortestPaths at
-	// all -- this alone must not produce a new served line.
-	time.Sleep(10 * 50 * time.Millisecond)
-	if servedAfter := strings.Count(buf.String(), servedMarker); servedAfter != servedBefore {
-		t.Fatalf("served line count changed from %d to %d after WipeGraph with no datapipe stamp advance", servedBefore, servedAfter)
-	}
-
-	// A query issued now must fall through to PostgreSQL -- correctly empty,
-	// the graph having just been wiped -- rather than serve the stale
-	// pre-wipe snapshot, and must not itself log a new served line.
+	// Whatever the engine's recovery has or has not finished by now, a query
+	// must never report the pre-wipe graph's paths: while it is in fallback
+	// the query is delegated to PostgreSQL (correctly empty), and once the
+	// background rebuild lands it is served from the empty replica (also
+	// empty).
 	if got := shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"]); len(got) != 0 {
 		t.Fatalf("post-wipe query returned paths from a wiped graph: %v", got)
 	}
-	if servedAfter := strings.Count(buf.String(), servedMarker); servedAfter != servedBefore {
-		t.Fatalf("served line count changed from %d to %d after querying a post-wipe, still-stale snapshot", servedBefore, servedAfter)
-	}
 
-	// Advancing the stamp lets the poller rebuild against the now-empty
-	// graph; the engine resumes serving, correctly reporting zero paths.
-	stamp2 := stamp1.Add(time.Hour)
-	updateDatapipeStamp(t, pool, stamp2)
-
+	// The recovery rebuild restores serving on its own -- no datapipe stamp
+	// advance needed, unlike before write-through, when only the poller's
+	// own rules could ever rebuild.
 	got := waitForEngineServe(t, buf, servedBefore, 5*time.Second, func() []string {
 		return shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"])
 	})
 	if len(got) != 0 {
-		t.Fatalf("post-rebuild query on a wiped graph returned paths: %v", got)
+		t.Fatalf("post-recovery query on a wiped graph returned paths: %v", got)
 	}
 }
 

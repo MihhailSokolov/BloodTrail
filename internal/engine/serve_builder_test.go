@@ -334,65 +334,6 @@ func TestTryNodeQueriesNoConstraintDeclines(t *testing.T) {
 	}
 }
 
-// TestTryNodeQueriesKindStaleAfterNoteWrite covers the kind-scoped
-// freshness gate: a NoteWrite that touches the spec's constrained kind
-// (User) must make the (unchanged) snapshot decline reasonKindStale, even
-// though its own Generation hasn't moved -- exactly the scenario
-// nodeKindsClean exists to catch (marks.go's doc). A constraint over an
-// untouched kind (Group) must still serve normally.
-func TestTryNodeQueriesKindStaleAfterNoteWrite(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User")})
-	e.NoteWrite(scope)
-
-	userSpec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
-	if _, ok := e.TryNodeCount(ctx, userSpec); ok {
-		t.Fatalf("TryNodeCount(User): ok = true, want false (kind_stale)")
-	}
-
-	groupSpec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "Group")}}
-	count, ok := e.TryNodeCount(ctx, groupSpec)
-	if !ok {
-		t.Fatalf("TryNodeCount(Group): ok = false, want true (Group untouched by the write)")
-	}
-	if count != 2 {
-		t.Fatalf("TryNodeCount(Group) = %d, want 2", count)
-	}
-}
-
-// TestTryNodeQueriesServeAgainAfterFreshSnapshot covers recovery from a
-// kind-stale decline: once a fresh snapshot is adopted at the write's new
-// generation (what RebuildNow would do), the previously-stale spec must
-// serve again.
-func TestTryNodeQueriesServeAgainAfterFreshSnapshot(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User")})
-	e.NoteWrite(scope)
-
-	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
-	if _, ok := e.TryNodeCount(ctx, spec); ok {
-		t.Fatalf("TryNodeCount before rebuild: ok = true, want false (kind_stale)")
-	}
-
-	freshSnap := buildNodeSpecSnapshot(t)
-	freshSnap.Generation = e.Generation()
-	e.snap.Store(snapshot.NewView(freshSnap))
-
-	count, ok := e.TryNodeCount(ctx, spec)
-	if !ok {
-		t.Fatalf("TryNodeCount after rebuild: ok = false, want true")
-	}
-	if count != 3 {
-		t.Fatalf("TryNodeCount after rebuild = %d, want 3", count)
-	}
-}
-
 // TestTryNodeQueriesDisabledDeclines covers cfg.Enabled = false: every entry
 // point declines immediately, before ever touching the snapshot (nil here,
 // which would otherwise decline reasonNoSnapshot -- proving Enabled is
@@ -441,77 +382,6 @@ func TestTryNodeFetchKindsResolveErrorDeclines(t *testing.T) {
 	if _, ok := e.TryNodeFetchKinds(context.Background(), spec); ok {
 		t.Fatalf("TryNodeFetchKinds: ok = true, want false (mapKindNames failed)")
 	}
-}
-
-// TestTryNodeFetchKindsDeclinesOnUnrelatedKindWrite is Finding 1's unit
-// evidence: TryNodeFetchKinds serves a full per-node kind LISTING, which
-// observes every kind a matching node carries -- not just whether it
-// carries one of spec's own constrained kinds, the way TryNodeCount/
-// TryNodeFetchIDs' answers do. A NoteWrite that touches Group -- a kind
-// entirely unrelated to a spec constrained on Computer, and not present on
-// any Computer-carrying node in buildNodeSpecSnapshot -- must still make
-// TryNodeFetchKinds decline reasonKindStale (via the extra
-// allNodeKindsClean(snap.Generation) check its own doc describes), while
-// TryNodeCount and TryNodeFetchIDs on that exact same spec keep serving
-// normally, since neither one's answer depends on anything beyond spec's
-// own ConstraintKinds().
-func TestTryNodeFetchKindsDeclinesOnUnrelatedKindWrite(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
-	e.NoteWrite(scope)
-
-	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "Computer")}}
-
-	if _, ok := e.TryNodeFetchKinds(ctx, spec); ok {
-		t.Fatalf("TryNodeFetchKinds(Computer): ok = true, want false (kind_stale: an unrelated node kind, Group, was touched)")
-	}
-
-	count, ok := e.TryNodeCount(ctx, spec)
-	if !ok {
-		t.Fatalf("TryNodeCount(Computer): ok = false, want true (Count depends only on its own constraint kinds)")
-	}
-	if count != 2 {
-		t.Fatalf("TryNodeCount(Computer) = %d, want 2", count)
-	}
-
-	idCursor, ok := e.TryNodeFetchIDs(ctx, spec)
-	if !ok {
-		t.Fatalf("TryNodeFetchIDs(Computer): ok = false, want true (FetchIDs depends only on its own constraint kinds)")
-	}
-	assertIDs(t, drainIDs(t, idCursor), []graph.ID{2, 3})
-}
-
-// TestTryNodeFetchKindsServesAgainAfterFreshSnapshot covers recovery from
-// TestTryNodeFetchKindsDeclinesOnUnrelatedKindWrite's kind-stale decline:
-// once a fresh snapshot is adopted at the write's new generation (what
-// RebuildNow would do), the previously-stale spec must serve again through
-// TryNodeFetchKinds specifically -- not just through TryNodeCount/
-// TryNodeFetchIDs, which never declined in the first place.
-func TestTryNodeFetchKindsServesAgainAfterFreshSnapshot(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
-	e.NoteWrite(scope)
-
-	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "Computer")}}
-	if _, ok := e.TryNodeFetchKinds(ctx, spec); ok {
-		t.Fatalf("TryNodeFetchKinds before rebuild: ok = true, want false (kind_stale)")
-	}
-
-	freshSnap := buildNodeSpecSnapshot(t)
-	freshSnap.Generation = e.Generation()
-	e.snap.Store(snapshot.NewView(freshSnap))
-
-	cursor, ok := e.TryNodeFetchKinds(ctx, spec)
-	if !ok {
-		t.Fatalf("TryNodeFetchKinds after rebuild: ok = false, want true")
-	}
-	assertIDs(t, idsOf(drainKinds(t, cursor)), []graph.ID{2, 3})
 }
 
 // TestTryNodeFetchIDsCloseDoesNotLeakFeeder is this file's cursor-leak
@@ -996,117 +866,6 @@ func TestTryRelQueriesEmptyVsNilAnchors(t *testing.T) {
 	}
 }
 
-// TestTryRelQueriesEdgeKindStaleDeclines covers the edge-kind-scoped
-// freshness gate: a NoteWrite that touches the spec's constrained edge kind
-// (AdminTo) must decline reasonKindStale, while a spec constrained to an
-// untouched edge kind (MemberOf) must still serve.
-func TestTryRelQueriesEdgeKindStaleDeclines(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchEdgeKinds(edgeKinds("AdminTo"))
-	e.NoteWrite(scope)
-
-	staleSpec := recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}
-	if _, ok := e.TryRelCount(ctx, staleSpec); ok {
-		t.Fatalf("TryRelCount(AdminTo): ok = true, want false (kind_stale)")
-	}
-
-	freshSpec := recognize.RelSpec{EdgeKinds: edgeKinds("MemberOf")}
-	if count, ok := e.TryRelCount(ctx, freshSpec); !ok || count != 2 {
-		t.Fatalf("TryRelCount(MemberOf) = (%d, %v), want (2, true)", count, ok)
-	}
-}
-
-// TestTryRelQueriesEndpointNodeKindStaleDeclines covers the node-kind-scoped
-// freshness gate for a RelSpec: it must only be checked when the spec
-// actually carries an endpoint kind constraint (StartConstraints or
-// EndConstraints non-empty) -- a spec with none must serve even though a
-// node kind was just touched, while a spec constraining an endpoint by that
-// exact touched kind must decline.
-func TestTryRelQueriesEndpointNodeKindStaleDeclines(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Computer")})
-	e.NoteWrite(scope)
-
-	unconstrained := recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}
-	if _, ok := e.TryRelCount(ctx, unconstrained); !ok {
-		t.Fatalf("TryRelCount(no endpoint constraints): ok = false, want true")
-	}
-
-	constrained := recognize.RelSpec{
-		EdgeKinds:      edgeKinds("AdminTo"),
-		EndConstraints: []recognize.KindConstraint{kindConstraint(false, "Computer")},
-	}
-	if _, ok := e.TryRelCount(ctx, constrained); ok {
-		t.Fatalf("TryRelCount(Computer end constraint): ok = true, want false (kind_stale)")
-	}
-}
-
-// TestTryRelQueriesAllEdgesDirtyDeclines covers allEdgesClean: an unscoped
-// TouchAllEdges write must decline every relationship query regardless of
-// EdgeKinds, since allEdgesClean(g) is checked unconditionally.
-func TestTryRelQueriesAllEdgesDirtyDeclines(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchAllEdges()
-	e.NoteWrite(scope)
-
-	spec := recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}
-	if _, ok := e.TryRelCount(ctx, spec); ok {
-		t.Fatalf("TryRelCount: ok = true, want false (all edges dirty)")
-	}
-}
-
-// TestTryRelQueriesUnconstrainedKindDeclinesOnAnyEdgeKindDirty covers
-// edgeKindsClean's empty-kinds case: a spec with no EdgeKinds filter at all
-// depends on *every* recorded edge kind entry, so touching a kind the spec
-// never names (HasSession) must still decline it.
-func TestTryRelQueriesUnconstrainedKindDeclinesOnAnyEdgeKindDirty(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchEdgeKinds(edgeKinds("HasSession"))
-	e.NoteWrite(scope)
-
-	unconstrained := recognize.RelSpec{}
-	if _, ok := e.TryRelCount(ctx, unconstrained); ok {
-		t.Fatalf("TryRelCount(unconstrained kinds): ok = true, want false (kind_stale, any edge kind dirty)")
-	}
-}
-
-// TestTryRelQueriesServeAgainAfterFreshSnapshot covers recovery from a
-// kind-stale decline: once a fresh snapshot is adopted at the write's new
-// generation, the previously-stale spec must serve again.
-func TestTryRelQueriesServeAgainAfterFreshSnapshot(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchEdgeKinds(edgeKinds("AdminTo"))
-	e.NoteWrite(scope)
-
-	spec := recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}
-	if _, ok := e.TryRelCount(ctx, spec); ok {
-		t.Fatalf("TryRelCount before rebuild: ok = true, want false (kind_stale)")
-	}
-
-	freshSnap := buildRelSpecSnapshot(t)
-	freshSnap.Generation = e.Generation()
-	e.snap.Store(snapshot.NewView(freshSnap))
-
-	if count, ok := e.TryRelCount(ctx, spec); !ok || count != 3 {
-		t.Fatalf("TryRelCount after rebuild = (%d, %v), want (3, true)", count, ok)
-	}
-}
-
 // TestTryRelQueriesDisabledDeclines covers cfg.Enabled = false: every Task 7
 // entry point declines immediately.
 func TestTryRelQueriesDisabledDeclines(t *testing.T) {
@@ -1298,67 +1057,6 @@ func TestRowResultDrivesShallowFetchRelationshipsLoopShape(t *testing.T) {
 	if r107.nid != 4 || r107.ek == nil || r107.ek.String() != "AdminTo" {
 		t.Fatalf("row for edge 107 = %+v, want node 4, kind AdminTo", r107)
 	}
-}
-
-// TestTryRelQueryRowsStepProjectionDeclinesOnUnrelatedNodeKindWrite is
-// Finding 2's unit evidence: a step projection's row carries the far node's
-// own kinds column, which resolveRelSpec's own gate does not fully cover --
-// that gate only checks node-kind cleanliness at all when spec.
-// StartConstraints or spec.EndConstraints is non-empty, which this spec
-// (deliberately, matching the common upstream shape: every outbound step
-// from one known node, with no endpoint kind filter) leaves both empty. A
-// NoteWrite touching Group -- a node kind this spec never constrains by, and
-// not the AdminTo edges' own concern at all -- must still make
-// TryRelQueryRows(ProjectionStepOutbound) decline reasonKindStale (via the
-// extra allNodesClean/allNodeKindsClean check the method's own doc
-// describes), while the same spec through ProjectionStartEnd -- whose row is
-// a bare id pair exposing no kind information -- keeps serving normally.
-func TestTryRelQueryRowsStepProjectionDeclinesOnUnrelatedNodeKindWrite(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
-	e.NoteWrite(scope)
-
-	spec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
-
-	if _, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false); ok {
-		t.Fatalf("TryRelQueryRows(StepOutbound): ok = true, want false (kind_stale: an unrelated node kind, Group, was touched)")
-	}
-
-	if _, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStartEnd, false); !ok {
-		t.Fatalf("TryRelQueryRows(StartEnd): ok = false, want true (pair projection exposes no kinds, so it is unaffected)")
-	}
-}
-
-// TestTryRelQueryRowsStepProjectionServesAgainAfterFreshSnapshot covers
-// recovery from TestTryRelQueryRowsStepProjectionDeclinesOnUnrelatedNodeKindWrite's
-// kind-stale decline: once a fresh snapshot is adopted at the write's new
-// generation (what RebuildNow would do), the previously-stale step
-// projection must serve again.
-func TestTryRelQueryRowsStepProjectionServesAgainAfterFreshSnapshot(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	ctx := context.Background()
-
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
-	e.NoteWrite(scope)
-
-	spec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
-	if _, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false); ok {
-		t.Fatalf("TryRelQueryRows before rebuild: ok = true, want false (kind_stale)")
-	}
-
-	freshSnap := buildRelSpecSnapshot(t)
-	freshSnap.Generation = e.Generation()
-	e.snap.Store(snapshot.NewView(freshSnap))
-
-	result, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false)
-	if !ok {
-		t.Fatalf("TryRelQueryRows after rebuild: ok = false, want true")
-	}
-	result.Close()
 }
 
 // TestTryRelQueryRowsOrderByEdgeIDAscending covers orderByEdgeID=true
@@ -1575,5 +1273,84 @@ func TestTryRelFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 			t.Fatalf("feeder goroutines leaked: before=%d after=%d (delta %d over %d attempts)", before, after, after-before, attempts)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestBuilderServingSurvivesAWrite is the replacement for the kind-stale
+// decline tests this file used to carry: with write-through (apply.go), a
+// write does not make the current View unservable at all -- Apply publishes
+// the write into it before the writing call returns, so the marks a write
+// stamps no longer gate anything. Every builder-serving entry point must
+// therefore keep serving straight through a write that touches the very
+// kinds it constrains by, including the two shapes (TryNodeFetchKinds and a
+// step-projection TryRelQueryRows) that used to require the strictest
+// whole-snapshot cleanliness of all.
+func TestBuilderServingSurvivesAWrite(t *testing.T) {
+	ctx := context.Background()
+
+	nodeEngine := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	scope := NewWriteScope()
+	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User"), graph.StringKind("Group")})
+	scope.TouchEdgeKinds(edgeKinds("AdminTo"))
+	nodeEngine.NoteWrite(scope)
+
+	userSpec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
+	if count, ok := nodeEngine.TryNodeCount(ctx, userSpec); !ok || count != 3 {
+		t.Fatalf("TryNodeCount(User) after a write touching User = (%d, %v), want (3, true)", count, ok)
+	}
+	if _, ok := nodeEngine.TryNodeFetchIDs(ctx, userSpec); !ok {
+		t.Fatalf("TryNodeFetchIDs(User) after a write touching User: ok = false, want true")
+	}
+	if _, ok := nodeEngine.TryNodeFetchKinds(ctx, userSpec); !ok {
+		t.Fatalf("TryNodeFetchKinds(User) after a write touching User: ok = false, want true")
+	}
+
+	relEngine := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	relScope := NewWriteScope()
+	relScope.TouchEdgeKinds(edgeKinds("AdminTo"))
+	relScope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
+	relEngine.NoteWrite(relScope)
+
+	relSpec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
+	if _, ok := relEngine.TryRelCount(ctx, relSpec); !ok {
+		t.Fatalf("TryRelCount(AdminTo) after a write touching AdminTo: ok = false, want true")
+	}
+	if _, ok := relEngine.TryRelQueryRows(ctx, relSpec, recognize.ProjectionStepOutbound, false); !ok {
+		t.Fatalf("TryRelQueryRows(StepOutbound) after a write touching an unrelated node kind: ok = false, want true")
+	}
+}
+
+// TestBuilderServingDeclinesInFallback is that claim's other half: the ONE
+// condition that now stops the builder-serving path is the engine being in
+// fallback (a write that could not be replayed into the replica, apply.go),
+// which serveGate turns into a reasonFallback decline for every entry point.
+func TestBuilderServingDeclinesInFallback(t *testing.T) {
+	ctx := context.Background()
+
+	nodeEngine := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	nodeEngine.state.Store(stateFallback)
+
+	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
+	if _, ok := nodeEngine.TryNodeCount(ctx, spec); ok {
+		t.Fatalf("TryNodeCount in fallback: ok = true, want false")
+	}
+	if _, ok := nodeEngine.TryNodeFetchIDs(ctx, spec); ok {
+		t.Fatalf("TryNodeFetchIDs in fallback: ok = true, want false")
+	}
+	if _, ok := nodeEngine.TryNodeFetchKinds(ctx, spec); ok {
+		t.Fatalf("TryNodeFetchKinds in fallback: ok = true, want false")
+	}
+
+	relEngine := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	relEngine.state.Store(stateFallback)
+	if _, ok := relEngine.TryRelCount(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}); ok {
+		t.Fatalf("TryRelCount in fallback: ok = true, want false")
+	}
+
+	// Recovery restores serving with no rebuild needed for the test's sake:
+	// the state flip is the whole gate.
+	relEngine.state.Store(stateServing)
+	if _, ok := relEngine.TryRelCount(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}); !ok {
+		t.Fatalf("TryRelCount after leaving fallback: ok = false, want true")
 	}
 }

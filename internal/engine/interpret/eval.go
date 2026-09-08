@@ -1212,15 +1212,16 @@ func evalPropertyLookup(env *Env, row *Row, pl *cypher.PropertyLookup) (any, boo
 	}
 
 	if nodeID, ok := row.Node(v.Symbol); ok {
-		propID, found := env.Snap.PropIDByName(pl.Symbol)
-		if !found {
-			// This property name was never interned by this snapshot's
-			// PropStore at all, meaning no node anywhere in the graph carries
-			// it -- so it is certainly absent from this one.
-			return nil, false, nil
-		}
-		v, ok := env.Snap.PropValue(nodeID, propID)
-		return v, ok, nil
+		// Resolved BY NAME, deliberately, rather than through the
+		// PropIDByName+PropValue pair: a PropID only ever names something the
+		// BASE snapshot's own PropStore interned at load time, so a property
+		// name that first appears in a delta segment -- a brand-new key a
+		// written-through update added to a node -- has no PropID at all and
+		// would read back as absent (View.PropIDByName's own doc). Resolving
+		// by name answers correctly for both, and costs the same single map
+		// lookup on the base path.
+		val, ok := env.Snap.PropValueByName(nodeID, pl.Symbol)
+		return val, ok, nil
 	}
 
 	if _, ok := row.Edge(v.Symbol); ok {

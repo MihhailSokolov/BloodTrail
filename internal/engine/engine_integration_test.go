@@ -232,11 +232,17 @@ func TestTryAllShortestPathsDifferential(t *testing.T) {
 	}
 }
 
-// TestTryAllShortestPathsStale exercises the self-review's required stale
-// case: a NoteWrite landing between RebuildNow and the query must decline
-// (served == false), even though a perfectly good (now merely outdated)
-// snapshot exists.
-func TestTryAllShortestPathsStale(t *testing.T) {
+// TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback replaces a test
+// that asserted the opposite of what write-through guarantees: that a write
+// landing between RebuildNow and a query made the engine decline.
+//
+// It no longer does, and must not: a write publishes itself into the replica
+// (apply.go), so the snapshot a query captures is already current. The one
+// condition that stops the path-serving path now is the engine being in
+// fallback -- a write that could NOT be replayed -- which this test drives
+// directly (the state is what serving reads; how it got set is Apply's
+// business, exercised end-to-end by the root package's own suites).
+func TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
@@ -250,23 +256,43 @@ func TestTryAllShortestPathsStale(t *testing.T) {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
-	eng.NoteWrite(nil)
-
 	pq := recognize.PathQuery{
 		Start: recognize.Endpoint{IDs: []graph.ID{ids["c0"]}},
 		End:   recognize.Endpoint{IDs: []graph.ID{ids["c1"]}},
 		Mode:  recognize.ModeAll,
 	}
 
-	var served bool
-	if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
-		_, served = eng.TryAllShortestPaths(ctx, tx, pq)
-		return nil
-	}); err != nil {
-		t.Fatalf("ReadTransaction: %v", err)
+	serves := func() bool {
+		t.Helper()
+		var served bool
+		if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+			_, served = eng.TryAllShortestPaths(ctx, tx, pq)
+			return nil
+		}); err != nil {
+			t.Fatalf("ReadTransaction: %v", err)
+		}
+		return served
 	}
-	if served {
-		t.Fatalf("TryAllShortestPaths served after NoteWrite invalidated the snapshot, want declined")
+
+	if !serves() {
+		t.Fatalf("TryAllShortestPaths declined right after RebuildNow, want served")
+	}
+
+	// A write, on its own, must not stop the engine serving.
+	eng.NoteWrite(nil)
+	if !serves() {
+		t.Fatalf("TryAllShortestPaths declined after a write; write-through leaves the replica servable")
+	}
+
+	// Fallback does.
+	eng.state.Store(stateFallback)
+	if serves() {
+		t.Fatalf("TryAllShortestPaths served while the engine is in fallback, want declined")
+	}
+
+	eng.state.Store(stateServing)
+	if !serves() {
+		t.Fatalf("TryAllShortestPaths declined after leaving fallback, want served")
 	}
 }
 

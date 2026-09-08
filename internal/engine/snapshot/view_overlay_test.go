@@ -804,3 +804,44 @@ func TestOverlayConcurrentReadersRace(t *testing.T) {
 		t.Fatalf("CheckViewConsistent(v): %v", err)
 	}
 }
+
+// TestOverlayMaxKindIDCoversDeltaCarriedKinds is a regression test for a
+// silent, data-dependent wrong answer: a delta edge (or node) whose kind id
+// exceeds the base snapshot's own MaxKindID must raise the View's ceiling
+// even when that kind is NOT in the segment's AddedKinds -- which is exactly
+// what happens whenever the kind was already registered in the base's kind
+// table (asserted in PostgreSQL by some earlier write) while no base row
+// carried it.
+//
+// Without this, every KindMask sized from MaxKindID silently drops the kind
+// (KindMask.Set/Has no-op above the ceiling), and a relationship query for it
+// serves zero rows for an edge that plainly exists in the View.
+func TestOverlayMaxKindIDCoversDeltaCarriedKinds(t *testing.T) {
+	base, view := buildOverlayFixture(t)
+
+	// The fixture's own rows only ever carry kinds 1, 2 and 5.
+	if base.MaxKindID != 5 {
+		t.Fatalf("fixture base MaxKindID = %d, want 5", base.MaxKindID)
+	}
+
+	var b SegmentBuilder
+	// Deliberately no AddKind call: this mirrors an applier that found both
+	// kinds already named by the base kind table and therefore had nothing
+	// new to register.
+	b.AddEdgeState(2001, 10, 30, 9)
+	if err := b.AddNodeState(70, []KindID{7}, []byte(`{"name":"n70"}`)); err != nil {
+		t.Fatalf("AddNodeState: %v", err)
+	}
+
+	overlay := view.WithSegment(b.Build())
+
+	if got := overlay.MaxKindID(); got != 9 {
+		t.Fatalf("overlay MaxKindID = %d, want 9 (the delta edge's own kind)", got)
+	}
+
+	mask := NewKindMask(overlay.MaxKindID())
+	mask.Set(9)
+	if !mask.Has(9) {
+		t.Fatalf("a KindMask sized from the overlay ceiling cannot hold the delta edge's kind")
+	}
+}

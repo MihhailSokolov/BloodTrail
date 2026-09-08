@@ -99,6 +99,14 @@ func (v *View) Overlay() bool {
 	return len(v.segments) > 0
 }
 
+// SegmentCount returns how many delta segments are layered over the base
+// snapshot -- 0 exactly when Overlay() is false. It exists for observability
+// (the applier logs it per published View, and a compactor decides when to
+// fold on it); nothing about a View's semantics depends on it.
+func (v *View) SegmentCount() int {
+	return len(v.segments)
+}
+
 // ensureDelta lazily computes merged (the newest-wins collapse of v's
 // segment stack) and the virtual dense id assignment derived from it, at
 // most once per View. Every pg id merged carries a non-tombstoned record
@@ -620,10 +628,20 @@ func (v *View) Kinds() *KindTable {
 // snapshot.KindMask to. For a base-only View (Overlay() == false) this is
 // exactly base.MaxKindID, unchanged -- the highest kind id any BASE node or
 // edge actually carries (Snapshot.MaxKindID's own doc). For an overlay View
-// it is raised to also cover any larger kind id a layered delta segment
-// registered via Segment.AddedKinds (a kind first introduced by a write one
-// of this View's segments records, which base.MaxKindID -- fixed at base
-// build time -- has no way to know about).
+// it is raised to also cover every kind id the merged delta introduces:
+// those registered via Segment.AddedKinds, AND those carried by a delta
+// node's KindIDs or a delta edge's Kind.
+//
+// The second half matters as much as the first, and is not implied by it.
+// AddedKinds only carries kinds the applier had to resolve because the base
+// View's kind TABLE did not name them; a kind the table already knows --
+// because some earlier write asserted it in PostgreSQL, whether or not any
+// node or edge in this base actually carries it -- is absent from AddedKinds
+// while still being able to exceed base.MaxKindID, which counts only kinds
+// base rows actually carry. A delta edge of such a kind would then be
+// filtered out by every KindMask sized from this ceiling (KindMask.Set/Has
+// both no-op above it), silently serving zero rows for a relationship that
+// demonstrably exists.
 //
 // This is the ceiling every snapshot.KindMask sizing call site outside this
 // package (buildKindMask, buildKindMaskSeam, selectKindIDs, kindMaskFor)
@@ -653,6 +671,23 @@ func (v *View) MaxKindID() KindID {
 					max = id
 				}
 			}
+			v.merged.IterNodes(func(_ uint64, st NodeSegState) bool {
+				if st.Tombstoned {
+					return true
+				}
+				for _, id := range st.KindIDs {
+					if id > max {
+						max = id
+					}
+				}
+				return true
+			})
+			v.merged.IterEdges(func(_ uint64, st EdgeSegState) bool {
+				if !st.Tombstoned && st.Kind > max {
+					max = st.Kind
+				}
+				return true
+			})
 		}
 		v.maxKindCeil = max
 	})
