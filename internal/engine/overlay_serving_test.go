@@ -434,3 +434,375 @@ func TestOverlayVarLengthTrailBlockedByEdgeTombstone(t *testing.T) {
 		t.Fatalf("b = %d, want 20 (30 must be unreachable: edge 1002 is tombstoned)", got)
 	}
 }
+
+// --- WHERE bare pattern predicate under overlay -----------------------------
+
+// TestOverlayWherePatternPredicate reuses buildOverlayChainFixture's View
+// (base -> delta edge -> virtual node, one base node tombstoned) to drive a
+// bare WHERE-clause relationship pattern predicate, `(a)-[:E]->(b)`, with
+// both endpoints independently bound by a comma-separated MATCH --
+// `(a:N),(b:N)`, a Cartesian product, not a single traversed pattern -- so
+// no relationship in the MATCH clause itself resolves the pair; the WHERE
+// predicate is the only place an edge is ever looked up. That lookup runs
+// through eval.go's hasAdjacentEdge: before its own Overlay() guard existed,
+// it called env.Snap.Out(src) unconditionally, which panics outright once
+// Overlay() is true (View.Out's own doc) -- so this exact query would have
+// panicked the whole process, not merely produced a wrong row, against the
+// pre-fix code.
+func TestOverlayWherePatternPredicate(t *testing.T) {
+	view := buildOverlayChainFixture(t)
+
+	rs := mustPlanAndExecute(t, view,
+		`MATCH (a:N),(b:N) WHERE (a)-[:E]->(b) RETURN a, b`,
+		overlayBudget)
+
+	if len(rs.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (got %+v)", len(rs.Rows), rs.Rows)
+	}
+	if got := view.GraphID(rs.Rows[0][0].Node); got != 10 {
+		t.Fatalf("row0 a = %d, want 10", got)
+	}
+	if got := view.GraphID(rs.Rows[0][1].Node); got != 20 {
+		t.Fatalf("row0 b = %d, want 20", got)
+	}
+	if got := view.GraphID(rs.Rows[1][0].Node); got != 20 {
+		t.Fatalf("row1 a = %d, want 20", got)
+	}
+	if got := view.GraphID(rs.Rows[1][1].Node); got != 30 {
+		t.Fatalf("row1 b = %d, want 30 (the virtual node, reached via the delta edge)", got)
+	}
+}
+
+// --- untyped shortestPath (no relationship kind) whose only path uses delta edges ---
+
+// TestOverlayUntypedShortestPathUsesOnlyDeltaEdges is
+// TestOverlayShortestPathUsesOnlyDeltaEdges with the `:R` relationship-kind
+// restriction dropped from the pattern -- an untyped shortestPath() step,
+// q.Kinds == nil ("every kind allowed", Query.Kinds' own doc). Before
+// AllShortestPaths stopped building a
+// snapshot.NewKindMask(s.Base().MaxKindID)+SetAll() fallback for this case,
+// that fallback's own ceiling excluded kind 5 ("R") entirely: R is
+// registered only by the delta segment below, above the base snapshot's own
+// MaxKindID (3, from node kinds S/M/T alone -- this fixture's base graph has
+// no edges at all), so every candidate edge failed the mask check and this
+// query returned zero rows instead of the one real path.
+func TestOverlayUntypedShortestPathUsesOnlyDeltaEdges(t *testing.T) {
+	kinds := map[snapshot.KindID]string{1: "S", 2: "M", 3: "T", 5: "R"}
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(kinds)
+	if err := b.AddNode(10, []snapshot.KindID{1}, nil); err != nil {
+		t.Fatalf("AddNode(10): %v", err)
+	}
+	if err := b.AddNode(30, []snapshot.KindID{3}, nil); err != nil {
+		t.Fatalf("AddNode(30): %v", err)
+	}
+	base, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if base.MaxKindID != 3 {
+		t.Fatalf("precondition: base.MaxKindID = %d, want 3 (kind 5 must be introduced only by the delta below)", base.MaxKindID)
+	}
+	v0 := snapshot.NewView(base)
+
+	sb := &snapshot.SegmentBuilder{}
+	if err := sb.AddNodeState(20, []snapshot.KindID{2}, nil); err != nil {
+		t.Fatalf("AddNodeState(20): %v", err)
+	}
+	sb.AddEdgeState(1001, 10, 20, 5)
+	sb.AddEdgeState(1002, 20, 30, 5)
+	view := v0.WithSegment(sb.Build())
+	if !view.Overlay() {
+		t.Fatal("view.Overlay() = false, want true")
+	}
+
+	rs := mustPlanAndExecute(t, view,
+		`MATCH p = shortestPath((s:S)-[*1..5]->(t:T)) WHERE s<>t RETURN p`,
+		overlayBudget)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (got %+v)", len(rs.Rows), rs.Rows)
+	}
+
+	pv := rs.Rows[0][0].Path
+	if pv == nil {
+		t.Fatal("Path = nil, want a *PathVal")
+	}
+	path := materializePath(view, pv, nil)
+
+	if len(path.Nodes) != 3 {
+		t.Fatalf("path.Nodes = %d, want 3", len(path.Nodes))
+	}
+	if got := uint64(path.Nodes[0].ID); got != 10 {
+		t.Fatalf("path.Nodes[0].ID = %d, want 10", got)
+	}
+	if got := uint64(path.Nodes[1].ID); got != 20 {
+		t.Fatalf("path.Nodes[1].ID = %d, want 20 (the virtual node)", got)
+	}
+	if got := uint64(path.Nodes[2].ID); got != 30 {
+		t.Fatalf("path.Nodes[2].ID = %d, want 30", got)
+	}
+
+	if len(path.Edges) != 2 {
+		t.Fatalf("path.Edges = %d, want 2", len(path.Edges))
+	}
+	if got := uint64(path.Edges[0].ID); got != 1001 {
+		t.Fatalf("path.Edges[0].ID = %d, want 1001", got)
+	}
+	if got := uint64(path.Edges[1].ID); got != 1002 {
+		t.Fatalf("path.Edges[1].ID = %d, want 1002", got)
+	}
+}
+
+// --- rel query whose kind filter includes a delta-introduced kind id -------
+
+// TestOverlayRelKindFilterIncludesDeltaIntroducedKind builds
+// buildRelSpecSnapshot's five-node, seven-edge fixture (base MaxKindID == 6,
+// the highest of kindUser/kindComputer/kindGroup/kindMemberOf/kindAdminTo/
+// kindHasSession), then layers a segment that registers a brand-new kind,
+// "Owns" (id 7, strictly above base MaxKindID), and adds one delta edge of
+// that kind. TryRelFetchKinds is asked for exactly that one kind.
+//
+// Before View.MaxKindID existed, buildKindMaskSeam sized its mask to
+// snap.Base().MaxKindID (6): mask.Set(7) silently no-op'd (KindMask.Set's
+// own ceiling guard), so kindMask.Has(7) came back false and the delta edge
+// was dropped from the scan entirely -- not merely mis-named. serve_builder.
+// go's selectKindIDs(plan.snap.Base().MaxKindID, ...) call (TryRelFetchKinds'
+// own kind-name resolution) had the identical ceiling gap independently: even
+// if the edge itself HAD survived the mask, kindNames[7] would have no
+// entry, so the row's Kind field would come back as a zero-value graph.Kind
+// rather than "Owns". This test's assertions catch either failure mode.
+func TestOverlayRelKindFilterIncludesDeltaIntroducedKind(t *testing.T) {
+	base := buildRelSpecSnapshot(t)
+	if base.MaxKindID != 6 {
+		t.Fatalf("precondition: base.MaxKindID = %d, want 6 (kind 7 must be introduced only by the delta below)", base.MaxKindID)
+	}
+	v0 := snapshot.NewView(base)
+
+	const kindOwns snapshot.KindID = 7
+
+	sb := &snapshot.SegmentBuilder{}
+	sb.AddKind(kindOwns, "Owns")
+	sb.AddEdgeState(301, 1, 3, kindOwns)
+	view := v0.WithSegment(sb.Build())
+	if !view.Overlay() {
+		t.Fatal("view.Overlay() = false, want true")
+	}
+
+	byName := relSpecKindByName()
+	byName["Owns"] = kindOwns
+	names := relSpecKindNames()
+	names[kindOwns] = graph.StringKind("Owns")
+
+	e := newOverlayTestEngine(t, view, byName, names)
+	ctx := context.Background()
+
+	cursor, ok := e.TryRelFetchKinds(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("Owns")})
+	if !ok {
+		t.Fatal("TryRelFetchKinds: declined, want served")
+	}
+	got := drainRelKinds(t, cursor)
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1 (got %+v)", len(got), got)
+	}
+	row := got[0]
+	if uint64(row.ID) != 301 || uint64(row.StartID) != 1 || uint64(row.EndID) != 3 {
+		t.Fatalf("triple = %+v, want {ID:301 StartID:1 EndID:3}", row.RelationshipTripleResult)
+	}
+	if row.Kind == nil || row.Kind.String() != "Owns" {
+		t.Fatalf("Kind = %v, want Owns", row.Kind)
+	}
+}
+
+// --- unconstrained endpoint reaching Endpoint.Iterate's default branch -----
+
+// TestOverlayShortestPathUnconstrainedNearSideSkipsTombstone builds a base
+// graph with a bare (unlabeled) node 10, a "Target"-kind node 20, an edge
+// 1001 (10->20, kind E), and an isolated bare node 30 -- then layers a
+// segment that tombstones node 30 alone (nothing else). The pattern
+// `shortestPath((s)-[:E*1..5]->(t:Target))` leaves s (the root) completely
+// unconstrained -- no ids, no kind, no predicate (interpret/expand.go's
+// resolveEndpoint doc: this exact shape gives s &NodeConstraint{}) -- and t
+// constrained to the small "Target" bitmap, so traverse.AllShortestPaths'
+// strategy B dispatches smallIsRoots=false: mergeSmallTerminals
+// (traverse.go) walks q.Roots.Iterate over the ENTIRE unconstrained root
+// side, which is exactly traverse.Endpoint.Iterate's default branch. Node
+// 30's dense id sits inside that scan's [0, NodeCount()) range; its own
+// Alive-skip is what keeps a tombstoned id from ever being handed to
+// mergeSmallTerminals' callback as a root candidate at all.
+func TestOverlayShortestPathUnconstrainedNearSideSkipsTombstone(t *testing.T) {
+	kinds := map[snapshot.KindID]string{2: "Target", 5: "E"}
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(kinds)
+	if err := b.AddNode(10, nil, nil); err != nil {
+		t.Fatalf("AddNode(10): %v", err)
+	}
+	if err := b.AddNode(20, []snapshot.KindID{2}, nil); err != nil {
+		t.Fatalf("AddNode(20): %v", err)
+	}
+	if err := b.AddNode(30, nil, nil); err != nil {
+		t.Fatalf("AddNode(30): %v", err)
+	}
+	b.AddEdge(1001, 10, 20, 5)
+	base, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	v0 := snapshot.NewView(base)
+
+	sb := &snapshot.SegmentBuilder{}
+	sb.TombstoneNode(30)
+	view := v0.WithSegment(sb.Build())
+	if !view.Overlay() {
+		t.Fatal("view.Overlay() = false, want true")
+	}
+
+	rs := mustPlanAndExecute(t, view,
+		`MATCH p = shortestPath((s)-[:E*1..5]->(t:Target)) WHERE s<>t RETURN p`,
+		overlayBudget)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (got %+v)", len(rs.Rows), rs.Rows)
+	}
+
+	pv := rs.Rows[0][0].Path
+	if pv == nil {
+		t.Fatal("Path = nil, want a *PathVal")
+	}
+	path := materializePath(view, pv, nil)
+	if len(path.Nodes) != 2 {
+		t.Fatalf("path.Nodes = %d, want 2", len(path.Nodes))
+	}
+	if got := uint64(path.Nodes[0].ID); got != 10 {
+		t.Fatalf("path.Nodes[0].ID = %d, want 10", got)
+	}
+	if got := uint64(path.Nodes[1].ID); got != 20 {
+		t.Fatalf("path.Nodes[1].ID = %d, want 20", got)
+	}
+}
+
+// --- multi-hop var-length trail crossing a delta edge then a base edge ----
+
+// TestOverlayVarLengthTrailMixesDeltaThenBaseEdge builds a base graph where
+// node "B" (pg id 1, the smallest, hence dense id 0) has exactly one
+// outgoing edge -- 1001, to "C" (pg id 2) -- which necessarily lands at
+// global forward-CSR slot 0 (Snapshot.OutOffsets[0] is always 0, and B is
+// the first node). A segment then adds node "A" (pg id 3, kind S) plus a
+// delta edge, 9001, from A to B. The fixed-length trail
+// `(a:S)-[:R*2..2]->(c)` walks exactly two hops: A->B (a genuine delta edge,
+// with no forward-CSR slot at all) then B->C (the base edge whose own slot
+// index happens to be exactly 0).
+//
+// Both hops populate their adjCandidate/EdgeRef via .edgeID under Overlay()
+// (exec.go's adjacency() doc), never .fwd -- so expand.go's containsFwd,
+// deciding whether hop 2's candidate repeats an edge hop 1 already used,
+// compares real edge ids (9001 vs 1001) and correctly finds no repeat. A
+// regression that compared adjCandidate.fwd here instead (both zero: hop
+// 1's delta candidate never sets fwd at all, hop 2's real slot index happens
+// to be 0) would falsely dedup the two hops as "the same edge" and drop
+// this trail's only path entirely.
+func TestOverlayVarLengthTrailMixesDeltaThenBaseEdge(t *testing.T) {
+	kinds := map[snapshot.KindID]string{1: "S", 5: "R"}
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(kinds)
+	if err := b.AddNode(1, nil, nil); err != nil { // B
+		t.Fatalf("AddNode(1): %v", err)
+	}
+	if err := b.AddNode(2, nil, nil); err != nil { // C
+		t.Fatalf("AddNode(2): %v", err)
+	}
+	if err := b.AddNode(3, []snapshot.KindID{1}, nil); err != nil { // A, kind S
+		t.Fatalf("AddNode(3): %v", err)
+	}
+	b.AddEdge(1001, 1, 2, 5) // B -> C
+	base, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if base.GraphIDs[0] != 1 {
+		t.Fatalf("precondition: dense id 0's pg id = %d, want 1 (B must be the first node, so its only edge is global forward-CSR slot 0)", base.GraphIDs[0])
+	}
+
+	v0 := snapshot.NewView(base)
+	sb := &snapshot.SegmentBuilder{}
+	sb.AddEdgeState(9001, 3, 1, 5) // A -> B (delta)
+	view := v0.WithSegment(sb.Build())
+	if !view.Overlay() {
+		t.Fatal("view.Overlay() = false, want true")
+	}
+
+	rs := mustPlanAndExecute(t, view, `MATCH p = (a:S)-[:R*2..2]->(c) RETURN p`, overlayBudget)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (got %+v)", len(rs.Rows), rs.Rows)
+	}
+
+	pv := rs.Rows[0][0].Path
+	if pv == nil {
+		t.Fatal("Path = nil, want a *PathVal")
+	}
+	path := materializePath(view, pv, nil)
+
+	if len(path.Nodes) != 3 {
+		t.Fatalf("path.Nodes = %d, want 3", len(path.Nodes))
+	}
+	if got := uint64(path.Nodes[0].ID); got != 3 {
+		t.Fatalf("path.Nodes[0].ID = %d, want 3 (A)", got)
+	}
+	if got := uint64(path.Nodes[1].ID); got != 1 {
+		t.Fatalf("path.Nodes[1].ID = %d, want 1 (B)", got)
+	}
+	if got := uint64(path.Nodes[2].ID); got != 2 {
+		t.Fatalf("path.Nodes[2].ID = %d, want 2 (C)", got)
+	}
+
+	if len(path.Edges) != 2 {
+		t.Fatalf("path.Edges = %d, want 2", len(path.Edges))
+	}
+	if got := uint64(path.Edges[0].ID); got != 9001 {
+		t.Fatalf("path.Edges[0].ID = %d, want 9001 (the delta edge, A->B)", got)
+	}
+	if got := uint64(path.Edges[1].ID); got != 1001 {
+		t.Fatalf("path.Edges[1].ID = %d, want 1001 (the base edge, B->C)", got)
+	}
+}
+
+// --- reverse-direction relationship scan under overlay ---------------------
+
+// TestOverlayRelScanReverseDirection builds buildRelSpecSnapshot's base
+// fixture, layers a segment adding one more delta edge into node 5 (Group),
+// then queries with only EndIDs set (no StartIDs) -- resolveRelSpec's doc:
+// this is the "only endAnchor non-nil" case, which newRelScanIter dispatches
+// to forward == false, the reverse/In-CSR scan. Before relScanIter's dual
+// path existed, advanceNear/next read Base().InTargets/InOffsets/InEdgeIdx
+// directly regardless of Overlay(); the delta edge, having no reverse-CSR
+// slot at all, would have been silently missed from a reverse-anchored scan
+// specifically -- a different code path from TestOverlayRelFetchTriples's
+// full/forward scan, which never exercises relScanIter's forward==false
+// branch at all.
+func TestOverlayRelScanReverseDirection(t *testing.T) {
+	base := buildRelSpecSnapshot(t)
+	v0 := snapshot.NewView(base)
+
+	sb := &snapshot.SegmentBuilder{}
+	sb.AddEdgeState(203, 3, 5, kindMemberOf)
+	view := v0.WithSegment(sb.Build())
+	if !view.Overlay() {
+		t.Fatal("view.Overlay() = false, want true")
+	}
+
+	e := newOverlayTestEngine(t, view, relSpecKindByName(), relSpecKindNames())
+	ctx := context.Background()
+
+	cursor, ok := e.TryRelFetchTriples(ctx, recognize.RelSpec{EndIDs: []graph.ID{5}})
+	if !ok {
+		t.Fatal("TryRelFetchTriples: declined, want served")
+	}
+	got := drainTriples(t, cursor)
+	want := []graph.RelationshipTripleResult{
+		{ID: 101, StartID: 1, EndID: 5},
+		{ID: 102, StartID: 2, EndID: 5},
+		{ID: 203, StartID: 3, EndID: 5},
+	}
+	assertTriples(t, got, want)
+}

@@ -1362,28 +1362,32 @@ func predicateBelongsTo(nc *NodeConstraint, c cypher.Expression) bool {
 // sentinel, matching edgeKindOK's identical "empty = any" contract) when
 // EdgeKinds is empty.
 //
-// The mask's own ceiling is max(env.Snap.Base().MaxKindID, every id in
-// kinds), not Base().MaxKindID alone: MaxKindID is computed once, at base
-// snapshot build time, from whichever kinds the BASE graph's own nodes and
-// edges actually carry (snapshot.Builder.Build's doc) -- it has no way to
-// know about a kind that, at that time, no base edge had ever used yet. A
-// step whose relationship pattern names a kind first introduced by a later
+// The mask's own ceiling is max(env.Snap.MaxKindID(), every id in kinds),
+// not env.Snap.MaxKindID() alone. Snap.MaxKindID() already raises the base
+// snapshot's own MaxKindID (whichever kinds the BASE graph's own nodes and
+// edges actually carry, snapshot.Builder.Build's doc) to also cover any kind
+// a delta segment introduced later (snapshot.View.MaxKindID's own doc), so
+// a step whose relationship pattern names a kind first introduced by a
 // delta segment (kinds is resolved from the pattern's own kind names via
-// snap.Kinds().ID, which IS overlay-aware -- snapshot.View.Kinds' own doc)
-// would otherwise get a mask sized too small to ever represent that kind at
-// all: snapshot.KindMask.Set/Has both silently no-op for any id above the
-// mask's own ceiling, so every edge of that kind would be filtered out of
-// the traversal as if the mask had never been given the kind in the first
-// place -- not merely a missed optimization, but a query one path down this
-// specific chain (a shortestPath()/allShortestPaths() step whose only
-// admissible edges were all delta-added, of a kind no base edge ever used)
-// silently under-answers, rather than over-answering, WHICH edges Query.Kinds
-// admits.
+// snap.Kinds().ID, which is itself overlay-aware) is already covered without
+// this function doing anything extra. The per-kinds loop below instead
+// covers a second, independent gap that predates overlays entirely: kind
+// NAMES are resolved against the database's whole global `kind` table
+// (snapshot.KindTable's own doc), which can register more kinds than this
+// one graph's nodes/edges ever used -- so a resolved KindID can still exceed
+// even the merged Snap.MaxKindID() ceiling. Either gap left unfixed has the
+// identical failure mode: snapshot.KindMask.Set/Has both silently no-op for
+// any id above the mask's own ceiling, so every edge of that kind would be
+// filtered out of the traversal as if the mask had never been given the
+// kind in the first place -- not merely a missed optimization, but a query
+// one path down this specific chain (a shortestPath()/allShortestPaths()
+// step whose only admissible edges were all of that kind) silently
+// under-answers, rather than over-answering, WHICH edges Query.Kinds admits.
 func kindMaskFor(env *Env, kinds []snapshot.KindID) *snapshot.KindMask {
 	if len(kinds) == 0 {
 		return nil
 	}
-	maxKindID := env.Snap.Base().MaxKindID
+	maxKindID := env.Snap.MaxKindID()
 	for _, k := range kinds {
 		if k > maxKindID {
 			maxKindID = k

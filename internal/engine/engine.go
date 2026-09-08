@@ -727,7 +727,7 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 		return nil, false
 	}
 
-	edgeKinds, err := buildKindMask(ctx, kindMapper, snap.Base().MaxKindID, pq.EdgeKinds)
+	edgeKinds, err := buildKindMask(ctx, kindMapper, snap.MaxKindID(), pq.EdgeKinds)
 	if err != nil {
 		e.decline(ctx, reasonError, err)
 		return nil, false

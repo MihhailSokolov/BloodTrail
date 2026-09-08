@@ -629,7 +629,7 @@ func (e *Engine) resolveRelSpec(ctx context.Context, op string, spec recognize.R
 		return nil, false
 	}
 
-	kindMask, err := buildKindMaskSeam(ctx, e.mapKind, snap.Base().MaxKindID, spec.EdgeKinds)
+	kindMask, err := buildKindMaskSeam(ctx, e.mapKind, snap.MaxKindID(), spec.EdgeKinds)
 	if err != nil {
 		e.declineOp(ctx, op, reasonError, err)
 		return nil, false
@@ -1167,7 +1167,7 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 		return nil, false
 	}
 
-	kindNames, err := resolveKindNameMap(selectKindIDs(plan.snap.Base().MaxKindID, plan.kindMask.Has), e.mapKindNames)
+	kindNames, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID(), plan.kindMask.Has), e.mapKindNames)
 	if err != nil {
 		e.declineOp(ctx, opRelKinds, reasonError, err)
 		return nil, false
@@ -1296,7 +1296,7 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 			return nil, false
 		}
 
-		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.Base().MaxKindID, func(snapshot.KindID) bool { return true }), e.mapKindNames)
+		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID(), func(snapshot.KindID) bool { return true }), e.mapKindNames)
 		if err != nil {
 			e.declineOp(ctx, opRelRows, reasonError, err)
 			return nil, false

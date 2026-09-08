@@ -59,6 +59,11 @@ type View struct {
 	edgeTombOnce sync.Once
 	edgeTomb     map[uint64]struct{}
 
+	// maxKindOnce guards maxKindCeil, the merged kind-id ceiling MaxKindID
+	// returns -- see its doc.
+	maxKindOnce sync.Once
+	maxKindCeil KindID
+
 	// deltaAdjOnce guards deltaOut/deltaIn, the per-dense-node index of
 	// delta-added/-upserted edges -- see ensureDeltaAdjacency.
 	deltaAdjOnce sync.Once
@@ -609,6 +614,49 @@ func (v *View) Kinds() *KindTable {
 		v.kindTable = NewKindTable(pairs)
 	})
 	return v.kindTable
+}
+
+// MaxKindID returns the largest KindID this View's callers should size a
+// snapshot.KindMask to. For a base-only View (Overlay() == false) this is
+// exactly base.MaxKindID, unchanged -- the highest kind id any BASE node or
+// edge actually carries (Snapshot.MaxKindID's own doc). For an overlay View
+// it is raised to also cover any larger kind id a layered delta segment
+// registered via Segment.AddedKinds (a kind first introduced by a write one
+// of this View's segments records, which base.MaxKindID -- fixed at base
+// build time -- has no way to know about).
+//
+// This is the ceiling every snapshot.KindMask sizing call site outside this
+// package (buildKindMask, buildKindMaskSeam, selectKindIDs, kindMaskFor)
+// should read instead of Base().MaxKindID directly: a mask sized off
+// Base().MaxKindID alone silently drops every delta-introduced kind
+// (KindMask.Set/Has both no-op above the mask's own ceiling), producing
+// wrong-but-not-panicking rows -- a resolved-but-unmapped kind id, or an
+// edge/node of that kind missing from a kind-filtered result -- rather than
+// an error.
+//
+// Memoized once per View (maxKindOnce): the merged delta's AddedKinds is
+// typically empty and never large (at most one commit's worth of newly
+// registered kinds), but Segment.AddedKinds allocates a fresh copy on every
+// call, so this computes the ceiling at most once regardless of how many
+// call sites ask.
+func (v *View) MaxKindID() KindID {
+	if !v.Overlay() {
+		return v.base.MaxKindID
+	}
+
+	v.maxKindOnce.Do(func() {
+		v.ensureDelta()
+		max := v.base.MaxKindID
+		if v.merged != nil {
+			for id := range v.merged.AddedKinds() {
+				if id > max {
+					max = id
+				}
+			}
+		}
+		v.maxKindCeil = max
+	})
+	return v.maxKindCeil
 }
 
 // MultiGraph reports whether the source database held more than one graph

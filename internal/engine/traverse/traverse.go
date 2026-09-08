@@ -153,14 +153,34 @@ func (e Endpoint) Count(total int) int {
 // s. Stops early if fn returns false.
 //
 // The IDs and Bits branches are unconditional passthroughs regardless of
-// s.Overlay(): IDs is always populated from a caller that has already
-// resolved liveness itself (interpret/expand.go's resolveEndpointSet, via
-// scanAnchorVisit's own Alive-skip), and Bits is always a NodesOfKind
-// bitmap, already overlay-correct by construction (snapshot.View.NodesOfKind's
-// own doc). Only the unconstrained default -- "every dense id" -- needs its
-// own check here: s.NodeCount() grows to keep a tombstoned base node's dense
-// id occupied (snapshot.View.Alive's doc), so iterating the full range
-// verbatim would hand a dead id to fn as if it were a real match.
+// s.Overlay(). Bits is always a NodesOfKind bitmap, already overlay-correct
+// by construction -- every bit it sets is, by buildKindBitmap's own
+// construction, for a node whose effective state is non-tombstoned, so it
+// never carries a dead id (snapshot.View.NodesOfKind's own doc).
+//
+// IDs does not carry the same guarantee. It is populated by more than one
+// caller, and not every caller resolves liveness first: interpret/
+// expand.go's resolveEndpointSet does (via scanAnchorVisit's own
+// Alive-skip), but engine.go's resolveIDEndpoint and resolveCriteriaEndpoint
+// -- servePathQuery's shortestPath()/allShortestPaths() endpoint resolvers
+// -- do not. Both map a database id to its dense id via snap.Dense alone,
+// which deliberately still resolves a tombstoned base node's id (Dense's
+// own doc: a tombstone hides a node, it does not remove its id mapping), so
+// a dead id can legitimately appear in IDs, not just in theory.
+//
+// This is harmless, not a gap this function needs to close: every consumer
+// of the id Iterate hands out reaches it through OutEdges/InEdges (or
+// through Alive itself), and OutEdges/InEdges both yield nothing at all for
+// a non-Alive node (their own doc's opening line) -- so a dead IDs entry
+// simply contributes no edges/paths, exactly as PostgreSQL would find none
+// through a deleted node id. IDs is left as a pure passthrough here, with no
+// added Alive check, on that basis -- not because every producer already
+// guarantees liveness.
+//
+// Only the unconstrained default -- "every dense id" -- gets an explicit
+// check here: s.NodeCount() grows to keep a tombstoned base node's dense id
+// occupied (snapshot.View.Alive's doc), so iterating the full range verbatim
+// would hand a dead id to fn as if it were a real match.
 func (e Endpoint) Iterate(s *snapshot.View, fn func(snapshot.NodeID) bool) {
 	switch {
 	case e.IDs != nil:
@@ -329,11 +349,17 @@ func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
 		maxDepth = MaxDepth
 	}
 
+	// q.Kinds nil means "every kind allowed" (the field's own doc); bfs.go's
+	// five kinds.Has(k) consumption sites treat a nil kinds exactly that way,
+	// so no mask needs to be built here at all. Building one used to require
+	// sizing it to s.Base().MaxKindID+SetAll(), which silently excluded any
+	// kind first introduced by a delta segment after the base snapshot was
+	// built (KindMask.Set/Has both no-op above the mask's own ceiling) --
+	// an untyped shortestPath()/allShortestPaths() whose only admissible
+	// edges were all delta-added returned zero paths instead of the real
+	// ones. Passing kinds through unchanged removes the ceiling instead of
+	// trying to widen it.
 	kinds := q.Kinds
-	if kinds == nil {
-		kinds = snapshot.NewKindMask(s.Base().MaxKindID)
-		kinds.SetAll()
-	}
 
 	budget := &memBudget{limit: q.MemoryLimit}
 

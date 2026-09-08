@@ -9,6 +9,14 @@ import "github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 // distances on return: dist[seed] == 0, and every reached node's distance
 // is its hop count from seed. Returns the deepest level reached (0 if
 // nothing beyond seed was reached).
+//
+// kinds nil means every kind is allowed (Query.Kinds' own doc) -- every
+// kinds.Has(k) consumption site in this file (there are five, across
+// bfsFrom, enumerate, pairShortest, and pairEnumerate) guards it with
+// kinds != nil first, rather than requiring a fully-populated SetAll mask
+// sized to some ceiling: a ceiling sized off the base snapshot alone cannot
+// represent a kind a delta segment introduces after the base was built (see
+// AllShortestPaths' own doc for the bug this used to cause).
 func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int, sc *scratch) int {
 	sc.reset()
 	sc.set(seed, 0)
@@ -21,7 +29,7 @@ func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapsh
 		var next []snapshot.NodeID
 		for _, u := range frontier {
 			visit := func(w snapshot.NodeID, k snapshot.KindID) {
-				if !kinds.Has(k) {
+				if kinds != nil && !kinds.Has(k) {
 					return
 				}
 				if _, seen := sc.get(w); seen {
@@ -131,7 +139,7 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 		}
 
 		visit := func(w snapshot.NodeID, k snapshot.KindID) {
-			if !kinds.Has(k) {
+			if kinds != nil && !kinds.Has(k) {
 				return
 			}
 			dw, ok := distBuf.get(w)
@@ -244,7 +252,7 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 		if len(frontF) <= len(frontB) {
 			var next []snapshot.NodeID
 			visit := func(w snapshot.NodeID, k snapshot.KindID) {
-				if !kinds.Has(k) {
+				if kinds != nil && !kinds.Has(k) {
 					return
 				}
 				if _, seen := scF.get(w); seen {
@@ -277,7 +285,7 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 		} else {
 			var next []snapshot.NodeID
 			visit := func(w snapshot.NodeID, k snapshot.KindID) {
-				if !kinds.Has(k) {
+				if kinds != nil && !kinds.Has(k) {
 					return
 				}
 				if _, seen := scTmp.get(w); seen {
@@ -381,7 +389,7 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 		}
 
 		visit := func(w snapshot.NodeID, k snapshot.KindID) {
-			if !kinds.Has(k) {
+			if kinds != nil && !kinds.Has(k) {
 				return
 			}
 			dw, ok := scF.get(w)

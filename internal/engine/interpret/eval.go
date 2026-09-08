@@ -994,13 +994,25 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 // not apply; see evalPatternPredicate's own doc for why this file's other
 // evaluator functions are consistently unmetered.
 func hasAdjacentEdge(env *Env, src, dst snapshot.NodeID, kinds []snapshot.KindID) bool {
-	targets, edgeKinds, _ := env.Snap.Out(src)
-	for i, t := range targets {
-		if t == dst && edgeKindOK(kinds, edgeKinds[i]) {
-			return true
+	if !env.Snap.Overlay() {
+		targets, edgeKinds, _ := env.Snap.Out(src)
+		for i, t := range targets {
+			if t == dst && edgeKindOK(kinds, edgeKinds[i]) {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+
+	found := false
+	env.Snap.OutEdges(src, func(t snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+		if t == dst && edgeKindOK(kinds, k) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // --- EvalValue: scalar/projection context -----------------------------------
