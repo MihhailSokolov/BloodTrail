@@ -94,7 +94,7 @@ func TestHydratePaths(t *testing.T) {
 
 	path := chainPath(t, snap, ids)
 
-	paths, err := hydratePaths(ctx, pool, pgDriver.KindMapper(), snap, []traverse.Path{path})
+	paths, err := hydratePaths(ctx, pool, pgDriver.KindMapper(), snapshot.NewView(snap), []traverse.Path{path})
 	if err != nil {
 		t.Fatalf("hydratePaths: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestHydratePathsMissingNode(t *testing.T) {
 		t.Fatalf("delete node c1: %v", err)
 	}
 
-	if _, err := hydratePaths(ctx, pool, pgDriver.KindMapper(), snap, []traverse.Path{path}); err == nil {
+	if _, err := hydratePaths(ctx, pool, pgDriver.KindMapper(), snapshot.NewView(snap), []traverse.Path{path}); err == nil {
 		t.Fatalf("hydratePaths: expected an error for a path referencing a node deleted since the snapshot was loaded")
 	}
 }
@@ -252,7 +252,7 @@ func TestHydratePathsEdgeBatchBoundary(t *testing.T) {
 		}
 	}
 
-	got, err := hydratePaths(ctx, pool, pgDriver.KindMapper(), snap, paths)
+	got, err := hydratePaths(ctx, pool, pgDriver.KindMapper(), snapshot.NewView(snap), paths)
 	if err != nil {
 		t.Fatalf("hydratePaths: %v", err)
 	}

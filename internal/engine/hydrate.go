@@ -38,19 +38,19 @@ type edgeKey struct {
 // A node or edge that paths reference but that no longer exists in the
 // database (deleted between the snapshot's load and this call) is reported
 // as an error rather than silently dropped or substituted.
-func hydratePaths(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMapper, snap *snapshot.Snapshot, paths []traverse.Path) (graph.PathSet, error) {
+func hydratePaths(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMapper, snap *snapshot.View, paths []traverse.Path) (graph.PathSet, error) {
 	if len(paths) == 0 {
 		return nil, nil
 	}
 
 	nodeIDs, edgeKeys := hydrationKeys(snap, paths)
 
-	nodes, err := hydrateNodes(ctx, pool, kindMapper, snap.GraphID, nodeIDs)
+	nodes, err := hydrateNodes(ctx, pool, kindMapper, snap.Base().GraphID, nodeIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	edges, err := hydrateEdges(ctx, pool, kindMapper, snap.GraphID, edgeKeys)
+	edges, err := hydrateEdges(ctx, pool, kindMapper, snap.Base().GraphID, edgeKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func hydratePaths(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.KindMap
 // hydrationKeys collects every database node id and (start, end, kind) edge
 // triple that paths reference, each deduplicated across all of paths and
 // returned in first-seen order.
-func hydrationKeys(snap *snapshot.Snapshot, paths []traverse.Path) ([]uint64, []edgeKey) {
+func hydrationKeys(snap *snapshot.View, paths []traverse.Path) ([]uint64, []edgeKey) {
 	seenNodes := make(map[uint64]struct{})
 	var nodeIDs []uint64
 
@@ -79,7 +79,7 @@ func hydrationKeys(snap *snapshot.Snapshot, paths []traverse.Path) ([]uint64, []
 
 	for _, p := range paths {
 		for _, dense := range p.Nodes {
-			id := snap.GraphIDs[dense]
+			id := snap.GraphID(dense)
 			if _, ok := seenNodes[id]; !ok {
 				seenNodes[id] = struct{}{}
 				nodeIDs = append(nodeIDs, id)
@@ -87,7 +87,7 @@ func hydrationKeys(snap *snapshot.Snapshot, paths []traverse.Path) ([]uint64, []
 		}
 
 		for i, kind := range p.Kinds {
-			key := edgeKey{start: snap.GraphIDs[p.Nodes[i]], end: snap.GraphIDs[p.Nodes[i+1]], kind: kind}
+			key := edgeKey{start: snap.GraphID(p.Nodes[i]), end: snap.GraphID(p.Nodes[i+1]), kind: kind}
 			if _, ok := seenEdges[key]; !ok {
 				seenEdges[key] = struct{}{}
 				edgeKeys = append(edgeKeys, key)
@@ -342,14 +342,14 @@ func edgeBatchQuery(graphID int32, batch []edgeKey) (string, []any) {
 // entity, so a lookup miss here would indicate an internal bug rather than
 // a real deletion; the check stays as cheap insurance against a nil-pointer
 // panic.
-func assemblePath(snap *snapshot.Snapshot, p traverse.Path, nodes map[uint64]*graph.Node, edges map[edgeKey]*graph.Relationship) (graph.Path, error) {
+func assemblePath(snap *snapshot.View, p traverse.Path, nodes map[uint64]*graph.Node, edges map[edgeKey]*graph.Relationship) (graph.Path, error) {
 	gp := graph.Path{
 		Nodes: make([]*graph.Node, len(p.Nodes)),
 		Edges: make([]*graph.Relationship, len(p.Kinds)),
 	}
 
 	for i, dense := range p.Nodes {
-		id := snap.GraphIDs[dense]
+		id := snap.GraphID(dense)
 		node, ok := nodes[id]
 		if !ok {
 			return graph.Path{}, fmt.Errorf("engine: hydratePaths: node %d missing from hydrated set", id)
@@ -358,7 +358,7 @@ func assemblePath(snap *snapshot.Snapshot, p traverse.Path, nodes map[uint64]*gr
 	}
 
 	for i, kind := range p.Kinds {
-		key := edgeKey{start: snap.GraphIDs[p.Nodes[i]], end: snap.GraphIDs[p.Nodes[i+1]], kind: kind}
+		key := edgeKey{start: snap.GraphID(p.Nodes[i]), end: snap.GraphID(p.Nodes[i+1]), kind: kind}
 		edge, ok := edges[key]
 		if !ok {
 			return graph.Path{}, fmt.Errorf("engine: hydratePaths: edge (%d, %d, kind %d) missing from hydrated set", key.start, key.end, key.kind)

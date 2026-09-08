@@ -20,7 +20,7 @@ func TestFreshness(t *testing.T) {
 		t.Fatalf("Fresh() on a brand-new Engine = (%v, %v), want (nil, false)", snap, fresh)
 	}
 
-	snap := &snapshot.Snapshot{Generation: 0}
+	snap := snapshot.NewView(&snapshot.Snapshot{Generation: 0})
 	e.snap.Store(snap)
 
 	if got, fresh := e.Fresh(); !fresh || got != snap {
@@ -46,7 +46,7 @@ func TestFreshness(t *testing.T) {
 func TestSnapshotStillCurrentDetectsSnapshotSwap(t *testing.T) {
 	e := New(nil, nil, Config{})
 
-	snapA := &snapshot.Snapshot{Generation: 5}
+	snapA := snapshot.NewView(&snapshot.Snapshot{Generation: 5})
 	e.snap.Store(snapA)
 	e.generation.Store(5)
 
@@ -55,7 +55,7 @@ func TestSnapshotStillCurrentDetectsSnapshotSwap(t *testing.T) {
 
 	// A concurrent RebuildNow adopts a new snapshot B stamped at the new
 	// generation.
-	snapB := &snapshot.Snapshot{Generation: 6}
+	snapB := snapshot.NewView(&snapshot.Snapshot{Generation: 6})
 	e.snap.Store(snapB)
 
 	// Fresh() now reports the *current* snapshot (B) as fresh -- correct for

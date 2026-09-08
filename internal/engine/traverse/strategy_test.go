@@ -30,7 +30,7 @@ const (
 // Node kinds are a separate namespace from the edge kinds these traversals
 // filter on, so neither addition changes any existing edge-kind-filtered
 // traversal result.
-func buildStrategyFixture(t *testing.T) *snapshot.Snapshot {
+func buildStrategyFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := uint64(0); i < 10; i++ {
@@ -63,7 +63,7 @@ func buildStrategyFixture(t *testing.T) *snapshot.Snapshot {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return s
+	return snapshot.NewView(s)
 }
 
 // assertGroupedByRoot checks that got, partitioned into contiguous runs of
@@ -279,10 +279,11 @@ func TestAllShortestPaths(t *testing.T) {
 			}
 			ids[i] = snapshot.NodeID(i)
 		}
-		s, err := b.Build()
+		built, err := b.Build()
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
+		s := snapshot.NewView(built)
 
 		q := Query{
 			Roots:     Endpoint{IDs: ids},
@@ -411,7 +412,7 @@ func TestAllShortestPaths(t *testing.T) {
 // eventually visit intermediates too (each has its own direct, 1-hop edge
 // into the terminal), Limit always stops dense iteration before it gets
 // there.
-func buildCapFixture(t *testing.T) *snapshot.Snapshot {
+func buildCapFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := uint64(0); i < 10; i++ {
@@ -431,7 +432,7 @@ func buildCapFixture(t *testing.T) *snapshot.Snapshot {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return s
+	return snapshot.NewView(s)
 }
 
 // TestCapTruncation is a permanent regression suite for a review finding on

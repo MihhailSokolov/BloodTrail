@@ -82,7 +82,7 @@ func TestEndpointHas(t *testing.T) {
 // So nodes 0 and 3 have out-degree > 0; nodes 1, 2, and 4 have out-degree 0.
 // The specific edge kind (1) is irrelevant: SelfEndpointConflict counts any
 // outgoing edge regardless of kind (see its doc for why).
-func buildSelfConflictFixture(t *testing.T) *snapshot.Snapshot {
+func buildSelfConflictFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := uint64(0); i < 5; i++ {
@@ -96,7 +96,7 @@ func buildSelfConflictFixture(t *testing.T) *snapshot.Snapshot {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return s
+	return snapshot.NewView(s)
 }
 
 // TestSelfEndpointConflict covers SelfEndpointConflict's two conditions

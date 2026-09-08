@@ -111,7 +111,7 @@ func newNodeSpecEngine(t *testing.T, snap *snapshot.Snapshot, gen uint64) *Engin
 	e := New(nil, nil, Config{Enabled: true})
 	e.mapKind = fakeKindMapper(nodeSpecKindByName())
 	e.mapKindNames = fakeResolver(t, nodeSpecKindNames())
-	e.snap.Store(snap)
+	e.snap.Store(snapshot.NewView(snap))
 	e.generation.Store(gen)
 	return e
 }
@@ -382,7 +382,7 @@ func TestTryNodeQueriesServeAgainAfterFreshSnapshot(t *testing.T) {
 
 	freshSnap := buildNodeSpecSnapshot(t)
 	freshSnap.Generation = e.Generation()
-	e.snap.Store(freshSnap)
+	e.snap.Store(snapshot.NewView(freshSnap))
 
 	count, ok := e.TryNodeCount(ctx, spec)
 	if !ok {
@@ -505,7 +505,7 @@ func TestTryNodeFetchKindsServesAgainAfterFreshSnapshot(t *testing.T) {
 
 	freshSnap := buildNodeSpecSnapshot(t)
 	freshSnap.Generation = e.Generation()
-	e.snap.Store(freshSnap)
+	e.snap.Store(snapshot.NewView(freshSnap))
 
 	cursor, ok := e.TryNodeFetchKinds(ctx, spec)
 	if !ok {
@@ -783,7 +783,7 @@ func newRelSpecEngine(t *testing.T, snap *snapshot.Snapshot, gen uint64) *Engine
 	e := New(nil, nil, Config{Enabled: true})
 	e.mapKind = fakeKindMapper(relSpecKindByName())
 	e.mapKindNames = fakeResolver(t, relSpecKindNames())
-	e.snap.Store(snap)
+	e.snap.Store(snapshot.NewView(snap))
 	e.generation.Store(gen)
 	return e
 }
@@ -1100,7 +1100,7 @@ func TestTryRelQueriesServeAgainAfterFreshSnapshot(t *testing.T) {
 
 	freshSnap := buildRelSpecSnapshot(t)
 	freshSnap.Generation = e.Generation()
-	e.snap.Store(freshSnap)
+	e.snap.Store(snapshot.NewView(freshSnap))
 
 	if count, ok := e.TryRelCount(ctx, spec); !ok || count != 3 {
 		t.Fatalf("TryRelCount after rebuild = (%d, %v), want (3, true)", count, ok)
@@ -1352,7 +1352,7 @@ func TestTryRelQueryRowsStepProjectionServesAgainAfterFreshSnapshot(t *testing.T
 
 	freshSnap := buildRelSpecSnapshot(t)
 	freshSnap.Generation = e.Generation()
-	e.snap.Store(freshSnap)
+	e.snap.Store(snapshot.NewView(freshSnap))
 
 	result, ok := e.TryRelQueryRows(ctx, spec, recognize.ProjectionStepOutbound, false)
 	if !ok {

@@ -584,7 +584,7 @@ func kindIDNames(kinds graph.Kinds) []string {
 // which its caller turns into "mark allEdges dirty" and nothing more. Any
 // other error is resolve's own (wrapped for context), which noteResolved's
 // caller treats as "mark everything dirty" instead.
-func resolveDeletedEdgeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve func([]snapshot.KindID) (graph.Kinds, error)) ([]string, error) {
+func resolveDeletedEdgeKinds(snap *snapshot.View, ids []graph.ID, resolve func([]snapshot.KindID) (graph.Kinds, error)) ([]string, error) {
 	if snap == nil {
 		return nil, errUnresolvedDelete
 	}
@@ -595,7 +595,7 @@ func resolveDeletedEdgeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve fu
 		if !ok {
 			return nil, errUnresolvedDelete
 		}
-		kindIDs = append(kindIDs, snap.OutKinds[fwdIdx])
+		kindIDs = append(kindIDs, snap.Base().OutKinds[fwdIdx])
 	}
 
 	kinds, err := resolve(kindIDs)
@@ -614,7 +614,7 @@ func resolveDeletedEdgeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve fu
 // from it, or either resolve call fails; there is no narrower fallback for a
 // node deletion the way there is for a lone edge deletion, so every failure
 // mode here is handled identically.
-func resolveDeletedNodeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve func([]snapshot.KindID) (graph.Kinds, error)) (nodeNames, edgeNames []string, ok bool) {
+func resolveDeletedNodeKinds(snap *snapshot.View, ids []graph.ID, resolve func([]snapshot.KindID) (graph.Kinds, error)) (nodeNames, edgeNames []string, ok bool) {
 	if snap == nil {
 		return nil, nil, false
 	}
@@ -626,12 +626,11 @@ func resolveDeletedNodeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve fu
 			return nil, nil, false
 		}
 
-		lo, hi := snap.KindOffsets[dense], snap.KindOffsets[dense+1]
-		nodeKindIDs = append(nodeKindIDs, snap.NodeKinds[lo:hi]...)
+		nodeKindIDs = append(nodeKindIDs, snap.KindIDsOf(dense)...)
 
-		_, outKinds := snap.Out(dense)
+		_, outKinds, _ := snap.Out(dense)
 		edgeKindIDs = append(edgeKindIDs, outKinds...)
-		_, inKinds := snap.In(dense)
+		_, inKinds, _ := snap.In(dense)
 		edgeKindIDs = append(edgeKindIDs, inKinds...)
 	}
 
@@ -681,7 +680,7 @@ func resolveDeletedNodeKinds(snap *snapshot.Snapshot, ids []graph.ID, resolve fu
 // the same way every other resolver failure in this file is handled (fall
 // back to TouchAll), since a failed KindMapper gives no reliable information
 // to be conservative *about*.
-func resolveUpsertedNodeKinds(snap *snapshot.Snapshot, upserts []nodeKindsUpsert, resolve func([]snapshot.KindID) (graph.Kinds, error)) ([]string, error) {
+func resolveUpsertedNodeKinds(snap *snapshot.View, upserts []nodeKindsUpsert, resolve func([]snapshot.KindID) (graph.Kinds, error)) ([]string, error) {
 	var names []string
 
 	for _, pair := range upserts {
@@ -698,8 +697,7 @@ func resolveUpsertedNodeKinds(snap *snapshot.Snapshot, upserts []nodeKindsUpsert
 			continue
 		}
 
-		lo, hi := snap.KindOffsets[dense], snap.KindOffsets[dense+1]
-		snapKindIDs := snap.NodeKinds[lo:hi]
+		snapKindIDs := snap.KindIDsOf(dense)
 
 		existing := make(map[string]struct{}, len(snapKindIDs))
 		if len(snapKindIDs) > 0 {

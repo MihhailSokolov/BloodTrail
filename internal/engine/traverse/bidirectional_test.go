@@ -13,7 +13,7 @@ import (
 // over all nodes; self-loops and parallel edges are not excluded, matching
 // how AddEdge/Build treat them elsewhere in the package). Every node carries
 // node kind 1, irrelevant to these edge-kind filtered traversals.
-func buildRandomGraph(t *testing.T, rng *rand.Rand, numNodes, numEdges int, maxKind snapshot.KindID) *snapshot.Snapshot {
+func buildRandomGraph(t *testing.T, rng *rand.Rand, numNodes, numEdges int, maxKind snapshot.KindID) *snapshot.View {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := 0; i < numNodes; i++ {
@@ -31,7 +31,7 @@ func buildRandomGraph(t *testing.T, rng *rand.Rand, numNodes, numEdges int, maxK
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return s
+	return snapshot.NewView(s)
 }
 
 // randomKindMask picks a random non-empty subset of 1-3 distinct kinds from

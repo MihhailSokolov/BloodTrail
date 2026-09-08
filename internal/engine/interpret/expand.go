@@ -773,7 +773,7 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		q.MemoryLimit = memLimit
 	}
 
-	dense, err := traverse.AllShortestPaths(env.Snap.Base(), q)
+	dense, err := traverse.AllShortestPaths(env.Snap, q)
 	if err != nil {
 		if errors.Is(err, traverse.ErrTooLarge) || errors.Is(err, traverse.ErrMemoryLimit) {
 			return nil, ErrBudget

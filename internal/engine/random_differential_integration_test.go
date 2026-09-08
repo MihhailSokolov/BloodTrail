@@ -198,7 +198,7 @@ func assertSelfEndpointQuery(t *testing.T, ctx context.Context, pgDriver *pg.Dri
 	if !ok {
 		t.Fatalf("snapshot has no dense id for database id %d, which LoadRandom just created", id)
 	}
-	targets, _ := snap.Out(dense)
+	targets, _, _ := snap.Out(dense)
 	hasOutgoingEdge := len(targets) > 0
 
 	var (

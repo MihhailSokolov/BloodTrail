@@ -21,7 +21,7 @@ import (
 // Database id equals dense id (nodes 0..9 added in order), and every node
 // carries a single node kind (1), which is irrelevant to these edge-kind
 // filtered traversals.
-func buildFixture(t *testing.T) *snapshot.Snapshot {
+func buildFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	b := snapshot.NewBuilder(1)
 	for i := uint64(0); i < 10; i++ {
@@ -45,7 +45,7 @@ func buildFixture(t *testing.T) *snapshot.Snapshot {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return s
+	return snapshot.NewView(s)
 }
 
 func maskOf(max snapshot.KindID, kinds ...snapshot.KindID) *snapshot.KindMask {
@@ -93,7 +93,7 @@ func assertPathSet(t *testing.T, got, want []Path) {
 // isValidPath independently verifies that p is a real, kind-allowed walk
 // through s: every hop exists in the Out-adjacency of its source with the
 // recorded kind, and the recorded kind is allowed by kinds.
-func isValidPath(s *snapshot.Snapshot, p Path, kinds *snapshot.KindMask) bool {
+func isValidPath(s *snapshot.View, p Path, kinds *snapshot.KindMask) bool {
 	if len(p.Nodes) < 2 {
 		return false
 	}
@@ -108,7 +108,7 @@ func isValidPath(s *snapshot.Snapshot, p Path, kinds *snapshot.KindMask) bool {
 		if !kinds.Has(k) {
 			return false
 		}
-		targets, edgeKinds := s.Out(u)
+		targets, edgeKinds, _ := s.Out(u)
 		found := false
 		for j, t := range targets {
 			if t == w && edgeKinds[j] == k {

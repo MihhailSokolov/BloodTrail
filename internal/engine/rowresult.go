@@ -117,7 +117,7 @@ func (c *feedCursor[T]) Chan() chan T {
 //
 // The zero value is not useful; construct with newRowResult.
 type rowResult struct {
-	snap *snapshot.Snapshot
+	snap *snapshot.View
 	it   relIterator
 	proj recognize.RowProjection
 
@@ -144,7 +144,7 @@ type rowResult struct {
 // produces into the row shape proj names. See rowResult's doc for kindNames'
 // contract; snap resolves a relEdge's dense start/end NodeIDs and a far
 // node's own kinds back to database ids and graph.Kind names.
-func newRowResult(snap *snapshot.Snapshot, it relIterator, proj recognize.RowProjection, kindNames map[snapshot.KindID]graph.Kind) graph.Result {
+func newRowResult(snap *snapshot.View, it relIterator, proj recognize.RowProjection, kindNames map[snapshot.KindID]graph.Kind) graph.Result {
 	return &rowResult{snap: snap, it: it, proj: proj, kindNames: kindNames}
 }
 
@@ -188,11 +188,11 @@ func (r *rowResult) Values() []any {
 
 	switch r.proj {
 	case recognize.ProjectionStartEnd:
-		return []any{graph.ID(r.snap.GraphIDs[r.cur.start]), graph.ID(r.snap.GraphIDs[r.cur.end])}
+		return []any{graph.ID(r.snap.GraphID(r.cur.start)), graph.ID(r.snap.GraphID(r.cur.end))}
 
 	case recognize.ProjectionStepOutbound:
 		return []any{
-			graph.ID(r.snap.GraphIDs[r.cur.end]),
+			graph.ID(r.snap.GraphID(r.cur.end)),
 			r.nodeKinds(r.cur.end),
 			graph.ID(r.cur.edgeID),
 			r.kindNames[r.cur.kind],
@@ -200,7 +200,7 @@ func (r *rowResult) Values() []any {
 
 	case recognize.ProjectionStepInbound:
 		return []any{
-			graph.ID(r.snap.GraphIDs[r.cur.start]),
+			graph.ID(r.snap.GraphID(r.cur.start)),
 			r.nodeKinds(r.cur.start),
 			graph.ID(r.cur.edgeID),
 			r.kindNames[r.cur.kind],
@@ -215,9 +215,9 @@ func (r *rowResult) Values() []any {
 // to their graph.Kind names via r.kindNames, for a step projection's far-
 // node kinds column.
 func (r *rowResult) nodeKinds(dense snapshot.NodeID) graph.Kinds {
-	lo, hi := r.snap.KindOffsets[dense], r.snap.KindOffsets[dense+1]
-	kinds := make(graph.Kinds, 0, hi-lo)
-	for _, kindID := range r.snap.NodeKinds[lo:hi] {
+	nodeKindIDs := r.snap.KindIDsOf(dense)
+	kinds := make(graph.Kinds, 0, len(nodeKindIDs))
+	for _, kindID := range nodeKindIDs {
 		kinds = append(kinds, r.kindNames[kindID])
 	}
 	return kinds

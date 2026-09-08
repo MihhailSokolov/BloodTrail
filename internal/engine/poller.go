@@ -163,12 +163,12 @@ func refusalLifted(st *pollState, stamp time.Time, generation uint64) bool {
 // (d) applies would otherwise retry (and, absent the RebuildNow-side rate
 // limit, re-warn) every tick forever, since !fresh stays true until a
 // rebuild actually succeeds.
-func decideRebuild(st *pollState, status string, stamp time.Time, snap *snapshot.Snapshot, fresh bool, generation uint64) bool {
+func decideRebuild(st *pollState, status string, stamp time.Time, snap *snapshot.View, fresh bool, generation uint64) bool {
 	if snap == nil {
 		return !remembered(st, stamp)
 	}
 
-	ruleB := stamp.After(snap.AnalysisStamp) && !remembered(st, stamp)
+	ruleB := stamp.After(snap.Base().AnalysisStamp) && !remembered(st, stamp)
 	ruleC := !fresh && status == "idle" && refusalLifted(st, stamp, generation)
 	ruleD := !fresh && status == "analyzing" && st.analyzingRebuilds < maxAnalyzingRebuilds && refusalLifted(st, stamp, generation)
 
@@ -192,11 +192,11 @@ func decideRebuild(st *pollState, status string, stamp time.Time, snap *snapshot
 // So status alone disambiguates the two: status == "analyzing" means it was
 // (d), and anything else falls through to (c)'s idle_stale label,
 // regardless of which part of refusalLifted's gate let either one through.
-func pickTrigger(st *pollState, stamp time.Time, snap *snapshot.Snapshot, status string) string {
+func pickTrigger(st *pollState, stamp time.Time, snap *snapshot.View, status string) string {
 	switch {
 	case snap == nil:
 		return triggerStartup
-	case stamp.After(snap.AnalysisStamp) && !remembered(st, stamp):
+	case stamp.After(snap.Base().AnalysisStamp) && !remembered(st, stamp):
 		return triggerAnalysis
 	case status == "analyzing":
 		return triggerAnalyzing

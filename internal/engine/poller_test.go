@@ -36,7 +36,7 @@ func TestDecideRebuild(t *testing.T) {
 		st         *pollState
 		status     string
 		stamp      time.Time
-		snap       *snapshot.Snapshot
+		snap       *snapshot.View
 		fresh      bool
 		generation uint64
 		want       bool
@@ -55,7 +55,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{},
 			status: "analyzing",
 			stamp:  t1,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  true,
 			want:   true,
 		},
@@ -64,7 +64,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{},
 			status: "idle",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  false,
 			want:   true,
 		},
@@ -73,7 +73,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{},
 			status: "idle",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  true,
 			want:   false,
 		},
@@ -89,7 +89,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{},
 			status: "ingesting",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  false,
 			want:   false,
 		},
@@ -123,7 +123,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status:     "idle",
 			stamp:      t1,
-			snap:       &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:       snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:      false,
 			generation: 7,
 			want:       false,
@@ -137,7 +137,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status:     "idle",
 			stamp:      t1,
-			snap:       &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:       snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:      false,
 			generation: 8,
 			want:       true,
@@ -153,7 +153,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status:     "idle",
 			stamp:      t2,
-			snap:       &snapshot.Snapshot{AnalysisStamp: t2},
+			snap:       snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t2}),
 			fresh:      false,
 			generation: 7,
 			want:       true,
@@ -169,7 +169,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{},
 			status: "analyzing",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  false,
 			want:   true,
 		},
@@ -183,7 +183,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{},
 			status: "analyzing",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  true,
 			want:   false,
 		},
@@ -198,7 +198,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:     &pollState{analyzingRebuilds: maxAnalyzingRebuilds},
 			status: "analyzing",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:  false,
 			want:   false,
 		},
@@ -214,7 +214,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status:     "analyzing",
 			stamp:      t1,
-			snap:       &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:       snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:      false,
 			generation: 7,
 			want:       false,
@@ -227,7 +227,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status:     "analyzing",
 			stamp:      t1,
-			snap:       &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:       snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			fresh:      false,
 			generation: 8,
 			want:       true,
@@ -243,7 +243,7 @@ func TestDecideRebuild(t *testing.T) {
 			st:         &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status:     "analyzing",
 			stamp:      t2,
-			snap:       &snapshot.Snapshot{AnalysisStamp: t2},
+			snap:       snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t2}),
 			fresh:      false,
 			generation: 7,
 			want:       true,
@@ -281,7 +281,7 @@ func TestPickTrigger(t *testing.T) {
 		st     *pollState
 		status string
 		stamp  time.Time
-		snap   *snapshot.Snapshot
+		snap   *snapshot.View
 		want   string
 	}{
 		{
@@ -297,7 +297,7 @@ func TestPickTrigger(t *testing.T) {
 			st:     &pollState{},
 			status: "analyzing",
 			stamp:  t1,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			want:   triggerAnalysis,
 		},
 		{
@@ -305,7 +305,7 @@ func TestPickTrigger(t *testing.T) {
 			st:     &pollState{},
 			status: "idle",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			want:   triggerIdleStale,
 		},
 		{
@@ -313,7 +313,7 @@ func TestPickTrigger(t *testing.T) {
 			st:     &pollState{lastStamp: t1, refused: true},
 			status: "idle",
 			stamp:  t1,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			want:   triggerIdleStale,
 		},
 		{
@@ -327,7 +327,7 @@ func TestPickTrigger(t *testing.T) {
 			st:     &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status: "idle",
 			stamp:  t2,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t2},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t2}),
 			want:   triggerIdleStale,
 		},
 		{
@@ -335,7 +335,7 @@ func TestPickTrigger(t *testing.T) {
 			st:     &pollState{},
 			status: "analyzing",
 			stamp:  t0,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			want:   triggerAnalyzing,
 		},
 		{
@@ -349,7 +349,7 @@ func TestPickTrigger(t *testing.T) {
 			st:     &pollState{lastStamp: t1, refused: true, refusedGeneration: 7},
 			status: "analyzing",
 			stamp:  t1,
-			snap:   &snapshot.Snapshot{AnalysisStamp: t0},
+			snap:   snapshot.NewView(&snapshot.Snapshot{AnalysisStamp: t0}),
 			want:   triggerAnalyzing,
 		},
 	}

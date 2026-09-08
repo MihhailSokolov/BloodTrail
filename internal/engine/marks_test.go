@@ -16,7 +16,7 @@ import (
 // node 2 (kind 200). It is deliberately tiny -- these tests exercise
 // noteResolved's kind-resolution logic, not the snapshot builder itself
 // (see snapshot/builder_test.go for that).
-func buildTwoNodeSnapshot(t *testing.T, edgeID uint64, edgeKind snapshot.KindID) *snapshot.Snapshot {
+func buildTwoNodeSnapshot(t *testing.T, edgeID uint64, edgeKind snapshot.KindID) *snapshot.View {
 	t.Helper()
 
 	b := snapshot.NewBuilder(1)
@@ -32,7 +32,7 @@ func buildTwoNodeSnapshot(t *testing.T, edgeID uint64, edgeKind snapshot.KindID)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return snap
+	return snapshot.NewView(snap)
 }
 
 // fakeResolver returns a noteResolved resolve function backed by a plain

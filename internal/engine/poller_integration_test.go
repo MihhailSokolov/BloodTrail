@@ -50,8 +50,8 @@ func TestPollerDrivesRebuilds(t *testing.T) {
 	defer eng.Stop()
 
 	snap1 := waitForFreshSnapshot(t, eng, 2*time.Second)
-	if !snap1.AnalysisStamp.Equal(stamp1) {
-		t.Fatalf("first build's AnalysisStamp = %v, want %v", snap1.AnalysisStamp, stamp1)
+	if !snap1.Base().AnalysisStamp.Equal(stamp1) {
+		t.Fatalf("first build's AnalysisStamp = %v, want %v", snap1.Base().AnalysisStamp, stamp1)
 	}
 
 	// A write outside the poller's own rebuild invalidates the snapshot the
@@ -69,8 +69,8 @@ func TestPollerDrivesRebuilds(t *testing.T) {
 	// The poller must pick up the newer stamp (rule (b)) and rebuild again,
 	// which also happens to clear the staleness NoteWrite introduced.
 	snap2 := waitForFreshSnapshot(t, eng, 2*time.Second)
-	if !snap2.AnalysisStamp.Equal(stamp2) {
-		t.Fatalf("second build's AnalysisStamp = %v, want %v", snap2.AnalysisStamp, stamp2)
+	if !snap2.Base().AnalysisStamp.Equal(stamp2) {
+		t.Fatalf("second build's AnalysisStamp = %v, want %v", snap2.Base().AnalysisStamp, stamp2)
 	}
 
 	stopped := make(chan struct{})
@@ -395,7 +395,7 @@ func createDatapipeStatusTable(t *testing.T, pool *pgxpool.Pool) {
 
 // waitForFreshSnapshot polls eng.Fresh() until it reports a fresh snapshot
 // or timeout elapses, failing the test on timeout.
-func waitForFreshSnapshot(t *testing.T, eng *Engine, timeout time.Duration) *snapshot.Snapshot {
+func waitForFreshSnapshot(t *testing.T, eng *Engine, timeout time.Duration) *snapshot.View {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)

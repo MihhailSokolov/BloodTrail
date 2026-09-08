@@ -271,6 +271,8 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 	}
 	result.pairs = pairs
 
+	view := snapshot.NewView(snap)
+
 	fmt.Printf("\n=== (a) %d random User->Computer pairs (seed=%d, mode=all) ===\n", cfg.runs, cfg.seed)
 	for i, p := range pairs {
 		q := traverse.Query{
@@ -280,7 +282,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 			Mode:      traverse.ModeAll,
 		}
 		t0 := time.Now()
-		paths, err := traverse.AllShortestPaths(snap, q)
+		paths, err := traverse.AllShortestPaths(view, q)
 		d := time.Since(t0)
 		if err != nil {
 			return nil, fmt.Errorf("pair %d (%s -> %s): %w", i, p.rootObjectID, p.termObjectID, err)
@@ -365,7 +367,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 		Limit:     domainAdminsPathsLimit,
 	}
 	t0 := time.Now()
-	daPaths, err := traverse.AllShortestPaths(snap, daQuery)
+	daPaths, err := traverse.AllShortestPaths(view, daQuery)
 	result.domainAdminsDuration = time.Since(t0)
 	if err != nil {
 		return nil, fmt.Errorf("domain admins query: %w", err)

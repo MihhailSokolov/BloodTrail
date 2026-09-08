@@ -222,7 +222,7 @@ func (e Endpoint) Has(id snapshot.NodeID) bool {
 // declining is always at least as correct, since PostgreSQL is the fallback
 // either way and returns the same answer (error or otherwise) whether or
 // not the engine attempted the query first.
-func SelfEndpointConflict(s *snapshot.Snapshot, roots, terminals Endpoint) bool {
+func SelfEndpointConflict(s *snapshot.View, roots, terminals Endpoint) bool {
 	total := s.NodeCount()
 
 	small, big := roots, terminals
@@ -235,7 +235,7 @@ func SelfEndpointConflict(s *snapshot.Snapshot, roots, terminals Endpoint) bool 
 		if !big.Has(id) {
 			return true
 		}
-		if targets, _ := s.Out(id); len(targets) > 0 {
+		if targets, _, _ := s.Out(id); len(targets) > 0 {
 			conflict = true
 			return false
 		}
@@ -295,7 +295,7 @@ var ErrTooLarge = errors.New("bloodtrail: query too large for the path engine")
 // Results are ordered by (root dense id, terminal dense id); depths within
 // a pair are equal by construction. Dense ascending == database-id
 // ascending because the snapshot loads nodes ordered by id.
-func AllShortestPaths(s *snapshot.Snapshot, q Query) ([]Path, error) {
+func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
 	n := s.NodeCount()
 
 	maxDepth := q.MaxDepth
@@ -305,7 +305,7 @@ func AllShortestPaths(s *snapshot.Snapshot, q Query) ([]Path, error) {
 
 	kinds := q.Kinds
 	if kinds == nil {
-		kinds = snapshot.NewKindMask(s.MaxKindID)
+		kinds = snapshot.NewKindMask(s.Base().MaxKindID)
 		kinds.SetAll()
 	}
 
@@ -372,7 +372,7 @@ func pathCap(limit, have int, oneMore bool) (cap int, done bool) {
 // strategyPairs implements strategy A: iterate every (root, terminal) pair
 // in ascending dense order and run pairPaths on each, sharing one set of
 // scratch buffers and stopping once Limit is reached.
-func strategyPairs(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget) ([]Path, error) {
+func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget) ([]Path, error) {
 	n := s.NodeCount()
 	scF, scT, scTmp := newScratch(n), newScratch(n), newScratch(n)
 	oneMore := q.Mode == ModeOne
@@ -423,7 +423,7 @@ type smallSideDist struct {
 // scratch buffers for the elements it is assigned, so no synchronization is
 // needed beyond the fan-out/fan-in itself: results[i] is written by exactly
 // one goroutine before g.Wait returns.
-func bfsSmallSide(s *snapshot.Snapshot, elems []snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int) []smallSideDist {
+func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int) []smallSideDist {
 	n := s.NodeCount()
 	results := make([]smallSideDist, len(elems))
 
@@ -477,7 +477,7 @@ func materialize(e Endpoint, total int) []snapshot.NodeID {
 // parallel via bfsSmallSide, then enumerates paths in a strictly ordered
 // sequential merge phase so output order (and Limit truncation) is
 // independent of goroutine scheduling.
-func strategySmallSide(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget, smallIsRoots bool) ([]Path, error) {
+func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget, smallIsRoots bool) ([]Path, error) {
 	n := s.NodeCount()
 
 	small := q.Terminals
@@ -503,7 +503,7 @@ func strategySmallSide(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, 
 // to the next. Per root r, distances are FROM r, so each reached terminal
 // is enumerated backward over the In-CSR mirror (enumerate's forward=false)
 // and reversed into a root-to-terminal Path.
-func mergeSmallRoots(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
+func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	n := s.NodeCount()
 	oneMore := q.Mode == ModeOne
 	var out []Path
@@ -552,7 +552,7 @@ func mergeSmallRoots(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, bu
 // checking each element's distance buffer for reachability. Per terminal
 // x, distances are TO x, so each reached root is enumerated forward over
 // the Out-CSR (enumerate's forward=true), Task 3's original direction.
-func mergeSmallTerminals(s *snapshot.Snapshot, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
+func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	n := s.NodeCount()
 	oneMore := q.Mode == ModeOne
 	var out []Path

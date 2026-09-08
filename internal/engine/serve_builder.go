@@ -150,7 +150,7 @@ func (e *Engine) servedOp(ctx context.Context, op string, start time.Time, extra
 // *next* call (via the marks it stamps), never corrupt the answer already
 // in flight, so a post-execution recheck here would catch nothing a
 // pre-execution one hasn't already ruled out.
-func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.Snapshot, bool) {
+func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool) {
 	if !e.cfg.Enabled {
 		e.declineOp(ctx, op, reasonDisabled, nil)
 		return nil, false
@@ -195,7 +195,7 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.Snapshot, 
 // declineOp so every decline's "op" attr says which of TryNodeCount/
 // TryNodeFetchIDs/TryNodeFetchKinds (or a Task 7 rel-query sibling) made the
 // call.
-func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.NodeSpec) (*snapshot.Bitset, *snapshot.Snapshot, bool) {
+func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.NodeSpec) (*snapshot.Bitset, *snapshot.View, bool) {
 	snap, ok := e.serveGate(ctx, op)
 	if !ok {
 		return nil, nil, false
@@ -215,7 +215,7 @@ func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.
 		return nil, nil, false
 	}
 
-	if !e.allNodesClean(snap.Generation) || !e.nodeKindsClean(snap.Generation, spec.ConstraintKinds()) {
+	if !e.allNodesClean(snap.Generation()) || !e.nodeKindsClean(snap.Generation(), spec.ConstraintKinds()) {
 		e.declineOp(ctx, op, reasonKindStale, nil)
 		return nil, nil, false
 	}
@@ -238,7 +238,7 @@ func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.
 // other bitmap, correctly narrowing an any-of union or collapsing an all-of
 // intersection to empty -- both consistent with what the same kind filter
 // would find in PostgreSQL.
-func matchConstraint(ctx context.Context, mapKind func(context.Context, graph.Kind) (int16, error), snap *snapshot.Snapshot, constraint recognize.KindConstraint) (*snapshot.Bitset, error) {
+func matchConstraint(ctx context.Context, mapKind func(context.Context, graph.Kind) (int16, error), snap *snapshot.View, constraint recognize.KindConstraint) (*snapshot.Bitset, error) {
 	bitmaps := make([]*snapshot.Bitset, 0, len(constraint.Kinds))
 	for _, kind := range constraint.Kinds {
 		kindID, err := mapKind(ctx, kind)
@@ -281,7 +281,7 @@ func matchConstraint(ctx context.Context, mapKind func(context.Context, graph.Ki
 // never sees this case (it declines reasonNoKindConstraint before calling in
 // first place when spec.Constraints is empty), but resolveRelSpec relies on
 // it directly, since RelSpec's Start/EndConstraints are allowed to be empty.
-func (e *Engine) resolveConstraintBitmaps(ctx context.Context, snap *snapshot.Snapshot, constraints []recognize.KindConstraint) (*snapshot.Bitset, error) {
+func (e *Engine) resolveConstraintBitmaps(ctx context.Context, snap *snapshot.View, constraints []recognize.KindConstraint) (*snapshot.Bitset, error) {
 	if len(constraints) == 0 {
 		return nil, nil
 	}
@@ -306,7 +306,7 @@ func (e *Engine) resolveConstraintBitmaps(ctx context.Context, snap *snapshot.Sn
 // matches" contract resolveIDEndpoint documents for the path-query side,
 // adapted to a Bitset (rather than a sorted slice) since the caller is
 // about to intersect it with kind-constraint bitmaps.
-func denseIDBitmap(snap *snapshot.Snapshot, ids []graph.ID) *snapshot.Bitset {
+func denseIDBitmap(snap *snapshot.View, ids []graph.ID) *snapshot.Bitset {
 	bm := snapshot.NewBitset(snap.NodeCount())
 	for _, id := range ids {
 		if dense, ok := snap.Dense(uint64(id)); ok {
@@ -386,7 +386,7 @@ func (e *Engine) TryNodeFetchIDs(ctx context.Context, spec recognize.NodeSpec) (
 	count := matches.Count()
 	cursor := newFeedCursor(ctx, func(yield func(graph.ID) bool) {
 		matches.Iterate(func(dense snapshot.NodeID) bool {
-			return yield(graph.ID(snap.GraphIDs[dense]))
+			return yield(graph.ID(snap.GraphID(dense)))
 		})
 	})
 
@@ -438,7 +438,7 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 		return nil, false
 	}
 
-	if !e.allNodeKindsClean(snap.Generation) {
+	if !e.allNodeKindsClean(snap.Generation()) {
 		e.declineOp(ctx, opNodeKinds, reasonKindStale, nil)
 		return nil, false
 	}
@@ -452,12 +452,12 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 	count := matches.Count()
 	cursor := newFeedCursor(ctx, func(yield func(graph.KindsResult) bool) {
 		matches.Iterate(func(dense snapshot.NodeID) bool {
-			lo, hi := snap.KindOffsets[dense], snap.KindOffsets[dense+1]
-			kinds := make(graph.Kinds, 0, hi-lo)
-			for _, kindID := range snap.NodeKinds[lo:hi] {
+			nodeKindIDs := snap.KindIDsOf(dense)
+			kinds := make(graph.Kinds, 0, len(nodeKindIDs))
+			for _, kindID := range nodeKindIDs {
 				kinds = append(kinds, kindNames[kindID])
 			}
-			return yield(graph.KindsResult{ID: graph.ID(snap.GraphIDs[dense]), Kinds: kinds})
+			return yield(graph.KindsResult{ID: graph.ID(snap.GraphID(dense)), Kinds: kinds})
 		})
 	})
 
@@ -477,13 +477,12 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 // one regardless of how many nodes match, and is what lets
 // TryNodeFetchKinds decline reasonError before starting to emit instead of
 // discovering a resolution failure mid-stream.
-func resolveMatchingKindNames(snap *snapshot.Snapshot, matches *snapshot.Bitset, resolve func([]snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
+func resolveMatchingKindNames(snap *snapshot.View, matches *snapshot.Bitset, resolve func([]snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
 	seen := make(map[snapshot.KindID]struct{})
 	var ids []snapshot.KindID
 
 	matches.Iterate(func(dense snapshot.NodeID) bool {
-		lo, hi := snap.KindOffsets[dense], snap.KindOffsets[dense+1]
-		for _, kindID := range snap.NodeKinds[lo:hi] {
+		for _, kindID := range snap.KindIDsOf(dense) {
 			if _, ok := seen[kindID]; !ok {
 				seen[kindID] = struct{}{}
 				ids = append(ids, kindID)
@@ -571,7 +570,7 @@ type relIterator interface {
 // freshness gate has already passed. Every TryRel* entry point builds
 // exactly one relIterator from a relPlan via newRelScanIter.
 type relPlan struct {
-	snap *snapshot.Snapshot
+	snap *snapshot.View
 
 	// kindMask is spec.EdgeKinds mapped to a snapshot.KindMask via
 	// buildKindMaskSeam -- SetAll when spec.EdgeKinds is empty ("every kind
@@ -630,7 +629,7 @@ func (e *Engine) resolveRelSpec(ctx context.Context, op string, spec recognize.R
 		return nil, false
 	}
 
-	kindMask, err := buildKindMaskSeam(ctx, e.mapKind, snap.MaxKindID, spec.EdgeKinds)
+	kindMask, err := buildKindMaskSeam(ctx, e.mapKind, snap.Base().MaxKindID, spec.EdgeKinds)
 	if err != nil {
 		e.declineOp(ctx, op, reasonError, err)
 		return nil, false
@@ -647,12 +646,12 @@ func (e *Engine) resolveRelSpec(ctx context.Context, op string, spec recognize.R
 		return nil, false
 	}
 
-	if !e.allEdgesClean(snap.Generation) || !e.edgeKindsClean(snap.Generation, spec.EdgeKinds) {
+	if !e.allEdgesClean(snap.Generation()) || !e.edgeKindsClean(snap.Generation(), spec.EdgeKinds) {
 		e.declineOp(ctx, op, reasonKindStale, nil)
 		return nil, false
 	}
 	if len(spec.StartConstraints) > 0 || len(spec.EndConstraints) > 0 {
-		if !e.allNodesClean(snap.Generation) || !e.nodeKindsClean(snap.Generation, spec.NodeConstraintKinds()) {
+		if !e.allNodesClean(snap.Generation()) || !e.nodeKindsClean(snap.Generation(), spec.NodeConstraintKinds()) {
 			e.declineOp(ctx, op, reasonKindStale, nil)
 			return nil, false
 		}
@@ -743,7 +742,7 @@ type relScanIter struct {
 	outerPos  int               // next unread index into outer, or next full-scan node id
 
 	forward bool
-	snap    *snapshot.Snapshot
+	snap    *snapshot.View
 
 	kindMask  *snapshot.KindMask
 	nearBits  *snapshot.Bitset
@@ -812,13 +811,13 @@ func (it *relScanIter) next() (relEdge, bool) {
 			var kind snapshot.KindID
 			var edgeID uint64
 			if it.forward {
-				far = it.snap.OutTargets[slot]
-				kind = it.snap.OutKinds[slot]
-				edgeID = it.snap.OutEdgeIDs[slot]
+				far = it.snap.Base().OutTargets[slot]
+				kind = it.snap.Base().OutKinds[slot]
+				edgeID = it.snap.Base().OutEdgeIDs[slot]
 			} else {
-				far = it.snap.InTargets[slot]
-				kind = it.snap.InKinds[slot]
-				edgeID = it.snap.OutEdgeIDs[it.snap.InEdgeIdx[slot]]
+				far = it.snap.Base().InTargets[slot]
+				kind = it.snap.Base().InKinds[slot]
+				edgeID = it.snap.Base().OutEdgeIDs[it.snap.Base().InEdgeIdx[slot]]
 			}
 
 			if !it.kindMask.Has(kind) {
@@ -869,9 +868,9 @@ func (it *relScanIter) advanceNear() bool {
 
 		var lo, hi uint64
 		if it.forward {
-			lo, hi = it.snap.OutOffsets[node], it.snap.OutOffsets[node+1]
+			lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[node+1]
 		} else {
-			lo, hi = it.snap.InOffsets[node], it.snap.InOffsets[node+1]
+			lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[node+1]
 		}
 		if lo == hi {
 			continue
@@ -1062,8 +1061,8 @@ func (e *Engine) TryRelFetchTriples(ctx context.Context, spec recognize.RelSpec)
 			}
 			row := graph.RelationshipTripleResult{
 				ID:      graph.ID(edge.edgeID),
-				StartID: graph.ID(snap.GraphIDs[edge.start]),
-				EndID:   graph.ID(snap.GraphIDs[edge.end]),
+				StartID: graph.ID(snap.GraphID(edge.start)),
+				EndID:   graph.ID(snap.GraphID(edge.end)),
 			}
 			if !yield(row) {
 				return
@@ -1099,7 +1098,7 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 		return nil, false
 	}
 
-	kindNames, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID, plan.kindMask.Has), e.mapKindNames)
+	kindNames, err := resolveKindNameMap(selectKindIDs(plan.snap.Base().MaxKindID, plan.kindMask.Has), e.mapKindNames)
 	if err != nil {
 		e.declineOp(ctx, opRelKinds, reasonError, err)
 		return nil, false
@@ -1116,8 +1115,8 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 			row := graph.RelationshipKindsResult{
 				RelationshipTripleResult: graph.RelationshipTripleResult{
 					ID:      graph.ID(edge.edgeID),
-					StartID: graph.ID(snap.GraphIDs[edge.start]),
-					EndID:   graph.ID(snap.GraphIDs[edge.end]),
+					StartID: graph.ID(snap.GraphID(edge.start)),
+					EndID:   graph.ID(snap.GraphID(edge.end)),
 				},
 				Kind: kindNames[edge.kind],
 			}
@@ -1222,13 +1221,13 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 
 	var kindNames map[snapshot.KindID]graph.Kind
 	if proj != recognize.ProjectionStartEnd {
-		g := plan.snap.Generation
+		g := plan.snap.Generation()
 		if !e.allNodesClean(g) || !e.allNodeKindsClean(g) {
 			e.declineOp(ctx, opRelRows, reasonKindStale, nil)
 			return nil, false
 		}
 
-		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID, func(snapshot.KindID) bool { return true }), e.mapKindNames)
+		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.Base().MaxKindID, func(snapshot.KindID) bool { return true }), e.mapKindNames)
 		if err != nil {
 			e.declineOp(ctx, opRelRows, reasonError, err)
 			return nil, false

@@ -62,7 +62,7 @@ type Engine struct {
 	pool     *pgxpool.Pool
 	cfg      Config
 
-	snap       atomic.Pointer[snapshot.Snapshot]
+	snap       atomic.Pointer[snapshot.View]
 	generation atomic.Uint64
 
 	// marks is the kind-scoped complement to generation above: which kind
@@ -199,7 +199,7 @@ func (e *Engine) Generation() uint64 {
 // means no snapshot has ever been adopted (RebuildNow has never succeeded,
 // or every attempt so far exceeded MemoryLimit); a non-nil, not-fresh result
 // means a snapshot exists but a NoteWrite landed after it was built.
-func (e *Engine) Fresh() (*snapshot.Snapshot, bool) {
+func (e *Engine) Fresh() (*snapshot.View, bool) {
 	snap := e.snap.Load()
 	if snap == nil {
 		return nil, false
@@ -222,8 +222,8 @@ func (e *Engine) Fresh() (*snapshot.Snapshot, bool) {
 // the original snap is now stale -- exactly the "results may mix two eras"
 // case the step-6 check exists to catch. Passing the captured snap
 // explicitly, rather than re-deriving it, is what makes the check correct.
-func (e *Engine) snapshotStillCurrent(snap *snapshot.Snapshot) bool {
-	return snap.Generation == e.generation.Load()
+func (e *Engine) snapshotStillCurrent(snap *snapshot.View) bool {
+	return snap.Generation() == e.generation.Load()
 }
 
 // RebuildNow loads a fresh snapshot.Snapshot from PostgreSQL and, if its
@@ -299,7 +299,7 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 	}
 	e.overBudget.Store(false)
 
-	e.snap.Store(snap)
+	e.snap.Store(snapshot.NewView(snap))
 
 	e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot rebuilt",
 		slog.Int("nodes", snap.NodeCount()),
@@ -579,21 +579,19 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	view := snapshot.NewView(snap)
-
-	q, ok := interpret.Plan(rq, view)
+	q, ok := interpret.Plan(rq, snap)
 	if !ok {
 		e.decline(ctx, reasonUnsupported, nil)
 		return nil, false
 	}
 
-	if snap.MultiGraph {
+	if snap.MultiGraph() {
 		e.decline(ctx, reasonMultiGraph, nil)
 		return nil, false
 	}
 
 	// A fresh copy, never rq itself -- see this method's own step 7 doc.
-	if !translateGateOK(ctx, cypher.Copy[*cypher.RegularQuery](rq), view) {
+	if !translateGateOK(ctx, cypher.Copy[*cypher.RegularQuery](rq), snap) {
 		e.decline(ctx, reasonTranslateGate, nil)
 		return nil, false
 	}
@@ -603,18 +601,18 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	rs, err := safeExecuteCypher(&interpret.Env{Snap: view, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
 		return nil, false
 	}
 
 	var edgeProps map[uint64]*graph.Properties
-	if edgeIDs := collectEdgeIDs(view, rs); len(edgeIDs) > 0 {
+	if edgeIDs := collectEdgeIDs(snap, rs); len(edgeIDs) > 0 {
 		if e.cypherHydrationRaceHook != nil {
 			e.cypherHydrationRaceHook()
 		}
-		edgeProps, err = hydrateEdgePropsByID(ctx, e.pool, snap.GraphID, edgeIDs)
+		edgeProps, err = hydrateEdgePropsByID(ctx, e.pool, snap.Base().GraphID, edgeIDs)
 		if err != nil {
 			e.decline(ctx, reasonHydration, err)
 			return nil, false
@@ -650,7 +648,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	result, ok := buildCypherRowsResult(view, rs, projectionValueKinds(q), edgeProps)
+	result, ok := buildCypherRowsResult(snap, rs, projectionValueKinds(q), edgeProps)
 	if !ok {
 		e.decline(ctx, reasonPanic, nil)
 		return nil, false
@@ -729,7 +727,7 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 		return nil, false
 	}
 
-	edgeKinds, err := buildKindMask(ctx, kindMapper, snap.MaxKindID, pq.EdgeKinds)
+	edgeKinds, err := buildKindMask(ctx, kindMapper, snap.Base().MaxKindID, pq.EdgeKinds)
 	if err != nil {
 		e.decline(ctx, reasonError, err)
 		return nil, false
@@ -802,7 +800,7 @@ func (e *Engine) decline(ctx context.Context, reason string, err error) {
 // including an id that snap doesn't recognize, which correctly narrows the
 // endpoint to zero matches (see resolveIDEndpoint) rather than failing the
 // call -- nor does the unconstrained default branch.
-func resolveEndpoint(ctx context.Context, tx graph.Transaction, kindMapper pg.KindMapper, snap *snapshot.Snapshot, ep recognize.Endpoint) (traverse.Endpoint, error) {
+func resolveEndpoint(ctx context.Context, tx graph.Transaction, kindMapper pg.KindMapper, snap *snapshot.View, ep recognize.Endpoint) (traverse.Endpoint, error) {
 	switch {
 	case len(ep.IDs) > 0:
 		return resolveIDEndpoint(snap, ep.IDs), nil
@@ -823,7 +821,7 @@ func resolveEndpoint(ctx context.Context, tx graph.Transaction, kindMapper pg.Ki
 // nil IDs slice carries. So the returned slice is always non-nil, even when
 // every id drops out, matching PostgreSQL finding no paths for a node id
 // that does not exist.
-func resolveIDEndpoint(snap *snapshot.Snapshot, ids []graph.ID) traverse.Endpoint {
+func resolveIDEndpoint(snap *snapshot.View, ids []graph.ID) traverse.Endpoint {
 	seen := make(map[snapshot.NodeID]struct{}, len(ids))
 	dense := make([]snapshot.NodeID, 0, len(ids))
 
@@ -851,7 +849,7 @@ func resolveIDEndpoint(snap *snapshot.Snapshot, ids []graph.ID) traverse.Endpoin
 // ctx is accepted (unused) to keep the same signature shape as
 // resolveEndpoint's other branches; tx already carries its own context from
 // when the caller's transaction was opened.
-func resolveCriteriaEndpoint(_ context.Context, tx graph.Transaction, snap *snapshot.Snapshot, criteria graph.Criteria) (traverse.Endpoint, error) {
+func resolveCriteriaEndpoint(_ context.Context, tx graph.Transaction, snap *snapshot.View, criteria graph.Criteria) (traverse.Endpoint, error) {
 	var dbIDs []graph.ID
 
 	err := tx.Nodes().Filter(criteria).FetchIDs(func(cursor graph.Cursor[graph.ID]) error {
@@ -893,7 +891,7 @@ func resolveCriteriaEndpoint(_ context.Context, tx graph.Transaction, snap *snap
 // caller falls back to PostgreSQL, which answers a genuinely unknown label
 // with zero matches on its own, so the only cost is the rarer, slower
 // fallback path for that case.
-func resolveKindsEndpoint(ctx context.Context, kindMapper pg.KindMapper, snap *snapshot.Snapshot, kinds graph.Kinds) (traverse.Endpoint, error) {
+func resolveKindsEndpoint(ctx context.Context, kindMapper pg.KindMapper, snap *snapshot.View, kinds graph.Kinds) (traverse.Endpoint, error) {
 	bitmaps := make([]*snapshot.Bitset, 0, len(kinds))
 	for _, kind := range kinds {
 		kindID, err := kindMapper.MapKind(ctx, kind)

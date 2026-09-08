@@ -9,7 +9,7 @@ import "github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 // distances on return: dist[seed] == 0, and every reached node's distance
 // is its hop count from seed. Returns the deepest level reached (0 if
 // nothing beyond seed was reached).
-func bfsFrom(s *snapshot.Snapshot, seed snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int, sc *scratch) int {
+func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int, sc *scratch) int {
 	sc.reset()
 	sc.set(seed, 0)
 
@@ -22,9 +22,9 @@ func bfsFrom(s *snapshot.Snapshot, seed snapshot.NodeID, forward bool, kinds *sn
 			var targets []snapshot.NodeID
 			var edgeKinds []snapshot.KindID
 			if forward {
-				targets, edgeKinds = s.Out(u)
+				targets, edgeKinds, _ = s.Out(u)
 			} else {
-				targets, edgeKinds = s.In(u)
+				targets, edgeKinds, _ = s.In(u)
 			}
 			for i, w := range targets {
 				if !kinds.Has(edgeKinds[i]) {
@@ -80,7 +80,7 @@ type pathState struct {
 // so no separate visited-set is needed. Parallel edges admitted under
 // different allowed kinds are pushed as distinct stack entries and so
 // produce distinct output paths.
-func enumerate(s *snapshot.Snapshot, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path, forward bool) ([]Path, error) {
+func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path, forward bool) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{from}}}
 
 	for len(stack) > 0 {
@@ -117,9 +117,9 @@ func enumerate(s *snapshot.Snapshot, from snapshot.NodeID, distBuf *scratch, kin
 		var targets []snapshot.NodeID
 		var edgeKinds []snapshot.KindID
 		if forward {
-			targets, edgeKinds = s.Out(u)
+			targets, edgeKinds, _ = s.Out(u)
 		} else {
-			targets, edgeKinds = s.In(u)
+			targets, edgeKinds, _ = s.In(u)
 		}
 		for i, w := range targets {
 			k := edgeKinds[i]
@@ -187,7 +187,7 @@ func reverseKinds(ks []snapshot.KindID) {
 // distance data on both sides, "lies on a shortest path" reduces to a
 // local two-buffer check at each hop, rather than having to reconstruct
 // which of phase 1's partially-explored nodes actually mattered.
-func pairShortest(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth int, scF, scT, scTmp *scratch) int {
+func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth int, scF, scT, scTmp *scratch) int {
 	if r == t {
 		return -1
 	}
@@ -214,7 +214,7 @@ func pairShortest(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.Ki
 		if len(frontF) <= len(frontB) {
 			var next []snapshot.NodeID
 			for _, u := range frontF {
-				targets, edgeKinds := s.Out(u)
+				targets, edgeKinds, _ := s.Out(u)
 				for i, w := range targets {
 					if !kinds.Has(edgeKinds[i]) {
 						continue
@@ -237,7 +237,7 @@ func pairShortest(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.Ki
 		} else {
 			var next []snapshot.NodeID
 			for _, u := range frontB {
-				targets, edgeKinds := s.In(u)
+				targets, edgeKinds, _ := s.In(u)
 				for i, w := range targets {
 					if !kinds.Has(edgeKinds[i]) {
 						continue
@@ -278,7 +278,7 @@ func pairShortest(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.Ki
 // populate scF/scT, then hands off to pairEnumerate; if no path exists
 // within maxDepth, out is returned unchanged and no error is produced
 // (absence of a path is not a failure).
-func pairPaths(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, cap int, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
+func pairPaths(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, cap int, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
 	D := pairShortest(s, r, t, kinds, maxDepth, scF, scT, scTmp)
 	if D < 0 {
 		return out, nil
@@ -303,7 +303,7 @@ func pairPaths(s *snapshot.Snapshot, r, t snapshot.NodeID, kinds *snapshot.KindM
 // sits on some shortest r->t path, so this DFS enumerates each such path
 // exactly once (per distinct edge-kind choice, as with enumerate) and
 // completes as soon as it reaches w == t rather than continuing past it.
-func pairEnumerate(s *snapshot.Snapshot, r, t snapshot.NodeID, D int, kinds *snapshot.KindMask, cap int, budget *memBudget, scF, scT *scratch, out []Path) ([]Path, error) {
+func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapshot.KindMask, cap int, budget *memBudget, scF, scT *scratch, out []Path) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{r}}}
 
 	for len(stack) > 0 {
@@ -330,7 +330,7 @@ func pairEnumerate(s *snapshot.Snapshot, r, t snapshot.NodeID, D int, kinds *sna
 			continue
 		}
 
-		targets, edgeKinds := s.Out(u)
+		targets, edgeKinds, _ := s.Out(u)
 		for i, w := range targets {
 			k := edgeKinds[i]
 			if !kinds.Has(k) {
