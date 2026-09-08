@@ -45,6 +45,9 @@ jobs:
     if: needs.discover.outputs.tags != '[]'
     runs-on: ubuntu-latest
     strategy:
+      # One tag's transient failure (a flaky registry or sumdb fetch) must
+      # not cancel the other tags' builds -- each tag publishes on its own.
+      fail-fast: false
       matrix:
         upstream_tag: ${{ fromJson(needs.discover.outputs.tags) }}
     steps:
