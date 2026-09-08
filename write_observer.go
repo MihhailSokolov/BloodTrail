@@ -31,14 +31,16 @@ const (
 // touched, instead of the all-or-nothing "something changed" a bare
 // engine.NoteWrite(nil) reports. Every override records onto scope before
 // (or, for Query, without knowing whether it needs to) delegating to the
-// inner transaction; every call this file does not override (UpdateRelationship,
-// GraphQueryMemoryLimit) is promoted straight through by embedding,
+// inner transaction; the one call this file does not override
+// (GraphQueryMemoryLimit) is promoted straight through by embedding,
 // unchanged. Commit IS overridden, below, for its own reason.
 //
-// UpdateRelationship is deliberately not overridden: a graph.Relationship's
-// Kind is fixed at creation (relationships.go has no AddedKind/DeletedKind
-// concept the way graph.Node does), so updating one only ever changes
-// properties -- nothing scope needs to know about.
+// UpdateRelationship IS overridden (see its own doc below), but only to
+// record a ChangeSet read-back key -- it adds no Touch call: a graph.
+// Relationship's Kind is fixed at creation (relationships.go has no
+// AddedKind/DeletedKind concept the way graph.Node does), so updating one
+// only ever changes properties, which the kind-scoped marks correctly leave
+// untouched.
 //
 // The zero value is not useful; construct one with a non-nil scope. scope is
 // shared with every observingNodeQuery/observingRelationshipQuery this
@@ -150,6 +152,32 @@ func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID gr
 		t.scope.Changes().RecordEdgeID(rel.ID)
 	}
 	return rel, err
+}
+
+// UpdateRelationship records relationship's own database id as a ChangeSet
+// read-back key -- unconditionally, before delegating -- mirroring
+// UpdateNode's identical "record regardless of what the call turns out to
+// touch" reasoning (see UpdateNode's own doc): relationship.ID is already
+// known from the argument itself (unlike CreateRelationshipByIDs' captured
+// return), so there is no reason to wait on the delegate's outcome the way
+// a captured-return call must. A write-through applier needs this edge id
+// key every time this call runs, even though it is property-only.
+//
+// No Touch call is added here, and none is needed: a graph.Relationship's
+// Kind is fixed at creation (relationships.go has no AddedKind/DeletedKind
+// concept the way graph.Node does), so this call only ever changes
+// properties -- nothing the kind-scoped marks need to reflect. Before
+// ChangeSet capture existed, that was reason enough to leave this call
+// promoted straight through, unobserved, by embedding -- the type doc's
+// pre-ChangeSet history. A write-through applier's changelog cannot
+// tolerate a write it never observes at all, so this override now exists to
+// record the ChangeSet entry, while correctly leaving the marks side
+// exactly as untouched as it always was.
+func (t *observingTransaction) UpdateRelationship(relationship *graph.Relationship) error {
+	if relationship != nil {
+		t.scope.Changes().RecordEdgeID(relationship.ID)
+	}
+	return t.Transaction.UpdateRelationship(relationship)
 }
 
 // Nodes returns an observingNodeQuery wrapping the inner transaction's own
@@ -653,6 +681,15 @@ func edgeIDsFromCriteria(criteria []graph.Criteria) ([]graph.ID, bool) {
 // what NodeQuery/RelationshipQuery.Update/Delete criteria in this codebase
 // use).
 //
+// A recognized criteria naming zero ids (an empty, non-nil []graph.ID from
+// query.InIDs(query.NodeID()/query.RelationshipID())) still reports ok=true,
+// with an empty ids result -- this is deliberate, not an edge case the
+// recognizer merely tolerates: nodeIDsFromCriteria/edgeIDsFromCriteria's own
+// callers then record nothing beyond this recognized-but-empty target list,
+// which is the correct changelog entry for that write, not a fallback --
+// an `id IN []` filter matches zero rows, so an empty ChangeSet is the
+// truth about what it did.
+//
 // This is deliberately narrower than dawgs' own more general id-list
 // recognition (internal/engine/recognize's unexported, read-path-only
 // idListFrom/matchIDIn): mirroring edgeKindsFromCriteria's own doc, this
@@ -722,10 +759,58 @@ func (b *observingBatch) wrote() bool {
 	return !b.scope.Empty()
 }
 
-// CreateNode touches every kind the new node carries, then delegates.
+// CreateNode touches every kind the new node carries, then delegates, then,
+// once the delegate reports success, records a ChangeSet read-back key for
+// the write via recordBatchCreateNodeIdentity -- see that function's own
+// doc for exactly which of node.ID or an "objectid" property it prefers,
+// and why a create that offers neither records a fallback instead of an
+// enumerable key.
 func (b *observingBatch) CreateNode(node *graph.Node) error {
 	b.scope.TouchNodeKinds(node.Kinds)
-	return b.Batch.CreateNode(node)
+	err := b.Batch.CreateNode(node)
+	if err == nil {
+		recordBatchCreateNodeIdentity(b.scope, node)
+	}
+	return err
+}
+
+// recordBatchCreateNodeIdentity records observingBatch.CreateNode's
+// ChangeSet entry for a create the delegate has already reported success
+// for. Unlike observingTransaction.CreateNode's tx-level equivalent, a
+// batch INSERT (graph.Batch.CreateNode's own doc: reports success/failure
+// only) never returns the row's generated id, so this method must instead
+// look at what the caller itself gave node:
+//
+//   - If node.ID is not graph.UnregisteredNodeID -- the sentinel
+//     graph.PrepareNode assigns every node this codebase constructs for a
+//     plain "let the database assign an id" create (see that function's
+//     own doc, and this package's own convention, verified against
+//     hydrate_integration_test.go's PrepareNode usage) -- the caller preset
+//     a real id itself. The one caller known to do this is the neo4j-to-
+//     PostgreSQL migration tool's own path, which carries over each node's
+//     original neo4j id rather than letting a fresh one be assigned; that
+//     preset id is exactly what a later read-back needs, so it is recorded
+//     via RecordNodeID.
+//   - Otherwise, if node's own Properties carry a string "objectid" value
+//     (objectIDFromProperties -- the same low-level read
+//     nodeUpsertObjectIDFor's declared-identity check uses, called directly
+//     here since a plain create has no IdentityProperties to check at all),
+//     that objectid is recorded via RecordNodeObjectID instead: a read-back
+//     by objectid finds whatever row the plain INSERT produced, multi-match
+//     included, exactly the same way an UpdateNodeBy upsert's own
+//     objectid-keyed read-back does.
+//   - Otherwise, this create gave the applier no key to re-read the new row
+//     by at all, so it records a fallback.
+func recordBatchCreateNodeIdentity(scope *engine.WriteScope, node *graph.Node) {
+	if node.ID != graph.UnregisteredNodeID {
+		scope.Changes().RecordNodeID(node.ID)
+		return
+	}
+	if objectID, ok := objectIDFromProperties(node.Properties); ok {
+		scope.Changes().RecordNodeObjectID(objectID)
+		return
+	}
+	scope.Changes().RecordFallback("Batch.CreateNode: no id or objectid to key read-back")
 }
 
 // CreateNodes implements graph.NodeBatchCreator, delegating to the inner
@@ -844,7 +929,7 @@ func recordNodeUpsertIdentity(scope *engine.WriteScope, update graph.NodeUpdate)
 		scope.Changes().RecordNodeObjectID(objectID)
 		return
 	}
-	scope.Changes().RecordFallback("unrecognized node upsert identity")
+	scope.Changes().RecordFallback("Batch.UpdateNodeBy: unrecognized identity")
 }
 
 // nodeUpsertObjectID recognizes update as identifying its target node by a
@@ -864,14 +949,30 @@ func nodeUpsertObjectID(update graph.NodeUpdate) (string, bool) {
 // nodeUpsertObjectIDFor is nodeUpsertObjectID's shared implementation; see
 // its doc.
 func nodeUpsertObjectIDFor(node *graph.Node, identityProperties []string) (string, bool) {
-	if node == nil || node.Properties == nil {
+	if node == nil {
 		return "", false
 	}
 	if len(identityProperties) != 1 || identityProperties[0] != "objectid" {
 		return "", false
 	}
+	return objectIDFromProperties(node.Properties)
+}
 
-	value, err := node.Properties.Get("objectid").String()
+// objectIDFromProperties reads a string "objectid" value off properties,
+// reporting ok=false when properties is nil, the key is absent, or the
+// stored value isn't a string. This is the shared low-level read behind
+// nodeUpsertObjectIDFor's declared-identity check (an UpdateNodeBy/
+// UpdateRelationshipBy upsert whose IdentityProperties names "objectid")
+// and observingBatch.CreateNode's own undeclared "does this freshly created
+// node happen to carry one" probe below -- the latter has no
+// IdentityProperties to check at all (CreateNode's caller never sets one),
+// so it calls this function directly rather than through
+// nodeUpsertObjectIDFor.
+func objectIDFromProperties(properties *graph.Properties) (string, bool) {
+	if properties == nil {
+		return "", false
+	}
+	value, err := properties.Get("objectid").String()
 	if err != nil {
 		return "", false
 	}
@@ -995,7 +1096,7 @@ func recordRelationshipUpsertIdentity(scope *engine.WriteScope, update graph.Rel
 	endOID, endOK := nodeUpsertObjectIDFor(update.End, update.EndIdentityProperties)
 
 	if update.Relationship == nil || !startOK || !endOK {
-		scope.Changes().RecordFallback("unrecognized relationship upsert identity")
+		scope.Changes().RecordFallback("Batch.UpdateRelationshipBy: unrecognized identity")
 		return
 	}
 

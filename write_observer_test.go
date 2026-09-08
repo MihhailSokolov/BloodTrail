@@ -787,7 +787,15 @@ func TestObservingTransactionCreateRelationshipByIDsErrorDoesNotRecordID(t *test
 	}
 }
 
-func TestObservingTransactionUpdateRelationshipNotOverridden(t *testing.T) {
+// TestObservingTransactionUpdateRelationshipRecordsEdgeIDAndDelegates covers
+// C2's fix: UpdateRelationship was previously left entirely unobserved
+// (promoted straight through by embedding), so a property-only relationship
+// update produced an empty ChangeSet -- an applier could never learn the
+// write happened at all. It is now overridden to record the relationship's
+// own id unconditionally, while leaving the kind-scoped marks exactly as
+// untouched as before: a relationship's Kind can never change after
+// creation, so there is genuinely nothing for Touch* to reflect here.
+func TestObservingTransactionUpdateRelationshipRecordsEdgeIDAndDelegates(t *testing.T) {
 	inner := &fakeTransaction{}
 	tx, scope := newObservingTransaction(inner)
 
@@ -798,8 +806,33 @@ func TestObservingTransactionUpdateRelationshipNotOverridden(t *testing.T) {
 	if len(inner.updateRelationshipCalls) != 1 || inner.updateRelationshipCalls[0] != rel {
 		t.Fatalf("UpdateRelationship did not delegate: %v", inner.updateRelationshipCalls)
 	}
+	// Marks stay untouched: a property-only relationship update carries no
+	// kind information, and Kind is immutable once created.
 	if !scope.Empty() {
-		t.Fatalf("UpdateRelationship (property-only, not overridden) touched scope, want untouched")
+		t.Fatalf("UpdateRelationship (property-only) touched the Touch*/Delete* marks, want untouched")
+	}
+	if got, want := scope.Changes().EdgeIDs(), []uint64{5}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Changes().EdgeIDs() = %v, want %v", got, want)
+	}
+}
+
+// TestObservingTransactionUpdateRelationshipNilDoesNotPanic covers the nil
+// guard mirroring UpdateNode's own "if node != nil" check: UpdateRelationship
+// must not dereference a nil relationship to read its ID, but should still
+// delegate whatever the caller passed (nil included) to the inner
+// transaction unchanged.
+func TestObservingTransactionUpdateRelationshipNilDoesNotPanic(t *testing.T) {
+	inner := &fakeTransaction{}
+	tx, scope := newObservingTransaction(inner)
+
+	if err := tx.UpdateRelationship(nil); err != nil {
+		t.Fatalf("UpdateRelationship: unexpected error: %v", err)
+	}
+	if len(inner.updateRelationshipCalls) != 1 || inner.updateRelationshipCalls[0] != nil {
+		t.Fatalf("UpdateRelationship did not delegate nil: %v", inner.updateRelationshipCalls)
+	}
+	if !scope.Changes().Empty() {
+		t.Fatalf("UpdateRelationship(nil) touched the ChangeSet, want untouched")
 	}
 }
 
@@ -1106,6 +1139,32 @@ func TestObservingNodeQueryDeleteRecognizedInIDsRecordsNodeIDs(t *testing.T) {
 	}
 	if got, want := scope.Changes().NodeIDs(), []uint64{11, 12}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Changes().NodeIDs() = %v, want %v", got, want)
+	}
+}
+
+// TestObservingNodeQueryDeleteZeroInIDsRecordsEmptyNonFallbackChangeSet pins
+// M2's deliberate behavior: a recognized query.InIDs(query.NodeID()) target
+// list naming zero ids is still ok=true (singleInIDsCriteria's own doc), so
+// Delete records nothing at all onto the ChangeSet -- crucially, NOT a
+// fallback. This is correct, not a gap: an `id IN []` filter matches zero
+// rows, so an empty ChangeSet is the truth about what this delete did.
+func TestObservingNodeQueryDeleteZeroInIDsRecordsEmptyNonFallbackChangeSet(t *testing.T) {
+	inner := &fakeNodeQuery{}
+	scope := engine.NewWriteScope()
+	nq := &observingNodeQuery{NodeQuery: inner, scope: scope}
+
+	nq.Filter(inIDsCriteria(nodeIDSymbol))
+	if err := nq.Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.deleteCalls != 1 {
+		t.Fatalf("Delete did not delegate to the inner query")
+	}
+	if ok, reasons := scope.Changes().HasFallback(); ok {
+		t.Fatalf("HasFallback() = true (%v), want false: a recognized zero-id InIDs is not a fallback", reasons)
+	}
+	if !scope.Changes().Empty() {
+		t.Fatalf("Changes().Empty() = false, want true for a recognized zero-id InIDs target")
 	}
 }
 
@@ -1506,7 +1565,11 @@ func TestObservingBatchCreateNodeTouchesScopeAndDelegates(t *testing.T) {
 	scope := engine.NewWriteScope()
 	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
 
-	node := &graph.Node{Kinds: graph.Kinds{graph.StringKind("User")}}
+	// ID left at graph.UnregisteredNodeID, mirroring graph.PrepareNode's own
+	// "let the database assign one" convention for a node with no id or
+	// objectid identity to key a read-back by; recordBatchCreateNodeIdentity
+	// covers that branch (fallback) separately below.
+	node := &graph.Node{ID: graph.UnregisteredNodeID, Kinds: graph.Kinds{graph.StringKind("User")}}
 	if err := b.CreateNode(node); err != nil {
 		t.Fatalf("CreateNode: unexpected error: %v", err)
 	}
@@ -1514,6 +1577,132 @@ func TestObservingBatchCreateNodeTouchesScopeAndDelegates(t *testing.T) {
 		t.Fatalf("CreateNode did not delegate: %v", inner.createNodeCalls)
 	}
 	assertScope(t, scope, []string{"User"}, nil, false, false, nil, nil)
+}
+
+// TestObservingBatchCreateNodeRecordsPresetNodeID covers C1's first
+// recognized branch: node.ID != graph.UnregisteredNodeID means the caller
+// preset a real database id itself (the neo4j-to-PostgreSQL migration
+// tool's own path is the one caller known to do this), so that id is the
+// read-back key, recorded via RecordNodeID regardless of whether node also
+// happens to carry an objectid property.
+func TestObservingBatchCreateNodeRecordsPresetNodeID(t *testing.T) {
+	inner := &fakeBatch{}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	node := &graph.Node{
+		ID:         500,
+		Kinds:      graph.Kinds{graph.StringKind("User")},
+		Properties: graph.NewProperties().Set("objectid", "S-1-5-21"),
+	}
+	if err := b.CreateNode(node); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+	if ok, reasons := scope.Changes().HasFallback(); ok {
+		t.Fatalf("HasFallback() = true (%v), want a preset id to record RecordNodeID instead", reasons)
+	}
+	if got, want := scope.Changes().NodeIDs(), []uint64{500}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Changes().NodeIDs() = %v, want %v", got, want)
+	}
+	if got := scope.Changes().NodeObjectIDs(); got != nil {
+		t.Fatalf("Changes().NodeObjectIDs() = %v, want nil (preset id takes priority)", got)
+	}
+}
+
+// TestObservingBatchCreateNodeRecordsObjectIDWhenIDUnregistered covers C1's
+// second recognized branch: node.ID is graph.UnregisteredNodeID (a plain
+// INSERT, no id ever returned), but node's own Properties carry a string
+// "objectid" value -- recorded via RecordNodeObjectID so a read-back by
+// objectid can find whatever row the INSERT produced.
+func TestObservingBatchCreateNodeRecordsObjectIDWhenIDUnregistered(t *testing.T) {
+	inner := &fakeBatch{}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	node := &graph.Node{
+		ID:         graph.UnregisteredNodeID,
+		Kinds:      graph.Kinds{graph.StringKind("User")},
+		Properties: graph.NewProperties().Set("objectid", "S-1-5-21"),
+	}
+	if err := b.CreateNode(node); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+	if ok, reasons := scope.Changes().HasFallback(); ok {
+		t.Fatalf("HasFallback() = true (%v), want a recognized objectid to record RecordNodeObjectID instead", reasons)
+	}
+	if got, want := scope.Changes().NodeObjectIDs(), []string{"S-1-5-21"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Changes().NodeObjectIDs() = %v, want %v", got, want)
+	}
+	if got := scope.Changes().NodeIDs(); got != nil {
+		t.Fatalf("Changes().NodeIDs() = %v, want nil", got)
+	}
+}
+
+// TestObservingBatchCreateNodeRecordsFallbackWhenNoIDOrObjectID covers C1's
+// third branch: node.ID is graph.UnregisteredNodeID and node carries no
+// (string) "objectid" property at all, table-driven over every way that can
+// happen -- there is nothing here for the applier to key a read-back by, so
+// this records a fallback instead.
+func TestObservingBatchCreateNodeRecordsFallbackWhenNoIDOrObjectID(t *testing.T) {
+	cases := []struct {
+		name       string
+		properties *graph.Properties
+	}{
+		{"nil properties", nil},
+		{"empty properties", graph.NewProperties()},
+		{"objectid present but not a string", graph.NewProperties().Set("objectid", 12345)},
+		{"a different property, no objectid at all", graph.NewProperties().Set("name", "n")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := &fakeBatch{}
+			scope := engine.NewWriteScope()
+			b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+			node := &graph.Node{
+				ID:         graph.UnregisteredNodeID,
+				Kinds:      graph.Kinds{graph.StringKind("User")},
+				Properties: tc.properties,
+			}
+			if err := b.CreateNode(node); err != nil {
+				t.Fatalf("CreateNode: unexpected error: %v", err)
+			}
+			if ok, reasons := scope.Changes().HasFallback(); !ok {
+				t.Fatalf("HasFallback() = false, want true for no id or objectid")
+			} else if want := "Batch.CreateNode: no id or objectid to key read-back"; len(reasons) != 1 || reasons[0] != want {
+				t.Fatalf("HasFallback() reasons = %v, want [%q]", reasons, want)
+			}
+			if got := scope.Changes().NodeIDs(); got != nil {
+				t.Fatalf("Changes().NodeIDs() = %v, want nil", got)
+			}
+			if got := scope.Changes().NodeObjectIDs(); got != nil {
+				t.Fatalf("Changes().NodeObjectIDs() = %v, want nil", got)
+			}
+		})
+	}
+}
+
+// TestObservingBatchCreateNodeErrorDoesNotRecordIdentity covers CreateNode's
+// error path: kinds are still touched (mirroring every other before-delegate
+// touch in this file, which similarly doesn't roll back on a downstream
+// error), but recordBatchCreateNodeIdentity must not run at all when the
+// delegate itself failed -- there is no successfully created row for any of
+// its three branches to key a read-back for.
+func TestObservingBatchCreateNodeErrorDoesNotRecordIdentity(t *testing.T) {
+	wantErr := errors.New("boom")
+	inner := &fakeBatch{createNodeErr: wantErr}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	node := &graph.Node{ID: 500, Kinds: graph.Kinds{graph.StringKind("User")}}
+	if err := b.CreateNode(node); err != wantErr {
+		t.Fatalf("CreateNode: error = %v, want %v", err, wantErr)
+	}
+	assertScope(t, scope, []string{"User"}, nil, false, false, nil, nil)
+	if !scope.Changes().Empty() {
+		t.Fatalf("CreateNode recorded a ChangeSet entry despite a delegate error, want untouched")
+	}
 }
 
 // TestObservingBatchCreateNodesDelegatesTouchesKindsAndRecordsIDs covers
@@ -1657,8 +1846,12 @@ func TestObservingBatchUpdateNodeByTouchesBaseKindsAndDelegates(t *testing.T) {
 	// No IdentityProperties/Properties given at all, so the identity is
 	// unrecognized -- see TestObservingBatchUpdateNodeByRecognizedObjectIDIdentity
 	// for the recognized case.
-	if ok, _ := scope.Changes().HasFallback(); !ok {
+	if ok, reasons := scope.Changes().HasFallback(); !ok {
 		t.Fatalf("HasFallback() = false, want true for an unrecognized upsert identity")
+	} else if want := "Batch.UpdateNodeBy: unrecognized identity"; len(reasons) != 1 || reasons[0] != want {
+		// M1: the fallback reason must follow this file's "<Method>: reason"
+		// convention, matching every other RecordFallback call site.
+		t.Fatalf("HasFallback() reasons = %v, want [%q]", reasons, want)
 	}
 }
 
@@ -1942,8 +2135,12 @@ func TestObservingBatchUpdateRelationshipByTouchesScopeAndDelegates(t *testing.T
 	assertScope(t, scope, nil, []string{"MemberOf"}, false, false, nil, nil)
 	// Neither endpoint carries an identity at all, so the whole upsert
 	// identity is unrecognized.
-	if ok, _ := scope.Changes().HasFallback(); !ok {
+	if ok, reasons := scope.Changes().HasFallback(); !ok {
 		t.Fatalf("HasFallback() = false, want true for an unrecognized upsert identity")
+	} else if want := "Batch.UpdateRelationshipBy: unrecognized identity"; len(reasons) != 1 || reasons[0] != want {
+		// M1: the fallback reason must follow this file's "<Method>: reason"
+		// convention, matching every other RecordFallback call site.
+		t.Fatalf("HasFallback() reasons = %v, want [%q]", reasons, want)
 	}
 }
 
