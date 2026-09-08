@@ -464,6 +464,37 @@ func TestNoteWriteNilDirtiesEverything(t *testing.T) {
 	}
 }
 
+// TestNoteWriteTouchAllScopeMatchesNilScope backs driver.go's Run/WipeGraph/
+// SetDefaultGraph, which used to call NoteWrite(nil) and now instead build a
+// *WriteScope with TouchAll() called (so a ChangeSet fallback reason has
+// somewhere to live) -- see write_observer.go's ChangeSet doc and driver.go's
+// own comments on those three methods. This asserts the two really are
+// interchangeable from noteResolved's point of view: identical generation
+// bump and identical allNodesClean/allEdgesClean results at both preGen and
+// postGen, matching TestNoteWriteNilDirtiesEverything's own assertions
+// exactly.
+func TestNoteWriteTouchAllScopeMatchesNilScope(t *testing.T) {
+	e := New(nil, nil, Config{})
+	preGen := e.Generation()
+
+	scope := NewWriteScope()
+	scope.TouchAll()
+	scope.Changes().RecordFallback("test: touch-all scope")
+
+	e.NoteWrite(scope)
+
+	postGen := e.Generation()
+	if postGen != preGen+1 {
+		t.Fatalf("Generation() after a TouchAll scope = %d, want %d", postGen, preGen+1)
+	}
+	if e.allNodesClean(preGen) || e.allEdgesClean(preGen) {
+		t.Fatalf("allNodesClean/allEdgesClean(preGen) = true after a TouchAll scope, want false")
+	}
+	if !e.allNodesClean(postGen) || !e.allEdgesClean(postGen) {
+		t.Fatalf("allNodesClean/allEdgesClean(postGen) = false after a TouchAll scope, want true")
+	}
+}
+
 // TestNoteWriteEmptyScopeOnlyBumpsGeneration covers the other end of the
 // spectrum from a nil scope: an explicitly Empty() scope still means "a
 // write happened" (the generation counter advances) but must not mark any

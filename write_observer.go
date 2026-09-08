@@ -3,11 +3,26 @@
 package bloodtrail
 
 import (
+	"fmt"
+
 	"github.com/specterops/dawgs/cypher/frontend"
 	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine"
+)
+
+// nodeIDSymbol and edgeIDSymbol are the Cypher variable symbols dawgs/query's
+// query.Node()/query.NodeID() and query.Relationship()/query.RelationshipID()
+// constructors attach (query/identifiers.go's NodeSymbol/EdgeSymbol) --
+// hardcoded here rather than imported, mirroring relationshipKindMatcherKinds'
+// own "r" literal below and its doc's reasoning: this file stays free of a
+// dawgs/query import the same way it stays free of a recognize import, since
+// nothing here needs that package's general-purpose criteria builders, only
+// the two fixed symbols its InIDs helper always uses.
+const (
+	nodeIDSymbol = "n"
+	edgeIDSymbol = "r"
 )
 
 // observingTransaction wraps a live graph.Transaction so that Driver.
@@ -84,10 +99,16 @@ func (t *observingTransaction) wrote() bool {
 
 // CreateNode touches every kind the new node is created with -- a brand new
 // node's Kinds is exactly the set of kinds that comes into existence -- then
-// delegates.
+// delegates, and, once the delegate reports success, records the new
+// node's own database id (only ever known from its return value, which
+// this method used to discard) as a ChangeSet read-back key.
 func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ...graph.Kind) (*graph.Node, error) {
 	t.scope.TouchNodeKinds(kinds)
-	return t.Transaction.CreateNode(properties, kinds...)
+	node, err := t.Transaction.CreateNode(properties, kinds...)
+	if err == nil && node != nil {
+		t.scope.Changes().RecordNodeID(node.ID)
+	}
+	return node, err
 }
 
 // UpdateNode touches node's AddedKinds and DeletedKinds -- the label delta
@@ -111,14 +132,24 @@ func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ..
 // touchNodeKindDelta's doc for the side-by-side comparison).
 func (t *observingTransaction) UpdateNode(node *graph.Node) error {
 	touchNodeKindDelta(t.scope, node)
+	if node != nil {
+		t.scope.Changes().RecordNodeID(node.ID)
+	}
 	return t.Transaction.UpdateNode(node)
 }
 
 // CreateRelationshipByIDs touches kind -- the only kind the new relationship
-// can carry -- then delegates.
+// can carry -- then delegates, and, once the delegate reports success,
+// records the new relationship's own database id (only ever known from its
+// return value, which this method used to discard) as a ChangeSet
+// read-back key.
 func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) (*graph.Relationship, error) {
 	t.scope.TouchEdgeKind(kind)
-	return t.Transaction.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
+	rel, err := t.Transaction.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
+	if err == nil && rel != nil {
+		t.scope.Changes().RecordEdgeID(rel.ID)
+	}
+	return rel, err
 }
 
 // Nodes returns an observingNodeQuery wrapping the inner transaction's own
@@ -160,6 +191,7 @@ func (t *observingTransaction) Relationships() graph.RelationshipQuery {
 func (t *observingTransaction) Query(query string, parameters map[string]any) graph.Result {
 	if cypherMutates(query) {
 		t.scope.TouchAll()
+		t.scope.Changes().RecordFallback("Query: mutating Cypher escapes changelog tracking")
 	}
 	return t.Transaction.Query(query, parameters)
 }
@@ -171,6 +203,7 @@ func (t *observingTransaction) Query(query string, parameters map[string]any) gr
 // same conservative one NoteWrite gives a nil scope.
 func (t *observingTransaction) Raw(query string, parameters map[string]any) graph.Result {
 	t.scope.TouchAll()
+	t.scope.Changes().RecordFallback("Raw: driver-specific query escapes changelog tracking")
 	return t.Transaction.Raw(query, parameters)
 }
 
@@ -184,6 +217,7 @@ func (t *observingTransaction) Raw(query string, parameters map[string]any) grap
 // still works correctly on the retargeted wrapper).
 func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transaction {
 	t.scope.TouchAll()
+	t.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
 	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng}
 }
 
@@ -241,14 +275,11 @@ func touchNodeKindDelta(scope *engine.WriteScope, node *graph.Node) {
 	scope.TouchNodeKinds(node.DeletedKinds)
 }
 
-// observingNodeQuery wraps a live graph.NodeQuery so that Delete() can mark
-// scope before delegating. graph.NodeQuery is embedded, so every method this
-// file does not override (Query, Update, Count, First, Fetch, FetchIDs,
-// FetchKinds) is promoted straight through to the inner query unchanged --
-// Update in particular is promoted deliberately:
-// NodeQuery.Update only ever sets properties (graph.NodeQuery's own doc,
-// "updates all candidate nodes with the given properties"), never labels, so
-// there is no kind information for it to report.
+// observingNodeQuery wraps a live graph.NodeQuery so that Delete() and
+// Update() can mark scope before delegating. graph.NodeQuery is embedded, so
+// every method this file does not override (Query, Count, First, Fetch,
+// FetchIDs, FetchKinds) is promoted straight through to the inner query
+// unchanged.
 //
 // The zero value is not useful; construct one via observingTransaction's own
 // Nodes() or observingBatch's own Nodes().
@@ -256,20 +287,33 @@ type observingNodeQuery struct {
 	graph.NodeQuery
 
 	scope *engine.WriteScope
+
+	// criteria accumulates every Filter/Filterf argument, in call order,
+	// mirroring observingRelationshipQuery's own field -- see its doc.
+	// Delete and Update only attempt to recognize an InIDs-shaped target
+	// list when exactly one criteria was recorded; see
+	// nodeIDsFromCriteria's doc.
+	criteria []graph.Criteria
 }
 
-// Filter delegates to the inner query and re-wraps the result so the fluent
-// chain keeps flowing through observingNodeQuery -- without this, a
-// subsequent .Delete() on the chain's result would reach the inner query
-// directly, skipping this wrapper's scope marking entirely.
+// Filter records criteria and delegates to the inner query, returning this
+// same wrapper so the fluent chain keeps flowing through observingNodeQuery
+// -- without this, a subsequent .Delete()/.Update() on the chain's result
+// would reach the inner query directly, skipping this wrapper's scope
+// marking entirely.
 func (q *observingNodeQuery) Filter(criteria graph.Criteria) graph.NodeQuery {
+	q.criteria = append(q.criteria, criteria)
 	q.NodeQuery = q.NodeQuery.Filter(criteria)
 	return q
 }
 
-// Filterf is Filter's graph.CriteriaProvider-accepting equivalent; see
-// Filter's doc for why re-wrapping matters.
+// Filterf calls criteriaDelegate once to record its result, then passes
+// criteriaDelegate itself through to the inner query's own Filterf --
+// rather than a closure fixed to the already-observed value -- so the
+// inner query's own semantics for calling the provider are unaffected
+// (mirroring observingRelationshipQuery.Filterf's identical reasoning).
 func (q *observingNodeQuery) Filterf(criteriaDelegate graph.CriteriaProvider) graph.NodeQuery {
+	q.criteria = append(q.criteria, criteriaDelegate())
 	q.NodeQuery = q.NodeQuery.Filterf(criteriaDelegate)
 	return q
 }
@@ -311,22 +355,62 @@ func (q *observingNodeQuery) Limit(limit int) graph.NodeQuery {
 // criteria could match nodes of any kind the caller didn't explicitly name
 // -- there is no narrower sound answer without re-deriving exactly which
 // nodes and edges the query's criteria matched, which nothing here attempts.
+// This TouchAllNodes/TouchAllEdges marking is unconditional and unchanged by
+// the ChangeSet recording added below: recognizing an InIDs-shaped criteria
+// only ever adds a narrower changelog entry alongside the same conservative
+// mark, never replaces it (a kind-only node delete goes through
+// Driver.DeleteNodesByKinds instead of this query -- see driver.go -- so
+// this method's own recognizer only ever needs to look for InIDs, not a
+// kind matcher).
 func (q *observingNodeQuery) Delete() error {
 	q.scope.TouchAllNodes()
 	q.scope.TouchAllEdges()
+	if ids, ok := nodeIDsFromCriteria(q.criteria); ok {
+		for _, id := range ids {
+			q.scope.Changes().RecordNodeID(id)
+		}
+	} else {
+		q.scope.Changes().RecordFallback("NodeQuery.Delete: unrecognized criteria")
+	}
 	return q.NodeQuery.Delete()
+}
+
+// Update touches TouchAllNodes unconditionally before delegating: unlike
+// this file's other overrides, a property-only update was previously left
+// entirely unobserved (NodeQuery.Update only ever sets properties, never
+// labels, so the ORIGINAL kind-scoped marks design deliberately left it
+// promoted -- see this type's pre-ChangeSet doc history). That gating
+// choice was sound for the kind-scoped freshness marks alone: a property
+// change carries no kind information for them to act on. But a
+// write-through applier building a changelog from these overrides cannot
+// tolerate a write it never even observes, so this override both records a
+// ChangeSet entry (a recognized InIDs target list, or a fallback) AND
+// conservatively marks TouchAllNodes -- mirroring Delete's own
+// unconditional, no-narrower-safe-answer marking above -- rather than
+// leaving the pre-ChangeSet "touch nothing" behavior in place. This is a
+// deliberate, narrow behavior change scoped to exactly this newly-added
+// override; every other Touch*/Delete* call site in this file is
+// unchanged.
+func (q *observingNodeQuery) Update(properties *graph.Properties) error {
+	q.scope.TouchAllNodes()
+	if ids, ok := nodeIDsFromCriteria(q.criteria); ok {
+		for _, id := range ids {
+			q.scope.Changes().RecordNodeID(id)
+		}
+	} else {
+		q.scope.Changes().RecordFallback("NodeQuery.Update: unrecognized criteria")
+	}
+	return q.NodeQuery.Update(properties)
 }
 
 // observingRelationshipQuery wraps a live graph.RelationshipQuery, recording
 // every criteria the caller filters by (mirroring relationship_query.go's
-// read-side recordingRelationshipQuery) so a subsequent Delete() has a
-// chance to recognize a kind-scoped delete and mark only the kinds it
-// actually affects, instead of TouchAllEdges. graph.RelationshipQuery is
-// embedded, so every method this file does not override (Update, Count,
-// First, Query, Fetch, FetchDirection, FetchIDs, FetchTriples, FetchKinds,
-// FetchAllShortestPaths) is promoted straight through unchanged -- Update in
-// particular is promoted deliberately, for the same property-only reason
-// observingNodeQuery's doc gives.
+// read-side recordingRelationshipQuery) so a subsequent Delete() or Update()
+// has a chance to recognize a scoped target and mark (and record) only what
+// it actually affects, instead of the fully conservative fallback. graph.
+// RelationshipQuery is embedded, so every method this file does not override
+// (Count, First, Query, Fetch, FetchDirection, FetchIDs, FetchTriples,
+// FetchKinds, FetchAllShortestPaths) is promoted straight through unchanged.
 //
 // The zero value is not useful; construct one via observingTransaction's own
 // Relationships() or observingBatch's own Relationships().
@@ -395,14 +479,42 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 
 // Delete marks scope via relationshipDeleteScope (see its doc for exactly
 // which shapes are recognized and why ignoring extra conjuncts stays sound)
-// before delegating to the inner query.
+// before delegating to the inner query. The recognized branch's ChangeSet
+// entry is RecordDeleteRelationshipsByKinds(kinds), not an enumerated edge
+// id list: relationshipDeleteScope's own recognized shape is a kind
+// matcher, not an InIDs target list, so "delete every relationship of
+// these kinds" is the operation this delete actually performs, and the
+// one the applier should replay -- an id list captured before the delete
+// ran could go stale by the time the applier reads it back. The
+// unrecognized branch falls back, same as every other unrecognized
+// criteria in this file.
 func (r *observingRelationshipQuery) Delete() error {
 	if kinds, touchAll := relationshipDeleteScope(r.criteria); touchAll {
 		r.scope.TouchAllEdges()
+		r.scope.Changes().RecordFallback("RelationshipQuery.Delete: unrecognized criteria")
 	} else {
 		r.scope.TouchEdgeKinds(kinds)
+		r.scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
 	}
 	return r.RelationshipQuery.Delete()
+}
+
+// Update touches TouchAllEdges unconditionally before delegating, and
+// records either a recognized InIDs target list or a fallback -- the
+// RelationshipQuery half of observingNodeQuery.Update's identical
+// reasoning; see its doc for the full explanation of why this newly-added
+// override marks TouchAllEdges where the pre-ChangeSet design left
+// property-only updates unobserved.
+func (r *observingRelationshipQuery) Update(properties *graph.Properties) error {
+	r.scope.TouchAllEdges()
+	if ids, ok := edgeIDsFromCriteria(r.criteria); ok {
+		for _, id := range ids {
+			r.scope.Changes().RecordEdgeID(id)
+		}
+	} else {
+		r.scope.Changes().RecordFallback("RelationshipQuery.Update: unrecognized criteria")
+	}
+	return r.RelationshipQuery.Update(properties)
 }
 
 // relationshipDeleteScope decides what an observingRelationshipQuery.
@@ -498,6 +610,86 @@ func relationshipKindMatcherKinds(km *cypher.KindMatcher) (graph.Kinds, bool) {
 	return km.Kinds, true
 }
 
+// nodeIDsFromCriteria recognizes criteria as exactly one recorded
+// criteria, shaped like query.InIDs(query.NodeID(), ids...) -- see
+// singleInIDsCriteria's doc for the exact AST shape recognized. Used by
+// observingNodeQuery.Delete and Update to record a precise ChangeSet entry
+// instead of a bare fallback whenever the caller named specific node ids
+// this way (the shape a target-by-id delete or update is expected to use;
+// see observingNodeQuery.Delete's own doc for why a kind-scoped node
+// delete never reaches this recognizer at all).
+func nodeIDsFromCriteria(criteria []graph.Criteria) ([]graph.ID, bool) {
+	if len(criteria) != 1 {
+		return nil, false
+	}
+	return singleInIDsCriteria(criteria[0], nodeIDSymbol)
+}
+
+// edgeIDsFromCriteria is nodeIDsFromCriteria's relationship equivalent,
+// recognizing query.InIDs(query.RelationshipID(), ids...). Used by
+// observingRelationshipQuery.Update; observingRelationshipQuery.Delete
+// uses relationshipDeleteScope/edgeKindsFromCriteria instead, recognizing a
+// kind matcher rather than an id list (see that method's own doc for why).
+func edgeIDsFromCriteria(criteria []graph.Criteria) ([]graph.ID, bool) {
+	if len(criteria) != 1 {
+		return nil, false
+	}
+	return singleInIDsCriteria(criteria[0], edgeIDSymbol)
+}
+
+// singleInIDsCriteria recognizes criteria as exactly the AST shape
+// query.InIDs(query.NodeID()/query.RelationshipID(), ids...) builds
+// (dawgs' query/model.go and query/identifiers.go): a *cypher.Comparison
+// with exactly one partial, operator IN, whose left side is a
+// single-argument id() *cypher.FunctionInvocation over a bare *cypher.
+// Variable named wantSymbol, and whose right side is a *cypher.Parameter
+// wrapping a []graph.ID (query.Parameter's own shape for the ids query.
+// InIDs was called with -- see query/model.go's InIDs/Parameter). ok is
+// false for any other shape, including a nil criteria, a criteria built by
+// hand as raw Cypher text (a bare *cypher.ListLiteral right-hand side, the
+// shape parsed Cypher text produces, is deliberately NOT recognized here),
+// or an id() call over anything but a bare Variable (e.g. query.StartID()/
+// query.EndID(), which wrap a differently-symbolled Variable and are never
+// what NodeQuery/RelationshipQuery.Update/Delete criteria in this codebase
+// use).
+//
+// This is deliberately narrower than dawgs' own more general id-list
+// recognition (internal/engine/recognize's unexported, read-path-only
+// idListFrom/matchIDIn): mirroring edgeKindsFromCriteria's own doc, this
+// file has a long-standing zero-dependency-on-recognize convention, and the
+// one shape this package's write path actually needs to recognize --
+// ids built by query.InIDs itself, never a hand-rolled Cypher list literal
+// -- is exactly this one.
+func singleInIDsCriteria(criteria graph.Criteria, wantSymbol string) ([]graph.ID, bool) {
+	cmp, isComparison := criteria.(*cypher.Comparison)
+	if !isComparison || cmp == nil || len(cmp.Partials) != 1 {
+		return nil, false
+	}
+
+	partial := cmp.Partials[0]
+	if partial == nil || partial.Operator != cypher.OperatorIn {
+		return nil, false
+	}
+
+	fn, isFunctionInvocation := cmp.Left.(*cypher.FunctionInvocation)
+	if !isFunctionInvocation || fn == nil || fn.Name != "id" || len(fn.Arguments) != 1 {
+		return nil, false
+	}
+
+	variable, isVariable := fn.Arguments[0].(*cypher.Variable)
+	if !isVariable || variable == nil || variable.Symbol != wantSymbol {
+		return nil, false
+	}
+
+	param, isParameter := partial.Right.(*cypher.Parameter)
+	if !isParameter || param == nil {
+		return nil, false
+	}
+
+	ids, isIDSlice := param.Value.([]graph.ID)
+	return ids, isIDSlice
+}
+
 // observingBatch wraps a live graph.Batch so that Driver.BatchOperation
 // (driver.go) can learn which node and edge kinds a batch touched, the same
 // way observingTransaction does for WriteTransaction. graph.Batch has no
@@ -536,12 +728,59 @@ func (b *observingBatch) CreateNode(node *graph.Node) error {
 	return b.Batch.CreateNode(node)
 }
 
+// CreateNodes implements graph.NodeBatchCreator, delegating to the inner
+// batch's own CreateNodes when it supports that optional bulk-create
+// contract (retriever/load.go's own caller-side type assertion, in dawgs,
+// is the production shape this mirrors: `creator, ok :=
+// batch.(graph.NodeBatchCreator)`). Go interfaces are static -- an
+// observingBatch cannot expose CreateNodes only when the inner batch
+// happens to -- so this method always exists; when the inner batch does
+// NOT implement NodeBatchCreator, it returns a descriptive error instead
+// of the ids a caller's own type assertion would otherwise expect, the
+// same failure shape retriever/load.go's own assertion-failure branch
+// already produces for a batch with no bulk-create support at all.
+//
+// Each input node's Kinds are touched before delegating (mirroring
+// CreateNode's own before-delegate touch), and, once the delegate reports
+// success, every returned id is recorded onto the ChangeSet as a read-back
+// key (RecordNodeID) -- the ids are documented to align index-for-index
+// with nodes (graph.NodeBatchCreator's own doc: "returns generated IDs in
+// input order"), but this only needs the ids themselves, not that
+// alignment, so no attempt is made to pair a specific id back to a
+// specific input node.
+func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
+	creator, ok := b.Batch.(graph.NodeBatchCreator)
+	if !ok {
+		return nil, fmt.Errorf("bloodtrail: batch %T does not support correlated bulk node creation", b.Batch)
+	}
+
+	for _, node := range nodes {
+		if node != nil {
+			b.scope.TouchNodeKinds(node.Kinds)
+		}
+	}
+
+	ids, err := creator.CreateNodes(nodes)
+	if err != nil {
+		return ids, err
+	}
+
+	for _, id := range ids {
+		b.scope.Changes().RecordNodeID(id)
+	}
+	return ids, nil
+}
+
 // DeleteNode records id for scope's own resolution against the engine's
 // current snapshot (WriteScope.DeleteNodeID's doc): unlike this file's other
 // delete paths, a batch delete-by-id names no kinds at all, so there is
-// nothing for this method itself to touch directly.
+// nothing for this method itself to touch directly. id is also recorded
+// onto the ChangeSet as a read-back key: the applier re-reads it from
+// PostgreSQL the same way every other RecordNodeID caller's target is
+// re-read, finding it gone and applying the delete.
 func (b *observingBatch) DeleteNode(id graph.ID) error {
 	b.scope.DeleteNodeID(id)
+	b.scope.Changes().RecordNodeID(id)
 	return b.Batch.DeleteNode(id)
 }
 
@@ -591,7 +830,52 @@ func (b *observingBatch) UpdateNodeBy(update graph.NodeUpdate) error {
 		b.scope.TouchNodeKinds(update.Node.AddedKinds)
 		b.scope.TouchNodeKinds(update.Node.DeletedKinds)
 	}
+	recordNodeUpsertIdentity(b.scope, update)
 	return b.Batch.UpdateNodeBy(update)
+}
+
+// recordNodeUpsertIdentity records update's ChangeSet entry: RecordNodeObjectID
+// when update's identity is recognized (nodeUpsertObjectID's doc), or
+// RecordFallback otherwise. Shared by observingBatch.UpdateNodeBy directly,
+// and by recordRelationshipUpsertIdentity below for each of
+// UpdateRelationshipBy's two endpoints.
+func recordNodeUpsertIdentity(scope *engine.WriteScope, update graph.NodeUpdate) {
+	if objectID, ok := nodeUpsertObjectID(update); ok {
+		scope.Changes().RecordNodeObjectID(objectID)
+		return
+	}
+	scope.Changes().RecordFallback("unrecognized node upsert identity")
+}
+
+// nodeUpsertObjectID recognizes update as identifying its target node by a
+// bare "objectid" property: update.IdentityProperties must be exactly
+// ["objectid"], and update.Node.Properties must carry a string value under
+// that key. Any other shape -- a nil Node, a nil Properties, a different
+// or additional identity property, or a non-string/absent objectid value
+// -- fails. This mirrors nodeUpsertObjectIDFor's identical logic, factored
+// out so both UpdateNodeBy's own identity and UpdateRelationshipBy's two
+// endpoint identities (which carry the properties slightly differently --
+// Start/End *graph.Node plus Start/EndIdentityProperties, rather than one
+// combined NodeUpdate) go through the same recognition rule.
+func nodeUpsertObjectID(update graph.NodeUpdate) (string, bool) {
+	return nodeUpsertObjectIDFor(update.Node, update.IdentityProperties)
+}
+
+// nodeUpsertObjectIDFor is nodeUpsertObjectID's shared implementation; see
+// its doc.
+func nodeUpsertObjectIDFor(node *graph.Node, identityProperties []string) (string, bool) {
+	if node == nil || node.Properties == nil {
+		return "", false
+	}
+	if len(identityProperties) != 1 || identityProperties[0] != "objectid" {
+		return "", false
+	}
+
+	value, err := node.Properties.Get("objectid").String()
+	if err != nil {
+		return "", false
+	}
+	return value, true
 }
 
 // UpdateNodes touches each node's AddedKinds/DeletedKinds delta via
@@ -635,6 +919,7 @@ func (b *observingBatch) UpdateNodes(nodes []*graph.Node) error {
 			if len(node.Kinds) > 0 {
 				b.scope.UpsertNodeKinds(node.ID, node.Kinds)
 			}
+			b.scope.Changes().RecordNodeID(node.ID)
 		}
 	}
 	return b.Batch.UpdateNodes(nodes)
@@ -644,6 +929,7 @@ func (b *observingBatch) UpdateNodes(nodes []*graph.Node) error {
 func (b *observingBatch) CreateRelationship(relationship *graph.Relationship) error {
 	if relationship != nil {
 		b.scope.TouchEdgeKind(relationship.Kind)
+		b.scope.Changes().RecordEdgeTriple(relationship.StartID, relationship.EndID, relationship.Kind)
 	}
 	return b.Batch.CreateRelationship(relationship)
 }
@@ -662,13 +948,17 @@ func (b *observingBatch) CreateRelationship(relationship *graph.Relationship) er
 //nolint:staticcheck // SA1019: deliberate passthrough of a deprecated call, see doc above.
 func (b *observingBatch) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) error {
 	b.scope.TouchEdgeKind(kind)
+	b.scope.Changes().RecordEdgeTriple(startNodeID, endNodeID, kind)
 	return b.Batch.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
 }
 
 // DeleteRelationship records id for scope's own resolution against the
-// engine's current snapshot (WriteScope.DeleteEdgeID's doc), then delegates.
+// engine's current snapshot (WriteScope.DeleteEdgeID's doc), records the
+// same id onto the ChangeSet as a read-back key (mirroring DeleteNode's
+// identical reasoning), then delegates.
 func (b *observingBatch) DeleteRelationship(id graph.ID) error {
 	b.scope.DeleteEdgeID(id)
+	b.scope.Changes().RecordEdgeID(id)
 	return b.Batch.DeleteRelationship(id)
 }
 
@@ -683,7 +973,35 @@ func (b *observingBatch) UpdateRelationshipBy(update graph.RelationshipUpdate) e
 	if update.Relationship != nil {
 		b.scope.TouchEdgeKind(update.Relationship.Kind)
 	}
+	recordRelationshipUpsertIdentity(b.scope, update)
 	return b.Batch.UpdateRelationshipBy(update)
+}
+
+// recordRelationshipUpsertIdentity records update's ChangeSet entry.
+// update.Relationship must be non-nil, and both its Start and End
+// endpoints must be recognized by nodeUpsertObjectIDFor (update's own
+// StartIdentityProperties/EndIdentityProperties, each exactly ["objectid"],
+// resolving to a string value on the corresponding Start/End node) -- the
+// pg upsert this call mirrors upserts both endpoint nodes AND the
+// relationship in one statement, so a triple keyed on the endpoints'
+// objectids is only sound to record when both endpoints are actually
+// resolvable that way. When recognized, this records the edge triple AND
+// a RecordNodeObjectID for each endpoint (the upsert's own effect on the
+// endpoint nodes, which the applier's read-back needs independently of the
+// relationship itself). Any other shape -- including just one endpoint
+// unrecognized -- records a single fallback instead.
+func recordRelationshipUpsertIdentity(scope *engine.WriteScope, update graph.RelationshipUpdate) {
+	startOID, startOK := nodeUpsertObjectIDFor(update.Start, update.StartIdentityProperties)
+	endOID, endOK := nodeUpsertObjectIDFor(update.End, update.EndIdentityProperties)
+
+	if update.Relationship == nil || !startOK || !endOK {
+		scope.Changes().RecordFallback("unrecognized relationship upsert identity")
+		return
+	}
+
+	scope.Changes().RecordEdgeTripleByObjectID(startOID, endOID, update.Relationship.Kind)
+	scope.Changes().RecordNodeObjectID(startOID)
+	scope.Changes().RecordNodeObjectID(endOID)
 }
 
 // WithGraph marks the whole scope dirty and returns a fresh observingBatch
@@ -691,6 +1009,7 @@ func (b *observingBatch) UpdateRelationshipBy(update graph.RelationshipUpdate) e
 // observingTransaction.WithGraph's identical reasoning.
 func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 	b.scope.TouchAll()
+	b.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
 	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), scope: b.scope, eng: b.eng}
 }
 

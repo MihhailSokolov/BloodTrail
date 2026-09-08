@@ -267,11 +267,23 @@ func (d *Driver) Close(ctx context.Context) error {
 // virtual dispatch: pg.Driver.Run calls its own WriteTransaction internally
 // (a concrete, same-package call), which would never reach Driver's override
 // above and so would never invalidate the engine's snapshot without this.
+//
+// The scope handed to NoteWrite has TouchAll() called on it -- touching
+// every node and edge kind, exactly like the nil scope this used to pass --
+// plus a ChangeSet fallback record: raw Cypher run outside a transaction is
+// exactly as opaque to this package's tracking as observingTransaction.
+// Query's own mutating-Cypher sniff (write_observer.go) already treats a
+// mutating statement inside a transaction, so the two are recorded the same
+// way. See marks_test.go's TestNoteWriteTouchAllScopeMatchesNilScope for the
+// verification that a TouchAll scope and a nil scope stamp identical marks.
 func (d *Driver) Run(ctx context.Context, query string, parameters map[string]any) error {
 	if err := d.Driver.Run(ctx, query, parameters); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	scope := engine.NewWriteScope()
+	scope.TouchAll()
+	scope.Changes().RecordFallback("Run: raw Cypher outside a transaction escapes changelog tracking")
+	d.engine.NoteWrite(scope)
 	return nil
 }
 
@@ -280,12 +292,17 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 // this override -- BloodHound's "clear database" action -- the engine would
 // keep serving shortest paths through data PostgreSQL no longer has, until
 // an unrelated write or analysis run happened to advance the write
-// generation. See Run's doc for why an override is needed at all.
+// generation. See Run's doc for why an override is needed at all, and for
+// why the scope handed to NoteWrite is a TouchAll scope carrying a
+// ChangeSet fallback rather than a bare nil.
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
 	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	scope := engine.NewWriteScope()
+	scope.TouchAll()
+	scope.Changes().RecordFallback("WipeGraph: full graph truncation escapes changelog tracking")
+	d.engine.NoteWrite(scope)
 	return nil
 }
 
@@ -301,19 +318,22 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 // built against whichever graph was default *before* this call, potentially
 // indefinitely (nothing else advances the write generation on its own).
 //
-// A nil NoteWrite scope is used, exactly like Run/WipeGraph: retargeting the
-// default graph changes which nodes, edges, and kinds "the graph" even
-// refers to, which is outside anything this package's kind-scoped write
-// tracking (engine/marks.go, write_observer.go's WriteScope) reasons about
-// -- the same "outside what kind-scoped tracking can reason about" call
-// observingTransaction.WithGraph and observingBatch.WithGraph
-// (write_observer.go) already make for a mid-transaction graph retarget, via
-// their own TouchAll().
+// A TouchAll scope carrying a ChangeSet fallback is used, exactly like
+// Run/WipeGraph: retargeting the default graph changes which nodes, edges,
+// and kinds "the graph" even refers to, which is outside anything this
+// package's kind-scoped write tracking (engine/marks.go, write_observer.go's
+// WriteScope) reasons about -- the same "outside what kind-scoped tracking
+// can reason about" call observingTransaction.WithGraph and observingBatch.
+// WithGraph (write_observer.go) already make for a mid-transaction graph
+// retarget, via their own TouchAll() plus RecordFallback.
 func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
 	if err := d.Driver.SetDefaultGraph(ctx, graphSchema); err != nil {
 		return err
 	}
-	d.engine.NoteWrite(nil)
+	scope := engine.NewWriteScope()
+	scope.TouchAll()
+	scope.Changes().RecordFallback("SetDefaultGraph: default graph retarget escapes changelog tracking")
+	d.engine.NoteWrite(scope)
 	return nil
 }
 
@@ -336,6 +356,7 @@ func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds,
 	scope := engine.NewWriteScope()
 	scope.TouchAllNodes()
 	scope.TouchAllEdges()
+	scope.Changes().RecordDeleteNodesByKinds(includeAny, excludeAny)
 	d.engine.NoteWrite(scope)
 	return nil
 }
@@ -354,6 +375,7 @@ func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kin
 	}
 	scope := engine.NewWriteScope()
 	scope.TouchEdgeKinds(kinds)
+	scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
 	d.engine.NoteWrite(scope)
 	return nil
 }

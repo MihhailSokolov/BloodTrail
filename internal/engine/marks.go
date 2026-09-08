@@ -44,6 +44,15 @@ type WriteScope struct {
 
 	allNodes bool
 	allEdges bool
+
+	// changes is the change log write_observer.go's overrides populate
+	// alongside every Touch*/Delete* call above -- see ChangeSet's own doc
+	// (changes.go) for what it records and why, and Changes' doc for how a
+	// caller reaches it. Touch*/Delete*/Empty() above are deliberately
+	// unaware of it: changes is additive bookkeeping for a later
+	// write-through applier, not an input to any freshness decision
+	// NoteWrite or marks.go's cleanAgainst family already make.
+	changes ChangeSet
 }
 
 // nodeKindsUpsert pairs a node's database id with the kinds an upsert-shaped
@@ -244,6 +253,19 @@ func (s *WriteScope) DeletedEdges() []graph.ID {
 	out := make([]graph.ID, len(s.deleteEdgeIDs))
 	copy(out, s.deleteEdgeIDs)
 	return out
+}
+
+// Changes returns the ChangeSet write_observer.go's overrides populate
+// alongside s's own Touch*/Delete* marks -- see ChangeSet's own doc
+// (changes.go) for what it records and why. The returned pointer aliases
+// s's own storage: every observer override in write_observer.go calls
+// s.Changes().RecordXxx(...) to populate it, and the eventual write-through
+// applier reads it back the same way once NoteWrite has been handed s. The
+// zero value of WriteScope already carries a ready-to-use zero-value
+// ChangeSet, so this never needs its own lazy-init check the way
+// TouchNodeKinds' map fields do.
+func (s *WriteScope) Changes() *ChangeSet {
+	return &s.changes
 }
 
 // UpsertedNodeKinds returns, as a map from node id to a fresh copy of its own
