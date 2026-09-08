@@ -149,9 +149,19 @@ func (e Endpoint) Count(total int) int {
 	}
 }
 
-// Iterate calls fn for each dense id e matches, in ascending order, given
-// the snapshot's total node count. Stops early if fn returns false.
-func (e Endpoint) Iterate(total int, fn func(snapshot.NodeID) bool) {
+// Iterate calls fn for each dense id e matches, in ascending order, against
+// s. Stops early if fn returns false.
+//
+// The IDs and Bits branches are unconditional passthroughs regardless of
+// s.Overlay(): IDs is always populated from a caller that has already
+// resolved liveness itself (interpret/expand.go's resolveEndpointSet, via
+// scanAnchorVisit's own Alive-skip), and Bits is always a NodesOfKind
+// bitmap, already overlay-correct by construction (snapshot.View.NodesOfKind's
+// own doc). Only the unconstrained default -- "every dense id" -- needs its
+// own check here: s.NodeCount() grows to keep a tombstoned base node's dense
+// id occupied (snapshot.View.Alive's doc), so iterating the full range
+// verbatim would hand a dead id to fn as if it were a real match.
+func (e Endpoint) Iterate(s *snapshot.View, fn func(snapshot.NodeID) bool) {
 	switch {
 	case e.IDs != nil:
 		for _, id := range e.IDs {
@@ -162,8 +172,14 @@ func (e Endpoint) Iterate(total int, fn func(snapshot.NodeID) bool) {
 	case e.Bits != nil:
 		e.Bits.Iterate(fn)
 	default:
+		total := s.NodeCount()
+		overlay := s.Overlay()
 		for i := 0; i < total; i++ {
-			if !fn(snapshot.NodeID(i)) {
+			id := snapshot.NodeID(i)
+			if overlay && !s.Alive(id) {
+				continue
+			}
+			if !fn(id) {
 				return
 			}
 		}
@@ -231,11 +247,21 @@ func SelfEndpointConflict(s *snapshot.View, roots, terminals Endpoint) bool {
 	}
 
 	conflict := false
-	small.Iterate(total, func(id snapshot.NodeID) bool {
+	small.Iterate(s, func(id snapshot.NodeID) bool {
 		if !big.Has(id) {
 			return true
 		}
-		if targets, _, _ := s.Out(id); len(targets) > 0 {
+		hasOut := false
+		if !s.Overlay() {
+			targets, _, _ := s.Out(id)
+			hasOut = len(targets) > 0
+		} else {
+			s.OutEdges(id, func(snapshot.NodeID, snapshot.KindID, uint64) bool {
+				hasOut = true
+				return false
+			})
+		}
+		if hasOut {
 			conflict = true
 			return false
 		}
@@ -380,9 +406,9 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	var out []Path
 	var callErr error
 
-	q.Roots.Iterate(n, func(r snapshot.NodeID) bool {
+	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
 		stopOuter := false
-		q.Terminals.Iterate(n, func(t snapshot.NodeID) bool {
+		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
 			if q.ExcludeSelf && r == t {
 				return true
 			}
@@ -463,9 +489,9 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 
 // materialize collects e's matched dense ids, in ascending order, into a
 // slice.
-func materialize(e Endpoint, total int) []snapshot.NodeID {
-	elems := make([]snapshot.NodeID, 0, e.Count(total))
-	e.Iterate(total, func(id snapshot.NodeID) bool {
+func materialize(e Endpoint, s *snapshot.View) []snapshot.NodeID {
+	elems := make([]snapshot.NodeID, 0, e.Count(s.NodeCount()))
+	e.Iterate(s, func(id snapshot.NodeID) bool {
 		elems = append(elems, id)
 		return true
 	})
@@ -478,13 +504,11 @@ func materialize(e Endpoint, total int) []snapshot.NodeID {
 // sequential merge phase so output order (and Limit truncation) is
 // independent of goroutine scheduling.
 func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget, smallIsRoots bool) ([]Path, error) {
-	n := s.NodeCount()
-
 	small := q.Terminals
 	if smallIsRoots {
 		small = q.Roots
 	}
-	elems := materialize(small, n)
+	elems := materialize(small, s)
 
 	// small side = roots -> forward BFS (dist-from-root) per root.
 	// small side = terminals -> reverse BFS (dist-to-terminal) per terminal.
@@ -504,7 +528,6 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 // is enumerated backward over the In-CSR mirror (enumerate's forward=false)
 // and reversed into a root-to-terminal Path.
 func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
-	n := s.NodeCount()
 	oneMore := q.Mode == ModeOne
 	var out []Path
 	var callErr error
@@ -512,7 +535,7 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 	for _, res := range results {
 		r, sc := res.elem, res.dists
 		stop := false
-		q.Terminals.Iterate(n, func(t snapshot.NodeID) bool {
+		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
 			if q.ExcludeSelf && r == t {
 				return true
 			}
@@ -553,12 +576,11 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 // x, distances are TO x, so each reached root is enumerated forward over
 // the Out-CSR (enumerate's forward=true), Task 3's original direction.
 func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
-	n := s.NodeCount()
 	oneMore := q.Mode == ModeOne
 	var out []Path
 	var callErr error
 
-	q.Roots.Iterate(n, func(r snapshot.NodeID) bool {
+	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
 		for _, res := range results {
 			t, sc := res.elem, res.dists
 			if q.ExcludeSelf && r == t {

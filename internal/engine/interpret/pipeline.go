@@ -853,7 +853,7 @@ func countAggregate(env *Env, agg *CountAgg, rows []*Row) int64 {
 		if nodeID, ok := r.Node(agg.Sym); ok {
 			key = appendTaggedUint(nil, 'N', env.Snap.GraphID(nodeID))
 		} else if edgeRef, ok := r.Edge(agg.Sym); ok {
-			key = appendTaggedUint(nil, 'D', env.Snap.Base().OutEdgeIDs[edgeRef.Fwd])
+			key = appendTaggedUint(nil, 'D', edgeRef.DatabaseID(env.Snap))
 		} else if v, ok := r.Scalar(agg.Sym); ok && v != nil {
 			key = appendScalarKey(nil, v)
 		} else {
@@ -908,7 +908,7 @@ func appendSymbolKey(env *Env, buf []byte, r *Row, sym string) []byte {
 		return appendTaggedUint(buf, 'N', env.Snap.GraphID(nodeID))
 	}
 	if edgeRef, ok := r.Edge(sym); ok {
-		return appendTaggedUint(buf, 'D', env.Snap.Base().OutEdgeIDs[edgeRef.Fwd])
+		return appendTaggedUint(buf, 'D', edgeRef.DatabaseID(env.Snap))
 	}
 	val, ok := r.Scalar(sym)
 	if !ok {
@@ -1049,7 +1049,7 @@ func outValKey(env *Env, v OutVal) []byte {
 	case OutNode:
 		return appendTaggedUint(nil, 'N', env.Snap.GraphID(v.Node))
 	case OutEdge:
-		return appendTaggedUint(nil, 'D', env.Snap.Base().OutEdgeIDs[v.Edge.Fwd])
+		return appendTaggedUint(nil, 'D', v.Edge.DatabaseID(env.Snap))
 	case OutPath:
 		buf := []byte{'P'}
 		buf = appendUint32(buf, uint32(len(v.Path.Nodes)))
@@ -1058,7 +1058,7 @@ func outValKey(env *Env, v OutVal) []byte {
 		}
 		buf = appendUint32(buf, uint32(len(v.Path.Edges)))
 		for _, e := range v.Path.Edges {
-			buf = appendTaggedUint(buf, 'e', env.Snap.Base().OutEdgeIDs[e.Fwd])
+			buf = appendTaggedUint(buf, 'e', e.DatabaseID(env.Snap))
 		}
 		return buf
 	default: // OutScalar

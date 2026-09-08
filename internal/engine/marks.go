@@ -584,6 +584,19 @@ func kindIDNames(kinds graph.Kinds) []string {
 // which its caller turns into "mark allEdges dirty" and nothing more. Any
 // other error is resolve's own (wrapped for context), which noteResolved's
 // caller treats as "mark everything dirty" instead.
+//
+// Deliberately still EdgeByID, not EdgeStateByID, even though snap.Overlay()
+// can now be true for a caller layering delta segments onto its snapshot:
+// EdgeByID misses -- and so this falls into the same errUnresolvedDelete ->
+// "mark allEdges dirty" path -- for ANY edge id the merged delta has ever
+// touched (snapshot.View.EdgeByID's own doc), which for a genuinely deleted
+// edge is simply the correct, conservative answer one step earlier than a
+// tighter EdgeStateByID resolution would need. Widening this to also miss
+// (dirty allEdges) for a merely delta-*upserted* edge id is over-broad but
+// safe over-invalidation, not a correctness bug -- and marks' entire
+// kind-scoped freshness story is retired once write-through delta segments
+// replace it as the mechanism deciding what a snapshot can still serve, so
+// tightening this one call site now would not outlive that retirement.
 func resolveDeletedEdgeKinds(snap *snapshot.View, ids []graph.ID, resolve func([]snapshot.KindID) (graph.Kinds, error)) ([]string, error) {
 	if snap == nil {
 		return nil, errUnresolvedDelete
@@ -606,9 +619,11 @@ func resolveDeletedEdgeKinds(snap *snapshot.View, ids []graph.ID, resolve func([
 }
 
 // resolveDeletedNodeKinds resolves, for every node id in ids, the node's own
-// kinds (via snap.Dense and KindOffsets/NodeKinds) and the kinds of every
-// edge incident to it in either direction (via Out and In) -- deleting a
-// node deletes its edges too, so both must be reported. ok is false --
+// kinds (via snap.Dense and KindIDsOf) and the kinds of every edge incident
+// to it in either direction (via Out/In when !snap.Overlay(), else
+// OutEdges/InEdges -- see snapshot.View's own doc for why an overlay View
+// panics on the former) -- deleting a node deletes its edges too, so both
+// must be reported. ok is false --
 // meaning the caller should fall back to marking both allNodes and allEdges
 // dirty, per noteResolved's doc -- if snap is nil, any id in ids is absent
 // from it, or either resolve call fails; there is no narrower fallback for a
@@ -628,10 +643,21 @@ func resolveDeletedNodeKinds(snap *snapshot.View, ids []graph.ID, resolve func([
 
 		nodeKindIDs = append(nodeKindIDs, snap.KindIDsOf(dense)...)
 
-		_, outKinds, _ := snap.Out(dense)
-		edgeKindIDs = append(edgeKindIDs, outKinds...)
-		_, inKinds, _ := snap.In(dense)
-		edgeKindIDs = append(edgeKindIDs, inKinds...)
+		if !snap.Overlay() {
+			_, outKinds, _ := snap.Out(dense)
+			edgeKindIDs = append(edgeKindIDs, outKinds...)
+			_, inKinds, _ := snap.In(dense)
+			edgeKindIDs = append(edgeKindIDs, inKinds...)
+		} else {
+			snap.OutEdges(dense, func(_ snapshot.NodeID, kind snapshot.KindID, _ uint64) bool {
+				edgeKindIDs = append(edgeKindIDs, kind)
+				return true
+			})
+			snap.InEdges(dense, func(_ snapshot.NodeID, kind snapshot.KindID, _ uint64) bool {
+				edgeKindIDs = append(edgeKindIDs, kind)
+				return true
+			})
+		}
 	}
 
 	if len(nodeKindIDs) > 0 {

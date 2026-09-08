@@ -16,25 +16,41 @@ func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapsh
 	frontier := []snapshot.NodeID{seed}
 	deepest := 0
 
+	overlay := s.Overlay()
 	for d := 0; d < maxDepth && len(frontier) > 0; d++ {
 		var next []snapshot.NodeID
 		for _, u := range frontier {
-			var targets []snapshot.NodeID
-			var edgeKinds []snapshot.KindID
-			if forward {
-				targets, edgeKinds, _ = s.Out(u)
-			} else {
-				targets, edgeKinds, _ = s.In(u)
-			}
-			for i, w := range targets {
-				if !kinds.Has(edgeKinds[i]) {
-					continue
+			visit := func(w snapshot.NodeID, k snapshot.KindID) {
+				if !kinds.Has(k) {
+					return
 				}
 				if _, seen := sc.get(w); seen {
-					continue
+					return
 				}
 				sc.set(w, int8(d+1))
 				next = append(next, w)
+			}
+			if !overlay {
+				var targets []snapshot.NodeID
+				var edgeKinds []snapshot.KindID
+				if forward {
+					targets, edgeKinds, _ = s.Out(u)
+				} else {
+					targets, edgeKinds, _ = s.In(u)
+				}
+				for i, w := range targets {
+					visit(w, edgeKinds[i])
+				}
+			} else if forward {
+				s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+					visit(w, k)
+					return true
+				})
+			} else {
+				s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+					visit(w, k)
+					return true
+				})
 			}
 		}
 		if len(next) > 0 {
@@ -114,21 +130,13 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 			continue
 		}
 
-		var targets []snapshot.NodeID
-		var edgeKinds []snapshot.KindID
-		if forward {
-			targets, edgeKinds, _ = s.Out(u)
-		} else {
-			targets, edgeKinds, _ = s.In(u)
-		}
-		for i, w := range targets {
-			k := edgeKinds[i]
+		visit := func(w snapshot.NodeID, k snapshot.KindID) {
 			if !kinds.Has(k) {
-				continue
+				return
 			}
 			dw, ok := distBuf.get(w)
 			if !ok || dw != du-1 {
-				continue
+				return
 			}
 			nextNodes := make([]snapshot.NodeID, len(cur.nodes)+1)
 			copy(nextNodes, cur.nodes)
@@ -139,6 +147,28 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 			nextKinds[len(cur.kinds)] = k
 
 			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
+		}
+		if !s.Overlay() {
+			var targets []snapshot.NodeID
+			var edgeKinds []snapshot.KindID
+			if forward {
+				targets, edgeKinds, _ = s.Out(u)
+			} else {
+				targets, edgeKinds, _ = s.In(u)
+			}
+			for i, w := range targets {
+				visit(w, edgeKinds[i])
+			}
+		} else if forward {
+			s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+				visit(w, k)
+				return true
+			})
+		} else {
+			s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+				visit(w, k)
+				return true
+			})
 		}
 	}
 
@@ -213,46 +243,66 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 
 		if len(frontF) <= len(frontB) {
 			var next []snapshot.NodeID
+			visit := func(w snapshot.NodeID, k snapshot.KindID) {
+				if !kinds.Has(k) {
+					return
+				}
+				if _, seen := scF.get(w); seen {
+					return
+				}
+				nd := int8(levelsF + 1)
+				scF.set(w, nd)
+				next = append(next, w)
+				if db, seen := scTmp.get(w); seen {
+					if cand := int(nd) + int(db); D < 0 || cand < D {
+						D = cand
+					}
+				}
+			}
 			for _, u := range frontF {
-				targets, edgeKinds, _ := s.Out(u)
-				for i, w := range targets {
-					if !kinds.Has(edgeKinds[i]) {
-						continue
+				if !s.Overlay() {
+					targets, edgeKinds, _ := s.Out(u)
+					for i, w := range targets {
+						visit(w, edgeKinds[i])
 					}
-					if _, seen := scF.get(w); seen {
-						continue
-					}
-					nd := int8(levelsF + 1)
-					scF.set(w, nd)
-					next = append(next, w)
-					if db, seen := scTmp.get(w); seen {
-						if cand := int(nd) + int(db); D < 0 || cand < D {
-							D = cand
-						}
-					}
+				} else {
+					s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+						visit(w, k)
+						return true
+					})
 				}
 			}
 			levelsF++
 			frontF = next
 		} else {
 			var next []snapshot.NodeID
+			visit := func(w snapshot.NodeID, k snapshot.KindID) {
+				if !kinds.Has(k) {
+					return
+				}
+				if _, seen := scTmp.get(w); seen {
+					return
+				}
+				nd := int8(levelsB + 1)
+				scTmp.set(w, nd)
+				next = append(next, w)
+				if df, seen := scF.get(w); seen {
+					if cand := int(df) + int(nd); D < 0 || cand < D {
+						D = cand
+					}
+				}
+			}
 			for _, u := range frontB {
-				targets, edgeKinds, _ := s.In(u)
-				for i, w := range targets {
-					if !kinds.Has(edgeKinds[i]) {
-						continue
+				if !s.Overlay() {
+					targets, edgeKinds, _ := s.In(u)
+					for i, w := range targets {
+						visit(w, edgeKinds[i])
 					}
-					if _, seen := scTmp.get(w); seen {
-						continue
-					}
-					nd := int8(levelsB + 1)
-					scTmp.set(w, nd)
-					next = append(next, w)
-					if df, seen := scF.get(w); seen {
-						if cand := int(df) + int(nd); D < 0 || cand < D {
-							D = cand
-						}
-					}
+				} else {
+					s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+						visit(w, k)
+						return true
+					})
 				}
 			}
 			levelsB++
@@ -330,19 +380,17 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 			continue
 		}
 
-		targets, edgeKinds, _ := s.Out(u)
-		for i, w := range targets {
-			k := edgeKinds[i]
+		visit := func(w snapshot.NodeID, k snapshot.KindID) {
 			if !kinds.Has(k) {
-				continue
+				return
 			}
 			dw, ok := scF.get(w)
 			if !ok || dw != du+1 {
-				continue
+				return
 			}
 			dtw, ok := scT.get(w)
 			if !ok || int(dtw) != D-int(dw) {
-				continue
+				return
 			}
 
 			nextNodes := make([]snapshot.NodeID, len(cur.nodes)+1)
@@ -354,6 +402,17 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 			nextKinds[len(cur.kinds)] = k
 
 			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
+		}
+		if !s.Overlay() {
+			targets, edgeKinds, _ := s.Out(u)
+			for i, w := range targets {
+				visit(w, edgeKinds[i])
+			}
+		} else {
+			s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+				visit(w, k)
+				return true
+			})
 		}
 	}
 

@@ -39,14 +39,63 @@ import (
 // never panics on an unrecognized node, it returns ErrUnsupported instead.
 var ErrUnsupported = errors.New("interpret: unsupported expression")
 
-// EdgeRef identifies one directed edge instance bound to a Row by its
-// forward-CSR slot: Snap.OutTargets[Fwd]/Snap.OutKinds[Fwd]/
-// Snap.OutEdgeIDs[Fwd] all describe the same edge. A reverse-CSR-discovered
-// edge (e.g. found while walking In(n)) is expected to have already been
-// translated to its forward index via Snap.InEdgeIdx by whatever produced
-// the Row -- this package always reads edges through the forward arrays.
+// EdgeRef identifies one directed edge instance bound to a Row. Exactly one
+// of its two fields is ever meaningful for a given EdgeRef, decided by
+// whichever mode the producing Env.Snap was in at the moment the EdgeRef was
+// built (a single query execution runs against one Env.Snap throughout, so
+// this never varies mid-row):
+//
+//   - Fwd is a forward-CSR slot: Snap.OutTargets[Fwd]/Snap.OutKinds[Fwd]/
+//     Snap.OutEdgeIDs[Fwd] all describe the same edge. Meaningful whenever
+//     Env.Snap.Overlay() was false. A reverse-CSR-discovered edge (e.g.
+//     found while walking In(n)) is expected to have already been
+//     translated to its forward index via Snap.InEdgeIdx by whatever
+//     produced the Row -- this package always reads a !Overlay() edge
+//     through the forward arrays.
+//   - EdgeID is the edge's own database id, used whenever Env.Snap.Overlay()
+//     was true: a delta-added or delta-upserted edge has no forward-CSR
+//     slot to name at all (snapshot.View.EdgeByID's own doc), so the
+//     adjacency walk that discovers it (exec.go's adjacency,
+//     expand.go's convertPath) carries the id snapshot.View.OutEdges/
+//     InEdges already yielded, rather than recomputing a slot that may not
+//     exist.
+//
+// DatabaseID and Kind below resolve either representation transparently,
+// given the same Env.Snap the EdgeRef was produced against; every other
+// reader of an EdgeRef in this package and in package engine (serve_cypher.go)
+// goes through one of them (or repeats the same Overlay()-guarded pair
+// inline, for the one case -- evalIdentityEquality's edge-equality branch --
+// where the original field comparison needed to survive unchanged for
+// !Overlay() rather than route through a shared helper).
 type EdgeRef struct {
-	Fwd uint64
+	Fwd    uint64
+	EdgeID uint64
+}
+
+// DatabaseID returns e's database edge id, resolved against snap -- see
+// EdgeRef's own doc for which field that means reading.
+func (e EdgeRef) DatabaseID(snap *snapshot.View) uint64 {
+	if snap.Overlay() {
+		return e.EdgeID
+	}
+	return snap.Base().OutEdgeIDs[e.Fwd]
+}
+
+// Kind returns e's edge kind, resolved against snap the same overlay-aware
+// way DatabaseID does. Under Overlay(), this resolves through
+// snap.EdgeStateByID(e.EdgeID) -- always a hit for an EdgeRef this package
+// itself produced (e was minted from a live OutEdges/InEdges yield against
+// this exact snap, so the edge is by construction still live and
+// resolvable); the zero KindID a miss would otherwise return is left
+// unguarded here for the same reason convertPath's own doc gives for not
+// defending against a case that cannot arise from this package's own
+// production.
+func (e EdgeRef) Kind(snap *snapshot.View) snapshot.KindID {
+	if snap.Overlay() {
+		_, _, kind, _ := snap.EdgeStateByID(e.EdgeID)
+		return kind
+	}
+	return snap.Base().OutKinds[e.Fwd]
 }
 
 // Row binds one MATCH solution's pattern variables to concrete snapshot
@@ -496,7 +545,7 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 		return evalLiteralComparison(env, row, rightExpr, op, leftLit)
 	}
 
-	if t, ok := evalIdentityEquality(row, leftExpr, rightExpr); ok {
+	if t, ok := evalIdentityEquality(env, row, leftExpr, rightExpr); ok {
 		if op == cypher.OperatorNotEquals {
 			t = t.Not()
 		}
@@ -541,7 +590,7 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 // other shape -- either operand not a bare Variable, either operand not
 // resolving to the same value namespace (both nodes, or both edges) in row,
 // or a node compared against an edge.
-func evalIdentityEquality(row *Row, leftExpr, rightExpr cypher.Expression) (t Tri, ok bool) {
+func evalIdentityEquality(env *Env, row *Row, leftExpr, rightExpr cypher.Expression) (t Tri, ok bool) {
 	lv, lIsVar := unwrapParens(leftExpr).(*cypher.Variable)
 	rv, rIsVar := unwrapParens(rightExpr).(*cypher.Variable)
 	if !lIsVar || !rIsVar || lv == nil || rv == nil {
@@ -553,7 +602,10 @@ func evalIdentityEquality(row *Row, leftExpr, rightExpr cypher.Expression) (t Tr
 	}
 	if le, lIsEdge := row.Edge(lv.Symbol); lIsEdge {
 		re, rIsEdge := row.Edge(rv.Symbol)
-		return boolToTri(rIsEdge && le.Fwd == re.Fwd), rIsEdge
+		if !env.Snap.Overlay() {
+			return boolToTri(rIsEdge && le.Fwd == re.Fwd), rIsEdge
+		}
+		return boolToTri(rIsEdge && le.EdgeID == re.EdgeID), rIsEdge
 	}
 	return TriFalse, false
 }
@@ -830,7 +882,7 @@ func evalKindMatcher(env *Env, row *Row, km *cypher.KindMatcher) (Tri, error) {
 		return matchKinds(env, env.Snap.KindIDsOf(nodeID), km.Kinds, km.IsExclusive), nil
 	}
 	if edgeRef, ok := row.Edge(v.Symbol); ok {
-		return matchKinds(env, []snapshot.KindID{env.Snap.Base().OutKinds[edgeRef.Fwd]}, km.Kinds, km.IsExclusive), nil
+		return matchKinds(env, []snapshot.KindID{edgeRef.Kind(env.Snap)}, km.Kinds, km.IsExclusive), nil
 	}
 	return TriNull, ErrUnsupported
 }
@@ -1293,7 +1345,7 @@ func evalIDFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, boo
 		return float64(env.Snap.GraphID(nodeID)), true, nil
 	}
 	if edgeRef, ok := row.Edge(v.Symbol); ok {
-		return float64(env.Snap.Base().OutEdgeIDs[edgeRef.Fwd]), true, nil
+		return float64(edgeRef.DatabaseID(env.Snap)), true, nil
 	}
 	return nil, false, ErrUnsupported
 }
@@ -1334,7 +1386,7 @@ func evalTypeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, b
 	if !ok {
 		return nil, false, ErrUnsupported
 	}
-	name, found := env.Snap.Kinds().Name(env.Snap.Base().OutKinds[edgeRef.Fwd])
+	name, found := env.Snap.Kinds().Name(edgeRef.Kind(env.Snap))
 	if !found {
 		return nil, false, ErrUnsupported
 	}

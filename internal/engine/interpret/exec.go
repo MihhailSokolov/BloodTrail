@@ -1006,7 +1006,22 @@ var errStopScan = errors.New("interpret: stop anchor scan")
 // error (any other non-nil return from visit aborts the scan the same way
 // and is likewise returned unchanged).
 func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint, visit func(*Row) error) error {
+	overlay := env.Snap.Overlay()
 	admit := func(id snapshot.NodeID) error {
+		// A tombstoned base node's dense id still resolves through Dense
+		// (snapshot.View.Alive's own doc) and still occupies a slot in
+		// [0, NodeCount()) (snapshot.View.NodeCount's doc), so every
+		// candidate source below -- not just the unconstrained full-scan
+		// default -- can hand admit a dead id once Overlay() is true: an
+		// id() anchor (case below) resolves through Dense with no liveness
+		// check of its own, and the unconstrained default scans every dense
+		// id in range regardless of whether it is still alive. The
+		// ObjectIDAnchor and kind-bitmap candidate sources are already
+		// alive-correct by construction (NodesByObjectID/NodesOfKind's own
+		// overlay doc), so this is a no-op for them, not a second filter.
+		if overlay && !env.Snap.Alive(id) {
+			return nil
+		}
 		if err := meter.spend(1); err != nil {
 			return err
 		}
@@ -1135,14 +1150,46 @@ func containsNodeID(ids []snapshot.NodeID, id snapshot.NodeID) bool {
 
 // --- Step expansion ---------------------------------------------------------
 
-// adjCandidate is one adjacency-slot hit: the node at the other end, the
-// edge's kind, and its forward-CSR index (Snap.OutTargets[fwd]/
+// adjCandidate is one adjacency hit: the node at the other end, the edge's
+// kind, and its identity -- fwd (a forward-CSR index; Snap.OutTargets[fwd]/
 // Snap.OutKinds[fwd]/Snap.OutEdgeIDs[fwd] all describe it, per EdgeRef's
-// doc).
+// doc) when adjacency walked env.Snap.Out/In (!Overlay()), or edgeID (the
+// edge's own database id, as yielded by OutEdges/InEdges -- a delta edge has
+// no forward-CSR slot to name at all) when it walked OutEdges/InEdges
+// (Overlay()). Exactly one of fwd/edgeID is meaningful for a given
+// adjCandidate, decided the same way EdgeRef's own two fields are -- see its
+// doc. edgeRefFor/containsFwd (expand.go) are the two places that read
+// whichever one applies.
 type adjCandidate struct {
-	other snapshot.NodeID
-	kind  snapshot.KindID
-	fwd   uint64
+	other  snapshot.NodeID
+	kind   snapshot.KindID
+	fwd    uint64
+	edgeID uint64
+}
+
+// edgeRefFor converts c into the EdgeRef a Row binds it under, resolving
+// which of EdgeRef's two fields to populate the same way adjCandidate's own
+// doc decides which of fwd/edgeID is meaningful: c was produced by
+// adjacency() against snap, so snap.Overlay() is exactly the discriminant
+// that decided which field adjacency itself populated.
+func edgeRefFor(snap *snapshot.View, c adjCandidate) EdgeRef {
+	if snap.Overlay() {
+		return EdgeRef{EdgeID: c.edgeID}
+	}
+	return EdgeRef{Fwd: c.fwd}
+}
+
+// candidateIdentity returns c's own overlay-aware edge identity value, for
+// callers (Row.markEdgeUsed/edgeUsed) that need a single uint64 to record or
+// test "is this the same physical edge another Step already consumed" --
+// see adjCandidate's own doc for why fwd and edgeID are never mixed within
+// one query's Row bookkeeping (a single execution runs against one
+// snap.Overlay()-ness throughout).
+func candidateIdentity(snap *snapshot.View, c adjCandidate) uint64 {
+	if snap.Overlay() {
+		return c.edgeID
+	}
+	return c.fwd
 }
 
 // adjacency enumerates every edge incident to bound that step's shape
@@ -1205,32 +1252,62 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 	sameSymbol := step.FromSym == step.ToSym
 
 	visitOut := func() error {
-		targets, kinds, _ := env.Snap.Out(bound)
-		lo := env.Snap.Base().OutOffsets[bound]
-		for i, other := range targets {
+		if !env.Snap.Overlay() {
+			targets, kinds, _ := env.Snap.Out(bound)
+			lo := env.Snap.Base().OutOffsets[bound]
+			for i, other := range targets {
+				if err := meter.spend(1); err != nil {
+					return err
+				}
+				if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
+					continue
+				}
+				out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: lo + uint64(i)})
+			}
+			return nil
+		}
+		var spendErr error
+		env.Snap.OutEdges(bound, func(other snapshot.NodeID, kind snapshot.KindID, edgeID uint64) bool {
 			if err := meter.spend(1); err != nil {
-				return err
+				spendErr = err
+				return false
 			}
 			if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
-				continue
+				return true
 			}
-			out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: lo + uint64(i)})
-		}
-		return nil
+			out = append(out, adjCandidate{other: other, kind: kind, edgeID: edgeID})
+			return true
+		})
+		return spendErr
 	}
 	visitIn := func() error {
-		sources, kinds, _ := env.Snap.In(bound)
-		lo := env.Snap.Base().InOffsets[bound]
-		for i, other := range sources {
+		if !env.Snap.Overlay() {
+			sources, kinds, _ := env.Snap.In(bound)
+			lo := env.Snap.Base().InOffsets[bound]
+			for i, other := range sources {
+				if err := meter.spend(1); err != nil {
+					return err
+				}
+				if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
+					continue
+				}
+				out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: uint64(env.Snap.Base().InEdgeIdx[lo+uint64(i)])})
+			}
+			return nil
+		}
+		var spendErr error
+		env.Snap.InEdges(bound, func(other snapshot.NodeID, kind snapshot.KindID, edgeID uint64) bool {
 			if err := meter.spend(1); err != nil {
-				return err
+				spendErr = err
+				return false
 			}
 			if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
-				continue
+				return true
 			}
-			out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: uint64(env.Snap.Base().InEdgeIdx[lo+uint64(i)])})
-		}
-		return nil
+			out = append(out, adjCandidate{other: other, kind: kind, edgeID: edgeID})
+			return true
+		})
+		return spendErr
 	}
 
 	if step.Direction == graph.DirectionBoth {
@@ -1308,17 +1385,17 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			nr := cloneRow(r)
 			nr.SetNode(unboundSym, c.other)
 			if step.EdgeSym != "" {
-				nr.SetEdge(step.EdgeSym, EdgeRef{Fwd: c.fwd})
+				nr.SetEdge(step.EdgeSym, edgeRefFor(env.Snap, c))
 			}
 			if pathArcKey != "" {
-				nr.SetEdge(pathArcKey, EdgeRef{Fwd: c.fwd})
+				nr.SetEdge(pathArcKey, edgeRefFor(env.Snap, c))
 			}
 			// Recorded regardless of EdgeSym/pathArcKey -- an anonymous
 			// relationship pattern (no variable name at all) still consumes
 			// a real, specific edge, and verifyClosingStep needs to know
 			// that just as much as it would for a named one. See Row's
 			// usedEdges doc.
-			nr.markEdgeUsed(c.fwd)
+			nr.markEdgeUsed(candidateIdentity(env.Snap, c))
 			if err := meter.spend(1); err != nil {
 				return nil, err
 			}
@@ -1371,14 +1448,14 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 			if !edgeKindOK(step.EdgeKinds, c.kind) {
 				continue
 			}
-			if r.edgeUsed(c.fwd) {
+			if r.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			nr := cloneRow(r)
 			if step.EdgeSym != "" {
-				nr.SetEdge(step.EdgeSym, EdgeRef{Fwd: c.fwd})
+				nr.SetEdge(step.EdgeSym, edgeRefFor(env.Snap, c))
 			}
-			nr.markEdgeUsed(c.fwd)
+			nr.markEdgeUsed(candidateIdentity(env.Snap, c))
 			if err := meter.spend(1); err != nil {
 				return nil, err
 			}

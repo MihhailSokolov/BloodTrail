@@ -749,8 +749,26 @@ type relScanIter struct {
 	farBits   *snapshot.Bitset
 	farAnchor *snapshot.Bitset
 
+	// curNear/slot/hi drive the !snap.Overlay() walk: a raw forward/reverse
+	// CSR slot range over curNear's own segment. ovEdges/ovPos are their
+	// Overlay() counterpart -- curNear's edges as yielded by OutEdges/
+	// InEdges, since a delta edge (or a base slot the delta overrides) has
+	// no CSR range to point slot/hi at -- see snapshot.View.OutEdges/InEdges'
+	// own doc. advanceNear populates whichever pair applies once per near
+	// node; next drains it exactly the way it always drained slot/hi.
 	curNear  snapshot.NodeID
 	slot, hi uint64
+
+	ovEdges []relScanOverlayEdge
+	ovPos   int
+}
+
+// relScanOverlayEdge is one (far, kind, edgeID) triple advanceNear buffers
+// for curNear when snap.Overlay() -- see relScanIter's own doc.
+type relScanOverlayEdge struct {
+	far    snapshot.NodeID
+	kind   snapshot.KindID
+	edgeID uint64
 }
 
 // newRelScanIter builds the relScanIter for plan, choosing among the four
@@ -798,42 +816,64 @@ func newRelScanIter(plan *relPlan) *relScanIter {
 }
 
 // next advances the scan by one matching edge, applying kindMask, farAnchor,
-// and farBits to every candidate slot (see relScanIter's doc for why nearBits
-// is instead applied once per near node, in advanceNear). ok is false once
-// every near node's segment has been exhausted.
+// and farBits to every candidate (see relScanIter's doc for why nearBits is
+// instead applied once per near node, in advanceNear). ok is false once
+// every near node's edges have been exhausted.
 func (it *relScanIter) next() (relEdge, bool) {
 	for {
-		for it.slot < it.hi {
-			slot := it.slot
-			it.slot++
+		if !it.snap.Overlay() {
+			for it.slot < it.hi {
+				slot := it.slot
+				it.slot++
 
-			var far snapshot.NodeID
-			var kind snapshot.KindID
-			var edgeID uint64
-			if it.forward {
-				far = it.snap.Base().OutTargets[slot]
-				kind = it.snap.Base().OutKinds[slot]
-				edgeID = it.snap.Base().OutEdgeIDs[slot]
-			} else {
-				far = it.snap.Base().InTargets[slot]
-				kind = it.snap.Base().InKinds[slot]
-				edgeID = it.snap.Base().OutEdgeIDs[it.snap.Base().InEdgeIdx[slot]]
-			}
+				var far snapshot.NodeID
+				var kind snapshot.KindID
+				var edgeID uint64
+				if it.forward {
+					far = it.snap.Base().OutTargets[slot]
+					kind = it.snap.Base().OutKinds[slot]
+					edgeID = it.snap.Base().OutEdgeIDs[slot]
+				} else {
+					far = it.snap.Base().InTargets[slot]
+					kind = it.snap.Base().InKinds[slot]
+					edgeID = it.snap.Base().OutEdgeIDs[it.snap.Base().InEdgeIdx[slot]]
+				}
 
-			if !it.kindMask.Has(kind) {
-				continue
-			}
-			if it.farAnchor != nil && !it.farAnchor.Has(far) {
-				continue
-			}
-			if it.farBits != nil && !it.farBits.Has(far) {
-				continue
-			}
+				if !it.kindMask.Has(kind) {
+					continue
+				}
+				if it.farAnchor != nil && !it.farAnchor.Has(far) {
+					continue
+				}
+				if it.farBits != nil && !it.farBits.Has(far) {
+					continue
+				}
 
-			if it.forward {
-				return relEdge{start: it.curNear, end: far, edgeID: edgeID, kind: kind}, true
+				if it.forward {
+					return relEdge{start: it.curNear, end: far, edgeID: edgeID, kind: kind}, true
+				}
+				return relEdge{start: far, end: it.curNear, edgeID: edgeID, kind: kind}, true
 			}
-			return relEdge{start: far, end: it.curNear, edgeID: edgeID, kind: kind}, true
+		} else {
+			for it.ovPos < len(it.ovEdges) {
+				e := it.ovEdges[it.ovPos]
+				it.ovPos++
+
+				if !it.kindMask.Has(e.kind) {
+					continue
+				}
+				if it.farAnchor != nil && !it.farAnchor.Has(e.far) {
+					continue
+				}
+				if it.farBits != nil && !it.farBits.Has(e.far) {
+					continue
+				}
+
+				if it.forward {
+					return relEdge{start: it.curNear, end: e.far, edgeID: e.edgeID, kind: e.kind}, true
+				}
+				return relEdge{start: e.far, end: it.curNear, edgeID: e.edgeID, kind: e.kind}, true
+			}
 		}
 
 		if !it.advanceNear() {
@@ -843,8 +883,18 @@ func (it *relScanIter) next() (relEdge, bool) {
 }
 
 // advanceNear moves to the next near node with a non-empty, nearBits-passing
-// CSR segment, setting curNear/slot/hi to it and reporting true, or reports
-// false once outer (or, for a full scan, 0..nodeCount-1) is exhausted.
+// set of edges, setting curNear (and, per snap.Overlay(), either slot/hi or
+// ovEdges/ovPos) to it and reporting true, or reports false once outer (or,
+// for a full scan, 0..nodeCount-1) is exhausted.
+//
+// A near node this method visits under Overlay() is never explicitly
+// Alive-checked here: OutEdges/InEdges themselves yield nothing at all for a
+// non-Alive node (snapshot.View.OutEdges/InEdges's own doc), so a dead near
+// node -- reached via outer (a stale id() anchor bitmap; denseIDBitmap does
+// not itself filter liveness) or via the full-scan default (every dense id
+// in [0, NodeCount()), tombstoned ones included) -- naturally produces an
+// empty ovEdges and falls through to the same "continue to the next near
+// node" branch a zero-degree node already took before this task.
 func (it *relScanIter) advanceNear() bool {
 	for {
 		var node snapshot.NodeID
@@ -866,17 +916,36 @@ func (it *relScanIter) advanceNear() bool {
 			continue
 		}
 
-		var lo, hi uint64
-		if it.forward {
-			lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[node+1]
-		} else {
-			lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[node+1]
+		if !it.snap.Overlay() {
+			var lo, hi uint64
+			if it.forward {
+				lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[node+1]
+			} else {
+				lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[node+1]
+			}
+			if lo == hi {
+				continue
+			}
+
+			it.curNear, it.slot, it.hi = node, lo, hi
+			return true
 		}
-		if lo == hi {
+
+		it.ovEdges = it.ovEdges[:0]
+		collect := func(far snapshot.NodeID, kind snapshot.KindID, edgeID uint64) bool {
+			it.ovEdges = append(it.ovEdges, relScanOverlayEdge{far: far, kind: kind, edgeID: edgeID})
+			return true
+		}
+		if it.forward {
+			it.snap.OutEdges(node, collect)
+		} else {
+			it.snap.InEdges(node, collect)
+		}
+		if len(it.ovEdges) == 0 {
 			continue
 		}
 
-		it.curNear, it.slot, it.hi = node, lo, hi
+		it.curNear, it.ovPos = node, 0
 		return true
 	}
 }

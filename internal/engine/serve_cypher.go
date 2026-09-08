@@ -84,10 +84,11 @@ const (
 // itself.
 
 // collectEdgeIDs gathers every database edge id any OutEdge or OutPath
-// column of rs's rows references, translated from the forward-CSR index
-// each interpret.EdgeRef carries (e.Fwd) to the database edge id
-// materializeEdge/materializePath ultimately need (snap.OutEdgeIDs[e.Fwd]) --
-// exactly the key hydrateEdgePropsByID batches on.
+// column of rs's rows references, resolved through interpret.EdgeRef's own
+// overlay-aware DatabaseID (e.Fwd's forward-CSR index when !snap.Overlay(),
+// e.EdgeID directly otherwise -- see EdgeRef's doc) to the database edge id
+// materializeEdge/materializePath ultimately need -- exactly the key
+// hydrateEdgePropsByID batches on.
 //
 // The returned slice may contain duplicates (the same edge reached via two
 // different rows or columns, or via more than one path segment) and is in
@@ -104,13 +105,13 @@ func collectEdgeIDs(snap *snapshot.View, rs *interpret.ResultSet) []uint64 {
 		for _, v := range row {
 			switch v.Kind {
 			case interpret.OutEdge:
-				ids = append(ids, snap.Base().OutEdgeIDs[v.Edge.Fwd])
+				ids = append(ids, v.Edge.DatabaseID(snap))
 			case interpret.OutPath:
 				if v.Path == nil {
 					continue
 				}
 				for _, e := range v.Path.Edges {
-					ids = append(ids, snap.Base().OutEdgeIDs[e.Fwd])
+					ids = append(ids, e.DatabaseID(snap))
 				}
 			}
 		}
@@ -239,9 +240,9 @@ func materializeNode(snap *snapshot.View, n snapshot.NodeID) *graph.Node {
 // test, or from edgePropsFor's own missing-entry fallback below) is exactly
 // as valid a props argument as a fully hydrated one.
 //
-// e.Fwd is always a *forward* CSR index, whether the edge itself was
-// originally discovered by walking a node's outgoing adjacency or its
-// incoming one: see EdgeRef's own doc comment (interpret/eval.go) -- a
+// !snap.Overlay(): e.Fwd is always a *forward* CSR index, whether the edge
+// itself was originally discovered by walking a node's outgoing adjacency or
+// its incoming one: see EdgeRef's own doc comment (interpret/eval.go) -- a
 // reverse-CSR-discovered edge is already translated to its forward index
 // via Snap.InEdgeIdx before it ever reaches a Row, so this function (like
 // every other reader of an EdgeRef in the interpret package) only ever
@@ -255,14 +256,30 @@ func materializeNode(snap *snapshot.View, n snapshot.NodeID) *graph.Node {
 // its own loop index to OutOffsets[bound] (see adjCandidate's doc comment
 // there). edgeSource below inverts that arithmetic for a caller that has
 // only the resulting flat index left.
+//
+// snap.Overlay(): e.Fwd has no forward-CSR slot to name at all for a delta
+// edge (EdgeRef's own doc), so start/end/kind instead resolve through
+// snap.EdgeStateByID(e.EdgeID) -- overlay-complete over base, delta-added,
+// and delta-upserted edges alike (its own doc). This always hits for an
+// EdgeRef this package's own executors produced (it was minted from a live
+// OutEdges/InEdges yield against this exact snap), so the miss case is left
+// unguarded here the same way Kind's doc explains.
 func materializeEdge(snap *snapshot.View, e interpret.EdgeRef, props *graph.Properties) *graph.Relationship {
-	fwd := e.Fwd
-	start := edgeSource(snap, fwd)
-	end := snap.Base().OutTargets[fwd]
-	name, _ := snap.Kinds().Name(snap.Base().OutKinds[fwd])
+	var start, end snapshot.NodeID
+	var kind snapshot.KindID
+	edgeID := e.DatabaseID(snap)
+	if !snap.Overlay() {
+		fwd := e.Fwd
+		start = edgeSource(snap, fwd)
+		end = snap.Base().OutTargets[fwd]
+		kind = snap.Base().OutKinds[fwd]
+	} else {
+		start, end, kind, _ = snap.EdgeStateByID(edgeID)
+	}
+	name, _ := snap.Kinds().Name(kind)
 
 	return graph.NewRelationship(
-		graph.ID(snap.Base().OutEdgeIDs[fwd]),
+		graph.ID(edgeID),
 		graph.ID(snap.GraphID(start)),
 		graph.ID(snap.GraphID(end)),
 		props,
@@ -288,7 +305,7 @@ func edgeSource(snap *snapshot.View, fwd uint64) snapshot.NodeID {
 // Nodes materialized via materializeNode in traversal order (Nodes[i]
 // connected to Nodes[i+1] by Edges[i], per PathVal's own doc comment in
 // interpret/exec.go), Edges via materializeEdge. edgeProps supplies each
-// edge's properties, keyed by database edge id (OutEdgeIDs[e.Fwd]) --
+// edge's properties, keyed by database edge id (e.DatabaseID(snap)) --
 // deliberately a plain edge-id key rather than the (start, end, kind)
 // triple hydrate.go's older edgeKey uses, since materializeEdge already
 // derives start/end/kind from the snapshot alone; Task 11's hydration query
@@ -334,7 +351,7 @@ func materializePath(snap *snapshot.View, p *interpret.PathVal, edgeProps map[ui
 // fallback -- see materializePath's doc for why absence is not treated as
 // an error here.
 func edgePropsFor(snap *snapshot.View, edgeProps map[uint64]*graph.Properties, e interpret.EdgeRef) *graph.Properties {
-	if props, ok := edgeProps[snap.Base().OutEdgeIDs[e.Fwd]]; ok && props != nil {
+	if props, ok := edgeProps[e.DatabaseID(snap)]; ok && props != nil {
 		return props
 	}
 	return graph.NewProperties()

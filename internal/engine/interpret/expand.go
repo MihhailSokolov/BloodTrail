@@ -156,15 +156,27 @@ type trailFrame struct {
 	firstIsSelfLoop bool
 }
 
-// containsFwd reports whether any edge in edges already carries fwd -- the
-// TRAIL semantics check ("an edge id may not repeat within one path"): fwd is
-// a forward-CSR slot index, which is unique per physical directed edge in the
-// snapshot (see EdgeRef's doc comment), so comparing fwd values here is
-// exactly equivalent to comparing the database edge ids dawgs' own
-// `e0.id != all(path.edge_ids)` guard compares.
-func containsFwd(edges []EdgeRef, fwd uint64) bool {
+// containsFwd reports whether any edge in edges already carries c's own
+// identity -- the TRAIL semantics check ("an edge id may not repeat within
+// one path"). !env.Snap.Overlay(): c.fwd is a forward-CSR slot index, unique
+// per physical directed edge in the snapshot (see EdgeRef's doc comment), so
+// comparing fwd values here is exactly equivalent to comparing the database
+// edge ids dawgs' own `e0.id != all(path.edge_ids)` guard compares.
+// Overlay(): a forward-CSR slot doesn't cover a delta edge at all, so c's
+// own database edge id (c.edgeID, exactly what adjacency yielded) is
+// compared instead -- still unique per physical directed edge, since it IS
+// the edge's own database id.
+func containsFwd(env *Env, edges []EdgeRef, c adjCandidate) bool {
+	if !env.Snap.Overlay() {
+		for _, e := range edges {
+			if e.Fwd == c.fwd {
+				return true
+			}
+		}
+		return false
+	}
 	for _, e := range edges {
-		if e.Fwd == fwd {
+		if e.EdgeID == c.edgeID {
 			return true
 		}
 	}
@@ -373,7 +385,7 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			if !edgeKindOK(step.EdgeKinds, c.kind) {
 				continue
 			}
-			if containsFwd(cur.edges, c.fwd) {
+			if containsFwd(env, cur.edges, c) {
 				continue
 			}
 
@@ -383,7 +395,7 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 
 			nextEdges := make([]EdgeRef, depth+1)
 			copy(nextEdges, cur.edges)
-			nextEdges[depth] = EdgeRef{Fwd: c.fwd}
+			nextEdges[depth] = edgeRefFor(env.Snap, c)
 
 			stack = append(stack, trailFrame{
 				nodes:           nextNodes,
@@ -684,7 +696,7 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			if !edgeKindOK(step.EdgeKinds, c.kind) {
 				continue
 			}
-			if containsFwd(cur.edges, c.fwd) {
+			if containsFwd(env, cur.edges, c) {
 				continue
 			}
 
@@ -694,7 +706,7 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 
 			nextEdges := make([]EdgeRef, depth+1)
 			copy(nextEdges, cur.edges)
-			nextEdges[depth] = EdgeRef{Fwd: c.fwd}
+			nextEdges[depth] = edgeRefFor(env.Snap, c)
 
 			stack = append(stack, reverseTrailFrame{
 				nodes:          nextNodes,
@@ -737,7 +749,7 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		return nil, err
 	}
 
-	if !step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap.NodeCount(), roots, terminals) {
+	if !step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap, roots, terminals) {
 		return nil, ErrSelfEndpoint
 	}
 
@@ -1248,26 +1260,27 @@ func kindsEndpointBitmap(env *Env, kinds []snapshot.KindID) *snapshot.Bitset {
 	return result
 }
 
-// endpointsIntersect reports whether roots and terminals (total is the
-// snapshot's own NodeCount, needed for Endpoint.Count/Iterate's "matches
-// every node" default) share at least one dense id -- the traverse.Endpoint-
-// aware replacement for the old materialized-slice idsIntersect, preserving
-// its exact semantics (a plain set-membership overlap test) rather than
-// traverse.SelfEndpointConflict's additional out-degree>0 requirement: see
-// ErrSelfEndpoint's own doc comment for why this package's self-endpoint
-// rule must stay exactly what it always was. Iterates whichever side
-// Count(total) reports as smaller and probes it against the other via Has,
-// so a Bits-vs-Bits or Bits-vs-IDs pair costs at most the smaller side's own
-// population, and neither side is ever materialized purely to run this
-// check.
-func endpointsIntersect(total int, roots, terminals traverse.Endpoint) bool {
+// endpointsIntersect reports whether roots and terminals (snap gives
+// Endpoint.Count/Iterate the "matches every node" default's own overlay-
+// aware node count and Alive check) share at least one dense id -- the
+// traverse.Endpoint-aware replacement for the old materialized-slice
+// idsIntersect, preserving its exact semantics (a plain set-membership
+// overlap test) rather than traverse.SelfEndpointConflict's additional
+// out-degree>0 requirement: see ErrSelfEndpoint's own doc comment for why
+// this package's self-endpoint rule must stay exactly what it always was.
+// Iterates whichever side Count(total) reports as smaller and probes it
+// against the other via Has, so a Bits-vs-Bits or Bits-vs-IDs pair costs at
+// most the smaller side's own population, and neither side is ever
+// materialized purely to run this check.
+func endpointsIntersect(snap *snapshot.View, roots, terminals traverse.Endpoint) bool {
+	total := snap.NodeCount()
 	small, big := roots, terminals
 	if terminals.Count(total) < roots.Count(total) {
 		small, big = terminals, roots
 	}
 
 	found := false
-	small.Iterate(total, func(id snapshot.NodeID) bool {
+	small.Iterate(snap, func(id snapshot.NodeID) bool {
 		if big.Has(id) {
 			found = true
 			return false
@@ -1348,11 +1361,35 @@ func predicateBelongsTo(nc *NodeConstraint, c cypher.Expression) bool {
 // a Step's EdgeKinds list, or nil (traverse's own "every kind allowed"
 // sentinel, matching edgeKindOK's identical "empty = any" contract) when
 // EdgeKinds is empty.
+//
+// The mask's own ceiling is max(env.Snap.Base().MaxKindID, every id in
+// kinds), not Base().MaxKindID alone: MaxKindID is computed once, at base
+// snapshot build time, from whichever kinds the BASE graph's own nodes and
+// edges actually carry (snapshot.Builder.Build's doc) -- it has no way to
+// know about a kind that, at that time, no base edge had ever used yet. A
+// step whose relationship pattern names a kind first introduced by a later
+// delta segment (kinds is resolved from the pattern's own kind names via
+// snap.Kinds().ID, which IS overlay-aware -- snapshot.View.Kinds' own doc)
+// would otherwise get a mask sized too small to ever represent that kind at
+// all: snapshot.KindMask.Set/Has both silently no-op for any id above the
+// mask's own ceiling, so every edge of that kind would be filtered out of
+// the traversal as if the mask had never been given the kind in the first
+// place -- not merely a missed optimization, but a query one path down this
+// specific chain (a shortestPath()/allShortestPaths() step whose only
+// admissible edges were all delta-added, of a kind no base edge ever used)
+// silently under-answers, rather than over-answering, WHICH edges Query.Kinds
+// admits.
 func kindMaskFor(env *Env, kinds []snapshot.KindID) *snapshot.KindMask {
 	if len(kinds) == 0 {
 		return nil
 	}
-	mask := snapshot.NewKindMask(env.Snap.Base().MaxKindID)
+	maxKindID := env.Snap.Base().MaxKindID
+	for _, k := range kinds {
+		if k > maxKindID {
+			maxKindID = k
+		}
+	}
+	mask := snapshot.NewKindMask(maxKindID)
 	for _, k := range kinds {
 		mask.Set(k)
 	}
@@ -1403,17 +1440,29 @@ var errConvertPathEdgeNotFound = errors.New("interpret: convertPath: no forward-
 // serving a corrupted PathVal.
 func convertPath(env *Env, p traverse.Path) (*PathVal, error) {
 	edges := make([]EdgeRef, len(p.Kinds))
+	overlay := env.Snap.Overlay()
 	for i, k := range p.Kinds {
 		u, w := p.Nodes[i], p.Nodes[i+1]
-		targets, kinds, _ := env.Snap.Out(u)
-		lo := env.Snap.Base().OutOffsets[u]
 		found := false
-		for j, t := range targets {
-			if t == w && kinds[j] == k {
-				edges[i] = EdgeRef{Fwd: lo + uint64(j)}
-				found = true
-				break
+		if !overlay {
+			targets, kinds, _ := env.Snap.Out(u)
+			lo := env.Snap.Base().OutOffsets[u]
+			for j, t := range targets {
+				if t == w && kinds[j] == k {
+					edges[i] = EdgeRef{Fwd: lo + uint64(j)}
+					found = true
+					break
+				}
 			}
+		} else {
+			env.Snap.OutEdges(u, func(target snapshot.NodeID, kind snapshot.KindID, edgeID uint64) bool {
+				if target == w && kind == k {
+					edges[i] = EdgeRef{EdgeID: edgeID}
+					found = true
+					return false
+				}
+				return true
+			})
 		}
 		if !found {
 			return nil, fmt.Errorf("interpret: convertPath: hop %d (node %d -> node %d, kind %d): %w", i, u, w, k, errConvertPathEdgeNotFound)
