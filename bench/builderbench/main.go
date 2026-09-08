@@ -225,31 +225,32 @@ type shapeThreshold struct {
 //     much cheaper "read from an in-memory adjacency structure" is than
 //     "read from PostgreSQL rows" for the same total volume -- not by
 //     avoiding a network round trip or a query planner, the way the
-//     smaller/filtered shapes below can. Measured 1.47x at 5M in the
-//     milestone-3 run this task defers from: honest physics for this
-//     shape, not a bug to chase with a uniform bar. engineAbsoluteCap 15s
-//     was a conservative estimate for a full 5M-scale MemberOf scan should
-//     its own pg baseline ever need capping; a real 5M run has since
-//     measured this shape's own bt p50 at 37.3s / 45.3s across attempts --
-//     *above*, not below, the 15s cap (see the README's "Where these
-//     numbers come from" note). The cap is therefore known-undersized as
-//     written; it has not actually failed a real run only because this
-//     shape's pg baseline has never itself exceeded -pg-cap at 5M scale,
-//     so the pg_capped path (the only path that consults
-//     engineAbsoluteCap) has never been exercised for this shape. A
-//     follow-up owns re-measuring and re-setting this cap the same
-//     evidence-based way group_members_bfs's was.
-//   - group_members_bfs: minRatio 5x (unchanged), engineAbsoluteCap 50s.
+//     smaller/filtered shapes below can. Measured 1.47x at 5M in an
+//     earlier run: honest physics for this shape, not a bug to chase with
+//     a uniform bar. engineAbsoluteCap 80s is measured evidence: three
+//     independent 5M-scale runs measured this shape's own bt p50 at
+//     33.0s / 37.3s / 45.3s under varying machine load, so 80s is the
+//     worst-case p50 (45.3s) x ~1.75, rounded -- replacing an earlier
+//     15s guess that a real capped run (the first time this shape's pg
+//     baseline ever exceeded -pg-cap at 5M) proved undersized: the shape
+//     answered correctly from memory in 33.0s and failed purely on the
+//     untested cap value. The worst-case-p50 convention exists because
+//     these multi-tens-of-seconds shapes swing with background load; a
+//     cap below a measured p50 fails runs that are answering correctly.
+//   - group_members_bfs: minRatio 5x (unchanged), engineAbsoluteCap 95s.
 //     This is the shape the pg wall-clock cap exists for: its pg baseline
 //     is a per-node query storm (one BFS layer's worth of individual
 //     MemberOf lookups against PostgreSQL) that runs for hours at 5M,
 //     entirely unrelated to how fast the engine itself answers the same
 //     traversal in memory -- it exceeds -pg-cap on every 5M-scale attempt,
-//     so this cap is always the deciding factor for this shape. 50s is
-//     measured evidence, not a guess: two independent 5M-scale runs (one
-//     under a -cpuprofile) both measured bt p50 within a second of 27.0s
-//     (26967.91ms and 27077.85ms), so 50s is that p50 x ~1.75, rounded,
-//     replacing an earlier invented 5s. A CPU profile of the -cpuprofile
+//     so this cap is always the deciding factor for this shape. 95s is
+//     measured evidence, not a guess: two 5M-scale runs (one under a
+//     -cpuprofile) measured bt p50 within a second of 27.0s (26967.91ms
+//     and 27077.85ms), but a third run on a loaded machine measured
+//     54.2s -- double that -- and failed the 50s cap those first two
+//     runs had produced. 95s is the worst-case p50 (54.2s) x ~1.75,
+//     rounded, replacing that 50s (itself a replacement for an invented
+//     5s). A CPU profile of the -cpuprofile
 //     run found no single obviously-fixable per-node cost to chase: the
 //     shape's own call path (traversal.BreadthFirst/LightweightDriver down
 //     through Engine.TryRelQueryRows/resolveRelSpec/denseIDBitmap) accounts
@@ -270,8 +271,8 @@ type shapeThreshold struct {
 //     the rare case a future, much larger corpus does trip the cap, not a
 //     bound anyone expects to hit in practice.
 var shapeThresholds = map[string]shapeThreshold{
-	"fetch_directed_graph_memberof": {minRatio: fetchDirectedGraphMinRatio, engineAbsoluteCap: 15 * time.Second},
-	"group_members_bfs":             {minRatio: enforceRatio, engineAbsoluteCap: 50 * time.Second},
+	"fetch_directed_graph_memberof": {minRatio: fetchDirectedGraphMinRatio, engineAbsoluteCap: 80 * time.Second},
+	"group_members_bfs":             {minRatio: enforceRatio, engineAbsoluteCap: 95 * time.Second},
 	"node_count_user":               {minRatio: enforceRatio, engineAbsoluteCap: 2 * time.Second},
 	"node_fetchids_user":            {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},
 	"delete_transit_edges_admin_to": {minRatio: enforceRatio, engineAbsoluteCap: 5 * time.Second},

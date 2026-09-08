@@ -193,6 +193,27 @@ func TestFetchDirectedGraphHasWeakerBar(t *testing.T) {
 	}
 }
 
+// TestMeasuredEngineAbsoluteCaps pins the two evidence-based caps for the
+// traversal-heavy shapes to their documented worst-case-p50 x ~1.75 values
+// (see shapeThresholds' doc and the README's cap-rationale table). These
+// values are measurement-derived; changing one requires fresh 5M-scale
+// evidence recorded alongside the change, so a silent edit fails here.
+func TestMeasuredEngineAbsoluteCaps(t *testing.T) {
+	want := map[string]time.Duration{
+		"fetch_directed_graph_memberof": 80 * time.Second, // worst measured bt p50 45.3s x ~1.75
+		"group_members_bfs":             95 * time.Second, // worst measured bt p50 54.2s x ~1.75
+	}
+	for name, cap := range want {
+		th, ok := shapeThresholds[name]
+		if !ok {
+			t.Fatalf("%s missing from shapeThresholds", name)
+		}
+		if th.engineAbsoluteCap != cap {
+			t.Errorf("%s.engineAbsoluteCap = %v, want %v", name, th.engineAbsoluteCap, cap)
+		}
+	}
+}
+
 // TestRunPGCapped_CutsOffASlowQuery exercises runPGCapped's core contract
 // -- a query exceeding pgCap is cut off and reported as capped=true,
 // nil-err -- without a database: run's closure below simulates a slow pg

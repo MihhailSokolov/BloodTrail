@@ -155,30 +155,27 @@ against `shapeThreshold.engineAbsoluteCap`:
 
 | Shape                            | Engine abs. cap (pg_capped path) | Why                                                                                 |
 |-----------------------------------|:---------------------------------:|-----------------------------------------------------------------------------------------|
-| `fetch_directed_graph_memberof`   | 15s                                | Known stale, flagged not fixed here (see below): a real 5M run measured bt p50 ~37-45s for this shape, *above* its current 15s cap. |
-| `group_members_bfs`               | **50s**                            | Measured evidence: two independent 5M runs (one under a CPU profile) both measured bt p50 within 1% of 27.0s (26967.91ms and 27077.85ms); 50s is that p50 x ~1.75, rounded, replacing an earlier invented 5s. See `main.go`'s `shapeThresholds` doc for the profiling finding behind this number. |
+| `fetch_directed_graph_memberof`   | **80s**                            | Measured evidence: three independent 5M runs measured bt p50 at 33.0s / 37.3s / 45.3s under varying machine load; 80s is the worst-case p50 (45.3s) x ~1.75, rounded. Replaces a 15s guess that the first genuinely pg-capped run at 5M proved undersized (the shape answered correctly from memory in 33.0s and failed purely on the cap value). |
+| `group_members_bfs`               | **95s**                            | Measured evidence: two 5M runs (one under a CPU profile) measured bt p50 within 1% of 27.0s (26967.91ms and 27077.85ms), but a third run on a loaded machine measured 54.2s and failed the 50s cap derived from the first two; 95s is the worst-case p50 (54.2s) x ~1.75, rounded, replacing that 50s (itself a replacement for an invented 5s). See `main.go`'s `shapeThresholds` doc for the profiling finding behind this shape's cost. |
 | `node_count_user`                 | 2s                                 | Confirmed by measurement: bt p50 ~0.01ms at 5M -- thousands of times inside this bound. |
 | `node_fetchids_user`              | 5s                                 | Confirmed by measurement: bt p50 ~186-193ms at 5M, >25x headroom.                    |
 | `delete_transit_edges_admin_to`   | 5s                                 | Confirmed by measurement: bt p50 ~203-204ms at 5M, >24x headroom.                    |
 
-**Where these numbers come from:** `group_members_bfs`'s 50s bound and the
-three bounded/filtered shapes' 2s/5s/5s bounds are now measured evidence
-from a real 4.76M-node/~48.9M-edge run (`bench/adgen -users 2800000
+**Where these numbers come from:** every cap in the table is now measured
+evidence from real 4.76M-node/~48.9M-edge runs (`bench/adgen -users 2800000
 -domains 4`). The three bounded/filtered shapes each get comfortable (>20x,
-and often >100x) headroom over their own measured bt p50; `group_members_bfs`
-is the odd one out even among these measured bounds -- its 50s cap is only
-~1.75x its own measured p50 (see the table above), a deliberately tight
-margin given how expensive a full BFS traversal already is at this scale,
-not the same order-of-magnitude cushion the cheaper shapes get for free.
-`fetch_directed_graph_memberof`'s 15s bound is a different kind of
-exception: the same run measured its own bt p50 at ~37-45s -- *above*,
-not below, its current cap -- because this shape's pg baseline has never
-actually exceeded `-pg-cap` at 5M scale (so the cap path has never been
-exercised for real). If it ever were exercised, this cap would incorrectly
-fail a shape that is answering correctly and reasonably fast from memory.
-This is a known, self-contained gap flagged for a follow-up fix, not
-corrected in this pass -- the fix is the same evidence-based-cap exercise
-`group_members_bfs` just got, applied to one more shape.
+and often >100x) headroom over their own measured bt p50. The two
+traversal-heavy shapes get a deliberately tighter, worst-case-anchored
+margin instead: their absolute cost at this scale is tens of seconds and
+swings roughly 2x with background machine load (`group_members_bfs`
+measured p50s of 27.0s twice on a quieter machine and 54.2s on a loaded
+one; `fetch_directed_graph_memberof` measured 33.0s / 37.3s / 45.3s), so
+each cap is its shape's worst-case measured p50 x ~1.75, rounded -- wide
+enough that a correctly-answering run doesn't fail on load noise, tight
+enough that a real regression at this scale still trips it. The
+convention was validated the hard way twice: an invented 5s cap and a
+15s guess, and later even a 50s cap derived from only the two quiet-run
+measurements, each failed runs whose answers were correct.
 
 Forcing the capped path for a smoke test (e.g. `-pg-cap 1ms`) makes every
 shape's pg baseline trip immediately, which is a convenient way to verify
