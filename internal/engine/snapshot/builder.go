@@ -120,6 +120,88 @@ func (b *Builder) addParsedNode(databaseID uint64, kinds []KindID, parsed []pars
 	return nil
 }
 
+// preparedProps is one node's already-encoded property entries, exactly as
+// stored in a base Snapshot's PropStore or in one of a Segment's
+// NodeSegStates: entries whose prop field indexes into names -- some OTHER
+// source's name table, not yet this Builder's own intern table -- and whose
+// string/array/object entries' ref/len fields index into arena -- that same
+// source's byte arena, not yet this Builder's own propArena.
+// Builder.addPreparedNode is what actually remaps and transplants one of
+// these into a fresh Builder; see its doc for why Fold (the only caller)
+// needs this at all.
+type preparedProps struct {
+	entries []propEntry
+	names   []string
+	arena   []byte
+}
+
+// addPreparedNode stages a node whose property bag is already encoded as
+// propEntry values from another source (a base Snapshot's PropStore, or one
+// of a Segment's NodeSegStates) -- Fold's building block for folding a
+// delta into a fresh base without ever re-parsing the original JSON (see
+// fold.go). Unlike AddParsedNode, which commits a freshly-parsed bag whose
+// property names have never been interned anywhere, this must first REMAP
+// every entry's prop id: props.entries' prop fields index props.names, a
+// DIFFERENT source's name table (the base Snapshot's PropStore.names, or
+// one input Segment's own names -- see NodeSegState's doc on why its seg
+// field keeps pointing at its ORIGINAL segment through a MergeSegments
+// merge), not this Builder's own intern table. Each entry's name is looked
+// up in props.names and re-interned via internProp, and string/array/object
+// payloads are copied from props.arena into this Builder's own propArena at
+// their new offsets -- so the result aliases neither the source's name
+// table nor its arena.
+//
+// Because interning order can differ between this Builder and whichever
+// source built props.entries, the entries' relative order by (remapped)
+// prop id is not guaranteed to survive the remap -- entries is re-sorted by
+// the new prop ids before being committed, exactly as commitNodeProps sorts
+// after its own interning pass.
+//
+// Like addParsedNode, databaseID must be strictly greater than every
+// previously staged node's databaseID, checked before anything else is
+// touched. internProp's PropID-wrap guard is this method's only other
+// failure mode; on that error, b.ids/b.kindsFlat/b.kindOffsets/
+// b.propEntries/b.propOffsets are left exactly as they were before this
+// call, the same "no partial mutation on error" contract addParsedNode's
+// own doc promises -- modulo the same small, deliberate exception
+// commitNodeProps already documents: a property whose bytes were already
+// appended to b.propArena before a LATER property in the same bag hit the
+// guard leaves those bytes orphaned in the arena rather than reclaimed.
+func (b *Builder) addPreparedNode(databaseID uint64, kinds []KindID, props preparedProps) error {
+	if n := len(b.ids); n > 0 && databaseID <= b.ids[n-1] {
+		return fmt.Errorf("databaseID %d is not strictly greater than previous %d", databaseID, b.ids[n-1])
+	}
+
+	entries := make([]propEntry, len(props.entries))
+	for i, e := range props.entries {
+		var name string
+		if int(e.prop) < len(props.names) {
+			name = props.names[e.prop]
+		}
+		newID, err := b.internProp(name)
+		if err != nil {
+			return err
+		}
+		ne := propEntry{prop: newID, kind: e.kind, num: e.num}
+		switch e.kind {
+		case propKindString, propKindArray, propKindObject:
+			ne.ref = uint32(len(b.propArena))
+			b.propArena = append(b.propArena, props.arena[e.ref:e.ref+e.len]...)
+			ne.len = e.len
+		}
+		entries[i] = ne
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].prop < entries[j].prop })
+
+	b.propEntries = append(b.propEntries, entries...)
+	b.propOffsets = append(b.propOffsets, uint32(len(b.propEntries)))
+
+	b.ids = append(b.ids, databaseID)
+	b.kindsFlat = append(b.kindsFlat, kinds...)
+	b.kindOffsets = append(b.kindOffsets, uint32(len(b.kindsFlat)))
+	return nil
+}
+
 // AddEdge stages an edge between two database node ids, carrying its own
 // database edge id (id). Edges may be added in any order and are resolved
 // against staged nodes at Build time; an edge whose start or end id never
