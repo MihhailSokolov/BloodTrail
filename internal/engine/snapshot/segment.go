@@ -328,15 +328,19 @@ type SegmentBuilder struct {
 // upsert shape) and its property bag as raw jsonb bytes (propsJSON may be
 // nil/empty, meaning no properties), parsed via the package-level
 // ParseProps exactly as Builder.AddNode parses a base snapshot's node
-// props. A parse error is returned rather than swallowed, leaving this id's
-// previously staged state (if any) unchanged.
+// props. A parse error, or internPropName's PropID-wrap guard firing while
+// committing the parsed properties, is returned rather than swallowed,
+// leaving this id's previously staged state (if any) unchanged.
 func (b *SegmentBuilder) AddNodeState(id uint64, kindIDs []KindID, propsJSON []byte) error {
 	parsed, err := ParseProps(propsJSON)
 	if err != nil {
 		return fmt.Errorf("snapshot: SegmentBuilder.AddNodeState: id %d: %w", id, err)
 	}
 
-	entries, objectID := b.commitProps(parsed.parsed)
+	entries, objectID, err := b.commitProps(parsed.parsed)
+	if err != nil {
+		return fmt.Errorf("snapshot: SegmentBuilder.AddNodeState: id %d: %w", id, err)
+	}
 
 	if b.nodes == nil {
 		b.nodes = make(map[uint64]segNodeBuild)
@@ -401,10 +405,19 @@ func (b *SegmentBuilder) AddKind(id KindID, name string) {
 // waste in exchange for not having to reclaim or compact the arena on
 // overwrite; a segment holds one commit's worth of writes, not a long-lived
 // accumulation, so this is not expected to matter in practice.
-func (b *SegmentBuilder) commitProps(parsed []parsedProp) (entries []propEntry, objectID string) {
+//
+// Returns an error, refusing to commit any of parsed, the instant
+// internPropName's PropID-wrap guard fires for one of them (see its doc);
+// entries built so far are discarded rather than returned, matching
+// Builder.commitNodeProps's own "nothing partially committed on error"
+// contract.
+func (b *SegmentBuilder) commitProps(parsed []parsedProp) (entries []propEntry, objectID string, err error) {
 	entries = make([]propEntry, len(parsed))
 	for i, pp := range parsed {
-		propID := b.internPropName(pp.name)
+		propID, err := b.internPropName(pp.name)
+		if err != nil {
+			return nil, "", err
+		}
 		e := propEntry{prop: propID, kind: pp.kind, num: pp.num}
 		switch pp.kind {
 		case propKindString, propKindArray, propKindObject:
@@ -419,18 +432,27 @@ func (b *SegmentBuilder) commitProps(parsed []parsedProp) (entries []propEntry, 
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].prop < entries[j].prop })
-	return entries, objectID
+	return entries, objectID, nil
 }
 
 // internPropName returns the PropID for name, interning it (assigning the
 // next dense id) if this is the first time name has been seen by this
-// SegmentBuilder. Unlike Builder.internProp, this carries no PropID-overflow
-// guard: a single commit's node upserts are never expected to introduce
-// anywhere near 65536 distinct property names, so the extra bookkeeping and
-// error path aren't worth carrying here.
-func (b *SegmentBuilder) internPropName(name string) PropID {
+// SegmentBuilder. Mirrors Builder.internProp exactly, reusing the same
+// package-level maxPropID constant: PropID is a uint16, so a SegmentBuilder
+// that has already interned math.MaxUint16+1 distinct names must refuse to
+// intern one more rather than let PropID(len(b.propNames)) silently wrap
+// back to an id already in use, which would alias two different property
+// names under the same PropID -- a silent correctness corruption, not
+// merely a missing feature. OpenGraph's custom property schemas make an
+// unusually large distinct-name count within one commit reachable in
+// principle, unlike the base Builder's whole-graph case this guard was
+// first written for, so SegmentBuilder needs the identical protection.
+func (b *SegmentBuilder) internPropName(name string) (PropID, error) {
 	if id, ok := b.propIDs[name]; ok {
-		return id
+		return id, nil
+	}
+	if len(b.propNames) > maxPropID {
+		return 0, fmt.Errorf("snapshot: SegmentBuilder.internPropName: more than %d distinct property names (PropID, a uint16, would wrap)", maxPropID+1)
 	}
 	if b.propIDs == nil {
 		b.propIDs = make(map[string]PropID)
@@ -438,7 +460,7 @@ func (b *SegmentBuilder) internPropName(name string) PropID {
 	id := PropID(len(b.propNames))
 	b.propNames = append(b.propNames, name)
 	b.propIDs[name] = id
-	return id
+	return id, nil
 }
 
 // Build packs the staged node and edge writes into an immutable Segment.

@@ -2,7 +2,9 @@
 package snapshot
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -359,5 +361,101 @@ func TestSegmentAddNodeStateParseErrorFailsLoudly(t *testing.T) {
 	b := &SegmentBuilder{}
 	if err := b.AddNodeState(1, nil, []byte(`{not valid json`)); err == nil {
 		t.Fatal("AddNodeState with malformed propsJSON = nil error, want non-nil")
+	}
+}
+
+// TestSegmentAddNodeStatePropIDWrapGuard is the regression test for
+// internPropName's PropID-wrap guard: PropID is a uint16, so at most
+// maxPropID+1 (65536) distinct property names can ever be represented
+// across one SegmentBuilder's whole lifetime -- interning a 65537th
+// distinct name would otherwise silently wrap PropID(len(b.propNames))
+// back to an id already assigned to some earlier name, aliasing the two
+// together and corrupting every subsequent PropValueByName/PropMap lookup
+// for both. AddNodeState must instead refuse outright the instant that
+// would happen, leaving the offending node (and every property this call
+// would have interned) completely unstaged -- mirroring
+// TestInternPropWrapGuard's coverage of the base Builder's identical guard.
+//
+// Names are batched batchSize-per-AddNodeState-call (each call's JSON bag
+// carries many distinct, generated scalar-valued keys) rather than one
+// name per call, so this reaches the real 65536-name cap in a handful of
+// calls instead of tens of thousands -- batchSize evenly divides
+// maxPropID+1, so no call straddles the boundary: every name in the last
+// successful batch still lands at or under the cap, and the following
+// call's first (and only) name is the one that trips the guard.
+func TestSegmentAddNodeStatePropIDWrapGuard(t *testing.T) {
+	const batchSize = 4096
+	total := maxPropID + 1 // exactly this many distinct names fit
+	if total%batchSize != 0 {
+		t.Fatalf("test setup: batchSize %d must evenly divide maxPropID+1 (%d)", batchSize, total)
+	}
+
+	b := &SegmentBuilder{}
+	nextName := 0
+	var nodeID uint64 = 1
+	for staged := 0; staged < total; staged += batchSize {
+		var buf strings.Builder
+		buf.WriteByte('{')
+		for i := 0; i < batchSize; i++ {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			fmt.Fprintf(&buf, `"seg_prop_%d":%d`, nextName, nextName)
+			nextName++
+		}
+		buf.WriteByte('}')
+		if err := b.AddNodeState(nodeID, nil, []byte(buf.String())); err != nil {
+			t.Fatalf("AddNodeState(%d) staging names %d..%d (still under the %d-name cap): %v", nodeID, staged, staged+batchSize-1, total, err)
+		}
+		nodeID++
+	}
+	staged := nodeID - 1
+
+	// The (total+1)th distinct name -- one call, one brand-new key -- must
+	// be refused rather than silently wrapping PropID.
+	rejectedID := nodeID
+	err := b.AddNodeState(rejectedID, nil, []byte(fmt.Sprintf(`{"seg_prop_%d":1}`, nextName)))
+	if err == nil {
+		t.Fatalf("AddNodeState: want an error once more than %d distinct property names have been interned, got nil", total)
+	}
+	if !strings.Contains(err.Error(), "distinct property names") {
+		t.Fatalf("AddNodeState error = %q, want it to mention the property-name cap", err.Error())
+	}
+
+	// The rejected call must have left the SegmentBuilder exactly as it was
+	// before it: the rejected node id was never staged at all.
+	seg := b.Build()
+	if got := seg.NodeCount(); got != int(staged) {
+		t.Fatalf("NodeCount() = %d, want %d (the rejected node must not have been staged)", got, staged)
+	}
+	if _, ok := seg.NodeState(rejectedID); ok {
+		t.Fatalf("NodeState(%d) present, want the rejected node completely unstaged", rejectedID)
+	}
+
+	// A builder that only ever reaches exactly the cap (never exceeding it)
+	// must Build and decode correctly -- proving the guard doesn't reject
+	// anything it shouldn't, and that no aliasing occurred among the names
+	// actually interned.
+	firstSt, ok := seg.NodeState(1)
+	if !ok {
+		t.Fatal("NodeState(1) not found, want the first staged node present")
+	}
+	if v, ok := firstSt.PropValueByName("seg_prop_0"); !ok || v != float64(0) {
+		t.Fatalf("first node's seg_prop_0 = (%v, %v), want (0, true)", v, ok)
+	}
+	lastSt, ok := seg.NodeState(staged)
+	if !ok {
+		t.Fatalf("NodeState(%d) not found, want the last staged node present", staged)
+	}
+	lastName := fmt.Sprintf("seg_prop_%d", total-1)
+	if v, ok := lastSt.PropValueByName(lastName); !ok || v != float64(total-1) {
+		t.Fatalf("last node's %s = (%v, %v), want (%d, true)", lastName, v, ok, total-1)
+	}
+
+	// A retry with a name already interned (not a new, (total+1)th one)
+	// must still succeed -- the guard blocks new names past the limit, not
+	// every future AddNodeState call outright.
+	if err := b.AddNodeState(rejectedID, nil, []byte(`{"seg_prop_0":99}`)); err != nil {
+		t.Fatalf("AddNodeState with an already-interned property name after the guard fired: %v", err)
 	}
 }
