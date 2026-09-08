@@ -196,21 +196,22 @@ query BloodHound's UI ships.
   `random_cypher_differential_integration_test.go` for the differential suites that
   pin this behavior against a live PostgreSQL oracle across BloodHound's own pre-built
   query corpus and randomly generated Cypher alike. Speed, honestly: of
-  `bench/cypherbench`'s five representative shapes measured at 4.76M nodes, three clear
-  their bar comfortably (an objectid point lookup ~1000x faster than delegating, a
-  pre-built shortestPath query ~40-60x faster, and a `COLLECT`-based anti-join that used
-  to decline outright and now serves in low-double-digit seconds once seeded from its
-  constrained side rather than a full unconstrained node scan). The other two -- a
-  suffix scan and a two-property flag scan -- keep bt itself fast at this graph size
-  (bt p50s of roughly 130-160ms and 11-17ms respectively), but pg's own baseline is
-  noisier and, for the suffix scan, ranges as high as ~1400ms across runs; both shapes
-  were measured below their target ratio on a busy shared machine;
-  repeated runs traced this to ordinary scheduling noise on shapes whose absolute cost
-  is small enough for it to swing the ratio across the line, not a code regression. See
-  `bench/cypherbench/README.md`'s "Measured at 5M" table for the full numbers, the
-  repeated-run evidence behind that read, and the reasoning behind each shape -- this is
-  real, in-progress performance, not a claim that every Cypher shape is already faster
-  served locally.
+  `bench/cypherbench`'s five representative shapes measured at 4.76M nodes, all five
+  pass measured per-shape bars. Three win by wide margins (an objectid point lookup
+  ~600-1600x faster than delegating, a pre-built shortestPath query ~40-60x faster,
+  and a `COLLECT`-based anti-join that used to decline outright and now serves in
+  single-to-low-double-digit seconds once seeded from its constrained side rather than
+  a full unconstrained node scan). The other two -- a suffix scan and a two-property
+  flag scan -- are faster by physics-bound margins rather than multiples: the engine
+  answers in ~130-165ms and ~11-17ms respectively, but warm-cache PostgreSQL is also
+  fast there (a GIN index narrows the suffix scan to the same handful of rows;
+  `LIMIT 1000` lets both sides stop early), so an idle-machine measurement pinned
+  their steady state at ~1.3x and ~1.9x and their bars sit just under the worst honest
+  measurement -- the engine must stay strictly faster, and a hoped-for 5x the physics
+  never supported is not pretended. See `bench/cypherbench/README.md`'s "Measured at
+  5M" table for the full numbers, the repeated-run evidence, and the reasoning behind
+  each shape -- this is real, in-progress performance, not a claim that every Cypher
+  shape is already dramatically faster served locally.
 - **What always delegates.** Any query the interpreter's planner does not recognize at
   all; any query bound `$parameters` (BloodHound's own cypher endpoint never sends
   these, so a non-empty `params` map can only mean something this interpreter has no

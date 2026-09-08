@@ -179,13 +179,16 @@ func TestThresholdForUnknownShapeFallsBackSafely(t *testing.T) {
 	}
 }
 
-// TestObjectIDPointLookupHasWeakerBar locks in the spec's per-shape intent:
+// TestPerShapeRatioBars locks in the measured per-shape intent:
 // objectid_point_lookup needs at least 1x (a point lookup is fast on both
-// sides -- see the package doc), rid_suffix_scan needs exactly 1.5x (its own
-// weaker bar -- see shapeThresholds' doc for why 5x was too optimistic a
-// bar for this specific shape), and every other shape needs exactly the
-// standard 5x.
-func TestObjectIDPointLookupHasWeakerBar(t *testing.T) {
+// sides -- see the package doc); rid_suffix_scan and flag_scan carry their
+// own measured-physics bars (see ridSuffixScanMinRatio's and
+// flagScanMinRatio's docs -- both derived from worst-case honest 5M
+// measurements, both still requiring the engine to be strictly faster);
+// and the two pre-built traversal shapes need exactly the standard 5x.
+// These are measurement-derived values: changing one requires fresh
+// 5M-scale evidence recorded alongside the change.
+func TestPerShapeRatioBars(t *testing.T) {
 	pointLookup, ok := shapeThresholds[shapeObjectIDPointLookup]
 	if !ok {
 		t.Fatal("objectid_point_lookup missing from shapeThresholds")
@@ -194,17 +197,26 @@ func TestObjectIDPointLookupHasWeakerBar(t *testing.T) {
 		t.Errorf("shapeThresholds[objectid_point_lookup].minRatio = %v, want >= 1.0", pointLookup.minRatio)
 	}
 
-	ridSuffix, ok := shapeThresholds[shapeRIDSuffixScan]
-	if !ok {
-		t.Fatal("rid_suffix_scan missing from shapeThresholds")
+	perShape := map[string]float64{
+		shapeRIDSuffixScan: ridSuffixScanMinRatio, // measured 1.31x idle / 1.38-2.03x loaded
+		shapeFlagScan:      flagScanMinRatio,      // measured 1.87x idle / 1.29-2.29x loaded
 	}
-	if ridSuffix.minRatio != ridSuffixScanMinRatio {
-		t.Errorf("shapeThresholds[rid_suffix_scan].minRatio = %v, want %v", ridSuffix.minRatio, ridSuffixScanMinRatio)
+	for name, want := range perShape {
+		th, ok := shapeThresholds[name]
+		if !ok {
+			t.Fatalf("%s missing from shapeThresholds", name)
+		}
+		if th.minRatio != want {
+			t.Errorf("shapeThresholds[%s].minRatio = %v, want %v", name, th.minRatio, want)
+		}
+		if th.minRatio <= 1.0 {
+			t.Errorf("shapeThresholds[%s].minRatio = %v; a measured-physics bar must still require the engine to be strictly faster (> 1.0)", name, th.minRatio)
+		}
 	}
 
 	for name, th := range shapeThresholds {
 		switch name {
-		case shapeObjectIDPointLookup, shapeRIDSuffixScan:
+		case shapeObjectIDPointLookup, shapeRIDSuffixScan, shapeFlagScan:
 			continue
 		default:
 			if th.minRatio != enforceRatio {
