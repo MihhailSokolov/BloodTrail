@@ -2,7 +2,7 @@
 
 // eval.go implements the expression evaluator itself,
 // walking the dawgs Cypher AST (github.com/specterops/dawgs@v0.8.0
-// cypher/models/cypher) directly against one snapshot.Snapshot and one bound
+// cypher/models/cypher) directly against one snapshot.View and one bound
 // Row, and routing every comparison through value.go's own primitives
 // (Tri, StringEq/StringNeq/ScalarEq/PropEq, StringPredicate, In, OrderCompare,
 // IsNull/IsNotNull) rather than re-deriving pg's semantics here.
@@ -189,7 +189,7 @@ func (r *Row) edgeUsed(fwd uint64) bool {
 // Both fields are safe to leave at their zero value; a nil map is treated as
 // empty and lazily allocated on first use.
 type Env struct {
-	Snap *snapshot.Snapshot
+	Snap *snapshot.View
 	Now  time.Time
 
 	regexMu    sync.Mutex
@@ -827,11 +827,10 @@ func evalKindMatcher(env *Env, row *Row, km *cypher.KindMatcher) (Tri, error) {
 	}
 
 	if nodeID, ok := row.Node(v.Symbol); ok {
-		lo, hi := env.Snap.KindOffsets[nodeID], env.Snap.KindOffsets[nodeID+1]
-		return matchKinds(env, env.Snap.NodeKinds[lo:hi], km.Kinds, km.IsExclusive), nil
+		return matchKinds(env, env.Snap.KindIDsOf(nodeID), km.Kinds, km.IsExclusive), nil
 	}
 	if edgeRef, ok := row.Edge(v.Symbol); ok {
-		return matchKinds(env, []snapshot.KindID{env.Snap.OutKinds[edgeRef.Fwd]}, km.Kinds, km.IsExclusive), nil
+		return matchKinds(env, []snapshot.KindID{env.Snap.Base().OutKinds[edgeRef.Fwd]}, km.Kinds, km.IsExclusive), nil
 	}
 	return TriNull, ErrUnsupported
 }
@@ -842,7 +841,7 @@ func evalKindMatcher(env *Env, row *Row, km *cypher.KindMatcher) (Tri, error) {
 func matchKinds(env *Env, have []snapshot.KindID, want graph.Kinds, exclusive bool) Tri {
 	matched := 0
 	for _, k := range want {
-		kindID, found := env.Snap.Kinds.ID(k.String())
+		kindID, found := env.Snap.Kinds().ID(k.String())
 		if found && containsKindID(have, kindID) {
 			matched++
 		} else if exclusive {
@@ -912,7 +911,7 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 
 	kinds := make([]snapshot.KindID, 0, len(rel.Kinds))
 	for _, k := range rel.Kinds {
-		id, found := env.Snap.Kinds.ID(k.String())
+		id, found := env.Snap.Kinds().ID(k.String())
 		if !found {
 			return TriNull, ErrUnsupported
 		}
@@ -943,7 +942,7 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 // not apply; see evalPatternPredicate's own doc for why this file's other
 // evaluator functions are consistently unmetered.
 func hasAdjacentEdge(env *Env, src, dst snapshot.NodeID, kinds []snapshot.KindID) bool {
-	targets, edgeKinds := env.Snap.Out(src)
+	targets, edgeKinds, _ := env.Snap.Out(src)
 	for i, t := range targets {
 		if t == dst && edgeKindOK(kinds, edgeKinds[i]) {
 			return true
@@ -1125,7 +1124,7 @@ func evalVariableValue(env *Env, row *Row, v *cypher.Variable) (any, bool, error
 		return val, true, nil
 	}
 	if nodeID, ok := row.Node(v.Symbol); ok {
-		return env.Snap.Props.NodeMap(nodeID), true, nil
+		return env.Snap.PropNodeMap(nodeID), true, nil
 	}
 	return nil, false, ErrUnsupported
 }
@@ -1149,14 +1148,14 @@ func evalPropertyLookup(env *Env, row *Row, pl *cypher.PropertyLookup) (any, boo
 	}
 
 	if nodeID, ok := row.Node(v.Symbol); ok {
-		propID, found := env.Snap.Props.IDByName(pl.Symbol)
+		propID, found := env.Snap.PropIDByName(pl.Symbol)
 		if !found {
 			// This property name was never interned by this snapshot's
 			// PropStore at all, meaning no node anywhere in the graph carries
 			// it -- so it is certainly absent from this one.
 			return nil, false, nil
 		}
-		v, ok := env.Snap.Props.Value(nodeID, propID)
+		v, ok := env.Snap.PropValue(nodeID, propID)
 		return v, ok, nil
 	}
 
@@ -1291,10 +1290,10 @@ func evalIDFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, boo
 		return nil, false, ErrUnsupported
 	}
 	if nodeID, ok := row.Node(v.Symbol); ok {
-		return float64(env.Snap.GraphIDs[nodeID]), true, nil
+		return float64(env.Snap.GraphID(nodeID)), true, nil
 	}
 	if edgeRef, ok := row.Edge(v.Symbol); ok {
-		return float64(env.Snap.OutEdgeIDs[edgeRef.Fwd]), true, nil
+		return float64(env.Snap.Base().OutEdgeIDs[edgeRef.Fwd]), true, nil
 	}
 	return nil, false, ErrUnsupported
 }
@@ -1314,11 +1313,10 @@ func evalLabelsFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any,
 		return nil, false, ErrUnsupported
 	}
 
-	lo, hi := env.Snap.KindOffsets[nodeID], env.Snap.KindOffsets[nodeID+1]
-	kinds := env.Snap.NodeKinds[lo:hi]
+	kinds := env.Snap.KindIDsOf(nodeID)
 	out := make([]any, 0, len(kinds))
 	for _, k := range kinds {
-		if name, found := env.Snap.Kinds.Name(k); found {
+		if name, found := env.Snap.Kinds().Name(k); found {
 			out = append(out, name)
 		}
 	}
@@ -1336,7 +1334,7 @@ func evalTypeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, b
 	if !ok {
 		return nil, false, ErrUnsupported
 	}
-	name, found := env.Snap.Kinds.Name(env.Snap.OutKinds[edgeRef.Fwd])
+	name, found := env.Snap.Kinds().Name(env.Snap.Base().OutKinds[edgeRef.Fwd])
 	if !found {
 		return nil, false, ErrUnsupported
 	}

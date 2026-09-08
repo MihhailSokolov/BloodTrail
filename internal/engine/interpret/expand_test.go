@@ -19,14 +19,14 @@ import (
 // trails compare equal regardless of which dense ids the snapshot happened
 // to assign, and two trails that used different parallel edges (or a
 // different node order) compare unequal.
-func pathSig(snap *snapshot.Snapshot, pv *PathVal) string {
+func pathSig(snap *snapshot.View, pv *PathVal) string {
 	s := "N:"
 	for _, n := range pv.Nodes {
-		s += fmt.Sprintf("%d,", snap.GraphIDs[n])
+		s += fmt.Sprintf("%d,", snap.GraphID(n))
 	}
 	s += "|E:"
 	for _, e := range pv.Edges {
-		s += fmt.Sprintf("%d,", snap.OutEdgeIDs[e.Fwd])
+		s += fmt.Sprintf("%d,", snap.Base().OutEdgeIDs[e.Fwd])
 	}
 	return s
 }
@@ -34,7 +34,7 @@ func pathSig(snap *snapshot.Snapshot, pv *PathVal) string {
 // pathSigsAtColumn extracts pathSig for every row's col'th projected value,
 // asserting each is actually OutPath, sorted for order-independent
 // comparison.
-func pathSigsAtColumn(t *testing.T, snap *snapshot.Snapshot, rs *ResultSet, col int) []string {
+func pathSigsAtColumn(t *testing.T, snap *snapshot.View, rs *ResultSet, col int) []string {
 	t.Helper()
 	out := make([]string, len(rs.Rows))
 	for i, row := range rs.Rows {
@@ -52,7 +52,7 @@ func pathSigsAtColumn(t *testing.T, snap *snapshot.Snapshot, rs *ResultSet, col 
 // projection column's set of path signatures equals want exactly
 // (multiplicity included -- two identical want entries require two matching
 // rows).
-func assertPathSigs(t *testing.T, snap *snapshot.Snapshot, query string, col int, want []string) {
+func assertPathSigs(t *testing.T, snap *snapshot.View, query string, col int, want []string) {
 	t.Helper()
 	rs := mustExec(t, snap, query, generousBudget)
 	got := pathSigsAtColumn(t, snap, rs, col)
@@ -70,7 +70,7 @@ func assertPathSigs(t *testing.T, snap *snapshot.Snapshot, query string, col int
 // execExpectErr plans and executes query, failing the test if Execute does
 // not return an error, and returning that error for the caller to inspect
 // (typically via errors.Is).
-func execExpectErr(t *testing.T, snap *snapshot.Snapshot, query string, b Budgets) error {
+func execExpectErr(t *testing.T, snap *snapshot.View, query string, b Budgets) error {
 	t.Helper()
 	q := planQuery(t, snap, query)
 	_, err := Execute(&Env{Snap: snap}, q, b)
@@ -243,7 +243,7 @@ func TestExpandVarLengthZeroLengthBindsSameNode(t *testing.T) {
 		if len(p.Path.Nodes) != 0 || len(p.Path.Edges) != 0 {
 			t.Fatalf("zero-length PathVal = %+v, want both slices empty", p.Path)
 		}
-		gotRoots[snap.GraphIDs[a.Node]] = true
+		gotRoots[snap.GraphID(a.Node)] = true
 	}
 	if !gotRoots[1] || !gotRoots[2] {
 		t.Fatalf("roots seen = %v, want both database ids 1 (connected) and 2 (isolated)", gotRoots)
@@ -433,7 +433,7 @@ func TestExpandVarLengthBudgetExhaustion(t *testing.T) {
 // co-equal length-2 shortest paths (s-a-t and s-b-t) between one Root node
 // and one Target node, plus a helper edge-kind mask -- shared by the
 // ModeOne/ModeAll parity subtests below.
-func shortestPathParityFixture(t *testing.T) (*snapshot.Snapshot, *snapshot.KindMask) {
+func shortestPathParityFixture(t *testing.T) (*snapshot.View, *snapshot.KindMask) {
 	t.Helper()
 	const (
 		kindRoot   snapshot.KindID = 1
@@ -455,7 +455,7 @@ func shortestPathParityFixture(t *testing.T) (*snapshot.Snapshot, *snapshot.Kind
 			{id: 303, start: 3, end: 4, kind: kindE},
 		},
 	)
-	mask := snapshot.NewKindMask(snap.MaxKindID)
+	mask := snapshot.NewKindMask(snap.Base().MaxKindID)
 	mask.Set(kindE)
 	return snap, mask
 }
@@ -964,7 +964,7 @@ func TestShortestPathLimit(t *testing.T) {
 // shortestPathLimit/noResidualWhere directly rather than through the full
 // runQuery/Execute pipeline (mirrors the groupComponents/Chains lookup
 // TestExpandShortestPathBudgetDeclinesOnHighFanOut already uses inline).
-func shortestPathPartAndStep(t *testing.T, snap *snapshot.Snapshot, query string) (*Part, *Step) {
+func shortestPathPartAndStep(t *testing.T, snap *snapshot.View, query string) (*Part, *Step) {
 	t.Helper()
 	q := planQuery(t, snap, query)
 	part := &q.Parts[0]
@@ -1273,7 +1273,7 @@ func TestExpandShortestPathResidualWhereConjunctDoesNotSpuriouslyDeclineOnMaxRow
 // ErrTooLarge, exactly reproducing this project's own corpus fixture finding
 // (see strategyBudgetOverrides' doc comment in expand.go for the full
 // investigation) at a much smaller, hand-built scale.
-func buildWideShortestPathSnapshot(t *testing.T) (snap *snapshot.Snapshot, wantSigs []string) {
+func buildWideShortestPathSnapshot(t *testing.T) (snap *snapshot.View, wantSigs []string) {
 	t.Helper()
 	const (
 		kindTarget snapshot.KindID = 1

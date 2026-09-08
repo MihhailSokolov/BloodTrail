@@ -29,7 +29,7 @@ type execEdgeSpec struct {
 }
 
 // buildExecSnapshot builds a hand-crafted snapshot for one test scenario.
-func buildExecSnapshot(t *testing.T, kindTable map[snapshot.KindID]string, nodes []execNodeSpec, edges []execEdgeSpec) *snapshot.Snapshot {
+func buildExecSnapshot(t *testing.T, kindTable map[snapshot.KindID]string, nodes []execNodeSpec, edges []execEdgeSpec) *snapshot.View {
 	t.Helper()
 
 	b := snapshot.NewBuilder(1)
@@ -52,13 +52,13 @@ func buildExecSnapshot(t *testing.T, kindTable map[snapshot.KindID]string, nodes
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	return snap
+	return snapshot.NewView(snap)
 }
 
 // planQuery parses and plans query against snap, failing the test if either
 // step does not succeed (every test in this file uses queries this
 // milestone's planner is expected to serve).
-func planQuery(t *testing.T, snap *snapshot.Snapshot, query string) *Query {
+func planQuery(t *testing.T, snap *snapshot.View, query string) *Query {
 	t.Helper()
 	rq, err := frontend.ParseCypher(frontend.NewContext(), query)
 	if err != nil {
@@ -72,7 +72,7 @@ func planQuery(t *testing.T, snap *snapshot.Snapshot, query string) *Query {
 }
 
 // mustExec plans and executes query, failing the test on any error.
-func mustExec(t *testing.T, snap *snapshot.Snapshot, query string, b Budgets) *ResultSet {
+func mustExec(t *testing.T, snap *snapshot.View, query string, b Budgets) *ResultSet {
 	t.Helper()
 	q := planQuery(t, snap, query)
 	rs, err := Execute(&Env{Snap: snap}, q, b)
@@ -228,7 +228,7 @@ func TestExecMultiPatternJoinOnSharedSymbol(t *testing.T) {
 // anchor visits O(1) nodes rather than scanning every decoy: a tiny MaxWork
 // budget that a full scan could never satisfy still succeeds when the
 // anchor is actually used.
-func manyUsersSnapshot(t *testing.T, n int) (snap *snapshot.Snapshot, targetDBID uint64) {
+func manyUsersSnapshot(t *testing.T, n int) (snap *snapshot.View, targetDBID uint64) {
 	t.Helper()
 	const kindUser snapshot.KindID = 1
 
@@ -269,7 +269,7 @@ func TestExecObjectIDAnchor(t *testing.T) {
 // "dup-oid", plus a third decoy User with a distinct objectid, for testing
 // that every anchor/filter shape that resolves through objectid visits (or
 // admits) both duplicates rather than an arbitrary single one.
-func dupObjectIDSnapshot(t *testing.T) (snap *snapshot.Snapshot, dup1, dup2, decoy uint64) {
+func dupObjectIDSnapshot(t *testing.T) (snap *snapshot.View, dup1, dup2, decoy uint64) {
 	t.Helper()
 	const kindUser snapshot.KindID = 1
 	dup1, dup2, decoy = 1, 2, 3
@@ -1105,7 +1105,7 @@ func TestRefactorCharacterization(t *testing.T) {
 // own dispatch switch would have no coverage that isolates it from that
 // chunking behavior.
 func TestRunComponentFromDispatchMatchesRunComponent(t *testing.T) {
-	check := func(t *testing.T, snap *snapshot.Snapshot, query, anchorSym string) {
+	check := func(t *testing.T, snap *snapshot.View, query, anchorSym string) {
 		t.Helper()
 		env := &Env{Snap: snap}
 		part := &planQuery(t, snap, query).Parts[0]

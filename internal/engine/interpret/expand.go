@@ -4,7 +4,7 @@
 // seams exec.go left open (see its own file comment and
 // runComponent's dispatch, below): variable-length relationship-pattern
 // expansion (`*min..max`) and shortestPath()/allShortestPaths() step
-// execution, both driven directly off one snapshot.Snapshot rather than a
+// execution, both driven directly off one snapshot.View rather than a
 // live PostgreSQL round trip.
 //
 // --- Var-length trail semantics -------------------------------------------
@@ -773,7 +773,7 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		q.MemoryLimit = memLimit
 	}
 
-	dense, err := traverse.AllShortestPaths(env.Snap, q)
+	dense, err := traverse.AllShortestPaths(env.Snap.Base(), q)
 	if err != nil {
 		if errors.Is(err, traverse.ErrTooLarge) || errors.Is(err, traverse.ErrMemoryLimit) {
 			return nil, ErrBudget
@@ -1048,7 +1048,7 @@ func shortestPathLimit(rowCapPlusOne int64, meter *workMeter, part *Part, step *
 // of that 2-4x range can still spend a small multiple of the override this
 // function computes before meter.spend's own accounting (the actual
 // enforcement mechanism) catches up.
-func strategyBudgetOverrides(meter *workMeter, snap *snapshot.Snapshot) (sideBudget, pairBudget int) {
+func strategyBudgetOverrides(meter *workMeter, snap *snapshot.View) (sideBudget, pairBudget int) {
 	if meter.budget.MaxWork <= 0 {
 		return 0, 0
 	}
@@ -1352,7 +1352,7 @@ func kindMaskFor(env *Env, kinds []snapshot.KindID) *snapshot.KindMask {
 	if len(kinds) == 0 {
 		return nil
 	}
-	mask := snapshot.NewKindMask(env.Snap.MaxKindID)
+	mask := snapshot.NewKindMask(env.Snap.Base().MaxKindID)
 	for _, k := range kinds {
 		mask.Set(k)
 	}
@@ -1405,8 +1405,8 @@ func convertPath(env *Env, p traverse.Path) (*PathVal, error) {
 	edges := make([]EdgeRef, len(p.Kinds))
 	for i, k := range p.Kinds {
 		u, w := p.Nodes[i], p.Nodes[i+1]
-		targets, kinds := env.Snap.Out(u)
-		lo := env.Snap.OutOffsets[u]
+		targets, kinds, _ := env.Snap.Out(u)
+		lo := env.Snap.Base().OutOffsets[u]
 		found := false
 		for j, t := range targets {
 			if t == w && kinds[j] == k {

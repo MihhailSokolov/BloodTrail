@@ -118,7 +118,7 @@ type planTestCase struct {
 // parse failure is treated as "not served" directly, without ever calling
 // Plan -- exactly mirroring production, where a parse error is caught and
 // delegated before Plan ever runs.
-func runPlanGolden(t *testing.T, snap *snapshot.Snapshot, cases []planTestCase) {
+func runPlanGolden(t *testing.T, snap *snapshot.View, cases []planTestCase) {
 	t.Helper()
 	for _, tc := range cases {
 		tc := tc
@@ -180,7 +180,7 @@ LIMIT 1000`
 RETURN p`
 )
 
-func testSnapshot(t *testing.T, corpusTexts []string) *snapshot.Snapshot {
+func testSnapshot(t *testing.T, corpusTexts []string) *snapshot.View {
 	t.Helper()
 	kinds := discoverKinds(corpusTexts,
 		// Extra kinds this file's own hand-written cases need beyond the
@@ -195,7 +195,7 @@ func testSnapshot(t *testing.T, corpusTexts []string) *snapshot.Snapshot {
 	if err != nil {
 		t.Fatalf("building test snapshot: %v", err)
 	}
-	return snap
+	return snapshot.NewView(snap)
 }
 
 // TestPlanServeDelegateMatrix is the brief's Step 1 golden table: every
@@ -685,7 +685,7 @@ func TestPlanInlineMapDesugarsIntoWhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	env := &Env{Snap: evalSnap}
+	env := &Env{Snap: snapshot.NewView(evalSnap)}
 
 	matchID, ok := evalSnap.Dense(1)
 	if !ok {
@@ -740,7 +740,7 @@ func TestPlanNeverPanics(t *testing.T) {
 	if _, ok := Plan(rq, nil); ok {
 		t.Fatal("Plan(rq, nil) ok = true, want false")
 	}
-	if _, ok := Plan(rq, &snapshot.Snapshot{}); ok {
-		t.Fatal("Plan(rq, &Snapshot{}) ok = true, want false (nil Kinds)")
+	if _, ok := Plan(rq, snapshot.NewView(&snapshot.Snapshot{})); ok {
+		t.Fatal("Plan(rq, NewView(&Snapshot{})) ok = true, want false (nil Kinds)")
 	}
 }

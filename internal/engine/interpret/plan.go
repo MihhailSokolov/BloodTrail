@@ -415,14 +415,14 @@ type Query struct {
 // label/relationship-type/kind-matcher names to snapshot.KindID); it must be
 // non-nil, matching the invariant that Snapshot.Kinds is never nil after
 // Build.
-func Plan(q *cypher.RegularQuery, snap *snapshot.Snapshot) (result *Query, ok bool) {
+func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			result, ok = nil, false
 		}
 	}()
 
-	if q == nil || snap == nil || snap.Kinds == nil || q.SingleQuery == nil {
+	if q == nil || snap == nil || snap.Kinds() == nil || q.SingleQuery == nil {
 		return nil, false
 	}
 
@@ -642,7 +642,7 @@ func cloneKnown(m map[string]symKind) map[string]symKind {
 // the Part's complete symbol table, regardless of which ReadingClause
 // introduced which variable).
 type partBuilder struct {
-	snap    *snapshot.Snapshot
+	snap    *snapshot.View
 	known   map[string]symKind
 	nodes   map[string]*NodeConstraint
 	chains  []Step
@@ -695,7 +695,7 @@ type partBuilder struct {
 // WITH boundary). It returns the built Part and this Part's own final
 // symbol table (carried forward as-is unless the caller applies a WITH on
 // top of it).
-func planPart(snap *snapshot.Snapshot, regexes map[string]*regexp.Regexp, carried map[string]symKind, numericScalars map[string]bool, reading []*cypher.ReadingClause) (Part, map[string]symKind, bool) {
+func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried map[string]symKind, numericScalars map[string]bool, reading []*cypher.ReadingClause) (Part, map[string]symKind, bool) {
 	pb := &partBuilder{
 		snap:           snap,
 		known:          cloneKnown(carried),
@@ -1025,7 +1025,7 @@ func (pb *partBuilder) addNodePattern(np *cypher.NodePattern) (string, bool) {
 	}
 	nc := pb.nodeConstraint(sym)
 	for _, k := range np.Kinds {
-		id, ok := pb.snap.Kinds.ID(k.String())
+		id, ok := pb.snap.Kinds().ID(k.String())
 		if !ok {
 			return "", false
 		}
@@ -1125,7 +1125,7 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 
 	var kinds []snapshot.KindID
 	for _, k := range rel.Kinds {
-		id, ok := pb.snap.Kinds.ID(k.String())
+		id, ok := pb.snap.Kinds().ID(k.String())
 		if !ok {
 			return Step{}, false
 		}
@@ -2092,7 +2092,7 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 		return false
 	}
 	for _, kind := range km.Kinds {
-		if _, ok := pb.snap.Kinds.ID(kind.String()); !ok {
+		if _, ok := pb.snap.Kinds().ID(kind.String()); !ok {
 			return false
 		}
 	}
@@ -2194,7 +2194,7 @@ func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 		return false
 	}
 	for _, k := range rel.Kinds {
-		if _, ok := pb.snap.Kinds.ID(k.String()); !ok {
+		if _, ok := pb.snap.Kinds().ID(k.String()); !ok {
 			return false
 		}
 	}
@@ -2585,7 +2585,7 @@ func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) 
 // relationalComparisonSafe's WHERE-side check does, for a RETURN item
 // referencing a carried numeric alias, however deeply nested inside
 // arithmetic); both empty when there was no preceding WITH.
-func planReturn(snap *snapshot.Snapshot, known map[string]symKind, countAliases, numericScalars map[string]bool, ret *cypher.Return) (Projection, []OrderKey, int64, int64, bool) {
+func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, numericScalars map[string]bool, ret *cypher.Return) (Projection, []OrderKey, int64, int64, bool) {
 	if ret == nil || ret.Projection == nil {
 		return Projection{}, nil, 0, -1, false
 	}

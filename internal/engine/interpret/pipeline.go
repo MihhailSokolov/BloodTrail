@@ -851,9 +851,9 @@ func countAggregate(env *Env, agg *CountAgg, rows []*Row) int64 {
 	for _, r := range rows {
 		var key []byte
 		if nodeID, ok := r.Node(agg.Sym); ok {
-			key = appendTaggedUint(nil, 'N', env.Snap.GraphIDs[nodeID])
+			key = appendTaggedUint(nil, 'N', env.Snap.GraphID(nodeID))
 		} else if edgeRef, ok := r.Edge(agg.Sym); ok {
-			key = appendTaggedUint(nil, 'D', env.Snap.OutEdgeIDs[edgeRef.Fwd])
+			key = appendTaggedUint(nil, 'D', env.Snap.Base().OutEdgeIDs[edgeRef.Fwd])
 		} else if v, ok := r.Scalar(agg.Sym); ok && v != nil {
 			key = appendScalarKey(nil, v)
 		} else {
@@ -873,7 +873,7 @@ func collectAggregate(env *Env, agg *CollectMembershipAgg, rows []*Row) idSet {
 	set := make(idSet, len(rows))
 	for _, r := range rows {
 		if nodeID, ok := r.Node(agg.Sym); ok {
-			set[env.Snap.GraphIDs[nodeID]] = struct{}{}
+			set[env.Snap.GraphID(nodeID)] = struct{}{}
 		}
 	}
 	return set
@@ -905,10 +905,10 @@ func groupKeyBytes(env *Env, r *Row, syms []string) []byte {
 // RETURN projection.
 func appendSymbolKey(env *Env, buf []byte, r *Row, sym string) []byte {
 	if nodeID, ok := r.Node(sym); ok {
-		return appendTaggedUint(buf, 'N', env.Snap.GraphIDs[nodeID])
+		return appendTaggedUint(buf, 'N', env.Snap.GraphID(nodeID))
 	}
 	if edgeRef, ok := r.Edge(sym); ok {
-		return appendTaggedUint(buf, 'D', env.Snap.OutEdgeIDs[edgeRef.Fwd])
+		return appendTaggedUint(buf, 'D', env.Snap.Base().OutEdgeIDs[edgeRef.Fwd])
 	}
 	val, ok := r.Scalar(sym)
 	if !ok {
@@ -1047,18 +1047,18 @@ func rowDistinctKey(env *Env, row []OutVal) string {
 func outValKey(env *Env, v OutVal) []byte {
 	switch v.Kind {
 	case OutNode:
-		return appendTaggedUint(nil, 'N', env.Snap.GraphIDs[v.Node])
+		return appendTaggedUint(nil, 'N', env.Snap.GraphID(v.Node))
 	case OutEdge:
-		return appendTaggedUint(nil, 'D', env.Snap.OutEdgeIDs[v.Edge.Fwd])
+		return appendTaggedUint(nil, 'D', env.Snap.Base().OutEdgeIDs[v.Edge.Fwd])
 	case OutPath:
 		buf := []byte{'P'}
 		buf = appendUint32(buf, uint32(len(v.Path.Nodes)))
 		for _, n := range v.Path.Nodes {
-			buf = appendTaggedUint(buf, 'n', env.Snap.GraphIDs[n])
+			buf = appendTaggedUint(buf, 'n', env.Snap.GraphID(n))
 		}
 		buf = appendUint32(buf, uint32(len(v.Path.Edges)))
 		for _, e := range v.Path.Edges {
-			buf = appendTaggedUint(buf, 'e', env.Snap.OutEdgeIDs[e.Fwd])
+			buf = appendTaggedUint(buf, 'e', env.Snap.Base().OutEdgeIDs[e.Fwd])
 		}
 		return buf
 	default: // OutScalar
@@ -1359,6 +1359,6 @@ func tryMembershipComparison(env *Env, row *Row, cmp *cypher.Comparison, members
 		// the inconsistency instead of a silently wrong TriFalse.
 		return TriNull, false
 	}
-	_, in := set[env.Snap.GraphIDs[nodeID]]
+	_, in := set[env.Snap.GraphID(nodeID)]
 	return boolToTri(in), true
 }

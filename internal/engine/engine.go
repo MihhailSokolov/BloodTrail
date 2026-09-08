@@ -579,7 +579,9 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	q, ok := interpret.Plan(rq, snap)
+	view := snapshot.NewView(snap)
+
+	q, ok := interpret.Plan(rq, view)
 	if !ok {
 		e.decline(ctx, reasonUnsupported, nil)
 		return nil, false
@@ -591,7 +593,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 	}
 
 	// A fresh copy, never rq itself -- see this method's own step 7 doc.
-	if !translateGateOK(ctx, cypher.Copy[*cypher.RegularQuery](rq), snap) {
+	if !translateGateOK(ctx, cypher.Copy[*cypher.RegularQuery](rq), view) {
 		e.decline(ctx, reasonTranslateGate, nil)
 		return nil, false
 	}
@@ -601,14 +603,14 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	rs, err := safeExecuteCypher(&interpret.Env{Snap: view, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
 		return nil, false
 	}
 
 	var edgeProps map[uint64]*graph.Properties
-	if edgeIDs := collectEdgeIDs(snap, rs); len(edgeIDs) > 0 {
+	if edgeIDs := collectEdgeIDs(view, rs); len(edgeIDs) > 0 {
 		if e.cypherHydrationRaceHook != nil {
 			e.cypherHydrationRaceHook()
 		}
@@ -648,7 +650,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	result, ok := buildCypherRowsResult(snap, rs, projectionValueKinds(q), edgeProps)
+	result, ok := buildCypherRowsResult(view, rs, projectionValueKinds(q), edgeProps)
 	if !ok {
 		e.decline(ctx, reasonPanic, nil)
 		return nil, false

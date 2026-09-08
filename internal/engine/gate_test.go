@@ -104,7 +104,7 @@ func TestTranslateGateOK(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseCypher(%q): %v", tc.text, err)
 			}
-			if got := translateGateOK(context.Background(), rq, snap); got != tc.want {
+			if got := translateGateOK(context.Background(), rq, snapshot.NewView(snap)); got != tc.want {
 				t.Fatalf("translateGateOK(%q) = %v, want %v", tc.text, got, tc.want)
 			}
 		})
@@ -213,12 +213,14 @@ func TestTranslateGateOKCopyLeavesOriginalASTUntouched(t *testing.T) {
 
 	const text = `MATCH (u:User)-[:MemberOf|AdminTo*1..]->(c:Computer) WHERE u.name = 'alice' RETURN u`
 
+	view := snapshot.NewView(snap)
+
 	rq, err := frontend.ParseCypher(frontend.NewContext(), text)
 	if err != nil {
 		t.Fatalf("ParseCypher(%q): %v", text, err)
 	}
 
-	q, ok := interpret.Plan(rq, snap)
+	q, ok := interpret.Plan(rq, view)
 	if !ok {
 		t.Fatalf("Plan(%q): not served", text)
 	}
@@ -227,7 +229,7 @@ func TestTranslateGateOKCopyLeavesOriginalASTUntouched(t *testing.T) {
 
 	// Exactly TryCypher's own step 7: a copy goes to the gate, never rq
 	// itself.
-	if !translateGateOK(context.Background(), cypher.Copy[*cypher.RegularQuery](rq), snap) {
+	if !translateGateOK(context.Background(), cypher.Copy[*cypher.RegularQuery](rq), view) {
 		t.Fatalf("translateGateOK(%q) = false, want true", text)
 	}
 
@@ -235,7 +237,7 @@ func TestTranslateGateOKCopyLeavesOriginalASTUntouched(t *testing.T) {
 		t.Fatalf("rq was mutated by translateGateOK despite being handed only a copy:\nbefore: %#v\nafter:  %#v", pristine, rq)
 	}
 
-	rs, err := interpret.Execute(&interpret.Env{Snap: snap}, q, generousBudgetForGateTest)
+	rs, err := interpret.Execute(&interpret.Env{Snap: view}, q, generousBudgetForGateTest)
 	if err != nil {
 		t.Fatalf("Execute(%q): %v", text, err)
 	}
@@ -289,12 +291,14 @@ func TestQueryIRIndependentOfASTCopyMutation(t *testing.T) {
 
 	const text = `MATCH (u:User)-[:MemberOf|AdminTo*1..]->(c:Computer) WHERE u.name = 'alice' RETURN u`
 
+	view := snapshot.NewView(snap)
+
 	rq, err := frontend.ParseCypher(frontend.NewContext(), text)
 	if err != nil {
 		t.Fatalf("ParseCypher(%q): %v", text, err)
 	}
 
-	q, ok := interpret.Plan(rq, snap)
+	q, ok := interpret.Plan(rq, view)
 	if !ok {
 		t.Fatalf("Plan(%q): not served", text)
 	}
@@ -306,7 +310,7 @@ func TestQueryIRIndependentOfASTCopyMutation(t *testing.T) {
 		t.Fatalf("rq.ReadingClauses is nil after mutating an unrelated copy, want the original list untouched")
 	}
 
-	rs, err := interpret.Execute(&interpret.Env{Snap: snap}, q, generousBudgetForGateTest)
+	rs, err := interpret.Execute(&interpret.Env{Snap: view}, q, generousBudgetForGateTest)
 	if err != nil {
 		t.Fatalf("Execute(%q): %v", text, err)
 	}

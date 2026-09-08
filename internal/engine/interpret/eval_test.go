@@ -75,7 +75,7 @@ func returnExprOf(t *testing.T, query string) cypher.Expression {
 // file's tests need, plus a database-id -> dense-NodeID index so tests can
 // bind Rows by the same ids they used to declare each node.
 type fixture struct {
-	snap  *snapshot.Snapshot
+	snap  *snapshot.View
 	dense map[uint64]snapshot.NodeID
 }
 
@@ -142,7 +142,7 @@ func newFixture(t *testing.T) *fixture {
 		dense[n.id] = id
 	}
 
-	return &fixture{snap: snap, dense: dense}
+	return &fixture{snap: snapshot.NewView(snap), dense: dense}
 }
 
 // row builds a single-node-bound Row: sym is bound to the dense NodeID of

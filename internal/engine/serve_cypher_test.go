@@ -98,7 +98,7 @@ func TestMaterializeNode(t *testing.T) {
 		nil,
 	)
 
-	got := materializeNode(snap, 0)
+	got := materializeNode(snapshot.NewView(snap), 0)
 
 	want := graph.NewNode(
 		graph.ID(100),
@@ -170,7 +170,7 @@ func TestMaterializeEdgeForwardAndReverseDiscovered(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			props := graph.NewProperties()
-			got := materializeEdge(snap, ref, props)
+			got := materializeEdge(snapshot.NewView(snap), ref, props)
 
 			want := graph.NewRelationship(graph.ID(777), graph.ID(10), graph.ID(30), props, graph.StringKind("Knows"))
 			if !reflect.DeepEqual(got, want) {
@@ -207,7 +207,7 @@ func TestMaterializePathOrder(t *testing.T) {
 		100: graph.AsProperties(map[string]any{"since": "2020"}),
 	}
 
-	got := materializePath(snap, pv, edgeProps)
+	got := materializePath(snapshot.NewView(snap), pv, edgeProps)
 
 	if len(got.Nodes) != 3 || len(got.Edges) != 2 {
 		t.Fatalf("materializePath shape = %d nodes, %d edges, want 3 nodes, 2 edges", len(got.Nodes), len(got.Edges))
@@ -242,7 +242,7 @@ func TestMaterializePathOrder(t *testing.T) {
 
 func TestMaterializePathNilIsZeroPath(t *testing.T) {
 	snap := buildCypherTestSnapshot(t, nil, nil, nil)
-	got := materializePath(snap, nil, nil)
+	got := materializePath(snapshot.NewView(snap), nil, nil)
 	if len(got.Nodes) != 0 || len(got.Edges) != 0 {
 		t.Fatalf("materializePath(nil) = %+v, want zero graph.Path", got)
 	}
@@ -442,7 +442,7 @@ func TestProjectionValueKindsKeysOrder(t *testing.T) {
 	)
 	q := planAndExec(t, snap, `MATCH (n) RETURN n.name, n.age, n`)
 
-	result := newCypherRowsResult(snap, q.rs, projectionValueKinds(q.query), nil)
+	result := newCypherRowsResult(snapshot.NewView(snap), q.rs, projectionValueKinds(q.query), nil)
 	if got, want := result.Keys(), []string{"n.name", "n.age", "n"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Keys() = %v, want %v", got, want)
 	}
@@ -466,11 +466,12 @@ func planAndExec(t *testing.T, snap *snapshot.Snapshot, text string) plannedQuer
 	if err != nil {
 		t.Fatalf("ParseCypher(%q): %v", text, err)
 	}
-	q, ok := interpret.Plan(rq, snap)
+	view := snapshot.NewView(snap)
+	q, ok := interpret.Plan(rq, view)
 	if !ok {
 		t.Fatalf("Plan(%q): not served", text)
 	}
-	rs, err := interpret.Execute(&interpret.Env{Snap: snap}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	rs, err := interpret.Execute(&interpret.Env{Snap: view}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
 	if err != nil {
 		t.Fatalf("Execute(%q): %v", text, err)
 	}
@@ -485,9 +486,10 @@ func TestCypherRowsResultMapperDeclinesForeignTargets(t *testing.T) {
 		[]cypherTestNode{{id: 1, kinds: []snapshot.KindID{1}, props: map[string]any{"name": "Alice"}}},
 		nil,
 	)
-	node := materializeNode(snap, 0)
+	view := snapshot.NewView(snap)
+	node := materializeNode(view, 0)
 
-	result := newCypherRowsResult(snap, &interpret.ResultSet{
+	result := newCypherRowsResult(view, &interpret.ResultSet{
 		Keys: []string{"n"},
 		Rows: [][]interpret.OutVal{{{Kind: interpret.OutNode, Node: 0}}},
 	}, []valueKind{valueDefault}, nil)
@@ -588,7 +590,7 @@ func TestBuildCypherRowsResultRecoversPanic(t *testing.T) {
 		},
 	}
 
-	result, ok := buildCypherRowsResult(snap, rs, []valueKind{valueDefault}, nil)
+	result, ok := buildCypherRowsResult(snapshot.NewView(snap), rs, []valueKind{valueDefault}, nil)
 	if ok {
 		t.Fatalf("buildCypherRowsResult: ok = true, want false (poison NodeID should panic and be recovered)")
 	}

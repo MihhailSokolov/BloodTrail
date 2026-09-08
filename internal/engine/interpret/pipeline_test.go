@@ -617,7 +617,7 @@ func TestLimitTarget(t *testing.T) {
 // runComponentLimited ever runs even once -- no early stop, and no work
 // reduction, would be observable at all. This is deliberately NOT the small
 // fixture size the rest of this file's tests use.
-func buildManyEnabledUsers(t *testing.T, n int) *snapshot.Snapshot {
+func buildManyEnabledUsers(t *testing.T, n int) *snapshot.View {
 	t.Helper()
 	const kindUser snapshot.KindID = 1
 	nodes := make([]execNodeSpec, n)

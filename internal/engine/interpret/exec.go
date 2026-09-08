@@ -1033,7 +1033,7 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 		// PostgreSQL enforces no uniqueness constraint on objectid, so more
 		// than one node can carry the same value; visit every one of them
 		// (NodesByObjectID), not just an arbitrary witness -- see its doc.
-		if ids, ok := env.Snap.Props.NodesByObjectID(*nc.ObjectIDAnchor); ok {
+		if ids, ok := env.Snap.NodesByObjectID(*nc.ObjectIDAnchor); ok {
 			for _, id := range ids {
 				if err := admit(id); err != nil {
 					return err
@@ -1092,8 +1092,7 @@ func nodeSatisfiesConstraint(env *Env, nc *NodeConstraint, id snapshot.NodeID) b
 		return true
 	}
 	if len(nc.Kinds) > 0 {
-		lo, hi := env.Snap.KindOffsets[id], env.Snap.KindOffsets[id+1]
-		have := env.Snap.NodeKinds[lo:hi]
+		have := env.Snap.KindIDsOf(id)
 		for _, k := range nc.Kinds {
 			if !containsKindID(have, k) {
 				return false
@@ -1101,7 +1100,7 @@ func nodeSatisfiesConstraint(env *Env, nc *NodeConstraint, id snapshot.NodeID) b
 		}
 	}
 	if len(nc.IDs) > 0 {
-		dbID := env.Snap.GraphIDs[id]
+		dbID := env.Snap.GraphID(id)
 		found := false
 		for _, want := range nc.IDs {
 			if want == dbID {
@@ -1114,7 +1113,7 @@ func nodeSatisfiesConstraint(env *Env, nc *NodeConstraint, id snapshot.NodeID) b
 		}
 	}
 	if nc.ObjectIDAnchor != nil {
-		ids, ok := env.Snap.Props.NodesByObjectID(*nc.ObjectIDAnchor)
+		ids, ok := env.Snap.NodesByObjectID(*nc.ObjectIDAnchor)
 		if !ok || !containsNodeID(ids, id) {
 			return false
 		}
@@ -1206,8 +1205,8 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 	sameSymbol := step.FromSym == step.ToSym
 
 	visitOut := func() error {
-		targets, kinds := env.Snap.Out(bound)
-		lo := env.Snap.OutOffsets[bound]
+		targets, kinds, _ := env.Snap.Out(bound)
+		lo := env.Snap.Base().OutOffsets[bound]
 		for i, other := range targets {
 			if err := meter.spend(1); err != nil {
 				return err
@@ -1220,8 +1219,8 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 		return nil
 	}
 	visitIn := func() error {
-		sources, kinds := env.Snap.In(bound)
-		lo := env.Snap.InOffsets[bound]
+		sources, kinds, _ := env.Snap.In(bound)
+		lo := env.Snap.Base().InOffsets[bound]
 		for i, other := range sources {
 			if err := meter.spend(1); err != nil {
 				return err
@@ -1229,7 +1228,7 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 			if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
 				continue
 			}
-			out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: uint64(env.Snap.InEdgeIdx[lo+uint64(i)])})
+			out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: uint64(env.Snap.Base().InEdgeIdx[lo+uint64(i)])})
 		}
 		return nil
 	}

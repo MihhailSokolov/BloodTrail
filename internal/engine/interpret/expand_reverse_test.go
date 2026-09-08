@@ -18,7 +18,7 @@ import (
 // pair runComponent hands expandVarLengthComponent -- so a test can drive the
 // forward-seeded and the constrained-side-seeded executors directly, side by
 // side, over identical inputs.
-func varLengthPartAndStep(t *testing.T, snap *snapshot.Snapshot, query string) (*Part, *Step) {
+func varLengthPartAndStep(t *testing.T, snap *snapshot.View, query string) (*Part, *Step) {
 	t.Helper()
 	q := planQuery(t, snap, query)
 	if len(q.Parts) != 1 {
@@ -42,7 +42,7 @@ func varLengthPartAndStep(t *testing.T, snap *snapshot.Snapshot, query string) (
 // node/edge signature (pathSig). Sorting makes the comparison order-
 // independent while keeping MULTIPLICITY significant -- two rows binding the
 // same endpoint pair via two distinct trails stay two separate entries.
-func varLengthRowSigs(t *testing.T, snap *snapshot.Snapshot, step *Step, rows []*Row) []string {
+func varLengthRowSigs(t *testing.T, snap *snapshot.View, step *Step, rows []*Row) []string {
 	t.Helper()
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
@@ -51,7 +51,7 @@ func varLengthRowSigs(t *testing.T, snap *snapshot.Snapshot, step *Step, rows []
 		if !okFrom || !okTo {
 			t.Fatalf("row is missing an endpoint binding (%s bound: %v, %s bound: %v)", step.FromSym, okFrom, step.ToSym, okTo)
 		}
-		sig := fmt.Sprintf("%s=%d %s=%d", step.FromSym, snap.GraphIDs[from], step.ToSym, snap.GraphIDs[to])
+		sig := fmt.Sprintf("%s=%d %s=%d", step.FromSym, snap.GraphID(from), step.ToSym, snap.GraphID(to))
 		if step.PathSym != "" {
 			v, ok := r.PathVar(step.PathSym)
 			if !ok {
@@ -85,7 +85,7 @@ func varLengthRowSigs(t *testing.T, snap *snapshot.Snapshot, step *Step, rows []
 // produce and Part.Where (which always carries those same conjuncts in full)
 // then discards. Post-WHERE is the only stage at which the two are required to
 // agree, and the only one any caller ever observes.
-func runVarLengthBothWays(t *testing.T, snap *snapshot.Snapshot, query string) (forward, reverse []string, forwardWork, reverseWork int64) {
+func runVarLengthBothWays(t *testing.T, snap *snapshot.View, query string) (forward, reverse []string, forwardWork, reverseWork int64) {
 	t.Helper()
 	env := &Env{Snap: snap}
 	part, step := varLengthPartAndStep(t, snap, query)
@@ -125,7 +125,7 @@ func runVarLengthBothWays(t *testing.T, snap *snapshot.Snapshot, query string) (
 // dispatcher's scan-tier requirement now correctly refuses to reverse for
 // cost reasons -- see varLengthReverseEligible's doc comment on why a kind
 // bitmap near side, though not "narrowing", is still excluded.
-func assertVarLengthRowsAgree(t *testing.T, snap *snapshot.Snapshot, query string) {
+func assertVarLengthRowsAgree(t *testing.T, snap *snapshot.View, query string) {
 	t.Helper()
 	forward, reverse, _, _ := runVarLengthBothWays(t, snap, query)
 	if len(forward) != len(reverse) {
@@ -143,7 +143,7 @@ func assertVarLengthRowsAgree(t *testing.T, snap *snapshot.Snapshot, query strin
 // runVarLengthBothWays), and -- so the comparison can never quietly become
 // vacuous -- that the dispatcher's own eligibility rule actually selects the
 // reverse route for this shape.
-func assertVarLengthDirectionsAgree(t *testing.T, snap *snapshot.Snapshot, query string) {
+func assertVarLengthDirectionsAgree(t *testing.T, snap *snapshot.View, query string) {
 	t.Helper()
 	env := &Env{Snap: snap}
 	part, step := varLengthPartAndStep(t, snap, query)
@@ -185,7 +185,7 @@ var revKindTable = map[snapshot.KindID]string{
 //   - a Target node whose objectid does NOT match (node 7), so the
 //     constrained-side seed selection has something to reject,
 //   - an isolated node (8) reachable from nothing.
-func buildReverseEqualityFixture(t *testing.T) *snapshot.Snapshot {
+func buildReverseEqualityFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	return buildExecSnapshot(t, revKindTable,
 		[]execNodeSpec{
@@ -328,7 +328,7 @@ func TestVarLengthReverseMultiplicity(t *testing.T) {
 // (a self-loop reached deeper is legal and extendable, e.g. `[3 -> 1 -(self)-
 // 1]`); it has to suppress emission at exactly the moment the most recently
 // walked edge is a self-loop and the trail is already two or more edges long.
-func buildReverseSelfLoopFixture(t *testing.T) *snapshot.Snapshot {
+func buildReverseSelfLoopFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	return buildExecSnapshot(t, revKindTable,
 		[]execNodeSpec{
@@ -587,7 +587,7 @@ func TestVarLengthReverseEligible(t *testing.T) {
 // regardless of that bitmap's one member's in-degree. Requiring the near
 // side to additionally be a full scan (tierScan) is what rules this out --
 // see varLengthReverseEligible's doc comment.
-func buildReverseHighInDegreeHubFixture(t *testing.T, fanIn int) *snapshot.Snapshot {
+func buildReverseHighInDegreeHubFixture(t *testing.T, fanIn int) *snapshot.View {
 	t.Helper()
 	const hubID = 2
 	nodes := []execNodeSpec{
@@ -684,7 +684,7 @@ func TestVarLengthReverseRejectsHighInDegreeHub(t *testing.T) {
 // single objectid-anchored Target. Forward expansion has to visit every one of
 // them (a full-snapshot anchor scan plus one expansion per node); backward
 // expansion starts from the one Target and walks a single edge.
-func buildReverseAsymmetricFixture(t *testing.T, wide int) *snapshot.Snapshot {
+func buildReverseAsymmetricFixture(t *testing.T, wide int) *snapshot.View {
 	t.Helper()
 	nodes := make([]execNodeSpec, 0, wide+1)
 	for i := 1; i <= wide; i++ {

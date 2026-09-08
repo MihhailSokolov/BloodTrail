@@ -98,19 +98,19 @@ const (
 // it the post-hydration snapshotStillCurrent recheck, entirely for a
 // pure-scalar/node result that never touched anything hydration or the
 // recheck could catch.
-func collectEdgeIDs(snap *snapshot.Snapshot, rs *interpret.ResultSet) []uint64 {
+func collectEdgeIDs(snap *snapshot.View, rs *interpret.ResultSet) []uint64 {
 	var ids []uint64
 	for _, row := range rs.Rows {
 		for _, v := range row {
 			switch v.Kind {
 			case interpret.OutEdge:
-				ids = append(ids, snap.OutEdgeIDs[v.Edge.Fwd])
+				ids = append(ids, snap.Base().OutEdgeIDs[v.Edge.Fwd])
 			case interpret.OutPath:
 				if v.Path == nil {
 					continue
 				}
 				for _, e := range v.Path.Edges {
-					ids = append(ids, snap.OutEdgeIDs[e.Fwd])
+					ids = append(ids, snap.Base().OutEdgeIDs[e.Fwd])
 				}
 			}
 		}
@@ -219,15 +219,15 @@ func safeExecuteCypher(env *interpret.Env, q *interpret.Query, b interpret.Budge
 // database's entire global `kind` table (see LoadSnapshot), independent of
 // which kinds any one node happens to carry, so every KindID a node's
 // kind_ids slice can contain was already registered there.
-func materializeNode(snap *snapshot.Snapshot, n snapshot.NodeID) *graph.Node {
-	lo, hi := snap.KindOffsets[n], snap.KindOffsets[n+1]
-	kinds := make(graph.Kinds, 0, hi-lo)
-	for _, id := range snap.NodeKinds[lo:hi] {
-		if name, ok := snap.Kinds.Name(id); ok {
+func materializeNode(snap *snapshot.View, n snapshot.NodeID) *graph.Node {
+	kindIDs := snap.KindIDsOf(n)
+	kinds := make(graph.Kinds, 0, len(kindIDs))
+	for _, id := range kindIDs {
+		if name, ok := snap.Kinds().Name(id); ok {
 			kinds = append(kinds, graph.StringKind(name))
 		}
 	}
-	return graph.NewNode(graph.ID(snap.GraphIDs[n]), graph.AsProperties(snap.Props.NodeMap(n)), kinds...)
+	return graph.NewNode(graph.ID(snap.GraphID(n)), graph.AsProperties(snap.PropNodeMap(n)), kinds...)
 }
 
 // materializeEdge builds a full graph.Relationship for one forward-CSR
@@ -255,16 +255,16 @@ func materializeNode(snap *snapshot.Snapshot, n snapshot.NodeID) *graph.Node {
 // its own loop index to OutOffsets[bound] (see adjCandidate's doc comment
 // there). edgeSource below inverts that arithmetic for a caller that has
 // only the resulting flat index left.
-func materializeEdge(snap *snapshot.Snapshot, e interpret.EdgeRef, props *graph.Properties) *graph.Relationship {
+func materializeEdge(snap *snapshot.View, e interpret.EdgeRef, props *graph.Properties) *graph.Relationship {
 	fwd := e.Fwd
 	start := edgeSource(snap, fwd)
-	end := snap.OutTargets[fwd]
-	name, _ := snap.Kinds.Name(snap.OutKinds[fwd])
+	end := snap.Base().OutTargets[fwd]
+	name, _ := snap.Kinds().Name(snap.Base().OutKinds[fwd])
 
 	return graph.NewRelationship(
-		graph.ID(snap.OutEdgeIDs[fwd]),
-		graph.ID(snap.GraphIDs[start]),
-		graph.ID(snap.GraphIDs[end]),
+		graph.ID(snap.Base().OutEdgeIDs[fwd]),
+		graph.ID(snap.GraphID(start)),
+		graph.ID(snap.GraphID(end)),
 		props,
 		graph.StringKind(name),
 	)
@@ -278,9 +278,9 @@ func materializeEdge(snap *snapshot.Snapshot, e interpret.EdgeRef, props *graph.
 // find the smallest i with OutOffsets[i+1] > fwd -- exactly that unique
 // row, including correctly skipping over any zero-out-degree node whose
 // segment is empty (OutOffsets[i] == OutOffsets[i+1]).
-func edgeSource(snap *snapshot.Snapshot, fwd uint64) snapshot.NodeID {
-	n := len(snap.OutOffsets) - 1
-	i := sort.Search(n, func(i int) bool { return snap.OutOffsets[i+1] > fwd })
+func edgeSource(snap *snapshot.View, fwd uint64) snapshot.NodeID {
+	n := len(snap.Base().OutOffsets) - 1
+	i := sort.Search(n, func(i int) bool { return snap.Base().OutOffsets[i+1] > fwd })
 	return snapshot.NodeID(i)
 }
 
@@ -308,7 +308,7 @@ func edgeSource(snap *snapshot.Snapshot, fwd uint64) snapshot.NodeID {
 // defensive, since nothing in this milestone's execution model is expected
 // to call this with a nil *PathVal (OutVal.Path is always non-nil whenever
 // OutVal.Kind is OutPath).
-func materializePath(snap *snapshot.Snapshot, p *interpret.PathVal, edgeProps map[uint64]*graph.Properties) graph.Path {
+func materializePath(snap *snapshot.View, p *interpret.PathVal, edgeProps map[uint64]*graph.Properties) graph.Path {
 	if p == nil {
 		return graph.Path{}
 	}
@@ -333,8 +333,8 @@ func materializePath(snap *snapshot.Snapshot, p *interpret.PathVal, edgeProps ma
 // projection column) so the two never disagree on the missing-entry
 // fallback -- see materializePath's doc for why absence is not treated as
 // an error here.
-func edgePropsFor(snap *snapshot.Snapshot, edgeProps map[uint64]*graph.Properties, e interpret.EdgeRef) *graph.Properties {
-	if props, ok := edgeProps[snap.OutEdgeIDs[e.Fwd]]; ok && props != nil {
+func edgePropsFor(snap *snapshot.View, edgeProps map[uint64]*graph.Properties, e interpret.EdgeRef) *graph.Properties {
+	if props, ok := edgeProps[snap.Base().OutEdgeIDs[e.Fwd]]; ok && props != nil {
 		return props
 	}
 	return graph.NewProperties()
@@ -528,7 +528,7 @@ func materializeScalar(v any, vk valueKind) any {
 //
 // The zero value is not useful; construct with newCypherRowsResult.
 type cypherRowsResult struct {
-	snap      *snapshot.Snapshot
+	snap      *snapshot.View
 	keys      []string
 	kinds     []valueKind // index-aligned with the original rows/keys, from projectionValueKinds
 	edgeProps map[uint64]*graph.Properties
@@ -562,7 +562,7 @@ type cypherRowsResult struct {
 // test code that calls it directly (as several serve_cypher_test.go cases
 // do, deliberately exercising known-good fixtures) gets an ordinary panic
 // on a genuine bug, same as before this fix.
-func newCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) graph.Result {
+func newCypherRowsResult(snap *snapshot.View, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) graph.Result {
 	r := &cypherRowsResult{
 		snap:      snap,
 		keys:      rs.Keys,
@@ -585,7 +585,7 @@ func newCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds
 // cypherRowsResult's own doc. This is the constructor
 // TryCypher's pipeline actually calls; newCypherRowsResult itself stays
 // available, unwrapped, for test code exercising known-good fixtures.
-func buildCypherRowsResult(snap *snapshot.Snapshot, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) (result graph.Result, ok bool) {
+func buildCypherRowsResult(snap *snapshot.View, rs *interpret.ResultSet, kinds []valueKind, edgeProps map[uint64]*graph.Properties) (result graph.Result, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			result, ok = nil, false

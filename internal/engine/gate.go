@@ -107,14 +107,14 @@ func (m snapshotKindMapper) AssertKinds(context.Context, graph.Kinds) ([]int16, 
 // input tree, and a panic during a gate check must never propagate out and
 // take down the query-serving path the same way an ordinary translation
 // error would not.
-func translateGateOK(ctx context.Context, q *cypher.RegularQuery, snap *snapshot.Snapshot) (ok bool) {
+func translateGateOK(ctx context.Context, q *cypher.RegularQuery, snap *snapshot.View) (ok bool) {
 	defer func() {
 		if recover() != nil {
 			ok = false
 		}
 	}()
 
-	mapper := snapshotKindMapper{kinds: snap.Kinds}
-	_, err := translate.Translate(ctx, q, mapper, nil, int32(snap.GraphID))
+	mapper := snapshotKindMapper{kinds: snap.Kinds()}
+	_, err := translate.Translate(ctx, q, mapper, nil, int32(snap.Base().GraphID))
 	return err == nil
 }
