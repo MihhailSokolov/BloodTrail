@@ -24,7 +24,10 @@ import (
 //   - dup1, dup2: RBNode-kind nodes both carrying objectid "dup-oid" -- the
 //     duplicate-objectid pair readBackNodesByObjectID must return both
 //     halves of.
-//   - edge1 = n1 -> n2 (RBEdge), edge2 = n2 -> n3 (RBEdge).
+//   - edge1 = n1 -> n2 (RBEdge), edge2 = n2 -> n3 (RBEdge), edge3 = n1 ->
+//     dup1 (RBEdge) -- edge3 backs exactly one half of the objectid-triple
+//     cross product below; the other half (n1 -> dup2) is deliberately
+//     left unseeded.
 //   - runtimeNode: created with RuntimeKind only AFTER the engine's
 //     snapshot is built (RebuildNow), so RuntimeKind is absent from that
 //     snapshot's own kind table -- the "kind you register at runtime" case
@@ -43,7 +46,14 @@ import (
 //     resolve to a KindID at all.
 //   - EdgeTriplesByObjectID: ("n1-oid", "missing-oid", RBEdge) -- the end
 //     endpoint's objectid matches no node, so the whole triple is
-//     unresolvable.
+//     unresolvable. ("n1-oid", "dup-oid", RBEdge), recorded twice
+//     (dedup must hold) -- both endpoints resolve, "n1-oid" to the single
+//     node n1 and "dup-oid" to the pair dup1/dup2, so this expands into the
+//     id-pair cross product {(n1,dup1), (n1,dup2)}: (n1,dup1) matches
+//     edge3 and must appear in result.edges, while (n1,dup2) has no
+//     backing edge and must appear in absentTriples with RBEdge's real,
+//     resolved KindID (not the unresolvedTripleKind sentinel, since RBEdge
+//     itself resolves fine -- only the specific triple doesn't exist).
 func TestReadBack(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
@@ -61,7 +71,7 @@ func TestReadBack(t *testing.T) {
 	}
 
 	var n1, n2, n3, dup1, dup2 graph.ID
-	var edge1, edge2 graph.ID
+	var edge1, edge2, edge3 graph.ID
 
 	err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		node1, err := tx.CreateNode(graph.NewProperties().Set("objectid", "n1-oid"), rbNodeKind)
@@ -106,6 +116,12 @@ func TestReadBack(t *testing.T) {
 		}
 		edge2 = e2.ID
 
+		e3, err := tx.CreateRelationshipByIDs(n1, dup1, rbEdgeKind, graph.NewProperties())
+		if err != nil {
+			return err
+		}
+		edge3 = e3.ID
+
 		return nil
 	})
 	if err != nil {
@@ -142,6 +158,11 @@ func TestReadBack(t *testing.T) {
 		t.Fatalf("map runtime kind: %v", err)
 	}
 
+	rbEdgeKindID, err := pgDriver.KindMapper().MapKind(ctx, rbEdgeKind)
+	if err != nil {
+		t.Fatalf("map RBEdge kind: %v", err)
+	}
+
 	fabricatedNodeID := graph.ID(uint64(n3) + 1_000_000)
 	fabricatedEdgeID := graph.ID(uint64(edge2) + 1_000_000)
 
@@ -161,6 +182,8 @@ func TestReadBack(t *testing.T) {
 	cs.RecordEdgeTriple(n1, n2, neverRegisteredKind)
 
 	cs.RecordEdgeTripleByObjectID("n1-oid", "missing-oid", rbEdgeKind)
+	cs.RecordEdgeTripleByObjectID("n1-oid", "dup-oid", rbEdgeKind)
+	cs.RecordEdgeTripleByObjectID("n1-oid", "dup-oid", rbEdgeKind) // recorded twice: dedup must hold
 
 	got, err := e.readBack(ctx, cs)
 	if err != nil {
@@ -195,9 +218,11 @@ func TestReadBack(t *testing.T) {
 	// --- edges ---
 	wantEdgeIDs := map[uint64]struct {
 		start, end uint64
+		kindID     int16
 	}{
-		uint64(edge1): {uint64(n1), uint64(n2)},
-		uint64(edge2): {uint64(n2), uint64(n3)},
+		uint64(edge1): {uint64(n1), uint64(n2), rbEdgeKindID},
+		uint64(edge2): {uint64(n2), uint64(n3), rbEdgeKindID},
+		uint64(edge3): {uint64(n1), uint64(dup1), rbEdgeKindID},
 	}
 	if len(got.edges) != len(wantEdgeIDs) {
 		t.Fatalf("edges = %d entries, want %d: %+v", len(got.edges), len(wantEdgeIDs), got.edges)
@@ -207,8 +232,9 @@ func TestReadBack(t *testing.T) {
 		if !ok {
 			t.Fatalf("edges: unexpected id %d", es.id)
 		}
-		if es.start != want.start || es.end != want.end {
-			t.Fatalf("edges: id %d = (%d -> %d), want (%d -> %d)", es.id, es.start, es.end, want.start, want.end)
+		if es.start != want.start || es.end != want.end || es.kindID != want.kindID {
+			t.Fatalf("edges: id %d = (%d -> %d, kind %d), want (%d -> %d, kind %d)",
+				es.id, es.start, es.end, es.kindID, want.start, want.end, want.kindID)
 		}
 	}
 
@@ -216,9 +242,22 @@ func TestReadBack(t *testing.T) {
 		t.Fatalf("absentEdgeIDs = %v, want [%d]", got.absentEdgeIDs, uint64(fabricatedEdgeID))
 	}
 
-	wantAbsentTriple := tripleKey{start: uint64(n1), end: uint64(n2), kindID: unresolvedTripleKind}
-	if len(got.absentTriples) != 1 || got.absentTriples[0] != wantAbsentTriple {
-		t.Fatalf("absentTriples = %+v, want [%+v]", got.absentTriples, wantAbsentTriple)
+	// (n1, n2, NeverRegisteredKind) can't resolve its kind at all, so it's
+	// reported under the unresolvedTripleKind sentinel; (n1, dup2, RBEdge)
+	// is the unbacked half of the objectid-triple cross product, reported
+	// with RBEdge's real, resolved KindID. Recording ("n1-oid", "dup-oid",
+	// RBEdge) twice above must not duplicate this second entry.
+	wantAbsentTriples := map[tripleKey]struct{}{
+		{start: uint64(n1), end: uint64(n2), kindID: unresolvedTripleKind}: {},
+		{start: uint64(n1), end: uint64(dup2), kindID: rbEdgeKindID}:       {},
+	}
+	if len(got.absentTriples) != len(wantAbsentTriples) {
+		t.Fatalf("absentTriples = %+v, want %d entries: %+v", got.absentTriples, len(wantAbsentTriples), wantAbsentTriples)
+	}
+	for _, tk := range got.absentTriples {
+		if _, ok := wantAbsentTriples[tk]; !ok {
+			t.Fatalf("absentTriples: unexpected entry %+v", tk)
+		}
 	}
 
 	// --- resolvedKinds ---

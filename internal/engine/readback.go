@@ -123,15 +123,17 @@ type readbackResult struct {
 //     an objectid it happens to carry is reported exactly once.
 //  3. cs.EdgeIDs() by database id (readBackEdgesByID), mirroring (1).
 //  4. cs.EdgeTriples() by (start, end, kind name) -- resolveTripleKindIDs
-//     resolves each distinct kind name to its current KindID via
-//     e.pgDriver.KindMapper().MapKind; a name that doesn't resolve at all
-//     means the edge cannot possibly exist (PostgreSQL has never heard of
-//     that kind), so the triple is reported absent (kindID
-//     unresolvedTripleKind) without ever being queried. Every triple whose
-//     kind does resolve is queried in one shared batch pass together with
-//     (5) below (readBackEdgesByTriple, adapted from hydrate.go's own
-//     edgeBatchQuery); a triple not found in the result is reported via
-//     absentTriples with its real, resolved kindID.
+//     resolves each distinct kind name to its current KindID; a name that
+//     ends up unresolved (genuinely never asserted, per resolveTripleKindIDs'
+//     own doc -- which also covers the residual ambiguity a name can be
+//     unresolved for) means the triple is reported absent (kindID
+//     unresolvedTripleKind) without ever being queried. A hard failure
+//     resolving kind ids (ctx cancellation or deadline) aborts readBack
+//     entirely instead of guessing -- see resolveTripleKindIDs' own doc.
+//     Every triple whose kind does resolve is queried in one shared batch
+//     pass together with (5) below (readBackEdgesByTriple, adapted from
+//     hydrate.go's own edgeBatchQuery); a triple not found in the result is
+//     reported via absentTriples with its real, resolved kindID.
 //  5. cs.EdgeTriplesByObjectID() -- each endpoint objectid is resolved
 //     against (2)'s own result rather than queried again: a pair where
 //     either endpoint's objectid matched zero rows in (2) is reported as
@@ -225,7 +227,10 @@ func (e *Engine) readBack(ctx context.Context, cs *ChangeSet) (*readbackResult, 
 	for _, t := range oidTriples {
 		kindNames = append(kindNames, t.Kind)
 	}
-	resolvedTripleKinds := resolveTripleKindIDs(ctx, kindMapper, kindNames)
+	resolvedTripleKinds, err := resolveTripleKindIDs(ctx, kindMapper, kindNames)
+	if err != nil {
+		return nil, err
+	}
 
 	pending := make(map[edgeKey]struct{})
 	absentTriples := make(map[tripleKey]struct{})
@@ -348,13 +353,66 @@ func kindKnownToView(view *snapshot.View, id int16) bool {
 }
 
 // resolveTripleKindIDs resolves every distinct kind name among kinds to its
-// current PostgreSQL KindID via kindMapper.MapKind, deduplicating by name so
-// a kind shared by many triples costs one call, not one per triple. A name
-// kindMapper doesn't recognize is simply absent from the result -- callers
-// treat that as "this triple's kind was never asserted, so the edge cannot
-// exist" rather than as an error, per readBack's own doc.
-func resolveTripleKindIDs(ctx context.Context, kindMapper pg.KindMapper, kinds []graph.Kind) map[string]int16 {
-	resolved := make(map[string]int16, len(kinds))
+// current PostgreSQL KindID, deduplicating by name so a kind shared by many
+// triples costs one lookup, not one per triple. A name that ends up
+// unresolved is simply absent from the result -- callers treat that as
+// "this triple's kind was never asserted, so the edge cannot exist" rather
+// than as an error, per readBack's own doc -- except when the underlying
+// failure is a hard error (see below), which resolveTripleKindIDs itself
+// returns rather than silently folding into "unresolved".
+//
+// dawgs' pg.KindMapper (v0.8.0, drivers/pg/manager.go) gives MapKind and
+// MapKinds a single opaque error return that conflates two very different
+// situations: a kind name PostgreSQL has genuinely never heard of (fetched
+// the current kind table and it just isn't in there), and a Fetch failure
+// while refreshing that kind table (context cancellation, connection pool
+// exhaustion, any other transport error) -- there is no sentinel or typed
+// error to tell them apart. Treating both the same way, as earlier versions
+// of this function did, is wrong: if the write's own ctx has already been
+// cancelled or hit its deadline, that failure has nothing to do with
+// whether the kind was ever asserted, and reporting the affected triples
+// "absent" would let readBack return a confidently-wrong result instead of
+// the error the applier needs in order to fall back to a full resync (see
+// readBack's own doc).
+//
+// So every MapKind/MapKinds error is checked against ctx.Err() before it is
+// allowed to mean "unresolved": a non-nil ctx.Err() means the error IS the
+// cancellation, and resolveTripleKindIDs aborts immediately, returning it
+// as a hard error. Only once ctx is confirmed still live does a mapper
+// error get treated as "this kind name doesn't exist".
+//
+// The resolution itself tries kindMapper.MapKinds first, as one batched,
+// all-or-nothing round trip covering every deduplicated kind at once: when
+// every one of them resolves (by far the common case -- a write's own kinds
+// were necessarily asserted before anything could reference them), that
+// single call is all this function ever does. MapKinds has no partial
+// result to return on error (mapKinds' own all-or-nothing contract, dawgs
+// manager.go), so a batch failure -- once ruled out as ctx cancellation --
+// falls back to resolving each deduplicated kind with its own MapKind call,
+// confining one bad or failing name's damage to that name's own triples
+// rather than the whole batch, exactly as a pure per-kind loop always has.
+//
+// Residual ambiguity, accepted as a dawgs v0.8.0 API limitation: a non-ctx
+// infrastructure failure mid-Fetch (ctx still live, e.g. a transient
+// connection-pool exhaustion) still can't be told apart from a genuinely
+// unasserted kind, so the per-kind fallback still misclassifies it as
+// "unresolved" rather than retrying or erroring. The blast radius is
+// bounded, not eliminated, by the per-kind fallback above: only that one
+// kind name's triples are affected, and readBack folds them into
+// absentTriples under the unresolvedTripleKind sentinel (-1) rather than a
+// real KindID. That sentinel can never match a real edge's kind id in the
+// engine's current View -- kindKnownToView's own doc: "a KindTable never
+// registers a negative id" -- and the only way a future applier can turn an
+// absentTriples entry into a concrete tombstone is by resolving it to a
+// real edge id via the View's own adjacency first (SegmentBuilder.
+// TombstoneEdge, snapshot/segment.go, takes an edge id, not a triple), so a
+// sentinel-kinded entry can never resolve to one. The observable failure
+// mode of this residual ambiguity is therefore a false negative -- a
+// just-created edge of that kind silently missing from the resulting View
+// -- rather than a wrong tombstone of a pre-existing, unrelated View edge.
+func resolveTripleKindIDs(ctx context.Context, kindMapper pg.KindMapper, kinds []graph.Kind) (map[string]int16, error) {
+	names := make([]string, 0, len(kinds))
+	deduped := make(graph.Kinds, 0, len(kinds))
 	seen := make(map[string]struct{}, len(kinds))
 
 	for _, kind := range kinds {
@@ -363,13 +421,41 @@ func resolveTripleKindIDs(ctx context.Context, kindMapper pg.KindMapper, kinds [
 			continue
 		}
 		seen[name] = struct{}{}
-
-		if id, err := kindMapper.MapKind(ctx, kind); err == nil {
-			resolved[name] = id
-		}
+		names = append(names, name)
+		deduped = append(deduped, kind)
 	}
 
-	return resolved
+	resolved := make(map[string]int16, len(deduped))
+	if len(deduped) == 0 {
+		return resolved, nil
+	}
+
+	if ids, err := kindMapper.MapKinds(ctx, deduped); err == nil {
+		for i, id := range ids {
+			resolved[names[i]] = id
+		}
+		return resolved, nil
+	} else if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("engine: readBack: resolve triple kind ids: %w", ctxErr)
+	}
+
+	// The batch call failed for a reason other than ctx cancellation --
+	// most likely at least one deduplicated name doesn't exist, but per
+	// this function's own doc that can't be told apart from an infra
+	// failure. Fall back to resolving each name on its own so only that
+	// name's triples are affected.
+	for i, kind := range deduped {
+		id, err := kindMapper.MapKind(ctx, kind)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("engine: readBack: resolve triple kind ids: %w", ctxErr)
+			}
+			continue
+		}
+		resolved[names[i]] = id
+	}
+
+	return resolved, nil
 }
 
 // readBackNodesByID fetches every node in ids from graphID, in batches of at
