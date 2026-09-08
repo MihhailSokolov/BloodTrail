@@ -16,9 +16,9 @@ import (
 // touched, instead of the all-or-nothing "something changed" a bare
 // engine.NoteWrite(nil) reports. Every override records onto scope before
 // (or, for Query, without knowing whether it needs to) delegating to the
-// inner transaction; every call this file does not override (Commit,
-// UpdateRelationship, GraphQueryMemoryLimit) is promoted straight through by
-// embedding, unchanged.
+// inner transaction; every call this file does not override (UpdateRelationship,
+// GraphQueryMemoryLimit) is promoted straight through by embedding,
+// unchanged. Commit IS overridden, below, for its own reason.
 //
 // UpdateRelationship is deliberately not overridden: a graph.Relationship's
 // Kind is fixed at creation (relationships.go has no AddedKind/DeletedKind
@@ -31,10 +31,55 @@ import (
 // observingTransaction WithGraph returns, so every write reachable from one
 // WriteTransaction call accumulates onto the one scope Driver.
 // WriteTransaction hands to engine.NoteWrite once the call succeeds.
+//
+// eng is used by Commit alone, to flush scope immediately on a
+// delegate-issued mid-transaction commit, mirroring observingBatch's own eng
+// field and Commit override (see Commit's doc below) -- it is never
+// consulted to decide whether a read can be served from the engine, and no
+// method on this type, observingNodeQuery, or observingRelationshipQuery
+// ever calls into eng (or any engine) for a read: every one of them wraps
+// the driver's raw graph.Transaction/NodeQuery/RelationshipQuery directly
+// (Driver.WriteTransaction, driver.go), never a wrappedTransaction/
+// recordingNodeQuery/recordingRelationshipQuery (transaction.go,
+// node_query.go, relationship_query.go) -- so there is no serving decision
+// point anywhere on a WriteTransaction's read path for wrote() (below) to
+// guard today. This is a verified, pinned fact, not an assumption: see
+// TestWriteTransactionReadAfterWriteDelegatesToPG and
+// TestBatchReadAfterWriteDelegatesToPG (staleness_integration_test.go), and
+// this type's own wrote() doc, for the full argument.
+//
+// wrote() is still added, and referenced from a short note on every method
+// below where a read flows through this type (Query, Nodes, Relationships),
+// as defense against a future change that gives any of these types, or the
+// query wrappers they hand out, direct engine access: whoever adds that must
+// consult wrote() (or the owning transaction's) first and decline -- fall
+// through to the inner, PostgreSQL-backed value -- whenever it reports true,
+// the same way recordingNodeQuery/recordingRelationshipQuery already consult
+// wrappedTransaction.declined today.
 type observingTransaction struct {
 	graph.Transaction
 
 	scope *engine.WriteScope
+	eng   *engine.Engine
+}
+
+// wrote reports whether this transaction has recorded any write onto scope
+// since Driver.WriteTransaction (driver.go) began it -- equivalently,
+// whether scope is non-empty (engine.WriteScope.Empty's doc: no kinds named,
+// no deletions or upserts recorded, and neither TouchAllNodes nor
+// TouchAllEdges called).
+//
+// Once wrote() is true, PostgreSQL -- never this package's in-memory engine
+// -- is the only source of truth for any further read run against this same
+// transaction: the engine's snapshot is only ever brought up to date by the
+// NoteWrite call Driver.WriteTransaction (or, for a mid-transaction commit,
+// Commit below) makes once a write is known to have landed, so by
+// construction it cannot yet reflect a write this same transaction is still
+// in the middle of. See the type doc above for why nothing on this type's
+// read path actually consults wrote() today, and for exactly which future
+// change would need to.
+func (t *observingTransaction) wrote() bool {
+	return !t.scope.Empty()
 }
 
 // CreateNode touches every kind the new node is created with -- a brand new
@@ -77,7 +122,11 @@ func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID gr
 }
 
 // Nodes returns an observingNodeQuery wrapping the inner transaction's own
-// NodeQuery, so a subsequent Delete() on it can still reach scope.
+// NodeQuery, so a subsequent Delete() on it can still reach scope. The
+// returned query is never engine-serving-capable today (it wraps the raw
+// NodeQuery straight from the driver's transaction, not a
+// recordingNodeQuery) -- see the type doc's composition-point note; a
+// future change that gives it one must decline whenever wrote() is true.
 func (t *observingTransaction) Nodes() graph.NodeQuery {
 	return &observingNodeQuery{NodeQuery: t.Transaction.Nodes(), scope: t.scope}
 }
@@ -85,7 +134,8 @@ func (t *observingTransaction) Nodes() graph.NodeQuery {
 // Relationships returns an observingRelationshipQuery wrapping the inner
 // transaction's own RelationshipQuery, so a subsequent Delete() on it has a
 // chance to scope more narrowly than TouchAllEdges (see
-// observingRelationshipQuery.Delete's doc).
+// observingRelationshipQuery.Delete's doc). See Nodes' doc immediately above
+// for the identical composition-point note.
 func (t *observingTransaction) Relationships() graph.RelationshipQuery {
 	return &observingRelationshipQuery{RelationshipQuery: t.Transaction.Relationships(), scope: t.scope}
 }
@@ -97,6 +147,16 @@ func (t *observingTransaction) Relationships() graph.RelationshipQuery {
 // it actually touched. query always runs against the inner transaction
 // regardless of what cypherMutates reports; the sniff only ever adds a scope
 // mark, never blocks or rewrites the call itself.
+//
+// This method never attempts to serve query from the engine, whether or not
+// wrote() is true: t.Transaction is always the driver's raw
+// graph.Transaction (Driver.WriteTransaction, driver.go), never a
+// wrappedTransaction (transaction.go), so there is no engine.TryCypher call
+// on this path to guard -- see the type doc's composition-point note. A
+// future change that adds one here (e.g. giving a write transaction's
+// not-yet-written reads the same chance ReadTransaction's
+// wrappedTransaction.Query already gets) must skip it whenever wrote()
+// reports true.
 func (t *observingTransaction) Query(query string, parameters map[string]any) graph.Result {
 	if cypherMutates(query) {
 		t.scope.TouchAll()
@@ -118,12 +178,32 @@ func (t *observingTransaction) Raw(query string, parameters map[string]any) grap
 // non-default graph is outside anything this package's kind-scoped tracking
 // reasons about, mirroring wrappedTransaction.WithGraph's own "declined"
 // treatment on the read side -- and returns a fresh observingTransaction
-// wrapping the inner WithGraph's result, sharing the *same* scope so writes
+// wrapping the inner WithGraph's result, sharing the *same* scope (so writes
 // against the retargeted graph still land in the one WriteScope this
-// WriteTransaction call will eventually report.
+// WriteTransaction call will eventually report) and the same eng (so Commit
+// still works correctly on the retargeted wrapper).
 func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transaction {
 	t.scope.TouchAll()
-	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope}
+	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng}
+}
+
+// Commit flushes the accumulated scope to the engine (eng.NoteWrite), then
+// resets scope to a fresh, empty WriteScope, before delegating to the inner
+// transaction's own Commit -- mirroring observingBatch.Commit's identical
+// reasoning below: graph.Transaction's own doc says Commit "calls to commit
+// this transaction right away", so a delegate that calls tx.Commit() itself
+// partway through -- rather than simply returning nil and leaving Driver.
+// WriteTransaction's own commit (driver.go) as the only one -- needs the
+// engine's snapshot invalidated at that same moment, not held back until
+// this WriteTransaction call's own final NoteWrite after the whole delegate
+// returns. Driver.WriteTransaction still calls NoteWrite once more after the
+// delegate returns, reading this transaction's *current* scope value at
+// that point -- which by then may be a different *WriteScope than the one
+// this method reset it to here, exactly as intended (see driver.go's doc).
+func (t *observingTransaction) Commit() error {
+	t.eng.NoteWrite(t.scope)
+	t.scope = engine.NewWriteScope()
+	return t.Transaction.Commit()
 }
 
 // touchNodeKindDelta marks scope with node's AddedKinds and DeletedKinds
@@ -431,13 +511,23 @@ func relationshipKindMatcherKinds(km *cypher.KindMatcher) (graph.Kinds, bool) {
 // The zero value is not useful; construct one with a non-nil scope and eng.
 // eng is only ever used by Commit, to flush scope immediately rather than
 // waiting for the enclosing Driver.BatchOperation call to finish (see
-// Commit's doc for why a batch specifically needs this and a transaction
-// does not).
+// Commit's doc) -- never to decide whether a read can be served from the
+// engine; see observingTransaction's identical doc (write_observer.go above)
+// for why, which applies to this type unchanged.
 type observingBatch struct {
 	graph.Batch
 
 	scope *engine.WriteScope
 	eng   *engine.Engine
+}
+
+// wrote reports whether this batch has recorded any write onto scope since
+// it began (Driver.BatchOperation, driver.go) or since the last Commit
+// flush reset it (Commit's own doc) -- equivalently, whether scope is
+// non-empty. See observingTransaction.wrote's doc for the full reasoning:
+// identical here, substituting "batch" for "transaction" throughout.
+func (b *observingBatch) wrote() bool {
+	return !b.scope.Empty()
 }
 
 // CreateNode touches every kind the new node carries, then delegates.
@@ -456,14 +546,18 @@ func (b *observingBatch) DeleteNode(id graph.ID) error {
 }
 
 // Nodes returns an observingNodeQuery wrapping the inner batch's own
-// NodeQuery, exactly as observingTransaction.Nodes does.
+// NodeQuery, exactly as observingTransaction.Nodes does -- including the
+// same composition-point note: the returned query is never
+// engine-serving-capable today, and a future change that gives it one must
+// decline whenever wrote() is true.
 func (b *observingBatch) Nodes() graph.NodeQuery {
 	return &observingNodeQuery{NodeQuery: b.Batch.Nodes(), scope: b.scope}
 }
 
 // Relationships returns an observingRelationshipQuery wrapping the inner
 // batch's own RelationshipQuery, exactly as observingTransaction.
-// Relationships does.
+// Relationships does. See Nodes' doc immediately above for the identical
+// composition-point note.
 func (b *observingBatch) Relationships() graph.RelationshipQuery {
 	return &observingRelationshipQuery{RelationshipQuery: b.Batch.Relationships(), scope: b.scope}
 }
@@ -602,14 +696,23 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 
 // Commit flushes scope to the engine immediately -- eng.NoteWrite(scope),
 // then a fresh WriteScope for whatever this batch does next -- before
-// delegating to the inner batch's own Commit. A batch, unlike a transaction,
-// is documented to support being committed mid-delegate and continuing to
-// receive more operations afterward (graph.Batch's own doc on Commit: "calls
-// to commit this batch transaction right away"), so a caller relying on that
-// to make an early chunk of a large batch visible needs the engine's
-// snapshot invalidated at that same moment, not held back until Driver.
-// BatchOperation's own NoteWrite call after the whole batch delegate
-// returns. Driver.BatchOperation still calls NoteWrite once more after the
+// delegating to the inner batch's own Commit. A batch is documented to
+// support being committed mid-delegate and continuing to receive more
+// operations afterward (graph.Batch's own doc on Commit: "calls to commit
+// this batch transaction right away"; dawgs' pg batch implementation
+// executes each buffered operation immediately on the connection rather
+// than inside one long-lived database transaction, which is what actually
+// makes "commit, then keep writing" work at the pg level for a batch in a
+// way it is not documented, or verified, to for a plain WriteTransaction),
+// so a caller relying on that to make an early chunk of a large batch
+// visible needs the engine's snapshot invalidated at that same moment, not
+// held back until Driver.BatchOperation's own NoteWrite call after the
+// whole batch delegate returns. observingTransaction.Commit
+// (write_observer.go above) overrides Commit for the same
+// "don't leave a flush invisible" reason, without relying on -- or needing
+// -- that same continue-after-commit guarantee.
+//
+// Driver.BatchOperation still calls NoteWrite once more after the
 // delegate returns (driver.go), reporting whatever scope accumulated since
 // this Commit call (or the whole batch, if Commit was never called
 // mid-delegate) -- reading b.scope's current value at that point, which by

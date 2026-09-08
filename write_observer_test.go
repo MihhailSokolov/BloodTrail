@@ -803,6 +803,111 @@ func TestObservingTransactionWithGraphTouchesScopeAndKeepsObserving(t *testing.T
 	}
 }
 
+func TestObservingTransactionWithGraphKeepsEng(t *testing.T) {
+	retargeted := &fakeTransaction{}
+	inner := &fakeTransaction{withGraphReturn: retargeted}
+	eng := disabledEngine()
+	tx := &observingTransaction{Transaction: inner, scope: engine.NewWriteScope(), eng: eng}
+
+	got := tx.WithGraph(graph.Graph{Name: "other"})
+	wrapped, ok := got.(*observingTransaction)
+	if !ok {
+		t.Fatalf("WithGraph returned %T, want *observingTransaction", got)
+	}
+	if wrapped.eng != eng {
+		t.Fatalf("WithGraph did not carry eng over to the retargeted wrapper -- a later Commit on it would nil-dereference")
+	}
+}
+
+func TestObservingTransactionWroteFalseInitially(t *testing.T) {
+	inner := &fakeTransaction{}
+	tx, _ := newObservingTransaction(inner)
+
+	if tx.wrote() {
+		t.Fatalf("wrote() = true on a transaction that has not made a single call yet")
+	}
+}
+
+func TestObservingTransactionWroteFalseAfterPureRead(t *testing.T) {
+	inner := &fakeTransaction{}
+	tx, _ := newObservingTransaction(inner)
+
+	// A non-mutating Cypher read leaves scope untouched (cypherMutates
+	// reports false for a bare MATCH/RETURN), so it must not flip wrote().
+	tx.Query(`MATCH (n) RETURN n`, nil)
+
+	if tx.wrote() {
+		t.Fatalf("wrote() = true after a pure (non-mutating) read, want false")
+	}
+}
+
+func TestObservingTransactionWroteTrueAfterWrite(t *testing.T) {
+	inner := &fakeTransaction{}
+	tx, _ := newObservingTransaction(inner)
+
+	if _, err := tx.CreateNode(graph.NewProperties(), graph.StringKind("User")); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+
+	if !tx.wrote() {
+		t.Fatalf("wrote() = false after CreateNode touched scope, want true")
+	}
+}
+
+func TestObservingTransactionCommitFlushesNowAndResetsScope(t *testing.T) {
+	inner := &fakeTransaction{}
+	eng := disabledEngine()
+	scope := engine.NewWriteScope()
+	tx := &observingTransaction{Transaction: inner, scope: scope, eng: eng}
+
+	if _, err := tx.CreateNode(graph.NewProperties(), graph.StringKind("User")); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+
+	genBefore := eng.Generation()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: unexpected error: %v", err)
+	}
+	if inner.commitCalls != 1 {
+		t.Fatalf("Commit did not delegate to the inner transaction")
+	}
+	if got := eng.Generation(); got != genBefore+1 {
+		t.Fatalf("Commit did not bump the engine generation immediately: got %d, want %d", got, genBefore+1)
+	}
+	if tx.scope == scope {
+		t.Fatalf("Commit did not replace scope with a new instance")
+	}
+	if !tx.scope.Empty() {
+		t.Fatalf("Commit did not reset scope to a fresh, empty WriteScope")
+	}
+	if tx.wrote() {
+		t.Fatalf("wrote() = true immediately after Commit reset scope, want false")
+	}
+
+	// Writes after the mid-transaction commit are still observed, into the
+	// new scope.
+	if _, err := tx.CreateNode(graph.NewProperties(), graph.StringKind("Computer")); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+	if tx.scope.Empty() {
+		t.Fatalf("post-Commit writes were not observed into the new scope")
+	}
+}
+
+func TestObservingTransactionCommitBumpsGenerationEvenWithEmptyScope(t *testing.T) {
+	inner := &fakeTransaction{}
+	eng := disabledEngine()
+	tx := &observingTransaction{Transaction: inner, scope: engine.NewWriteScope(), eng: eng}
+
+	genBefore := eng.Generation()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: unexpected error: %v", err)
+	}
+	if got := eng.Generation(); got != genBefore+1 {
+		t.Fatalf("Commit with an empty scope did not bump the generation: got %d, want %d", got, genBefore+1)
+	}
+}
+
 // -----------------------------------------------------------------------
 // observingNodeQuery
 // -----------------------------------------------------------------------

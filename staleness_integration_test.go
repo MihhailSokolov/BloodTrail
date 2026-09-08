@@ -1209,3 +1209,263 @@ func TestCypherMultiGraphGuard(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "kind-scoped builder query still serves; the MultiGraph guard is TryCypher-only",
 		func() int64 { return nodeCountByKind(t, ctx, bt, cypherMultiGraphNodeKind) }, 1)
 }
+
+// writeTxReadNodeKind and writeTxReadObjectID are
+// TestWriteTransactionReadAfterWriteDelegatesToPG's own fixture, named
+// distinctly from every other integration test's fixture in this shared,
+// long-lived database (see stalenessNodeKindA's doc for why that matters).
+var writeTxReadNodeKind = graph.StringKind("WriteTxReadNode")
+
+const writeTxReadObjectID = "WriteTxRead-1"
+
+// TestWriteTransactionReadAfterWriteDelegatesToPG pins the correctness rule
+// a WriteTransaction must uphold once it has performed any write: every
+// subsequent read run against that same transaction must see PostgreSQL's
+// own view -- including the transaction's own uncommitted write -- and must
+// never be served from the in-memory engine, which only ever learns about a
+// write at commit (Driver.WriteTransaction's own engine.NoteWrite call,
+// driver.go). Reading a stale, pre-write snapshot back from inside the very
+// transaction that just wrote would silently hide the caller's own write
+// from itself.
+//
+// The Cypher read below (`MATCH (n:WriteTxReadNode) WHERE n.objectid = ...
+// RETURN n.objectid`) is deliberately the same WHERE-objectid-anchor, RETURN
+// -property shape TestCypherStalenessPropertyOnlyWrite above and
+// internal/engine/cypher_integration_test.go's "duplicate objectid anchor"
+// case already prove TryCypher recognizes and serves once the engine is
+// fresh and idle -- confirmed again below, by rerunning the identical query
+// after this test's own transaction commits and the engine rebuilds. That
+// makes the marker delta of 0 asserted for the in-transaction read
+// meaningful evidence of a real decline, not merely "an unrecognized query
+// fell through anyway".
+//
+// Composition finding backing this pin (write_observer.go's own doc on
+// observingTransaction has the full argument): Driver.WriteTransaction
+// (driver.go) wraps the delegate's tx directly in an observingTransaction,
+// never in a wrappedTransaction (transaction.go) -- so
+// observingTransaction.Query/.Nodes()/.Relationships() never reach
+// engine.TryCypher/TryNodeCount/TryRelCount/etc. at all, whether or not a
+// write has already happened on this transaction. This test's core
+// assertion therefore already held, unconditionally, before this change;
+// see observingTransaction.wrote()'s doc for why the explicit wrote() guard
+// is still added to write_observer.go as defense against a future change to
+// that composition, rather than skipped because this pin currently passes
+// either way.
+func TestWriteTransactionReadAfterWriteDelegatesToPG(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	t.Cleanup(func() { _ = bt.Close(ctx) })
+	t.Cleanup(func() { graphtest.WipeGraph(t, pgDriver) })
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	text := fmt.Sprintf(`MATCH (n:WriteTxReadNode) WHERE n.objectid = '%s' RETURN n.objectid`, writeTxReadObjectID)
+
+	// === The pin: create, then read, inside the SAME WriteTransaction. ===
+	before := markerCount(buf, cypherServedMarker)
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		if _, err := tx.CreateNode(graph.NewProperties().Set("objectid", writeTxReadObjectID), writeTxReadNodeKind); err != nil {
+			return err
+		}
+
+		result := tx.Query(text, nil)
+		defer result.Close()
+
+		if !result.Next() {
+			return fmt.Errorf("read-after-write: no rows (query: %s)", text)
+		}
+		values := result.Values()
+		if len(values) != 1 {
+			return fmt.Errorf("read-after-write: %d columns, want 1", len(values))
+		}
+		got, ok := values[0].(string)
+		if !ok {
+			return fmt.Errorf("read-after-write: value %#v is not a string", values[0])
+		}
+		if got != writeTxReadObjectID {
+			return fmt.Errorf("read-after-write: got objectid %q, want %q -- the read did not see this transaction's own write", got, writeTxReadObjectID)
+		}
+		if result.Next() {
+			return fmt.Errorf("read-after-write: more than one row")
+		}
+		return result.Error()
+	}); err != nil {
+		t.Fatalf("WriteTransaction (create then read): %v", err)
+	}
+	if delta := markerCount(buf, cypherServedMarker) - before; delta != 0 {
+		t.Fatalf("cypher read inside the write transaction was served by the engine (marker delta %d, want 0)\ncaptured log:\n%s", delta, buf.String())
+	}
+
+	// === Sanity check on the premise: the identical query, run once the
+	// transaction has committed and the engine has rebuilt, DOES serve --
+	// proving the marker delta of 0 above was a real decline, not a query
+	// shape TryCypher was never going to recognize in the first place. ===
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, cypherServedMarker, 1, "post-commit, post-rebuild: the identical query now serves from the engine",
+		func() string { return cypherStringValue(t, ctx, bt, text) }, writeTxReadObjectID)
+}
+
+// batchReadNodeKind and batchReadObjectID are
+// TestBatchReadAfterWriteDelegatesToPG's own fixture, named distinctly from
+// every other integration test's fixture in this shared, long-lived
+// database (see stalenessNodeKindA's doc for why that matters).
+var batchReadNodeKind = graph.StringKind("BatchReadNode")
+
+const batchReadObjectID = "BatchRead-1"
+
+// TestBatchReadAfterWriteDelegatesToPG is
+// TestWriteTransactionReadAfterWriteDelegatesToPG's batch analogue: once a
+// BatchOperation has performed a write, a subsequent read through that same
+// batch's Nodes()/Relationships() wrappers must reflect PostgreSQL's own
+// view of what was just flushed, never a stale in-memory engine answer.
+// UpdateNodeBy is an upsert (graph.Batch's own doc: "in the case where the
+// node does not yet exist, created") -- since no BatchReadNode exists yet in
+// this test's freshly wiped graph, the call below creates one. UpdateNodeBy
+// buffers, though (dawgs' own nodeUpdateByBuffer): dawgs documents that
+// batch.Nodes()/Relationships() "delegate straight to the inner transaction
+// and execute immediately... they do not see Go-side buffered writes, but
+// do see flushed (committed) chunks" -- so this test calls batch.Commit()
+// (graph.Batch's own doc: "calls to commit this batch transaction right
+// away") between the two to flush that chunk before Count() runs. That
+// Commit call is itself the mid-batch-commit path observingBatch.Commit
+// (write_observer.go) exists for: it also flushes this batch's WriteScope
+// to the engine immediately, rather than waiting for Driver.BatchOperation's
+// own final NoteWrite -- so a read run right after it, through a batch that
+// has now written, has the engine's own bookkeeping already caught up too.
+//
+// See TestWriteTransactionReadAfterWriteDelegatesToPG's doc for the
+// composition finding this pin shares: observingBatch.Nodes() (write_
+// observer.go) wraps the inner batch's raw NodeQuery directly, never a
+// recordingNodeQuery (node_query.go), so engine.TryNodeCount is never
+// reachable from a batch's Nodes() at all, written-to or not. The marker
+// delta of 0 asserted below is still meaningful evidence, not a vacuous
+// pass, because the second half of this test proves the identical
+// structural count IS a servable shape once the batch has committed and the
+// engine has rebuilt.
+func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+
+	t.Setenv(EnvEnginePollInterval, "1h")
+	buf := installLogCapture(t)
+
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	if err != nil {
+		t.Fatalf("open bloodtrail: %v", err)
+	}
+	t.Cleanup(func() { _ = bt.Close(ctx) })
+	t.Cleanup(func() { graphtest.WipeGraph(t, pgDriver) })
+
+	d, ok := bt.(*Driver)
+	if !ok {
+		t.Fatalf("expected *Driver, got %T", bt)
+	}
+
+	// BatchReadNode is asserted up front, via schema.Graphs (not
+	// DefaultGraph.Nodes, which assertSchema never reads) -- unlike
+	// WriteTransaction's CreateNode, which registers a brand new kind
+	// synchronously on the call that first uses it, a batch's UpdateNodeBy
+	// only registers the kinds it names when its buffered write actually
+	// flushes (dawgs' flushNodeUpsertBatch -> AssertKinds,
+	// drivers/pg/batch.go), which has not happened yet by the time this
+	// test's Count() call below needs to translate the SAME kind name into
+	// a kind id. Asserting it here sidesteps that ordering pitfall
+	// entirely, rather than being what this test is trying to prove.
+	if err := bt.AssertSchema(ctx, graph.Schema{
+		Graphs:       []graph.Graph{{Name: graphtest.GraphName, Nodes: graph.Kinds{batchReadNodeKind}}},
+		DefaultGraph: graph.Graph{Name: graphtest.GraphName},
+	}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	// === The pin: UpdateNodeBy (an upsert -- no BatchReadNode exists yet,
+	// so this creates one), then Count, inside the SAME BatchOperation. ===
+	var gotCount int64
+	before := markerCount(buf, builderServedMarker)
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		// No IdentityKind/IdentityProperties: formatConflictMatcher's empty
+		// case targets the always-present (id, graph_id) constraint rather
+		// than an objectid uniqueness index this test's schema never
+		// declares (BloodHound's own schema declares one in production;
+		// asserting it here would be testing dawgs' index machinery, not
+		// this task's read/write delegation rule). Node.ID is left at its
+		// zero value, so there is no existing (0, graph_id) row to
+		// conflict with -- this upsert genuinely creates a new node.
+		update := graph.NodeUpdate{
+			Node: &graph.Node{
+				Properties: graph.NewProperties().Set("objectid", batchReadObjectID),
+				Kinds:      graph.Kinds{batchReadNodeKind},
+			},
+		}
+		if err := batch.UpdateNodeBy(update); err != nil {
+			return err
+		}
+
+		// UpdateNodeBy buffers into dawgs' own nodeUpdateByBuffer -- it is
+		// not visible to PostgreSQL until flushed: dawgs documents that
+		// batch.Nodes()/Relationships() "do not see Go-side buffered
+		// writes, but do see flushed (committed) chunks". Commit is the
+		// documented way to flush a chunk mid-batch and keep going
+		// (graph.Batch's own doc: "calls to commit this batch transaction
+		// right away") -- observingBatch.Commit (write_observer.go)
+		// additionally flushes scope to the engine right here, so a read
+		// run right after it, through a batch that has now written, has
+		// the engine's own bookkeeping already caught up too.
+		if err := batch.Commit(); err != nil {
+			return err
+		}
+
+		n, err := batch.Nodes().Filter(query.Kind(query.Node(), batchReadNodeKind)).Count()
+		gotCount = n
+		return err
+	}); err != nil {
+		t.Fatalf("BatchOperation (UpdateNodeBy then Count): %v", err)
+	}
+	if delta := markerCount(buf, builderServedMarker) - before; delta != 0 {
+		t.Fatalf("node count inside the batch was served by the engine (marker delta %d, want 0)\ncaptured log:\n%s", delta, buf.String())
+	}
+	if gotCount != 1 {
+		t.Fatalf("Count inside the batch = %d, want 1 (the node UpdateNodeBy just upserted, seen via PostgreSQL)", gotCount)
+	}
+
+	// === Sanity check on the premise: the identical structural count,
+	// once the batch has committed and the engine has rebuilt, DOES serve. ===
+	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatalf("engine reports stale immediately after RebuildNow")
+	}
+
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "post-commit, post-rebuild: the identical node count now serves from the engine",
+		func() int64 { return nodeCountByKind(t, ctx, bt, batchReadNodeKind) }, 1)
+}
