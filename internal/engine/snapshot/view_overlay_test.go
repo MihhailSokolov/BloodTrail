@@ -520,6 +520,247 @@ func TestOverlayOutInPanicOnOverlay(t *testing.T) {
 	}()
 }
 
+// TestDedupEdgeKeysCatchesDoubleEmission unit-tests dedupEdgeKeys
+// (viewcheck.go) directly: it must report an error when the same edgeKey
+// appears more than once -- the case a plain set-membership check would
+// silently collapse and miss -- and otherwise return every key once. No
+// View in this package ever actually double-emits (ensureEdgeTomb's
+// filtering rules that out by construction -- see view.go), so this is the
+// only way to exercise dedupEdgeKeys' own duplicate-detection path.
+func TestDedupEdgeKeysCatchesDoubleEmission(t *testing.T) {
+	dup := edgeKey{a: 1, b: 2, kind: 5, edge: 1002}
+	other := edgeKey{a: 3, b: 4, kind: 1, edge: 9}
+
+	if _, err := dedupEdgeKeys([]edgeKey{dup, dup, other}, "OutEdges"); err == nil {
+		t.Fatal("dedupEdgeKeys did not report the key seen twice, want an error")
+	}
+
+	set, err := dedupEdgeKeys([]edgeKey{dup, other}, "OutEdges")
+	if err != nil {
+		t.Fatalf("dedupEdgeKeys(no duplicates): %v", err)
+	}
+	if len(set) != 2 {
+		t.Fatalf("dedupEdgeKeys(no duplicates) set len = %d, want 2", len(set))
+	}
+	if _, ok := set[dup]; !ok {
+		t.Fatal("dedupEdgeKeys(no duplicates) set missing dup")
+	}
+	if _, ok := set[other]; !ok {
+		t.Fatal("dedupEdgeKeys(no duplicates) set missing other")
+	}
+}
+
+// TestOverlayEdgeOverrideRepointsSourceExactlyOnce covers upserting an edge
+// id that already exists in the base to different endpoints: the OLD
+// source/target must no longer see it at all, and the NEW source/target must
+// see it EXACTLY once -- counting yields rather than checking set
+// membership, since a set collapses a double emission to indistinguishable
+// from a single one (see CheckViewConsistent's own strengthened check for
+// the same reason).
+func TestOverlayEdgeOverrideRepointsSourceExactlyOnce(t *testing.T) {
+	s, v0 := buildOverlayFixture(t)
+	n20, _ := v0.Dense(20) // old source of edge 1002 (20 -> 30, kind 5)
+	n30, _ := v0.Dense(30) // old target
+	n40, _ := v0.Dense(40) // new source
+	n60, _ := v0.Dense(60) // new target
+
+	// Sanity: base EdgeByID finds edge 1002 at its original endpoints.
+	if _, ok := s.EdgeByID(1002); !ok {
+		t.Fatal("test setup: base EdgeByID(1002) not found")
+	}
+
+	sb := &SegmentBuilder{}
+	sb.AddEdgeState(1002, 40, 60, 3) // re-point 20->30 (kind 5) to 40->60 (kind 3)
+	v1 := v0.WithSegment(sb.Build())
+
+	oldOutCount := 0
+	v1.OutEdges(n20, func(target NodeID, kind KindID, edgeID uint64) bool {
+		if edgeID == 1002 {
+			oldOutCount++
+		}
+		return true
+	})
+	if oldOutCount != 0 {
+		t.Fatalf("OutEdges(20) yielded edge 1002 %d times after re-pointing away from 20, want 0", oldOutCount)
+	}
+
+	oldInCount := 0
+	v1.InEdges(n30, func(source NodeID, kind KindID, edgeID uint64) bool {
+		if edgeID == 1002 {
+			oldInCount++
+		}
+		return true
+	})
+	if oldInCount != 0 {
+		t.Fatalf("InEdges(30) yielded edge 1002 %d times after re-pointing away from 30, want 0", oldInCount)
+	}
+
+	newOutCount := 0
+	var gotTarget NodeID
+	var gotKind KindID
+	v1.OutEdges(n40, func(target NodeID, kind KindID, edgeID uint64) bool {
+		if edgeID == 1002 {
+			newOutCount++
+			gotTarget, gotKind = target, kind
+		}
+		return true
+	})
+	if newOutCount != 1 {
+		t.Fatalf("OutEdges(40) yielded edge 1002 %d times after re-pointing to 40, want exactly 1", newOutCount)
+	}
+	if gotTarget != n60 || gotKind != 3 {
+		t.Fatalf("OutEdges(40)'s edge 1002 = (target %d, kind %d), want (%d, 3)", gotTarget, gotKind, n60)
+	}
+
+	newInCount := 0
+	v1.InEdges(n60, func(source NodeID, kind KindID, edgeID uint64) bool {
+		if edgeID == 1002 {
+			newInCount++
+		}
+		return true
+	})
+	if newInCount != 1 {
+		t.Fatalf("InEdges(60) yielded edge 1002 %d times after re-pointing to 60, want exactly 1", newInCount)
+	}
+
+	start, end, kind, ok := v1.EdgeStateByID(1002)
+	if !ok || start != n40 || end != n60 || kind != 3 {
+		t.Fatalf("EdgeStateByID(1002) = (%d, %d, %d, %v), want (%d, %d, 3, true)", start, end, kind, ok, n40, n60)
+	}
+
+	if err := CheckViewConsistent(v1); err != nil {
+		t.Fatalf("CheckViewConsistent(v1): %v", err)
+	}
+}
+
+// TestOverlayKindRemovalViaUpsert covers a base node whose delta state drops
+// one of its kinds while retaining another: the dropped kind's bitmap bit
+// must clear, and the retained kind must still match.
+func TestOverlayKindRemovalViaUpsert(t *testing.T) {
+	_, v0 := buildOverlayFixture(t)
+	n10, _ := v0.Dense(10) // base kind [1]
+
+	// First segment: give node 10 a second kind, simulating a prior commit
+	// that left it with both kind 1 and kind 2.
+	sb1 := &SegmentBuilder{}
+	mustAddNodeState(t, sb1, 10, []KindID{1, 2}, `{"objectid":"S-obj-10","name":"n10"}`)
+	v1 := v0.WithSegment(sb1.Build())
+
+	if !v1.NodesOfKind(1).Has(n10) || !v1.NodesOfKind(2).Has(n10) {
+		t.Fatal("test setup: node 10 must carry both kinds 1 and 2 before the removal")
+	}
+
+	// Second segment: drop kind 1, retaining kind 2.
+	sb2 := &SegmentBuilder{}
+	mustAddNodeState(t, sb2, 10, []KindID{2}, `{"objectid":"S-obj-10","name":"n10"}`)
+	v2 := v1.WithSegment(sb2.Build())
+
+	if v2.NodesOfKind(1).Has(n10) {
+		t.Fatal("NodesOfKind(1) still contains node 10 after the delta dropped kind 1")
+	}
+	if !v2.NodesOfKind(2).Has(n10) {
+		t.Fatal("NodesOfKind(2) missing node 10 -- the retained kind must still match")
+	}
+	if kinds := v2.KindIDsOf(n10); !reflect.DeepEqual(kinds, []KindID{2}) {
+		t.Fatalf("KindIDsOf(10) = %v, want [2]", kinds)
+	}
+
+	if err := CheckViewConsistent(v2); err != nil {
+		t.Fatalf("CheckViewConsistent(v2): %v", err)
+	}
+}
+
+// TestOverlayObjectIDChangeStaleness covers a base node whose delta bag
+// changes its objectid: the OLD value must no longer resolve via
+// NodeByObjectID/NodesByObjectID, and the NEW value must resolve to the same
+// dense id.
+func TestOverlayObjectIDChangeStaleness(t *testing.T) {
+	_, v0 := buildOverlayFixture(t)
+	n10, _ := v0.Dense(10)
+
+	if got, ok := v0.NodeByObjectID("S-obj-10"); !ok || got != n10 {
+		t.Fatalf("test setup: v0.NodeByObjectID(S-obj-10) = (%d, %v), want (%d, true)", got, ok, n10)
+	}
+
+	sb := &SegmentBuilder{}
+	mustAddNodeState(t, sb, 10, []KindID{1}, `{"objectid":"S-obj-10-NEW","name":"n10"}`)
+	v1 := v0.WithSegment(sb.Build())
+
+	if got, ok := v1.NodeByObjectID("S-obj-10"); ok {
+		t.Fatalf("NodeByObjectID(S-obj-10) = (%d, true) after the delta changed node 10's objectid, want a miss", got)
+	}
+	if ids, ok := v1.NodesByObjectID("S-obj-10"); ok {
+		t.Fatalf("NodesByObjectID(S-obj-10) = (%v, true) after the objectid changed, want a miss", ids)
+	}
+
+	got, ok := v1.NodeByObjectID("S-obj-10-NEW")
+	if !ok || got != n10 {
+		t.Fatalf("NodeByObjectID(S-obj-10-NEW) = (%d, %v), want (%d, true)", got, ok, n10)
+	}
+	ids, ok := v1.NodesByObjectID("S-obj-10-NEW")
+	if !ok || !reflect.DeepEqual(ids, []NodeID{n10}) {
+		t.Fatalf("NodesByObjectID(S-obj-10-NEW) = (%v, %v), want ([%d], true)", ids, ok, n10)
+	}
+
+	// The old View must be unaffected.
+	if got, ok := v0.NodeByObjectID("S-obj-10"); !ok || got != n10 {
+		t.Fatalf("v0.NodeByObjectID(S-obj-10) = (%d, %v), want (%d, true) -- old View must be unaffected", got, ok, n10)
+	}
+
+	if err := CheckViewConsistent(v1); err != nil {
+		t.Fatalf("CheckViewConsistent(v1): %v", err)
+	}
+}
+
+// TestOverlayEdgeBetweenTwoVirtualNodes covers a delta edge whose BOTH
+// endpoints are delta-added (virtual) nodes -- neither has a base forward-
+// CSR slot at all, so the edge can only ever be walked through the delta
+// adjacency index in both directions.
+func TestOverlayEdgeBetweenTwoVirtualNodes(t *testing.T) {
+	_, v0 := buildOverlayFixture(t)
+
+	sb := &SegmentBuilder{}
+	mustAddNodeState(t, sb, 70, []KindID{1}, `{"objectid":"S-obj-70","name":"n70"}`)
+	mustAddNodeState(t, sb, 80, []KindID{1}, `{"objectid":"S-obj-80","name":"n80"}`)
+	sb.AddEdgeState(5001, 70, 80, 7)
+	v1 := v0.WithSegment(sb.Build())
+
+	n70, ok := v1.Dense(70)
+	if !ok {
+		t.Fatal("Dense(70) not found")
+	}
+	n80, ok := v1.Dense(80)
+	if !ok {
+		t.Fatal("Dense(80) not found")
+	}
+
+	foundOut := false
+	v1.OutEdges(n70, func(target NodeID, kind KindID, edgeID uint64) bool {
+		if target == n80 && kind == 7 && edgeID == 5001 {
+			foundOut = true
+		}
+		return true
+	})
+	if !foundOut {
+		t.Fatal("OutEdges(70) did not walk the delta edge between two virtual nodes")
+	}
+
+	foundIn := false
+	v1.InEdges(n80, func(source NodeID, kind KindID, edgeID uint64) bool {
+		if source == n70 && kind == 7 && edgeID == 5001 {
+			foundIn = true
+		}
+		return true
+	})
+	if !foundIn {
+		t.Fatal("InEdges(80) did not walk the delta edge between two virtual nodes")
+	}
+
+	if err := CheckViewConsistent(v1); err != nil {
+		t.Fatalf("CheckViewConsistent(v1): %v", err)
+	}
+}
+
 // TestOverlayConcurrentReadersRace exercises every memoized projection
 // (kind bitmaps, Kinds table, edge-tombstone set, delta adjacency index)
 // from many goroutines at once against one shared overlay View, so `go test

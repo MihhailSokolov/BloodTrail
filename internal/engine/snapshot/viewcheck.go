@@ -94,32 +94,42 @@ func CheckViewConsistent(v *View) error {
 		}
 	}
 
-	// OutEdges/InEdges symmetry.
-	type edgeKey struct {
-		a, b NodeID
-		kind KindID
-		edge uint64
-	}
-	outSet := make(map[edgeKey]struct{})
+	// OutEdges/InEdges symmetry, plus duplicate-emission detection. Keys are
+	// collected into slices (not inserted straight into a set) so
+	// dedupEdgeKeys can tally occurrences: the same node yielding the exact
+	// same (target, kind, edgeID) twice from one OutEdges/InEdges call would
+	// insert the same key twice, which a bare `set[key] = struct{}{}` would
+	// silently collapse to one entry and never flag as the inconsistency it
+	// is.
+	var outKeys, inKeys []edgeKey
 	for id := NodeID(0); int(id) < n; id++ {
 		if !alive[id] {
 			continue
 		}
 		v.OutEdges(id, func(target NodeID, kind KindID, edgeID uint64) bool {
-			outSet[edgeKey{id, target, kind, edgeID}] = struct{}{}
+			outKeys = append(outKeys, edgeKey{id, target, kind, edgeID})
 			return true
 		})
 	}
-	inSet := make(map[edgeKey]struct{})
 	for id := NodeID(0); int(id) < n; id++ {
 		if !alive[id] {
 			continue
 		}
 		v.InEdges(id, func(source NodeID, kind KindID, edgeID uint64) bool {
-			inSet[edgeKey{source, id, kind, edgeID}] = struct{}{}
+			inKeys = append(inKeys, edgeKey{source, id, kind, edgeID})
 			return true
 		})
 	}
+
+	outSet, err := dedupEdgeKeys(outKeys, "OutEdges")
+	if err != nil {
+		return err
+	}
+	inSet, err := dedupEdgeKeys(inKeys, "InEdges")
+	if err != nil {
+		return err
+	}
+
 	for k := range outSet {
 		if _, ok := inSet[k]; !ok {
 			return fmt.Errorf("snapshot: CheckViewConsistent: OutEdges(%d) yielded edge %d to %d (kind %d) with no matching InEdges entry", k.a, k.edge, k.b, k.kind)
@@ -132,6 +142,40 @@ func CheckViewConsistent(v *View) error {
 	}
 
 	return nil
+}
+
+// edgeKey identifies one edge's appearance in an OutEdges/InEdges emission.
+// a and b are always the edge's true source and target respectively,
+// regardless of which accessor produced the key (OutEdges(a) yields b as
+// the target; InEdges(b) yields a as the source) -- that's what lets
+// outSet/inSet be compared directly for symmetry above.
+type edgeKey struct {
+	a, b NodeID
+	kind KindID
+	edge uint64
+}
+
+// dedupEdgeKeys tallies occurrences of each edgeKey in keys and returns the
+// deduplicated set, or an error naming the first key seen more than once.
+// See CheckViewConsistent's call sites for why counting occurrences, rather
+// than inserting straight into a set, is the point: it is what catches a
+// double emission -- the same node yielding the exact same edge to the same
+// other endpoint more than once in one OutEdges/InEdges call -- that a plain
+// set-membership check would silently collapse and miss entirely. label
+// names the direction ("OutEdges" or "InEdges") for the error message.
+func dedupEdgeKeys(keys []edgeKey, label string) (map[edgeKey]struct{}, error) {
+	counts := make(map[edgeKey]int, len(keys))
+	for _, k := range keys {
+		counts[k]++
+	}
+	set := make(map[edgeKey]struct{}, len(counts))
+	for k, c := range counts {
+		if c > 1 {
+			return nil, fmt.Errorf("snapshot: CheckViewConsistent: %s yielded edge %d from %d to %d (kind %d) %d times, want at most once", label, k.edge, k.a, k.b, k.kind, c)
+		}
+		set[k] = struct{}{}
+	}
+	return set, nil
 }
 
 // kindTableIDs returns every (id, name) pair kt registers. Reaches into
