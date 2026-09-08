@@ -39,14 +39,28 @@ func randKindSubset(rng *rand.Rand, pool []KindID) []KindID {
 }
 
 // randPropsJSON returns a property bag JSON for id: a deterministic
-// objectid and name (so repeated upserts of the same id keep the same
-// objectid unless a test deliberately changes it), plus randomized
+// objectid ("OBJ-<id>") and name (so repeated upserts of the same id keep
+// the same objectid unless a test deliberately changes it), plus randomized
 // number/bool fields and occasional array/object/null values so every JSON
 // value kind propEntry can carry gets exercised.
 func randPropsJSON(rng *rand.Rand, id uint64) string {
+	return randPropsJSONWithObjectID(rng, id, fmt.Sprintf("OBJ-%d", id))
+}
+
+// randPropsJSONWithObjectID is randPropsJSON with the objectid value
+// overridden to objectID instead of the default "OBJ-<id>" -- used by
+// buildRandomSegments to occasionally converge two different node ids onto
+// the same objectid, so the randomized property test also exercises
+// PropStore.objectIndexDup / View.NodesByObjectID's multi-match path (see
+// compareViewContents' objectid section, which already resolves
+// NodesByObjectID as a sorted pg-id SET rather than a single witness, so a
+// collision here needs no comparator changes). Deterministic, always-on
+// collision coverage lives in TestFoldObjectIDCollisionAcrossDifferentNodes
+// below; this is best-effort extra fuzzing on top, not load-bearing.
+func randPropsJSONWithObjectID(rng *rand.Rand, id uint64, objectID string) string {
 	var buf strings.Builder
-	fmt.Fprintf(&buf, `{"objectid":"OBJ-%d","name":"name-%d","score":%f,"enabled":%v`,
-		id, id, rng.Float64()*100, rng.Intn(2) == 0)
+	fmt.Fprintf(&buf, `{"objectid":%q,"name":"name-%d","score":%f,"enabled":%v`,
+		objectID, id, rng.Float64()*100, rng.Intn(2) == 0)
 	if rng.Intn(3) == 0 {
 		fmt.Fprintf(&buf, `,"tags":["a","b","t%d"]`, rng.Intn(10))
 	}
@@ -58,6 +72,17 @@ func randPropsJSON(rng *rand.Rand, id uint64) string {
 	}
 	buf.WriteByte('}')
 	return buf.String()
+}
+
+// randObjectID returns the default objectid for id, unless it randomly
+// decides (roughly 1 in 12) to instead reuse a randomly chosen id's from
+// pool -- deliberately colliding two different node ids onto one objectid
+// value. pool may be empty, in which case the default is always used.
+func randObjectID(rng *rand.Rand, id uint64, pool []uint64) string {
+	if len(pool) > 0 && rng.Intn(12) == 0 {
+		return fmt.Sprintf("OBJ-%d", pool[rng.Intn(len(pool))])
+	}
+	return fmt.Sprintf("OBJ-%d", id)
 }
 
 // buildRandomBaseSnapshot builds a seeded random base Snapshot with
@@ -119,10 +144,14 @@ func buildRandomSegments(t *testing.T, rng *rand.Rand, baseIDs, baseEdgeIDs []ui
 
 		// Upserts: ~15 currently-live ids get a changed kind list and/or
 		// property bag (score/enabled/tags/meta vary per call; objectid/name
-		// stay a deterministic function of the id).
+		// are normally a deterministic function of the id, but randObjectID
+		// occasionally converges this upsert's objectid onto another
+		// currently-live id's -- two upserts converging on one value, per
+		// the objectid-collision finding).
 		for i := 0; i < 15 && len(liveIDs) > 0; i++ {
 			id := liveIDs[rng.Intn(len(liveIDs))]
-			mustAddNodeState(t, sb, id, randKindSubset(rng, foldAllKinds), randPropsJSON(rng, id))
+			objID := randObjectID(rng, id, liveIDs)
+			mustAddNodeState(t, sb, id, randKindSubset(rng, foldAllKinds), randPropsJSONWithObjectID(rng, id, objID))
 		}
 
 		// Tombstones: ~5 currently-live ids, deliberately drawn from the same
@@ -142,12 +171,16 @@ func buildRandomSegments(t *testing.T, rng *rand.Rand, baseIDs, baseEdgeIDs []ui
 			sb.AddKind(7, "Container")
 		}
 
-		// New nodes: ids all comfortably above every base id.
+		// New nodes: ids all comfortably above every base id. randObjectID
+		// occasionally has a brand-new node reuse a currently-live id's
+		// objectid -- a delta-added node colliding with a still-live node,
+		// per the objectid-collision finding.
 		newIDs := make([]uint64, 0, 5)
 		for i := 0; i < 5; i++ {
 			nextNewID++
 			nid := nextNewID
-			mustAddNodeState(t, sb, nid, randKindSubset(rng, foldAllKinds), randPropsJSON(rng, nid))
+			objID := randObjectID(rng, nid, liveIDs)
+			mustAddNodeState(t, sb, nid, randKindSubset(rng, foldAllKinds), randPropsJSONWithObjectID(rng, nid, objID))
 			newIDs = append(newIDs, nid)
 		}
 
@@ -452,6 +485,158 @@ func TestFoldNoSegmentsProducesEquivalentSnapshot(t *testing.T) {
 	compareViewContents(t, NewView(folded), NewView(base))
 	if err := CheckViewConsistent(NewView(folded)); err != nil {
 		t.Fatalf("CheckViewConsistent: %v", err)
+	}
+}
+
+// containsUint64 reports whether want appears anywhere in ids.
+func containsUint64(ids []uint64, want uint64) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFoldObjectIDCollisionAcrossDifferentNodes covers what the randomized
+// property test's randPropsJSON generator alone can never guarantee (it
+// derives every node's default objectid from its own database id, so two
+// different ids collide only on randObjectID's roughly-1-in-12 draw): TWO
+// alive nodes sharing one objectid value in Fold's output. Fold itself has
+// no objectid-specific logic anywhere (see fold.go's doc: every property bag
+// it transplants was already parsed once, and addPreparedNode just copies
+// propEntry bytes) -- so a collision surviving correctly is really proving
+// that PropStore.objectIndexDup (buildPropStore, props.go) gets built
+// correctly from FOLDED output, not that Fold "knows" about objectid at all.
+//
+// Two ways a collision can arise are both covered, in the same delta:
+//   - a delta-added node (70) reuses a still-live BASE node's (10) untouched
+//     objectid "S-obj-10";
+//   - two delta UPSERTS (nodes 20 and 30) both write the same new value
+//     "DUP-CONVERGE", converging from two previously-distinct base values.
+func TestFoldObjectIDCollisionAcrossDifferentNodes(t *testing.T) {
+	base, _ := buildOverlayFixture(t) // nodes 10..60, each carrying "S-obj-<id>"
+
+	sb := &SegmentBuilder{}
+	mustAddNodeState(t, sb, 70, []KindID{1}, `{"objectid":"S-obj-10","name":"n70"}`)
+	mustAddNodeState(t, sb, 20, []KindID{1}, `{"objectid":"DUP-CONVERGE","name":"n20"}`)
+	mustAddNodeState(t, sb, 30, []KindID{2}, `{"objectid":"DUP-CONVERGE","name":"n30"}`)
+	seg := sb.Build()
+
+	folded, err := Fold(base, []*Segment{seg})
+	if err != nil {
+		t.Fatalf("Fold: %v", err)
+	}
+	foldedView := NewView(folded)
+	stacked := NewView(base).WithSegment(seg)
+
+	if foldedView.Overlay() {
+		t.Fatal("NewView(folded).Overlay() = true, want false")
+	}
+
+	// The full comparator's own "objectid resolution" section already
+	// resolves NodesByObjectID as a SORTED PG-ID SET on both sides (see
+	// objectIDPgIDs), never a single witness -- so this call alone
+	// re-verifies both collisions agree between the folded and the stacked
+	// overlay view.
+	compareViewContents(t, foldedView, stacked)
+
+	// Belt-and-suspenders: name the exact expected sets from the finding's
+	// own wording, and confirm a multi-match is not itself flagged as an
+	// invariant violation by either view.
+	cases := []struct {
+		objectID  string
+		wantPgIDs []uint64
+	}{
+		{"S-obj-10", []uint64{10, 70}},
+		{"DUP-CONVERGE", []uint64{20, 30}},
+	}
+	for _, tc := range cases {
+		gotFolded := objectIDPgIDs(foldedView, tc.objectID)
+		if !reflect.DeepEqual(gotFolded, tc.wantPgIDs) {
+			t.Fatalf("folded NodesByObjectID(%q) pg ids = %v, want %v", tc.objectID, gotFolded, tc.wantPgIDs)
+		}
+		gotStacked := objectIDPgIDs(stacked, tc.objectID)
+		if !reflect.DeepEqual(gotStacked, tc.wantPgIDs) {
+			t.Fatalf("stacked NodesByObjectID(%q) pg ids = %v, want %v", tc.objectID, gotStacked, tc.wantPgIDs)
+		}
+
+		// NodeByObjectID (single witness): witness selection differs
+		// between a folded plain PropStore's "arbitrary member" (see
+		// PropStore.NodeByObjectID's doc) and an overlay View's
+		// deterministic-sort witness (see View.NodeByObjectID's doc) by
+		// documented design, so this does NOT assert the two witnesses
+		// equal EACH OTHER -- only that folded's witness resolves to SOME
+		// member of the same pg-id set.
+		n, ok := foldedView.NodeByObjectID(tc.objectID)
+		if !ok {
+			t.Fatalf("folded NodeByObjectID(%q) = (_, false), want a hit", tc.objectID)
+		}
+		if pg := foldedView.GraphID(n); !containsUint64(tc.wantPgIDs, pg) {
+			t.Fatalf("folded NodeByObjectID(%q) resolved to pg %d, want one of %v", tc.objectID, pg, tc.wantPgIDs)
+		}
+	}
+
+	if err := CheckViewConsistent(foldedView); err != nil {
+		t.Fatalf("CheckViewConsistent(foldedView): %v", err)
+	}
+	if err := CheckViewConsistent(stacked); err != nil {
+		t.Fatalf("CheckViewConsistent(stacked): %v", err)
+	}
+}
+
+// TestFoldObjectIDValueChangeAcrossOverride closes the reviewer's Minor
+// finding for Fold specifically (an equivalent check already exists for a
+// bare overlay View, not folded output, in
+// TestOverlayObjectIDChangeStaleness in view_overlay_test.go): a delta
+// upsert that changes a base node's objectid must, after folding, make the
+// OLD value resolve to nothing and the NEW value resolve to that node. Fold's
+// generic addPreparedNode transplant has no objectid-specific logic, so this
+// proves buildPropStore's objectIndex construction (props.go) runs correctly
+// against FOLDED output specifically.
+func TestFoldObjectIDValueChangeAcrossOverride(t *testing.T) {
+	base, _ := buildOverlayFixture(t) // node 10 carries "S-obj-10"
+
+	sb := &SegmentBuilder{}
+	mustAddNodeState(t, sb, 10, []KindID{1}, `{"objectid":"S-obj-10-NEW","name":"n10"}`)
+	seg := sb.Build()
+
+	folded, err := Fold(base, []*Segment{seg})
+	if err != nil {
+		t.Fatalf("Fold: %v", err)
+	}
+	foldedView := NewView(folded)
+	pg10, ok := foldedView.Dense(10)
+	if !ok {
+		t.Fatalf("folded Dense(10) = (_, false), want ok")
+	}
+
+	if got, ok := foldedView.NodeByObjectID("S-obj-10"); ok {
+		t.Fatalf("folded NodeByObjectID(S-obj-10) = (%d, true) after the override changed node 10's objectid, want a miss", got)
+	}
+	if ids, ok := foldedView.NodesByObjectID("S-obj-10"); ok {
+		t.Fatalf("folded NodesByObjectID(S-obj-10) = (%v, true), want a miss", ids)
+	}
+
+	got, ok := foldedView.NodeByObjectID("S-obj-10-NEW")
+	if !ok || got != pg10 {
+		t.Fatalf("folded NodeByObjectID(S-obj-10-NEW) = (%d, %v), want (%d, true)", got, ok, pg10)
+	}
+	ids, ok := foldedView.NodesByObjectID("S-obj-10-NEW")
+	if !ok || !reflect.DeepEqual(ids, []NodeID{pg10}) {
+		t.Fatalf("folded NodesByObjectID(S-obj-10-NEW) = (%v, %v), want ([%d], true)", ids, ok, pg10)
+	}
+
+	// The base snapshot Fold was given, and a fresh View over it, must be
+	// entirely unaffected by folding a segment on top of it -- Fold never
+	// mutates its inputs.
+	baseView := NewView(base)
+	if got, ok := baseView.NodeByObjectID("S-obj-10"); !ok || baseView.GraphID(got) != 10 {
+		t.Fatalf("base NodeByObjectID(S-obj-10) = (%d, %v), want it still resolving to pg 10 -- Fold must not mutate its base input", got, ok)
+	}
+
+	if err := CheckViewConsistent(foldedView); err != nil {
+		t.Fatalf("CheckViewConsistent(foldedView): %v", err)
 	}
 }
 
