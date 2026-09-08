@@ -189,17 +189,17 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 
 // Commit flushes the accumulated scope to the engine (eng.NoteWrite), then
 // resets scope to a fresh, empty WriteScope, before delegating to the inner
-// transaction's own Commit -- mirroring observingBatch.Commit's identical
-// reasoning below: graph.Transaction's own doc says Commit "calls to commit
-// this transaction right away", so a delegate that calls tx.Commit() itself
-// partway through -- rather than simply returning nil and leaving Driver.
-// WriteTransaction's own commit (driver.go) as the only one -- needs the
-// engine's snapshot invalidated at that same moment, not held back until
-// this WriteTransaction call's own final NoteWrite after the whole delegate
-// returns. Driver.WriteTransaction still calls NoteWrite once more after the
-// delegate returns, reading this transaction's *current* scope value at
-// that point -- which by then may be a different *WriteScope than the one
-// this method reset it to here, exactly as intended (see driver.go's doc).
+// transaction's own Commit. Under the pinned dawgs pg driver, a delegate that
+// calls tx.Commit() mid-transaction will cause the outer WriteTransaction's
+// final Commit to return ErrTxClosed; writes persist, and this override
+// ensures invalidation is recorded at the commit point. This override is
+// therefore defensive today: it guards against the mid-transaction commit
+// scenario, matching observingBatch.Commit's pattern, though that scenario's
+// actual feasibility under the pg driver remains unverified (Driver.
+// WriteTransaction still calls NoteWrite once more after the delegate returns,
+// reading this transaction's *current* scope value at that point -- which by
+// then may be a different *WriteScope than the one this method reset it to
+// here, exactly as intended).
 func (t *observingTransaction) Commit() error {
 	t.eng.NoteWrite(t.scope)
 	t.scope = engine.NewWriteScope()

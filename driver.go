@@ -208,14 +208,17 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // unaffected by this change.
 //
 // observer is declared once, outside the delegate closure below, then
-// reconstructed fresh inside it on every invocation -- exactly the same
-// "declared outside, built inside" shape BatchOperation uses below, for the
-// identical reason: this method's final NoteWrite call reads observer.scope's
-// *current* value, which observingTransaction.Commit may have already reset
-// to a fresh, still-accumulating WriteScope (by a delegate-issued
-// mid-transaction commit) by the time txDelegate returns. Reading through
-// observer, rather than a separately captured scope variable, is what makes
-// that reset visible here; see observingTransaction.Commit's own doc.
+// reconstructed fresh inside it on every invocation -- matching
+// BatchOperation's "declared outside, built inside" pattern (see its doc).
+// This method's final NoteWrite call reads observer.scope's *current* value,
+// which observingTransaction.Commit may have already reset to a fresh,
+// still-accumulating WriteScope (by a delegate-issued mid-transaction commit)
+// by the time txDelegate returns. Reading through observer, rather than a
+// separately captured scope variable, is what makes that reset visible here;
+// see observingTransaction.Commit's own doc. Unlike BatchOperation, which
+// builds the observer once outside the closure (same scope across retries),
+// WriteTransaction builds a fresh observer inside the closure per invocation
+// (each attempt gets a fresh scope -- deliberately tighter).
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
 	var observer *observingTransaction
 	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {
