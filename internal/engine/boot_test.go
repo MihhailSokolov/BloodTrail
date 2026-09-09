@@ -87,6 +87,21 @@ func TestRunBootLoadNeverFlipsToFallbackOnContextCancel(t *testing.T) {
 	}
 }
 
+// TestDefaultGraphResolvedIsNilSafe pins the nil guard runBootLoad's
+// per-iteration gate depends on: every unit test in this package builds an
+// Engine with a nil pgDriver, and runBootLoad now probes the default graph
+// on every iteration -- so a missing guard would turn an ordinary
+// database-free unit test (or, worse, a production Engine constructed
+// before its driver) into a nil-pointer panic inside a background
+// goroutine, where nothing would ever recover it.
+func TestDefaultGraphResolvedIsNilSafe(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+
+	if e.defaultGraphResolved() {
+		t.Fatalf("defaultGraphResolved() = true with a nil pgDriver, want false")
+	}
+}
+
 // -----------------------------------------------------------------------
 // Task 15: snapshot-file boot load. The two tests below pin the pure,
 // database-free pieces (snapshotFilePath's disabled short-circuit,

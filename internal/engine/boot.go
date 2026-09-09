@@ -113,7 +113,8 @@ func (e *Engine) Stop() {
 
 // runBootLoad is the boot-load goroutine body launched by Start, once
 // Start's own claimRebuildLoop call has won the single rebuild-loop gate
-// (fallbackRebuilding): it keeps calling rebuildOnce, labeled
+// (fallbackRebuilding): it makes one attempt to load a local snapshot file
+// (tryLoadSnapshotFile) and otherwise keeps calling rebuildOnce, labeled
 // triggerStartup, until one is actually adopted, then hands off to
 // finishFallbackRebuild exactly as runFallbackRebuild's own adopted exit
 // does -- both loops share that flag now, so the same race
@@ -126,15 +127,66 @@ func (e *Engine) Stop() {
 // fallback recovery are the same kind of operation (retry a snapshot load
 // until it sticks), just triggered differently.
 //
-// Before any of that, it makes exactly one attempt to short-circuit the
-// whole retry-against-PostgreSQL loop by loading a local snapshot file
-// instead (tryLoadSnapshotFile) -- cheap, and only ever worth retrying by
-// falling through to the ordinary pg rebuild loop below on any failure, so
-// there is no separate retry schedule for it. A successful, adopted file
-// load hands off to finishFallbackRebuild exactly as an adopted pg rebuild
-// would, and returns without the loop below ever running at all (see
-// RebuildCount's own doc: this is the whole reason a file-boot integration
-// test can assert RebuildCount() == 0).
+// Each iteration is gated on the default graph having resolved
+// (defaultGraphResolved, below) -- because NEITHER load can run before it
+// has. This is not a defensive nicety; it is the whole reason this loop is
+// shaped the way it is, and an earlier version of this method got it wrong
+// in a way that made the snapshot-file feature unreachable in production:
+//
+//   - pg.NewDriverWithOptions does no database I/O, so a freshly opened
+//     pg.Driver's SchemaManager has hasDefaultGraph == false (dawgs
+//     drivers/pg/manager.go). Only SetDefaultGraph/AssertDefaultGraph -- i.e.
+//     only a caller's own AssertSchema -- ever sets it.
+//   - bloodtrail.Open (driver.go) calls Start BEFORE it returns the driver
+//     the caller needs in order to call AssertSchema at all. So this
+//     goroutine ALWAYS starts with the default graph unresolved, and the
+//     caller cannot possibly have fixed that yet.
+//   - The earlier version made its file attempt as a single statement before
+//     this loop. snapshotFilePath's DefaultGraph() lookup therefore returned
+//     ("", false) every time, so tryLoadSnapshotFile returned false without
+//     ever reading -- or logging anything at all about -- the file, and the
+//     attempt was spent, never retried. Measured in production ordering: 0
+//     "snapshot file loaded", 0 "rejected", 0 "no snapshot file", every open,
+//     with a valid matching-watermark file sitting unread on disk.
+//     (internal/engine's own file-boot tests missed this because
+//     internal/graphtest.OpenPG asserts the schema before the engine exists,
+//     an ordering production can never produce.)
+//
+// Treating "no default graph yet" as a RETRYABLE condition -- rather than as
+// a terminal false for the file, and rather than as the failed rebuildOnce
+// call it used to produce -- is what fixes it. Both loads need the graph id:
+// snapshotFilePath names the file after it, and LoadSnapshot (load.go)
+// errors "no default graph is set" without it, so an iteration that runs
+// before AssertSchema lands has nothing useful to attempt and is skipped
+// entirely, waiting out the same backoff any other unproductive iteration
+// does. That the skip also stops rebuildAttempts from counting a rebuild
+// that never reached PostgreSQL is what lets a file boot honestly report
+// RebuildCount() == 0 (see RebuildCount's own doc), and it stops the
+// "boot load failed: no default graph is set" WARN that every driver open
+// used to log exactly once -- an ordinary startup wait was never an error.
+//
+// The file attempt itself keeps its one-shot semantics per successful boot:
+// fileTried is set the first time an iteration is actually ABLE to attempt
+// it, so the attempt happens exactly once, and only once the graph id is
+// knowable -- never repeatedly, and never before the pg rebuild that a
+// failed attempt falls through to. Trying it before rebuildOnce in that same
+// iteration is deliberate: a file load that works saves the entire pg
+// rebuild, so it must not be spent first.
+//
+// The e.snap.Load() == nil guard is the other half of that ordering
+// question: a View already adopted by anyone (a concurrent manual
+// RebuildNow, say) makes a file load pointless -- the replica is already
+// current -- and it would be wrong to publish an older file over it. The
+// loop's own adopted-rebuild exits return before ever reaching another
+// attempt, so this guard is only about adoptions from OUTSIDE this loop; it
+// is a cheap, explicit statement of an invariant rather than a race to win,
+// since adoptRebuiltView's epoch check and snapshotFileTrustedAtBoot's
+// watermark equality both independently refuse a file that would lose a
+// write.
+//
+// A successful, adopted file load hands off to finishFallbackRebuild exactly
+// as an adopted pg rebuild would, and returns without rebuildOnce ever being
+// called at all.
 //
 // Runs on the engine's own background context (bgCtx, cancelled by Stop),
 // not ctx: ctx's cancellation is honored too (a caller-supplied way to stop
@@ -145,26 +197,37 @@ func (e *Engine) Stop() {
 // runFallbackRebuild's own context-cancelled returns do (and for the same
 // reason: Stop cancelling bgCtx means the engine is shutting down, so there
 // is no reason to run finishFallbackRebuild's relaunch-if-raced recheck).
+// The cancellation check runs FIRST, before the default-graph probe and
+// before any load attempt, so a Stop during startup still exits promptly.
 func (e *Engine) runBootLoad(ctx context.Context) {
-	if e.tryLoadSnapshotFile(e.bgCtx) {
-		e.finishFallbackRebuild()
-		return
-	}
-
 	backoff := fallbackRetryInterval
+	fileTried := false
+
 	for {
 		if ctx.Err() != nil || e.bgCtx.Err() != nil {
 			e.fallbackRebuilding.Store(false)
 			return
 		}
 
-		adopted, err := e.rebuildOnce(e.bgCtx, triggerStartup)
-		switch {
-		case err != nil:
-			e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: boot load failed", slog.Any("error", err))
-		case adopted:
-			e.finishFallbackRebuild()
-			return
+		var err error
+		if !e.defaultGraphResolved() {
+			e.cfg.Log.DebugContext(e.bgCtx, "bloodtrail: boot load waiting for the default graph")
+		} else {
+			if !fileTried {
+				fileTried = true
+				if e.snap.Load() == nil && e.tryLoadSnapshotFile(e.bgCtx) {
+					e.finishFallbackRebuild()
+					return
+				}
+			}
+
+			var adopted bool
+			if adopted, err = e.rebuildOnce(e.bgCtx, triggerStartup); err != nil {
+				e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: boot load failed", slog.Any("error", err))
+			} else if adopted {
+				e.finishFallbackRebuild()
+				return
+			}
 		}
 
 		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
@@ -180,6 +243,26 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// defaultGraphResolved reports whether the embedded PostgreSQL driver's
+// default graph is known yet -- the precondition BOTH of boot load's two
+// loads share (snapshotFilePath names its file after the graph id;
+// LoadSnapshot errors without it), and the one thing a freshly opened
+// pg.Driver is guaranteed NOT to have (see runBootLoad's doc).
+//
+// A nil pgDriver reports false rather than panicking, matching
+// snapshotFilePath's own care about the same field: unit tests in this
+// package routinely build an Engine with no driver at all, and an engine
+// that has no driver genuinely has no default graph -- there is nothing for
+// boot load to load from, so waiting is the honest answer rather than a
+// nil-pointer dereference inside a background goroutine.
+func (e *Engine) defaultGraphResolved() bool {
+	if e.pgDriver == nil {
+		return false
+	}
+	_, ok := e.pgDriver.DefaultGraph()
+	return ok
 }
 
 // snapshotFilePath returns the path this engine's boot-load attempt
@@ -199,6 +282,14 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 // to graph simply names a different file, one that either doesn't exist
 // yet (a quiet miss, tryLoadSnapshotFile's own doc) or was itself written
 // by a previous SaveSnapshot against that same graph.
+//
+// The ("", false) an unresolved default graph produces here is a genuine
+// "cannot answer yet", not "no file": boot load must never spend its one
+// file attempt on it, which is why runBootLoad gates that attempt on
+// defaultGraphResolved instead of letting this return stand in for a miss
+// (see runBootLoad's doc). SaveSnapshot's own caller (persist.go) is under
+// no such constraint -- by the time anything is worth saving, a snapshot has
+// been adopted, which cannot have happened without the graph resolving.
 func (e *Engine) snapshotFilePath() (string, bool) {
 	if e.cfg.SnapshotDir == "" {
 		return "", false
@@ -257,11 +348,14 @@ func snapshotFileTrustedAtBoot(fileWatermark, pgWatermark uint64) bool {
 
 // tryLoadSnapshotFile makes one attempt to boot this engine straight from
 // its own snapshot file (snapshotFilePath) instead of PostgreSQL, reporting
-// whether it actually adopted one. Called once, at the very top of
-// runBootLoad, before the ordinary pg rebuild loop -- see that method's own
-// doc for why a single attempt, with no retry schedule of its own, is
-// enough: any failure here simply falls through to the retry loop that
-// already exists for the pg path.
+// whether it actually adopted one. Called once per successful boot, from
+// inside runBootLoad's retry loop -- in the first iteration whose
+// defaultGraphResolved check passes, before that same iteration's
+// rebuildOnce call. See runBootLoad's own doc for why the attempt has to be
+// made from inside the loop rather than before it, and why a single attempt,
+// with no retry schedule of its own, is still enough once it is: any failure
+// here simply falls through to the retry loop that already exists for the pg
+// path.
 //
 // epoch and settledGen are read BEFORE ReadSnapshotFile even opens the
 // file, mirroring rebuildOnce's identical ordering and for the identical

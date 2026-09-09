@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
 )
@@ -166,6 +168,82 @@ func TestFileBootLoadsMatchingWatermarkSnapshot(t *testing.T) {
 	}
 	if strings.Contains(logged, "bloodtrail: snapshot file rejected") {
 		t.Fatalf("boot logged \"snapshot file rejected\" for a matching-watermark file:\n%s", logged)
+	}
+}
+
+// TestFileBootWaitsForTheDefaultGraphToResolve pins the mechanism the
+// production-ordering defect turned on (see runBootLoad's own doc, and the
+// root package's file_boot_wiring_integration_test.go for the end-to-end
+// version through dawgs.Open): a boot load that starts BEFORE the default
+// graph resolves must still make its file attempt afterwards, not spend it
+// on the one instant at which it is guaranteed to be impossible.
+//
+// Every other test in this file boots over graphtest.OpenPG's driver, whose
+// schema was asserted before the engine existed -- so DefaultGraph() answers
+// immediately, and none of them can distinguish "attempted once, up front"
+// from "attempted once the graph was knowable". This one deliberately builds
+// a SECOND, fresh pg.Driver over the same pool and never asserts a schema on
+// it until the engine has already been running for a while, reproducing
+// exactly what bloodtrail.Open (driver.go) forces on every real deployment:
+// Start runs before any caller can possibly have called AssertSchema.
+func TestFileBootWaitsForTheDefaultGraphToResolve(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	dir := t.TempDir()
+	nodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
+
+	// A driver whose SchemaManager has never resolved a default graph --
+	// pg.NewDriver does no database I/O at all, so this is exactly the state
+	// dawgs.Open hands bloodtrail.Open.
+	unresolved := pg.NewDriver(size.Gibibyte, pool)
+	if _, ok := unresolved.DefaultGraph(); ok {
+		t.Fatalf("a freshly constructed pg.Driver already reports a default graph; this test's premise no longer holds")
+	}
+
+	engB, buf := newLogCapturingEngine(unresolved, pool, dir)
+	engB.Start(ctx)
+	defer engB.Stop()
+
+	// Long enough for several boot-load iterations to run and find nothing
+	// they can do yet (the loop's first wait is fallbackRetryInterval, 100ms).
+	time.Sleep(250 * time.Millisecond)
+
+	if got := engB.RebuildCount(); got != 0 {
+		t.Fatalf("RebuildCount = %d while the default graph was still unresolved, want 0: a rebuild that cannot name a graph must not be attempted, let alone counted", got)
+	}
+	if !strings.Contains(buf.String(), "bloodtrail: boot load waiting for the default graph") {
+		t.Fatalf("boot load never logged that it was waiting for the default graph:\n%s", buf.String())
+	}
+
+	// The instant a real caller's AssertSchema could first land.
+	if err := unresolved.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+
+	waitForFresh(t, engB)
+
+	if got := engB.RebuildCount(); got != 0 {
+		t.Fatalf("RebuildCount = %d after the deferred file attempt should have adopted, want 0 (no pg rebuild should ever have run)", got)
+	}
+
+	view, serving := engB.Fresh()
+	if !serving {
+		t.Fatalf("engine B not serving after boot")
+	}
+	if _, ok := view.Dense(uint64(nodeID)); !ok {
+		t.Fatalf("engine B's loaded snapshot is missing the node engine A wrote through and saved")
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "bloodtrail: snapshot file loaded") {
+		t.Fatalf("boot did not log \"snapshot file loaded\" once the default graph resolved:\n%s", logged)
+	}
+	if strings.Contains(logged, "bloodtrail: boot load failed") {
+		t.Fatalf("boot load logged a failure while merely waiting for the default graph -- an ordinary startup wait is not an error:\n%s", logged)
 	}
 }
 
