@@ -150,22 +150,36 @@ type Engine struct {
 	// resolvedDirtyGen <= settledDirtyGen <= dirtyGen holds at all times.
 	//
 	//   - dirtyGen counts every genuine watermark failure this engine has
-	//     ever seen: a BumpWatermark call that genuinely failed
-	//     (NoteWatermarkBumpFailure -- never ErrWatermarkUnavailable, which
-	//     means this engine was never tracking a watermark at all), and a
-	//     failed watermark-table DDL exec (ensureWatermarkTable). Each such
-	//     failure means the pg watermark counter and this engine's own
-	//     bookkeeping may have silently diverged -- a write may have landed
-	//     in PostgreSQL without ever being counted -- which a snapshot-file
-	//     writer must never trust as convergence even if the numbers happen
-	//     to line up again by coincidence.
-	//   - settledDirtyGen counts those same failures once the write each one
+	//     ever seen, ONCE PER WRITE SCOPE: a write scope's first eager bump
+	//     failure (NoteWatermarkBumpFailure -- never ErrWatermarkUnavailable,
+	//     which means this engine was never tracking a watermark at all)
+	//     advances it, but that same scope's later mutating calls, which keep
+	//     retrying the identical failing bump (ensureBumped's own
+	//     bumped-exactly-once guard has no way to skip a bump that never
+	//     succeeded), do not advance it again -- gated by the scope's own
+	//     mark transitioning at most once (WriteScope.markWatermarkBumpFailed,
+	//     changes_scope.go). A failed watermark-table DDL exec
+	//     (ensureWatermarkTable) also advances it, unconditionally (it guards
+	//     no scope to gate on). Each such failure means the pg watermark
+	//     counter and this engine's own bookkeeping may have silently
+	//     diverged -- a write may have landed in PostgreSQL without ever
+	//     being counted -- which a snapshot-file writer must never trust as
+	//     convergence even if the numbers happen to line up again by
+	//     coincidence.
+	//   - settledDirtyGen counts those same failures, ALSO once per write
+	//     scope (the scope's mark is consumed, not merely read,
+	//     WriteScope.takeWatermarkBumpFailure), once the write each one
 	//     guarded is SETTLED in PostgreSQL: committed (its Apply ran) or
 	//     known to have produced nothing (its driver-level call returned an
 	//     error, ResolveAbandonedWrite). A DDL failure guards no write at
-	//     all, so it settles itself immediately. settledDirtyGen ==
-	//     dirtyGen therefore means "every failure ever noted belongs to a
-	//     write whose outcome is already final in PostgreSQL".
+	//     all, so it settles itself immediately. Because both counters move
+	//     by exactly one per failing scope, settledDirtyGen == dirtyGen means
+	//     "every failure ever noted belongs to a write whose outcome is
+	//     already final in PostgreSQL" -- a claim that would not hold if
+	//     dirtyGen counted failing BUMP ATTEMPTS instead of failing SCOPES,
+	//     since one scope's bump can be retried (and fail again) many times
+	//     across a transaction's/batch's later mutating calls while only ever
+	//     settling once.
 	//   - resolvedDirtyGen is the largest settledDirtyGen value that was
 	//     read BEFORE the load of a snapshot this engine went on to ADOPT
 	//     (rebuildOnce/adoptRebuiltView). It is the only one of the three

@@ -154,6 +154,48 @@ func TestNoteWatermarkBumpFailureOpensGenerationAndMarksScope(t *testing.T) {
 	}
 }
 
+// TestNoteWatermarkBumpFailureCountsOncePerScopeAcrossRepeatedRetries is
+// F1's regression: a write scope whose eager bump keeps failing on every one
+// of its own later mutating calls -- exactly the shape ensureBumped's own
+// bumped-exactly-once guard produces once a scope's FIRST bump fails
+// (Watermark's bumped flag never becomes true for a scope whose bump never
+// succeeds, so every later call on that same transaction/batch retries the
+// identical failing bump) -- must open exactly ONE watermark trust
+// generation, not one per retry. Before this fix, e.dirtyGen advanced on
+// every call while settleWatermarkFailure's consume-once mark only ever
+// settled one of them, so N failing calls on one scope left settledDirtyGen
+// permanently N-1 behind dirtyGen: no amount of adoption could ever resolve
+// it, distrusting the engine for good under this failure mode's ordinary
+// shape.
+func TestNoteWatermarkBumpFailureCountsOncePerScopeAcrossRepeatedRetries(t *testing.T) {
+	ctx := context.Background()
+	e := New(nil, nil, Config{})
+	scope := NewWriteScope()
+
+	if opened := e.NoteWatermarkBumpFailure(ctx, scope, errors.New("boom 1")); !opened {
+		t.Fatalf("NoteWatermarkBumpFailure (first call for this scope) = false, want true")
+	}
+	wantGens(t, e, 1, 0, 0)
+
+	if opened := e.NoteWatermarkBumpFailure(ctx, scope, errors.New("boom 2")); opened {
+		t.Fatalf("NoteWatermarkBumpFailure (second call, same scope) = true, want false: the mark is already set")
+	}
+	wantGens(t, e, 1, 0, 0) // dirty stays at 1, not 2 -- the over-count this test guards against.
+
+	// The write this scope belongs to eventually lands: its Apply settles
+	// the one mark both failing calls shared, exactly once.
+	e.Apply(ctx, scope)
+	wantGens(t, e, 1, 1, 0)
+
+	// A snapshot adopted after that settling resolves the generation --
+	// recoverable, exactly as a single failure would be.
+	adoptSnapshot(t, e, e.settledDirtyGen.Load())
+	wantGens(t, e, 1, 1, 1)
+	if !e.watermarkGensResolved() {
+		t.Fatalf("watermarkGensResolved = false after the adoption, want true: two failing calls on one scope must resolve like one")
+	}
+}
+
 // TestWatermarkFailureWithoutSettlingStaysUnresolved is the generation
 // algebra's central claim, and the one a clearable dirty flag got wrong: a
 // failure whose write has not settled yet cannot be resolved by ANY amount of

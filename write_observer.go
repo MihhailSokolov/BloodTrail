@@ -42,13 +42,27 @@ import (
 // helper is exactly Enabled: false with a nil pool).
 //
 // Any other error is a genuine failure: BumpWatermark's own protocol
-// promise is that it never blocks the write it guards, so this logs once and
-// opens a watermark trust generation for this write (via
+// promise is that it never blocks the write it guards, so this logs once
+// (every call, including a retry -- see below) and, the first time this
+// scope's bump fails, opens a watermark trust generation for this write (via
 // eng.NoteWatermarkBumpFailure, which also marks scope as the one thing that
-// can later settle it), and records a ChangeSet fallback -- the applier can no
+// can later settle it) and records a ChangeSet fallback -- the applier can no
 // longer trust a narrow delta for a write whose counter was never recorded,
 // and that same fallback record is what starts the rebuild whose adoption
 // eventually restores trust (engine.WatermarkTrusted's own doc).
+//
+// A scope whose bump has already failed once reaches this same default
+// branch again on every later mutating call the same transaction/batch
+// makes: Watermark's bumped flag never becomes true for a scope whose bump
+// keeps failing, so the early-return guard above never fires, and the retry
+// fails the identical bump again. eng.NoteWatermarkBumpFailure reports
+// whether THIS call is the one that opened the generation (false on every
+// such retry, since the scope is already marked -- its own doc); the
+// ChangeSet fallback record is only added on that first call, since a scope
+// already carrying a fallback record has nothing new for a repeat "watermark:
+// bump failed: <err>" reason to add (ChangeSet.HasFallback() already reports
+// true, apply.go's own rebuild trigger already fires) -- recording it again
+// per retry would only grow scope's fallback reason set for no benefit.
 func ensureBumped(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope) {
 	if eng == nil || scope == nil {
 		return
@@ -73,8 +87,9 @@ func ensureBumped(ctx context.Context, eng *engine.Engine, scope *engine.WriteSc
 	case errors.Is(err, engine.ErrWatermarkUnavailable):
 		// Nothing to do -- see this function's own doc.
 	default:
-		eng.NoteWatermarkBumpFailure(ctx, scope, err)
-		scope.Changes().RecordFallback(fmt.Sprintf("watermark: bump failed: %v", err))
+		if eng.NoteWatermarkBumpFailure(ctx, scope, err) {
+			scope.Changes().RecordFallback(fmt.Sprintf("watermark: bump failed: %v", err))
+		}
 	}
 }
 

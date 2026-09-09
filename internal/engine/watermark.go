@@ -143,31 +143,52 @@ func (e *Engine) ReadWatermark(ctx context.Context) (uint64, error) {
 
 // NoteWatermarkBumpFailure logs (Warn) that scope's own eager bump genuinely
 // failed -- not ErrWatermarkUnavailable, which never reaches this method at
-// all (see its own doc) -- and opens a new watermark trust generation for it:
-// e.dirtyGen advances immediately, which makes WatermarkTrusted report false
-// from this instant on, and scope is marked so that this same failure can be
-// settled exactly once later, when the write it guards reaches a final
-// outcome in PostgreSQL (settleWatermarkFailure's own doc).
+// all (see its own doc) -- and, the FIRST time this is called for scope,
+// opens a new watermark trust generation for it: e.dirtyGen advances, which
+// makes WatermarkTrusted report false from this instant on, and scope is
+// marked so that this same failure can be settled exactly once later, when
+// the write it guards reaches a final outcome in PostgreSQL
+// (settleWatermarkFailure's own doc).
 //
-// Both halves have to happen here, at the one call site (write_observer.go's
-// ensureBumped) that knows both the engine and the write's own scope: the
-// generation is what withdraws trust, and the mark is the only thing that can
-// ever give it back. The caller additionally records its own ChangeSet
-// fallback on the same scope, which is what makes that write's Apply rebuild
-// the replica rather than replay a delta for a write whose counter was never
-// recorded.
+// Reports whether it actually opened a generation (true on that first call,
+// false on every later one for the same scope), so the caller can decide
+// whether there is anything new to record about it (write_observer.go's
+// ensureBumped's own doc, on the ChangeSet fallback it conditions on this).
 //
-// A nil scope still advances dirtyGen, deliberately, but can never be
-// settled -- the engine would then stay distrusted for the rest of its life.
-// No caller passes nil (ensureBumped returns early on a nil scope before it
-// ever attempts a bump); fail-closed is the right answer if one ever did.
-func (e *Engine) NoteWatermarkBumpFailure(ctx context.Context, scope *WriteScope, err error) {
+// A LATER call for a scope whose mark is already set is expected, not a
+// bug: a write scope whose eager bump fails once has no way to become
+// bumped=true (SetWatermark is never called), so ensureBumped's own guard --
+// "bump exactly once, then skip" -- keeps retrying the SAME failing bump on
+// every later mutating call the transaction/batch makes, and each retry
+// fails again. Advancing e.dirtyGen on every such retry, rather than once
+// per scope, would open N generations for one underlying failure while
+// settleWatermarkFailure's consume-once mark only ever settles one of them --
+// settledDirtyGen could then never catch up to dirtyGen, permanently
+// distrusting the engine under this failure mode's ordinary shape (a
+// transaction that keeps writing after its first bump fails, or a batch with
+// several calls). Gating on markWatermarkBumpFailed's own transition report
+// is what keeps dirtyGen's per-scope count exactly paired with
+// settledDirtyGen's per-scope count, one increment each, no matter how many
+// times that scope's bump is retried.
+//
+// Both halves -- the generation and the mark -- have to happen here, at the
+// one call site (write_observer.go's ensureBumped) that knows both the
+// engine and the write's own scope: the generation is what withdraws trust,
+// and the mark is the only thing that can ever give it back.
+//
+// A nil scope still advances dirtyGen on every call, deliberately -- there is
+// no mark to gate on, and no way to ever settle it, so the engine stays
+// distrusted for the rest of its life. No caller passes nil (ensureBumped
+// returns early on a nil scope before it ever attempts a bump); fail-closed
+// is the right answer if one ever did.
+func (e *Engine) NoteWatermarkBumpFailure(ctx context.Context, scope *WriteScope, err error) bool {
 	e.cfg.Log.WarnContext(ctx, "bloodtrail: watermark bump failed", slog.Any("error", err))
 
-	e.dirtyGen.Add(1)
-	if scope != nil {
-		scope.markWatermarkBumpFailed()
+	if scope == nil || scope.markWatermarkBumpFailed() {
+		e.dirtyGen.Add(1)
+		return true
 	}
+	return false
 }
 
 // noteSelfSettlingWatermarkFailure records a watermark failure that guards no
@@ -217,9 +238,15 @@ func (e *Engine) noteSelfSettlingWatermarkFailure() {
 //
 // The scope's mark is CONSUMED (takeWatermarkBumpFailure), so a scope that
 // somehow reached both call sites -- or an Apply that somehow ran twice for
-// one scope -- still advances the counter exactly once, which is what makes
-// "settledDirtyGen == dirtyGen means every failure has settled" a sound
-// reading of two independent counters.
+// one scope -- still advances the counter exactly once. That is only half of
+// what makes "settledDirtyGen == dirtyGen means every failure has settled" a
+// sound reading of two independent counters: the other half is
+// NoteWatermarkBumpFailure's matching once-per-scope gate on dirtyGen (its
+// own doc), without which a scope whose bump keeps failing on every retry
+// would open one dirtyGen generation per retry that this method's own
+// consume-once mark could never settle more than one of. With both halves in
+// place, each counter moves by exactly one per scope that ever fails its
+// bump, however many times that scope's own mutating calls retry it.
 func (e *Engine) settleWatermarkFailure(scope *WriteScope) bool {
 	if scope == nil || !scope.takeWatermarkBumpFailure() {
 		return false
@@ -387,6 +414,12 @@ func (e *Engine) watermarkGensResolved() bool {
 //  3. The replica is trustworthy right now: state == stateServing, i.e. no
 //     write is currently known to have failed to replay.
 //
+// Condition 1 is actually sampled TWICE -- once before conditions 2 and 3 are
+// read, and once again after, requiring both samples to agree -- rather than
+// once. The implementation (below) explains why; it costs two atomic loads
+// and touches nothing in the argument above, which only ever needed
+// condition 1 to hold at some instant covered by the other two.
+//
 // # How a failure is resolved, and why it takes an adopted snapshot
 //
 // A genuine bump failure (NoteWatermarkBumpFailure, from write_observer.go's
@@ -473,7 +506,29 @@ func (e *Engine) WatermarkTrusted(ctx context.Context) bool {
 	}
 
 	_, converged := e.watermarkConverged(ctx)
-	return watermarkTrustedFor(dirtyGen, resolvedGen, converged, e.state.Load())
+	state := e.state.Load()
+
+	// Re-read the same pair, in the same resolved-then-dirty order
+	// (watermarkGens' own doc, load-bearing there too), AFTER the live pg
+	// round trip and the state load above, and require it to still match
+	// the pair sampled before them. Neither watermarkConverged nor
+	// e.state.Load() consult the generations at all, so a failure noted
+	// while either of those two calls was in flight -- opening a new
+	// generation this decision would otherwise never learn about -- would
+	// go unnoticed by the single-sample version: dirtyGen == resolvedGen
+	// checked above could already be stale by the time converged/state are
+	// read moments later. Comparing both reads costs two more atomic loads
+	// and narrows that window to nothing, for free: it does not touch the
+	// proof above (which only ever needed dirtyGen == resolvedGen to hold at
+	// SOME instant covered by the other two conditions), since agreeing
+	// twice is strictly stronger evidence of that than agreeing once, never
+	// weaker.
+	dirtyGen2, resolvedGen2 := e.watermarkGens()
+	if dirtyGen2 != dirtyGen || resolvedGen2 != resolvedGen {
+		return false
+	}
+
+	return watermarkTrustedFor(dirtyGen, resolvedGen, converged, state)
 }
 
 // watermarkConvergedFor is watermarkConverged's pure comparison, extracted

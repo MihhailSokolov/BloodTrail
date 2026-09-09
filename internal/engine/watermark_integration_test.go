@@ -350,6 +350,58 @@ func TestWatermarkTrustWithheldWhileInFallback(t *testing.T) {
 	wantTrusted(t, ctx, eng, true, "serving again")
 }
 
+// TestWatermarkRepeatedBumpFailuresOnOneScopeCountAsOne is F1's regression,
+// exercised against WatermarkTrusted's full, live-pg predicate (rather than
+// watermark_test.go's TestNoteWatermarkBumpFailureCountsOncePerScopeAcrossRepeatedRetries,
+// which pins the same generation algebra without a database): a write scope
+// whose eager bump fails on TWO of its own mutating calls in a row -- the
+// shape a transaction produces once its first bump fails, since every later
+// call on that same scope retries the identical failing bump (ensureBumped's
+// own doc) -- must open exactly one generation, settle with exactly one
+// Apply, and become trusted again with exactly one adoption. Before this
+// fix, the second call's extra dirtyGen increment could never be matched by
+// a second settle (the scope's mark only ever consumes once), so
+// WatermarkTrusted would stay false no matter how many snapshots were
+// adopted afterwards.
+func TestWatermarkRepeatedBumpFailuresOnOneScopeCountAsOne(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	defer eng.Stop()
+	resetWatermarkTable(t, ctx, eng)
+	parkRebuildLoop(eng)
+
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "converged and serving before the write starts")
+
+	// Two failing mutating calls against the same scope.
+	scope := NewWriteScope()
+	eng.NoteWatermarkBumpFailure(ctx, scope, errors.New("simulated bump failure 1"))
+	eng.NoteWatermarkBumpFailure(ctx, scope, errors.New("simulated bump failure 2"))
+
+	if got, settled := eng.dirtyGen.Load(), eng.settledDirtyGen.Load(); got != 1 || settled != 0 {
+		t.Fatalf("generations = (dirty %d, settled %d) after two failing calls on one scope, want (1, 0): the second call must not open a second generation", got, settled)
+	}
+	wantTrusted(t, ctx, eng, false, "an unsettled failure was noted")
+
+	// The write lands anyway, carrying the one fallback record ensureBumped
+	// records only for the scope's FIRST failure (write_observer.go's own
+	// doc).
+	scope.Changes().RecordFallback("watermark: bump failed: simulated bump failure 1")
+	eng.Apply(ctx, scope)
+	if got, settled := eng.dirtyGen.Load(), eng.settledDirtyGen.Load(); got != 1 || settled != 1 {
+		t.Fatalf("generations = (dirty %d, settled %d) after Apply, want (1, 1): one Apply must settle both failing calls' shared generation", got, settled)
+	}
+	wantTrusted(t, ctx, eng, false, "settled, but no adopted snapshot contains it yet")
+
+	// One adoption resolves it -- recoverable, exactly as a single bump
+	// failure would be.
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "the shared generation settled once, and one adoption resolved it")
+}
+
 // TestWatermarkTrustNotRestoredByAConcurrentWriteResolving is the direct
 // regression test for the wrong-trust race that a clearable dirty flag could
 // not close, whatever it was gated on.

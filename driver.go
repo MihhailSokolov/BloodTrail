@@ -254,14 +254,35 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // error branch below at all: its e.inflightBumps entry would never be
 // retired, permanently breaking watermarkConverged (watermark.go's own
 // doc), and its counter value would never fold into e.appliedWatermark.
-// BatchOperation does not share this risk -- its observer/scope is built
+//
+// A second, independent consequence of the same orphaning: if attempt #1's
+// bump instead FAILED (rather than succeeded), its scope's bump-failure mark
+// (WriteScope.markWatermarkBumpFailed, changes_scope.go) is orphaned right
+// alongside it. That mark is the only thing settleWatermarkFailure/
+// ResolveAbandonedWrite could ever consume to retire the dirtyGen generation
+// NoteWatermarkBumpFailure already opened for attempt #1 -- but attempt #1's
+// own scope is never seen by the success/error branch below either (only
+// attempt #2's `observer` is), so nothing ever calls either settling method
+// on it. dirtyGen would have advanced with no corresponding settledDirtyGen
+// increment ever possible, permanently distrusting the engine (WatermarkTrusted's
+// own doc: dirtyGen == resolvedGen can never hold again). Both consequences
+// fail CLOSED, not open -- a permanently unresolved inflightBumps entry keeps
+// watermarkConverged false forever, and a permanently unsettled generation
+// keeps WatermarkTrusted false forever, so a retry of this shape could make
+// this engine wrongly distrust a good snapshot, never wrongly trust a bad
+// one.
+//
+// BatchOperation does not share either risk -- its observer/scope is built
 // ONCE outside its own delegate closure (see its doc), so ensureBumped's
 // own bumped-flag guard correctly skips re-bumping on any retry the
-// embedded driver's BatchOperation might perform. If the pinned dawgs pg
+// embedded driver's BatchOperation might perform, and a scope whose mark it
+// already set stays that same scope across every retry, so it is still the
+// one the eventual success/error branch settles. If the pinned dawgs pg
 // driver ever starts retrying WriteTransaction's delegate internally, this
 // method would need to stop reconstructing a fresh WriteScope per
-// invocation (or otherwise resolve every attempt's own bump, not just the
-// last one's) before that behavior could be trusted.
+// invocation (or otherwise resolve every attempt's own bump AND its own
+// bump-failure mark, not just the last attempt's) before either could be
+// trusted.
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
 	var observer *observingTransaction
 	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {

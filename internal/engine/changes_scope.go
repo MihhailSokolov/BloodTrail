@@ -107,8 +107,25 @@ func (s *WriteScope) Watermark() (uint64, bool) {
 // opened. Called only by NoteWatermarkBumpFailure (watermark.go), which
 // advances that generation in the same breath -- the two must not drift
 // apart, which is why neither is exported on its own.
-func (s *WriteScope) markWatermarkBumpFailed() {
+//
+// Reports whether this call is the one that SET the mark -- true only the
+// first time it is called on a given scope; false on every later call while
+// the mark is still unconsumed. A single write scope's mutating calls all
+// share one scope (ensureBumped's own "bumped exactly once" guard notwithstanding
+// -- a scope whose first bump failed has no way to become bumped=true, so its
+// later mutating calls retry the same failing bump and fail again), so a
+// scope whose bump keeps failing must open exactly one watermark trust
+// generation, not one per retry: NoteWatermarkBumpFailure uses this return
+// value to advance e.dirtyGen only on the transition, keeping it in lockstep
+// with settleWatermarkFailure's own once-per-scope consume
+// (takeWatermarkBumpFailure) -- both counters move by exactly one per scope
+// that ever fails, however many times that scope's own bump is retried.
+func (s *WriteScope) markWatermarkBumpFailed() bool {
+	if s.watermarkBumpFailed {
+		return false
+	}
 	s.watermarkBumpFailed = true
+	return true
 }
 
 // takeWatermarkBumpFailure reports whether this scope carries an unsettled
