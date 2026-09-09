@@ -35,6 +35,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -42,6 +43,7 @@ import (
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/query"
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
@@ -579,6 +581,130 @@ func randomCypherQuery(rng *rand.Rand) string {
 	return tmpl(rng)
 }
 
+// --- Interleaved write-through mutations -----------------------------------
+//
+// Every randomCypherMutationInterval-th completed query across the whole
+// seed x query sweep (a global counter spanning all
+// randomCypherDifferentialTotalQueries queries, not restarted per seed),
+// TestRandomCypherDifferential performs one small mutation batch through bt
+// -- create, update, or delete, chosen uniformly by applyRandomCypherMutation
+// -- against this suite's own 40-node adversarial catalog, then continues
+// comparing the next generated query exactly as before. Each mutation uses
+// one of writethrough_differential_integration_test.go's own already-proven
+// write-observer-recognized shapes (tx.CreateNode+CreateRelationshipByIDs,
+// its class 6; Nodes().Filter(InIDs(...)).Update(...), its class 10; batch.
+// DeleteRelationship by id, its class 7) rather than an untested one, so
+// this interleaving carries no risk of tripping fallback by accident -- if
+// one unexpectedly did anyway, that is a genuine finding (caught by this
+// test's own RebuildCount/fallback pin at the end), not something to route
+// around.
+
+const (
+	// randomCypherMutationIntervalDefault is how often (in completed
+	// queries) a mutation batch runs, absent an override -- small enough
+	// (every 5th of this suite's 200 total queries, 40 mutation events) to
+	// exercise write-through repeatedly across the sweep without dominating
+	// its runtime.
+	randomCypherMutationIntervalDefault = 5
+
+	// randomCypherMutationIntervalEnv overrides randomCypherMutationIntervalDefault
+	// when set to a non-negative integer; set to "0" to disable the
+	// mutation phase entirely -- an escape hatch mirroring this package's
+	// only other test-file env knob, graphtest.PGAvailable's own
+	// BLOODTRAIL_TEST_PG (which gates whether these suites run at all).
+	randomCypherMutationIntervalEnv = "BLOODTRAIL_TEST_RANDOM_MUTATION_INTERVAL"
+)
+
+// randomCypherMutationInterval resolves the effective interval:
+// randomCypherMutationIntervalEnv's value when it parses as a non-negative
+// integer, randomCypherMutationIntervalDefault otherwise (unset, empty, or
+// unparseable).
+func randomCypherMutationInterval() int {
+	if v := os.Getenv(randomCypherMutationIntervalEnv); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return randomCypherMutationIntervalDefault
+}
+
+// applyRandomCypherMutation performs one small, seeded-deterministic
+// mutation batch through bt against the adversarial fixture's own node/edge
+// catalog: a create (tx.CreateNode plus one connecting edge to a random
+// existing node -- writethrough_differential_integration_test.go's class
+// 6 shape), an update (Nodes().Filter(query.InIDs(...)).Update(...),
+// merging fresh str/val values onto one existing node -- its class 10
+// shape), or a delete (batch.DeleteRelationship on one randomly chosen
+// existing edge, discovered live from oracleDB rather than tracked
+// separately -- its class 7 shape), chosen uniformly by mutationSeed's own
+// draw. *idsPtr is the running node-id catalog randomCypherPickKind's
+// callers implicitly assume is non-empty; a create appends its new id so
+// later mutation events can also target it.
+//
+// mutationSeed seeds the choice and every random draw this call makes, so
+// a caller can name exactly this seed in a failure message for a
+// reproducible mutation -- though this whole suite is already fully
+// deterministic end to end (fixed fixture, fixed per-seed query streams,
+// and TestRandomCypherDifferential's own fixed mutationSeed formula), so
+// simply rerunning the suite already reproduces any given mutation
+// bit-for-bit; the returned summary (and the seed within it) is for a
+// human reader's benefit, not because rerunning alone would not suffice.
+func applyRandomCypherMutation(t *testing.T, ctx context.Context, bt, oracleDB graph.Database, idsPtr *[]graph.ID, mutationSeed int64) string {
+	t.Helper()
+
+	rng := rand.New(rand.NewSource(mutationSeed))
+
+	switch rng.Intn(3) {
+	case 0: // create: tx.CreateNode + one connecting edge.
+		kind := graph.StringKind(randomCypherPickKind(rng))
+		edgeKind := graph.StringKind(randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))])
+		peer := (*idsPtr)[rng.Intn(len(*idsPtr))]
+		props := randomCypherNodeProperties(len(*idsPtr))
+
+		var newID graph.ID
+		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+			n, err := tx.CreateNode(props, kind)
+			if err != nil {
+				return err
+			}
+			newID = n.ID
+			_, err = tx.CreateRelationshipByIDs(newID, peer, edgeKind, graph.NewProperties())
+			return err
+		}); err != nil {
+			t.Fatalf("random differential mutation (seed=%d, create): %v", mutationSeed, err)
+		}
+		*idsPtr = append(*idsPtr, newID)
+		return fmt.Sprintf("mutation seed=%d: created node id=%d kind=%s (+%s edge to node %d)", mutationSeed, newID, kind, edgeKind, peer)
+
+	case 1: // update: Nodes().Filter(InIDs(...)).Update(...).
+		id := (*idsPtr)[rng.Intn(len(*idsPtr))]
+		newProps := graph.NewProperties().Set("str", randomCypherPickString(rng)).Set("val", randomCypherPickNumber(rng))
+		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+			return tx.Nodes().Filter(query.InIDs(query.NodeID(), id)).Update(newProps)
+		}); err != nil {
+			t.Fatalf("random differential mutation (seed=%d, update): %v", mutationSeed, err)
+		}
+		return fmt.Sprintf("mutation seed=%d: updated node id=%d (str/val)", mutationSeed, id)
+
+	default: // delete: batch.DeleteRelationship by id.
+		result, err := runCorpusQuery(t, ctx, oracleDB, `MATCH ()-[r]->() RETURN r LIMIT 200`)
+		if err != nil {
+			t.Fatalf("random differential mutation (seed=%d, delete): locate candidate edge: %v", mutationSeed, err)
+		}
+		edgeIDs := extractEdgeIDs(result)
+		if len(edgeIDs) == 0 {
+			return fmt.Sprintf("mutation seed=%d: delete skipped (no edges left)", mutationSeed)
+		}
+		target := edgeIDs[rng.Intn(len(edgeIDs))]
+		if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+			return batch.DeleteRelationship(target)
+		}); err != nil {
+			t.Fatalf("random differential mutation (seed=%d, delete): %v", mutationSeed, err)
+		}
+		return fmt.Sprintf("mutation seed=%d: deleted relationship id=%d", mutationSeed, target)
+	}
+}
+
 // --- The suite itself -------------------------------------------------
 
 // randomCypherDifferentialSeeds and randomCypherDifferentialQueriesPerSeed
@@ -710,10 +836,22 @@ func TestRandomCypherDifferential(t *testing.T) {
 	bt := graph.Database(d)
 	oracleDB := graph.Database(oracle)
 
+	// Captured right after the one rebuild above, before either the query
+	// sweep or its interleaved mutations run: everything from here on --
+	// every generated query AND every mutation batch applyRandomCypherMutation
+	// performs -- must be served by write-through alone (this suite's own
+	// exit criterion for being re-based on write-through).
+	rebuildsBeforeSweep := d.engine.RebuildCount()
+	fallbacksBeforeSweep := markerCount(buf, fallbackEnteredMarker)
+
+	mutationInterval := randomCypherMutationInterval()
+
 	var (
 		servedCount   int
 		nonEmptyCount int
 		totalCount    int
+		globalIter    int
+		lastMutation  string
 	)
 
 	for seed := int64(1); seed <= randomCypherDifferentialSeeds; seed++ {
@@ -722,10 +860,19 @@ func TestRandomCypherDifferential(t *testing.T) {
 		for q := 0; q < randomCypherDifferentialQueriesPerSeed; q++ {
 			text := randomCypherQuery(rng)
 
+			globalIter++
+			if mutationInterval > 0 && globalIter%mutationInterval == 0 {
+				// A fixed offset well clear of any query-generation seed
+				// (1..randomCypherDifferentialSeeds) or query index, so this
+				// mutation's own rand.Rand draws never correlate with
+				// either.
+				lastMutation = applyRandomCypherMutation(t, ctx, bt, oracleDB, &ids, int64(900000+globalIter))
+			}
+
 			t.Run(fmt.Sprintf("seed=%d/query=%d", seed, q), func(t *testing.T) {
 				defer func() {
 					if t.Failed() {
-						t.Logf("reproduce with: seed=%d query=%d\nquery: %s", seed, q, text)
+						t.Logf("reproduce with: seed=%d query=%d\nquery: %s\nmost recent mutation: %s", seed, q, text, lastMutation)
 					}
 				}()
 
@@ -779,4 +926,12 @@ func TestRandomCypherDifferential(t *testing.T) {
 	if nonEmptyCount < randomCypherNonEmptyFloor {
 		t.Errorf("only %d/%d queries returned any rows, want >= %d (see randomCypherNonEmptyFloor's doc) -- a template may have become unsatisfiable (e.g. two disjoint value pools, as previously happened to the `IN n.tags` template)", nonEmptyCount, totalCount, randomCypherNonEmptyFloor)
 	}
+
+	// This suite's own exit criterion for being re-based on write-through:
+	// every interleaved mutation batch above (mutationInterval permitting)
+	// must have been served entirely from write-through, never by way of a
+	// rebuild or a fallback -- see applyRandomCypherMutation's own doc for why its three
+	// shapes are each already-proven write-observer-recognized ones.
+	assertRebuildCountUnchanged(t, d, rebuildsBeforeSweep, "random differential sweep (including interleaved mutations)")
+	assertNoNewFallback(t, buf, fallbacksBeforeSweep, "random differential sweep (including interleaved mutations)")
 }

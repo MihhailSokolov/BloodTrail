@@ -109,6 +109,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
@@ -1052,6 +1053,29 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		runBuilderQueryDifferentialMatrix(t, ctx, bt, oracle, buf, tally, nodeKinds, edgeKinds)
 	})
 
+	// --- Write-through rerun: the SAME fixtures graph (no rewipe), mutated
+	// through bt's own write path, then the identical matrix rerun with
+	// RebuildCount pinned -- see runBuilderMatrixWriteThroughPreamble's own
+	// doc for the full design. writeThroughPreambleEnabled (prebuilt_corpus_
+	// integration_test.go, this same package) gates this phase, shared with
+	// that file's own "writethrough" subtest; on by default since it is
+	// cheap.
+	if writeThroughPreambleEnabled() {
+		t.Run("fixtures_writethrough", func(t *testing.T) {
+			nodeKinds, edgeKinds := builderMatrixFixtureKinds(t)
+
+			rebuilds := d.engine.RebuildCount()
+			fallbacks := markerCount(buf, fallbackEnteredMarker)
+
+			runBuilderMatrixWriteThroughPreamble(t, ctx, bt, oracle, pool, nodeKinds, edgeKinds)
+
+			runBuilderQueryDifferentialMatrix(t, ctx, bt, oracle, buf, tally, nodeKinds, edgeKinds)
+
+			assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+			assertNoNewFallback(t, buf, fallbacks, t.Name())
+		})
+	}
+
 	// --- Graphs 2..21: 20 seeded random graphs. ---
 	for seed := int64(1); seed <= builderMatrixRandomSeeds; seed++ {
 		t.Run(fmt.Sprintf("random/seed=%d", seed), func(t *testing.T) {
@@ -1069,5 +1093,115 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		if tally[family] == 0 {
 			t.Errorf("op family %q was never served by the engine anywhere in this suite -- a recognizer regression affecting exactly this family would go unnoticed", family)
 		}
+	}
+}
+
+// runBuilderMatrixWriteThroughPreamble performs a small, standard mutation
+// batch through bt against the "fixtures" graph already loaded by
+// TestBuilderQueryDifferentialMatrix's own "fixtures" subtest, leaving the
+// replica in write-through-derived (not rebuild-derived) state before the
+// caller reruns runBuilderQueryDifferentialMatrix over the same graph --
+// re-basing this suite's structural matrix on write-through, mirroring
+// prebuilt_corpus_integration_test.go's own runCorpusWriteThroughPreamble
+// for its 222-query corpus (see that function's doc for the shared design
+// rationale: reuse already-proven write-observer-recognized shapes so this
+// preamble carries no risk of tripping fallback by accident).
+//
+// Uses write-through's classes 1 (objectid upsert create), 2 (objectid upsert
+// merge), 5 (batch.UpdateNodes kinds+deleted prop), and 7 (batch.
+// DeleteRelationship by id) -- the same four prebuilt_corpus_integration_
+// test.go's own preamble uses -- against nodeKinds[0]/edgeKinds[0] (real
+// kinds this specific graph carries, derived by the caller's own
+// builderMatrixFixtureKinds, never hardcoded) so the mutations are counted
+// by, not invisible to, the structural matrix's own per-kind Count/FetchIDs/
+// FetchKinds/FetchTriples/pair-row/step-row checks that follow.
+func runBuilderMatrixWriteThroughPreamble(t *testing.T, ctx context.Context, bt, oracle graph.Database, pool *pgxpool.Pool, nodeKinds, edgeKinds graph.Kinds) {
+	t.Helper()
+
+	// Read BEFORE any write below -- see prebuilt_corpus_integration_test.go's
+	// runCorpusWriteThroughPreamble's identical reasoning: class 2 must
+	// merge onto a genuinely pre-existing node, not (by scan-order
+	// accident) the brand-new one class 1 is about to create. This
+	// fixtures graph carries exactly one objectid-bearing node today
+	// (adcs_fanout.json's lone Group node); if a future fixture edit adds
+	// none at all, this read comes back "" and class 2 below degrades to
+	// upserting a fresh (rather than merged) node under that empty-string
+	// objectid, which still exercises the same write shape, just without an
+	// existing target to merge onto.
+	existingOID := cypherStringValue(t, ctx, oracle, `MATCH (n) WHERE n.objectid IS NOT NULL RETURN n.objectid LIMIT 1`)
+
+	// Asserted through a THROWAWAY *pg.Driver sharing bt's own connection
+	// pool, never through bt (or pgDriver/oracle) itself -- see
+	// prebuilt_corpus_integration_test.go's runCorpusWriteThroughPreamble
+	// doc, "Why the constraint is asserted through a THROWAWAY driver, not
+	// bt itself", for the full derivation. Every driver instance already in
+	// scope by this point (bt, pgDriver, oracle) already asserted
+	// graphtest.GraphName's schema at least once before this preamble runs,
+	// so each one's own SchemaManager cache would fast-path a same-name
+	// re-assert into a no-op that never issues the real CREATE UNIQUE INDEX
+	// -- confirmed the same way for this file (PostgreSQL error 42P10 on
+	// the very next UpdateNodeBy) before this fix.
+	schema := graph.Schema{DefaultGraph: graph.Graph{
+		Name:            graphtest.GraphName,
+		NodeConstraints: []graph.Constraint{{Field: "objectid", Type: graph.BTreeIndex}},
+	}}
+	if err := pg.NewDriver(size.Gibibyte, pool).AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("write-through preamble: assert schema with objectid constraint: %v", err)
+	}
+
+	primaryKind := nodeKinds[0]
+	tempKind := graph.StringKind("WT18MatrixTemp")
+	taggedKind := graph.StringKind("WT18MatrixTagged")
+	mergedKind := graph.StringKind("WT18MatrixMerged")
+
+	// Class 1: objectid upsert creating a brand-new node of a REAL fixture
+	// kind, counted by that kind's Count/FetchIDs/FetchKinds checks in the
+	// rerun that follows.
+	const newObjectID = "WT18-MatrixPreambleNode"
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodeBy(objectIDUpdate(newObjectID, graph.NewProperties().Set("wt18temp", "gone-soon"), primaryKind, tempKind))
+	}); err != nil {
+		t.Fatalf("write-through preamble: objectid upsert create: %v", err)
+	}
+
+	newNodeResult, err := runCorpusQuery(t, ctx, bt, fmt.Sprintf(`MATCH (n) WHERE n.objectid = %s RETURN n`, cypherStringLiteral(newObjectID)))
+	if err != nil {
+		t.Fatalf("write-through preamble: locate new node: %v", err)
+	}
+	newIDs := extractNodeIDs(newNodeResult)
+	if len(newIDs) != 1 {
+		t.Fatalf("write-through preamble: locate new node: got %d nodes, want 1", len(newIDs))
+	}
+	newNodeID := newIDs[0]
+
+	// Class 2: objectid upsert merging a kind onto whichever node
+	// existingOID (read above, before any write) names.
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodeBy(objectIDUpdate(existingOID, graph.NewProperties().Set("wt18merged", "yes"), mergedKind))
+	}); err != nil {
+		t.Fatalf("write-through preamble: objectid upsert merge: %v", err)
+	}
+
+	// Class 5: batch.UpdateNodes carrying AddedKinds/DeletedKinds and a
+	// deleted property, targeting the class-1 node above by id.
+	update := &graph.Node{ID: newNodeID, Kinds: graph.Kinds{taggedKind}, DeletedKinds: graph.Kinds{tempKind}, Properties: graph.NewProperties()}
+	update.Properties.Delete("wt18temp")
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodes([]*graph.Node{update})
+	}); err != nil {
+		t.Fatalf("write-through preamble: batch UpdateNodes: %v", err)
+	}
+
+	// Class 7: batch.DeleteRelationship by id -- a real edge of the
+	// fixture's first edge kind, discovered via this file's own
+	// relTriplesByCriteria (never hardcoded).
+	triples := relTriplesByCriteria(t, ctx, oracle, query.KindIn(query.Relationship(), edgeKinds[0]))
+	if len(triples) == 0 {
+		t.Fatalf("write-through preamble: no existing %s relationship to delete", edgeKinds[0])
+	}
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.DeleteRelationship(triples[0].ID)
+	}); err != nil {
+		t.Fatalf("write-through preamble: DeleteRelationship: %v", err)
 	}
 }

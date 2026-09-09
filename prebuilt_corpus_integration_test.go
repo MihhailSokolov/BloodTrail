@@ -31,9 +31,11 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/cypher/frontend"
 	"github.com/specterops/dawgs/drivers/pg"
@@ -641,6 +643,64 @@ func renderPathSignatures(ps graph.PathSet) []string {
 	return out
 }
 
+// sortFlatPathNodesAndEdges sorts, IN PLACE, the Nodes and Edges of paths'
+// one accumulated pseudo-path -- by each node's/edge's own canonical JSON
+// signature (canonicalizePath's own rendering, so this sort key agrees
+// exactly with what renderPathSignatures compares) -- discovered necessary
+// (2026-09-09) when interleaving live mutations into
+// random_cypher_differential_integration_test.go's own differential sweep
+// started making bt's and PostgreSQL's respective (unspecified, since
+// neither side's Cypher text carries an ORDER BY) row-return order for a
+// bare "RETURN n"/"RETURN n, r" projection disagree: ops.FetchByQuery
+// (dawgs' ops/ops.go) accumulates every row's bare node/relationship
+// values into ONE shared, running graph.Path across the WHOLE result
+// (never resetting per row -- see nodeSignaturesByCypher's own doc,
+// writethrough_differential_integration_test.go, for the same behavior
+// documented from a different caller), so for exactly this common query
+// shape, "unordered" comparison (assertCorpusResultsMatch's ordered=false
+// branch) previously degenerated into comparing one giant, row-encounter-
+// order-sensitive blob per side instead of a genuine node/edge SET --
+// harmless for TestPrebuiltCorpusDifferential's static, never-mutated
+// fixture (both engines' default scan order happened to coincide there)
+// but a real, previously-latent gap this suite's own interleaved mutations
+// were the first to expose. A same-set, different-order pair of "RETURN
+// n" results is not a correctness divergence; it is exactly what
+// "unordered" was always supposed to tolerate.
+//
+// Deliberately a no-op when paths does not hold EXACTLY one entry:
+// ops.FetchByQuery gives a query whose RETURN clause instead projects a
+// genuine, per-row graph.Path value (e.g. a shortestPath result) its OWN
+// distinct entry in the returned PathSet for each such row, in which case
+// len(Paths) > 1, and that path's own internal node/edge sequence IS
+// traversal-order-significant -- reordering it would be wrong, not merely
+// unnecessary. The two shapes cannot be mixed within one query's result
+// (whether a given RETURN column produces a bare entity or a path value is
+// fixed by the query's own projection, uniformly across every row), so
+// this len-1 guard reliably distinguishes them.
+func sortFlatPathNodesAndEdges(paths graph.PathSet) {
+	if len(paths) != 1 {
+		return
+	}
+
+	signature := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			panic(fmt.Sprintf("bloodtrail: sortFlatPathNodesAndEdges: marshal signature: %v", err))
+		}
+		return string(b)
+	}
+
+	p := &paths[0]
+	sort.Slice(p.Nodes, func(i, j int) bool {
+		return signature(canonNode{ID: uint64(p.Nodes[i].ID), Props: p.Nodes[i].Properties.MapOrEmpty()}) <
+			signature(canonNode{ID: uint64(p.Nodes[j].ID), Props: p.Nodes[j].Properties.MapOrEmpty()})
+	})
+	sort.Slice(p.Edges, func(i, j int) bool {
+		return signature(canonEdge{Kind: p.Edges[i].Kind.String(), Props: p.Edges[i].Properties.MapOrEmpty()}) <
+			signature(canonEdge{Kind: p.Edges[j].Kind.String(), Props: p.Edges[j].Properties.MapOrEmpty()})
+	})
+}
+
 // assertCorpusResultsMatch compares got (the bloodtrail-side result)
 // against want (the pg oracle's): paths by canonical node-id+properties/
 // edge-kind+properties rendering (renderPathSignatures/canonicalizePath --
@@ -656,6 +716,24 @@ func assertCorpusResultsMatch(t *testing.T, ordered bool, got, want ops.QueryRes
 
 	if len(got.Paths) != len(want.Paths) {
 		t.Errorf("path count mismatch: got %d paths, want %d", len(got.Paths), len(want.Paths))
+	}
+
+	if !ordered {
+		// See sortFlatPathNodesAndEdges's own doc: a bare-node/relationship
+		// projection ("RETURN n", never a genuine path-typed value) packs
+		// every row into ONE shared pseudo-path, in row-ENCOUNTER order --
+		// not a meaningful order at all, since neither the underlying
+		// Cypher query (no ORDER BY) nor this comparison's own "unordered"
+		// contract makes any promise about it. Sorting each side's own
+		// pseudo-path contents before rendering makes what follows
+		// insensitive to that meaningless order, restoring genuine SET
+		// semantics for exactly the queries "unordered" was always meant to
+		// cover -- a no-op for the genuine-multi-path case (len(Paths) > 1,
+		// e.g. several distinct shortestPath rows), where each path's own
+		// internal node/edge sequence remains traversal-order-significant
+		// and untouched.
+		sortFlatPathNodesAndEdges(got.Paths)
+		sortFlatPathNodesAndEdges(want.Paths)
 	}
 
 	gotPaths, wantPaths := renderPathSignatures(got.Paths), renderPathSignatures(want.Paths)
@@ -1013,41 +1091,11 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 		key := corpusQueryKey(q)
 
 		t.Run(key, func(t *testing.T) {
-			ordered := hasOrderBy(q.query)
-
-			before := buf.String()
-			baseline := markerCount(buf, cypherServedMarker)
-
-			gotResult, gotErr := runCorpusQuery(t, ctx, bt, q.query)
-			if gotErr != nil {
-				t.Fatalf("bloodtrail query error: %v\nquery: %s", gotErr, q.query)
+			servedOrAllowed, nonEmpty := runOneCorpusQueryComparison(t, ctx, buf, bt, oracleDB, q, key)
+			if !servedOrAllowed {
+				undelegated++
 			}
-
-			if delta := markerCount(buf, cypherServedMarker) - baseline; delta == 0 {
-				if reason, allowed := expectedDelegations[key]; allowed {
-					t.Logf("delegated as expected (%s)", reason)
-				} else {
-					undelegated++
-					tail := buf.String()[len(before):]
-					t.Errorf("query %q was not served by the bloodtrail engine (delegated to PostgreSQL); decline reason: %s", q.name, declineReason(tail))
-				}
-			}
-
-			wantResult, wantErr := runCorpusQuery(t, ctx, oracleDB, q.query)
-			if wantErr != nil {
-				t.Fatalf("oracle query error: %v\nquery: %s", wantErr, q.query)
-			}
-
-			if reason, ambiguous := knownAmbiguousQueries[key]; ambiguous {
-				t.Logf("comparing node ids only: known shortestPath tie (%s)", reason)
-				assertStringMultiset(t, idSet(extractNodeIDs(gotResult)), idSet(extractNodeIDs(wantResult)), "node id set")
-			} else if ordered {
-				assertOrderedCorpusResult(t, ctx, oracleDB, q.name, gotResult, wantResult)
-			} else {
-				assertCorpusResultsMatch(t, false, gotResult, wantResult)
-			}
-
-			if len(wantResult.Paths) > 0 || len(wantResult.Literals) > 0 {
+			if nonEmpty {
 				nonEmptyCount++
 			}
 		})
@@ -1072,4 +1120,297 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 			t.Fatalf("probe error strings differ:\n bloodtrail: %s\n oracle:     %s", gotErr.Error(), wantErr.Error())
 		}
 	})
+
+	// --- Write-through rerun: the identical 222-query comparison, now
+	// against write-through-derived (not rebuild-derived) replica state --
+	// see this file's own "write-through rerun" section doc, below
+	// TestPrebuiltCorpusDifferential, for the full design and why it is
+	// safe against this specific fixture.
+	if writeThroughPreambleEnabled() {
+		t.Run("writethrough", func(t *testing.T) {
+			rebuilds := d.engine.RebuildCount()
+			fallbacks := markerCount(buf, fallbackEnteredMarker)
+
+			runCorpusWriteThroughPreamble(t, ctx, bt, oracleDB, pool)
+
+			var (
+				wtNonEmptyCount int
+				wtUndelegated   int
+			)
+			for _, q := range queries {
+				q := q
+				key := corpusQueryKey(q)
+
+				t.Run(key, func(t *testing.T) {
+					servedOrAllowed, nonEmpty := runOneCorpusQueryComparison(t, ctx, buf, bt, oracleDB, q, key)
+					if !servedOrAllowed {
+						wtUndelegated++
+					}
+					if nonEmpty {
+						wtNonEmptyCount++
+					}
+				})
+			}
+
+			if pct := wtNonEmptyCount * 100 / len(queries); pct < 60 {
+				t.Errorf("anti-vacuity (write-through rerun): only %d%% (%d/%d) of active queries returned >=1 row against the mutated fixture, want >=60%%", pct, wtNonEmptyCount, len(queries))
+			}
+			if wtUndelegated > 0 {
+				t.Errorf("anti-vacuity (write-through rerun): %d of %d active, non-allowlisted queries were not served by the engine after the mutation preamble, want 0", wtUndelegated, len(queries))
+			}
+
+			assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+			assertNoNewFallback(t, buf, fallbacks, t.Name())
+		})
+	}
+}
+
+// runOneCorpusQueryComparison runs q's own query text against bt (checking
+// the served-marker delta against expectedDelegations, exactly as the
+// original inline loop body did) and oracleDB, then compares the two
+// results via the corpus suite's usual ambiguous/ordered/default dispatch.
+// Returns whether the bloodtrail side either served the query or was
+// allowed to delegate (expectedDelegations), and whether the oracle's own
+// result was non-empty -- the two per-query facts TestPrebuiltCorpusDifferential's
+// own anti-vacuity tallies need. Extracted so both the original
+// (rebuild-derived) comparison pass and the write-through-derived rerun
+// (see runCorpusWriteThroughPreamble, and this file's own "write-through
+// rerun" section doc below) share one comparison body instead of two copies
+// drifting apart by hand.
+func runOneCorpusQueryComparison(t *testing.T, ctx context.Context, buf *lockedBuffer, bt, oracleDB graph.Database, q corpusQuery, key string) (servedOrAllowed, nonEmpty bool) {
+	t.Helper()
+
+	ordered := hasOrderBy(q.query)
+
+	before := buf.String()
+	baseline := markerCount(buf, cypherServedMarker)
+
+	gotResult, gotErr := runCorpusQuery(t, ctx, bt, q.query)
+	if gotErr != nil {
+		t.Fatalf("bloodtrail query error: %v\nquery: %s", gotErr, q.query)
+	}
+
+	servedOrAllowed = true
+	if delta := markerCount(buf, cypherServedMarker) - baseline; delta == 0 {
+		if reason, allowed := expectedDelegations[key]; allowed {
+			t.Logf("delegated as expected (%s)", reason)
+		} else {
+			servedOrAllowed = false
+			tail := buf.String()[len(before):]
+			t.Errorf("query %q was not served by the bloodtrail engine (delegated to PostgreSQL); decline reason: %s", q.name, declineReason(tail))
+		}
+	}
+
+	wantResult, wantErr := runCorpusQuery(t, ctx, oracleDB, q.query)
+	if wantErr != nil {
+		t.Fatalf("oracle query error: %v\nquery: %s", wantErr, q.query)
+	}
+
+	if reason, ambiguous := knownAmbiguousQueries[key]; ambiguous {
+		t.Logf("comparing node ids only: known shortestPath tie (%s)", reason)
+		assertStringMultiset(t, idSet(extractNodeIDs(gotResult)), idSet(extractNodeIDs(wantResult)), "node id set")
+	} else if ordered {
+		assertOrderedCorpusResult(t, ctx, oracleDB, q.name, gotResult, wantResult)
+	} else {
+		assertCorpusResultsMatch(t, false, gotResult, wantResult)
+	}
+
+	nonEmpty = len(wantResult.Paths) > 0 || len(wantResult.Literals) > 0
+	return servedOrAllowed, nonEmpty
+}
+
+// --- Write-through rerun (re-basing this suite on write-through) ----------
+//
+// The comparison above (TestPrebuiltCorpusDifferential's main body) proves
+// the corpus's 222 active queries agree between bt and oracleDB against
+// REBUILD-derived replica state: d.engine.RebuildNow, called once, right
+// after graphtest.LoadCorpusFixture, loads the whole fixture from
+// PostgreSQL in one shot. That never exercises the write-through path at
+// all -- every one of write_observer.go's recognized write shapes could be
+// silently broken and this suite would still pass, since RebuildNow always
+// starts from PostgreSQL's own ground truth regardless of how the replica
+// got there before the rebuild.
+//
+// The "writethrough" subtest above closes that gap: it runs a small,
+// standard mutation batch through bt (runCorpusWriteThroughPreamble, four
+// of writethrough_differential_integration_test.go's own already-proven
+// mutation classes -- 1, 2, 5, and 7) with RebuildCount pinned around it,
+// then reruns the IDENTICAL 222-query comparison (runOneCorpusQueryComparison,
+// shared with the original pass) against whatever state the write-through
+// path alone produced. Because the mutation touches real corpus data (a
+// real :User node's own objectid; a real :MemberOf edge) rather than an
+// inert namespace of its own, the rerun's queries see genuinely different
+// results than the first pass did -- not a no-op rerun of the same
+// comparison against unchanged data, the shape this package's own recent
+// history (TestDAWGSCorpus's redundant "delegating" pass, since removed)
+// warns against reintroducing.
+//
+// writeThroughPreambleEnabled gates this whole phase (shared with
+// builder_differential_matrix_integration_test.go's own "fixtures_writethrough"
+// subtest): unset (the default) runs it, since it is cheap -- a handful of
+// extra writes against an already-open connection, plus one more pass over
+// an already-loaded 222-query set (roughly doubling this one test's own
+// ~2s runtime, not the whole suite's). Set writeThroughPreambleSkipEnv to
+// any non-empty value to skip it, mirroring this package's only other
+// test-file env knob, graphtest.PGAvailable's own BLOODTRAIL_TEST_PG (which
+// gates whether these suites run at all).
+const writeThroughPreambleSkipEnv = "BLOODTRAIL_TEST_SKIP_WRITETHROUGH_PREAMBLE"
+
+func writeThroughPreambleEnabled() bool {
+	return os.Getenv(writeThroughPreambleSkipEnv) == ""
+}
+
+// runCorpusWriteThroughPreamble performs a small, standard mutation batch
+// through bt (the driver under test) after the corpus fixture's initial,
+// rebuild-derived comparison pass has already completed -- see this file's
+// "write-through rerun" section doc, above, for why and how the caller uses
+// this.
+//
+// Mirrors four of writethrough_differential_integration_test.go's own
+// mutation classes -- 1 (objectid upsert creating a node), 2 (objectid
+// upsert merging properties/kinds onto an existing node), 5 (batch.
+// UpdateNodes carrying AddedKinds/DeletedKinds and a deleted property), and
+// 7 (batch.DeleteRelationship by id) -- chosen because all four are already
+// proven write-observer-recognized shapes in that file's own passing suite,
+// so this preamble carries no risk of tripping fallback by accident; a
+// shape that unexpectedly did would be a genuine finding, not something to
+// route around (see TestPrebuiltCorpusDifferential's own assertNoNewFallback
+// call on the "writethrough" subtest).
+//
+// Every write here targets real corpus-fixture data -- a real :User node's
+// own objectid (class 2's target, read live from oracleDB, never
+// hardcoded, matching builder_differential_matrix_integration_test.go's own
+// firstEdgeAnchor/firstNodeKindOf precedent for deriving anchors from real
+// data rather than fixture-internal literals), and a real :MemberOf edge
+// (class 7's target) -- rather than an inert namespace of its own, so the
+// mutations are visible to, not invisible to, the 222-query rerun that
+// follows: any :User-scanning query's own result set now includes the
+// class-1 node and reflects the class-2 node's merged property/kind, and
+// any query touching the deleted class-7 relationship's endpoints sees one
+// fewer edge. Because both bt and oracleDB read the identical post-mutation
+// PostgreSQL state, the rerun's pass/fail verdict never depends on knowing
+// the "right" answer in advance -- only on whether the two sides still
+// agree.
+//
+// The objectid unique index classes 1/2 need (UpdateNodeBy's ON CONFLICT
+// target) is asserted here, against this fixture specifically -- verified
+// (2026-09-09, against a freshly loaded corpus fixture) to carry no
+// duplicate objectid across its ~292 objectid-bearing nodes, so creating it
+// this late (after the fixture, not before, unlike writethrough_differential_
+// integration_test.go's own wipe-first ordering) cannot conflict.
+//
+// # Why the constraint is asserted through a THROWAWAY driver, not bt itself
+//
+// bt's own *pg.Driver.SchemaManager caches, per graph name, whatever
+// model.Graph its FIRST AssertGraph call for that name resolved to
+// (dawgs' drivers/pg/manager.go, SchemaManager.AssertGraph: "if
+// graphInstance, isDefined := s.graphs[schema.Name]; isDefined { ... return
+// graphInstance, nil }" -- a fast-path that skips calling query.On(tx).
+// AssertGraph entirely, so it never re-diffs or re-syncs constraints once a
+// name is cached). TestPrebuiltCorpusDifferential's own setup already
+// called bt.AssertSchema(graphtest.CorpusSchema()) (no NodeConstraints)
+// on this exact bt instance before this preamble ever runs, so a second
+// bt.AssertSchema call naming the SAME graph name (even with different
+// NodeConstraints) is a complete no-op: it returns the already-cached
+// definition without ever issuing the underlying CREATE UNIQUE INDEX SQL.
+// This was discovered empirically (not assumed): the first version of this
+// preamble called bt.AssertSchema directly here, and the very next
+// UpdateNodeBy failed with PostgreSQL error 42P10 ("there is no unique or
+// exclusion constraint matching the ON CONFLICT specification") --
+// confirming the index was genuinely never created.
+//
+// The fix is a throwaway *pg.Driver sharing bt's own connection pool,
+// asserted exactly once, whose SchemaManager cache starts empty for this
+// graph name -- its one AssertGraph call therefore reaches the real
+// diff-and-sync path and issues the CREATE UNIQUE INDEX for real. This
+// works because the constraint is a physical PostgreSQL object, not
+// per-driver-instance state: dawgs' node-upsert SQL (drivers/pg/query/
+// format.go's FormatNodeUpsert) builds its "on conflict (...)" clause
+// purely from the NodeUpdate's own IdentityProperties at write time, with
+// no dependency on whatever bt's own SchemaManager cache happens to
+// believe about constraints -- so bt (whose cache never learns about this
+// index at all) can still issue UpdateNodeBy calls against it successfully,
+// the moment it physically exists.
+func runCorpusWriteThroughPreamble(t *testing.T, ctx context.Context, bt, oracleDB graph.Database, pool *pgxpool.Pool) {
+	t.Helper()
+
+	// Read BEFORE any write below: class 2 merges onto whichever :User the
+	// oracle's own current data names here, so this must be a genuinely
+	// pre-existing fixture principal, not (by scan-order accident) the
+	// brand-new node class 1 is about to create.
+	existingUserOID := cypherStringValue(t, ctx, oracleDB, `MATCH (u:User) WHERE u.objectid IS NOT NULL RETURN u.objectid LIMIT 1`)
+
+	schema := graph.Schema{DefaultGraph: graph.Graph{
+		Name:            graphtest.GraphName,
+		NodeConstraints: []graph.Constraint{{Field: "objectid", Type: graph.BTreeIndex}},
+	}}
+	if err := pg.NewDriver(size.Gibibyte, pool).AssertSchema(ctx, schema); err != nil {
+		t.Fatalf("write-through preamble: assert schema with objectid constraint: %v", err)
+	}
+
+	userKind := graph.StringKind("User")
+	tempKind := graph.StringKind("WT18Temp")
+	taggedKind := graph.StringKind("WT18Tagged")
+	mergedKind := graph.StringKind("WT18Merged")
+
+	// Class 1: objectid upsert creating a brand-new User node -- visible to
+	// every corpus query that scans :User.
+	const newObjectID = "WT18-PreambleUser"
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodeBy(objectIDUpdate(newObjectID,
+			graph.NewProperties().Set("name", "WT18 Preamble User").Set("enabled", true).Set("wt18temp", "gone-soon"),
+			userKind, tempKind))
+	}); err != nil {
+		t.Fatalf("write-through preamble: objectid upsert create: %v", err)
+	}
+
+	newNodeResult, err := runCorpusQuery(t, ctx, bt, fmt.Sprintf(`MATCH (n) WHERE n.objectid = %s RETURN n`, cypherStringLiteral(newObjectID)))
+	if err != nil {
+		t.Fatalf("write-through preamble: locate new node: %v", err)
+	}
+	newIDs := extractNodeIDs(newNodeResult)
+	if len(newIDs) != 1 {
+		t.Fatalf("write-through preamble: locate new node: got %d nodes, want 1", len(newIDs))
+	}
+	newNodeID := newIDs[0]
+
+	// Class 2: objectid upsert merging a property and unioning a kind onto
+	// an EXISTING corpus :User.
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodeBy(objectIDUpdate(existingUserOID, graph.NewProperties().Set("wt18merged", "yes"), mergedKind))
+	}); err != nil {
+		t.Fatalf("write-through preamble: objectid upsert merge: %v", err)
+	}
+
+	// Class 5: batch.UpdateNodes carrying AddedKinds/DeletedKinds and a
+	// deleted property, targeting the class-1 node above by id (seeded with
+	// a throwaway second kind and property for exactly this step to
+	// remove).
+	update := &graph.Node{ID: newNodeID, Kinds: graph.Kinds{taggedKind}, DeletedKinds: graph.Kinds{tempKind}, Properties: graph.NewProperties()}
+	update.Properties.Delete("wt18temp")
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.UpdateNodes([]*graph.Node{update})
+	}); err != nil {
+		t.Fatalf("write-through preamble: batch UpdateNodes: %v", err)
+	}
+
+	// Class 7: batch.DeleteRelationship by id -- the most recently created
+	// MemberOf edge (seedFillerPopulation runs last in LoadCorpusFixture's
+	// own seeding order, internal/graphtest/corpusfixture.go, so the
+	// highest-id MemberOf edge is very likely one of its low-salience
+	// filler memberships rather than a specific, individually-queried
+	// fixture edge).
+	lastMemberOf, err := runCorpusQuery(t, ctx, oracleDB, `MATCH ()-[r:MemberOf]->() RETURN r ORDER BY id(r) DESC LIMIT 1`)
+	if err != nil {
+		t.Fatalf("write-through preamble: locate MemberOf edge to delete: %v", err)
+	}
+	relIDs := extractEdgeIDs(lastMemberOf)
+	if len(relIDs) != 1 {
+		t.Fatalf("write-through preamble: locate MemberOf edge to delete: got %d, want 1", len(relIDs))
+	}
+	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
+		return batch.DeleteRelationship(relIDs[0])
+	}); err != nil {
+		t.Fatalf("write-through preamble: DeleteRelationship: %v", err)
+	}
 }
