@@ -44,7 +44,7 @@ func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapsh
 				if forward {
 					targets, edgeKinds, _ = s.Out(u)
 				} else {
-					targets, edgeKinds, _ = s.In(u)
+					targets, edgeKinds = s.In(u)
 				}
 				for i, w := range targets {
 					visit(w, edgeKinds[i])
@@ -107,6 +107,7 @@ type pathState struct {
 func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path, forward bool) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{from}}}
 
+	overlay := s.Overlay()
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -156,13 +157,13 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 
 			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
 		}
-		if !s.Overlay() {
+		if !overlay {
 			var targets []snapshot.NodeID
 			var edgeKinds []snapshot.KindID
 			if forward {
 				targets, edgeKinds, _ = s.Out(u)
 			} else {
-				targets, edgeKinds, _ = s.In(u)
+				targets, edgeKinds = s.In(u)
 			}
 			for i, w := range targets {
 				visit(w, edgeKinds[i])
@@ -240,6 +241,8 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 	levelsF, levelsB := 0, 0
 	D := -1
 
+	overlay := s.Overlay()
+
 	for len(frontF) > 0 && len(frontB) > 0 {
 		limit := maxDepth
 		if D >= 0 && D < limit {
@@ -268,7 +271,7 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 				}
 			}
 			for _, u := range frontF {
-				if !s.Overlay() {
+				if !overlay {
 					targets, edgeKinds, _ := s.Out(u)
 					for i, w := range targets {
 						visit(w, edgeKinds[i])
@@ -301,8 +304,8 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 				}
 			}
 			for _, u := range frontB {
-				if !s.Overlay() {
-					targets, edgeKinds, _ := s.In(u)
+				if !overlay {
+					targets, edgeKinds := s.In(u)
 					for i, w := range targets {
 						visit(w, edgeKinds[i])
 					}
@@ -364,6 +367,7 @@ func pairPaths(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask,
 func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapshot.KindMask, cap int, budget *memBudget, scF, scT *scratch, out []Path) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{r}}}
 
+	overlay := s.Overlay()
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -411,7 +415,7 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 
 			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
 		}
-		if !s.Overlay() {
+		if !overlay {
 			targets, edgeKinds, _ := s.Out(u)
 			for i, w := range targets {
 				visit(w, edgeKinds[i])

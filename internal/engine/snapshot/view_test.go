@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// buildViewFixture builds the brief's fixture snapshot -- 3 nodes, 2 edges,
-// with an objectid property on every node -- and wraps it in a View.
+// buildViewFixture builds the fixture snapshot these tests share -- 3 nodes,
+// 2 edges, with an objectid property on every node -- and wraps it in a View.
 func buildViewFixture(t *testing.T) (*Snapshot, *View) {
 	t.Helper()
 
@@ -27,8 +27,8 @@ func buildViewFixture(t *testing.T) (*Snapshot, *View) {
 }
 
 // TestViewMirrorsBase asserts that every View accessor returns exactly what
-// the direct Snapshot call returns, per the brief's fixture: 3 nodes, 2
-// edges, props with objectid.
+// the direct Snapshot call returns, over buildViewFixture's snapshot: 3
+// nodes, 2 edges, props with objectid.
 func TestViewMirrorsBase(t *testing.T) {
 	s, v := buildViewFixture(t)
 
@@ -75,21 +75,13 @@ func TestViewMirrorsBase(t *testing.T) {
 			t.Fatalf("Out(%d) edgeIDs = %v, want %v", n, gotOutEdgeIDs, s.OutEdgeIDs[lo64:hi64])
 		}
 
-		gotInTargets, gotInKinds, gotInEdgeIDs := v.In(n)
+		gotInTargets, gotInKinds := v.In(n)
 		wantInTargets, wantInKinds := s.In(n)
 		if !reflect.DeepEqual(gotInTargets, wantInTargets) {
 			t.Fatalf("In(%d) targets = %v, want %v", n, gotInTargets, wantInTargets)
 		}
 		if !reflect.DeepEqual(gotInKinds, wantInKinds) {
 			t.Fatalf("In(%d) kinds = %v, want %v", n, gotInKinds, wantInKinds)
-		}
-		inLo, inHi := s.InOffsets[n], s.InOffsets[n+1]
-		wantInEdgeIDs := make([]uint64, inHi-inLo)
-		for i, idx := range s.InEdgeIdx[inLo:inHi] {
-			wantInEdgeIDs[i] = s.OutEdgeIDs[idx]
-		}
-		if !reflect.DeepEqual(gotInEdgeIDs, wantInEdgeIDs) {
-			t.Fatalf("In(%d) edgeIDs = %v, want %v", n, gotInEdgeIDs, wantInEdgeIDs)
 		}
 	}
 

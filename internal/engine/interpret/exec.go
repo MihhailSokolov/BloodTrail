@@ -10,7 +10,7 @@
 // package serves is built from: pattern matching within one Part
 // (matchPart/runComponent, fixed-length Steps here, variable-length/
 // shortestPath Steps dispatched out to expand.go), WHERE filtering, and
-// RETURN projection. pipeline.go's runQuery (Task 9) is what actually drives
+// RETURN projection. pipeline.go's runQuery is what actually drives
 // Execute end to end -- chaining Part[0] and Part[1] across a WITH boundary
 // via this file's own cartesianJoin/mergeRowInto row-merge primitives,
 // applying WITH's grouping/aggregation, and finishing with RETURN DISTINCT/
@@ -23,9 +23,9 @@
 // PostgreSQL, which is always correct.
 //
 // projectItem has an explicit OutPath case for a bare path-variable RETURN
-// item, reading whatever expand.go's Task 8 functions or this file's
-// assembleChainPathVal (Task 8b) bound via Row.SetPathVar (always a *PathVal
-// in this package).
+// item, reading whatever expand.go's variable-length expansion functions or
+// this file's assembleChainPathVal bound via Row.SetPathVar (always a
+// *PathVal in this package).
 
 package interpret
 
@@ -44,12 +44,12 @@ import (
 // Budgets) is exceeded during materialization.
 var ErrBudget = errors.New("interpret: budget exceeded")
 
-// errUnsupportedStep marks a query shape outside this task's scope: a
-// var-length or shortestPath/allShortestPaths Step (Task 8), or a WITH
-// clause / ORDER BY / SKIP / LIMIT / RETURN DISTINCT (Task 9). It is
-// unexported deliberately -- a caller only needs to know Execute declined
-// and must delegate the whole query to PostgreSQL, not which future task
-// will lift the restriction.
+// errUnsupportedStep marks a query shape this file itself does not handle:
+// a var-length or shortestPath/allShortestPaths Step (expand.go's territory),
+// or a WITH clause / ORDER BY / SKIP / LIMIT / RETURN DISTINCT (pipeline.go's).
+// It is unexported deliberately -- a caller only needs to know Execute
+// declined and must delegate the whole query to PostgreSQL, not which part of
+// the package might later lift the restriction.
 var errUnsupportedStep = errors.New("interpret: unsupported step")
 
 // Budgets caps one Execute call's cost. MaxRows caps the number of rows
@@ -107,10 +107,10 @@ type OutVal struct {
 
 // PathVal is a materialized path value: an alternating node/edge sequence,
 // Nodes[i] connected to Nodes[i+1] by Edges[i]. Declared here because
-// ResultSet/OutVal need the type; this file's assembleChainPathVal (Task 8b)
+// ResultSet/OutVal need the type; this file's assembleChainPathVal
 // constructs them for named paths in mixed fixed/variable-length chains, while
-// expand.go's Task 8 functions construct them for standalone variable-length
-// and shortest-path patterns. An empty PathVal (both slices nil) is the
+// expand.go's expansion functions construct them for standalone
+// variable-length and shortest-path patterns. An empty PathVal (both slices nil) is the
 // eventual representation of a zero-length `*0..` path, per the design doc.
 type PathVal struct {
 	Nodes []snapshot.NodeID
@@ -211,7 +211,7 @@ func (m *workMeter) addFinalRow() error {
 // willing to spend; see Budgets.
 //
 // The actual multi-part/WITH/DISTINCT/ORDER BY/SKIP/LIMIT pipeline lives in
-// pipeline.go's runQuery (Task 9); this function is left as the package's
+// pipeline.go's runQuery; this function is left as the package's
 // stable public entry point plus its own nil-defensiveness.
 func Execute(env *Env, q *Query, b Budgets) (*ResultSet, error) {
 	if env == nil || env.Snap == nil || q == nil {
@@ -409,15 +409,15 @@ func mergeRowInto(dst, src *Row) {
 //     query needs; declined outright.
 //  2. A component containing a shortestPath/allShortestPaths Step
 //     (Shortest != ShortestNone) must consist of exactly that one Step --
-//     see Task 8b's plan.go shortestStepsAreIsolated, which now also
-//     rejects this shape at plan time -- and dispatches to
+//     see plan.go's shortestStepsAreIsolated, which also rejects this
+//     shape at plan time -- and dispatches to
 //     expandShortestPathComponent, which resolves both endpoints as
 //     complete, pre-adjacency node sets and has no way to honor a further
 //     chain hanging off either one.
 //  3. A component consisting of exactly one variable-length Step (Range !=
-//     nil) dispatches to expandVarLengthComponent, unchanged since Task 8.
+//     nil) dispatches to expandVarLengthComponent.
 //  4. A component with two or more Steps, at least one variable-length, no
-//     shortestPath: Task 8b's mixed fixed/var-length chain shape (e.g.
+//     shortestPath: the mixed fixed/var-length chain shape (e.g.
 //     `(c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group)`).
 //     Dispatches to expandChainComponent, which requires the component to
 //     be a strict left-to-right chain (isStrictLinearChain) -- declining
@@ -429,7 +429,8 @@ func mergeRowInto(dst, src *Row) {
 //     expandChainComponent (so RETURN p's PathVal assembly logic lives in
 //     one place); an unnamed pure-fixed component falls through to this
 //     function's own general BFS/closing-edge walk below, exactly as
-//     before Task 8b -- zero behavior change for every existing shape.
+//     before named-path chain support was added -- zero behavior change
+//     for every pre-existing shape.
 func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdxs []int) ([]*Row, error) {
 	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
 	if !pathUniform {
@@ -588,8 +589,9 @@ func runComponentFrom(env *Env, meter *workMeter, part *Part, comp component, an
 }
 
 // hasSpecialStep reports whether any of part.Chains[stepIdxs] is a
-// variable-length or shortestPath/allShortestPaths Step -- runComponent's
-// Task 8 dispatch condition.
+// variable-length or shortestPath/allShortestPaths Step -- the condition on
+// which runComponent dispatches out to expand.go instead of walking the
+// component itself.
 func hasSpecialStep(part *Part, stepIdxs []int) bool {
 	for _, idx := range stepIdxs {
 		st := &part.Chains[idx]
@@ -696,7 +698,7 @@ func pathStepArcKey(stepIdx int) string {
 
 // expandChainComponent executes a component of one or more Steps -- none
 // shortestPath -- that isStrictLinearChain has already confirmed forms a
-// simple left-to-right chain: runComponent's Task 8b dispatch target for
+// simple left-to-right chain: runComponent's dispatch target for
 // both a mixed fixed/var-length multi-step chain (e.g.
 // `(c:Computer)-[:HasSession]->(u:User)-[:MemberOf*1..]->(g:Group)`) and,
 // when pathSym != "", a chain that needs its whole traversal-order PathVal
@@ -705,8 +707,8 @@ func pathStepArcKey(stepIdx int) string {
 // exactly one place rather than being duplicated into runComponent's
 // general BFS/closing-edge walk below.
 //
-// Anchoring (documented per the brief's explicit "simplest correct approach
-// is fine" allowance): this does NOT run runComponent's general
+// Anchoring: this deliberately takes the simplest correct approach, and does
+// NOT run runComponent's general
 // BFS-from-cost-optimal-anchor algorithm. A variable-length Step can only
 // ever be expanded forward from its own FromSym (buildStep: Direction is
 // always Outbound for Range != nil; expandVarLengthTrailsForSeed/adjacency
@@ -1282,7 +1284,7 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 	}
 	visitIn := func() error {
 		if !env.Snap.Overlay() {
-			sources, kinds, _ := env.Snap.In(bound)
+			sources, kinds := env.Snap.In(bound)
 			lo := env.Snap.Base().InOffsets[bound]
 			for i, other := range sources {
 				if err := meter.spend(1); err != nil {

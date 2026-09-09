@@ -303,27 +303,30 @@ func (v *View) Out(n NodeID) (targets []NodeID, kinds []KindID, edgeIDs []uint64
 
 // In returns slice views over n's incoming edges: aligned source and kind
 // slices, aliasing the base snapshot exactly as Out does, sorted by (source,
-// kind) -- see Snapshot.In. The edge id slice cannot alias the same way: the
-// reverse CSR stores each slot's forward-array index (Snapshot.InEdgeIdx)
-// rather than the database edge id itself, so edgeIDs is resolved through
-// OutEdgeIDs and freshly allocated on every call.
+// kind) -- see Snapshot.In.
+//
+// Unlike Out, this deliberately returns no edge id slice, and so is an exact
+// mirror of Snapshot.In. It could not alias one anyway: the reverse CSR
+// stores each slot's forward-array index (Snapshot.InEdgeIdx) rather than the
+// database edge id itself, so edge ids would have to be gathered through
+// OutEdgeIDs into a freshly allocated slice on every call -- an allocation
+// and a gather sized to n's in-degree, which is multi-megabyte work on a hub
+// node and lands on every backward-BFS expansion in this package's hot path.
+// No caller ever wanted it: the traversals here read only sources and kinds,
+// and the one call site that needs to identify the edges themselves
+// (interpret's In-expansion) wants the forward slot INDEX, not the id, and
+// reads it straight off Base().InEdgeIdx. A caller that genuinely needs
+// resolved edge ids should use InEdges, which streams them without
+// materializing a slice at all.
 //
 // Valid ONLY when !Overlay() -- see Out's doc. Panics (a debug assertion)
 // if called while Overlay() is true -- use InEdges instead.
-func (v *View) In(n NodeID) (sources []NodeID, kinds []KindID, edgeIDs []uint64) {
+func (v *View) In(n NodeID) (sources []NodeID, kinds []KindID) {
 	if v.Overlay() {
 		panic("snapshot: View.In called on an overlay View (Overlay() == true); use InEdges instead")
 	}
 	lo, hi := v.base.InOffsets[n], v.base.InOffsets[n+1]
-	sources = v.base.InTargets[lo:hi]
-	kinds = v.base.InKinds[lo:hi]
-
-	fwdIdx := v.base.InEdgeIdx[lo:hi]
-	edgeIDs = make([]uint64, len(fwdIdx))
-	for i, j := range fwdIdx {
-		edgeIDs[i] = v.base.OutEdgeIDs[j]
-	}
-	return sources, kinds, edgeIDs
+	return v.base.InTargets[lo:hi], v.base.InKinds[lo:hi]
 }
 
 // deltaEdge is one delta-added or delta-upserted edge, from the perspective
