@@ -57,9 +57,17 @@
 // objectid can possibly conflict. Because dawgs' AssertGraph diffs and
 // syncs a partition's indexes/constraints to exactly the set the CURRENT
 // call named (drivers/pg/query/query.go's AssertGraph), asserting the
-// index here is self-contained: the next suite's own AssertSchema call
-// (with no NodeConstraints of its own) removes it again before that suite
-// writes anything, so this suite's index never outlives its own run.
+// index here is self-contained: whatever suite's AssertSchema call happens
+// to run next against this database -- in this process or a later one --
+// and names no NodeConstraints of its own removes it again before that
+// suite writes anything. That is NOT the same claim as "this suite's index
+// never outlives its own run": nothing in this suite's own Cleanup drops
+// the index, so if this test is the last (or only) one run in a given
+// process -- e.g. `-run WriteThroughDifferential` on its own -- the index
+// physically persists in the database until some future run's AssertSchema
+// call happens to remove it. That is still safe (an extra unique index on
+// an expression no other suite's fixtures rely on causes no conflict by
+// itself), just not bounded to "this run."
 package bloodtrail
 
 import (
@@ -124,11 +132,23 @@ func nodeSignaturesByCypher(t *testing.T, ctx context.Context, db graph.Database
 // integration_test.go), which requires the column to already be a string.
 // This file uses it to prove a deleted property is genuinely gone (nil)
 // rather than merely absent from view, without routing through coalesce()
-// or toString(): FINDINGS (this file's own report) notes that the
-// interpreter declines -- correctly, just unserved -- any Cypher text
-// query built around either function, so a test that used one to probe a
-// possibly-missing property would never observe a served marker even
-// though the underlying write-through delta is correct.
+// or toString().
+//
+// coalesce() itself IS implemented and servable: interpret/plan.go's
+// checkExpr recognizes cypher.CoalesceFunction as an allowed expression
+// shape, and interpret/eval.go's evalCoalesce carries it out at execution
+// time. An earlier draft of this file's own FINDINGS misdiagnosed a decline
+// on `RETURN coalesce(n.missing,'MISSING')` as "coalesce not implemented" --
+// the real rule is projectionName's (interpret/plan.go): any RETURN item
+// that is not a bare variable or a bare property lookup needs an explicit
+// alias, or Plan rejects the whole query outright (reason=unsupported)
+// before evaluation is ever reached. The unaliased form above declines for
+// exactly that reason; `RETURN coalesce(n.missing,'MISSING') AS v` serves
+// fine (see class 5's own aliased-coalesce assertion below, which exists
+// to demonstrate this directly). This helper still avoids the function
+// call entirely -- not because it would fail to serve, but because a bare
+// property lookup needs no alias at all and most directly distinguishes a
+// genuinely nil property from one merely coalesced to a default string.
 func cypherValueOrNil(t *testing.T, ctx context.Context, db graph.Database, text string) any {
 	t.Helper()
 
@@ -175,6 +195,39 @@ func assertNoNewFallback(t *testing.T, buf *lockedBuffer, before int, label stri
 	if after := markerCount(buf, fallbackEnteredMarker); after != before {
 		t.Fatalf("%s: the engine entered fallback %d time(s) during a write shape that must stay servable\ncaptured log:\n%s", label, after-before, buf.String())
 	}
+}
+
+// requireServedNodeSignaturesEqual runs text against bt via
+// nodeSignaturesByCypher, requiring cypherServedMarker to advance by
+// exactly 1 for that one call, then runs text against oracle the same way
+// and compares the two signature sets as an unordered multiset via
+// assertStringMultiset. This is the served-marker-guarded equivalent of a
+// bare nodeSignaturesByCypher(bt,...) vs nodeSignaturesByCypher(oracle,...)
+// comparison: every other full-row comparison in this file used to call
+// nodeSignaturesByCypher on bt with no served-marker check at all, so a
+// query that silently declined to PostgreSQL would still pass (bt would
+// just be reading the same rows straight from PostgreSQL as oracle does,
+// proving nothing about write-through).
+//
+// This can't be folded into requireMarkerDelta (staleness_integration_test.go)
+// the way every scalar-valued assertion in this file is: requireMarkerDelta
+// is generic over `T comparable`, and nodeSignaturesByCypher's return type
+// ([]string) does not satisfy that constraint -- slices are not comparable
+// in Go, full stop, not even the "may panic at runtime" kind of comparable
+// that interface types get (see requireMarkerDelta's own doc for that
+// caveat). So the served-check and the value-check are two separate calls
+// here instead of requireMarkerDelta's usual one.
+func requireServedNodeSignaturesEqual(t *testing.T, ctx context.Context, buf *lockedBuffer, bt, oracle graph.Database, text, label string) {
+	t.Helper()
+
+	before := markerCount(buf, cypherServedMarker)
+	got := nodeSignaturesByCypher(t, ctx, bt, text)
+	if delta := markerCount(buf, cypherServedMarker) - before; delta != 1 {
+		t.Fatalf("%s: %q log count changed by %d, want exactly 1\ncaptured log:\n%s", label, cypherServedMarker, delta, buf.String())
+	}
+
+	want := nodeSignaturesByCypher(t, ctx, oracle, text)
+	assertStringMultiset(t, got, want, label)
 }
 
 // objectIDUpdate builds a graph.NodeUpdate identifying its target purely by
@@ -268,8 +321,8 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the new node is counted by kind",
 			func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, wantCount)
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "ObjectIDUpsertCreatesNode")
-		assertNoNewFallback(t, buf, fallbacks, "ObjectIDUpsertCreatesNode")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -281,15 +334,19 @@ func TestWriteThroughDifferential(t *testing.T) {
 		kindB := graph.StringKind("WT2NodeB")
 		const objectID = "WT2-1"
 
+		// Captured BEFORE the fixture setup write below (not just before the
+		// write under test), so a rebuild the fixture setup itself triggers
+		// is caught too -- this class's exit criterion is that NOTHING in
+		// it needs a rebuild, not only its own headline write.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
+
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 			_, err := tx.CreateNode(graph.NewProperties().Set("objectid", objectID).Set("first", "one"), kindA)
 			return err
 		}); err != nil {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
-
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 			return batch.UpdateNodeBy(objectIDUpdate(objectID, graph.NewProperties().Set("second", "two"), kindB))
@@ -305,17 +362,27 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "the newly written property serves",
 			func() string { return cypherStringValue(t, ctx, bt, secondText) }, cypherStringValue(t, ctx, oracle, secondText))
 
+		// Literal anchors, not just oracle equality: this class's whole
+		// point is that the merge UNIONS kinds rather than replacing them,
+		// so both counts must land on exactly 1 (one single node carrying
+		// both kinds) -- a bug that dropped kindA (or never added kindB)
+		// while leaving PostgreSQL's own committed row similarly wrong
+		// would still pass a bare bt-vs-oracle comparison.
+		if wantA := nodeCountByKind(t, ctx, oracle, kindA); wantA != 1 {
+			t.Fatalf("test fixture assumption violated: oracle's own kindA count = %d, want 1", wantA)
+		}
+		if wantB := nodeCountByKind(t, ctx, oracle, kindB); wantB != 1 {
+			t.Fatalf("test fixture assumption violated: oracle's own kindB count = %d, want 1", wantB)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the original kind is preserved (union, not replace)",
-			func() int64 { return nodeCountByKind(t, ctx, bt, kindA) }, nodeCountByKind(t, ctx, oracle, kindA))
+			func() int64 { return nodeCountByKind(t, ctx, bt, kindA) }, int64(1))
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the new kind is also present on the same node",
-			func() int64 { return nodeCountByKind(t, ctx, bt, kindB) }, nodeCountByKind(t, ctx, oracle, kindB))
+			func() int64 { return nodeCountByKind(t, ctx, bt, kindB) }, int64(1))
 
-		gotFull := nodeSignaturesByCypher(t, ctx, bt, `MATCH (n:WT2NodeA) RETURN n`)
-		wantFull := nodeSignaturesByCypher(t, ctx, oracle, `MATCH (n:WT2NodeA) RETURN n`)
-		assertStringMultiset(t, gotFull, wantFull, "full node row (id+properties) after the merge")
+		requireServedNodeSignaturesEqual(t, ctx, buf, bt, oracle, `MATCH (n:WT2NodeA) RETURN n`, "full node row (id+properties) after the merge")
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "ObjectIDUpsertMergesPropsUnionsKinds")
-		assertNoNewFallback(t, buf, fallbacks, "ObjectIDUpsertMergesPropsUnionsKinds")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -327,15 +394,17 @@ func TestWriteThroughDifferential(t *testing.T) {
 		const existingOID = "WT3-EXIST"
 		const absentOID = "WT3-NEW"
 
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
+
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 			_, err := tx.CreateNode(graph.NewProperties().Set("objectid", existingOID).Set("name", "orig"), kind)
 			return err
 		}); err != nil {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
-
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 			if err := batch.UpdateNodeBy(objectIDUpdate(existingOID, graph.NewProperties().Set("lastseen", "2024-01-01"))); err != nil {
@@ -357,23 +426,41 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "the existing node's kind survives a kind-less upsert",
 			func() string { return cypherStringValue(t, ctx, bt, existingNameText) }, cypherStringValue(t, ctx, oracle, existingNameText))
 
+		// Literal anchor: this class's fixture creates exactly ONE node
+		// carrying kind, and a kind-less upsert unions in an EMPTY kind
+		// set -- it can only ever preserve that count, never grow or shrink
+		// it. A bug that dropped the kind on both sides equally would still
+		// pass a bare bt-vs-oracle comparison, so anchor the oracle side to
+		// the literal too.
+		if want := nodeCountByKind(t, ctx, oracle, kind); want != 1 {
+			t.Fatalf("test fixture assumption violated: oracle's own kind count = %d, want 1", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the existing node's kind count is unaffected",
-			func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, nodeCountByKind(t, ctx, oracle, kind))
+			func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, int64(1))
 
 		// Absent objectid: a brand-new, kind-less node must exist and
-		// carry the property the upsert wrote. Correctness (does the
-		// replica agree with PostgreSQL) is asserted unconditionally;
-		// whether this particular unconstrained, kind-less lookup happens
-		// to be servable is not this class's claim, so it is only checked
-		// informationally, and never allowed to cause a fallback.
+		// carry the property the upsert wrote, AND this lookup DOES serve
+		// from the replica -- it is not an unservable shape. Cypher's
+		// extractObjectIDAnchor (interpret/plan.go) sets an ObjectIDAnchor
+		// on a bare `n.objectid = <literal>` conjunct regardless of
+		// whether n carries any kind constraint at all, and rankOf
+		// (interpret/exec.go) ranks tierObjectID strictly ahead of
+		// tierKind/tierScan -- ahead of ever consulting a kind -- so a
+		// kind-less node is reached, and reached first, exactly like a
+		// kinded one. A kind-less node is also fully materialized in the
+		// snapshot: SegmentBuilder.AddNodeState (snapshot/segment.go)
+		// explicitly documents "kindIDs may be nil/empty -- kind-less
+		// nodes are a legal production upsert shape", and View.ensureDelta
+		// (snapshot/view.go) assigns it a virtual dense id the same way as
+		// any other delta-added node. So this sub-case serves the same as
+		// the existing-objectid sub-case above -- there is no capability
+		// boundary here to work around.
 		absentText := fmt.Sprintf(`MATCH (n) WHERE n.objectid = '%s' RETURN n.lastseen`, absentOID)
-		wantAbsent := cypherStringValue(t, ctx, oracle, absentText)
-		if got := cypherStringValue(t, ctx, bt, absentText); got != wantAbsent {
-			t.Fatalf("kind-less node created by an upsert on an absent objectid: got %q, want %q", got, wantAbsent)
-		}
+		requireMarkerDelta(t, buf, cypherServedMarker, 1, "the kind-less node created by an upsert on an absent objectid serves",
+			func() string { return cypherStringValue(t, ctx, bt, absentText) }, cypherStringValue(t, ctx, oracle, absentText))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "KindlessLastSeenUpsert")
-		assertNoNewFallback(t, buf, fallbacks, "KindlessLastSeenUpsert")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -423,8 +510,8 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("the edge's own property: got %q, want %q", got, want)
 		}
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "UpdateRelationshipByObjectIDEndpoints")
-		assertNoNewFallback(t, buf, fallbacks, "UpdateRelationshipByObjectIDEndpoints")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -434,6 +521,11 @@ func TestWriteThroughDifferential(t *testing.T) {
 	t.Run("BatchUpdateNodesKindsAndPropertyDeletion", func(t *testing.T) {
 		oldKind := graph.StringKind("WT5Old")
 		newKind := graph.StringKind("WT5New")
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var nodeID graph.ID
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -446,9 +538,6 @@ func TestWriteThroughDifferential(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
-
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		// dawgs' pg driver reads a plain batch.UpdateNodes' Node.Kinds field
 		// as the SQL statement's own "added_kinds" positional parameter
@@ -469,23 +558,48 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the new kind is present",
 			func() int64 { return nodeCountByKind(t, ctx, bt, newKind) }, nodeCountByKind(t, ctx, oracle, newKind))
+
+		// Literal anchor: the fixture's one node had ITS ONLY kind
+		// deleted, so oldKind's count must land on exactly 0 -- not just
+		// "whatever PostgreSQL also shows," which is exactly the check
+		// that would still pass if the delete silently no-op'd on both
+		// sides (the AddedKinds authoring mistake this file's own report
+		// already documents was a real near-miss of this shape).
+		if want := nodeCountByKind(t, ctx, oracle, oldKind); want != 0 {
+			t.Fatalf("test fixture assumption violated: oracle's own old-kind count = %d, want 0", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the old kind is gone",
-			func() int64 { return nodeCountByKind(t, ctx, bt, oldKind) }, nodeCountByKind(t, ctx, oracle, oldKind))
+			func() int64 { return nodeCountByKind(t, ctx, bt, oldKind) }, int64(0))
 
 		keepText := fmt.Sprintf(`MATCH (n) WHERE id(n) = %d RETURN n.keep`, nodeID)
 		staleText := fmt.Sprintf(`MATCH (n) WHERE id(n) = %d RETURN n.stale`, nodeID)
 
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "the untouched property survives",
 			func() string { return cypherStringValue(t, ctx, bt, keepText) }, cypherStringValue(t, ctx, oracle, keepText))
+
+		// Literal anchor: the deleted property must read back as the
+		// literal nil, not merely "whatever PostgreSQL's own row also
+		// shows" -- see the oldKind anchor's comment above for why that
+		// distinction matters.
+		if want := cypherValueOrNil(t, ctx, oracle, staleText); want != nil {
+			t.Fatalf("test fixture assumption violated: oracle's own deleted property = %v, want nil", want)
+		}
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "the deleted property is gone",
-			func() any { return cypherValueOrNil(t, ctx, bt, staleText) }, cypherValueOrNil(t, ctx, oracle, staleText))
+			func() any { return cypherValueOrNil(t, ctx, bt, staleText) }, any(nil))
 
-		gotFull := nodeSignaturesByCypher(t, ctx, bt, `MATCH (n:WT5New) RETURN n`)
-		wantFull := nodeSignaturesByCypher(t, ctx, oracle, `MATCH (n:WT5New) RETURN n`)
-		assertStringMultiset(t, gotFull, wantFull, "full node row (id+properties) after UpdateNodes")
+		// coalesce() itself is fully implemented and servable (see
+		// cypherValueOrNil's own doc above, and this class's report
+		// correction) -- an ALIASED coalesce projection over the very
+		// property this class just deleted proves it directly: n.stale is
+		// nil, so coalesce falls through to its literal default.
+		coalesceText := fmt.Sprintf(`MATCH (n) WHERE id(n) = %d RETURN coalesce(n.stale, 'MISSING') AS v`, nodeID)
+		requireMarkerDelta(t, buf, cypherServedMarker, 1, "an aliased coalesce() projection over the deleted property serves",
+			func() string { return cypherStringValue(t, ctx, bt, coalesceText) }, cypherStringValue(t, ctx, oracle, coalesceText))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "BatchUpdateNodesKindsAndPropertyDeletion")
-		assertNoNewFallback(t, buf, fallbacks, "BatchUpdateNodesKindsAndPropertyDeletion")
+		requireServedNodeSignaturesEqual(t, ctx, buf, bt, oracle, `MATCH (n:WT5New) RETURN n`, "full node row (id+properties) after UpdateNodes")
+
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -521,8 +635,8 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the created relationship's triple fetches",
 			func() int { return len(applyRelTriples(t, ctx, bt, edgeKind)) }, len(applyRelTriples(t, ctx, oracle, edgeKind)))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "TxCreateNodeAndRelationship")
-		assertNoNewFallback(t, buf, fallbacks, "TxCreateNodeAndRelationship")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -531,6 +645,11 @@ func TestWriteThroughDifferential(t *testing.T) {
 	t.Run("BatchDeleteRelationshipByID", func(t *testing.T) {
 		nodeKind := graph.StringKind("WT7Node")
 		edgeKind := graph.StringKind("WT7Edge")
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var relID graph.ID
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -552,11 +671,10 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
 
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
-
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the edge is counted",
 			func() int64 { return relCountByKind(t, ctx, bt, edgeKind) }, int64(1))
+		requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: both endpoint nodes are counted",
+			func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, int64(2))
 
 		if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 			return batch.DeleteRelationship(relID)
@@ -564,13 +682,24 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("BatchOperation (DeleteRelationship): %v", err)
 		}
 
+		// Literal anchors alongside the oracle comparisons: the deleted
+		// edge's own kind must land on exactly 0, and an edge-only delete
+		// must leave both endpoint nodes' count at exactly 2 -- not just
+		// "whatever PostgreSQL also shows," which would still pass if the
+		// delete silently no-op'd identically on both sides.
+		if want := relCountByKind(t, ctx, oracle, edgeKind); want != 0 {
+			t.Fatalf("test fixture assumption violated: oracle's own edge count = %d, want 0", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the deleted edge is gone from the served count",
-			func() int64 { return relCountByKind(t, ctx, bt, edgeKind) }, relCountByKind(t, ctx, oracle, edgeKind))
+			func() int64 { return relCountByKind(t, ctx, bt, edgeKind) }, int64(0))
+		if want := nodeCountByKind(t, ctx, oracle, nodeKind); want != 2 {
+			t.Fatalf("test fixture assumption violated: oracle's own node count = %d, want 2", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "neither endpoint node was removed by an edge-only delete",
-			func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, nodeCountByKind(t, ctx, oracle, nodeKind))
+			func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, int64(2))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "BatchDeleteRelationshipByID")
-		assertNoNewFallback(t, buf, fallbacks, "BatchDeleteRelationshipByID")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -579,6 +708,11 @@ func TestWriteThroughDifferential(t *testing.T) {
 	t.Run("BatchDeleteNodeCascadesEdges", func(t *testing.T) {
 		nodeKind := graph.StringKind("WT8Node")
 		edgeKind := graph.StringKind("WT8Edge")
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var startID graph.ID
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -599,9 +733,6 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
 
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
-
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: both nodes are counted",
 			func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, int64(2))
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the edge is fetched as a triple",
@@ -613,13 +744,23 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("BatchOperation (DeleteNode): %v", err)
 		}
 
+		// Literal anchors alongside the oracle comparisons: exactly one of
+		// the two baseline nodes was deleted (want 1, not 2), and its one
+		// incident edge must be fully gone (want 0 triples) -- not just
+		// "whatever PostgreSQL also shows."
+		if want := nodeCountByKind(t, ctx, oracle, nodeKind); want != 1 {
+			t.Fatalf("test fixture assumption violated: oracle's own node count = %d, want 1", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the deleted node is gone from the served count",
-			func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, nodeCountByKind(t, ctx, oracle, nodeKind))
+			func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, int64(1))
+		if want := len(applyRelTriples(t, ctx, oracle, edgeKind)); want != 0 {
+			t.Fatalf("test fixture assumption violated: oracle's own edge triple count = %d, want 0", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "its incident edge is gone too (the cascade)",
-			func() int { return len(applyRelTriples(t, ctx, bt, edgeKind)) }, len(applyRelTriples(t, ctx, oracle, edgeKind)))
+			func() int { return len(applyRelTriples(t, ctx, bt, edgeKind)) }, 0)
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "BatchDeleteNodeCascadesEdges")
-		assertNoNewFallback(t, buf, fallbacks, "BatchDeleteNodeCascadesEdges")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -634,6 +775,11 @@ func TestWriteThroughDifferential(t *testing.T) {
 		relNodeKind := graph.StringKind("WT9RelNode")
 		edgeKindDropped := graph.StringKind("WT9EdgeDropped")
 		edgeKindKept := graph.StringKind("WT9EdgeKept")
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 			if _, err := tx.CreateNode(graph.NewProperties(), kindA); err != nil {
@@ -670,9 +816,6 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
 
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
-
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: two nodes carry kindA (one also excluded)",
 			func() int64 { return nodeCountByKind(t, ctx, bt, kindA) }, int64(2))
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: both dropped-kind edges are counted",
@@ -685,22 +828,40 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("DeleteRelationshipsByKinds: %v", err)
 		}
 
+		// Literal anchors alongside every oracle comparison below: this
+		// class's fixture shape pins each post-delete count to one exact
+		// number, so a delete that silently no-op'd identically on both
+		// sides (matching, but wrong) cannot pass here the way a bare
+		// bt-vs-oracle check would let it.
+		assertOracleLiteral := func(label string, got, want int64) {
+			t.Helper()
+			if got != want {
+				t.Fatalf("test fixture assumption violated: %s: oracle's own value = %d, want %d", label, got, want)
+			}
+		}
+
+		assertOracleLiteral("kindA", nodeCountByKind(t, ctx, oracle, kindA), 1)
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "kindA count drops to just the excluded (protected) node",
-			func() int64 { return nodeCountByKind(t, ctx, bt, kindA) }, nodeCountByKind(t, ctx, oracle, kindA))
+			func() int64 { return nodeCountByKind(t, ctx, bt, kindA) }, int64(1))
+		assertOracleLiteral("kindExcl", nodeCountByKind(t, ctx, oracle, kindExcl), 1)
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the excluded node itself is untouched",
-			func() int64 { return nodeCountByKind(t, ctx, bt, kindExcl) }, nodeCountByKind(t, ctx, oracle, kindExcl))
+			func() int64 { return nodeCountByKind(t, ctx, bt, kindExcl) }, int64(1))
+		assertOracleLiteral("kindOther", nodeCountByKind(t, ctx, oracle, kindOther), 1)
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "an unrelated kind is untouched",
-			func() int64 { return nodeCountByKind(t, ctx, bt, kindOther) }, nodeCountByKind(t, ctx, oracle, kindOther))
+			func() int64 { return nodeCountByKind(t, ctx, bt, kindOther) }, int64(1))
 
+		assertOracleLiteral("edgeKindDropped", relCountByKind(t, ctx, oracle, edgeKindDropped), 0)
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "every dropped-kind edge is gone",
-			func() int64 { return relCountByKind(t, ctx, bt, edgeKindDropped) }, relCountByKind(t, ctx, oracle, edgeKindDropped))
+			func() int64 { return relCountByKind(t, ctx, bt, edgeKindDropped) }, int64(0))
+		assertOracleLiteral("edgeKindKept", relCountByKind(t, ctx, oracle, edgeKindKept), 1)
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the kept-kind edge survives",
-			func() int64 { return relCountByKind(t, ctx, bt, edgeKindKept) }, relCountByKind(t, ctx, oracle, edgeKindKept))
+			func() int64 { return relCountByKind(t, ctx, bt, edgeKindKept) }, int64(1))
+		assertOracleLiteral("relNodeKind", nodeCountByKind(t, ctx, oracle, relNodeKind), 3)
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "no node was removed by a relationship-kind delete",
-			func() int64 { return nodeCountByKind(t, ctx, bt, relNodeKind) }, nodeCountByKind(t, ctx, oracle, relNodeKind))
+			func() int64 { return nodeCountByKind(t, ctx, bt, relNodeKind) }, int64(3))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "DeleteByKindsIncludeExcludeAndRelationships")
-		assertNoNewFallback(t, buf, fallbacks, "DeleteByKindsIncludeExcludeAndRelationships")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -709,6 +870,11 @@ func TestWriteThroughDifferential(t *testing.T) {
 	// -----------------------------------------------------------------
 	t.Run("InIDsNodeQueryUpdate", func(t *testing.T) {
 		kind := graph.StringKind("WT10Node")
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var idA, idB, idC graph.ID
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -730,9 +896,6 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
 
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
-
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 			return tx.Nodes().Filter(query.InIDs(query.NodeID(), idA, idB)).Update(graph.NewProperties().Set("tagged", "yes"))
 		}); err != nil {
@@ -753,8 +916,8 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "a node outside the InIDs target list is untagged",
 			func() any { return cypherValueOrNil(t, ctx, bt, untouchedText) }, cypherValueOrNil(t, ctx, oracle, untouchedText))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "InIDsNodeQueryUpdate")
-		assertNoNewFallback(t, buf, fallbacks, "InIDsNodeQueryUpdate")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -770,6 +933,17 @@ func TestWriteThroughDifferential(t *testing.T) {
 		// know about a FIXED kind name from some earlier run, defeating
 		// this class's entire point: proving the applier can resolve a
 		// kind id its own View has never seen before at all.
+		//
+		// This does mean every run of this class permanently adds one more
+		// row to that same never-truncated `kind` catalog table -- this
+		// suite does not delete it afterward, to keep the class focused on
+		// its one point rather than on catalog hygiene. snapshot.KindID is
+		// an int16 (snapshot/bitset.go), so the catalog has room for
+		// something on the order of 2^15 distinct kind names across this
+		// database's entire lifetime; one more per test run is a
+		// negligible rate against that budget for any plausible CI
+		// cadence, but it is a real, permanent accumulation, not zero --
+		// documented here explicitly rather than left to be rediscovered.
 		kind := graph.StringKind(fmt.Sprintf("WT11New%d", time.Now().UnixNano()))
 		const objectID = "WT11-1"
 
@@ -790,8 +964,8 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "a property read against the brand-new kind's node serves",
 			func() string { return cypherStringValue(t, ctx, bt, text) }, cypherStringValue(t, ctx, oracle, text))
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "RuntimeKindRegistration")
-		assertNoNewFallback(t, buf, fallbacks, "RuntimeKindRegistration")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -829,12 +1003,10 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the replica converges to PostgreSQL's own partially-flushed truth",
 			func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, wantCommitted)
 
-		gotFull := nodeSignaturesByCypher(t, ctx, bt, `MATCH (n:WT12Node) RETURN n`)
-		wantFull := nodeSignaturesByCypher(t, ctx, oracle, `MATCH (n:WT12Node) RETURN n`)
-		assertStringMultiset(t, gotFull, wantFull, "full node set after the partially-failed batch")
+		requireServedNodeSignaturesEqual(t, ctx, buf, bt, oracle, `MATCH (n:WT12Node) RETURN n`, "full node set after the partially-failed batch")
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "PartiallyFailedBatchConverges")
-		assertNoNewFallback(t, buf, fallbacks, "PartiallyFailedBatchConverges")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 
 	// -----------------------------------------------------------------
@@ -845,6 +1017,12 @@ func TestWriteThroughDifferential(t *testing.T) {
 	// -----------------------------------------------------------------
 	t.Run("FallbackViaRawCypherRecovers", func(t *testing.T) {
 		kind := graph.StringKind("WT13Node")
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early: the
+		// exactly-one-rebuild assertion further down must cover the whole
+		// class, not just the deliberate fallback trigger.
+		rebuilds := d.engine.RebuildCount()
 
 		var nodeID graph.ID
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -857,8 +1035,6 @@ func TestWriteThroughDifferential(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
-
-		rebuilds := d.engine.RebuildCount()
 
 		text := fmt.Sprintf(`MATCH (n) WHERE id(n) = %d RETURN n.name`, nodeID)
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "baseline: the property read serves",
@@ -890,8 +1066,15 @@ func TestWriteThroughDifferential(t *testing.T) {
 			t.Fatalf("RebuildCount = %d, want %d -- recovering from a fallback must cost exactly one rebuild", got, rebuilds+1)
 		}
 
+		// Literal anchor alongside the oracle comparison: the raw
+		// statement's own text sets the property to exactly "after", so
+		// anchor to that literal rather than only to whatever PostgreSQL
+		// also shows.
+		if want := cypherStringValue(t, ctx, oracle, text); want != "after" {
+			t.Fatalf("test fixture assumption violated: oracle's own post-fallback value = %q, want %q", want, "after")
+		}
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "after recovery: the property read serves the raw statement's own write",
-			func() string { return cypherStringValue(t, ctx, bt, text) }, cypherStringValue(t, ctx, oracle, text))
+			func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
 
 		if _, fresh := d.engine.Fresh(); !fresh {
 			t.Fatalf("the engine is still not serving after logging %q", fallbackExitedMarker)
@@ -910,6 +1093,11 @@ func TestWriteThroughDifferential(t *testing.T) {
 		edgeKind := graph.StringKind("WT14Edge")
 
 		const n = 20
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := d.engine.RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		// The delete goroutine's own fixture -- n relationships to delete
 		// concurrently with the create goroutine's writes -- is seeded
@@ -937,9 +1125,6 @@ func TestWriteThroughDifferential(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
-
-		rebuilds := d.engine.RebuildCount()
-		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var wg sync.WaitGroup
 		errs := make(chan error, n*2)
@@ -981,16 +1166,25 @@ func TestWriteThroughDifferential(t *testing.T) {
 		// doc on why that discipline matters).
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "every concurrently-created node is present",
 			func() int64 { return nodeCountByKind(t, ctx, bt, createKind) }, nodeCountByKind(t, ctx, oracle, createKind))
+
+		// Literal anchors alongside the oracle comparisons: all n deleted
+		// relationships must be gone (want 0), and deleting only
+		// relationships must leave all 2n endpoint nodes untouched (want
+		// 2*n) -- not just "whatever PostgreSQL also shows."
+		if want := relCountByKind(t, ctx, oracle, edgeKind); want != 0 {
+			t.Fatalf("test fixture assumption violated: oracle's own edge count = %d, want 0", want)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "every concurrently-deleted relationship is gone",
-			func() int64 { return relCountByKind(t, ctx, bt, edgeKind) }, relCountByKind(t, ctx, oracle, edgeKind))
+			func() int64 { return relCountByKind(t, ctx, bt, edgeKind) }, int64(0))
+		if want := nodeCountByKind(t, ctx, oracle, relNodeKind); want != int64(2*n) {
+			t.Fatalf("test fixture assumption violated: oracle's own endpoint-node count = %d, want %d", want, 2*n)
+		}
 		requireMarkerDelta(t, buf, builderServedMarker, 1, "the deleted relationships' endpoint nodes were untouched",
-			func() int64 { return nodeCountByKind(t, ctx, bt, relNodeKind) }, nodeCountByKind(t, ctx, oracle, relNodeKind))
+			func() int64 { return nodeCountByKind(t, ctx, bt, relNodeKind) }, int64(2*n))
 
-		gotFull := nodeSignaturesByCypher(t, ctx, bt, `MATCH (n:WT14Create) RETURN n`)
-		wantFull := nodeSignaturesByCypher(t, ctx, oracle, `MATCH (n:WT14Create) RETURN n`)
-		assertStringMultiset(t, gotFull, wantFull, "full concurrently-created node set")
+		requireServedNodeSignaturesEqual(t, ctx, buf, bt, oracle, `MATCH (n:WT14Create) RETURN n`, "full concurrently-created node set")
 
-		assertRebuildCountUnchanged(t, d, rebuilds, "ConcurrentWriters")
-		assertNoNewFallback(t, buf, fallbacks, "ConcurrentWriters")
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
 }

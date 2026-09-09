@@ -168,6 +168,21 @@ func markerCount(buf *lockedBuffer, marker string) int {
 // until Start's own one-shot boot-load rebuild has already settled), so any
 // change in the count across exactly this call can only be attributed to
 // this call.
+//
+// A comparability caveat for callers instantiating T = any (interface{}):
+// Go's `comparable` constraint accepts an interface type at compile time --
+// == on two interface values is always legal to write -- but comparing two
+// interface values whose dynamic types are themselves non-comparable (a
+// slice, a map, a func) panics at RUNTIME, not compile time. Every T = any
+// use in this package compares a value that is either nil or a string (a
+// property that may be absent), which is always safe. A caller that needs
+// to compare a slice-typed result (e.g. writethrough_differential_
+// integration_test.go's nodeSignaturesByCypher, which returns []string)
+// cannot use T = any (or any other instantiation) to paper over that --
+// []string fails the comparable constraint outright at compile time, since
+// slices are not comparable at all, so that caller needs its own
+// comparison logic instead of this helper (see that file's
+// requireServedNodeSignaturesEqual).
 func requireMarkerDelta[T comparable](t *testing.T, buf *lockedBuffer, marker string, wantDelta int, label string, query func() T, want T) {
 	t.Helper()
 
