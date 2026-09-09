@@ -115,7 +115,7 @@ type cypherDiffCase struct {
 	text string
 }
 
-// TestTryCypherDifferential is Task 11's core evidence: for Cypher texts
+// TestTryCypherDifferential is TryCypher's core evidence: for Cypher texts
 // covering a chain shortestPath, a diamond allShortestPaths, an edge-kind-
 // filtered shortestPath, and two WHERE-predicate shapes exercising the
 // endpoint-predicate-lifting extension (NOT+COALESCE, regex =~), it drives
@@ -177,8 +177,8 @@ func TestTryCypherDifferential(t *testing.T) {
 	// hydratedEdgeKind links two candidate starts to the same end, exactly
 	// like multiKindEdge above, but carries a real, non-empty property bag
 	// (unlike every other edge kind seeded in this fixture, which uses
-	// graph.NewProperties() -- empty) -- Task 13's own required differential
-	// coverage: a path query whose edges actually need Task 11's
+	// graph.NewProperties() -- empty) -- deliberate differential
+	// coverage: a path query whose edges actually need the
 	// hydrateEdgePropsByID round trip, not just the CSR-only shape
 	// hydration-less edges would already get right for free. assertSameSet
 	// (via canonicalize) compares edge Properties byte for byte, so a
@@ -239,7 +239,7 @@ func TestTryCypherDifferential(t *testing.T) {
 
 		// Hydrated-edge-properties case: a shortestPath whose one edge
 		// carries a real property bag, so the differential comparison below
-		// (assertSameSet, via canonicalize) actually exercises Task 11/13's
+		// (assertSameSet, via canonicalize) actually exercises the
 		// hydrateEdgePropsByID round trip -- every other edge kind in this
 		// fixture is seeded with graph.NewProperties() (empty), which a
 		// completely unhydrated edge (a zero-value *graph.Properties) would
@@ -366,7 +366,7 @@ func TestTryCypherDifferential(t *testing.T) {
 			text: fmt.Sprintf(`MATCH p = allShortestPaths((s:MultiKindA:MultiKindB)-[:MultiKindEdge*1..]->(e)) WHERE id(e) = %d AND s.name = 'alice' RETURN p`, multiKindEndID),
 		},
 		{
-			// Task 13's required "plain property MATCH" coverage: a bare
+			// Plain-property-MATCH coverage: a bare
 			// MATCH/WHERE/RETURN with no shortestPath/allShortestPaths
 			// pattern at all -- exactly the general-purpose shape the
 			// retired milestone-2 recognizer could never serve, and the
@@ -401,10 +401,10 @@ func TestTryCypherDifferential(t *testing.T) {
 			text: `MATCH p = (g:Group)<-[:MemberOf]-(u:User) RETURN p LIMIT 5`,
 		},
 		{
-			// Task 13's required "path query asserting hydrated edge
-			// properties equal pg's" coverage: hydratedEdgeKind's one edge
+			// Coverage for a path query asserting that hydrated edge
+			// properties equal pg's: hydratedEdgeKind's one edge
 			// carries a real property bag (since/weight), so this
-			// differential comparison actually exercises Task 11/13's
+			// differential comparison actually exercises the
 			// hydrateEdgePropsByID round trip -- assertSameSet's
 			// canonicalize compares edge Properties byte for byte, so a
 			// hydration bug would show up here as a property mismatch even
@@ -445,11 +445,11 @@ func TestTryCypherDifferential(t *testing.T) {
 	}
 }
 
-// TestTryCypherRejectsNonShortestPath was Task 11's required reject case
-// under the retired milestone-2 recognizer (recognize.FromCypher), which
+// TestTryCypherRejectsNonShortestPath was originally the reject case
+// for the retired milestone-2 recognizer (recognize.FromCypher), which
 // only ever recognized shortestPath/allShortestPaths shapes -- so a plain
 // `MATCH (n) RETURN n` was, at the time, the simplest possible "declined"
-// example. Task 13's interpreter-backed TryCypher serves that exact shape
+// example. The interpreter-backed TryCypher serves that exact shape
 // directly (see TestTryCypherDifferential's own "plain property MATCH (no
 // shortestPath at all)" case above), so this case is renamed and re-pointed
 // at a shape the interpreter itself still declines:
@@ -534,7 +534,7 @@ func TestTryCypherParams(t *testing.T) {
 	})
 }
 
-// TestTryCypherAggregationQuery is Task 13's required "corpus aggregation
+// TestTryCypherAggregationQuery is the "corpus aggregation
 // query" coverage: interpret/plan_test.go's unexported corpusAggregationQuery
 // (migrated verbatim from BloodHound's real analysis-query corpus,
 // "Kerberoastable users with most admin privileges" -- duplicated here byte
@@ -645,7 +645,7 @@ LIMIT 100`
 	assertSameSet(t, engineOut, oracleOut, false)
 }
 
-// TestTryCypherCollectAntiJoinQuery is Task 13's required "*0.. COLLECT
+// TestTryCypherCollectAntiJoinQuery is the "*0.. COLLECT
 // anti-join" coverage: interpret/plan_test.go's unexported
 // corpusCollectAntiJoinQuery (migrated verbatim from BloodHound's real
 // analysis-query corpus, "Domain Admins logons to non-Domain Controllers" --
@@ -759,7 +759,7 @@ LIMIT 1000`
 	assertSameSet(t, engineOut, oracleOut, false)
 }
 
-// TestTryCypherReturnPropertyLiteralMatchesOracleType is Task 13's required
+// TestTryCypherReturnPropertyLiteralMatchesOracleType is the
 // "RETURN n.prop literal projection" coverage: TryCypher's own result and a
 // direct PostgreSQL round trip through the plain pg driver -- deliberately
 // bypassing ops.FetchByQuery's own node/edge/path mapping, which launders

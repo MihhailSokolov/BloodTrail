@@ -515,7 +515,7 @@ type observingRelationshipQuery struct {
 	// criteria accumulates every Filter/Filterf argument, in call order.
 	// Delete only attempts to recognize a kind-scoped shape when exactly one
 	// criteria was recorded -- the shape edgeKindsFromCriteria (and its
-	// eventual Task 4 replacement, recognize.FromRelCriteria) recognizes is
+	// eventual replacement, recognize.FromRelCriteria) recognizes is
 	// always a single conjunction or bare KindMatcher built in one Filter
 	// call, never several composed together.
 	criteria []graph.Criteria
@@ -715,7 +715,7 @@ func edgeKindsFromCriteria(criteria graph.Criteria) (graph.Kinds, bool) {
 // recognize.go's edgeSymbol constant and matchRelationshipKinds, whose
 // AST-matching this is a deliberate copy of, kept local rather than
 // exported/imported so this file's dependency on the recognize package's
-// surface stays at zero until Task 4 gives it a real FromRelCriteria to call
+// surface stays at zero until a real FromRelCriteria exists to call
 // instead). A KindMatcher over any other reference (notably the node
 // variable "n"), or a nil km, fails.
 func relationshipKindMatcherKinds(km *cypher.KindMatcher) (graph.Kinds, bool) {

@@ -2,7 +2,7 @@
 
 //go:build integration
 
-// This file covers two watermark-protocol gaps a Task 13 review found: every
+// This file covers two gaps in the watermark protocol's coverage: every
 // existing watermark test either drove internal/engine's own primitives
 // directly (internal/engine/watermark_integration_test.go's own doc on why --
 // an import cycle, since the real observer/driver wiring lives up here) or

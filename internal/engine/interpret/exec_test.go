@@ -57,7 +57,7 @@ func buildExecSnapshot(t *testing.T, kindTable map[snapshot.KindID]string, nodes
 
 // planQuery parses and plans query against snap, failing the test if either
 // step does not succeed (every test in this file uses queries this
-// milestone's planner is expected to serve).
+// package's planner is expected to serve).
 func planQuery(t *testing.T, snap *snapshot.View, query string) *Query {
 	t.Helper()
 	rq, err := frontend.ParseCypher(frontend.NewContext(), query)
@@ -559,8 +559,8 @@ func TestExecReturnNodeAndScalar(t *testing.T) {
 	}
 }
 
-// --- bonus: closing-edge cycle (documented-legal shape, not in the brief's
-// required list, but explicitly called out in plan.go's declareSymbol doc
+// --- bonus: closing-edge cycle (a documented-legal shape, explicitly
+// called out in plan.go's declareSymbol doc
 // comment as a shape this executor must join by identity rather than reject
 // or silently mishandle) ------------------------------------------------------
 
@@ -627,7 +627,7 @@ func TestExecClosingStepRejectsSelfLoopEdgeReuse(t *testing.T) {
 	}
 }
 
-// --- Task 8b: mixed fixed/var-length chains + named-path assembly ---------
+// --- Mixed fixed/var-length chains + named-path assembly -----------------
 //
 // BloodHound's prebuilt queries routinely mix fixed and variable-length
 // steps in one pattern chain (e.g. `(c:Computer)-[:HasSession]->(u:User)-
@@ -640,8 +640,8 @@ func TestExecClosingStepRejectsSelfLoopEdgeReuse(t *testing.T) {
 // comment for the "always walk left-to-right from the chain's own leftmost
 // symbol" anchoring choice this section's tests exercise.
 
-// TestExecChainMixedFixedVarWithoutNamedPath: deliverable 1 in isolation --
-// a mixed fixed-then-var chain with no path variable at all must still
+// TestExecChainMixedFixedVarWithoutNamedPath: the chain executor in
+// isolation -- a mixed fixed-then-var chain with no path variable at all must still
 // execute correctly (both the 1-hop and 2-hop MemberOf extensions from the
 // same HasSession-bound user), and a decoy HasSession target with no further
 // MemberOf edges must contribute nothing.
@@ -816,7 +816,7 @@ func TestExecChainVarFixedVarLeadingZeroLengthSkipsStep(t *testing.T) {
 // variable-length steps (a-[*1..3]->m-[*1..3]->b) whose only qualifying
 // trails happen to reuse the SAME physical edge (X->Y) once in each step's
 // own trail. Trail-edge uniqueness is scoped to a single step's own DFS
-// (see expand.go's package doc, unchanged by Task 8b's refactor into
+// (see expand.go's package doc, unchanged by the refactor into
 // expandVarLengthTrailsForSeed) -- never across steps of the same chain --
 // so this row must survive, with the shared edge's id appearing TWICE in
 // the assembled path's own Edges list. The companion "forbidden WITHIN one

@@ -538,7 +538,7 @@ func TestTryNodeQueriesNilIDsUnconstrained(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 7: TryRelCount / TryRelFetchIDs / TryRelFetchTriples /
+// Relationship queries: TryRelCount / TryRelFetchIDs / TryRelFetchTriples /
 // TryRelFetchKinds / TryRelQueryRows.
 // ---------------------------------------------------------------------------
 
@@ -879,8 +879,8 @@ func TestTryRelQueriesEmptyVsNilAnchors(t *testing.T) {
 	}
 }
 
-// TestTryRelQueriesDisabledDeclines covers cfg.Enabled = false: every Task 7
-// entry point declines immediately.
+// TestTryRelQueriesDisabledDeclines covers cfg.Enabled = false: every
+// rel-query entry point declines immediately.
 func TestTryRelQueriesDisabledDeclines(t *testing.T) {
 	e := New(nil, nil, Config{Enabled: false})
 	ctx := context.Background()
@@ -966,7 +966,8 @@ func TestTryRelFetchKindsResolveErrorDeclines(t *testing.T) {
 // ProjectionStartEnd rowResult with the exact consumer loop shape dawgs'
 // container.FetchDirectedGraph uses (container/fetch.go): a fixed pair of
 // graph.ID targets scanned every row via Scan, inside a plain `for
-// result.Next() { ... }` loop -- the task brief's mandated fidelity test.
+// result.Next() { ... }` loop -- a fidelity test against the real
+// upstream consumer's own loop shape.
 func TestRowResultDrivesContainerFetchDirectedGraphLoopShape(t *testing.T) {
 	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
@@ -1007,8 +1008,8 @@ func TestRowResultDrivesContainerFetchDirectedGraphLoopShape(t *testing.T) {
 // ProjectionStepOutbound rowResult with the exact consumer loop shape
 // dawgs' traversal.shallowFetchRelationships uses for an outbound step
 // (traversal/traversal.go): four fixed targets (graph.ID, graph.Kinds,
-// graph.ID, graph.Kind) scanned every row -- the task brief's other
-// mandated fidelity test.
+// graph.ID, graph.Kind) scanned every row -- the other real-consumer
+// fidelity test.
 func TestRowResultDrivesShallowFetchRelationshipsLoopShape(t *testing.T) {
 	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
@@ -1227,7 +1228,7 @@ func TestTryRelQueriesUnconstrainedRelSpecServesFully(t *testing.T) {
 	}
 }
 
-// TestTryRelFetchIDsCloseDoesNotLeakFeeder is this file's Task 7
+// TestTryRelFetchIDsCloseDoesNotLeakFeeder is this file's rel-query
 // cursor-leak regression test, modeled directly on
 // TestTryNodeFetchIDsCloseDoesNotLeakFeeder above: a cursor that is drained
 // partially and then Close()d must not leave its feeder goroutine blocked

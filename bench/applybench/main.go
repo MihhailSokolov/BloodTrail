@@ -21,7 +21,7 @@
 // instances that need different settings concurrently; every phase below
 // runs its writes/opens sequentially for exactly this reason.
 //
-// It measures four things from the milestone's write-through spec:
+// It measures four things about the write-through path:
 //
 //   - (a) sustained apply throughput: ingest-shaped writes (batch.
 //     UpdateNodeBy objectid upserts for new User nodes, batch.
@@ -216,9 +216,9 @@ const (
 
 // applyOverheadMaxPct is -enforce's bar for (a): the engine-enabled write
 // wall time must not exceed the engine-disabled baseline by more than this
-// percentage. Evidence-based, per the m4.5 measured-physics convention (see
-// bench/builderbench's/bench/cypherbench's shapeThresholds docs for that
-// convention applied elsewhere): three 5M-scale runs (2026-09, see this
+// percentage. Evidence-based, following the same measured-physics convention
+// used elsewhere in this repo (see bench/builderbench's and
+// bench/cypherbench's shapeThresholds docs): three 5M-scale runs (2026-09, see this
 // package's README cap-rationale table) measured 33.52% / 25.22% / 26.05%;
 // 60.0 is the worst of those (33.52%) x ~1.75, rounded up to a clean number.
 // Replacing this value requires fresh 5M-scale evidence recorded alongside
@@ -288,7 +288,7 @@ func run(args []string) int {
 	fs := flag.NewFlagSet("applybench", flag.ContinueOnError)
 	var (
 		dsn            = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
-		ingest         = fs.Int("ingest", 12_000, "ingest units written per repeat (each unit is 1 new User node upsert + 1 new MemberOf edge upsert to an existing hub Group -- M in the task's 'M nodes+edges' sense is 2x this)")
+		ingest         = fs.Int("ingest", 12_000, "ingest units written per repeat (each unit is 1 new User node upsert + 1 new MemberOf edge upsert to an existing hub Group -- so M in the 'M nodes+edges' sense is 2x this)")
 		flush          = fs.Int("flush", 20_000, "(a)'s batch flush size in operations (an explicit batch.Commit() every this many UpdateNodeBy/UpdateRelationshipBy calls), matching production's write flush size")
 		latencyFlush   = fs.Int("latency-flush", 2_000, "(b)'s batch flush size in operations -- deliberately smaller than -flush so several write-through Apply calls land INSIDE the sampled window (see the package doc's (b))")
 		repeats        = fs.Int("repeats", 3, "number of repeats per measurement (p50 is taken over these); must be >= 3")
@@ -1873,9 +1873,8 @@ func overheadPercent(onP50, offP50 time.Duration) float64 {
 // idle sample, e.g. a near-instant smoke-scale query) reports true
 // unconditionally -- there is nothing meaningful to bound duringP95
 // against, and failing a smoke-scale run on that technicality would be
-// exactly the kind of false failure the m4.5 measured-physics convention
-// this package's caps are meant to eventually replace already warns
-// against.
+// exactly the kind of false failure a bar anchored to measured physics,
+// rather than to an invented number, is meant to avoid.
 func latencyWithinMultiplier(duringP95, idleP95 time.Duration, multiplier float64) bool {
 	if idleP95 <= 0 {
 		return true

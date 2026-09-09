@@ -17,8 +17,7 @@ import (
 // --- test helpers: parsing -------------------------------------------------
 
 // whereExprOf parses query (expected to contain exactly one MATCH with a
-// WHERE clause) and returns the WHERE clause's single top-level expression,
-// per the brief's suggested helper shape.
+// WHERE clause) and returns the WHERE clause's single top-level expression.
 func whereExprOf(t *testing.T, query string) cypher.Expression {
 	t.Helper()
 
@@ -421,7 +420,7 @@ func TestEvalCoalesce(t *testing.T) {
 	})
 }
 
-// TestEvalCoalesceGuardIdiom pins the brief's named corpus-guard scenario:
+// TestEvalCoalesceGuardIdiom pins the corpus-guard scenario:
 // COALESCE(u.gmsa, false) = true on a node without gmsa evaluates to
 // TriFalse, not TriNull -- coalesce always produces a definite (never
 // "absent") value here, so the comparison is a plain, total boolean
@@ -613,8 +612,8 @@ func TestEvalArithmetic(t *testing.T) {
 	})
 }
 
-// TestEvalStringConcatenation pins gap (b)'s fix (task 16b) as corrected by
-// this task's own review finding: `+` is disambiguated STATICALLY, from
+// TestEvalStringConcatenation pins the string-concatenation fix, as
+// corrected by a later review finding: `+` is disambiguated STATICALLY, from
 // each operand's AST shape (classifyAddOperand), never from what it
 // evaluates to at runtime -- applyAdd's own doc comment pins the full
 // pg-parity investigation, the review finding that replaced the earlier
@@ -732,7 +731,7 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
-	// coalesce() (review finding, this task): classifyCoalesceOperand
+	// coalesce() pg-parity finding: classifyCoalesceOperand
 	// (eval.go) derives coalesce's static addOperandKind from its own
 	// arguments, mirroring dawgs' translateCoalesceFunction. A string
 	// literal argument gives the whole call a known Text type
@@ -805,7 +804,7 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
-	// type() (audit, this task): EdgeTypeFunction is statically Text in pg
+	// type() pg-parity audit: EdgeTypeFunction is statically Text in pg
 	// (function.go's `CastType: pgsql.Text`, the identical shape to
 	// toLower()/toUpper()) -- classifyAddOperand previously fell through to
 	// its addOther default for type(), which never served a WRONG numeric
@@ -832,7 +831,7 @@ func TestEvalStringConcatenation(t *testing.T) {
 		}
 	})
 
-	// split()/labels() (audit, this task): both are array-typed in pg
+	// split()/labels() pg-parity audit: both are array-typed in pg
 	// (TextArray), a third `+` semantics (list concatenation) this package
 	// implements nowhere -- left classified addOther, safe by construction
 	// rather than by a correct type mirror, since evalSplitFunction/
@@ -856,7 +855,7 @@ func TestEvalStringConcatenation(t *testing.T) {
 
 	// The corpus shape itself (selector/AdminSDHolder): a concatenation
 	// result feeding an equality comparison. An absent right-hand property
-	// must make the whole comparison NULL (the brief's own pinned rule:
+	// must make the whole comparison NULL (the pinned rule:
 	// "absent property -> NULL result -> comparison NULL -> row drops"),
 	// not an error.
 	t.Run("concatenation feeding an equality comparison: match", func(t *testing.T) {
@@ -882,7 +881,7 @@ func TestEvalStringConcatenation(t *testing.T) {
 	})
 }
 
-// TestEvalLastLogonTimestampScenario pins the brief's named scenario:
+// TestEvalLastLogonTimestampScenario pins the stale-logon scenario:
 // n.lastlogontimestamp < (datetime().epochseconds - (60 * 86400)) evaluated
 // against a controlled Env.Now.
 func TestEvalLastLogonTimestampScenario(t *testing.T) {
@@ -1339,7 +1338,7 @@ func TestEvalKindMatcher(t *testing.T) {
 	})
 }
 
-// --- Pattern predicates (gap (a), task 16b) ---------------------------------
+// --- Pattern predicates ------------------------------------------------------
 
 // TestEvalPatternPredicate exercises evalPatternPredicate directly against
 // the fixture's one real edge (950 -[:MemberOf]-> 900): both symbols
@@ -1401,7 +1400,7 @@ func TestEvalPatternPredicateSelfReferenceNoSelfLoop(t *testing.T) {
 	}
 }
 
-// TestEvalPatternPredicateNeverNull pins the milestone brief's own rule
+// TestEvalPatternPredicateNeverNull pins the never-NULL rule
 // directly: a pattern predicate's result is always TriTrue or TriFalse,
 // never TriNull, regardless of any node property (there is none inspected
 // here at all -- see evalPatternPredicate's own doc comment) -- unlike an

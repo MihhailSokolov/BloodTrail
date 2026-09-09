@@ -6,8 +6,8 @@
 // interpret.EdgeRef/interpret.PathVal into a full *graph.Node/*graph.
 // Relationship/graph.Path, and wrapping a fully-materialized interpret.
 // ResultSet as a graph.Result (cypherRowsResult) the way pathResult
-// (result.go) and rowResult (rowresult.go) already wrap this milestone's
-// two earlier serving pipelines.
+// (result.go) and rowResult (rowresult.go) already wrap the engine's two
+// earlier serving pipelines.
 //
 // engine.go's TryCypher wires all of this together, via
 // safeExecuteCypher/buildCypherRowsResult, into a served graph.Result.
@@ -32,9 +32,8 @@ import (
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
-// Budget/batch constants for the Cypher interpreter pipeline (the milestone
-// plan's "Global Constants" section), defined here as this task's file is
-// their designated home.
+// Budget/batch constants for the Cypher interpreter pipeline, whose
+// designated home is this file.
 //
 // maxExpansionDepth's own mirror lives in interpret.MaxExpansionDepth
 // (interpret/plan.go): that constant caps the *hop count* of an unbounded
@@ -51,7 +50,7 @@ const (
 	// maxCypherRows caps the number of rows a served Cypher query may
 	// produce, mirroring interpret.Budgets.MaxRows -- the executor already
 	// enforces this during materialization (interpret.ErrBudget), so a
-	// caller wiring interpret.Execute for the TryCypher pipeline (Task 13)
+	// caller wiring interpret.Execute for the TryCypher pipeline
 	// is expected to pass Budgets{MaxRows: maxCypherRows, ...} rather than
 	// leave it unbounded.
 	maxCypherRows = 100_000
@@ -65,8 +64,8 @@ const (
 	// local serving slower than simply delegating to PostgreSQL.
 	maxCypherWork = 1 << 28
 
-	// edgePropsBatchSize caps how many database edge ids one Task 11
-	// property-hydration query batches into a single `WHERE id = ANY($1)`
+	// edgePropsBatchSize caps how many database edge ids one edge-property
+	// hydration query batches into a single `WHERE id = ANY($1)`
 	// round trip, mirroring hydrate.go's own edgeBatchSize for node/edge
 	// hydration (500 triples there; edge-id-only batches here can run much
 	// larger since each bound parameter is a single uint64, not a three-
@@ -76,7 +75,7 @@ const (
 
 // --- TryCypher pipeline support -------------------------------------------
 //
-// collectEdgeIDs and cypherExecReason are the two pieces of Task 13's
+// collectEdgeIDs and cypherExecReason are the two pieces of the
 // TryCypher pipeline (engine.go) that are pure functions of an already-
 // executed interpret.ResultSet/error rather than engine.Engine methods in
 // their own right, so -- like this file's materialization helpers above and
@@ -122,7 +121,7 @@ func collectEdgeIDs(snap *snapshot.View, rs *interpret.ResultSet) []uint64 {
 }
 
 // cypherExecReason maps one interpret.Execute error to the TryCypher decline
-// reason it logs, per the milestone's pinned sentinel-to-reason table:
+// reason it logs, per this pinned sentinel-to-reason table:
 // interpret.ErrBudget (a MaxRows/MaxWork budget was exceeded) ->
 // reasonBudget; interpret.ErrCollation (the answer depends on PostgreSQL's
 // own collation) -> reasonCollation; interpret.ErrSelfEndpoint (mirrors
@@ -236,8 +235,8 @@ func materializeNode(snap *snapshot.View, n snapshot.NodeID) *graph.Node {
 // materializeEdge builds a full graph.Relationship for one forward-CSR
 // slot: ID/Kind from that slot's own OutEdgeIDs/OutKinds entries, StartID/
 // EndID from GraphIDs at the slot's source and target dense ids. props is
-// supplied by the caller (Task 11's edge-property hydration, wired in Task
-// 13) and passed straight through -- this function never inspects
+// supplied by the caller (the edge-property hydration the TryCypher
+// pipeline performs) and passed straight through -- this function never inspects
 // edgeProps itself, so an empty, non-nil *graph.Properties (e.g. from a
 // test, or from edgePropsFor's own missing-entry fallback below) is exactly
 // as valid a props argument as a fully hydrated one.
@@ -310,21 +309,21 @@ func edgeSource(snap *snapshot.View, fwd uint64) snapshot.NodeID {
 // edge's properties, keyed by database edge id (e.DatabaseID(snap)) --
 // deliberately a plain edge-id key rather than the (start, end, kind)
 // triple hydrate.go's older edgeKey uses, since materializeEdge already
-// derives start/end/kind from the snapshot alone; Task 11's hydration query
+// derives start/end/kind from the snapshot alone; the hydration query
 // needs nothing more than a `WHERE id = ANY($1)` over the edge table to
 // produce this map.
 //
 // A PathVal edge with no corresponding edgeProps entry gets an empty,
 // non-nil *graph.Properties (via edgePropsFor) rather than an error: this
 // function has no way to distinguish "not yet hydrated" from "hydrated as
-// genuinely empty", and the milestone's execution model (Task 13) is
+// genuinely empty", and the TryCypher execution model is
 // responsible for guaranteeing every edge a materialized path can reference
 // was included in that path's own hydration batch before this function is
 // ever called -- so a missing entry here would only reflect a caller bug
 // upstream, which is not this function's job to detect or report.
 //
 // A nil p returns the zero graph.Path{} rather than panicking -- purely
-// defensive, since nothing in this milestone's execution model is expected
+// defensive, since nothing in that execution model is expected
 // to call this with a nil *PathVal (OutVal.Path is always non-nil whenever
 // OutVal.Kind is OutPath).
 func materializePath(snap *snapshot.View, p *interpret.PathVal, edgeProps map[uint64]*graph.Properties) graph.Path {
@@ -568,7 +567,7 @@ type cypherRowsResult struct {
 // be index-aligned with rs.Keys/rs.Rows[i] -- the caller is expected to have
 // produced it via projectionValueKinds(q) against the same *interpret.Query
 // that planned rs. edgeProps supplies every path/edge column's relationship
-// properties (Task 11's hydration, keyed by database edge id) and may be
+// properties (the edge-property hydration, keyed by database edge id) and may be
 // nil or incomplete: edgePropsFor's missing-entry fallback (an empty,
 // non-nil *graph.Properties) covers both cases, so a test may pass nil to
 // exercise column shapes without hydrating anything.
@@ -691,7 +690,7 @@ func (r *cypherRowsResult) Values() []any {
 // plain scalar column (int64/int32/float64/string/bool/[]any/map[string]any)
 // falls all the way through every MapFunc and reaches ops.FetchByQuery's
 // final `else` branch, which wraps it as a graph.Literal -- exactly the
-// behavior the brief's "decline everything else" requirement is aimed at.
+// behavior this mapper's "decline everything else" design is aimed at.
 func (r *cypherRowsResult) Mapper() graph.ValueMapper {
 	return graph.NewValueMapper(mapPathValue, mapCypherNodeValue, mapCypherRelationshipValue)
 }

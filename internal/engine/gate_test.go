@@ -20,11 +20,11 @@ import (
 // it as a query migrated from BloodHound's real analysis-query corpus): it
 // cannot be imported directly (unexported, and defined in a _test.go file,
 // so invisible outside package interpret even if exported), so the literal
-// is duplicated here. This is the brief's own "corpus aggregation query"
+// is duplicated here. This is the "corpus aggregation query"
 // fixture -- WITH DISTINCT/COUNT/ORDER BY/LIMIT over a MemberOf|AdminTo
 // traversal -- and is expected to pass the gate (dawgs' own pg translator
-// accepts it, since it is real BloodHound query shape, not a shape this
-// milestone's interpreter merely happens to accept).
+// accepts it, since it is real BloodHound query shape, not a shape
+// BloodTrail's interpreter merely happens to accept).
 const corpusAggregationQueryText = `MATCH (u:User)
 WHERE u.hasspn = true
   AND u.enabled = true
@@ -161,7 +161,7 @@ func TestSnapshotKindMapperAssertKindsAlwaysErrors(t *testing.T) {
 // --- gate mutation cannot leak into a served result ------------------------
 
 // TestTranslateGateOKCopyLeavesOriginalASTUntouched is the regression test
-// pinned by this milestone's own critical finding on TryCypher's pipeline
+// for a critical finding on TryCypher's pipeline
 // (engine.go's TryCypher doc, step 7): dawgs' translate.Translate runs a
 // real optimizer (cypher/models/pgsql/optimize) over whatever
 // *cypher.RegularQuery it is given, and that optimizer is free to mutate

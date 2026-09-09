@@ -239,7 +239,7 @@ func TestSnapshotFileCorruptByte(t *testing.T) {
 
 // TestSnapshotFileTruncated checks that a file cut off partway through
 // (payload present but incomplete, no CRC trailer at all) is rejected --
-// generically, per the brief; a truncated body surfaces as ErrCorrupt in
+// generically; a truncated body surfaces as ErrCorrupt in
 // this implementation (a short read partway through the packed arrays),
 // but the assertion only requires an error, not that specific sentinel.
 func TestSnapshotFileTruncated(t *testing.T) {

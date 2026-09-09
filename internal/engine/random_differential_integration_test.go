@@ -28,7 +28,7 @@ const randomDifferentialSeeds = 20
 // queries TestRandomDifferential issues against each seed's graph.
 const randomDifferentialQueriesPerSeed = 10
 
-// TestRandomDifferential is Task 14's randomized differential suite: for
+// TestRandomDifferential is a randomized differential suite: for
 // seeds 1..randomDifferentialSeeds, it wipes the graph, generates a random
 // one via graphtest.LoadRandom (60 nodes across 5 kinds, 180 edges across 6
 // kinds, seeded rand, self-loops and same/different-kind parallel edges all
@@ -36,7 +36,7 @@ const randomDifferentialQueriesPerSeed = 10
 // randomDifferentialQueriesPerSeed random TryAllShortestPaths queries --
 // random explicit-id endpoint pair (sometimes the same node), a random 1-4
 // edge-kind subset, and a random Mode -- checked against the same
-// pg-driver-only oracle TestTryAllShortestPathsDifferential (Task 10) uses:
+// pg-driver-only oracle TestTryAllShortestPathsDifferential uses:
 // assertSameSet for ModeAll, assertModeOne for ModeOne, both called with
 // allowEmpty true since a uniformly random id pair is frequently
 // disconnected and that is not itself a bug.
@@ -47,7 +47,7 @@ const randomDifferentialQueriesPerSeed = 10
 // SQLSTATE 22023 ("shortest path endpoints must not resolve to the same
 // node") from the very first BFS hop, aborting the whole query rather than
 // just skipping that pair (see traverse.SelfEndpointConflict's doc for the
-// underlying SQL). Task 10's oraclePathsByPair issues exactly the query
+// underlying SQL). oraclePathsByPair issues exactly the query
 // shape that hits this, so calling it for such a pair fails the test on an
 // oracle error, not a real engine/oracle mismatch. The engine now declines
 // outright whenever the resolved roots and terminals share a node with an

@@ -15,9 +15,9 @@ import (
 )
 
 // This file seeds a deterministic BloodHound-shaped graph through the pg
-// driver's write/batch APIs so that milestone 4's pre-built Cypher query
-// corpus (testdata/prebuilt/{agt,agi,selectors}.json, see task-14) has
-// something to match against: Task 16's differential suite runs every
+// driver's write/batch APIs so that the pre-built Cypher query
+// corpus (testdata/prebuilt/{agt,agi,selectors}.json) has
+// something to match against: the corpus differential suite runs every
 // enabled corpus query against both the bloodtrail engine and the plain pg
 // driver oracle and compares results, and an empty graph makes every query
 // trivially agree (0 rows == 0 rows) without ever exercising a real
@@ -61,10 +61,10 @@ import (
 // the AGT kind-based and AGI property-based conventions), and a minimal
 // Azure corner -- return real rows, organized as one seeding helper per
 // family (seedDomainsAndWellKnownPrincipals, seedUsers, seedComputers,
-// ...) so a gap Task 16 finds is a small, localized addition to one
+// ...) so a gap that suite finds is a small, localized addition to one
 // helper rather than a rewrite. It does not attempt every query in the
 // corpus (some, e.g. GPO-linking or the narrower selector-only well-known
-// SIDs, are left for whoever extends this file once Task 16's
+// SIDs, are left for whoever extends this file once a
 // differential run shows which families still come back empty).
 //
 // # Time-dependent predicates
@@ -348,7 +348,7 @@ func (s *corpusSeed) edge(start, end string, kind graph.Kind, props *graph.Prope
 }
 
 // flaggedEdge registers a relationship carrying the {"isacl", "lastseen"}
-// shape the brief calls out for the six core BloodHound relationship kinds
+// property shape used for the six core BloodHound relationship kinds
 // (MemberOf/AdminTo/HasSession/GenericAll/Owns/WriteDacl): isACL marks
 // whether the edge represents a materialized ACE (GenericAll/Owns/
 // WriteDacl -- true) versus a structural/derived relationship (MemberOf/
@@ -378,7 +378,7 @@ type wellKnownGroup struct {
 }
 
 // domain1RIDGroups/domain2RIDGroups are the RID-suffixed well-known groups
-// the brief calls out (-512/-513/-516/-519/-525) plus a handful more the
+// the corpus queries name (-512/-513/-516/-519/-525) plus a handful more the
 // corpus' selectors.json also names (-517/-518/-521/-526/-527/-557), which
 // cost nothing extra to seed alongside them.
 var domain1RIDGroups = []wellKnownGroup{
@@ -403,7 +403,7 @@ var domain2RIDGroups = []wellKnownGroup{
 }
 
 // builtinGroups are the domain-agnostic "S-1-5-32-*" local groups
-// selectors.json and the brief both name; their objectid is the bare
+// selectors.json names; their objectid is the bare
 // well-known SID (no domain prefix), matching how BloodHound and the
 // corpus' own "ENDS WITH 'S-1-5-32-...'" predicates expect them.
 var builtinGroups = []wellKnownGroup{
@@ -422,8 +422,8 @@ var builtinGroups = []wellKnownGroup{
 // sidPrefix, or a literal "S-1-5-32" prefix for builtin groups -- the
 // function doesn't care which, it just concatenates sidPrefix+"-"+rid).
 // tier0 groups get both the AGT-style Tag_Tier_Zero kind and the AGI-style
-// system_tags property, on the same node, per the brief's "both ways"
-// requirement.
+// system_tags property, on the same node, so a query written either way
+// finds it.
 func addWellKnownGroups(s *corpusSeed, sidPrefix string, groups []wellKnownGroup) {
 	for _, g := range groups {
 		objectID := sidPrefix + "-" + g.ridOrSuffix
@@ -1042,7 +1042,7 @@ func seedAzure(s *corpusSeed) {
 // queries and the "All Domain Admins"/general population style queries
 // operate over something closer to a real environment's density than the
 // curated core alone would give them, and so the fixture's total size
-// approaches the brief's "~300 nodes" target.
+// approaches the fixture's own ~300-node target.
 func seedFillerPopulation(s *corpusSeed) {
 	legacyOS := []string{"Windows XP Professional", "Windows Server 2003 Standard", "Windows Server 2012 R2 Datacenter", "Windows 8.1 Pro"}
 	modernOS := []string{"Windows Server 2019 Datacenter", "Windows 10 Enterprise", "Windows Server 2022 Datacenter", "Windows 11 Enterprise"}
@@ -1118,7 +1118,7 @@ func seedFillerPopulation(s *corpusSeed) {
 // -- the full node/edge kind closure the pre-built Cypher corpus references
 // (see this file's package doc), declared under GraphName. Exported so a
 // caller that opens a *second* driver instance against the same underlying
-// database -- e.g. milestone 4's Task 16 differential suite, which opens
+// database -- e.g. the pre-built corpus differential suite, which opens
 // both the bloodtrail driver and a raw pg oracle driver sharing one
 // connection pool -- can assert the identical schema on that instance too:
 // each *pg.Driver (bloodtrail.Driver's own embedded one included) keeps its
@@ -1128,7 +1128,7 @@ func seedFillerPopulation(s *corpusSeed) {
 // as-yet-uncached kind). Calling this on every driver instance up front
 // avoids relying on that self-heal path at all.
 //
-// DefaultGraph is set here (it was not, before Task 16), for the same
+// DefaultGraph is set here (it originally was not), for the same
 // per-instance reason: which graph is "the" default is itself instance
 // state (pg.Driver.SetDefaultGraph/AssertDefaultGraph), not a database-wide
 // setting, so a *pg.Driver instance that never had a default graph asserted
@@ -1137,11 +1137,12 @@ func seedFillerPopulation(s *corpusSeed) {
 // built by dawgs.Open, or a second, explicit pg.DriverName instance opened
 // against the same pool -- fails every query against it outright ("driver
 // operation requires a graph target to be set") until something asserts
-// one. Task 15's own TestLoadCorpusFixtureSelfCheck never noticed this gap:
+// one. TestLoadCorpusFixtureSelfCheck never noticed this gap:
 // it calls LoadCorpusFixture on the very same *pg.Driver graphtest.OpenPG
 // just constructed (and therefore already defaulted), never a second
-// instance -- Task 16 does, so the gap became this function's problem to
-// close rather than something worth touching that test over.
+// instance -- the corpus differential suite does, so the gap became this
+// function's problem to close rather than something worth touching that
+// test over.
 func CorpusSchema() graph.Schema {
 	return graph.Schema{
 		Graphs:       []graph.Graph{{Name: GraphName, Nodes: corpusKinds(corpusNodeKindNames), Edges: corpusKinds(corpusEdgeKindNames)}},

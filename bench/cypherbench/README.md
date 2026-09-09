@@ -22,7 +22,7 @@ make bench-cypher
 
 ## What it measures
 
-Five Cypher shapes from the milestone's spec, each run as one warmup call
+Five Cypher shapes, each run as one warmup call
 per driver (comparing result row counts as a correctness guard) followed by
 `-runs` further timed calls per driver:
 
@@ -159,7 +159,7 @@ go run ./bench/cypherbench -dsn "$BLOODTRAIL_TEST_PG" -pg-cap 1ms
 directly around each bt call (`runCypherOnceCapped` in `main.go`) -- but
 unlike `-pg-cap`, tripping it is never a graceful, recordable outcome. It is
 a fail-fast safety net for the exact incident this flag was added to catch:
-during a 2026-09 milestone-4.5 5M-scale run, `collect_antijoin_prebuilt`'s
+during a 2026-09 5M-scale run, `collect_antijoin_prebuilt`'s
 own bt-side call declined (`internal/engine.TryCypher`'s `reason=budget` --
 its first `MATCH` clause seeds from a completely unconstrained pattern
 variable, forcing a full 4.76M-node scan-and-traverse that exceeds
@@ -197,7 +197,7 @@ the check), so none of this is a correctness question:
 |------------------------------|:---:|:---------------------------:|:-------:|-----|
 | `objectid_point_lookup`      | 1x  | 1590x / 835x / **1041x**     | pass    | The in-memory objectid index answers in under a millisecond every time; pg still pays a full jsonb round trip (~195-1132ms). This is the shape the index exists for. |
 | `shortest_path_prebuilt`     | 5x  | 56x / 59x / **42x**          | pass    | The engine now seeds and searches from the constrained side rather than materializing the query's full unconstrained endpoint set (see the root README's Cypher section); bt p50 stayed in the ~260-370ms band across all three runs against a consistently ~15-17s pg baseline. |
-| `collect_antijoin_prebuilt`  | 5x (judged on the absolute cap, see below) | bt p50 9.5s / 13.7s / **14.5s**; pg pg_capped at 120s every run | pass    | **Now served**, not declined. Constrained-side var-length seeding (`internal/engine/interpret/expand.go`'s `varLengthReverseEligible`) seeds Part[0]'s `(s)-[:MemberOf*0..]->(g:Group)` from the ~4 matching `-516` groups instead of a full 4.76M-node scan, which is what turns a deterministic `reason=budget` decline into a serve. Read the ~13.5s-class cost honestly: it is a serve, not a fast serve. Most of it is plausibly Part[1]'s untouched forward chain (`(c:Computer)-[:HasSession]->(:User)-[:MemberOf*1..]->(g:Group)`, still anchored on every Computer) plus Part[0]'s own pass over the Group kind bitmap to evaluate its pushed predicate -- a target for future tuning, not this task's scope. Judged on `engineAbsoluteCap` (30s) rather than a ratio because pg's own baseline (a 700,000-member group's full trail enumeration) is uncappable at this density -- it exceeds `-pg-cap`'s 120s on every attempt. |
+| `collect_antijoin_prebuilt`  | 5x (judged on the absolute cap, see below) | bt p50 9.5s / 13.7s / **14.5s**; pg pg_capped at 120s every run | pass    | **Now served**, not declined. Constrained-side var-length seeding (`internal/engine/interpret/expand.go`'s `varLengthReverseEligible`) seeds Part[0]'s `(s)-[:MemberOf*0..]->(g:Group)` from the ~4 matching `-516` groups instead of a full 4.76M-node scan, which is what turns a deterministic `reason=budget` decline into a serve. Read the ~13.5s-class cost honestly: it is a serve, not a fast serve. Most of it is plausibly Part[1]'s untouched forward chain (`(c:Computer)-[:HasSession]->(:User)-[:MemberOf*1..]->(g:Group)`, still anchored on every Computer) plus Part[0]'s own pass over the Group kind bitmap to evaluate its pushed predicate -- a target for future tuning, out of scope here. Judged on `engineAbsoluteCap` (30s) rather than a ratio because pg's own baseline (a 700,000-member group's full trail enumeration) is uncappable at this density -- it exceeds `-pg-cap`'s 120s on every attempt. |
 | `rid_suffix_scan`            | **1.1x** | 10.57x / 1.49x / 1.38x, then **1.31x idle** | pass    | pg's `kind_ids` GIN index already narrows the `ENDS WITH` scan to the same ~4 rows the engine itself walks, so both sides' absolute cost is small (bt ~130-165ms; pg ~212ms warm, up to ~1400ms cold). The idle-machine run pinned the warm-cache steady state at 1.31x -- the 10.57x reading was a cold pg cache, not the norm -- so the bar is 1.1x, just under the worst honest measurement, still requiring the engine to be strictly faster. |
 | `flag_scan`                  | **1.2x** | 2.29x / 1.29x / 2.25x, then **1.87x idle** | pass    | bt's absolute cost is small and stable in every run (~11-17ms p50); with `LIMIT 1000` both drivers stop after ~1000 matches, so warm-cache pg is also fast (~22-27ms). The idle-machine run pinned the steady state at 1.87x; the one historical 7.79x reading rode a cold pg cache (114ms). The interpreter's LIMIT early-termination is in effect in every run (bt was ~25x *slower* before it); the bar is 1.2x, just under the worst honest measurement. |
 

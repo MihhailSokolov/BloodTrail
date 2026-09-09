@@ -398,8 +398,9 @@ func (f fakeBT) ReadTransaction(ctx context.Context, txDelegate graph.Transactio
 // TestRunCypherOnceCapped_CutsOffASlowRunAndFails exercises
 // runCypherOnceCapped's core contract -- unlike runPGCypherCapped, an
 // engine-side run exceeding btCap is never a graceful, recordable outcome:
-// it is the milestone-4.5 incident's own failure mode (a decline silently
-// delegating to an unbounded PostgreSQL query), so runCypherOnceCapped must
+// it is the failure mode a 2026-09 benchmark incident exposed (a decline
+// silently delegating to an unbounded PostgreSQL query, which then ran for
+// 17.5 hours before being killed by hand), so runCypherOnceCapped must
 // return a hard, descriptive error naming both the shape and -bt-cap
 // itself, not a "capped" bool a caller could mistake for a data point.
 func TestRunCypherOnceCapped_CutsOffASlowRunAndFails(t *testing.T) {
@@ -493,8 +494,8 @@ func TestRunCypherOnceCapped_ParentCancellationIsNotMistakenForACap(t *testing.T
 // TestExtractRelKinds confirms shape 4's edge-kind list is parsed correctly
 // out of shape4Text's own "[:A|B|C*1..]" alternation -- deriving the list
 // from the query text itself (rather than hand-transcribing it a second
-// time) means the two can never silently drift apart. Locks in the "64-kind
-// interpolation" the task brief calls out by name.
+// time) means the two can never silently drift apart. Locks in the 64-kind
+// interpolation shape 4 depends on.
 func TestExtractRelKinds(t *testing.T) {
 	kinds := extractRelKinds(shape4Text)
 

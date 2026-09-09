@@ -16,7 +16,7 @@ import (
 // goroutine submits into. Unlike pathCursor's unbuffered channel (result.go)
 // -- fine there because a graph.PathSet is small enough to fully compute
 // before streaming even starts -- the builder-serving queries this backs
-// (TryNodeFetchIDs, TryNodeFetchKinds, and Task 7's rel-query siblings) can
+// (TryNodeFetchIDs, TryNodeFetchKinds, and the rel-query siblings) can
 // iterate a snapshot bitset with many thousands of set bits, and a caller
 // that reads in small batches (or with per-row work between reads) would
 // otherwise force the feeder to resume and block on every single row. A

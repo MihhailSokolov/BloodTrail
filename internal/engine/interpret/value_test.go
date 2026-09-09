@@ -80,7 +80,7 @@ func TestTriAndOrXorAllPairs(t *testing.T) {
 	}
 }
 
-// Explicit named cases per the brief, in addition to the exhaustive sweep
+// Explicit named cases, in addition to the exhaustive sweep
 // above: these pin the SQL corner cases that are easy to get backwards.
 func TestTriNamedCases(t *testing.T) {
 	cases := []struct {

@@ -36,8 +36,8 @@
 // PATHBENCH_* summary line (grep '^PATHBENCH_'). With -enforce, pathbench
 // exits nonzero if (a)'s p95 exceeds pairP95Threshold or (b)'s total time
 // exceeds domainAdminsThreshold; CI must never pass -enforce, since these
-// thresholds are only meaningful against a realistically sized graph (see
-// the task-16 brief). Any other failure (a database error, an empty graph,
+// thresholds are only meaningful against a realistically sized graph. Any
+// other failure (a database error, an empty graph,
 // an engine decline that should not happen for a single-ID pair query)
 // aborts the run with a nonzero exit regardless of -enforce.
 package main
@@ -93,7 +93,7 @@ var (
 	edgeKindNames = []string{edgeMemberOf, edgeAdminTo, edgeHasSession, edgeGenericAll, edgeWriteDacl, edgeAddMember}
 )
 
-// Enforcement thresholds from the task-16 brief.
+// Enforcement thresholds -enforce applies (see the package doc above).
 const (
 	pairP95Threshold       = 100 * time.Millisecond
 	domainAdminsThreshold  = 5 * time.Second

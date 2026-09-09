@@ -179,7 +179,7 @@ func TestPairPaths(t *testing.T) {
 }
 
 // TestPairPathsCrossCheck cross-checks pairPaths(ModeAll) against a
-// reference computed purely with Task 3 primitives (a full reverse
+// reference computed purely with the single-source primitives (a full reverse
 // bfsFrom(t) followed by enumerate(r)) on 50 seeded random graphs. The two
 // approaches share no code path beyond bfsFrom itself, so agreement here is
 // strong evidence that pairShortest's phase-1 termination bound and

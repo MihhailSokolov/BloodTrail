@@ -252,7 +252,7 @@ type Engine struct {
 	// mapKind resolves a graph.Kind name to its KindID, as
 	// e.pgDriver.KindMapper().MapKind would. The builder-serving path
 	// (serve_builder.go: TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds and
-	// Task 7's rel-query siblings) calls this instead of reaching into
+	// the rel-query siblings) calls this instead of reaching into
 	// pgDriver directly, purely so unit tests can fake kind-name resolution
 	// without standing up a real KindMapper (which needs a live PostgreSQL
 	// connection), adapted to a field since these methods are themselves the

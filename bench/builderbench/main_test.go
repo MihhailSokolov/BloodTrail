@@ -167,10 +167,10 @@ func TestThresholdFor_UnknownShapeFallsBackSafely(t *testing.T) {
 	}
 }
 
-// TestFetchDirectedGraphHasWeakerBar locks in the specific requirement the
-// task brief calls out by name: fetch_directed_graph_memberof's minRatio
-// must be less than every other shape's, and specifically 1.2x while the
-// others stay at enforceRatio (5x).
+// TestFetchDirectedGraphHasWeakerBar locks in this shape's deliberately
+// weaker bar: fetch_directed_graph_memberof's minRatio must be less than
+// every other shape's, and specifically 1.2x while the others stay at
+// enforceRatio (5x).
 func TestFetchDirectedGraphHasWeakerBar(t *testing.T) {
 	fdg, ok := shapeThresholds["fetch_directed_graph_memberof"]
 	if !ok {
@@ -314,9 +314,10 @@ func TestRunPGCapped_ParentCancellationIsNotMistakenForACap(t *testing.T) {
 
 // TestRunBTCapped_CutsOffASlowRunAndFails exercises runBTCapped's core
 // contract -- unlike runPGCapped, an engine-side run exceeding btCap is
-// never a graceful, recordable outcome: it is the milestone-4.5 incident's
-// own failure mode (a decline silently delegating to an unbounded
-// PostgreSQL query), so runBTCapped must return a hard, descriptive error
+// never a graceful, recordable outcome: it is the failure mode a 2026-09
+// benchmark incident exposed (a decline silently delegating to an unbounded
+// PostgreSQL query, which then ran for 17.5 hours before being killed by
+// hand), so runBTCapped must return a hard, descriptive error
 // naming both the shape and -bt-cap itself, not a "capped" bool a caller
 // could mistake for a data point.
 func TestRunBTCapped_CutsOffASlowRunAndFails(t *testing.T) {

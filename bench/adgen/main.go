@@ -38,8 +38,8 @@ import (
 const graphName = "bloodtrail_test"
 
 // progressEvery controls how often the load path reports progress to
-// stderr while copying rows, per the task brief ("progress output to
-// stderr every ~100k rows at large scales").
+// stderr while copying rows: roughly every 100k rows, so a large-scale
+// load shows steady progress instead of going silent for minutes.
 const progressEvery = 100_000
 
 func main() {

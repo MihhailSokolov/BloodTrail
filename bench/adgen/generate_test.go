@@ -58,7 +58,7 @@ func TestGenerateSeedVarianceProducesDifferentGraphs(t *testing.T) {
 }
 
 // TestGenerateCounts pins down the deterministic (non-random) node/edge
-// count arithmetic described in the task brief for Users=1000: 1 domain (<
+// count arithmetic for Users=1000: 1 domain (<
 // 50k users), Computers = Users/2, Groups = Users/5 (>=4 to hold the four
 // well-known groups), plus bounds on the edge count that hold for ANY seed
 // because only the group-nesting category (p=0.3 per non-special group) has
@@ -245,13 +245,13 @@ func TestGenerateHasPathFromUserToDomainAdmins(t *testing.T) {
 }
 
 // TestGenerateDefaultEdgeDensityNear10 asserts that a *default* run (no
-// flags/knobs beyond -users) lands close to the milestone's ~10-edges-per-
-// node design point (5M nodes / ~50M edges at -users 2800000, see the
-// task-15 brief and README.md). Users=100000 (2 domains, matching the
-// same per-domain proportions the -users 2800000 reference scale uses --
-// see README.md's worked example) is used as a fast proxy for that large
-// run. The tolerance band is deliberately generous (8-12) since the brief
-// only asks for "roughly 10 edges/node", not an exact ratio.
+// flags/knobs beyond -users) lands close to the ~10-edges-per-node design
+// point (5M nodes / ~50M edges at -users 2800000, see README.md).
+// Users=100000 (2 domains, matching the same per-domain proportions the
+// -users 2800000 reference scale uses -- see README.md's worked example) is
+// used as a fast proxy for that large run. The tolerance band is
+// deliberately generous (8-12) because the design point is "roughly 10
+// edges/node", not an exact ratio.
 func TestGenerateDefaultEdgeDensityNear10(t *testing.T) {
 	g := Generate(Spec{Users: 100_000, Seed: 1})
 
@@ -264,9 +264,9 @@ func TestGenerateDefaultEdgeDensityNear10(t *testing.T) {
 // TestGenerateMultiDomainIsolation exercises the domainCount > 1 path,
 // which every other test in this file avoids (they all use Users < 50000,
 // i.e. a single domain). Users=150000 is the smallest input that produces
-// exactly 3 domains under domainCount's floor-based formula (the task-15
-// brief's illustrative "Users=120000 (3 domains)" example does not hold
-// against that formula: 120000/50000 floors to 2, not 3 -- 150000 is the
+// exactly 3 domains under domainCount's floor-based formula (the intuitive
+// "Users=120000 gives 3 domains" reading does not hold against that
+// formula: 120000/50000 floors to 2, not 3 -- 150000 is the
 // smallest exact-3-domains input and also partitions evenly, 50000 users
 // per domain).
 //
@@ -489,7 +489,7 @@ func TestGenerateDomainsOverride(t *testing.T) {
 
 // TestGenerateWellKnownRIDGroupsPerDomain asserts that every domain gets
 // exactly one each of the four well-known, RID-suffixed groups the
-// cypherbench RID-suffix query shape (task 21) looks up: Domain Admins
+// cypherbench RID-suffix query shape looks up: Domain Admins
 // (-512), Domain Users (-513), Domain Controllers (-516), and Enterprise
 // Admins (-519).
 func TestGenerateWellKnownRIDGroupsPerDomain(t *testing.T) {
@@ -510,7 +510,7 @@ func TestGenerateWellKnownRIDGroupsPerDomain(t *testing.T) {
 }
 
 // TestGeneratePrincipalTimestampsAnchorToGenerationTime asserts the
-// resolution the task brief calls for: a principal's day-relative
+// intended resolution: a principal's day-relative
 // timestamp properties (lastlogontimestamp here) are computed as
 // nowFunc() minus a seed-deterministic number of days, not as an absolute
 // point fixed by the seed. Generating the identical Spec at two different
@@ -561,11 +561,11 @@ func firstUserNode(t *testing.T, g Graph) Node {
 }
 
 // TestGeneratePrincipalPropertyBags asserts the realistic-property-bag
-// shape the task brief calls for: every User/Computer node carries the
+// shape adgen aims for: every User/Computer node carries the
 // full common-principal field set (plus its kind-specific extras), the
-// per-field true/false split lands close to the brief's target
+// per-field true/false split lands close to its target
 // probabilities, and the mean marshaled JSON size across every principal
-// (User+Computer) node lands in the brief's 400-700 byte target window.
+// (User+Computer) node lands in the 400-700 byte target window.
 // Users=5000 (a single domain, so exact arithmetic applies) is large
 // enough to make the sampled ratios a stable proxy for the underlying
 // per-node probabilities without slowing the test suite down.
@@ -714,7 +714,7 @@ func assertRatioWithin(t *testing.T, label string, count, total int, lo, hi floa
 
 // TestGenerateGroupPropertyBag asserts groups (including the well-known
 // RID-suffixed ones) carry admincount and a realistic-length description,
-// and that the admincount true-rate lands close to the brief's 10% target.
+// and that the admincount true-rate lands close to its 10% target.
 func TestGenerateGroupPropertyBag(t *testing.T) {
 	g := Generate(Spec{Users: 5000, Seed: 21})
 
@@ -791,15 +791,14 @@ func TestGenerateDistinguishedNameLengths(t *testing.T) {
 }
 
 // BenchmarkGenerate measures Generate's per-call wall-clock cost at a
-// moderate scale, including the per-node property-bag construction task 19
-// added -- the task brief's concern is that this "should not blow
-// generation time" once task 21 scales up to the milestone's 5M-node
-// benchmark target. Run with:
+// moderate scale, including the per-node property-bag construction -- the
+// concern being that building a property bag per node must not blow up
+// generation time once the generator is run at the 5M-node benchmark
+// target. Run with:
 //
 //	go test ./bench/adgen/ -bench=BenchmarkGenerate -benchtime=5x -run '^$'
 //
-// and extrapolate ns/op to nodes/sec; see the task-19 report for the
-// specific measurement and its extrapolation to 5M nodes.
+// and extrapolate ns/op to nodes/sec.
 func BenchmarkGenerate(b *testing.B) {
 	spec := Spec{Users: 100_000, Seed: 1}
 	b.ResetTimer()

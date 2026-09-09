@@ -600,7 +600,8 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 // roots, and for each root walks the (already-ascending) small-side list
 // checking each element's distance buffer for reachability. Per terminal
 // x, distances are TO x, so each reached root is enumerated forward over
-// the Out-CSR (enumerate's forward=true), Task 3's original direction.
+// the Out-CSR (enumerate's forward=true), enumerate's own original
+// direction.
 func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
 	var out []Path

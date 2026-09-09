@@ -45,9 +45,10 @@
 // snapshot (engine/boot.go): dawgs.Open launches that goroutine and returns
 // immediately, without waiting for it to adopt. There is no exported hook to
 // observe that adoption completing from outside the driver, and log-scraping
-// a specific message string is deliberately not used here (see the
-// package's task brief): instead, builderbench times its own throwaway
-// engine.LoadSnapshot call against the same data (also how it reports the
+// a specific message string is deliberately not used here (a benchmark must
+// not depend on a log line's exact wording): instead, builderbench times its
+// own throwaway engine.LoadSnapshot call against the same data (also how it
+// reports the
 // snapshot's node/edge/byte counts cheaply) and sleeps a safety multiple of
 // that measured cost, printing the wait duration. Boot load is that exact
 // same call, made once, with no periodic cadence to also account for, so

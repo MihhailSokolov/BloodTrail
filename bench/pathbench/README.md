@@ -37,11 +37,11 @@ Every section prints a human-readable line and a machine-greppable
 ## `-enforce`
 
 With `-enforce`, `pathbench` exits nonzero if (a)'s p95 exceeds 100ms or
-(b)'s total time exceeds 5s -- the task-16 brief's two thresholds, meant for
-an operator run against a realistically sized graph. **CI must never pass
-`-enforce`.** Any other failure (a database error, an empty graph, an engine
-decline that should not happen for a single-ID pair query) aborts the run
-with a nonzero exit regardless of `-enforce`.
+(b)'s total time exceeds 5s -- the two thresholds this benchmark enforces,
+meant for an operator run against a realistically sized graph. **CI must
+never pass `-enforce`.** Any other failure (a database error, an empty
+graph, an engine decline that should not happen for a single-ID pair query)
+aborts the run with a nonzero exit regardless of `-enforce`.
 
 ## Flags
 

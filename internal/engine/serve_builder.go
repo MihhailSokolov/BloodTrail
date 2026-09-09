@@ -74,7 +74,7 @@ const (
 )
 
 // declineOp is decline's builder-serving counterpart: TryNodeCount,
-// TryNodeFetchIDs, and TryNodeFetchKinds (this file), and Task 7's
+// TryNodeFetchIDs, and TryNodeFetchKinds (this file), and the
 // rel-query siblings, each log one Debug "bloodtrail: builder engine
 // declined" event carrying which operation declined (op) alongside the
 // reason and, when available, the underlying error. This is a separate
@@ -171,7 +171,7 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 //
 // op names the specific entry point, threaded through to serveGate/
 // declineOp so every decline's "op" attr says which of TryNodeCount/
-// TryNodeFetchIDs/TryNodeFetchKinds (or a Task 7 rel-query sibling) made the
+// TryNodeFetchIDs/TryNodeFetchKinds (or a rel-query sibling) made the
 // call.
 func (e *Engine) resolveNodeSpec(ctx context.Context, op string, spec recognize.NodeSpec) (*snapshot.Bitset, *snapshot.View, bool) {
 	snap, ok := e.serveGate(ctx, op)
@@ -242,8 +242,8 @@ func matchConstraint(ctx context.Context, mapKind func(context.Context, graph.Ki
 // to its own bitmap via matchConstraint and intersects them together --
 // Cypher's AND semantics for multiple conjuncts naming the same variable
 // (resolveNodeSpec's step 5 doc, generalized). It is the shared
-// constraint-resolution step behind resolveNodeSpec (Task 6, one endpoint:
-// the bare node variable "n") and resolveRelSpec (Task 7, two independent
+// constraint-resolution step behind resolveNodeSpec (one endpoint:
+// the bare node variable "n") and resolveRelSpec (two independent
 // endpoints: "s" and "e", each calling this once with its own Start/
 // EndConstraints).
 //
@@ -824,7 +824,7 @@ func (it *relScanIter) next() (relEdge, bool) {
 // not itself filter liveness) or via the full-scan default (every dense id
 // in [0, NodeCount()), tombstoned ones included) -- naturally produces an
 // empty ovEdges and falls through to the same "continue to the next near
-// node" branch a zero-degree node already took before this task.
+// node" branch a zero-degree node already takes.
 func (it *relScanIter) advanceNear() bool {
 	for {
 		var node snapshot.NodeID

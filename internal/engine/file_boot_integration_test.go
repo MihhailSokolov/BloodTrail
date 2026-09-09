@@ -128,7 +128,7 @@ func newLogCapturingEngine(pgDriver *pg.Driver, pool *pgxpool.Pool, dir string) 
 	return New(pgDriver, pool, Config{Enabled: true, SnapshotDir: dir, Log: logger}), buf
 }
 
-// TestFileBootLoadsMatchingWatermarkSnapshot is the brief's Step 1 core
+// TestFileBootLoadsMatchingWatermarkSnapshot is the core
 // case: engine B, booting fresh over the same pool and SnapshotDir engine A
 // just saved into, must adopt the file directly -- no PostgreSQL rebuild at
 // all (RebuildCount() == 0) -- and serve the node engine A wrote through
@@ -247,7 +247,7 @@ func TestFileBootWaitsForTheDefaultGraphToResolve(t *testing.T) {
 	}
 }
 
-// TestFileBootRejectsStaleWatermarkAndRebuilds is the brief's Step 1
+// TestFileBootRejectsStaleWatermarkAndRebuilds is the
 // out-of-band-write case: after engine A saves its file, the pg watermark
 // counter is bumped directly (simulating a write that landed -- and
 // advanced the counter -- without ever being folded into a new save,
@@ -297,7 +297,7 @@ func TestFileBootRejectsStaleWatermarkAndRebuilds(t *testing.T) {
 	}
 }
 
-// TestFileBootRejectsCorruptFileAndRebuilds is the brief's "corrupt the
+// TestFileBootRejectsCorruptFileAndRebuilds is the "corrupt the
 // file" case: a byte flipped inside an otherwise-valid, matching-watermark
 // file must still be refused (ReadSnapshotFile's own CRC32 check, or
 // possibly a field it drives an allocation from, catching it before this
@@ -365,7 +365,7 @@ func corruptFile(t *testing.T, path string) {
 	}
 }
 
-// TestFileBootDisabledWhenSnapshotDirEmpty is the brief's "SnapshotDir
+// TestFileBootDisabledWhenSnapshotDirEmpty is the "SnapshotDir
 // empty -> no file ever written/read" case: with the feature left off
 // (the zero value of Config.SnapshotDir), a normal boot must fall straight
 // to the pg rebuild loop, SaveSnapshot must be a silent no-op, and NONE of
@@ -418,8 +418,8 @@ func TestFileBootDisabledWhenSnapshotDirEmpty(t *testing.T) {
 // ReadSnapshotFile call actually runs and gets a real fs.ErrNotExist, which
 // its own doc says logs the quiet Debug "bloodtrail: no snapshot file"
 // marker rather than the noisier Info "snapshot file rejected" one a
-// present-but-untrustworthy file would earn. Nothing before this task
-// exercised that specific branch: TestFileBootDisabledWhenSnapshotDirEmpty
+// present-but-untrustworthy file would earn. No other test exercises that
+// specific branch: TestFileBootDisabledWhenSnapshotDirEmpty
 // never reaches ReadSnapshotFile at all (snapshotFilePath's own empty-string
 // check returns false first), and every other file_boot test in this file
 // seeds a real file before booting from it.

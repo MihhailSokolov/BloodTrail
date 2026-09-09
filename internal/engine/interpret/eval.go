@@ -31,7 +31,7 @@ import (
 )
 
 // ErrUnsupported is returned for an AST shape this evaluator does not
-// recognize -- a construct the future planner/gate (Task 6+) is expected to
+// recognize -- a construct the planner/gate is expected to
 // have already rejected before a query ever reaches interpretation. It is
 // exported so callers can distinguish "genuinely can't do this locally"
 // (this, or ErrCollation) from an outright bug, but reaching it in
@@ -99,9 +99,9 @@ func (e EdgeRef) Kind(snap *snapshot.View) snapshot.KindID {
 }
 
 // Row binds one MATCH solution's pattern variables to concrete snapshot
-// values: dense node ids, edge references, path values (a seam for a future
-// task -- nothing in this milestone materializes paths yet, so PathVar's
-// value type is deliberately just `any`), and plain scalars (e.g. bound by a
+// values: dense node ids, edge references, path values (a seam left open
+// deliberately -- nothing materialized paths when this was written, so
+// PathVar's value type is just `any`), and plain scalars (e.g. bound by a
 // future UNWIND/WITH implementation, or by a caller pre-seeding a computed
 // value). All four namespaces are separate maps rather than one
 // `map[string]any`, matching how a Cypher planner would keep them: which
@@ -168,10 +168,10 @@ func (r *Row) Edge(sym string) (EdgeRef, bool) {
 	return ref, ok
 }
 
-// SetPathVar binds sym to a path value. No task before this one produces a
-// path value, so v's shape is not yet defined by anything other than the
-// caller; this exists purely so Row's namespace shape matches the brief's
-// contract ahead of the task that will populate it.
+// SetPathVar binds sym to a path value. Nothing produced a path value when
+// this was written, so v's shape is not defined by anything other than the
+// caller; this exists purely so Row's namespace shape already carries the
+// path slot, ahead of the code that populates it.
 func (r *Row) SetPathVar(sym string, v any) {
 	if r.paths == nil {
 		r.paths = make(map[string]any)
@@ -271,8 +271,8 @@ func (e *Env) compiledRegex(pattern string) (*regexp.Regexp, error) {
 // --- EvalPredicate: boolean (WHERE-clause) context --------------------------
 
 // EvalPredicate evaluates expr against row under env, returning Cypher's
-// three-valued boolean result. Every AST shape the brief documents this
-// package as consuming is handled explicitly; anything else returns
+// three-valued boolean result. Every AST shape this
+// package documents itself as consuming is handled explicitly; anything else returns
 // ErrUnsupported rather than panicking (see that sentinel's doc comment).
 func EvalPredicate(env *Env, row *Row, expr cypher.Expression) (Tri, error) {
 	switch typed := expr.(type) {
@@ -477,8 +477,8 @@ func evalComparison(env *Env, row *Row, cmp *cypher.Comparison) (Tri, error) {
 	return result, nil
 }
 
-// evalPartialComparison dispatches one `left op right` step to the Task 4
-// primitive its operator calls for, per the brief's pinned routing table.
+// evalPartialComparison dispatches one `left op right` step to the value.go
+// primitive its operator calls for, per this package's pinned routing table.
 func evalPartialComparison(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operator, rightExpr cypher.Expression) (Tri, error) {
 	switch op {
 	case cypher.OperatorEquals, cypher.OperatorNotEquals:
@@ -518,7 +518,7 @@ func evalPartialComparison(env *Env, row *Row, leftExpr cypher.Expression, op cy
 // asLiteral reports whether expr (after unwrapping any Parentheticals) is a
 // *cypher.Literal, per DAWGS' pgsql translator: whether a comparison's
 // operand is syntactically a literal (vs. a property lookup or any other
-// expression) is exactly what decides which Task 4 equality primitive
+// expression) is exactly what decides which equality primitive
 // applies (StringEq/StringNeq for a string-literal counterpart, ScalarEq for
 // any other literal, PropEq when neither side is a literal) -- not the
 // runtime type of what it evaluates to.
@@ -527,7 +527,7 @@ func asLiteral(expr cypher.Expression) (*cypher.Literal, bool) {
 	return lit, ok
 }
 
-// evalEquality implements `=`/`<>` per the brief's routing table:
+// evalEquality implements `=`/`<>` per that same routing table:
 // literal-vs-anything routes through evalLiteralComparison (which further
 // splits on the literal's own type), a bare `<node var> op <node var>` (or
 // the analogous edge-variable shape) routes through evalIdentityEquality
@@ -781,22 +781,22 @@ func evalRegexComparison(env *Env, row *Row, leftExpr, rightExpr cypher.Expressi
 // Design note (regex compilation seam): value.go's StringPredicate takes a
 // needle string, not a compiled pattern, and recompiles via
 // regexp.Compile on every call for OpRegex -- its own doc comment already
-// flags this as "a performance concern for a future milestone's plan-
-// execution loop" and explicitly declines to fix it there, since
-// StringPredicate is Task 4's frozen, already-reviewed API and changing its
-// signature would ripple into value_test.go for no change in observable
-// behavior. But this task's Env is exactly the object a real query's row
-// loop constructs once and then threads through every row's
-// EvalPredicate/EvalValue call, which makes it the natural place to cache
+// flags this as "a performance concern for a future plan-execution loop"
+// and explicitly declines to fix it there, since StringPredicate is a
+// frozen, already-reviewed API and changing its signature would ripple into
+// value_test.go for no change in observable behavior. But Env is exactly
+// the object a real query's row loop constructs once and then threads
+// through every row's EvalPredicate/EvalValue call, which makes it the
+// natural place to cache
 // a compiled pattern across that whole loop without needing a separate
 // plan/prepare pass: the first row for a given regex literal compiles and
 // caches it (keyed by source pattern text, via Env.compiledRegex), and every
 // subsequent row -- for that predicate, or any other predicate in the same
 // query reusing the same pattern text -- reuses the cached *regexp.Regexp.
-// A future planner (Task 6+) can still replace this with a prepare-once
+// A future planner can still replace this with a prepare-once
 // artifact attached to the plan node instead of a live cache keyed by
-// pattern text; until then, this is the seam that avoids the "compile once
-// per row" cost the brief calls out as unacceptable.
+// pattern text; until then, this is the seam that avoids the unacceptable
+// "compile once per row" cost.
 //
 // The null/absent/non-string/negation policy itself is NOT duplicated here:
 // it lives in exactly one place, value.go's stringPredicateCore, shared by
@@ -932,9 +932,9 @@ func containsKindID(have []snapshot.KindID, k snapshot.KindID) bool {
 // matching this file's own established convention (e.g. evalKindMatcher)
 // of never trusting an unconditional type assertion in evaluator code.
 //
-// The result is always TriTrue or TriFalse, never TriNull: per the
-// milestone brief's own pin, a pattern predicate's existence check has
-// nothing to be NULL about (no property lookup is ever involved -- only
+// The result is always TriTrue or TriFalse, never TriNull: a pattern
+// predicate's existence check has nothing to be NULL about (no property
+// lookup is ever involved -- only
 // row-bound node identity and a snapshot-resolved kind mask), matching
 // pg's own translation, which lowers this to `EXISTS(SELECT 1 FROM edge
 // WHERE ...)` -- a SQL boolean, never SQL NULL.
@@ -1180,9 +1180,9 @@ func decodeCypherStringLiteral(raw string) (string, error) {
 // via a PropertyLookup): a scalar binding (e.g. from a future UNWIND) wins
 // first if present, then a node variable materializes to its full property
 // map (the shape a Cypher RETURN n would need). Edge and path variables have
-// no defined "materialize as a value" shape yet in this milestone (no
-// edge-property store exists, and no path type has been built by any task
-// before this one), so both are ErrUnsupported for now.
+// no defined "materialize as a value" shape here (no edge-property store
+// exists in the snapshot, and no path type existed when this was written),
+// so both are ErrUnsupported for now.
 func evalVariableValue(env *Env, row *Row, v *cypher.Variable) (any, bool, error) {
 	if val, ok := row.Scalar(v.Symbol); ok {
 		return val, true, nil
@@ -1197,8 +1197,8 @@ func evalVariableValue(env *Env, row *Row, v *cypher.Variable) (any, bool, error
 // datetime().epochseconds/.epochmillis (see below), and a plain node
 // variable's property, read from Snap.Props. An edge variable's property
 // lookup is ErrUnsupported: the snapshot's PropStore only models node
-// property bags (see props.go), and nothing in this milestone's brief calls
-// for relationship properties, so there is nowhere to read r.prop from yet.
+// property bags (see props.go), and nothing in this package's supported
+// query set calls for relationship properties, so there is nowhere to read r.prop from yet.
 func evalPropertyLookup(env *Env, row *Row, pl *cypher.PropertyLookup) (any, bool, error) {
 	atom := unwrapParens(pl.Atom)
 
@@ -1232,21 +1232,21 @@ func evalPropertyLookup(env *Env, row *Row, pl *cypher.PropertyLookup) (any, boo
 }
 
 // evalDateTimeComponent implements datetime().epochseconds/.epochmillis:
-// the only two ITTC (instant-type/temporal-component) accessors the brief
-// documents as supported, since the gate is expected to reject any other
+// the only two ITTC (instant-type/temporal-component) accessors this
+// package supports, since the gate is expected to reject any other
 // datetime() component at plan time (before it ever reaches this
 // evaluator). Both derive from Env.Now, fixed once per query.
 //
-// Numeric representation note: the brief describes this as returning
-// "int64", and evalIDFunction's doc comment carries the same note -- see it
-// for the full rationale. In short: this package's value model (value.go's
+// Numeric representation note: the natural reading of these accessors is
+// that they return "int64", and evalIDFunction's doc comment carries the
+// same note -- see it for the full rationale. In short: this package's value model (value.go's
 // own doc comment) is "every JSON number is float64", which is what lets a
 // single set of primitives (ScalarEq/PropEq/OrderCompare/In, all frozen
-// Task 4 code that only type-switches on float64) work uniformly over every
+// value.go code that only type-switches on float64) work uniformly over every
 // numeric value regardless of where it came from. Handing back a literal Go
 // int64 here would silently opt these two accessors out of that model --
 // e.g. `n.lastlogontimestamp < (datetime().epochseconds - (60 * 86400))`,
-// one of this task's own named test scenarios, requires the epochseconds
+// one of this package's own named test scenarios, requires the epochseconds
 // value to flow through evalArithmetic and then OrderCompare, both of which
 // only recognize float64. So this returns float64, trading away exact int64
 // precision above 2^53 (~9e15) for internal consistency; Unix epoch
@@ -1289,7 +1289,7 @@ func evalListLiteral(env *Env, row *Row, list *cypher.ListLiteral) (any, bool, e
 // translator lower-cases before matching against the same
 // cypher.XxxFunction name constants used below -- see
 // dawgs@v0.8.0/cypher/models/cypher/functions.go). Any function not in the
-// brief's supported list is ErrUnsupported: the future gate is expected to
+// package's supported list is ErrUnsupported: the future gate is expected to
 // have already rejected it (or, for size(string) specifically, to delegate
 // the whole query to pg instead -- see evalSizeFunction).
 func evalFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool, error) {
@@ -1333,8 +1333,8 @@ func singleVariableArg(fi *cypher.FunctionInvocation) (*cypher.Variable, bool) {
 // id (Snap.GraphIDs[dense id]); an edge variable's id is its database edge
 // id (Snap.OutEdgeIDs[forward slot]).
 //
-// Numeric representation note (deviation from a literal reading of the
-// brief): the brief describes id() as returning "int64". This evaluator
+// Numeric representation note (a deliberate deviation): id() is naturally
+// read as returning "int64". This evaluator
 // instead returns float64, deliberately keeping id() inside this package's
 // one uniform numeric representation -- value.go's doc comment states the
 // value model is "exactly one of nil, string, float64, bool, []any, or
@@ -1343,8 +1343,9 @@ func singleVariableArg(fi *cypher.FunctionInvocation) (*cypher.Variable, bool) {
 // for numbers, with no int64 case. Returning a real int64 here would make
 // `WHERE id(n) = 5` silently fail (jsonbEqual's default case returns false
 // for an unrecognized dynamic type, since int64 isn't float64) and would
-// make id(n) unusable in arithmetic -- caught concretely by this task's own
-// `datetime().epochseconds - ...` test scenario needing the same treatment.
+// make id(n) unusable in arithmetic -- caught concretely by this package's
+// own `datetime().epochseconds - ...` test scenario needing the same
+// treatment.
 // So id() and datetime()'s epoch accessors both normalize to float64,
 // trading exact precision above 2^53 (~9e15) for correctness everywhere
 // else in the package; no realistic BloodHound database id gets close to
@@ -1474,8 +1475,8 @@ func evalCoalesce(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool,
 // other primitive inside WHERE/comparison/arithmetic evaluation, which
 // requires float64 here.
 //
-// Per the brief, size() of a string is a different pg rendering (character
-// length, not array length) that this evaluator does not attempt to
+// size() of a string is a different pg rendering (character length, not
+// array length) that this evaluator does not attempt to
 // reproduce -- the future gate is expected to route
 // size(<string-typed operand>) to delegation at plan time rather than ever
 // construct a call this function would see, so a non-list, non-absent

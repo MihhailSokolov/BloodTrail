@@ -76,7 +76,7 @@ func wantTrusted(t *testing.T, ctx context.Context, eng *Engine, want bool, why 
 	}
 }
 
-// TestWatermarkTwoWritesConverge is the brief's Step 1(a): two writes bump
+// TestWatermarkTwoWritesConverge is the sequential case: two writes bump
 // the pg counter to N and N+1 in turn; after both have been applied,
 // appliedWatermark must equal the pg counter exactly, and watermarkConverged
 // must report true.
@@ -130,8 +130,8 @@ func TestWatermarkTwoWritesConverge(t *testing.T) {
 	}
 }
 
-// TestWatermarkRolledBackWriteTransactionStillConverges is the brief's Step
-// 1(b): a WriteTransaction whose delegate writes a node and then returns an
+// TestWatermarkRolledBackWriteTransactionStillConverges is the rollback
+// case: a WriteTransaction whose delegate writes a node and then returns an
 // error rolls back (pg data unchanged), but its eager bump still landed --
 // so the pg counter still advances, and the engine still reaches
 // convergence once that bump is resolved via AdvanceWatermark (the "empty
@@ -213,7 +213,7 @@ func nodeCount(ctx context.Context, d interface {
 	return count, err
 }
 
-// TestWatermarkConcurrentBumpsConverge is the brief's Step 1(c): 10
+// TestWatermarkConcurrentBumpsConverge is the concurrent case: 10
 // goroutines each performing 10 bump+apply cycles concurrently must still
 // converge once every goroutine finishes -- the monotonic max-advance
 // (AdvanceWatermark) and the inflight counter together are what make

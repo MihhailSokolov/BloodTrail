@@ -92,10 +92,10 @@ func waitCompactionSettled(e *Engine) error {
 	return nil
 }
 
-// ---- Step 1's four required cases ---------------------------------------
+// ---- The four core compaction cases -------------------------------------
 
-// TestCompactionTriggersExactlyOnceAndMatchesUncompactedStack is the
-// brief's core case: with cfg.CompactEntries forced tiny, a run of Applies
+// TestCompactionTriggersExactlyOnceAndMatchesUncompactedStack is the core
+// case: with cfg.CompactEntries forced tiny, a run of Applies
 // that crosses the threshold exactly once must trigger exactly one
 // background compaction (CompactionCount), and the resulting View's
 // content must be indistinguishable, by every accessor
@@ -141,10 +141,10 @@ func TestCompactionTriggersExactlyOnceAndMatchesUncompactedStack(t *testing.T) {
 	}
 }
 
-// TestAdoptCompactionRebasesSegmentsAddedDuringFold is the brief's
+// TestAdoptCompactionRebasesSegmentsAddedDuringFold is the
 // mid-fold-injection case, driven synchronously (Fold called directly
-// rather than through the async runCompaction goroutine, exactly as the
-// brief's own Step 1 describes): a segment published AFTER the fold's
+// rather than through the async runCompaction goroutine, so the injection
+// point is deterministic): a segment published AFTER the fold's
 // inputs were captured but BEFORE adoption runs must survive as the
 // adopted View's own rebased tail, and the result must match a
 // never-compacted reference stacking the same two segments.
@@ -201,7 +201,7 @@ func TestAdoptCompactionRebasesSegmentsAddedDuringFold(t *testing.T) {
 	}
 }
 
-// TestAdoptCompactionDiscardsWhenBaseSwapped is the brief's
+// TestAdoptCompactionDiscardsWhenBaseSwapped is the
 // base-swap-mid-compaction case: a concurrent rebuild (adoptRebuiltView,
 // engine.go) publishing a whole new base while a fold was in flight must
 // make that fold's own adoption attempt refuse outright, leaving the
@@ -242,9 +242,9 @@ func TestAdoptCompactionDiscardsWhenBaseSwapped(t *testing.T) {
 	}
 }
 
-// TestCompactionSurvivesLowIDTailAcrossTwoCompactions is the F2 finding's
-// own end-to-end reproduction at the compaction level (task-16 review): the
-// "ordinary concurrency" scenario the finding names, played out across TWO
+// TestCompactionSurvivesLowIDTailAcrossTwoCompactions is the end-to-end
+// reproduction, at the compaction level, of the low-id-tail bug: the
+// ordinary-concurrency scenario that triggers it, played out across TWO
 // real compactions rather than Fold alone (TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips,
 // snapshot/fold_test.go, covers the same shape one layer down).
 //
@@ -257,13 +257,13 @@ func TestAdoptCompactionDiscardsWhenBaseSwapped(t *testing.T) {
 // never sees id 500 at all; adoption rebases segA (id 500) as the new base's
 // own tail. The SECOND compaction then must fold that new base (whose max id
 // is now 501) together with segA -- a delta-added id (500) BELOW the base's
-// own max, id-for-id the shape the F2 finding says can poison every fold
+// own max, id-for-id the shape that can poison every fold
 // from here on: a pre-fix Fold rejects 500 as a bigserial-monotonicity
 // violation, adoption never gets a folded snapshot to publish, the tail is
 // never cleared, and the identical failure repeats on every later attempt
 // (compaction AND SaveSnapshot) forever. This test's critical assertion is
-// that the second Fold succeeds -- see the task-16 report for this test's
-// own RED evidence against the pre-fix code.
+// that the second Fold succeeds; run against the pre-fix Fold it fails
+// there, on exactly that rejection.
 func TestCompactionSurvivesLowIDTailAcrossTwoCompactions(t *testing.T) {
 	ctx := context.Background()
 	baseView := buildApplyView(t) // ids 1-3

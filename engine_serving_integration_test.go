@@ -159,7 +159,7 @@ func waitForEngineServe(t *testing.T, buf *lockedBuffer, baseline int, deadline 
 }
 
 // waitForBuilderServe is waitForEngineServe's counterpart for the
-// builder-serving path (Task 8's Nodes() wiring): it repeatedly calls query
+// builder-serving path (the Nodes() wiring): it repeatedly calls query
 // until buf's captured log shows more builderServedMarker lines than
 // baseline, up to deadline, returning the result from the exact call that
 // observed a new marker. Generic over query's return type so it serves both
@@ -826,9 +826,10 @@ func TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly(t *testing.T)
 	}
 }
 
-// TestNodeQueryServesFromLiveDriver is Task 8's core evidence: opened
-// through dawgs.Open exactly like TestEngineServesFromLiveDriver, a
-// structural Nodes() query -- the shape BloodHound's builder queries use for
+// TestNodeQueryServesFromLiveDriver is the core evidence for the structural
+// node-query serving path: opened through dawgs.Open exactly like
+// TestEngineServesFromLiveDriver, a structural Nodes() query -- the shape
+// BloodHound's builder queries use for
 // e.g. FetchNodeIDsByKind, Filter(query.Kind(query.Node(), kind)) -- must be
 // served from the in-memory engine (recordingNodeQuery, node_query.go) once
 // a snapshot exists, agree with the pg-driver oracle on both Count() and the
@@ -919,11 +920,11 @@ func TestNodeQueryServesFromLiveDriver(t *testing.T) {
 	}
 }
 
-// TestContainerFetchDirectedGraphServesFromLiveDriver is Task 9's evidence
+// TestContainerFetchDirectedGraphServesFromLiveDriver is the evidence
 // for the Count/FetchIDs/FetchTriples/FetchKinds/Query interceptions added
 // to recordingRelationshipQuery (relationship_query.go): dawgs' own
 // container.FetchDirectedGraph -- a real upstream consumer, imported here
-// rather than reimplemented, per this task's own point (see relationship_
+// rather than reimplemented, which is the whole point (see relationship_
 // query.go's Query doc) -- issues exactly
 // tx.Relationships().Filter(criteria).Query(delegate,
 // query.Returning(query.StartID(), query.EndID())), the single-criteria,
@@ -993,13 +994,13 @@ func TestContainerFetchDirectedGraphServesFromLiveDriver(t *testing.T) {
 	}
 }
 
-// TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver is Task 9's
+// TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver is the
 // evidence for orderByEdgeID: dawgs' own
 // traversal.New(db, 1).BreadthFirst(ctx, traversal.Plan{Root: ..., Driver:
 // traversal.LightweightDriver(...)}) (see bfsCollectNodeIDs' doc for why the
-// worker count is 1, not dawgs' own traversal.New(db, 2) as sketched in the
-// task brief) -- again a real upstream consumer, not reimplemented --
-// drives shallowFetchRelationships (traversal/traversal.go), which OrderBys
+// worker count is 1, not dawgs' own traversal.New(db, 2)) -- again a real
+// upstream consumer, not reimplemented -- drives
+// shallowFetchRelationships (traversal/traversal.go), which OrderBys
 // every relationship query by ascending relationship id before calling
 // Query with a step RowProjection. This is
 // the one upstream shape that sets recordingRelationshipQuery.orderByEdgeID
@@ -1069,7 +1070,7 @@ func TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver(t *testing.T
 	}
 }
 
-// TestRelationshipStructuralFetchesServeFromLiveDriver is this task's
+// TestRelationshipStructuralFetchesServeFromLiveDriver is the
 // evidence for the !orderByEdgeID and !tainted guard components shared by
 // recordingRelationshipQuery's Count/FetchIDs/FetchTriples/FetchKinds
 // (relationship_query.go): unlike TestContainerFetchDirectedGraphServesFrom

@@ -13,7 +13,7 @@
 // cfg) on the same DSN and pool is the delegated baseline: plain PostgreSQL,
 // no engine at all.
 //
-// It measures five Cypher shapes from the milestone's spec:
+// It measures five Cypher shapes:
 //
 //  1. rid_suffix_scan: a RID-suffix property scan, MATCH (n:Group) WHERE
 //     n.objectid ENDS WITH '-512' RETURN n -- the same shape BloodHound's
@@ -336,8 +336,8 @@ LIMIT 1000`
 
 // shape5Text is BloodHound's own pre-built "Domain Admins logons to
 // non-Domain Controllers" query, copied verbatim from
-// testdata/prebuilt/agt.json -- the milestone's required "COLLECT
-// anti-join" shape: a WITH COLLECT(...) result feeding a second MATCH's NOT
+// testdata/prebuilt/agt.json -- the "COLLECT anti-join" shape: a WITH
+// COLLECT(...) result feeding a second MATCH's NOT
 // ... IN exclusion. Both its edge kinds (MemberOf, HasSession) are already
 // in edgeKindNames, so unlike shape4Text it needs no extra kind assertion.
 const shape5Text = `MATCH (s)-[:MemberOf*0..]->(g:Group)

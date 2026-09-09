@@ -390,11 +390,10 @@ func stringPredicateCore(match func(s string) bool, val any, ok bool, negated bo
 }
 
 // matchString runs the case-sensitive positive test for op. For OpRegex the
-// pattern is compiled on every call: the brief's note that "regex is
-// compiled by the caller (plan-time)" is a performance concern for a future
-// milestone's plan-execution loop (compile once, evaluate per row), not a
-// change to this function's observable result -- MatchString's answer does
-// not depend on when the pattern was compiled. A pattern that fails to
+// pattern is compiled on every call: hoisting that compile to plan time
+// (compile once, evaluate per row) is a performance concern for a future
+// plan-execution loop, not a change to this function's observable result --
+// MatchString's answer does not depend on when the pattern was compiled. A pattern that fails to
 // compile is treated as no-match; Cypher regex literals are expected to be
 // validated before a query reaches interpretation.
 func matchString(op StringOp, s, needle string) bool {
@@ -435,7 +434,7 @@ func IsNotNull(val any, ok bool) Tri {
 // In evaluates Cypher's `val IN list`.
 //
 // Note on signature: the exact return type is (Tri, error) rather than a
-// bare Tri, even though the brief's header line elides the error. The
+// bare Tri, which a purely three-valued predicate would suggest. The
 // numeric-list branch below must be able to signal ErrRuntimeCast (a
 // non-numeric property text failing pg's `::int8`/`::float8` cast), and
 // that can only reach the caller through a second return value -- the Tri

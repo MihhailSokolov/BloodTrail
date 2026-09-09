@@ -16,13 +16,13 @@ import (
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
-// TestCypherBudgetConstants pins the exact values the milestone plan's
-// "Global Constants" section mandates for maxCypherRows/maxCypherWork/
-// edgePropsBatchSize -- serve_cypher.go's own doc comments explain what each
-// bounds; this test exists purely to catch an accidental change to one of
-// the pinned numbers (and, incidentally, gives edgePropsBatchSize -- not yet
-// consumed by any pipeline code, since that is Task 11/13's job -- a
-// reference, so it is not flagged as dead code before those tasks land).
+// TestCypherBudgetConstants pins the exact values of maxCypherRows/
+// maxCypherWork/edgePropsBatchSize -- serve_cypher.go's own doc comments
+// explain what each bounds; this test exists purely to catch an accidental
+// change to one of the pinned numbers (and, incidentally, gives
+// edgePropsBatchSize -- not yet consumed by any pipeline code, since that is
+// the hydration wiring's job -- a reference, so it is not flagged as dead
+// code before that wiring lands).
 func TestCypherBudgetConstants(t *testing.T) {
 	if maxCypherRows != 100_000 {
 		t.Fatalf("maxCypherRows = %d, want 100_000", maxCypherRows)

@@ -85,8 +85,8 @@ func (m snapshotKindMapper) MapKinds(_ context.Context, kinds graph.Kinds) ([]in
 // read queries and rejects CREATE/MERGE/DELETE/SET outright before a query
 // reaches translateGateOK at all. This method exists solely so
 // snapshotKindMapper satisfies pgsql.KindMapper; reaching it at all would
-// mean a write clause reached the gate, a bug elsewhere this milestone's
-// read-only serving path is not supposed to allow -- so it fails loudly
+// mean a write clause reached the gate, a bug elsewhere the read-only
+// serving path is not supposed to allow -- so it fails loudly
 // rather than fabricating an assertion result.
 func (m snapshotKindMapper) AssertKinds(context.Context, graph.Kinds) ([]int16, error) {
 	return nil, errors.New("bloodtrail: kind assertion during read serving")

@@ -22,7 +22,7 @@
 // jobs are (1) decide whether the query's *shape* is inside the matrix at
 // all, consulting only Snapshot.Kinds (to resolve label/type names to
 // snapshot.KindID) and (2) compile the query into a plain-data Query value a
-// later executor (Task 7 onward) can run directly against the snapshot,
+// later executor can run directly against the snapshot,
 // without ever re-inspecting the AST for feasibility.
 
 package interpret
@@ -44,11 +44,10 @@ import (
 // explicit upper bound in the query text (`*1..5`) always overrides this,
 // even if it is larger than 15 -- see buildStep.
 //
-// This constant's permanent home is the engine package (alongside
-// maxCypherRows/maxCypherWork/edgePropsBatchSize, per the milestone plan's
-// Global Constants section) once that file exists; it is defined here,
-// exported, so this package is self-contained until that task lands and can
-// re-point callers at the engine's copy without changing its value.
+// This constant's natural home is the engine package, alongside
+// maxCypherRows/maxCypherWork/edgePropsBatchSize (engine/serve_cypher.go);
+// it is defined here, exported, so this package stays self-contained, and a
+// caller can be re-pointed at the engine's copy without changing its value.
 const MaxExpansionDepth = 15
 
 // --- Query IR ---------------------------------------------------------------
@@ -218,7 +217,7 @@ type WithConstant struct {
 }
 
 // WithClause is the plan for one `WITH` boundary between two Parts (the
-// brief's "supported pipeline" is exactly one such boundary -- Plan rejects
+// supported pipeline is exactly one such boundary -- Plan rejects
 // any query with more than one, see planStages). Every WITH projection item
 // must be one of exactly four shapes (controller amendment, narrower than
 // general Cypher WITH):
@@ -236,7 +235,7 @@ type WithConstant struct {
 // an aliased plain variable (`WITH u AS x`), or a projection item that is
 // none of the above all reject the whole query (see planWith).
 //
-// Execution semantics a future executor (Task 9) must reproduce, since they
+// Execution semantics any executor must reproduce, since they
 // are not obvious from the field shapes alone: grouping by GroupKeys happens
 // automatically whenever len(Aggregates) > 0 (an aggregate function always
 // implies "group by every other projected item", independent of the
@@ -1199,8 +1198,8 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 // finalizeShortestPaths runs after every pattern and WHERE conjunct in the
 // Part has been processed: for every shortestPath/allShortestPaths Step it
 // sets HasExplicitEndpointInequality and enforces the endpoint-constraint
-// rule (see its own doc below), plus the Task 8b mixing restriction (see
-// shortestStepsAreIsolated).
+// rule (see its own doc below), plus the shortest-step mixing restriction
+// (see shortestStepsAreIsolated).
 func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression) bool {
 	if !pb.shortestStepsAreIsolated() {
 		return false
@@ -1228,7 +1227,7 @@ func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression)
 // still legally write it alongside an ordinary chain that happens to reuse
 // one of its own endpoint symbols (e.g. `MATCH (a)-->(b),
 // shortestPath((b)-[*1..]->(c))`), pulling both into the SAME connected
-// component the executor would compute. Task 8b's chain executor
+// component the executor would compute. The chain executor
 // (expandChainComponent) and the standalone shortestPath executor
 // (expandShortestPathComponent) are mutually exclusive: a shortestPath Step
 // resolves both endpoints as complete, pre-adjacency node sets before ever
@@ -1282,12 +1281,11 @@ func (pb *partBuilder) shortestStepsAreIsolated() bool {
 // an id() anchor, an objectid anchor, or at least one pushed single-symbol
 // WHERE predicate.
 //
-// Task 6's original implementation of finalizeShortestPaths' "at least one
+// The original implementation of finalizeShortestPaths' "at least one
 // endpoint constrained" rule (see that function's doc) checked only
-// Kinds/IDs/ObjectIDAnchor, deliberately mirroring the milestone brief's
-// literal "kind- or id-constrained" wording. Predicates was added here
-// after this task's own gap-closing investigation found a real, required
-// corpus query this excluded for no correctness reason: agi.json's
+// Kinds/IDs/ObjectIDAnchor, a literal reading of "kind- or
+// id-constrained". Predicates was added here after that reading was found
+// to exclude a real, required corpus query for no correctness reason: agi.json's
 // "Shortest paths to Tier Zero / High Value targets" is
 // `shortestPath((s)-[:...*1..]->(t)) WHERE COALESCE(t.system_tags, ”)
 // CONTAINS 'admin_tier_0' AND s<>t` -- t carries no kind label at all (the
@@ -2142,7 +2140,7 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 //
 // Also rejected, all deliberately conservative narrowings this package's
 // required corpus never needs (REJECTED delegates to PostgreSQL, which is
-// always safe, per the milestone's own established convention):
+// always safe -- this package's established convention):
 //   - Range != nil (`(n)-[:K*1..]->(m)` inside a pattern predicate): this
 //     one IS a genuine pg limitation -- buildPatternPredicates' per-step
 //     loop explicitly rejects it outright ("expansion in pattern predicate
@@ -2334,8 +2332,7 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 		// or a string, would need character-length semantics this
 		// evaluator does not reproduce -- see eval.go's evalSizeFunction
 		// doc); requiring a literal PropertyLookup argument here is what
-		// the brief calls "size() on anything but a property lookup"
-		// rejects.
+		// rejects size() on anything but a property lookup.
 		if len(fi.Arguments) != 1 {
 			return false
 		}

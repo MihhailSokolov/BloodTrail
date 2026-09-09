@@ -128,8 +128,7 @@ import (
 // endpoints (Step.HasExplicitEndpointInequality false). PostgreSQL's own
 // shortestPath implementation raises SQLSTATE 22023 for exactly this shape
 // (a root that is also a terminal aborts its recursive seed query -- see
-// traverse.SelfEndpointConflict's doc comment for the milestone-2 in-depth
-// citation); this package cannot raise that error itself (there is no live
+// traverse.SelfEndpointConflict's doc comment for the in-depth citation); this package cannot raise that error itself (there is no live
 // pg statement here to fail), so it returns this sentinel instead, which the
 // engine is expected to treat as "decline, delegate to PostgreSQL" so the
 // caller still observes the real SQLSTATE 22023 pg itself raises.
@@ -148,8 +147,8 @@ var ErrSelfEndpoint = errors.New("interpret: self endpoint")
 // exact iterative-stack-instead-of-recursion shape in this codebase); trails
 // are capped at Range.Max (documented as small -- MaxExpansionDepth is 15
 // unless a query explicitly asks for deeper), so the repeated copying this
-// implies is the "small slices, linear containment" tradeoff the brief
-// itself calls out, not a hidden hot loop.
+// implies is a deliberate "small slices, linear containment" tradeoff,
+// not a hidden hot loop.
 type trailFrame struct {
 	nodes           []snapshot.NodeID
 	edges           []EdgeRef
@@ -186,7 +185,7 @@ func containsFwd(env *Env, edges []EdgeRef, c adjCandidate) bool {
 // expandVarLengthComponent expands a single-Step component whose Step is a
 // variable-length relationship pattern (`*min..max`, Step.Range != nil),
 // producing one row per emitted trail (see this file's package doc for the
-// exact pinned semantics). It is runComponent's Task 8 dispatch target for
+// exact pinned semantics). It is runComponent's dispatch target for
 // exactly that shape -- see runComponent's own doc comment for why this
 // package handles only a component consisting of one such Step in isolation.
 //
@@ -194,8 +193,8 @@ func containsFwd(env *Env, edges []EdgeRef, c adjCandidate) bool {
 // binds `r` to a *list* of relationships in real Cypher -- a value shape
 // nothing in this package's Row/EdgeRef model represents (EdgeRef is always
 // exactly one edge) -- so that shape is declined outright (errUnsupportedStep)
-// rather than silently binding something wrong; no shape in this task's
-// required corpus needs it. A pattern reusing the same symbol for both
+// rather than silently binding something wrong; no shape in the required
+// corpus needs it. A pattern reusing the same symbol for both
 // endpoints (`(n)-[*1..3]->(n)`) is declined for the same "decline rather
 // than guess" reason: it would need an identity constraint between the seed
 // and every candidate terminal that this function does not implement (the
@@ -298,7 +297,7 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // variable-length Step), producing one output row per emitted trail --
 // factored out of expandVarLengthComponent (the standalone single-var-step
 // dispatch above, which calls this once per scanAnchor-produced seed) so
-// exec.go's expandChainComponent (Task 8b's mixed fixed/var-length chain
+// exec.go's expandChainComponent (the mixed fixed/var-length chain
 // executor) can reuse the identical trail-DFS semantics to grow a row that
 // already carries earlier steps' own bindings, instead of a freshly scanned
 // seed -- see this file's package doc for the exact pinned semantics
@@ -307,7 +306,7 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 //
 // pathArcKey, when non-empty, additionally binds each output row's own
 // per-step trail as a *PathVal under that key -- expandVarLengthComponent
-// passes step.PathSym itself (preserving its exact pre-Task-8b behavior:
+// passes step.PathSym itself (preserving its standalone behavior:
 // this is the whole standalone pattern's own path), while
 // expandChainComponent passes a synthetic per-step key (pathStepArcKey,
 // exec.go) instead, since a var-length step's own PathSym (when the whole
@@ -1008,7 +1007,7 @@ func shortestPathLimit(rowCapPlusOne int64, meter *workMeter, part *Part, step *
 // exceeds PairBudget=4096, since the root side is effectively the whole
 // snapshot) nor strategy B (18 > SideBudget=16 on the terminal side, and
 // the root side is far larger than SideBudget too) accepts the shape --
-// not a Task 8 unit-mixing bug in shortestPathBudget's own rowCap
+// not a unit-mixing bug in shortestPathBudget's own rowCap
 // arithmetic (that was already fixed in an earlier review pass; see its
 // own doc). Wiring this component's traverse.Query exactly the way
 // servePathQuery (engine.go) does -- leaving PairBudget/SideBudget at their

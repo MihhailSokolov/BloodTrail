@@ -374,8 +374,8 @@ func TestExpandVarLengthNamedRelationshipVariableDeclined(t *testing.T) {
 }
 
 // TestExpandMixedComponentDeclined: a component that mixes a var-length Step
-// with an ordinary fixed-length Step sharing a symbol is outside this task's
-// required shapes (see runComponent's doc comment) and must decline rather
+// with an ordinary fixed-length Step sharing a symbol is outside this
+// package's supported shapes (see runComponent's doc comment) and must decline rather
 // than guess at a composed semantics.
 func TestExpandMixedComponentDeclined(t *testing.T) {
 	const kindRoot snapshot.KindID = 1
@@ -464,8 +464,8 @@ func shortestPathParityFixture(t *testing.T) (*snapshot.View, *snapshot.KindMask
 // allShortestPaths() through the full Plan/Execute pipeline over a corpus-
 // shaped pattern (kind-constrained endpoints, an edge-kind disjunction,
 // unbounded `*1..`, an explicit `s<>t`, mirroring
-// testdata/prebuilt_shortest_path.json's shape minus its LIMIT, which Task 9
-// -- not this one -- implements) and asserts the resulting paths equal a
+// testdata/prebuilt_shortest_path.json's shape minus its LIMIT, which
+// pipeline.go implements) and asserts the resulting paths equal a
 // hardcoded expected signature set, computed by hand from the fixture's own
 // known graph shape rather than derived at test time via convertPath (the
 // very function these rows are produced through) or a second

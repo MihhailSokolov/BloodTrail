@@ -251,12 +251,12 @@ func TestPrebuiltCorpusCounts(t *testing.T) {
 	})
 }
 
-// --- Task 16: the pre-built corpus differential suite ---
+// --- The pre-built corpus differential suite ---
 //
-// This is milestone 4's exit criterion: every active (non-disabled,
+// This is the corpus-wide differential: every active (non-disabled,
 // non-probe) query across agt.json, agi.json, and selectors.json -- 222
 // entries -- runs against both the bloodtrail driver (served, if at all,
-// from a snapshot forced fresh over Task 15's corpus fixture) and a raw pg
+// from a snapshot forced fresh over the corpus fixture) and a raw pg
 // driver oracle on the same database, comparing results and asserting the
 // bloodtrail engine actually served the query rather than silently
 // delegating. The one deliberately malformed "probe" entry gets its own
@@ -264,7 +264,7 @@ func TestPrebuiltCorpusCounts(t *testing.T) {
 //
 // # File placement: package bloodtrail, not bloodtrail_test
 //
-// Task 14's own report already flagged this file for exactly this reason:
+// The reason is the same one that pins its siblings here:
 // this suite needs a deterministic, on-demand snapshot rebuild
 // (d.engine.RebuildNow) after seeding the fixture, the same unexported
 // access dawgs_corpus_integration_test.go, builder_differential_matrix_
@@ -615,8 +615,8 @@ func extractLiteralSignatures(qr ops.QueryResult) []string {
 // assertStringSequence/assertStringMultiset (both already defined in
 // dawgs_corpus_integration_test.go, this same package). idSet deduplicates
 // first, so handing its output to assertStringMultiset (a count-sensitive
-// comparison) still yields plain set equality, matching the brief's "node
-// sets by id, edge sets by id" wording; idSequence preserves encounter
+// comparison) still yields plain set equality, matching this suite's own
+// "node sets by id, edge sets by id" rule; idSequence preserves encounter
 // order, for the one query compared as an ordered sequence instead (see
 // hasOrderBy).
 func idSequence(ids []graph.ID) []string {
@@ -1036,8 +1036,8 @@ func assertOrderedCorpusResult(t *testing.T, ctx context.Context, oracleDB graph
 	assertCorpusResultsMatch(t, true, false, got, want)
 }
 
-// TestPrebuiltCorpusDifferential is milestone 4's Task 16 exit criterion --
-// see this file's Task 16 section doc above for the full design. Before
+// TestPrebuiltCorpusDifferential is the corpus differential itself --
+// see this file's section doc above for the full design. Before
 // running anything, it guards both allowlists (assertAllowlistKeysUnambiguous
 // on expectedDelegations and knownAmbiguousQueries) and the ORDER BY
 // inventory (orderedCorpusQueryName's own doc). Then, per non-disabled,
@@ -1045,7 +1045,7 @@ func assertOrderedCorpusResult(t *testing.T, ctx context.Context, oracleDB graph
 // entries), this:
 //
 //  1. runs the query through the bloodtrail driver (served, if at all, from
-//     a snapshot forced fresh via a manual engine.RebuildNow over Task 15's
+//     a snapshot forced fresh via a manual engine.RebuildNow over
 //     internal/graphtest.LoadCorpusFixture) and through a raw pg driver
 //     oracle on the same database, both via ops.FetchByQuery;
 //  2. compares node id sets, edge id sets, and literal values -- tie-aware

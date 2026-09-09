@@ -34,13 +34,14 @@ func corpusQueryHasRow(t *testing.T, ctx context.Context, d *pg.Driver, cypherTe
 	return found
 }
 
-// TestLoadCorpusFixtureSelfCheck is task-15's own exit criterion: seed the
+// TestLoadCorpusFixtureSelfCheck is the fixture's own smoke test: seed the
 // corpus fixture, then confirm -- straight through the pg driver, the same
-// oracle Task 16's differential suite will compare the engine against --
+// oracle the corpus differential suite compares the engine against --
 // that each of five representative predicates drawn from the major corpus
 // families returns at least one row. This does not attempt to validate the
-// whole corpus (that is Task 16's job); it exists so a broken fixture (a
-// missing kind declaration, a property typed wrong, a WHERE clause that
+// whole corpus (that is the differential suite's job); it exists so a
+// broken fixture (a missing kind declaration, a property typed wrong, a
+// WHERE clause that
 // silently matches nothing) fails fast and close to the code that caused
 // it, rather than surfacing 100+ query mismatches downstream.
 func TestLoadCorpusFixtureSelfCheck(t *testing.T) {

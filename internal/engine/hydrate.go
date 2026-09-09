@@ -211,11 +211,11 @@ func hydrateEdgeBatch(ctx context.Context, pool *pgxpool.Pool, kindMapper pg.Kin
 
 // hydrateEdgePropsByID fetches the properties of every edge in ids from
 // graphID, keyed by database edge id, in batches of at most
-// edgePropsBatchSize (serve_cypher.go's Task 10 constant) ids per `WHERE id
+// edgePropsBatchSize (serve_cypher.go's own constant) ids per `WHERE id
 // = ANY($1)` round trip. Unlike hydrateNodes/hydrateEdges (which report a
 // missing entity as an aggregate count), a missing id here is reported
 // individually -- "bloodtrail: edge %d vanished during hydration" -- since
-// this is the shape Task 13's execution pipeline is expected to surface to a
+// this is the shape the TryCypher pipeline is expected to surface to a
 // caller as a declined query, and a single concrete id is more actionable
 // there than a bare count. Duplicate ids in the input are deduplicated
 // before any query is issued, so a caller (e.g. multiple paths sharing an

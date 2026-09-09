@@ -232,7 +232,7 @@ func compareViewContents(t *testing.T, a, b *View) {
 
 // ---- the property test --------------------------------------------------
 
-// TestFoldMatchesStackedOverlay is the brief's core property test: a
+// TestFoldMatchesStackedOverlay is the core property test: a
 // randomized 200-node/600-edge base with 3 randomized segments layered on
 // top (upserts, tombstones incl. cascade-relevant node deletes, new nodes,
 // new edges incl. edges to new nodes, added kinds) must fold into a
@@ -469,8 +469,8 @@ func TestFoldAllNodesTombstoned(t *testing.T) {
 	}
 }
 
-// TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips is the F2 finding's own
-// regression test (task-16 review): a delta-added node id BELOW the base's
+// TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips is the low-id-tail
+// regression test: a delta-added node id BELOW the base's
 // own max id must fold successfully, interleaved into its correct ascending
 // position, rather than be rejected as a bigserial-monotonicity violation.
 //
@@ -490,9 +490,8 @@ func TestFoldAllNodesTombstoned(t *testing.T) {
 // Against the pre-fix Fold (foldBaseNodes then foldAddedNodes, the latter
 // asserting every delta-added id exceeds the base's own max), this test
 // fails with "delta-added node 45 does not exceed the base snapshot's max
-// database id 60" -- see the task-16 report's RED evidence. The fix (this
-// package's foldNodes, a two-pointer ascending merge of base ids and
-// delta-added ids) makes it pass.
+// database id 60". The fix (this package's foldNodes, a two-pointer
+// ascending merge of base ids and delta-added ids) makes it pass.
 func TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips(t *testing.T) {
 	base, _ := buildOverlayFixture(t) // nodes 10..60 (step 10); max base id 60
 

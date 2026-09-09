@@ -1412,7 +1412,7 @@ func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
 		// than an objectid uniqueness index this test's schema never
 		// declares (BloodHound's own schema declares one in production;
 		// asserting it here would be testing dawgs' index machinery, not
-		// this task's read/write delegation rule). Node.ID is left at its
+		// this test's read/write delegation rule). Node.ID is left at its
 		// zero value, so there is no existing (0, graph_id) row to
 		// conflict with -- this upsert genuinely creates a new node.
 		update := graph.NodeUpdate{

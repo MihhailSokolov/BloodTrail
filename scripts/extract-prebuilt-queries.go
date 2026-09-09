@@ -37,7 +37,7 @@
 //     export carries one more entry, a deliberately malformed Cypher
 //     fragment BloodHound's own frontend test suite uses to assert the UI
 //     surfaces a parse error; it is folded into agt.json too, marked
-//     "probe": true, since it belongs to the same corpus and Task 16's
+//     "probe": true, since it belongs to the same corpus and the corpus
 //     differential suite needs a known-bad query to assert parse failure
 //     against.
 //   - packages/javascript/bh-shared-ui/src/commonSearchesAGI.ts -- the

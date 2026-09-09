@@ -316,7 +316,7 @@ func ParseProps(propsJSON []byte) (ParsedProps, error) {
 // values. propsJSON may be nil or empty, meaning no properties. Malformed
 // JSON is impossible in practice (jsonb guarantees valid JSON on the way
 // out of PostgreSQL), but is still surfaced as an error rather than
-// panicking or silently dropping data, per the brief: a decode failure here
+// panicking or silently dropping data: a decode failure here
 // can only mean programmer error (e.g. hand-written test JSON), and should
 // fail loudly.
 func parseNodeProps(propsJSON []byte) ([]parsedProp, error) {

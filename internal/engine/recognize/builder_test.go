@@ -445,8 +445,9 @@ func TestFromRelCriteria_Rejects(t *testing.T) {
 // already id(<var>) whether InIDs was called with a FunctionInvocation or a
 // bare Variable), a Parameter/Literal wrapping []int64 / []uint64 / []any,
 // and a bare *cypher.ListLiteral (the shape a cypher-text `IN [1, 2, 3]`
-// parses to -- Task 7's concern, but matchIDIn must already handle it since
-// FromRelCriteria/FromNodeCriteria will be reused there).
+// parses to -- a cypher-text recognizer's concern, but matchIDIn must
+// already handle it, since FromRelCriteria/FromNodeCriteria are reused
+// there).
 func TestMatchIDIn(t *testing.T) {
 	validRight := &cypher.Parameter{Value: []graph.ID{1}}
 

@@ -30,17 +30,17 @@ const raceStressBound = 50 * time.Second
 // goroutine can draw a low id, then lose the CPU for long enough that
 // another applier draws AND PUBLISHES a higher id first. A lower id can
 // therefore land in the segment stack after some compaction has already
-// folded a base whose own max id exceeds it -- exactly the "ordinary
-// concurrency" shape the F2 finding names (task-16 report): two commits
+// folded a base whose own max id exceeds it -- exactly the
+// ordinary-concurrency shape this test targets: two commits
 // landing at Apply in an order that does not match the order PostgreSQL's
 // bigserial sequence numbered them. This test relies on Fold tolerating
 // that (foldNodes' two-pointer ascending merge, snapshot/fold.go), not on
 // any ordering property of how ids happen to be generated here -- and
 // TestCompactRace's own final CompactionCount() assertion below, not this
 // constant, is what actually proves the reliance pays off: against the
-// pre-F2-fix Fold, a low id landing after a compaction had already raised
-// the base's max would poison every later fold for good (the F2 finding's
-// own wording), driving adopted compactions toward a low, stuck count well
+// pre-fix Fold, a low id landing after a compaction had already raised
+// the base's max would poison every later fold for good, driving adopted
+// compactions toward a low, stuck count well
 // short of what CompactEntries=30 forcing a trigger every 50 applies should
 // produce.
 const raceIDBase = 10_000
@@ -128,8 +128,8 @@ func checkViewAccessors(t *testing.T, view *snapshot.View) {
 	}
 }
 
-// TestCompactRace is this file's mandatory `-race` stress test (the brief's
-// Step 2): 4 applier goroutines publish synthetic segments concurrently
+// TestCompactRace is this file's `-race` stress test: 4 applier
+// goroutines publish synthetic segments concurrently
 // through the exact same publishAppend seam the unit tests above use (so
 // every real Apply-tail code path -- collapseSegmentStackIfNeeded,
 // maybeStartCompaction, and (via forceCompactionAttempt above) the

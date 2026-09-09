@@ -221,7 +221,7 @@ directly around each bt call (`runBTCapped` in `main.go`) -- but unlike
 `-pg-cap`, tripping it is never a graceful, recordable outcome. It exists as
 a fail-fast safety net for the same failure mode `bench/cypherbench`'s
 identical flag was added to catch there (see that package's README for the
-2026-09 milestone-4.5 incident): a bt call that has not returned within
+2026-09 incident that prompted it): a bt call that has not returned within
 `-bt-cap` has almost certainly not been quietly slow -- the engine declined
 and the driver silently fell through to PostgreSQL, which can then run
 unbounded. `runBTCapped` returns a hard error naming the shape and the cap,

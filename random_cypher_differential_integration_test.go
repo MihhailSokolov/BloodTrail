@@ -70,7 +70,7 @@ var (
 	randomCypherEdgeKindNames = []string{"R1", "R2", "R3"}
 )
 
-// randomCypherStringPool covers every string trap Task 17's brief lists:
+// randomCypherStringPool covers every string trap this suite targets:
 // a '%' and a '_' (SQL LIKE metacharacters CONTAINS/STARTS WITH/ENDS WITH
 // must match literally, never as wildcards), a backslash, a value leading
 // with '{', '[', or '"' (decodeScalarString's own double-decode trigger --
@@ -462,7 +462,7 @@ var randomCypherNullableProps = []string{"str", "val", "flag", "tags"}
 // accepted top-level shapes -- interpret/plan.go's planStages doc: a bare
 // SinglePartQuery, however many MATCH clauses it carries, or a
 // MultiPartQuery with exactly one WITH boundary), covering every predicate
-// family Task 17's brief lists: property =/<>/</>, STARTS/ENDS WITH,
+// family this suite exercises: property =/<>/</>, STARTS/ENDS WITH,
 // CONTAINS, a CONTAINS negation, a COALESCE(...)= guard, IN over both text
 // and numeric lists (and list membership against a "tags" array property),
 // IS [NOT] NULL, toLower/toUpper comparisons, *0..2/*1..3 var-length chains
@@ -800,7 +800,7 @@ const (
 	randomCypherNonEmptyFloor = 120
 )
 
-// TestRandomCypherDifferential is Task 17's adversarial random Cypher
+// TestRandomCypherDifferential is an adversarial random Cypher
 // differential suite: a fixed, adversarial 40-node/3-kind property fixture
 // (loadRandomCypherFixture) seeded once via the plain pg driver, then
 // randomCypherDifferentialSeeds*randomCypherDifferentialQueriesPerSeed

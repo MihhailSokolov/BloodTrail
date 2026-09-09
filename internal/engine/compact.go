@@ -42,9 +42,8 @@ const maxSegments = 32
 // of duplicating the numbers: both packages then have exactly one place,
 // this one, that states what "large" means for a delta.
 //
-// Provisional: the plan that introduced these two flags calls for
-// revisiting both once a dedicated write-throughput benchmark measures
-// compaction cost at scale.
+// Provisional: both values are worth revisiting once a dedicated
+// write-throughput benchmark measures compaction cost at scale.
 const (
 	DefaultCompactEntries = 1_000_000
 	DefaultCompactBytes   = 512 * size.Mebibyte

@@ -15,10 +15,9 @@ import (
 )
 
 // prebuiltShortestPathQuery mirrors one entry of
-// testdata/prebuilt_shortest_path.json (the same JSON shape as
-// recognize/testdata/prebuilt_shortest_path.json, copied rather than moved
-// -- see the task report for why recognize/cypher.go and its test could not
-// yet be deleted).
+// testdata/prebuilt_shortest_path.json -- the same JSON shape the retired
+// recognize-package Cypher recognizer's own fixture used, copied here
+// rather than moved so each package's corpus stands on its own.
 type prebuiltShortestPathQuery struct {
 	Name   string `json:"name"`
 	Cypher string `json:"cypher"`
@@ -139,11 +138,10 @@ func runPlanGolden(t *testing.T, snap *snapshot.View, cases []planTestCase) {
 }
 
 // corpusAggregationQuery and corpusCollectAntiJoinQuery are the two
-// pre-built queries the brief specifically names as required serve=true
-// cases beyond the shortestPath corpus (verbatim from upstream's
-// commonSearchesAGT.ts, "Kerberoastable users with most admin privileges"
-// and "Domain Admins logons to non-Domain Controllers" respectively -- see
-// the task report for the extraction).
+// pre-built queries that must serve beyond the shortestPath corpus, copied
+// verbatim from upstream's commonSearchesAGT.ts ("Kerberoastable users with
+// most admin privileges" and "Domain Admins logons to non-Domain
+// Controllers" respectively).
 const (
 	corpusAggregationQuery = `MATCH (u:User)
 WHERE u.hasspn = true
@@ -165,8 +163,8 @@ WHERE g.objectid ENDS WITH '-512' AND NOT c IN exclude
 RETURN p
 LIMIT 1000`
 
-	// corpusMixedChainPathQuery and corpusADCSMixedVarChainQuery are Task 8b's
-	// own gap-defining corpus shapes (see the task's own brief): a named path
+	// corpusMixedChainPathQuery and corpusADCSMixedVarChainQuery are the two
+	// gap-defining corpus shapes for mixed chains: a named path
 	// over a fixed-then-var chain, and an ADCS-shaped chain with TWO
 	// var-length steps ("*0.." leading, a fixed "*1"-implicit trailing hop)
 	// separated by fixed hops. Both must plan+serve now that exec.go's
@@ -198,7 +196,7 @@ func testSnapshot(t *testing.T, corpusTexts []string) *snapshot.View {
 	return snapshot.NewView(snap)
 }
 
-// TestPlanServeDelegateMatrix is the brief's Step 1 golden table: every
+// TestPlanServeDelegateMatrix is the golden table: every
 // pre-built shortestPath entry from the migrated JSON corpus (all served
 // except the one upstream ships fully commented out, which fails to parse
 // at all -- see loadPrebuiltShortestPathQueries's caller below), the corpus
@@ -228,8 +226,8 @@ func TestPlanServeDelegateMatrix(t *testing.T) {
 	cases = append(cases,
 		planTestCase{name: "corpus aggregation query", cypher: corpusAggregationQuery, want: true},
 		planTestCase{name: "COLLECT anti-join query", cypher: corpusCollectAntiJoinQuery, want: true},
-		planTestCase{name: "Task 8b: mixed fixed+var named-path chain", cypher: corpusMixedChainPathQuery, want: true},
-		planTestCase{name: "Task 8b: ADCS-shaped multi-var-length chain", cypher: corpusADCSMixedVarChainQuery, want: true},
+		planTestCase{name: "mixed fixed+var named-path chain", cypher: corpusMixedChainPathQuery, want: true},
+		planTestCase{name: "ADCS-shaped multi-var-length chain", cypher: corpusADCSMixedVarChainQuery, want: true},
 		planTestCase{name: "standalone *0..", cypher: `MATCH (n)-[:X*0..]->(m) RETURN n`, want: true},
 		planTestCase{name: "inline property map", cypher: `MATCH (n:User {name:'X'}) RETURN n`, want: true},
 
@@ -250,9 +248,9 @@ func TestPlanServeDelegateMatrix(t *testing.T) {
 	runPlanGolden(t, snap, cases)
 }
 
-// TestPlanRejectMatrix covers additional out-of-matrix constructs the brief
-// names but that are not already exercised by TestPlanServeDelegateMatrix's
-// required corpus/delegate rows.
+// TestPlanRejectMatrix covers additional out-of-matrix constructs that are
+// not already exercised by TestPlanServeDelegateMatrix's required corpus/
+// delegate rows.
 func TestPlanRejectMatrix(t *testing.T) {
 	snap := testSnapshot(t, nil)
 
@@ -263,7 +261,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "quantifier", cypher: `MATCH (n:User) WHERE ANY(x IN n.spns WHERE x = 'a') RETURN n`, want: false},
 		{name: "pattern predicate", cypher: `MATCH (n:User) WHERE (n)-[:X]->() RETURN n`, want: false},
 
-		// Gap (a) fix (task 16b): the narrow WHERE-clause pattern-predicate
+		// Pattern-predicate gap fix: the narrow WHERE-clause pattern-predicate
 		// shape pg itself supports for a single fixed-length step between
 		// two already-bound node variables -- see checkPatternPredicate's
 		// own doc comment for the full accept/reject rationale, pinned
@@ -331,7 +329,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "plain named path projected", cypher: `MATCH p = (a:User)-[:X]->(b:User) RETURN p`, want: true},
 		{name: "named path used in WHERE rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) WHERE p = a RETURN a`, want: false},
 
-		// Task 8b: a named path symbol must not cross a WITH boundary --
+		// A named path symbol must not cross a WITH boundary --
 		// planWith's plain-variable-carry-over branch already rejects a
 		// symPath kind (checked here, not merely reasoned about).
 		{name: "named path symbol carried across WITH boundary rejected", cypher: `MATCH p = (a:User)-[:X]->(b:User) WITH p MATCH (c:User) RETURN c`, want: false},
@@ -341,7 +339,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "shortestPath both endpoints unconstrained rejected", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t)) WHERE s<>t RETURN p`, want: false},
 		{name: "shortestPath one endpoint constrained by kind ok", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t:User)) WHERE s<>t RETURN p`, want: true},
 		{name: "shortestPath one endpoint constrained by id ok", cypher: `MATCH p = shortestPath((s)-[:X*1..]->(t)) WHERE id(t) = 1 AND s<>t RETURN p`, want: true},
-		// Gap (c) fix (task 16b): a single-symbol WHERE predicate pushed
+		// Pushed-predicate gap fix: a single-symbol WHERE predicate pushed
 		// into NodeConstraint.Predicates (pushdown, above) is exactly as
 		// "narrowable" as a kind or id() anchor from finalizeShortestPaths'
 		// own point of view -- resolveEndpointSet (expand.go) already
@@ -413,7 +411,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "edge symbol reused across steps in one chain rejected", cypher: `MATCH (a:User)-[r:X]->(b:User)-[r:X]->(c:User) RETURN a`, want: false},
 		{name: "edge symbol reused across pattern parts rejected", cypher: `MATCH (a:User)-[r:X]->(b:User) MATCH (c:User)-[r:X]->(d:User) RETURN a`, want: false},
 
-		// Task 8b: mixed fixed/var-length chains within one component are
+		// Mixed fixed/var-length chains within one component are
 		// now servable (see plan_test.go's TestPlanServeDelegateMatrix and
 		// exec_test.go/expand_test.go for the executed shapes), but
 		// shortestPath must stay isolated -- sharing a symbol with ANY other
@@ -430,7 +428,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 			want:   true,
 		},
 
-		// Fix (review finding, this task): pg statically types `+` between
+		// Concatenation-parity fix: pg statically types `+` between
 		// two raw property lookups as string concatenation unconditionally,
 		// regardless of what they hold at runtime
 		// (isConcatenationOperation's "both operands are property lookups"
@@ -447,7 +445,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "arithmetic + same property lookup added to itself rejected", cypher: `MATCH (n:User) RETURN n.score + n.score AS x`, want: false},
 		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) RETURN n.a + 1 AS x`, want: true},
 
-		// Fix (review finding, this task): classifyAddOperand used to bucket
+		// Coalesce-typing fix: classifyAddOperand used to bucket
 		// EVERY coalesce() call as addOther (numeric), but pg's own
 		// translateCoalesceFunction derives coalesce's STATIC type from its
 		// arguments -- see classifyCoalesceOperand's doc (eval.go) for the
@@ -470,7 +468,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// bare numeric literal -- accepted, numeric semantics.
 		{name: "arithmetic + coalesce with a numeric-literal argument accepted (addOther)", cypher: `MATCH (n:User) RETURN coalesce(n.score, 5) + 1 AS x`, want: true},
 
-		// Audit (this task): `type(r)` is statically Text in pg
+		// pg-parity audit: `type(r)` is statically Text in pg
 		// (EdgeTypeFunction's `CastType: pgsql.Text`, dawgs' function.go),
 		// the same shape as toLower()/toUpper() -- classifyAddOperand now
 		// buckets it addStaticText too, so a `+` naming it is still
@@ -488,7 +486,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN split(n.name, ',') + 1 AS x`, want: true},
 		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN labels(n) + 1 AS x`, want: true},
 
-		// Divergence-2 fix (task 17-report.md / task-17 follow-up): dawgs'
+		// Negative-numeric-literal divergence fix: dawgs'
 		// pgsql translator lowers a direct `n.prop = <literal>`/`<>` via
 		// native jsonb equality for a bare POSITIVE numeric literal, but via
 		// text-extraction-then-cast for a NEGATIVE one (a
@@ -718,8 +716,8 @@ func TestPlanInlineMapDesugarsIntoWhere(t *testing.T) {
 }
 
 // TestPlanNeverPanics feeds Plan a handful of nil/degenerate inputs to
-// confirm the recover() backstop and defensive nil checks hold, per the
-// brief's "never panics" requirement.
+// confirm the recover() backstop and defensive nil checks hold, per Plan's
+// own "never panics" contract.
 func TestPlanNeverPanics(t *testing.T) {
 	snap := testSnapshot(t, nil)
 

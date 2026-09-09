@@ -53,7 +53,7 @@ type diffCase struct {
 	allowEmpty bool
 }
 
-// TestTryAllShortestPathsDifferential is the milestone's core evidence: for
+// TestTryAllShortestPathsDifferential is the core differential evidence: for
 // a table of recognize.PathQuery shapes spanning both root fixtures, every
 // resolveEndpoint branch (explicit IDs, Criteria, single- and multi-kind
 // Kinds), both Modes, an edge-kind restriction, a disconnected pair, and an
@@ -340,9 +340,10 @@ func TestStartBootLoadsSnapshotWithoutDatapipeStatus(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// F1 (Task 12 review), integration evidence: the two tests below exercise
-// the real Start/enterFallback race end to end, against a live database,
-// complementing boot_test.go's deterministic unit tests of the same CAS.
+// Integration evidence for the boot-load/fallback race: the two tests below
+// exercise the real Start/enterFallback race end to end, against a live
+// database, complementing boot_test.go's deterministic unit tests of the
+// same CAS.
 // -----------------------------------------------------------------------
 
 // lockedBuffer is a bytes/strings-backed log sink safe for concurrent writes
@@ -423,7 +424,7 @@ func TestStartBootLoadLogsNoFallbackEntered(t *testing.T) {
 }
 
 // TestTryAllShortestPathsDeclinesSelfEndpoint is a targeted regression test
-// for a mismatch Task 14's randomized differential suite surfaced: querying
+// for a mismatch the randomized differential suite surfaced: querying
 // a node against itself (Start and End both resolving to c0, which has an
 // outgoing edge in traversal_shapes.json's chain) is a request PostgreSQL's
 // own shortest-path implementation cannot serve at all -- it raises
@@ -651,8 +652,7 @@ func oraclePathsByPair(t *testing.T, ctx context.Context, pgDriver *pg.Driver, s
 
 // canonNode/canonEdge/canonPath give graph.Path a canonical, order-
 // independent-once-sorted rendering for set comparison: node database ids
-// and edge kind strings plus every node/edge's own property map, exactly as
-// the task brief specifies.
+// and edge kind strings plus every node/edge's own property map.
 type canonNode struct {
 	ID    uint64         `json:"id"`
 	Props map[string]any `json:"props"`

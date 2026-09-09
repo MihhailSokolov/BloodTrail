@@ -262,10 +262,9 @@ func fixtureKinds(files []caseFile) (nodeKinds, edgeKinds graph.Kinds) {
 // count.
 const dawgsCorpusServedFloor = 70
 
-// TestDAWGSCorpus is the "DAWGS integration corpus green" exit criterion:
-// dawgs' own Cypher conformance corpus, run against *bloodtrail.Driver
-// instead of a bare driver, against the deterministically-rebuilt snapshot
-// described in this file's package doc.
+// TestDAWGSCorpus runs dawgs' own Cypher conformance corpus against
+// *bloodtrail.Driver instead of a bare driver, against the
+// deterministically-rebuilt snapshot described in this file's package doc.
 //
 // A failure in a case means either this adaptation itself is wrong (a
 // mismapped assertion, a bad path, a schema gap) or the in-memory path
@@ -392,8 +391,8 @@ func TestDAWGSCorpus(t *testing.T) {
 	// the boot-load's own one-shot rebuild timing.
 	waitForBootLoad(t, d)
 
-	// Hand-constructed per the brief above: integration.Open's scheme
-	// detection excludes bloodtrail, but Session itself is a plain struct
+	// Hand-constructed rather than obtained from integration.Open, whose
+	// scheme detection excludes bloodtrail. Session itself is a plain struct
 	// with exported fields, and WithRollbackFixture (harness.go) needs
 	// nothing else.
 	session := &integration.Session{DB: db, Ctx: ctx}

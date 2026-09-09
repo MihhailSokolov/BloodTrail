@@ -3,7 +3,7 @@
 // pipeline.go implements the WITH
 // pipeline (implicit grouping, COUNT/COLLECT aggregation, the COLLECT
 // anti-join id-set membership rewrite), RETURN DISTINCT, ORDER BY, and
-// SKIP/LIMIT. It replaces exec.go's Task 7 seam (the early gate on
+// SKIP/LIMIT. It replaces exec.go's early-gate seam (the gate on
 // WithClause/Order/Skip/Limit/Distinct) with the real implementation and
 // is the last piece Execute needs to serve a full Query.
 //
@@ -117,7 +117,7 @@ type membershipTable map[string]idSet
 
 // --- Execute: multi-part flow, DISTINCT, ORDER BY, SKIP/LIMIT ---------------
 
-// runQuery is exec.go's Execute, minus the Task 7 seam: it fully materializes
+// runQuery is exec.go's Execute, minus that early gate: it fully materializes
 // q against env, applying every Part's own pattern match + WHERE, the WITH
 // pipeline between Part[0] and Part[1] (if any), RETURN DISTINCT, ORDER BY,
 // and SKIP/LIMIT, in that order -- matching pg's own logical evaluation
@@ -802,10 +802,9 @@ func applyAggregate(env *Env, out *Row, agg WithAggregate, groupRows []*Row) {
 	case agg.Count != nil:
 		// Stored as float64, matching this package's uniform numeric
 		// representation for every value that might re-enter a comparison
-		// (ORDER BY, WHERE) -- see plan.go's CountAgg doc comment and this
-		// task's own brief. A future projection layer (Task 10) converts a
-		// bare, top-level count alias to pg-parity int64 at the RETURN
-		// boundary only.
+		// (ORDER BY, WHERE) -- see plan.go's CountAgg doc comment. A future
+		// projection layer converts a bare, top-level count alias to
+		// pg-parity int64 at the RETURN boundary only.
 		out.SetScalar(agg.Alias, float64(countAggregate(env, agg.Count, groupRows)))
 	case agg.Collect != nil:
 		out.SetScalar(agg.Alias, collectAggregate(env, agg.Collect, groupRows))
@@ -814,7 +813,7 @@ func applyAggregate(env *Env, out *Row, agg WithAggregate, groupRows []*Row) {
 
 // countAggregate implements COUNT(sym)/COUNT(DISTINCT sym) over one group.
 // agg.Sym is always bound as a node or edge variable for any query this
-// milestone's planner can currently produce (Part[0] -- the only Part a
+// package's planner can currently produce (Part[0] -- the only Part a
 // WithClause's Aggregates are ever attached to -- never has a pre-existing
 // scalar symbol of its own, since that would require a second WITH boundary,
 // which Plan rejects), and a bound node/edge is unconditionally non-null in
@@ -1115,8 +1114,8 @@ func resolveOrderValue(aliasIndex map[string]int, row *Row, outRow []OutVal, sym
 // the *whole* comparator this way, null rank included: a null sorts last in
 // ASC (the highest jsonb type rank) and therefore FIRST in DESC, not "last
 // no matter what". A naive DESC that special-cased null to stay last
-// independent of direction would silently disagree with pg here -- this is
-// exactly the corner the milestone brief calls out by name.
+// independent of direction would silently disagree with pg here -- exactly
+// the corner this comparator is written to get right.
 func sortRows(rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[string]int) error {
 	idx := make([]int, len(rows))
 	for i := range idx {
@@ -1324,7 +1323,7 @@ func evalNegationWithMembership(env *Env, row *Row, expr cypher.Expression, memb
 // membership set and left a bare Variable bound as a node in row -- the one
 // shape Plan's checkInOperands allows a collect alias to appear in. matched
 // is false for anything else (the caller falls through to ordinary
-// evaluation in that case). Per the brief's pinned semantics: an empty set
+// evaluation in that case). Per this package's pinned semantics: an empty set
 // answers TriFalse (pg's `x = ANY(empty)` is false, never null), and this
 // answer is always total (never TriNull) since Plan guarantees left is a
 // bound node variable, which -- absent OPTIONAL MATCH -- this package's rows

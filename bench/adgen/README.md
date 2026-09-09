@@ -49,7 +49,7 @@ The shape is driven entirely by `-users` and optionally by `-domains`:
 
 ### Edge density: ~10 edges per node, by default
 
-The milestone's path-engine performance targets are defined at ~5M nodes /
+BloodTrail's path-engine performance targets are defined at ~5M nodes /
 ~50M edges, i.e. **~10 edges per node**. `adgen`'s per-user/per-computer
 budgets above (8 extra `MemberOf`, 8 ACL edges, 50%/30% `AdminTo`/
 `HasSession` computer coverage) were sized so that a plain default run (no
@@ -69,7 +69,7 @@ row: 56 domains of exactly 50,000 users each (the same per-domain size as
 the measured `-users 100000` row above, which has 2 such domains), so
 `4,760,000` nodes is exact arithmetic and `≈48.9M` edges is that row's
 measured per-domain edge count (872,763.5 edges/domain) extrapolated to 56
-domains -- consistent with the milestone's ~50M-edge target at ~5M nodes.
+domains -- consistent with the ~50M-edge target at ~5M nodes.
 `TestGenerateDefaultEdgeDensityNear10` in `generate_test.go` pins this down
 with a generous [8, 12] edges/node tolerance band at `-users 100000` (fast,
 no database needed) rather than asserting an exact ratio, since the ACL/
@@ -128,7 +128,7 @@ Beyond `objectid`/`name`, every node carries a deterministically generated
 property bag sized and distributed to approximate fixture-measured upstream
 reality (mean ~8.5 properties / ~374 bytes per node overall; principals
 15-31 properties / 500-900 bytes in that measurement). This matters for the
-milestone's 5M-node cypher/memory benchmarks (task 21): a graph with only
+5M-node cypher/memory benchmarks: a graph with only
 `{objectid, name}` on every node understates both memory footprint and the
 property-predicate work real Cypher queries do.
 
@@ -213,7 +213,7 @@ same seed.
 
 Edge rows are always written with `properties = {}` (see `main.go`'s
 `newEdgeCopySource`) -- `Edge` doesn't even have a `Props` field. This is
-deliberate, not an oversight: the milestone's path/cypher engine never
+deliberate, not an oversight: BloodTrail's path/cypher engine never
 keeps edge properties resident in memory (only node property bags and the
 graph topology are loaded), and no query in the pre-built Cypher corpus or
 the cypherbench query shape filters or projects on an edge property.

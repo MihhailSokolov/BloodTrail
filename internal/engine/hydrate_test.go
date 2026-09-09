@@ -12,13 +12,13 @@ import (
 // here would panic on any real query, so a nil error together with a
 // non-nil, empty map proves no query was attempted.
 //
-// This lives outside the integration build tag deliberately: Task 11 (this
-// task) has no production caller yet -- wiring hydrateEdgePropsByID into the
-// served pipeline is Task 13's job -- so without a reference from a
+// This lives outside the integration build tag deliberately:
+// hydrateEdgePropsByID has no production caller yet -- wiring it into the
+// served pipeline comes later -- so without a reference from a
 // plain-build test, golangci-lint's `unused` check (which the CI workflow
 // runs without -tags integration) flags hydrateEdgePropsByID,
 // hydrateEdgePropsByIDBatched, hydrateEdgePropsBatch, and dedupeUint64s as
-// dead code. This mirrors Task 10's identical fix for edgePropsBatchSize
+// dead code. This mirrors the identical fix for edgePropsBatchSize
 // (serve_cypher_test.go's TestCypherBudgetConstants).
 func TestHydrateEdgePropsByIDEmptyNoQuery(t *testing.T) {
 	got, err := hydrateEdgePropsByID(context.Background(), nil, 1, nil)

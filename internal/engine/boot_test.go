@@ -12,8 +12,8 @@ import (
 )
 
 // -----------------------------------------------------------------------
-// F1 (Task 12 review): Start's boot-load goroutine and the fallback
-// recovery goroutine must never run concurrently. Before this fix, boot.go
+// Start's boot-load goroutine and the fallback recovery goroutine must
+// never run concurrently. Before this fix, boot.go
 // claimed they never could -- "Apply only ever calls enterFallback when
 // e.snap.Load() != nil" -- but apply.go's nil-scope and HasFallback
 // branches call enterFallback BEFORE Apply's own nil-snapshot check runs
@@ -107,7 +107,7 @@ func TestDefaultGraphResolvedIsNilSafe(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// Task 15: snapshot-file boot load. The two tests below pin the pure,
+// Snapshot-file boot load. The two tests below pin the pure,
 // database-free pieces (snapshotFilePath's disabled short-circuit,
 // snapshotFileTrustedAtBoot's own predicate); the full read-compare-adopt
 // sequence (tryLoadSnapshotFile) is exercised end to end, against a live
@@ -156,7 +156,7 @@ func TestSnapshotFileTrustedAtBootRequiresExactMatch(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// I1 (Task 20 review): a process SIGKILLed between WriteSnapshotFile's
+// Stale temp-file sweep: a process SIGKILLed between WriteSnapshotFile's
 // os.CreateTemp and its own rename leaves a ".snapshot-*.tmp" file behind
 // that nothing else in the codebase ever reaps -- the boot loader only ever
 // opens the final graph-<id>.btsnap name. sweepStaleSnapshotTempFiles closes

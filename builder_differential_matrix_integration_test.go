@@ -2,16 +2,16 @@
 
 //go:build integration
 
-// This file is Task 12 of the milestone-3 plan: a differential matrix suite
-// comparing every builder-query shape the wrapped driver's recording
-// wrappers (node_query.go's recordingNodeQuery, relationship_query.go's
-// recordingRelationshipQuery) can recognize and serve against the raw pg
+// This file is a differential matrix suite comparing every builder-query
+// shape the wrapped driver's recording wrappers (node_query.go's
+// recordingNodeQuery, relationship_query.go's recordingRelationshipQuery)
+// can recognize and serve against the raw pg
 // driver used as an oracle, across the project's hand fixtures and a batch
 // of seeded random graphs.
 //
 // # File placement: root package, not internal/engine
 //
-// The task brief originally called for this file to live at
+// The natural home for this file would be
 // internal/engine/builder_differential_integration_test.go, mirroring
 // random_differential_integration_test.go's placement. It lives here
 // instead, at the repository root as part of package bloodtrail, for the
@@ -215,7 +215,7 @@ const (
 // graphtest.LoadRandom itself is left completely untouched: it is shared
 // infrastructure internal/engine's own random differential suite already
 // depends on at its documented size, and changing that size would be an
-// unrelated, unnecessary risk to take on for this task.
+// unrelated, unnecessary risk to take on here.
 //
 // Reuses graphtest.RandomNodeKinds/RandomEdgeKinds/GraphName so a caller
 // comparing this suite's random graphs against internal/engine's own knows
@@ -972,8 +972,8 @@ func runBuilderQueryDifferentialMatrix(t *testing.T, ctx context.Context, bt, or
 	}
 }
 
-// TestBuilderQueryDifferentialMatrix is Task 12's deliverable: opens a real
-// *Driver (bt) alongside a raw pg driver oracle on the same PostgreSQL
+// TestBuilderQueryDifferentialMatrix drives the whole matrix: it opens a
+// real *Driver (bt) alongside a raw pg driver oracle on the same PostgreSQL
 // database, then runs runBuilderQueryDifferentialMatrix once for the hand
 // fixtures and once per random-graph seed (1..builderMatrixRandomSeeds),
 // wiping and reloading the graph and forcing a deterministic RebuildNow

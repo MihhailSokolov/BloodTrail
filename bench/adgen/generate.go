@@ -71,7 +71,7 @@ var (
 	EdgeKinds = []string{EdgeMemberOf, EdgeAdminTo, EdgeHasSession, EdgeGenericAll, EdgeWriteDacl, EdgeAddMember}
 )
 
-// usersPerDomainCap is the scale factor from the task brief: one domain per
+// usersPerDomainCap is the domain scale factor: one domain per
 // 50k users, minimum one domain.
 const usersPerDomainCap = 50_000
 
@@ -79,7 +79,7 @@ const usersPerDomainCap = 50_000
 // (never the product of two counts that both grow with -users, which would
 // make large runs quadratic and computationally infeasible -- see the
 // AdminTo design note below) but are sized so that a default run (no flags
-// beyond -users) lands close to the milestone's ~10-edges-per-node design
+// beyond -users) lands close to the ~10-edges-per-node design
 // point -- see Generate's doc comment and README.md for the worked
 // numbers. Raised from an earlier, much sparser pass (extraMemberOfPerUser
 // 3, aclDensityPerUser 1.5, adminToCoverage 0.3, hasSessionCoverage 0.1)
@@ -129,14 +129,13 @@ var nowFunc = time.Now
 // wellKnownGroupsPerDomain is the number of well-known, RID-suffixed
 // groups every domain gets up front -- Domain Admins ("-512"), Domain
 // Users ("-513"), Domain Controllers ("-516"), and Enterprise Admins
-// ("-519"), the four RID suffixes the cypherbench query shape (task 21)
-// looks up -- before any synthetic group.
+// ("-519"), the four RID suffixes the cypherbench query shape looks up --
+// before any synthetic group.
 const wellKnownGroupsPerDomain = 4
 
 // maxTimestampOffsetDays bounds how far into the past a principal's
 // lastlogontimestamp/pwdlastset/whencreated can be dated, relative to
-// nowFunc(): "epoch numbers spread over 0-400 days back" per the task
-// brief.
+// nowFunc(): epoch numbers spread over 0-400 days back.
 const maxTimestampOffsetDays = 400
 
 // day is a calendar day, used only to convert maxTimestampOffsetDays (and
@@ -189,7 +188,8 @@ type domain struct {
 // seeded from spec.Seed, consumed in a fixed order that depends only on
 // spec.Users).
 //
-// Shape (see the task-15 brief for the source of these ratios):
+// Shape (README.md's "Density realism" section explains where these ratios
+// come from):
 //
 //   - domains = spec.Domains if > 0, else max(1, Users/50000); Users,
 //     Computers (=Users/2 overall) and Groups (=Users/5 overall, floor,
@@ -215,7 +215,7 @@ type domain struct {
 // These per-user/per-computer budgets are deliberately kept linear in
 // Users (see the AdminTo/HasSession design note below) but were sized so
 // that a *default* run (no flags beyond -users) lands close to the
-// milestone's ~10-edges-per-node design point: at Users=100000 (2
+// ~10-edges-per-node design point: at Users=100000 (2
 // domains) this produces a ~10.3 edges/node graph (see
 // TestGenerateDefaultEdgeDensityNear10), and the same per-domain
 // proportions carry through to -users 2800000 (56 domains of 50,000
@@ -411,8 +411,8 @@ var userTierOUs = []string{
 }
 
 // newUserNode builds a User node: the shared principal bag (see
-// principalCommonProps) plus the three Kerberos/password-policy flags the
-// task brief calls out specifically for users.
+// principalCommonProps) plus the three Kerberos/password-policy flags that
+// apply specifically to users.
 func newUserNode(objectID, name, domainDN string, rng *rand.Rand, now time.Time) Node {
 	local := localPart(name, "@")
 	tierOU := userTierOUs[rng.Intn(len(userTierOUs))]
@@ -451,7 +451,7 @@ func newComputerNode(objectID, name, domainDN string, rng *rand.Rand, now time.T
 }
 
 // newGroupNode builds a Group node: objectid/name plus admincount (10%)
-// and a realistic-length description, per the task brief. Well-known
+// and a realistic-length description. Well-known
 // groups (Domain Admins, Domain Users, Domain Controllers, Enterprise
 // Admins) use this same constructor as ordinary synthetic groups -- only
 // their objectid's RID suffix and name distinguish them.
@@ -480,7 +480,7 @@ type weightedOS struct {
 // to match the pre-built Cypher corpus' own legacy-OS regex
 // ("(?i).*Windows.* (2000|2003|2008|2012|xp|vista|7|8|me|nt).*", see
 // testdata/prebuilt/agt.json and internal/graphtest/corpusfixture.go's
-// legacyOS pool) so cypherbench's legacy-computer queries (task 21) have
+// legacyOS pool) so cypherbench's legacy-computer queries have
 // real rows to match in a generated benchmark graph, not only in the
 // smaller corpus fixture. Weights sum to 1.0.
 var operatingSystems = []weightedOS{
@@ -623,7 +623,8 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 
 	// 7. Guarantee at least one multi-hop path from a User to Domain
 	// Admins, biasing the otherwise-random ACL noise above toward actually
-	// reaching Domain Admins via a small set of paths, per the brief.
+	// reaching Domain Admins via a small set of paths, so a multi-hop
+	// attack path always exists for path queries to find.
 	if len(users) > 0 {
 		if len(extraGroups) > 0 {
 			edges = append(edges,
@@ -639,8 +640,9 @@ func generateDomainEdges(edges []Edge, info domain, rng *rand.Rand) []Edge {
 }
 
 // round rounds x to the nearest integer using round-half-away-from-zero,
-// matching the "~N%" ratios described in the task brief closely enough that
-// precise reproduction isn't required (the brief says as much explicitly).
+// matching the "~N%" ratios Generate's own shape doc describes closely
+// enough: those ratios are approximations, so exact reproduction of any one
+// of them is not required.
 func round(x float64) int {
 	return int(math.Round(x))
 }

@@ -19,7 +19,7 @@ func mustAddNodeJSON(t *testing.T, b *Builder, databaseID uint64, kinds []KindID
 	}
 }
 
-// TestPropStorePropertyBagsAndObjectIDIndex is the brief's fixture: three
+// TestPropStorePropertyBagsAndObjectIDIndex covers the core fixture: three
 // nodes (10, 20, 30) with property bags exercising every JSON value kind,
 // checked via Value, NodeMap, and the objectid index.
 func TestPropStorePropertyBagsAndObjectIDIndex(t *testing.T) {
@@ -181,8 +181,8 @@ func TestAddNodePropsMalformedJSON(t *testing.T) {
 }
 
 // TestPropStoreNodeByObjectIDIgnoresNonStringValues checks that a numeric
-// (or otherwise non-string) objectid value is not indexed, per the brief's
-// "only indexes nodes whose objectid value is a string" requirement.
+// (or otherwise non-string) objectid value is not indexed, per the index's
+// "only indexes nodes whose objectid value is a string" rule.
 func TestPropStoreNodeByObjectIDIgnoresNonStringValues(t *testing.T) {
 	b := NewBuilder(1)
 	mustAddNodeJSON(t, b, 10, []KindID{1}, `{"objectid":12345}`)

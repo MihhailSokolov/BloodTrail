@@ -113,7 +113,7 @@ func matchIDEquals(cmp *cypher.Comparison) (symbol string, id graph.ID, ok bool)
 // literalToID unwraps a query.Equals right-hand side to a graph.ID. The
 // dawgs query package always wraps the value in query.Parameter (a
 // *cypher.Parameter with an empty Symbol), but a bare *cypher.Literal is
-// accepted too since Task 7's cypher-text recognizer will see literals
+// accepted too since a cypher-text recognizer sees literals
 // parsed straight from query text. The wrapped value itself must be a
 // graph.ID, int64, or uint64; anything else -- including a nil expr, a null
 // Literal, or a Parameter/Literal wrapping some other Go type -- fails.

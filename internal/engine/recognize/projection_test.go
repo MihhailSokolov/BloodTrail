@@ -256,7 +256,7 @@ func TestOrderIsEdgeIDAscending_Accepts(t *testing.T) {
 
 // TestOrderIsEdgeIDAscending_Rejects is an adversarial false-accept hunt:
 // descending order, ordering by the wrong variable (notably NodeID(), the
-// brief's explicit example), the wrong count of criteria, and structural
+// most obvious near-miss), the wrong count of criteria, and structural
 // default-deny cases.
 func TestOrderIsEdgeIDAscending_Rejects(t *testing.T) {
 	tests := []struct {

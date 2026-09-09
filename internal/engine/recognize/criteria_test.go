@@ -179,7 +179,7 @@ func TestFromCriteria_Rejects(t *testing.T) {
 
 // TestLiteralToID exercises literalToID directly since FromCriteria only
 // ever feeds it *cypher.Parameter wrapping a graph.ID (what query.Equals
-// actually builds); Task 7's cypher-text recognizer will also feed it bare
+// actually builds); a cypher-text recognizer also feeds it bare
 // *cypher.Literal nodes (parsed straight from query text) and int64/uint64
 // payloads, so those paths need their own coverage here.
 func TestLiteralToID(t *testing.T) {
