@@ -32,26 +32,62 @@ Local example on Apple Silicon:
 ## End-to-end test
 
 `build/e2e.sh [upstream-tag]` (defaults to `v9.6.0`) builds the image, boots the upstream
-example compose stack on Neo4j, and drives `cmd/bloodtrail` against it: install, verify,
-roll back, confirm a second install refuses to migrate onto the graph the first one left in
-PostgreSQL, clear that with `--replace-postgres-graph`, and roll back again. The install step
-passes `--admin-password`, which runs an ingest-and-search smoke test against the fixture
-`TESTLAB.LOCAL` domain (`internal/verify/fixture`) -- BloodTrail's own path engine phase then
-runs against that same fixture, still installed, before rollback:
+example compose stack on Neo4j -- with `BLOODTRAIL_LOG_LEVEL=debug` stamped into the
+`bloodhound` service's environment on that base compose file before the stack's first boot,
+so every marker in the table below is visible from the start, Debug-level ones included, with
+no later restart needed just to turn logging up -- and drives `cmd/bloodtrail` against it:
+install, verify, roll back, confirm a second install refuses to migrate onto the graph the
+first one left in PostgreSQL, clear that with `--replace-postgres-graph`, and roll back again.
+The install step passes `--admin-password`, which runs an ingest-and-search smoke test against
+the fixture `TESTLAB.LOCAL` domain (`internal/verify/fixture`) -- BloodTrail's own phases then
+run against that same fixture, still installed, before rollback:
 
-1. Wait up to 120s for the `bloodhound` container's logs to show `snapshot rebuilt` -- the
-   engine has replicated the freshly analyzed graph into memory.
+1. **Zero-rebuild write-through.** Assert the `bloodhound` container's logs show exactly one
+   `snapshot rebuilt` (the one-shot boot load, `trigger=startup`) across install+ingest+analysis,
+   at least one `write-through applied`, and no rebuild between ingest completion and a
+   `POST /api/v2/graphs/cypher` lookup of a node analysis itself creates (the domain's well-known
+   `Everyone` principal) -- proof every write, ingest and analysis alike, replayed directly into
+   the in-memory replica instead of falling back to a PostgreSQL rebuild.
 2. `GET /api/v2/graphs/shortest-path` between two fixture objects known to be connected
    (TESTLAB.LOCAL's built-in Administrator, RID 500, is a direct `MemberOf` member of Domain
-   Admins, RID 512) and assert HTTP 200 with a non-empty `data.nodes`.
+   Admins, RID 512) and assert HTTP 200 with a non-empty `data.nodes`, and that the logs show
+   more `path engine served` lines after the call than before.
 3. `POST /api/v2/graphs/cypher` with a pre-built-shaped `shortestPath` query anchored on the
    same two fixture objects, and assert HTTP 200.
-4. Assert the `bloodhound` container's logs show more `path engine served` lines after those
-   two calls than before -- the exit-criterion proof that the in-memory engine, not PostgreSQL,
-   answered.
+4. `GET /api/v2/groups/{object_id}/members` and two `POST /api/v2/graphs/cypher` queries copied
+   from BloodHound's own pre-built query corpus, each asserted against its own served-marker delta
+   the same way step 2 was -- `builder engine served` and `cypher engine served` are logged at
+   Debug, already visible since the stack's first boot.
+5. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
+   directory (so the file survives the container recreate the config change itself causes),
+   then `docker compose restart` the same container -- no further config change, so the
+   container is not recreated -- and assert the logs show `snapshot file written` at that
+   shutdown, `snapshot file loaded` (never `snapshot file rejected`) at the reboot, and **no**
+   new `snapshot rebuilt` line: proof the file itself, not a rebuild that happened to produce
+   the same answer, is what the reboot served from. One more `GET /api/v2/graphs/shortest-path`
+   confirms the reloaded engine still answers correctly.
 
 Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Run it
 with `PLATFORM=linux/arm64 ./build/e2e.sh` on Apple Silicon to avoid amd64 emulation.
+
+### Log markers
+
+The `bloodhound` container's logs carry BloodTrail's own markers, all prefixed
+`bloodtrail:`. The Debug-level ones below appear only under `BLOODTRAIL_LOG_LEVEL=debug`
+(which `e2e.sh` sets from the stack's first boot); everything at Info or above is logged
+regardless.
+
+| Marker | Level | Meaning |
+| --- | --- | --- |
+| `write-through applied` | Debug | A committed write was replayed into the in-memory replica with no rebuild. |
+| `fallback entered` / `fallback exited` | Warn / Info | A write could not be replayed narrowly; every query declines to PostgreSQL until the recovery rebuild below adopts a fresh snapshot. |
+| `snapshot rebuilt` | Info | A full PostgreSQL rebuild ran and was adopted -- `trigger` names why: `startup` (the one-shot boot load), `fallback` (recovery from the line above), or `manual`. |
+| `snapshot file written` | Info | The current replica was folded and written to `BLOODTRAIL_SNAPSHOT_DIR` -- by a clean shutdown, or by a background compaction once it had adopted its result. |
+| `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL. |
+| `snapshot file rejected` | Info | Boot found a file but its watermark did not match PostgreSQL's; it fell back to a rebuild instead. |
+| `no snapshot file` | Debug | Boot found no file at all (feature disabled, or none written yet). |
+| `compaction finished` | Info | A background compaction folded the write-through delta back into the base snapshot. |
+| `path engine served` / `builder engine served` / `cypher engine served` | Info / Debug / Debug | The in-memory engine, not PostgreSQL, answered a shortest-path, structural (node/relationship), or Cypher query respectively. |
 
 ## First release checklist
 

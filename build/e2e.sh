@@ -27,6 +27,22 @@ echo "==> Building image $IMAGE"
 
 echo "==> Starting the upstream stack"
 cp "$ROOT/.build/upstream-$TAG/examples/docker-compose/docker-compose.yml" "$WORK/"
+# BLOODTRAIL_LOG_LEVEL=debug is stamped into the bloodhound service's own
+# environment list here, on the base compose file, rather than later on the
+# override file `bloodtrail install` writes: settings.go's SettingsFromEnv
+# only ever reads it once, at driver-construction time, so it must already
+# be in place before the FIRST BloodTrail-driver boot -- the very run this
+# fixture's ingest+analysis happens in -- for Debug lines like "write-through
+# applied" to be observable from that boot onward. Scoped to the bloodhound
+# service specifically (the awk state machine below) so app-db/graph-db's
+# own "    environment:" blocks, at the same indent, are left alone.
+awk '
+  $0 ~ /^  [A-Za-z0-9_-]+:$/ { in_bh = ($0 == "  bloodhound:") }
+  { print }
+  in_bh && $0 == "    environment:" { print "      - BLOODTRAIL_LOG_LEVEL=debug" }
+' "$WORK/docker-compose.yml" > "$WORK/docker-compose.yml.tmp"
+mv "$WORK/docker-compose.yml.tmp" "$WORK/docker-compose.yml"
+grep -q "BLOODTRAIL_LOG_LEVEL=debug" "$WORK/docker-compose.yml"
 printf 'BLOODHOUND_TAG=%s\n' "$DOCKERHUB_TAG" > "$WORK/.env"
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" up -d
 for _ in $(seq 1 90); do api_ready && break; sleep 5; done
@@ -44,30 +60,75 @@ docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T
 (cd "$ROOT" && go run ./cmd/bloodtrail status --compose-file "$WORK/docker-compose.yml") > "$WORK/status.txt"
 grep -q "running:.*$IMAGE" "$WORK/status.txt"
 
-echo "==> Waiting for the path engine's snapshot to rebuild from the ingested fixture"
+bh_logs() { docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" logs bloodhound > "$WORK/bloodhound-logs.txt" 2>&1; }
+
+echo "==> Asserting write-through replicated the ingested-and-analyzed fixture with no post-boot rebuild"
+# The poller that used to keep re-rebuilding a snapshot on a timer is gone
+# (see internal/engine/boot.go's own doc on Start): every committed write is
+# now replayed directly into the in-memory replica by Apply
+# (write_observer.go's driver hooks), so the only rebuild a healthy
+# container logs across its whole lifetime is the one-shot boot load
+# Start's own goroutine runs before it can serve anything at all
+# (triggerStartup, boot.go) -- there is no periodic rebuild left to wait
+# for. `bloodtrail install --admin-password`'s own smoke test
+# (internal/verify.Smoke.Run, which the install call above already ran to
+# completion, including its own GET /api/v2/search poll) is therefore
+# already all the synchronization this phase needs: by the time install
+# returned, the fixture's ingest AND analysis had both committed to
+# PostgreSQL and been replayed into the engine, with no lag left to poll
+# out.
+#
 # Written to a file rather than piped into grep, for the same reason as the
 # status check above: `docker compose logs` keeps writing after `grep -q`
 # finds its match and closes the pipe, dies of SIGPIPE, and (with pipefail)
 # turns a successful match into a failed pipeline.
-#
-# "snapshot rebuilt" alone also matches the startup-triggered rebuild, which
-# runs against the pre-ingest 1-node graph before the fixture is loaded --
-# that line appears in the logs almost immediately and would let the loop
-# fall through while the snapshot is still stale, so the GET below would hit
-# a declining engine and PostgreSQL would answer instead (see
-# internal/engine/engine.go's "bloodtrail: snapshot rebuilt" log call and
-# internal/engine/poller.go's triggerStartup/triggerAnalysis constants). Wait
-# specifically for the analysis-triggered rebuild, which fires once the
-# fixture's ingest+analysis run completes and is the one that reflects the
-# ingested graph.
-bh_logs() { docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" logs bloodhound > "$WORK/bloodhound-logs.txt" 2>&1; }
-snapshot_rebuilt=false
-for _ in $(seq 1 24); do
-  bh_logs
-  if grep "snapshot rebuilt" "$WORK/bloodhound-logs.txt" | grep -q '"trigger":"analysis"'; then snapshot_rebuilt=true; break; fi
-  sleep 5
-done
-[ "$snapshot_rebuilt" = true ] || { echo "the path engine never logged an analysis-triggered rebuilt snapshot within 120s" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+bh_logs
+rebuilt_after_ingest="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
+applied_after_ingest="$(grep -c "bloodtrail: write-through applied" "$WORK/bloodhound-logs.txt" || true)"
+# Measured against this real deployment's own ingest+analysis pipeline
+# (SharpHound-shaped JSON through the same /api/v2/file-upload path every
+# real collector uses, followed by the same analysis pass a production
+# deployment runs) rather than a synthetic corpus: this container logs
+# exactly one rebuild -- the boot load (trigger=startup), which ran against
+# the freshly created container's empty graph before the fixture upload
+# even began -- with every write the fixture's ingest+analysis produced
+# replayed by write-through instead of tripping a fallback rebuild.
+[ "$rebuilt_after_ingest" -eq 1 ] || { echo "expected exactly 1 \"snapshot rebuilt\" line (the boot load) after install+ingest+analysis, found $rebuilt_after_ingest" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+grep "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" | grep -q '"trigger":"startup"' || { echo "the one rebuild logged was not the boot load (trigger=startup)" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+[ "$applied_after_ingest" -ge 1 ] || { echo "no \"write-through applied\" lines after install+ingest+analysis; every write should have replayed directly into the engine" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+
+echo "==> Querying for a node analysis itself creates, to prove analysis-phase writes reached the engine"
+# TESTLAB.LOCAL-S-1-1-0 is the domain's well-known "Everyone" principal --
+# not part of the SharpHound fixture at all (internal/verify/fixture has no
+# such object) -- but created by analysis post-processing itself
+# (upstream packages/go/analysis/ad/post.go's Post -> LinkWellKnownNodes ->
+# createWellKnownNodesForDomain -> getOrCreateWellKnownGroup, which
+# CreateNodes it when absent) as part of the same analysis run install's
+# smoke test already waited out above. Its objectid is deterministic:
+# wellknown.EveryoneSIDSuffix ("-S-1-1-0") appended to the domain's FQDN,
+# not its SID (getOrCreateWellKnownGroup branches on which well-known
+# principal it is building; Everyone and Authenticated Users take the
+# domain-name branch, unlike Domain Users/Computers). Finding it here is
+# proof that this specific analysis-phase CREATE -- not just the raw
+# ingest that came before it -- was replayed into the in-memory replica by
+# write-through, not merely served by the boot rebuild counted above.
+LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
+TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+[ -n "$TOKEN" ] || { echo "could not obtain a session token for the zero-rebuild phase" >&2; exit 1; }
+
+EVERYONE_OID="TESTLAB.LOCAL-S-1-1-0"
+everyone_query="MATCH (n) WHERE n.objectid = '$EVERYONE_OID' RETURN n LIMIT 1"
+everyone_body="$(jq -n --arg q "$everyone_query" '{query:$q}')"
+everyone_code="$(curl -s -o "$WORK/everyone.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$everyone_body" http://127.0.0.1:8080/api/v2/graphs/cypher)"
+[ "$everyone_code" = "200" ] || { echo "POST /api/v2/graphs/cypher (well-known Everyone lookup) returned HTTP $everyone_code" >&2; cat "$WORK/everyone.json" >&2; exit 1; }
+everyone_nodes="$(jq '.data.nodes | length' "$WORK/everyone.json")"
+[ "$everyone_nodes" -ge 1 ] || { echo "the domain's well-known Everyone principal ($EVERYONE_OID), created by analysis post-processing, was not found" >&2; cat "$WORK/everyone.json" >&2; exit 1; }
+
+bh_logs
+rebuilt_after_query="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
+[ "$rebuilt_after_query" -eq "$rebuilt_after_ingest" ] || { echo "a rebuild was logged between ingest completion and the analysis-created-node query (count $rebuilt_after_ingest -> $rebuilt_after_query); write-through's zero-rebuild guarantee did not hold" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
 
 echo "==> Querying the path engine directly"
 # The fixture's built-in Administrator (RID 500) is a direct MemberOf member
@@ -96,21 +157,18 @@ served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true
 served_delta=$((served_after - served_before))
 [ "$served_delta" -ge 1 ] || { echo "the path engine did not serve GET /api/v2/graphs/shortest-path (\"path engine served\" count $served_before -> $served_after, delta $served_delta); PostgreSQL answered instead" >&2; exit 1; }
 
-# The POST below is exercised here too (proving the endpoint is live before
-# the debug-logging restart further down), but its own serving marker is
-# deliberately not asserted at this point: milestone 4 rewired the cypher
-# endpoint off servePathQuery entirely, so it no longer touches the Info
-# "bloodtrail: path engine served" line checked above, and instead logs its
-# own "bloodtrail: cypher engine served" (see internal/engine/engine.go's
-# TryCypher/cypherServedLogMessage) at Debug -- which stays invisible until
-# BLOODTRAIL_LOG_LEVEL=debug reaches the container, and that only happens at
-# the restart below (see its own comment for why it can't simply move
-# earlier: doing so before the "trigger":"analysis" wait above would drop
-# the pre-recreate log history and swap that wait's required trigger for a
-# "startup" one). The dedicated "Querying the Cypher interpreter directly"
-# phase further down -- which runs after that restart, with debug logging
-# already active -- is what actually asserts the cypher engine served this
-# endpoint instead of PostgreSQL.
+# The POST below is exercised here too (proving the endpoint is live), but
+# its own serving marker is deliberately not asserted at this point:
+# the cypher endpoint is no longer wired through servePathQuery at all, so
+# it no longer touches the Info "bloodtrail: path engine served" line
+# checked above, and instead logs its own "bloodtrail: cypher engine served"
+# (see internal/engine/engine.go's TryCypher/cypherServedLogMessage) at Debug.
+# BLOODTRAIL_LOG_LEVEL=debug has been active since the container's very
+# first boot (stamped into the base compose file above), so that line is
+# already being written -- but the dedicated "Querying the Cypher
+# interpreter directly" phase further down is what actually asserts it,
+# via its own before/after delta around its own calls; asserting it here
+# too would double-count against that phase's delta.
 cypher="MATCH p=shortestPath((s)-[:MemberOf*1..]->(t:Group)) WHERE s.objectid = '$USER_SID' AND t.objectid ENDS WITH '-512' AND s<>t RETURN p LIMIT 10"
 CYPHER_BODY="$(jq -n --arg q "$cypher" '{query:$q}')"
 cypher_code="$(curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
@@ -119,57 +177,6 @@ cypher_code="$(curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
 [ "$cypher_code" = "200" ] || { echo "POST /api/v2/graphs/cypher returned HTTP $cypher_code" >&2; cat "$WORK/cypher.json" >&2; exit 1; }
 cypher_node_count="$(jq '.data.nodes | length' "$WORK/cypher.json")"
 [ "$cypher_node_count" -gt 0 ] || { echo "POST /api/v2/graphs/cypher returned no nodes" >&2; cat "$WORK/cypher.json" >&2; exit 1; }
-
-echo "==> Enabling debug logging for the builder-served log line"
-# internal/engine/serve_builder.go's servedOp logs "bloodtrail: builder
-# engine served" one level quieter (Debug) than the path engine's Info
-# "bloodtrail: path engine served" used above, deliberately, since a
-# structural node/relationship query is expected to run far more often than
-# a shortest-path one. Debug only surfaces once BLOODTRAIL_LOG_LEVEL=debug
-# reaches the bloodhound service, and settings.go's SettingsFromEnv (called
-# once from driver.go at driver construction) only ever reads that
-# environment variable at process start, so it takes a container recreate to
-# take effect -- there is no live-reconfigure path and no `bloodtrail
-# install` flag for it (see cmd/bloodtrail/main.go's flag set). The smallest
-# mechanism is editing the override file `bloodtrail install` already wrote
-# (compose.OverrideFileName, rendered by compose.Override.Render with the
-# `bhe_graph_driver` entry already in it) and reapplying it with the same
-# two -f files the installer itself merges via dockerx.Compose.WithExtraFile
-# -- `bloodtrail rollback` only ever os.Remove()s this file wholesale, so
-# editing its contents here does not confuse it.
-#
-# This restart is deliberately placed here, after the path phase, rather
-# than right after `install` returns (which would be earlier, and was
-# considered): the fixture's ingest+analysis already ran as part of
-# `install --admin-password`'s own smoke test (internal/installer's
-# runVerification), inside the single container instance install itself
-# started, and that run is what drives the "trigger":"analysis" snapshot
-# rebuild the wait loop above requires. Recreating the container between
-# install and that wait would both drop the pre-recreate container's log
-# history (docker compose logs only ever shows the current container
-# instance) and replace the required "analysis" trigger with a "startup"
-# one (rule (a) in internal/engine/poller.go's decideRebuild -- no snapshot
-# exists yet after a recreate), breaking the existing assertion above.
-# Restarting now, once that wait and the path-phase queries it fed have
-# already passed, costs only one more short wait for the API and the
-# engine's own (now startup-triggered) snapshot rebuild before the builder
-# phase queries it.
-OVERRIDE_FILE="$WORK/docker-compose.bloodtrail.yml"
-awk '{print} /^    environment:$/ { print "      - BLOODTRAIL_LOG_LEVEL=debug" }' "$OVERRIDE_FILE" > "$OVERRIDE_FILE.tmp"
-mv "$OVERRIDE_FILE.tmp" "$OVERRIDE_FILE"
-grep -q "BLOODTRAIL_LOG_LEVEL=debug" "$OVERRIDE_FILE"
-docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" -f "$OVERRIDE_FILE" up -d
-for _ in $(seq 1 90); do api_ready && break; sleep 5; done
-api_ready
-
-echo "==> Waiting for the path engine's snapshot to rebuild after the debug-logging restart"
-snapshot_rebuilt=false
-for _ in $(seq 1 24); do
-  bh_logs
-  if grep -q "snapshot rebuilt" "$WORK/bloodhound-logs.txt"; then snapshot_rebuilt=true; break; fi
-  sleep 5
-done
-[ "$snapshot_rebuilt" = true ] || { echo "the path engine never logged a rebuilt snapshot within 120s of the debug-logging restart" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
 
 echo "==> Querying the builder engine directly"
 # The fixture's Domain Admins group (RID 512) lists the built-in
@@ -188,9 +195,8 @@ echo "==> Querying the builder engine directly"
 # straight against the node's objectid property -- so {object_id} is the AD
 # SID string, exactly what GROUP_SID already holds, not a database row id.
 #
-# The session token from the login above should still be valid (BloodHound
-# records sessions in PostgreSQL, not in the bloodhound process the restart
-# above recreated), but re-authenticate anyway rather than lean on that.
+# The session token from the login above should still be valid (no restart
+# has happened since), but re-authenticate anyway rather than lean on that.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
 TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the builder phase" >&2; exit 1; }
@@ -215,11 +221,11 @@ builder_served_delta=$((served_after - served_before))
 [ "$builder_served_delta" -ge 1 ] || { echo "the builder engine did not serve GET /api/v2/groups/\$GROUP_SID/members (\"builder engine served\" count $served_before -> $served_after, delta $builder_served_delta); PostgreSQL answered instead" >&2; exit 1; }
 
 echo "==> Querying the Cypher interpreter directly"
-# Milestone 4 extends the same in-memory replica to a Cypher interpreter
+# The same in-memory replica also backs a Cypher interpreter
 # (internal/engine.TryCypher), reached through POST /api/v2/graphs/cypher
 # exactly as the path phase above already exercised once (with a
 # hand-written shortestPath text). This phase instead sends two queries
-# copied verbatim from the milestone's own pre-built corpus
+# copied verbatim from BloodHound's own pre-built query corpus
 # (testdata/prebuilt/{selectors,agt}.json), one of each required shape:
 #
 #   - a plain property MATCH (no path, no traversal): selectors.json's
@@ -241,13 +247,12 @@ echo "==> Querying the Cypher interpreter directly"
 # of Domain Admins (RID 512, see the path phase's own comment above), so the
 # shortestPath query is guaranteed at least that one trivial one-hop match.
 #
-# BLOODTRAIL_LOG_LEVEL=debug is already active from the restart above (the
-# builder phase's own debug-logging line only surfaces at that level, and
-# the just-completed builder phase already relied on it), so
-# cypherServedLogMessage's Debug line ("bloodtrail: cypher engine served",
-# see internal/engine/engine.go) is visible here too without another
-# restart. The session token from the builder phase above is still valid
-# (no restart happened in between).
+# BLOODTRAIL_LOG_LEVEL=debug has been active since the container's very
+# first boot (the builder phase above already relied on this for its own
+# Debug-level marker), so cypherServedLogMessage's Debug line ("bloodtrail:
+# cypher engine served", see internal/engine/engine.go) is visible here
+# too. The session token from the builder phase above is still valid (no
+# restart happened in between).
 CYPHER_PLAIN_MATCH="$(cat <<'CYPHER_EOF'
 MATCH (n:Group)
 WHERE n.objectid ENDS WITH '-512'
@@ -285,6 +290,120 @@ bh_logs
 served_after="$(grep -c "cypher engine served" "$WORK/bloodhound-logs.txt" || true)"
 cypher_served_delta=$((served_after - served_before))
 [ "$cypher_served_delta" -ge 2 ] || { echo "the cypher interpreter did not serve both corpus queries (\"cypher engine served\" count $served_before -> $served_after, delta $cypher_served_delta); PostgreSQL answered instead" >&2; exit 1; }
+
+echo "==> Enabling the snapshot file for a graceful-restart persistence check"
+# BLOODTRAIL_SNAPSHOT_DIR (settings.go's EnvSnapshotDir) turns on the
+# snapshot-file boot/save cycle: on a clean shutdown, Driver.Close saves a
+# fold of the engine's current View to <dir>/graph-<id>.btsnap
+# (internal/engine/persist.go's SaveSnapshot), and a later Start's boot-load
+# goroutine tries reading that file back before spending a full PostgreSQL
+# rebuild (internal/engine/boot.go's tryLoadSnapshotFile) -- gated on the
+# file's embedded watermark exactly matching PostgreSQL's own watermark
+# counter at that moment (63906a9 fixed the boot-side half of this: the
+# attempt used to run before the driver's default graph could possibly be
+# known, making the file unreachable in production regardless of what it
+# held; 1f57046 fixed the save-side half, below).
+#
+# A bind mount onto the host filesystem, not the container's own writable
+# layer, is required here: this override-file edit is applied below with
+# `docker compose ... up -d`, and `up -d` after a compose config change
+# RECREATES the container -- discarding its writable layer -- whereas the
+# `docker compose restart` this phase actually means to test, further
+# down, does not. Without a mount surviving that recreate, the very first
+# boot under the new config would find no file (same as every boot
+# before it), and the restart that follows would too, making the
+# assertions below vacuous.
+#
+# OVERRIDE_FILE is the file `bloodtrail install` already wrote
+# (compose.OverrideFileName, rendered by compose.Override.Render with the
+# `bhe_graph_driver` entry already in it, so it always has an
+# "environment:" section to extend) and reapplies with the same two -f
+# files the installer itself merges via dockerx.Compose.WithExtraFile --
+# `bloodtrail rollback` only ever os.Remove()s this file wholesale, so
+# editing its contents here does not confuse it.
+OVERRIDE_FILE="$WORK/docker-compose.bloodtrail.yml"
+SNAPSHOT_HOST_DIR="$WORK/snapshot-data"
+SNAPSHOT_CONTAINER_DIR="/data/bloodtrail-snapshots"
+mkdir -p "$SNAPSHOT_HOST_DIR"
+awk -v hostdir="$SNAPSHOT_HOST_DIR" -v ctdir="$SNAPSHOT_CONTAINER_DIR" '
+  { print }
+  /^    image:/ { print "    volumes:"; print "      - " hostdir ":" ctdir }
+  /^    environment:$/ { print "      - BLOODTRAIL_SNAPSHOT_DIR=" ctdir }
+' "$OVERRIDE_FILE" > "$OVERRIDE_FILE.tmp"
+mv "$OVERRIDE_FILE.tmp" "$OVERRIDE_FILE"
+grep -q "BLOODTRAIL_SNAPSHOT_DIR=$SNAPSHOT_CONTAINER_DIR" "$OVERRIDE_FILE"
+grep -q "$SNAPSHOT_HOST_DIR:$SNAPSHOT_CONTAINER_DIR" "$OVERRIDE_FILE"
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" -f "$OVERRIDE_FILE" up -d
+for _ in $(seq 1 90); do api_ready && break; sleep 5; done
+api_ready
+
+echo "==> Restarting the API container to prove the snapshot file survives it"
+# The point of this phase is narrower than "serves correctly after a
+# restart": a boot that silently fell back to a full PostgreSQL rebuild
+# would still answer the query below correctly, which would make a check
+# that stopped there pass vacuously. Proving the FILE -- not a rebuild that
+# happens to produce the same answer -- was actually used needs all three
+# marker assertions below together: a shutdown-time write, a boot-time
+# load that is neither "rejected" nor silently absent, and (the strongest
+# of the three) zero new "snapshot rebuilt" lines from this boot --
+# tryLoadSnapshotFile's successful path returns before rebuildOnce is ever
+# called (boot.go), so a genuine file load costs exactly zero rebuilds, by
+# construction.
+#
+# `docker compose restart` -- unlike the `up -d` calls above and below,
+# which recreate the container because the compose config just changed --
+# sends SIGTERM to the same container's still-running process and starts
+# it again in place once it exits, with no config change to react to. A
+# generous --timeout keeps a slow fold+write from ever racing SIGKILL on
+# this tiny fixture graph, though the graph is small enough that this
+# should never bind in practice: the save this phase measures folds and
+# writes 118 nodes / 974 edges in about 7ms, four orders of magnitude
+# inside even the 10s default.
+#
+# The shutdown-side assertion is what earns this phase a real container
+# stop rather than a driver-level test. The save runs inside Driver.Close,
+# on the context BloodHound's own shutdown hands it -- which is always
+# ALREADY CANCELLED, because that cancellation is precisely what releases
+# the wait that reaches the deferred Close at all. A save reading
+# PostgreSQL on such a context can never converge, and declines with a
+# single Debug line; nothing errors, nothing warns, and the next boot
+# rebuilds exactly as if the feature were switched off. That is a defect
+# only a signal-driven shutdown reproduces -- every driver test that
+# closed with a live context passed throughout -- so this phase, which
+# stops the container the way an operator does, is the end-to-end guard
+# for it. See driver.go's Close for the fix and its own regression test.
+bh_logs
+written_before="$(grep -c "bloodtrail: snapshot file written" "$WORK/bloodhound-logs.txt" || true)"
+loaded_before="$(grep -c "bloodtrail: snapshot file loaded" "$WORK/bloodhound-logs.txt" || true)"
+rejected_before="$(grep -c "bloodtrail: snapshot file rejected" "$WORK/bloodhound-logs.txt" || true)"
+rebuilt_before="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
+
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" -f "$OVERRIDE_FILE" restart --timeout 30 bloodhound
+for _ in $(seq 1 90); do api_ready && break; sleep 5; done
+api_ready
+
+bh_logs
+written_after="$(grep -c "bloodtrail: snapshot file written" "$WORK/bloodhound-logs.txt" || true)"
+loaded_after="$(grep -c "bloodtrail: snapshot file loaded" "$WORK/bloodhound-logs.txt" || true)"
+rejected_after="$(grep -c "bloodtrail: snapshot file rejected" "$WORK/bloodhound-logs.txt" || true)"
+rebuilt_after="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
+
+[ "$((written_after - written_before))" -ge 1 ] || { echo "the shutdown triggered by \"docker compose restart\" never logged \"snapshot file written\" (count $written_before -> $written_after); the graceful-shutdown save did not run" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+[ "$((rejected_after - rejected_before))" -eq 0 ] || { echo "the restart's boot rejected the snapshot file it had just written (\"snapshot file rejected\" count $rejected_before -> $rejected_after)" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+[ "$((loaded_after - loaded_before))" -ge 1 ] || { echo "the restart's boot never logged \"snapshot file loaded\" (count $loaded_before -> $loaded_after); it did not use the file" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+[ "$((rebuilt_after - rebuilt_before))" -eq 0 ] || { echo "the restart's boot logged a snapshot rebuild (\"snapshot rebuilt\" count $rebuilt_before -> $rebuilt_after) despite also logging a file load; it silently fell back to a PostgreSQL rebuild instead of proving the file was used" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+ls "$SNAPSHOT_HOST_DIR"/graph-*.btsnap >/dev/null 2>&1 || { echo "no graph-*.btsnap file found on the bind-mounted host directory $SNAPSHOT_HOST_DIR after the restart" >&2; exit 1; }
+
+echo "==> Querying after the restart to confirm the reloaded snapshot serves correctly"
+LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
+TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+[ -n "$TOKEN" ] || { echo "could not obtain a session token after the restart" >&2; exit 1; }
+restart_code="$(curl -s -o "$WORK/restart-shortest-path.json" -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/v2/graphs/shortest-path?start_node=$USER_SID&end_node=$GROUP_SID")"
+[ "$restart_code" = "200" ] || { echo "GET /api/v2/graphs/shortest-path after the restart returned HTTP $restart_code" >&2; cat "$WORK/restart-shortest-path.json" >&2; exit 1; }
+restart_node_count="$(jq '.data.nodes | length' "$WORK/restart-shortest-path.json")"
+[ "$restart_node_count" -gt 0 ] || { echo "GET /api/v2/graphs/shortest-path after the restart returned no nodes" >&2; cat "$WORK/restart-shortest-path.json" >&2; exit 1; }
 
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
