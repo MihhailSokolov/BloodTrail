@@ -27,9 +27,7 @@ import (
 // node (including its property bag) ordered by id, then every edge, feeding
 // all three into a snapshot.Builder, and finally runs the multi-graph probe
 // (see probeMultiGraph). Build assigns dense NodeIDs in the node scan's
-// ascending order and stamps the snapshot's BuiltAt; Generation and
-// AnalysisStamp are left zero for the engine and poller (Tasks 10 and 12) to
-// set later.
+// ascending order and stamps the snapshot's BuiltAt.
 func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) (*snapshot.Snapshot, error) {
 	graphModel, ok := pgDriver.DefaultGraph()
 	if !ok {

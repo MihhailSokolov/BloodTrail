@@ -130,9 +130,6 @@ func TestViewMirrorsBase(t *testing.T) {
 	if got, want := v.MultiGraph(), s.MultiGraph; got != want {
 		t.Fatalf("MultiGraph() = %v, want %v", got, want)
 	}
-	if got, want := v.Generation(), s.Generation; got != want {
-		t.Fatalf("Generation() = %d, want %d", got, want)
-	}
 	if got, want := v.ApproxBytes(), s.ApproxBytes(); got != want {
 		t.Fatalf("ApproxBytes() = %d, want %d", got, want)
 	}

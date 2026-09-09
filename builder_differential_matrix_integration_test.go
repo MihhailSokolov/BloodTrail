@@ -108,7 +108,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
@@ -989,12 +988,12 @@ func runBuilderQueryDifferentialMatrix(t *testing.T, ctx context.Context, bt, or
 func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	// Long enough that the poller's own background ticker never fires
-	// during this test, so every snapshot observed below is the direct,
-	// deterministic result of this test's own RebuildNow calls -- no race
-	// against a background rebuild. Must be set before dawgs.Open: Settings
-	// are read from the environment exactly once, at Open time.
-	t.Setenv(EnvEnginePollInterval, "1h")
+	// Every snapshot observed below is the direct, deterministic result of
+	// this test's own RebuildNow calls, each made right after loading that
+	// graph's own data -- Start's boot-load rebuild (driver.go) may land at
+	// any point before that, against whatever state happened to exist then,
+	// but it is always superseded by this test's own explicit RebuildNow
+	// before any comparison runs, so it needs no suppression here.
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1037,7 +1036,7 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		for _, path := range builderMatrixFixturePaths {
 			graphtest.LoadDataset(t, pgDriver, path)
 		}
-		if err := d.engine.RebuildNow(ctx, "matrix_test", time.Time{}); err != nil {
+		if err := d.engine.RebuildNow(ctx, "matrix_test"); err != nil {
 			t.Fatalf("RebuildNow: %v", err)
 		}
 
@@ -1050,7 +1049,7 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		t.Run(fmt.Sprintf("random/seed=%d", seed), func(t *testing.T) {
 			graphtest.WipeGraph(t, pgDriver)
 			loadBuilderMatrixRandomGraph(t, pgDriver, seed)
-			if err := d.engine.RebuildNow(ctx, "matrix_test", time.Time{}); err != nil {
+			if err := d.engine.RebuildNow(ctx, "matrix_test"); err != nil {
 				t.Fatalf("RebuildNow (seed=%d): %v", seed, err)
 			}
 

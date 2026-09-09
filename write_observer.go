@@ -28,27 +28,22 @@ const (
 
 // observingTransaction wraps a live graph.Transaction so that Driver.
 // WriteTransaction (driver.go) can learn -- from the very same calls the
-// caller was always going to make -- which node and edge kinds a write
-// touched, instead of the all-or-nothing "something changed" a bare
-// engine.NoteWrite(nil) reports. Every override records onto scope before
-// (or, for Query, without knowing whether it needs to) delegating to the
-// inner transaction; the one call this file does not override
+// caller was always going to make -- the ChangeSet (changes.go) Apply
+// (apply.go) needs to replay the write into the in-memory engine: the
+// actual read-back keys (node/edge database ids, or the objectid values an
+// upsert identified its target by), or, where a key can't be pinned down, a
+// fallback record naming why. Every override records onto scope before (or,
+// for Query, without knowing whether it needs to) delegating to the inner
+// transaction; the one call this file does not override
 // (GraphQueryMemoryLimit) is promoted straight through by embedding,
 // unchanged. Commit IS overridden, below, for its own reason.
-//
-// UpdateRelationship IS overridden (see its own doc below), but only to
-// record a ChangeSet read-back key -- it adds no Touch call: a graph.
-// Relationship's Kind is fixed at creation (relationships.go has no
-// AddedKind/DeletedKind concept the way graph.Node does), so updating one
-// only ever changes properties, which the kind-scoped marks correctly leave
-// untouched.
 //
 // The zero value is not useful; construct one with a non-nil scope. scope is
 // shared with every observingNodeQuery/observingRelationshipQuery this
 // transaction hands out (Nodes/Relationships below) and with the
 // observingTransaction WithGraph returns, so every write reachable from one
 // WriteTransaction call accumulates onto the one scope Driver.
-// WriteTransaction hands to engine.NoteWrite once the call succeeds.
+// WriteTransaction hands to engine.Apply once the call succeeds.
 //
 // eng is used by Commit alone, to flush scope immediately on a
 // delegate-issued mid-transaction commit, mirroring observingBatch's own eng
@@ -91,14 +86,12 @@ type observingTransaction struct {
 
 // wrote reports whether this transaction has recorded any write onto scope
 // since Driver.WriteTransaction (driver.go) began it -- equivalently,
-// whether scope is non-empty (engine.WriteScope.Empty's doc: no kinds named,
-// no deletions or upserts recorded, and neither TouchAllNodes nor
-// TouchAllEdges called).
+// whether scope's ChangeSet is non-empty (engine.WriteScope.Empty's doc).
 //
 // Once wrote() is true, PostgreSQL -- never this package's in-memory engine
 // -- is the only source of truth for any further read run against this same
 // transaction: the engine's snapshot is only ever brought up to date by the
-// NoteWrite call Driver.WriteTransaction (or, for a mid-transaction commit,
+// Apply call Driver.WriteTransaction (or, for a mid-transaction commit,
 // Commit below) makes once a write is known to have landed, so by
 // construction it cannot yet reflect a write this same transaction is still
 // in the middle of. See the type doc above for why nothing on this type's
@@ -108,13 +101,10 @@ func (t *observingTransaction) wrote() bool {
 	return !t.scope.Empty()
 }
 
-// CreateNode touches every kind the new node is created with -- a brand new
-// node's Kinds is exactly the set of kinds that comes into existence -- then
-// delegates, and, once the delegate reports success, records the new
-// node's own database id (only ever known from its return value, which
-// this method used to discard) as a ChangeSet read-back key.
+// CreateNode delegates, then, once the delegate reports success, records
+// the new node's own database id (only ever known from its return value,
+// which this method used to discard) as a ChangeSet read-back key.
 func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ...graph.Kind) (*graph.Node, error) {
-	t.scope.TouchNodeKinds(kinds)
 	node, err := t.Transaction.CreateNode(properties, kinds...)
 	if err == nil && node != nil {
 		t.scope.Changes().RecordNodeID(node.ID)
@@ -122,40 +112,22 @@ func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ..
 	return node, err
 }
 
-// UpdateNode touches node's AddedKinds and DeletedKinds -- the label delta
-// this call actually applies -- when either is non-empty, and touches
-// nothing otherwise: UpdateNode never creates (see graph.Transaction's own
-// doc, "will not create missing Node entries"), so a node with neither
-// AddedKinds nor DeletedKinds set is a pure property update, which no kind
-// mark needs to reflect. node's base Kinds field is deliberately not touched
-// here -- unlike observingBatch.UpdateNodeBy's upsert case below, this call
-// can only ever be touching a node the graph already had, so Kinds carries
-// no information the delta doesn't already capture.
-//
-// This is verified, not assumed, against dawgs' actual pg driver: the
-// tx-level UpdateNode this call delegates to (drivers/pg/transaction.go)
-// reads only node.AddedKinds and node.DeletedKinds when building its
-// AddKinds/DeleteKinds update statements -- it never references node.Kinds.
-// So the delta this method touches is exactly, not just approximately, the
-// database's real kind-membership effect; contrast observingBatch.
-// UpdateNodes below, whose analogous-looking pg batch write path does read
-// node.Kinds and therefore needs an additional UpsertNodeKinds call (see
-// touchNodeKindDelta's doc for the side-by-side comparison).
+// UpdateNode records node's own database id as a ChangeSet read-back key
+// unconditionally, before delegating: the applier's read-back re-reads
+// whatever PostgreSQL's row actually holds after the update, regardless of
+// whether this particular call changed labels, properties, or both.
 func (t *observingTransaction) UpdateNode(node *graph.Node) error {
-	touchNodeKindDelta(t.scope, node)
 	if node != nil {
 		t.scope.Changes().RecordNodeID(node.ID)
 	}
 	return t.Transaction.UpdateNode(node)
 }
 
-// CreateRelationshipByIDs touches kind -- the only kind the new relationship
-// can carry -- then delegates, and, once the delegate reports success,
-// records the new relationship's own database id (only ever known from its
-// return value, which this method used to discard) as a ChangeSet
+// CreateRelationshipByIDs delegates, then, once the delegate reports
+// success, records the new relationship's own database id (only ever known
+// from its return value, which this method used to discard) as a ChangeSet
 // read-back key.
 func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) (*graph.Relationship, error) {
-	t.scope.TouchEdgeKind(kind)
 	rel, err := t.Transaction.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
 	if err == nil && rel != nil {
 		t.scope.Changes().RecordEdgeID(rel.ID)
@@ -164,24 +136,12 @@ func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID gr
 }
 
 // UpdateRelationship records relationship's own database id as a ChangeSet
-// read-back key -- unconditionally, before delegating -- mirroring
-// UpdateNode's identical "record regardless of what the call turns out to
-// touch" reasoning (see UpdateNode's own doc): relationship.ID is already
-// known from the argument itself (unlike CreateRelationshipByIDs' captured
-// return), so there is no reason to wait on the delegate's outcome the way
-// a captured-return call must. A write-through applier needs this edge id
-// key every time this call runs, even though it is property-only.
-//
-// No Touch call is added here, and none is needed: a graph.Relationship's
-// Kind is fixed at creation (relationships.go has no AddedKind/DeletedKind
-// concept the way graph.Node does), so this call only ever changes
-// properties -- nothing the kind-scoped marks need to reflect. Before
-// ChangeSet capture existed, that was reason enough to leave this call
-// promoted straight through, unobserved, by embedding -- the type doc's
-// pre-ChangeSet history. A write-through applier's changelog cannot
-// tolerate a write it never observes at all, so this override now exists to
-// record the ChangeSet entry, while correctly leaving the marks side
-// exactly as untouched as it always was.
+// read-back key -- unconditionally, before delegating: relationship.ID is
+// already known from the argument itself (unlike CreateRelationshipByIDs'
+// captured return), so there is no reason to wait on the delegate's outcome
+// the way a captured-return call must. A write-through applier needs this
+// edge id key every time this call runs, even though it only ever changes
+// properties (a graph.Relationship's Kind is fixed at creation).
 func (t *observingTransaction) UpdateRelationship(relationship *graph.Relationship) error {
 	if relationship != nil {
 		t.scope.Changes().RecordEdgeID(relationship.ID)
@@ -200,21 +160,21 @@ func (t *observingTransaction) Nodes() graph.NodeQuery {
 }
 
 // Relationships returns an observingRelationshipQuery wrapping the inner
-// transaction's own RelationshipQuery, so a subsequent Delete() on it has a
-// chance to scope more narrowly than TouchAllEdges (see
-// observingRelationshipQuery.Delete's doc). See Nodes' doc immediately above
-// for the identical composition-point note.
+// transaction's own RelationshipQuery, so a subsequent Delete() or Update()
+// on it can still reach scope. See Nodes' doc immediately above for the
+// identical composition-point note.
 func (t *observingTransaction) Relationships() graph.RelationshipQuery {
 	return &observingRelationshipQuery{RelationshipQuery: t.Transaction.Relationships(), scope: t.scope}
 }
 
 // Query sniffs query for a Cypher updating clause (cypherMutates) and, if
-// found, marks the whole scope dirty -- raw Cypher text can do anything a
+// found, records a ChangeSet fallback: raw Cypher text can do anything a
 // CREATE/SET/REMOVE/DELETE/MERGE clause allows, and nothing short of a full
-// recognizer (out of scope here) could say which kinds narrower than "all"
-// it actually touched. query always runs against the inner transaction
-// regardless of what cypherMutates reports; the sniff only ever adds a scope
-// mark, never blocks or rewrites the call itself.
+// recognizer (out of scope here) could say what it actually touched, so
+// the only sound answer for the applier is the same one a nil write scope
+// gives. query always runs against the inner transaction regardless of what
+// cypherMutates reports; the sniff only ever adds a scope mark, never blocks
+// or rewrites the call itself.
 //
 // This method never attempts to serve query from the engine, whether or not
 // wrote() is true: t.Transaction is always the driver's raw
@@ -227,25 +187,22 @@ func (t *observingTransaction) Relationships() graph.RelationshipQuery {
 // reports true.
 func (t *observingTransaction) Query(query string, parameters map[string]any) graph.Result {
 	if cypherMutates(query) {
-		t.scope.TouchAll()
 		t.scope.Changes().RecordFallback("Query: mutating Cypher escapes changelog tracking")
 	}
 	return t.Transaction.Query(query, parameters)
 }
 
-// Raw always marks the whole scope dirty: unlike Query, whose text is at
+// Raw always records a ChangeSet fallback: unlike Query, whose text is at
 // least Cypher that cypherMutates can attempt to classify, Raw's query is
 // driver-specific (SQL, for the PostgreSQL backend this driver wraps) and
-// this package has no way to parse it at all -- the only sound answer is the
-// same conservative one NoteWrite gives a nil scope.
+// this package has no way to parse it at all.
 func (t *observingTransaction) Raw(query string, parameters map[string]any) graph.Result {
-	t.scope.TouchAll()
 	t.scope.Changes().RecordFallback("Raw: driver-specific query escapes changelog tracking")
 	return t.Transaction.Raw(query, parameters)
 }
 
-// WithGraph marks the whole scope dirty -- a transaction retargeted at a
-// non-default graph is outside anything this package's kind-scoped tracking
+// WithGraph records a ChangeSet fallback -- a transaction retargeted at a
+// non-default graph is outside anything this package's changelog tracking
 // reasons about, mirroring wrappedTransaction.WithGraph's own "declined"
 // treatment on the read side -- and returns a fresh observingTransaction
 // wrapping the inner WithGraph's result, sharing the *same* scope (so writes
@@ -253,7 +210,6 @@ func (t *observingTransaction) Raw(query string, parameters map[string]any) grap
 // WriteTransaction call will eventually report) and the same eng (so Commit
 // still works correctly on the retargeted wrapper).
 func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transaction {
-	t.scope.TouchAll()
 	t.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
 	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng, ctx: t.ctx}
 }
@@ -307,41 +263,6 @@ func applyContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
-}
-
-// touchNodeKindDelta marks scope with node's AddedKinds and DeletedKinds
-// when either is non-empty, and does nothing otherwise. This is the shared
-// rule behind observingTransaction.UpdateNode and observingBatch.
-// UpdateNodes -- both calls that only ever update a node already known to
-// exist (contrast observingBatch.UpdateNodeBy, an upsert that may instead be
-// creating the node, where the base Kinds field must be touched too; see
-// that method's doc).
-//
-// For observingTransaction.UpdateNode this delta IS the whole story: dawgs'
-// pg driver's tx-level UpdateNode (drivers/pg/transaction.go) builds its
-// update statement solely from query.AddKinds(query.Node(), node.AddedKinds)
-// and query.DeleteKinds(query.Node(), node.DeletedKinds) when each is
-// non-empty -- it never reads node.Kinds at all -- so there is no
-// information a Kinds-only touch could add. This is a verified fact about
-// the real driver, not an assumption; see observingTransaction.UpdateNode's
-// own doc.
-//
-// For observingBatch.UpdateNodes, by contrast, this delta is only PART of
-// the story: dawgs' pg driver's batch UpdateNodes additionally unions the
-// node's full Kinds field into the database row regardless of AddedKinds
-// (NodeUpdateParameters.Append/FormatNodesUpdate in drivers/pg/batch.go and
-// drivers/pg/query/format.go). observingBatch.UpdateNodes therefore calls
-// this AND separately calls scope.UpsertNodeKinds(node.ID, node.Kinds) --
-// see that method's own doc, and engine.WriteScope.UpsertNodeKinds' doc, for
-// why a snapshot-scoped set-difference there is both necessary and
-// sufficient to close the gap this function alone would leave open for that
-// one caller.
-func touchNodeKindDelta(scope *engine.WriteScope, node *graph.Node) {
-	if len(node.AddedKinds) == 0 && len(node.DeletedKinds) == 0 {
-		return
-	}
-	scope.TouchNodeKinds(node.AddedKinds)
-	scope.TouchNodeKinds(node.DeletedKinds)
 }
 
 // observingNodeQuery wraps a live graph.NodeQuery so that Delete() and
@@ -417,23 +338,16 @@ func (q *observingNodeQuery) Limit(limit int) graph.NodeQuery {
 	return q
 }
 
-// Delete marks the whole scope dirty for both nodes and edges before
-// delegating: deleting a node cascades to every edge incident to it (the
-// same reasoning DeleteNodeID's resolution path in engine/marks.go
-// documents for the transaction-level delete-by-id case), and this query's
-// criteria could match nodes of any kind the caller didn't explicitly name
-// -- there is no narrower sound answer without re-deriving exactly which
-// nodes and edges the query's criteria matched, which nothing here attempts.
-// This TouchAllNodes/TouchAllEdges marking is unconditional and unchanged by
-// the ChangeSet recording added below: recognizing an InIDs-shaped criteria
-// only ever adds a narrower changelog entry alongside the same conservative
-// mark, never replaces it (a kind-only node delete goes through
-// Driver.DeleteNodesByKinds instead of this query -- see driver.go -- so
-// this method's own recognizer only ever needs to look for InIDs, not a
-// kind matcher).
+// Delete records either a recognized InIDs target list or a fallback
+// before delegating: this query's criteria could match nodes of any kind
+// the caller didn't explicitly name, and deleting a node cascades to every
+// edge incident to it, so a criteria shape nodeIDsFromCriteria does not
+// recognize gives the applier no sound way to replay this delete narrowly
+// -- RecordFallback is the honest answer (a kind-only node delete goes
+// through Driver.DeleteNodesByKinds instead of this query -- see driver.go
+// -- so this method's own recognizer only ever needs to look for InIDs, not
+// a kind matcher).
 func (q *observingNodeQuery) Delete() error {
-	q.scope.TouchAllNodes()
-	q.scope.TouchAllEdges()
 	if ids, ok := nodeIDsFromCriteria(q.criteria); ok {
 		for _, id := range ids {
 			q.scope.Changes().RecordNodeID(id)
@@ -444,24 +358,9 @@ func (q *observingNodeQuery) Delete() error {
 	return q.NodeQuery.Delete()
 }
 
-// Update touches TouchAllNodes unconditionally before delegating: unlike
-// this file's other overrides, a property-only update was previously left
-// entirely unobserved (NodeQuery.Update only ever sets properties, never
-// labels, so the ORIGINAL kind-scoped marks design deliberately left it
-// promoted -- see this type's pre-ChangeSet doc history). That gating
-// choice was sound for the kind-scoped freshness marks alone: a property
-// change carries no kind information for them to act on. But a
-// write-through applier building a changelog from these overrides cannot
-// tolerate a write it never even observes, so this override both records a
-// ChangeSet entry (a recognized InIDs target list, or a fallback) AND
-// conservatively marks TouchAllNodes -- mirroring Delete's own
-// unconditional, no-narrower-safe-answer marking above -- rather than
-// leaving the pre-ChangeSet "touch nothing" behavior in place. This is a
-// deliberate, narrow behavior change scoped to exactly this newly-added
-// override; every other Touch*/Delete* call site in this file is
-// unchanged.
+// Update records either a recognized InIDs target list or a fallback
+// before delegating, mirroring Delete's own reasoning immediately above.
 func (q *observingNodeQuery) Update(properties *graph.Properties) error {
-	q.scope.TouchAllNodes()
 	if ids, ok := nodeIDsFromCriteria(q.criteria); ok {
 		for _, id := range ids {
 			q.scope.Changes().RecordNodeID(id)
@@ -560,23 +459,17 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 // criteria in this file.
 func (r *observingRelationshipQuery) Delete() error {
 	if kinds, touchAll := relationshipDeleteScope(r.criteria); touchAll {
-		r.scope.TouchAllEdges()
 		r.scope.Changes().RecordFallback("RelationshipQuery.Delete: unrecognized criteria")
 	} else {
-		r.scope.TouchEdgeKinds(kinds)
 		r.scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
 	}
 	return r.RelationshipQuery.Delete()
 }
 
-// Update touches TouchAllEdges unconditionally before delegating, and
-// records either a recognized InIDs target list or a fallback -- the
-// RelationshipQuery half of observingNodeQuery.Update's identical
-// reasoning; see its doc for the full explanation of why this newly-added
-// override marks TouchAllEdges where the pre-ChangeSet design left
-// property-only updates unobserved.
+// Update records either a recognized InIDs target list or a fallback
+// before delegating -- the RelationshipQuery half of
+// observingNodeQuery.Update's identical reasoning.
 func (r *observingRelationshipQuery) Update(properties *graph.Properties) error {
-	r.scope.TouchAllEdges()
 	if ids, ok := edgeIDsFromCriteria(r.criteria); ok {
 		for _, id := range ids {
 			r.scope.Changes().RecordEdgeID(id)
@@ -588,16 +481,13 @@ func (r *observingRelationshipQuery) Update(properties *graph.Properties) error 
 }
 
 // relationshipDeleteScope decides what an observingRelationshipQuery.
-// Delete() call should mark, given every criteria its caller filtered by --
-// for two consumers with different soundness requirements. The
-// TouchEdgeKinds mark only ever needs to be a safe superset (invalidating
-// more than necessary costs nothing but a wasted rebuild trigger), but the
-// RecordDeleteRelationshipsByKinds ChangeSet entry is replayed verbatim by
-// the applier (apply.go) to decide which edges to tombstone in the
-// in-memory replica -- there, a reported kind set that is too WIDE is
-// unsound: PostgreSQL only deleted the rows also matching whatever else the
-// query narrowed by, so the applier would tombstone edges PostgreSQL never
-// touched.
+// Delete() call's ChangeSet entry should be, given every criteria its
+// caller filtered by: the RecordDeleteRelationshipsByKinds entry it feeds
+// is replayed verbatim by the applier (apply.go) to decide which edges to
+// tombstone in the in-memory replica, so a reported kind set that is too
+// WIDE is unsound there -- PostgreSQL only deleted the rows also matching
+// whatever else the query narrowed by, so the applier would tombstone
+// edges PostgreSQL never touched.
 //
 // When exactly one criteria was recorded and edgeKindsFromCriteria
 // recognizes it with a non-empty result, kinds is that result and touchAll
@@ -622,15 +512,14 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 	return nil, true
 }
 
-// edgeKindsFromCriteria is a minimal stand-in for Task 4's
-// recognize.FromRelCriteria (not written as of this file): it recognizes
-// just enough of a relationship-delete's criteria to scope the delete
-// soundly for BOTH of relationshipDeleteScope's consumers (see its doc),
-// without depending on a recognizer package that doesn't exist yet. Since
-// Task 11, one of those consumers (RecordDeleteRelationshipsByKinds) is
-// replayed verbatim by the applier, so the reported kinds must describe
-// EXACTLY what the delete removes, not merely a safe-to-over-invalidate
-// approximation.
+// edgeKindsFromCriteria is a minimal stand-in for a not-yet-written
+// recognize.FromRelCriteria: it recognizes just enough of a
+// relationship-delete's criteria to scope the delete soundly for
+// relationshipDeleteScope's RecordDeleteRelationshipsByKinds ChangeSet
+// entry (see its doc), without depending on a recognizer package that
+// doesn't exist yet. That entry is replayed verbatim by the applier, so the
+// reported kinds must describe EXACTLY what the delete removes, not merely
+// a safe-to-over-invalidate approximation.
 //
 // Recognized shapes are a bare *cypher.KindMatcher over the relationship
 // variable "r" (what dawgs' query.Kind(query.Relationship(), k)/
@@ -640,13 +529,14 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 // kinds: a delete matching kind K1 or K2 still only touches K1 and K2's
 // edges.
 //
-// This is deliberately NOT the "ignore what you don't recognize" pattern
-// this file's other recognizers use for a mark, where over-invalidating is
-// always safe. A Conjunction additionally narrowed by, say, a property
-// filter or an endpoint id removes only a SUBSET of the named kinds' edges,
-// which means the kinds this function would otherwise report describe a
-// SUPERSET of what the query actually deletes -- fine for a mark, but
-// unsound to hand the applier as an exact tombstone criteria (it would then
+// This is deliberately NOT the "ignore what you don't recognize, fall back
+// to RecordFallback" pattern this file's other recognizers use, where
+// over-invalidating is always safe. A Conjunction additionally narrowed by,
+// say, a property filter or an endpoint id removes only a SUBSET of the
+// named kinds' edges, which means the kinds this function would otherwise
+// report describe a SUPERSET of what the query actually deletes -- fine
+// for a plain safe-superset fallback, but unsound to hand the applier as
+// an exact tombstone criteria (it would then
 // delete edges PostgreSQL never touched). So any conjunct that is not
 // itself a bare relationship KindMatcher -- whatever kind of expression it
 // is, or a KindMatcher over the wrong variable -- fails the WHOLE
@@ -804,14 +694,14 @@ func singleInIDsCriteria(criteria graph.Criteria, wantSymbol string) ([]graph.ID
 }
 
 // observingBatch wraps a live graph.Batch so that Driver.BatchOperation
-// (driver.go) can learn which node and edge kinds a batch touched, the same
-// way observingTransaction does for WriteTransaction. graph.Batch has no
-// method this file leaves promoted unmodified -- every one of its methods
-// either changes graph data (and so needs a scope mark) or is Commit, which
-// this file overrides for its own reason (see Commit's doc) -- so, unlike
-// the other wrappers in this file, embedding graph.Batch here exists only to
-// satisfy the interface's method set at compile time, not to promote
-// anything.
+// (driver.go) can learn the ChangeSet a batch's writes need to be replayed
+// into the in-memory engine, the same way observingTransaction does for
+// WriteTransaction. graph.Batch has no method this file leaves promoted
+// unmodified -- every one of its methods either changes graph data (and so
+// needs a ChangeSet entry) or is Commit, which this file overrides for its
+// own reason (see Commit's doc) -- so, unlike the other wrappers in this
+// file, embedding graph.Batch here exists only to satisfy the interface's
+// method set at compile time, not to promote anything.
 //
 // The zero value is not useful; construct one with a non-nil scope and eng.
 // eng is only ever used by Commit, to flush scope immediately rather than
@@ -839,14 +729,12 @@ func (b *observingBatch) wrote() bool {
 	return !b.scope.Empty()
 }
 
-// CreateNode touches every kind the new node carries, then delegates, then,
-// once the delegate reports success, records a ChangeSet read-back key for
-// the write via recordBatchCreateNodeIdentity -- see that function's own
-// doc for exactly which of node.ID or an "objectid" property it prefers,
-// and why a create that offers neither records a fallback instead of an
-// enumerable key.
+// CreateNode delegates, then, once the delegate reports success, records a
+// ChangeSet read-back key for the write via recordBatchCreateNodeIdentity --
+// see that function's own doc for exactly which of node.ID or an "objectid"
+// property it prefers, and why a create that offers neither records a
+// fallback instead of an enumerable key.
 func (b *observingBatch) CreateNode(node *graph.Node) error {
-	b.scope.TouchNodeKinds(node.Kinds)
 	err := b.Batch.CreateNode(node)
 	if err == nil {
 		recordBatchCreateNodeIdentity(b.scope, node)
@@ -905,24 +793,16 @@ func recordBatchCreateNodeIdentity(scope *engine.WriteScope, node *graph.Node) {
 // same failure shape retriever/load.go's own assertion-failure branch
 // already produces for a batch with no bulk-create support at all.
 //
-// Each input node's Kinds are touched before delegating (mirroring
-// CreateNode's own before-delegate touch), and, once the delegate reports
-// success, every returned id is recorded onto the ChangeSet as a read-back
-// key (RecordNodeID) -- the ids are documented to align index-for-index
-// with nodes (graph.NodeBatchCreator's own doc: "returns generated IDs in
-// input order"), but this only needs the ids themselves, not that
-// alignment, so no attempt is made to pair a specific id back to a
-// specific input node.
+// Once the delegate reports success, every returned id is recorded onto the
+// ChangeSet as a read-back key (RecordNodeID) -- the ids are documented to
+// align index-for-index with nodes (graph.NodeBatchCreator's own doc:
+// "returns generated IDs in input order"), but this only needs the ids
+// themselves, not that alignment, so no attempt is made to pair a specific
+// id back to a specific input node.
 func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 	creator, ok := b.Batch.(graph.NodeBatchCreator)
 	if !ok {
 		return nil, fmt.Errorf("bloodtrail: batch %T does not support correlated bulk node creation", b.Batch)
-	}
-
-	for _, node := range nodes {
-		if node != nil {
-			b.scope.TouchNodeKinds(node.Kinds)
-		}
 	}
 
 	ids, err := creator.CreateNodes(nodes)
@@ -936,15 +816,10 @@ func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 	return ids, nil
 }
 
-// DeleteNode records id for scope's own resolution against the engine's
-// current snapshot (WriteScope.DeleteNodeID's doc): unlike this file's other
-// delete paths, a batch delete-by-id names no kinds at all, so there is
-// nothing for this method itself to touch directly. id is also recorded
-// onto the ChangeSet as a read-back key: the applier re-reads it from
-// PostgreSQL the same way every other RecordNodeID caller's target is
-// re-read, finding it gone and applying the delete.
+// DeleteNode records id onto the ChangeSet as a read-back key: the applier
+// re-reads it from PostgreSQL the same way every other RecordNodeID
+// caller's target is re-read, finding it gone and applying the delete.
 func (b *observingBatch) DeleteNode(id graph.ID) error {
-	b.scope.DeleteNodeID(id)
 	b.scope.Changes().RecordNodeID(id)
 	return b.Batch.DeleteNode(id)
 }
@@ -966,35 +841,9 @@ func (b *observingBatch) Relationships() graph.RelationshipQuery {
 	return &observingRelationshipQuery{RelationshipQuery: b.Batch.Relationships(), scope: b.scope}
 }
 
-// UpdateNodeBy touches update.Node's Kinds, AddedKinds, and DeletedKinds
-// unconditionally, then delegates. Unlike observingTransaction.UpdateNode,
-// this call is an upsert (graph.Batch's own doc on UpdateNodeBy: "in the
-// case where the node does not yet exist, created") -- if it creates rather
-// than updates, update.Node.Kinds is the new node's entire kind set, not a
-// delta, and there is no way from here to tell which case actually happened,
-// so Kinds must be touched every time alongside whatever AddedKinds/
-// DeletedKinds delta was also given.
-//
-// Verified sound against dawgs' actual pg batch write path (not just assumed
-// safe by analogy): UpdateNodeBy buffers into nodeUpdateByBuffer, flushed via
-// flushNodeUpsertBatch -> NodeUpsertParameters.Append (drivers/pg/batch.go),
-// which reads update.Node.Kinds ONLY -- never AddedKinds/DeletedKinds -- into
-// the upsert statement's excluded.kind_ids, and FormatNodeUpsert's SQL
-// (drivers/pg/query/format.go) unions it into the row's kind_ids on conflict
-// ("kind_ids = uniq(sort(n.kind_ids || excluded.kind_ids))"). Touching
-// update.Node.Kinds unconditionally, as this method already does, is
-// therefore not merely a safe superset of that effect -- it is an exact
-// match. The additional AddedKinds/DeletedKinds touches are conservative
-// extras this call has always made (neither field reaches the database
-// through this write path at all) and cost nothing to keep, so this method's
-// body is left as-is; contrast observingBatch.UpdateNodes below, whose
-// distinct pg batch write path required an actual code change to stay sound.
+// UpdateNodeBy records update's ChangeSet entry via recordNodeUpsertIdentity,
+// then delegates.
 func (b *observingBatch) UpdateNodeBy(update graph.NodeUpdate) error {
-	if update.Node != nil {
-		b.scope.TouchNodeKinds(update.Node.Kinds)
-		b.scope.TouchNodeKinds(update.Node.AddedKinds)
-		b.scope.TouchNodeKinds(update.Node.DeletedKinds)
-	}
 	recordNodeUpsertIdentity(b.scope, update)
 	return b.Batch.UpdateNodeBy(update)
 }
@@ -1059,101 +908,53 @@ func objectIDFromProperties(properties *graph.Properties) (string, bool) {
 	return value, true
 }
 
-// UpdateNodes touches each node's AddedKinds/DeletedKinds delta via
-// touchNodeKindDelta, AND separately calls scope.UpsertNodeKinds(node.ID,
-// node.Kinds) for every node with a non-empty Kinds field.
-//
-// graph.Batch's own doc describes this call as updating existing nodes "by
-// ID", not upserting -- which might suggest, as it correctly does for
-// observingTransaction.UpdateNode's identical-looking case, that the
-// AddedKinds/DeletedKinds delta is the whole story and Kinds itself carries
-// no extra information. Verified against dawgs' actual pg batch write path,
-// it is not: UpdateNodes buffers into nodeUpdateBuffer, flushed via
-// flushNodeUpdateBatch -> NodeUpdateParameters.Append (drivers/pg/batch.go),
-// which reads node.Kinds -- the node's FULL kind set, not node.AddedKinds --
-// into the update statement's "added_kinds" SQL parameter, and
-// FormatNodesUpdate's SQL (drivers/pg/query/format.go) unions it into
-// kind_ids unconditionally: "kind_ids = uniq(sort(kind_ids - u.deleted_kinds
-// || u.added_kinds))". So a caller that sets Kinds without also calling
-// node.AddKinds(...) -- nothing in graph.Node's API or graph.Batch's
-// documented contract forbids this -- changes kind membership in the
-// database with zero information in AddedKinds/DeletedKinds for
-// touchNodeKindDelta to see. (The batch's largeUpdate path, taken instead of
-// flushNodeUpdateBatch above LargeNodeUpdateThreshold nodes, reads node.Kinds
-// the same way via LargeNodeUpdateRows.Append/FormatMergeNodeLargeUpdate, so
-// this call's per-node marking below covers both without needing to know
-// which path a given UpdateNodes call will take.)
-//
-// The UpsertNodeKinds call does not naively mark every node.Kinds entry
-// dirty -- doing so would dirty hot, already-clean kinds (User, Computer,
-// ...) on every tagging-style UpdateNodes call that sets Kinds alongside
-// AddedKinds (the shape every caller in this codebase uses today), defeating
-// this milestone's whole design goal of narrow, kind-scoped invalidation.
-// Instead resolution is deferred to NoteWrite time, against the engine's
-// current snapshot, so only kinds the union could have genuinely added get
-// marked; see engine.WriteScope.UpsertNodeKinds' doc for the full soundness
-// argument.
+// UpdateNodes records each node's own database id as a ChangeSet read-back
+// key, then delegates.
 func (b *observingBatch) UpdateNodes(nodes []*graph.Node) error {
 	for _, node := range nodes {
 		if node != nil {
-			touchNodeKindDelta(b.scope, node)
-			if len(node.Kinds) > 0 {
-				b.scope.UpsertNodeKinds(node.ID, node.Kinds)
-			}
 			b.scope.Changes().RecordNodeID(node.ID)
 		}
 	}
 	return b.Batch.UpdateNodes(nodes)
 }
 
-// CreateRelationship touches relationship's Kind, then delegates.
+// CreateRelationship records a ChangeSet edge triple, then delegates.
 func (b *observingBatch) CreateRelationship(relationship *graph.Relationship) error {
 	if relationship != nil {
-		b.scope.TouchEdgeKind(relationship.Kind)
 		b.scope.Changes().RecordEdgeTriple(relationship.StartID, relationship.EndID, relationship.Kind)
 	}
 	return b.Batch.CreateRelationship(relationship)
 }
 
-// CreateRelationshipByIDs touches kind, then delegates. graph.Batch's own
-// CreateRelationshipByIDs is deprecated in favor of CreateRelationship, but
-// this wrapper calls it anyway rather than rewriting the call into a
-// CreateRelationship of its own: this method exists purely to observe and
-// pass through whatever the caller invoked, and the two methods are not
-// documented to behave identically for every graph.Batch implementation
-// (graph.Batch's own CreateRelationship carries a TODO about incorrect
-// upsert-on-conflict behavior that CreateRelationshipByIDs may or may not
-// share) -- silently rerouting the call here could change behavior for a
-// Batch implementation this package has no way to know about.
+// CreateRelationshipByIDs records a ChangeSet edge triple, then delegates.
+// graph.Batch's own CreateRelationshipByIDs is deprecated in favor of
+// CreateRelationship, but this wrapper calls it anyway rather than
+// rewriting the call into a CreateRelationship of its own: this method
+// exists purely to observe and pass through whatever the caller invoked,
+// and the two methods are not documented to behave identically for every
+// graph.Batch implementation (graph.Batch's own CreateRelationship carries
+// a TODO about incorrect upsert-on-conflict behavior that
+// CreateRelationshipByIDs may or may not share) -- silently rerouting the
+// call here could change behavior for a Batch implementation this package
+// has no way to know about.
 //
 //nolint:staticcheck // SA1019: deliberate passthrough of a deprecated call, see doc above.
 func (b *observingBatch) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) error {
-	b.scope.TouchEdgeKind(kind)
 	b.scope.Changes().RecordEdgeTriple(startNodeID, endNodeID, kind)
 	return b.Batch.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
 }
 
-// DeleteRelationship records id for scope's own resolution against the
-// engine's current snapshot (WriteScope.DeleteEdgeID's doc), records the
-// same id onto the ChangeSet as a read-back key (mirroring DeleteNode's
-// identical reasoning), then delegates.
+// DeleteRelationship records id onto the ChangeSet as a read-back key
+// (mirroring DeleteNode's identical reasoning), then delegates.
 func (b *observingBatch) DeleteRelationship(id graph.ID) error {
-	b.scope.DeleteEdgeID(id)
 	b.scope.Changes().RecordEdgeID(id)
 	return b.Batch.DeleteRelationship(id)
 }
 
-// UpdateRelationshipBy touches update.Relationship's Kind unconditionally,
-// then delegates. Like UpdateNodeBy above, this is an upsert (graph.Batch's
-// own doc: "in the case where the relationship does not yet exist,
-// created"), so Kind must be touched regardless of whether this call turns
-// out to update or create -- a relationship's Kind is fixed for its
-// lifetime (graph.Relationship has no Added/DeletedKind concept the way
-// graph.Node does), so there is no narrower delta to touch instead.
+// UpdateRelationshipBy records update's ChangeSet entry via
+// recordRelationshipUpsertIdentity, then delegates.
 func (b *observingBatch) UpdateRelationshipBy(update graph.RelationshipUpdate) error {
-	if update.Relationship != nil {
-		b.scope.TouchEdgeKind(update.Relationship.Kind)
-	}
 	recordRelationshipUpsertIdentity(b.scope, update)
 	return b.Batch.UpdateRelationshipBy(update)
 }
@@ -1185,11 +986,10 @@ func recordRelationshipUpsertIdentity(scope *engine.WriteScope, update graph.Rel
 	scope.Changes().RecordNodeObjectID(endOID)
 }
 
-// WithGraph marks the whole scope dirty and returns a fresh observingBatch
+// WithGraph records a ChangeSet fallback and returns a fresh observingBatch
 // wrapping the inner WithGraph's result, sharing the same scope -- mirroring
 // observingTransaction.WithGraph's identical reasoning.
 func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
-	b.scope.TouchAll()
 	b.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
 	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), scope: b.scope, eng: b.eng, ctx: b.ctx}
 }
@@ -1264,10 +1064,10 @@ var parseCypherFrontend = func(text string) (*cypher.RegularQuery, error) {
 // SinglePartQuery, or in any part of a MultiPartQuery (a query with one or
 // more WITH boundaries). A parse failure, or a panic from the frontend
 // itself (see the recover below), reports true: this is the same
-// conservative default NoteWrite(nil) has always meant for Run's raw-Cypher
-// callers (driver.go), and text that fails to parse -- or crashes parsing --
-// here is exactly as unknown to this package as it would be to whatever
-// eventually rejects it downstream.
+// conservative default Driver.Run's own ChangeSet fallback record gives its
+// raw-Cypher callers (driver.go), and text that fails to parse -- or
+// crashes parsing -- here is exactly as unknown to this package as it would
+// be to whatever eventually rejects it downstream.
 //
 // This deliberately does not attempt to recognize which specific kinds an
 // updating clause touches (unlike edgeKindsFromCriteria above, which does,
@@ -1275,7 +1075,7 @@ var parseCypherFrontend = func(text string) (*cypher.RegularQuery, error) {
 // mutating Cypher statement can create, relabel, or delete nodes and edges
 // of arbitrary kinds named anywhere in its pattern or SET/REMOVE items, and
 // nothing here attempts to walk that out. observingTransaction.Query calls
-// this and marks the whole scope dirty on true.
+// this and records a ChangeSet fallback on true.
 //
 // mutates is a NAMED return, not a plain bool, and this matters: an unnamed
 // return would still let the deferred recover below run on a panic, but the

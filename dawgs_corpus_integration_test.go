@@ -25,9 +25,9 @@
 // This file needs same-package access to Driver's own unexported `engine`
 // field (see staleness_integration_test.go's identically-reasoned doc) so it
 // can force a deterministic rebuild with d.engine.RebuildNow between the two
-// modes described below, rather than wiring up a datapipe_status table and
-// racing the poller. That access requires living in package bloodtrail, not
-// bloodtrail_test.
+// modes described below, rather than depending on the timing of Start's own
+// asynchronous boot-load goroutine (engine/boot.go). That access requires
+// living in package bloodtrail, not bloodtrail_test.
 //
 // # What this runs, and why two modes
 //
@@ -42,12 +42,14 @@
 // against *bloodtrail.Driver instead of a bare pg/neo4j driver.
 //
 // Every read-only case (no "fixture" field) runs twice against each dataset
-// group: once immediately after the dataset loads, with the engine's
-// snapshot stale from that same load (NoteWrite fires on every real commit,
-// LoadDataset's edges included -- see write_observer.go/driver.go), so
-// TryCypher declines and every query answers by delegating straight to
-// PostgreSQL ("delegating" subtests); and once more after a manual
-// d.engine.RebuildNow, so every shape internal/engine/interpret's Plan
+// group: once immediately after the dataset loads ("delegating" subtests,
+// named from this suite's pre-write-through era -- Apply now replays every
+// real commit, LoadDataset's edges included, into whatever snapshot
+// currently exists, see write_observer.go/apply.go, so this pass may now
+// exercise engine-served cases too rather than pure delegation; a fuller
+// audit of this file's own doc against write-through is a follow-up, not
+// this task's own concern); and once more after a manual d.engine.RebuildNow,
+// so every shape internal/engine/interpret's Plan
 // actually accepts -- milestone 4's general-purpose Cypher interpreter, a
 // much broader surface than milestone 3's retired shortestPath/
 // allShortestPaths-only recognizer (recognize.FromCypher, removed once
@@ -59,9 +61,9 @@
 //
 // Fixture cases (a "fixture" field) run inside a rolled-back write
 // transaction (Session.WithRollbackFixture): Driver.WriteTransaction only
-// calls d.engine.NoteWrite on success (driver.go), and the rollback sentinel
+// calls d.engine.Apply on success (driver.go), and the rollback sentinel
 // withRollback returns makes the underlying call fail, so a fixture's write
-// never reaches NoteWrite and never disturbs either mode's snapshot state.
+// never reaches Apply and never disturbs either mode's snapshot state.
 // More fundamentally, a write transaction's own Query calls always run
 // directly against the live tx (only wrappedTransaction.Query, built for
 // ReadTransaction, ever consults the engine) -- delegation by construction,
@@ -82,7 +84,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/graph"
@@ -376,13 +377,12 @@ func TestDAWGSCorpus(t *testing.T) {
 
 		t.Run(ds, func(t *testing.T) {
 			// ClearGraph/LoadDataset both write through the wrapped driver
-			// (db, not a raw pg.Driver), so each bumps the engine's write
-			// generation (driver.go's WriteTransaction/BatchOperation ->
-			// d.engine.NoteWrite) and invalidates whatever snapshot the
-			// previous dataset group's "engine" pass built -- exactly the
-			// state the immediately-following "delegating" subtests below
-			// need: a live driver with a stale-or-absent snapshot for this
-			// group's freshly loaded data.
+			// (db, not a raw pg.Driver), so each replays into whatever
+			// snapshot currently exists (driver.go's WriteTransaction/
+			// BatchOperation -> d.engine.Apply) rather than leaving the
+			// previous dataset group's "engine"-pass snapshot untouched --
+			// see this file's own package doc for why the "delegating"
+			// framing below predates write-through.
 			integration.ClearGraph(t, db, ctx)
 			idMap := session.LoadDataset(t, datasetPath(ds))
 
@@ -408,18 +408,15 @@ func TestDAWGSCorpus(t *testing.T) {
 				}
 			}
 
-			// Mode 1: delegating -- no rebuild has happened for this
-			// group's data yet, so every read-only case answers via
-			// PostgreSQL (pure delegation, TryCypher declines on
-			// staleness).
+			// Mode 1: "delegating" -- no manual rebuild has happened for
+			// this group's data yet (see the package doc's note on this
+			// name predating write-through).
 			t.Run("delegating", runReadOnlyCases)
 
-			// Force a deterministic snapshot rebuild from this group's data
-			// -- no datapipe_status table is set up (nothing here needs the
-			// poller's own cadence; see staleness_integration_test.go's
-			// identically-reasoned doc), so RebuildNow is the only way a
-			// snapshot ever gets built.
-			if err := d.engine.RebuildNow(ctx, "manual", time.Time{}); err != nil {
+			// Force a deterministic snapshot rebuild from this group's
+			// data: RebuildNow is a manual, on-demand call, independent of
+			// Start's own one-shot boot-load goroutine (engine/boot.go).
+			if err := d.engine.RebuildNow(ctx, "manual"); err != nil {
 				t.Fatalf("RebuildNow (dataset %q): %v", ds, err)
 			}
 

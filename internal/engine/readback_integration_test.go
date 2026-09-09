@@ -137,7 +137,7 @@ func TestReadBack(t *testing.T) {
 	}
 
 	e := New(pgDriver, pool, Config{})
-	if err := e.RebuildNow(ctx, "test", time.Time{}); err != nil {
+	if err := e.RebuildNow(ctx, "test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 

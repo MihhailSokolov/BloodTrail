@@ -19,8 +19,7 @@ import (
 
 // Kind ids used throughout this file's hand-built snapshot: arbitrary, but
 // fixed, so every test can share one snapshot shape and one fake kind
-// mapper/resolver pair. Kept distinct from marks_test.go's buildTwoNodeSnapshot
-// fixture (100/200), which exercises unrelated noteResolved logic.
+// mapper/resolver pair.
 const (
 	kindUser     snapshot.KindID = 1
 	kindComputer snapshot.KindID = 2
@@ -49,6 +48,27 @@ func fakeKindMapper(byName map[string]snapshot.KindID) func(context.Context, gra
 			return 0, fmt.Errorf("fakeKindMapper: no id for kind %s", kind.String())
 		}
 		return id, nil
+	}
+}
+
+// fakeResolver returns an e.mapKindNames fake backed by a plain map,
+// standing in for the real KindMapper.MapKindIDs call (which needs a live
+// PostgreSQL connection): looking up an id absent from byID is a test-setup
+// bug, not a case under test, so it fails loudly via t.Fatalf rather than
+// returning an error a caller might confuse with a genuine resolver
+// failure. Shared with overlay_serving_test.go.
+func fakeResolver(t *testing.T, byID map[snapshot.KindID]graph.Kind) func([]snapshot.KindID) (graph.Kinds, error) {
+	t.Helper()
+	return func(ids []snapshot.KindID) (graph.Kinds, error) {
+		kinds := make(graph.Kinds, len(ids))
+		for i, id := range ids {
+			kind, ok := byID[id]
+			if !ok {
+				t.Fatalf("fakeResolver: no fake mapping for kind id %d", id)
+			}
+			kinds[i] = kind
+		}
+		return kinds, nil
 	}
 }
 
@@ -98,21 +118,16 @@ func buildNodeSpecSnapshot(t *testing.T) *snapshot.Snapshot {
 }
 
 // newNodeSpecEngine builds an Engine wired for this file's tests: enabled,
-// snap adopted and stamped at generation gen (also the live counter, so
-// Fresh()/allNodesClean/nodeKindsClean all read as clean unless a test calls
-// NoteWrite afterward), with mapKind/mapKindNames faked via
-// nodeSpecKindByName/nodeSpecKindNames (fakeResolver is marks_test.go's
-// existing []KindID->graph.Kinds fake, reused here for e.mapKindNames --
-// see the task's seam-reuse guidance).
-func newNodeSpecEngine(t *testing.T, snap *snapshot.Snapshot, gen uint64) *Engine {
+// snap adopted, with mapKind/mapKindNames faked via
+// nodeSpecKindByName/nodeSpecKindNames (fakeResolver is this file's own
+// []KindID->graph.Kinds fake, reused here for e.mapKindNames).
+func newNodeSpecEngine(t *testing.T, snap *snapshot.Snapshot) *Engine {
 	t.Helper()
 
-	snap.Generation = gen
 	e := New(nil, nil, Config{Enabled: true})
 	e.mapKind = fakeKindMapper(nodeSpecKindByName())
 	e.mapKindNames = fakeResolver(t, nodeSpecKindNames())
 	e.snap.Store(snapshot.NewView(snap))
-	e.generation.Store(gen)
 	return e
 }
 
@@ -194,7 +209,7 @@ func kindConstraint(allOf bool, names ...string) recognize.KindConstraint {
 // TryNodeFetchIDs, and TryNodeFetchKinds must all agree on the User carriers
 // (database ids 1, 2, 5).
 func TestTryNodeQueriesSingleAnyOf(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
 	ctx := context.Background()
 
@@ -234,7 +249,7 @@ func TestTryNodeQueriesSingleAnyOf(t *testing.T) {
 // TestTryNodeQueriesMultiKindAnyOfUnion covers an any-of constraint over two
 // kinds: the match set is their union (User: 1,2,5; Group: 4,5 -> 1,2,4,5).
 func TestTryNodeQueriesMultiKindAnyOfUnion(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User", "Group")}}
 	ctx := context.Background()
 
@@ -253,7 +268,7 @@ func TestTryNodeQueriesMultiKindAnyOfUnion(t *testing.T) {
 // TestTryNodeQueriesAllOfIntersection covers an all-of constraint: only node
 // 5 carries both User and Group.
 func TestTryNodeQueriesAllOfIntersection(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(true, "User", "Group")}}
 	ctx := context.Background()
 
@@ -273,7 +288,7 @@ func TestTryNodeQueriesAllOfIntersection(t *testing.T) {
 // with spec.IDs: the User carriers (1,2,5) intersected with {2,3,5} leaves
 // {2,5}.
 func TestTryNodeQueriesKindAndIDsIntersect(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{
 		Constraints: []recognize.KindConstraint{kindConstraint(false, "User")},
 		IDs:         []graph.ID{2, 3, 5},
@@ -296,7 +311,7 @@ func TestTryNodeQueriesKindAndIDsIntersect(t *testing.T) {
 // snapshot doesn't recognize: it drops silently rather than erroring or
 // widening the match.
 func TestTryNodeQueriesUnknownIDDrops(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{
 		Constraints: []recognize.KindConstraint{kindConstraint(false, "User")},
 		IDs:         []graph.ID{2, 999},
@@ -319,7 +334,7 @@ func TestTryNodeQueriesUnknownIDDrops(t *testing.T) {
 // decline: even with spec.IDs set, an id-only node query has no kind to
 // prove freshness against and must decline reasonNoKindConstraint.
 func TestTryNodeQueriesNoConstraintDeclines(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{IDs: []graph.ID{1, 2}}
 	ctx := context.Background()
 
@@ -359,7 +374,7 @@ func TestTryNodeQueriesDisabledDeclines(t *testing.T) {
 // "matches nothing" -- the same ambiguity-averse stance
 // resolveKindsEndpoint/buildKindMask already take for the path-query side.
 func TestTryNodeQueriesMapKindErrorDeclines(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "Nonexistent")}}
 	ctx := context.Background()
 
@@ -373,7 +388,7 @@ func TestTryNodeQueriesMapKindErrorDeclines(t *testing.T) {
 // actually present among the matching nodes declines reasonError before any
 // cursor is handed back, rather than surfacing mid-stream.
 func TestTryNodeFetchKindsResolveErrorDeclines(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	e.mapKindNames = func(ids []snapshot.KindID) (graph.Kinds, error) {
 		return nil, errors.New("boom: kind id resolution failed")
 	}
@@ -412,7 +427,7 @@ func TestTryNodeFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	e := newNodeSpecEngine(t, snap, 0)
+	e := newNodeSpecEngine(t, snap)
 	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
 
 	runtime.GC()
@@ -459,7 +474,7 @@ func TestTryNodeFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 // must yield no rows. This regression test ensures resolveNodeSpec branches on
 // spec.IDs != nil instead of len(spec.IDs) > 0.
 func TestTryNodeQueriesEmptyIDsMatchesNothing(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	// User kind matches 1, 2, 5, but empty IDs slice means intersection is empty
 	spec := recognize.NodeSpec{
 		Constraints: []recognize.KindConstraint{kindConstraint(false, "User")},
@@ -499,7 +514,7 @@ func TestTryNodeQueriesEmptyIDsMatchesNothing(t *testing.T) {
 // be returned. This test ensures that after fixing the empty-IDs bug, nil IDs
 // still work correctly.
 func TestTryNodeQueriesNilIDsUnconstrained(t *testing.T) {
-	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	// User kind matches 1, 2, 5; nil IDs means all of them pass through
 	spec := recognize.NodeSpec{
 		Constraints: []recognize.KindConstraint{kindConstraint(false, "User")},
@@ -646,15 +661,13 @@ func buildRelSpecSnapshot(t *testing.T) *snapshot.Snapshot {
 // newRelSpecEngine is newNodeSpecEngine's RelSpec counterpart: an Engine
 // wired with relSpecKindByName/relSpecKindNames instead of
 // nodeSpecKindByName/nodeSpecKindNames, otherwise identical.
-func newRelSpecEngine(t *testing.T, snap *snapshot.Snapshot, gen uint64) *Engine {
+func newRelSpecEngine(t *testing.T, snap *snapshot.Snapshot) *Engine {
 	t.Helper()
 
-	snap.Generation = gen
 	e := New(nil, nil, Config{Enabled: true})
 	e.mapKind = fakeKindMapper(relSpecKindByName())
 	e.mapKindNames = fakeResolver(t, relSpecKindNames())
 	e.snap.Store(snapshot.NewView(snap))
-	e.generation.Store(gen)
 	return e
 }
 
@@ -715,7 +728,7 @@ func assertTriples(t *testing.T, got []graph.RelationshipTripleResult, want []gr
 // survive the kind mask, and both happen to end on a Computer, so both
 // survive the far-kind filter too.
 func TestTryRelQueriesStartAnchoredKindAndFarKindFilter(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 
 	spec := recognize.RelSpec{
@@ -743,7 +756,7 @@ func TestTryRelQueriesStartAnchoredKindAndFarKindFilter(t *testing.T) {
 // mirror: spec.EndIDs = {1}'s only incoming edge is HasSession from node 3,
 // and a Computer start constraint keeps it (node 3 is a Computer).
 func TestTryRelQueriesEndAnchoredKindAndFarKindFilter(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 
 	spec := recognize.RelSpec{
@@ -769,7 +782,7 @@ func TestTryRelQueriesEndAnchoredKindAndFarKindFilter(t *testing.T) {
 // TestTryRelQueriesFullScanPairs covers the no-anchor branch: every MemberOf
 // edge in the whole snapshot, regardless of source.
 func TestTryRelQueriesFullScanPairs(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 
 	spec := recognize.RelSpec{EdgeKinds: edgeKinds("MemberOf")}
@@ -798,7 +811,7 @@ func TestTryRelQueriesBothAnchorsAnchorOnSmallerSide(t *testing.T) {
 	ctx := context.Background()
 
 	// Start (1 id) is smaller than End (2 ids): anchors on Start.
-	eStartSmaller := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eStartSmaller := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	specStartSmaller := recognize.RelSpec{
 		StartIDs:  []graph.ID{1},
 		EndIDs:    []graph.ID{3, 4},
@@ -814,7 +827,7 @@ func TestTryRelQueriesBothAnchorsAnchorOnSmallerSide(t *testing.T) {
 	})
 
 	// End (1 id) is smaller than Start (2 ids): anchors on End.
-	eEndSmaller := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eEndSmaller := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	specEndSmaller := recognize.RelSpec{
 		StartIDs:  []graph.ID{1, 2},
 		EndIDs:    []graph.ID{3},
@@ -837,7 +850,7 @@ func TestTryRelQueriesBothAnchorsAnchorOnSmallerSide(t *testing.T) {
 // `len(...) > 0`.
 func TestTryRelQueriesEmptyVsNilAnchors(t *testing.T) {
 	ctx := context.Background()
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 
 	// Non-nil, empty StartIDs: matches nothing, even though AdminTo has
 	// matches overall.
@@ -894,7 +907,7 @@ func TestTryRelQueriesDisabledDeclines(t *testing.T) {
 // once for spec.EdgeKinds, once for an endpoint KindConstraint -- both must
 // decline reasonError rather than being treated as "matches nothing".
 func TestTryRelQueriesMapKindErrorDeclines(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 
 	edgeSpec := recognize.RelSpec{EdgeKinds: edgeKinds("Nonexistent")}
@@ -912,7 +925,7 @@ func TestTryRelQueriesMapKindErrorDeclines(t *testing.T) {
 // every returned row carries the edge's actual database triple plus its
 // resolved graph.Kind name.
 func TestTryRelFetchKindsResolvesKindNames(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 	spec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
 
@@ -938,7 +951,7 @@ func TestTryRelFetchKindsResolvesKindNames(t *testing.T) {
 // kind-name resolution failure path: e.mapKindNames failing declines
 // reasonError before any cursor is handed back.
 func TestTryRelFetchKindsResolveErrorDeclines(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	e.mapKindNames = func(ids []snapshot.KindID) (graph.Kinds, error) {
 		return nil, errors.New("boom: kind id resolution failed")
 	}
@@ -955,7 +968,7 @@ func TestTryRelFetchKindsResolveErrorDeclines(t *testing.T) {
 // graph.ID targets scanned every row via Scan, inside a plain `for
 // result.Next() { ... }` loop -- the task brief's mandated fidelity test.
 func TestRowResultDrivesContainerFetchDirectedGraphLoopShape(t *testing.T) {
-	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 	spec := recognize.RelSpec{EdgeKinds: edgeKinds("MemberOf")}
 
@@ -997,7 +1010,7 @@ func TestRowResultDrivesContainerFetchDirectedGraphLoopShape(t *testing.T) {
 // graph.ID, graph.Kind) scanned every row -- the task brief's other
 // mandated fidelity test.
 func TestRowResultDrivesShallowFetchRelationshipsLoopShape(t *testing.T) {
-	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 	spec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
 
@@ -1064,7 +1077,7 @@ func TestRowResultDrivesShallowFetchRelationshipsLoopShape(t *testing.T) {
 // 107, in that ascending order) must be emitted in exactly that order, not
 // CSR/(target,kind) scan order.
 func TestTryRelQueryRowsOrderByEdgeIDAscending(t *testing.T) {
-	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 	spec := recognize.RelSpec{StartIDs: []graph.ID{1}}
 
@@ -1105,7 +1118,7 @@ func TestTryRelQueryRowsOrderByEdgeIDAscending(t *testing.T) {
 // non-nil): there is no anchored scan to gather and sort, so this must
 // decline reasonUnsupportedOrder.
 func TestTryRelQueryRowsUnsupportedOrderDeclines(t *testing.T) {
-	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 	spec := recognize.RelSpec{}
 
@@ -1118,7 +1131,7 @@ func TestTryRelQueryRowsUnsupportedOrderDeclines(t *testing.T) {
 // anchor direction constraint: ProjectionStepOutbound requires StartIDs
 // non-nil, ProjectionStepInbound requires EndIDs non-nil.
 func TestTryRelQueryRowsProjectionMismatchDeclines(t *testing.T) {
-	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	eng := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 
 	outboundSpec := recognize.RelSpec{EndIDs: []graph.ID{1}}
@@ -1138,7 +1151,7 @@ func TestTryRelQueryRowsProjectionMismatchDeclines(t *testing.T) {
 // a clean snapshot. This proves the engine handles the most permissive query
 // shape and returns all edges with their full (start, edgeID, end) triples.
 func TestTryRelQueriesUnconstrainedRelSpecServesFully(t *testing.T) {
-	e := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	ctx := context.Background()
 	spec := recognize.RelSpec{}
 
@@ -1238,7 +1251,7 @@ func TestTryRelFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	e := newRelSpecEngine(t, snap, 0)
+	e := newRelSpecEngine(t, snap)
 	spec := recognize.RelSpec{EdgeKinds: edgeKinds("MemberOf")}
 
 	runtime.GC()
@@ -1276,58 +1289,21 @@ func TestTryRelFetchIDsCloseDoesNotLeakFeeder(t *testing.T) {
 	}
 }
 
-// TestBuilderServingSurvivesAWrite is the replacement for the kind-stale
-// decline tests this file used to carry: with write-through (apply.go), a
-// write does not make the current View unservable at all -- Apply publishes
-// the write into it before the writing call returns, so the marks a write
-// stamps no longer gate anything. Every builder-serving entry point must
-// therefore keep serving straight through a write that touches the very
-// kinds it constrains by, including the two shapes (TryNodeFetchKinds and a
-// step-projection TryRelQueryRows) that used to require the strictest
-// whole-snapshot cleanliness of all.
-func TestBuilderServingSurvivesAWrite(t *testing.T) {
-	ctx := context.Background()
-
-	nodeEngine := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
-	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User"), graph.StringKind("Group")})
-	scope.TouchEdgeKinds(edgeKinds("AdminTo"))
-	nodeEngine.NoteWrite(scope)
-
-	userSpec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
-	if count, ok := nodeEngine.TryNodeCount(ctx, userSpec); !ok || count != 3 {
-		t.Fatalf("TryNodeCount(User) after a write touching User = (%d, %v), want (3, true)", count, ok)
-	}
-	if _, ok := nodeEngine.TryNodeFetchIDs(ctx, userSpec); !ok {
-		t.Fatalf("TryNodeFetchIDs(User) after a write touching User: ok = false, want true")
-	}
-	if _, ok := nodeEngine.TryNodeFetchKinds(ctx, userSpec); !ok {
-		t.Fatalf("TryNodeFetchKinds(User) after a write touching User: ok = false, want true")
-	}
-
-	relEngine := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
-	relScope := NewWriteScope()
-	relScope.TouchEdgeKinds(edgeKinds("AdminTo"))
-	relScope.TouchNodeKinds(graph.Kinds{graph.StringKind("Group")})
-	relEngine.NoteWrite(relScope)
-
-	relSpec := recognize.RelSpec{StartIDs: []graph.ID{1}, EdgeKinds: edgeKinds("AdminTo")}
-	if _, ok := relEngine.TryRelCount(ctx, relSpec); !ok {
-		t.Fatalf("TryRelCount(AdminTo) after a write touching AdminTo: ok = false, want true")
-	}
-	if _, ok := relEngine.TryRelQueryRows(ctx, relSpec, recognize.ProjectionStepOutbound, false); !ok {
-		t.Fatalf("TryRelQueryRows(StepOutbound) after a write touching an unrelated node kind: ok = false, want true")
-	}
-}
-
-// TestBuilderServingDeclinesInFallback is that claim's other half: the ONE
-// condition that now stops the builder-serving path is the engine being in
-// fallback (a write that could not be replayed into the replica, apply.go),
-// which serveGate turns into a reasonFallback decline for every entry point.
+// TestBuilderServingDeclinesInFallback covers the builder-serving path's
+// only decline condition left: the engine being in fallback (a write that
+// could not be replayed into the replica, apply.go), which serveGate turns
+// into a reasonFallback decline for every entry point. There is no
+// analogous "survives a write" test alongside this one -- write-through
+// means Apply publishes a write into the current View before the writing
+// call returns, so a write never makes a View unservable on its own (the
+// happy-path tests throughout this file already serve from a View no write
+// has ever touched, which is the same View a write-through Apply call would
+// leave being served from); fallback is the one exception, and this test is
+// its complete coverage.
 func TestBuilderServingDeclinesInFallback(t *testing.T) {
 	ctx := context.Background()
 
-	nodeEngine := newNodeSpecEngine(t, buildNodeSpecSnapshot(t), 0)
+	nodeEngine := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
 	nodeEngine.state.Store(stateFallback)
 
 	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
@@ -1341,7 +1317,7 @@ func TestBuilderServingDeclinesInFallback(t *testing.T) {
 		t.Fatalf("TryNodeFetchKinds in fallback: ok = true, want false")
 	}
 
-	relEngine := newRelSpecEngine(t, buildRelSpecSnapshot(t), 0)
+	relEngine := newRelSpecEngine(t, buildRelSpecSnapshot(t))
 	relEngine.state.Store(stateFallback)
 	if _, ok := relEngine.TryRelCount(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}); ok {
 		t.Fatalf("TryRelCount in fallback: ok = true, want false")

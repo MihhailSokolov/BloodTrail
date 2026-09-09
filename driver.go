@@ -4,11 +4,13 @@
 //
 // The driver embeds the PostgreSQL driver, which stays the system of record
 // for every write. Reads run under ReadTransaction get a chance to be
-// served instead from an in-memory path engine (internal/engine), rebuilt
-// from PostgreSQL on a poller's cadence and invalidated by writes; whenever
-// the engine cannot -- or, per BLOODTRAIL_ENGINE, must not -- serve a
-// query, it falls straight through to PostgreSQL, so results are always
-// correct even while the engine's snapshot is cold, stale, or disabled.
+// served instead from an in-memory path engine (internal/engine), whose
+// snapshot Start loads once at boot and every subsequent write replays
+// into directly (write-through, engine/apply.go) -- there is no separate
+// rebuild cadence to fall behind; whenever the engine cannot -- or, per
+// BLOODTRAIL_ENGINE, must not -- serve a query, it falls straight through
+// to PostgreSQL, so results are always correct even while the engine's
+// snapshot is cold, in fallback, or disabled.
 package bloodtrail
 
 import (
@@ -156,12 +158,11 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 	logger := buildLogger(settings, slog.Default().Handler())
 
 	eng := engine.New(pgDriver, cfg.Pool, engine.Config{
-		Enabled:      settings.Engine,
-		PollInterval: settings.EnginePollInterval,
-		MemoryLimit:  settings.MemoryLimit,
-		Log:          logger,
+		Enabled:     settings.Engine,
+		MemoryLimit: settings.MemoryLimit,
+		Log:         logger,
 	})
-	// A driver-scoped background context, deliberately not ctx: the poller
+	// A driver-scoped background context, deliberately not ctx: the boot-load
 	// goroutine Start launches must outlive this Open call and keep running
 	// for as long as the driver itself is open, regardless of whether the
 	// caller's ctx is later canceled. Close stops it via engine.Stop.
@@ -289,8 +290,9 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 	return err
 }
 
-// Close stops the engine's poller before closing the embedded PostgreSQL
-// driver, so no engine goroutine outlives the driver.
+// Close stops the engine's background goroutines (boot load, fallback
+// recovery) before closing the embedded PostgreSQL driver, so no engine
+// goroutine outlives the driver.
 func (d *Driver) Close(ctx context.Context) error {
 	d.engine.Stop()
 	return d.Driver.Close(ctx)
@@ -303,21 +305,19 @@ func (d *Driver) Close(ctx context.Context) error {
 // (a concrete, same-package call), which would never reach Driver's override
 // above and so would never invalidate the engine's snapshot without this.
 //
-// The scope handed to Apply has TouchAll() called on it -- touching every
-// node and edge kind, exactly like the nil scope this used to pass -- plus a
-// ChangeSet fallback record: raw Cypher run outside a transaction is exactly
-// as opaque to this package's tracking as observingTransaction.Query's own
-// mutating-Cypher sniff (write_observer.go) already treats a mutating
-// statement inside a transaction, so the two are recorded the same way. That
-// fallback record is what makes Apply give up on replaying this write
-// narrowly and rebuild the replica instead (engine.enterFallback), which is
-// the only sound answer for a write nothing in this package can describe.
+// The scope handed to Apply carries a ChangeSet fallback record: raw Cypher
+// run outside a transaction is exactly as opaque to this package's tracking
+// as observingTransaction.Query's own mutating-Cypher sniff
+// (write_observer.go) already treats a mutating statement inside a
+// transaction, so the two are recorded the same way. That fallback record is
+// what makes Apply give up on replaying this write narrowly and rebuild the
+// replica instead (engine.enterFallback), which is the only sound answer
+// for a write nothing in this package can describe.
 func (d *Driver) Run(ctx context.Context, query string, parameters map[string]any) error {
 	if err := d.Driver.Run(ctx, query, parameters); err != nil {
 		return err
 	}
 	scope := engine.NewWriteScope()
-	scope.TouchAll()
 	scope.Changes().RecordFallback("Run: raw Cypher outside a transaction escapes changelog tracking")
 	d.engine.Apply(ctx, scope)
 	return nil
@@ -328,14 +328,13 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 // this override -- BloodHound's "clear database" action -- the engine would
 // keep serving shortest paths through data PostgreSQL no longer has. See
 // Run's doc for why an override is needed at all, and for why the scope
-// handed to Apply is a TouchAll scope carrying a ChangeSet fallback rather
-// than a bare nil.
+// handed to Apply carries a ChangeSet fallback rather than replaying
+// anything narrowly.
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
 	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
 		return err
 	}
 	scope := engine.NewWriteScope()
-	scope.TouchAll()
 	scope.Changes().RecordFallback("WipeGraph: full graph truncation escapes changelog tracking")
 	d.engine.Apply(ctx, scope)
 	return nil
@@ -350,24 +349,22 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 // override, so without this override the engine would keep serving
 // snapshots -- and this driver's own mapKind/mapKindNames lookups
 // (internal/engine's KindMapper seam) would keep resolving kind names --
-// built against whichever graph was default *before* this call, potentially
-// indefinitely (nothing else advances the write generation on its own).
+// built against whichever graph was default *before* this call,
+// potentially indefinitely.
 //
-// A TouchAll scope carrying a ChangeSet fallback is used, exactly like
-// Run/WipeGraph (so Apply rebuilds rather than guesses): retargeting the
-// default graph changes which nodes, edges, and kinds "the graph" even
-// refers to, which is outside anything this package's kind-scoped write
-// tracking (engine/marks.go, write_observer.go's WriteScope) reasons about --
-// the same "outside what kind-scoped tracking can reason about" call
-// observingTransaction.WithGraph and observingBatch.WithGraph
-// (write_observer.go) already make for a mid-transaction graph retarget, via
-// their own TouchAll() plus RecordFallback.
+// A ChangeSet fallback is recorded, exactly like Run/WipeGraph (so Apply
+// rebuilds rather than guesses): retargeting the default graph changes
+// which nodes, edges, and kinds "the graph" even refers to, which is
+// outside anything this package's write tracking (write_observer.go's
+// WriteScope/ChangeSet) reasons about -- the same "outside what tracking
+// can reason about" call observingTransaction.WithGraph and
+// observingBatch.WithGraph (write_observer.go) already make for a
+// mid-transaction graph retarget.
 func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
 	if err := d.Driver.SetDefaultGraph(ctx, graphSchema); err != nil {
 		return err
 	}
 	scope := engine.NewWriteScope()
-	scope.TouchAll()
 	scope.Changes().RecordFallback("SetDefaultGraph: default graph retarget escapes changelog tracking")
 	d.engine.Apply(ctx, scope)
 	return nil
@@ -375,23 +372,19 @@ func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) e
 
 // DeleteNodesByKinds deletes nodes through the embedded PostgreSQL driver
 // (a raw pooled connection, not a WriteTransaction/BatchOperation call) and
-// notifies the engine of the write once it completes successfully, scoped to
-// TouchAllNodes and TouchAllEdges rather than a nil (touch-everything)
-// scope: this is still conservative on the node side (includeAny/excludeAny
-// name which nodes qualify for deletion, but a deleted node's own kinds are
-// never narrower than "could be anything" from here, since a node can carry
-// several kinds and this call only filters, it doesn't report which ones
-// existed) and, on the edge side, deleting a node cascades to delete every
-// edge incident to it, which may carry kinds having nothing to do with
-// includeAny at all -- so TouchAllEdges, not TouchEdgeKinds(includeAny). See
-// Run's doc for why an override is needed at all.
+// notifies the engine of the write once it completes successfully via a
+// ChangeSet kind-scoped delete criteria, replayed by the applier
+// (apply.go's applyNodeKindCriteria) the same way it replays
+// includeAny/excludeAny against the in-memory replica -- including the
+// cascade to every edge incident to a deleted node, which the applier's own
+// tombstoneNodeWithCascade derives directly from the View rather than
+// needing this call to report anything about edges at all. See Run's doc
+// for why an override is needed at all.
 func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
 	if err := d.Driver.DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
 		return err
 	}
 	scope := engine.NewWriteScope()
-	scope.TouchAllNodes()
-	scope.TouchAllEdges()
 	scope.Changes().RecordDeleteNodesByKinds(includeAny, excludeAny)
 	d.engine.Apply(ctx, scope)
 	return nil
@@ -400,17 +393,16 @@ func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds,
 // DeleteRelationshipsByKinds deletes relationships through the embedded
 // PostgreSQL driver (a raw pooled connection, not a
 // WriteTransaction/BatchOperation call) and notifies the engine of the write
-// once it completes successfully, scoped to exactly kinds: unlike
-// DeleteNodesByKinds, deleting relationships has no cascade -- removing an
-// edge never removes a node or any other edge -- so kinds fully describes
-// what this call could possibly have touched. See Run's doc for why an
-// override is needed at all.
+// once it completes successfully via a ChangeSet kind-scoped delete
+// criteria: unlike DeleteNodesByKinds, deleting relationships has no
+// cascade -- removing an edge never removes a node or any other edge -- so
+// kinds fully describes what this call could possibly have touched. See
+// Run's doc for why an override is needed at all.
 func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kinds) error {
 	if err := d.Driver.DeleteRelationshipsByKinds(ctx, kinds); err != nil {
 		return err
 	}
 	scope := engine.NewWriteScope()
-	scope.TouchEdgeKinds(kinds)
 	scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
 	d.engine.Apply(ctx, scope)
 	return nil

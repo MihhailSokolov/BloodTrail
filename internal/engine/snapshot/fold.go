@@ -22,11 +22,7 @@ import "fmt"
 // derived indexes rebuilt from scratch by Build, and nodes staged in
 // strictly ascending database-id order. base's own MultiGraph flag is
 // carried over (informational metadata about the source database, unrelated
-// to this fold); Generation and AnalysisStamp are deliberately left zero,
-// exactly as a freshly Built snapshot leaves them for LoadSnapshot's own
-// caller (the engine and poller, respectively) to stamp afterward -- see
-// Snapshot's doc on those two fields. A caller folding a live base+segments
-// stack must re-stamp both on the result before publishing it.
+// to this fold).
 func Fold(base *Snapshot, segments []*Segment) (*Snapshot, error) {
 	merged := MergeSegments(segments)
 

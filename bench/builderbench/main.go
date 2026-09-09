@@ -5,9 +5,10 @@
 // pathbench's shortest-path queries) against a graph already loaded into
 // PostgreSQL, normally by bench/adgen (see bench/adgen/README.md).
 //
-// Unlike pathbench (which constructs internal/engine directly, bypassing
-// the poller entirely via a manual RebuildNow call), builderbench opens the
-// *real* production driver -- dawgs.Open(ctx, bloodtrail.DriverName, cfg),
+// Unlike pathbench (which constructs internal/engine directly and builds its
+// snapshot via a manual RebuildNow call, bypassing the driver's own boot
+// load entirely), builderbench opens the *real* production driver --
+// dawgs.Open(ctx, bloodtrail.DriverName, cfg),
 // exactly as BloodHound would -- because the shapes benchmarked here are
 // intercepted by the driver's Nodes()/Relationships() wrapping
 // (recordingNodeQuery/recordingRelationshipQuery, see relationship_query.go
@@ -40,24 +41,24 @@
 // faster serving from memory is than delegating to PostgreSQL.
 //
 // Before any shape is measured, builderbench waits for the bloodtrail
-// driver's background poller to build its first in-memory snapshot. There
-// is no way to observe that build completing from outside the driver (no
-// exported hook, and log-scraping a specific message string is deliberately
-// not used here -- see the package's task brief): instead, builderbench
-// times its own throwaway engine.LoadSnapshot call against the same data
-// (also how it reports the snapshot's node/edge/byte counts cheaply) and
-// sleeps a safety multiple of that measured cost plus the poller's own poll
-// interval, printing the wait duration. This scales with graph size
-// automatically, unlike a fixed sleep.
+// driver's Start-launched boot-load goroutine to build its first in-memory
+// snapshot (engine/boot.go): dawgs.Open launches that goroutine and returns
+// immediately, without waiting for it to adopt. There is no exported hook to
+// observe that adoption completing from outside the driver, and log-scraping
+// a specific message string is deliberately not used here (see the
+// package's task brief): instead, builderbench times its own throwaway
+// engine.LoadSnapshot call against the same data (also how it reports the
+// snapshot's node/edge/byte counts cheaply) and sleeps a safety multiple of
+// that measured cost, printing the wait duration. Boot load is that exact
+// same call, made once, with no periodic cadence to also account for, so
+// this scales with graph size automatically, unlike a fixed sleep.
 //
 // Usage:
 //
 //	go run ./bench/builderbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce] [-cpuprofile <file>]
 //
 // builderbench never imports bench/adgen (a generator, not a library) and
-// never writes to the database (beyond a scratch datapipe_status row it
-// creates and drops itself, needed to drive the poller -- see
-// createDatapipeStatusTable's doc): it finds every kind name purely by
+// never writes to the database at all: it finds every kind name purely by
 // duplicating bench/adgen/generate.go's constants, the same convention
 // pathbench follows.
 //
@@ -314,12 +315,6 @@ func thresholdFor(name string) shapeThreshold {
 // noise.
 const bfsWorkers = 2
 
-// enginePollInterval is set via BLOODTRAIL_ENGINE_POLL_INTERVAL before
-// opening the bloodtrail driver, short enough that the wait computed in
-// execute (waitForFreshSnapshot's caller) is dominated by the actual
-// snapshot build cost rather than by the poller's own idle cadence.
-const enginePollInterval = 200 * time.Millisecond
-
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -521,7 +516,6 @@ type benchResult struct {
 	buildEdges    int
 	buildBytes    uint64
 
-	pollInterval time.Duration
 	waitDuration time.Duration
 
 	rootID       uint64
@@ -554,10 +548,10 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 	// so bt and oracle are deliberately never Close()'d below (that would
 	// close this shared pool out from under whichever driver is still in
 	// use); this defer is builderbench's one and only close. builderbench
-	// is a one-shot CLI process, so bt's background poller goroutine
-	// (started deep inside dawgs.Open by bloodtrail.Open) is simply
-	// abandoned at process exit rather than stopped gracefully -- there is
-	// no exported way to stop it without calling the very Close this
+	// is a one-shot CLI process, so bt's background boot-load/fallback-
+	// recovery goroutines (started deep inside dawgs.Open by bloodtrail.Open)
+	// are simply abandoned at process exit rather than stopped gracefully --
+	// there is no exported way to stop them without calling the very Close this
 	// comment explains why we avoid, and an abandoned goroutine in a
 	// process about to exit is harmless.
 	defer pool.Close()
@@ -615,25 +609,6 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 	fmt.Printf("builderbench: highest in-degree group (shape 2's BFS root): objectid=%s id=%d in_degree(%s)=%d\n",
 		rootObjectID, rootID, edgeMemberOf, inDegree)
 
-	if err := createDatapipeStatusTable(ctx, pool); err != nil {
-		return nil, fmt.Errorf("create datapipe_status: %w", err)
-	}
-	defer func() {
-		if err := dropDatapipeStatusTable(ctx, pool); err != nil {
-			fmt.Fprintf(os.Stderr, "builderbench: drop datapipe_status: %v\n", err)
-		}
-	}()
-	if err := insertDatapipeStatus(ctx, pool, "idle", time.Now().UTC()); err != nil {
-		return nil, fmt.Errorf("insert datapipe_status: %w", err)
-	}
-
-	// Must be set before dawgs.Open below: bloodtrail.Open reads
-	// SettingsFromEnv exactly once, at construction time.
-	if err := os.Setenv(bloodtrail.EnvEnginePollInterval, enginePollInterval.String()); err != nil {
-		return nil, fmt.Errorf("set %s: %w", bloodtrail.EnvEnginePollInterval, err)
-	}
-	result.pollInterval = enginePollInterval
-
 	dawgsCfg := dawgs.Config{ConnectionString: cfg.dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
 
 	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgsCfg)
@@ -653,25 +628,22 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 	}
 
 	// See the package doc: there is no exported way to observe the
-	// bloodtrail driver's background poller actually finishing its first
-	// build, so this waits a safety multiple of the just-measured build
-	// cost plus the poller's own poll interval instead. 2x the poll
-	// interval covers the wait for the first tick to fire at all (a
-	// time.Ticker's first tick arrives one full interval after it starts,
-	// never immediately) plus one interval of scheduling slack; 2x the
-	// measured build cost covers the rebuild itself plus variance from
-	// running against a now-shared pool. The 1s floor keeps tiny graphs
-	// (whose build cost is sub-millisecond) from racing the poller on a
-	// near-zero wait.
-	waitDuration := 2*enginePollInterval + 2*result.buildDuration + 500*time.Millisecond
+	// bloodtrail driver's Start-launched boot-load goroutine actually
+	// finishing its first build (dawgs.Open above returns as soon as Start
+	// launches it, not once it adopts), so this waits a safety multiple of
+	// the just-measured build cost instead: boot load is that same
+	// LoadSnapshot call, made once, immediately, with no periodic cadence
+	// to also account for. The 1s floor keeps tiny graphs (whose build cost
+	// is sub-millisecond) from racing it on a near-zero wait.
+	waitDuration := 2*result.buildDuration + 500*time.Millisecond
 	if waitDuration < time.Second {
 		waitDuration = time.Second
 	}
 	result.waitDuration = waitDuration
-	fmt.Printf("builderbench: waiting %s for the bloodtrail driver's poller to build its first snapshot (poll_interval=%s) ...\n",
-		waitDuration, enginePollInterval)
+	fmt.Printf("builderbench: waiting %s for the bloodtrail driver's boot-load goroutine to build its first snapshot ...\n",
+		waitDuration)
 	time.Sleep(waitDuration)
-	fmt.Printf("BUILDERBENCH_WAIT duration_ms=%.3f poll_interval_ms=%.3f\n", floatMillis(waitDuration), floatMillis(enginePollInterval))
+	fmt.Printf("BUILDERBENCH_WAIT duration_ms=%.3f\n", floatMillis(waitDuration))
 
 	root, err := fetchNodeByID(ctx, bt, graph.ID(rootID))
 	if err != nil {
@@ -997,67 +969,6 @@ func highestInDegreeGroup(ctx context.Context, pool *pgxpool.Pool, graphID int32
 		return 0, "", 0, err
 	}
 	return id, objectID, inDegree, nil
-}
-
-// createDatapipeStatusTable, insertDatapipeStatus, and
-// dropDatapipeStatusTable manage a scratch datapipe_status row: the
-// column names and constraint verified against upstream BloodHound
-// v9.6.0's migrations -- see internal/engine/poller_integration_test.go's
-// identically named test helper for the full provenance note, duplicated
-// here (a non-test main package cannot import a _test.go helper) for the
-// same reason bench/pathbench and bench/adgen duplicate other constants
-// rather than import test-only code.
-//
-// The bloodtrail driver's poller (internal/engine/poller.go's tick) reads
-// this table on every tick and does nothing at all if the query fails --
-// including "relation does not exist" -- so without this table the poller
-// would silently never build a snapshot, and builderbench would spend its
-// whole run delegating to PostgreSQL on both drivers (a ratio of ~1x, not
-// an error). createDatapipeStatusTable must run, and insertDatapipeStatus's
-// row must exist, before dawgs.Open constructs the bloodtrail driver in
-// execute, so the very first poll tick already finds a valid row.
-//
-// IMPORTANT: builderbench requires a dedicated benchmark database. It will
-// refuse to run if datapipe_status already exists, since CREATE TABLE IF
-// NOT EXISTS would silently no-op on a real BloodHound database's table, but
-// the deferred DROP TABLE IF EXISTS would then destroy that real table (live
-// pipeline state). Point -dsn at a database created and loaded by adgen for
-// benchmarking only, never at a real BloodHound installation.
-func createDatapipeStatusTable(ctx context.Context, pool *pgxpool.Pool) error {
-	// Check if the table already exists. If it does, refuse to run.
-	var exists bool
-	if err := pool.QueryRow(ctx, "SELECT to_regclass('datapipe_status') IS NOT NULL").Scan(&exists); err != nil {
-		return fmt.Errorf("check datapipe_status pre-existence: %w", err)
-	}
-	if exists {
-		return fmt.Errorf("datapipe_status table already exists; builderbench requires a dedicated benchmark database loaded by adgen, never a real BloodHound installation (the deferred DROP would destroy live pipeline state)")
-	}
-
-	const ddl = `CREATE TABLE IF NOT EXISTS datapipe_status (
-		singleton boolean DEFAULT true NOT NULL,
-		status text NOT NULL,
-		updated_at timestamp with time zone NOT NULL,
-		last_complete_analysis_at timestamp with time zone,
-		last_analysis_run_at timestamp with time zone,
-		last_complete_optimize_at timestamp with time zone,
-		next_scheduled_analysis_at timestamp with time zone,
-		CONSTRAINT singleton_uni CHECK (singleton)
-	)`
-	_, err := pool.Exec(ctx, ddl)
-	return err
-}
-
-func insertDatapipeStatus(ctx context.Context, pool *pgxpool.Pool, status string, stamp time.Time) error {
-	_, err := pool.Exec(ctx,
-		`INSERT INTO datapipe_status (singleton, status, updated_at, last_complete_analysis_at) VALUES (true, $1, now(), $2)`,
-		status, stamp,
-	)
-	return err
-}
-
-func dropDatapipeStatusTable(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, "DROP TABLE IF EXISTS datapipe_status")
-	return err
 }
 
 // report prints every shape's enforcement line and the final PASS/FAIL

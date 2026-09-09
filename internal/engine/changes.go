@@ -9,33 +9,28 @@ import (
 	"github.com/specterops/dawgs/graph"
 )
 
-// ChangeSet is the change log a WriteScope accumulates alongside its
-// existing Touch*/Delete* marks (see WriteScope's own doc, marks.go): where
-// those marks describe which KINDS a write touched -- the input to the
-// kind-scoped freshness queries NoteWrite already serves -- ChangeSet
-// describes, for the same write, the actual read-back keys (node/edge
-// database ids, or the objectid values an upsert identified its target by)
-// and, where a key can't be pinned down, the coarser operation (a
-// kind-scoped delete criteria, or a bare "this write escaped tracking"
-// fallback) a later write-through applier needs in order to replay the
-// write's effect into the in-memory engine, rather than re-deriving it from
-// the observer call sequence itself.
+// ChangeSet is the change log a WriteScope accumulates (see WriteScope's own
+// doc, changes_scope.go): the actual read-back keys (node/edge database ids,
+// or the objectid values an upsert identified its target by) and, where a
+// key can't be pinned down, the coarser operation (a kind-scoped delete
+// criteria, or a bare "this write escaped tracking" fallback) Apply
+// (apply.go) needs in order to replay the write's effect into the in-memory
+// engine, rather than re-deriving it from the observer call sequence itself.
 //
 // Every Record* method is additive and idempotent: recording the same
 // logical entry more than once (e.g. two calls that both name node id 7,
 // or two RecordFallback calls with the same reason) has the same effect as
 // recording it once -- see each method's own doc for its exact dedup key.
 // Nothing on this type reads e.snap or any other engine state, and nothing
-// here decides what the applier should DO with a recorded entry; every
-// method is a pure, in-memory accumulation, exactly like WriteScope's own
-// Touch*/Delete* methods, and every accessor below returns a fresh copy the
-// caller may freely mutate without affecting the ChangeSet.
+// here decides what Apply should DO with a recorded entry; every method is a
+// pure, in-memory accumulation, and every accessor below returns a fresh
+// copy the caller may freely mutate without affecting the ChangeSet.
 //
-// The zero value is ready to use, mirroring WriteScope's own zero-value
-// convention: every map field is allocated lazily, on first use, by the
-// Record* method that needs it. Not safe for concurrent use, for the same
-// reason WriteScope itself isn't: a ChangeSet is built by the one goroutine
-// handling a single write and read back once, after that write commits.
+// The zero value is ready to use: every map field is allocated lazily, on
+// first use, by the Record* method that needs it. Not safe for concurrent
+// use, for the same reason WriteScope itself isn't: a ChangeSet is built by
+// the one goroutine handling a single write and read back once, after that
+// write commits.
 type ChangeSet struct {
 	nodeIDs       map[uint64]struct{}
 	nodeObjectIDs map[string]struct{}
@@ -82,10 +77,9 @@ type NodeKindDeleteCriteria struct {
 	Include, Exclude graph.Kinds
 }
 
-// kindName is graph.Kind.String(), guarded against a nil Kind the way
-// WriteScope.TouchNodeKinds/TouchEdgeKind already guard their own callers --
-// see those methods' docs (marks.go) for why a nil Kind is tolerated rather
-// than treated as a caller bug.
+// kindName is graph.Kind.String(), guarded against a nil Kind: nothing in
+// the write path is expected to produce one, but silently tolerating it is
+// cheap insurance against a caller mistake more forgiving than a crash.
 func kindName(kind graph.Kind) string {
 	if kind == nil {
 		return ""
@@ -263,10 +257,9 @@ func (c *ChangeSet) RecordDeleteRelationshipsByKinds(kinds graph.Kinds) {
 // package's changelog tracking entirely -- a mutating raw Cypher Query, a
 // Raw SQL call, a WithGraph retarget, an unrecognized Update/Delete
 // criteria, or an unrecognized upsert identity shape -- alongside reason, a
-// short human-readable description of which. The applier's only sound
-// response to a fallback is the same one NoteWrite's own unscoped path
-// already gives the kind-scoped marks: treat the write as unknown and fall
-// back to a full resync, rather than trying to replay it narrowly.
+// short human-readable description of which. Apply's only sound response to
+// a fallback is to treat the write as unknown and enter fallback (a full
+// resync), rather than trying to replay it narrowly.
 //
 // Recording the same reason string more than once has the same effect as
 // recording it once; HasFallback() returns each distinct reason exactly
@@ -283,12 +276,8 @@ func (c *ChangeSet) RecordFallback(reason string) {
 
 // Empty reports whether nothing has been recorded on c at all -- no ids, no
 // object ids, no triples, no kind-scoped delete criteria, and no fallback.
-// This is ChangeSet's own equivalent of WriteScope.Empty(), over a
-// disjoint set of fields: a WriteScope's Touch*/Delete* dimensions
-// (marks.go) can be Empty() while its ChangeSet is not, or vice versa, in
-// principle, though every Record* call in write_observer.go is paired with
-// a Touch*/Delete* call that marks the same write, so in practice the two
-// track each other closely today.
+// WriteScope.Empty() (changes_scope.go) is exactly this call on the
+// WriteScope's own ChangeSet.
 func (c *ChangeSet) Empty() bool {
 	return len(c.nodeIDs) == 0 && len(c.nodeObjectIDs) == 0 &&
 		len(c.edgeIDs) == 0 &&
@@ -307,9 +296,23 @@ func (c *ChangeSet) HasFallback() (ok bool, reasons []string) {
 	return true, sortedKeys(c.fallbacks)
 }
 
+// sortedKeys returns the keys of m in sorted order, or nil if m is empty --
+// the shared implementation behind HasFallback and NodeObjectIDs.
+func sortedKeys(m map[string]struct{}) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // sortedUint64Keys returns the keys of m in ascending order, or nil if m is
-// empty -- NodeIDs/EdgeIDs' shared implementation, mirroring marks.go's own
-// sortedKeys for map[string]uint64 keys.
+// empty -- NodeIDs/EdgeIDs' shared implementation, mirroring sortedKeys
+// above for map[string]uint64 keys.
 func sortedUint64Keys(m map[uint64]struct{}) []uint64 {
 	if len(m) == 0 {
 		return nil

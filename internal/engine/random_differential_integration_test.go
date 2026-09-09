@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
@@ -76,7 +75,7 @@ func TestRandomDifferential(t *testing.T) {
 		graphtest.WipeGraph(t, pgDriver)
 		ids := graphtest.LoadRandom(t, pgDriver, seed)
 
-		if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+		if err := eng.RebuildNow(ctx, triggerManual); err != nil {
 			t.Fatalf("seed=%d: RebuildNow: %v", seed, err)
 		}
 

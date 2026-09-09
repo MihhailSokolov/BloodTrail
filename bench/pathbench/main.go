@@ -299,7 +299,7 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 		// served query, which would otherwise print once per pair below.
 		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	})
-	if err := eng.RebuildNow(ctx, "manual", time.Time{}); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		return nil, fmt.Errorf("engine rebuild: %w", err)
 	}
 	hydratedEdgeKinds := stringKinds(edgeKindNames)

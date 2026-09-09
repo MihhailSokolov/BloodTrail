@@ -350,28 +350,22 @@ func TestEnterFallbackFlipsStateOnceAndStopsServing(t *testing.T) {
 	}
 }
 
-// TestApplyBumpsEpochAndKeepsMarksBookkeeping pins the two things Apply does
-// before any of its early returns can apply: the epoch bump a concurrent
-// rebuild's adoption check depends on (adoptRebuiltView), and the interim
-// generation/marks bookkeeping the poller still reads. The engine here has
-// no snapshot, so Apply returns before it would ever reach read-back.
-func TestApplyBumpsEpochAndKeepsMarksBookkeeping(t *testing.T) {
+// TestApplyBumpsEpochBeforeAnyEarlyReturn pins the one thing Apply does
+// before any of its early returns can fire: the epoch bump a concurrent
+// rebuild's adoption check depends on (adoptRebuiltView). The engine here
+// has no snapshot, so Apply returns before it would ever reach read-back.
+func TestApplyBumpsEpochBeforeAnyEarlyReturn(t *testing.T) {
 	e := New(nil, nil, Config{Enabled: true})
 
 	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User")})
 	scope.Changes().RecordNodeID(7)
 
 	epochBefore := e.applyEpoch.Load()
-	genBefore := e.Generation()
 
 	e.Apply(context.Background(), scope)
 
 	if got := e.applyEpoch.Load(); got != epochBefore+1 {
 		t.Fatalf("applyEpoch = %d after Apply, want %d", got, epochBefore+1)
-	}
-	if got := e.Generation(); got != genBefore+1 {
-		t.Fatalf("Generation = %d after Apply, want %d", got, genBefore+1)
 	}
 	if e.state.Load() != stateServing {
 		t.Fatalf("Apply with no snapshot adopted entered fallback, want it to stay serving")
@@ -453,7 +447,6 @@ func TestApplyEarlyReturnRelaunchesRecoveryWhenNoneIsRunning(t *testing.T) {
 	e.state.Store(stateFallback)
 
 	scope := NewWriteScope()
-	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User")})
 	scope.Changes().RecordNodeID(7)
 
 	e.Apply(context.Background(), scope)

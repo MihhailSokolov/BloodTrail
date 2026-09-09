@@ -33,19 +33,20 @@ const (
 )
 
 // triggerFallback labels the RebuildNow calls the fallback recovery
-// goroutine makes, alongside poller.go's own trigger* labels, so a rebuild
-// driven by a failed apply is distinguishable in the log from a poller- or
-// test-driven one.
+// goroutine makes, alongside boot.go's own triggerStartup and triggerManual,
+// so a rebuild driven by a failed apply is distinguishable in the log from a
+// boot-load- or test-driven one.
 const triggerFallback = "fallback"
 
 // fallbackRetryInterval and fallbackRetryMax bound the fallback recovery
-// goroutine's retry cadence: the first retry after a failed (or
-// not-adopted) rebuild waits fallbackRetryInterval, and each further retry
-// doubles the wait up to fallbackRetryMax. This mirrors the rate-limiting
-// spirit of RebuildNow's own refusal warning (refusalLogInterval) and the
-// poller's query-error backoff -- a database that stays unreachable, or a
-// graph that stays over cfg.MemoryLimit, must not turn recovery into a hot
-// loop -- while still recovering promptly from a transient failure.
+// goroutine's retry cadence (shared with Start's boot-load goroutine,
+// boot.go): the first retry after a failed (or not-adopted) rebuild waits
+// fallbackRetryInterval, and each further retry doubles the wait up to
+// fallbackRetryMax. This mirrors the rate-limiting spirit of RebuildNow's
+// own refusal warning (refusalLogInterval) -- a database that stays
+// unreachable, or a graph that stays over cfg.MemoryLimit, must not turn
+// recovery into a hot loop -- while still recovering promptly from a
+// transient failure.
 const (
 	fallbackRetryInterval = 100 * time.Millisecond
 	fallbackRetryMax      = 30 * time.Second
@@ -71,27 +72,22 @@ const (
 //     adoptRebuiltView). Bumped for every call, before anything else can
 //     decide to return early, so a rebuild is never allowed to adopt a
 //     snapshot that could have missed this write.
-//  2. NoteWrite (marks.go): advance the write-generation counter and stamp
-//     the kind marks. Nothing in the serving path reads either any more --
-//     this is interim bookkeeping for the poller, which still consults
-//     Fresh() until it is retired -- but it must happen before the new View
-//     is published, since its delete-id resolution reads the CURRENT View.
-//  3. Give up early -- correctly, and without any PostgreSQL round trip --
+//  2. Give up early -- correctly, and without any PostgreSQL round trip --
 //     when there is nothing to keep up to date: a disabled engine (which
 //     never serves), an engine already in fallback (whose pending rebuild
 //     reads post-write state anyway), or an engine with no snapshot adopted
-//     yet (the boot rebuild will read post-write state anyway, for the same
-//     reason).
-//  4. A nil scope, or a ChangeSet carrying a fallback record, means this
+//     yet (the boot-load rebuild will read post-write state anyway, for the
+//     same reason).
+//  3. A nil scope, or a ChangeSet carrying a fallback record, means this
 //     write's effect cannot be expressed as a delta at all: enterFallback,
 //     which is the honest answer rather than a guess.
-//  5. Read back every key the ChangeSet named from PostgreSQL (readBack,
+//  4. Read back every key the ChangeSet named from PostgreSQL (readBack,
 //     readback.go): present rows are the write's post-state, absent keys are
 //     deletions. A read-back error is not survivable either -- the write's
 //     effect is unknown -- so it enters fallback too.
-//  6. Turn that read-back result, plus the kind-scoped delete criteria the
+//  5. Turn that read-back result, plus the kind-scoped delete criteria the
 //     ChangeSet carries, into one immutable delta Segment (buildApplySegment).
-//  7. Layer the segment onto the current View and publish the result, unless
+//  6. Layer the segment onto the current View and publish the result, unless
 //     the result would exceed cfg.MemoryLimit -- the same limit RebuildNow
 //     applies to a freshly loaded snapshot, applied here to the View the
 //     delta produces -- in which case enterFallback instead.
@@ -104,16 +100,12 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 
 	e.applyEpoch.Add(1)
 
-	// Interim bookkeeping: generation + kind marks. Retired with the poller.
-	e.NoteWrite(scope)
-
 	if !e.cfg.Enabled {
 		return
 	}
 
 	if scope == nil {
-		// NoteWrite's own "unknown write, touch everything" case: nothing
-		// names what changed, so nothing can be replayed narrowly.
+		// Nothing names what changed, so nothing can be replayed narrowly.
 		e.enterFallback(ctx, "nil write scope")
 		return
 	}
@@ -532,9 +524,9 @@ func (e *Engine) startFallbackRebuild() {
 // published View both complete and current, and serving from anything less
 // is exactly what fallback exists to prevent. The state flip itself happens
 // inside adoptRebuiltView, alongside the publish it belongs with, so that a
-// rebuild from any other source (the poller, a manual call) ends the
-// fallback too rather than leaving the engine declining behind an
-// already-trustworthy replica.
+// rebuild from any other source (Start's boot-load goroutine, a manual
+// call) ends the fallback too rather than leaving the engine declining
+// behind an already-trustworthy replica.
 //
 // The adopted case hands off to finishFallbackRebuild rather than clearing
 // fallbackRebuilding itself -- see that function's doc for the stranding
@@ -552,7 +544,7 @@ func (e *Engine) runFallbackRebuild() {
 			return
 		}
 
-		adopted, err := e.rebuildOnce(e.bgCtx, triggerFallback, time.Time{})
+		adopted, err := e.rebuildOnce(e.bgCtx, triggerFallback)
 		switch {
 		case err != nil:
 			e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: fallback rebuild failed", slog.Any("error", err))
@@ -592,9 +584,10 @@ func (e *Engine) runFallbackRebuild() {
 // it is moments from exiting, having already committed to leaving fallback
 // exited. Without this recheck, the engine would be left stranded in
 // stateFallback with no goroutine ever again scheduled to recover it, every
-// query declining to PostgreSQL forever (a background poller can paper over
-// this today by rebuilding on its own cadence, but that poller is retired
-// once write-through's freshness gates are, so this cannot depend on it).
+// query declining to PostgreSQL forever: there is no background poller left
+// to paper over that by rebuilding on its own cadence (the poller was
+// retired alongside write-through's freshness gates, boot.go), so this
+// recheck is the only thing that can.
 //
 // Only called from the adopted-rebuild return path (see runFallbackRebuild),
 // never from a context-cancelled return: relaunching in response to a state

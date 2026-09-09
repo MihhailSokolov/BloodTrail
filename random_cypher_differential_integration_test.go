@@ -38,7 +38,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
@@ -695,7 +694,7 @@ func TestRandomCypherDifferential(t *testing.T) {
 		t.Fatalf("loadRandomCypherFixture returned %d ids, want %d", len(ids), randomCypherFixtureNodeCount)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 

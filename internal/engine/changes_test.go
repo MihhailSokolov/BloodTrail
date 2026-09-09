@@ -190,10 +190,11 @@ func TestChangeSetEmbeddedInWriteScopeViaChanges(t *testing.T) {
 	if got, want := scope.Changes().NodeIDs(), []uint64{1, 2}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("scope.Changes().NodeIDs() = %v, want %v", got, want)
 	}
-	// The WriteScope's own Touch*/Delete* dimensions (Empty()) must stay
-	// completely unaware of the ChangeSet -- see ChangeSet's own doc.
-	if !scope.Empty() {
-		t.Fatalf("WriteScope.Empty() = false after only Changes() calls, want true (Touch*/Delete* untouched)")
+	// WriteScope.Empty() is scope.Changes().Empty() -- a write that only
+	// ever records into the ChangeSet must still be seen as non-empty (this
+	// is exactly what wrote(), write_observer.go, keys on).
+	if scope.Empty() {
+		t.Fatalf("WriteScope.Empty() = true after RecordNodeID calls, want false")
 	}
 	if scope.Changes().Empty() {
 		t.Fatalf("ChangeSet.Empty() = true after RecordNodeID calls, want false")

@@ -73,7 +73,7 @@ func TestTryAllShortestPathsDifferential(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -232,17 +232,17 @@ func TestTryAllShortestPathsDifferential(t *testing.T) {
 	}
 }
 
-// TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback replaces a test
-// that asserted the opposite of what write-through guarantees: that a write
-// landing between RebuildNow and a query made the engine decline.
-//
-// It no longer does, and must not: a write publishes itself into the replica
-// (apply.go), so the snapshot a query captures is already current. The one
-// condition that stops the path-serving path now is the engine being in
-// fallback -- a write that could NOT be replayed -- which this test drives
-// directly (the state is what serving reads; how it got set is Apply's
-// business, exercised end-to-end by the root package's own suites).
-func TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback(t *testing.T) {
+// TestTryAllShortestPathsDeclinesInFallback covers the one condition that
+// stops the path-serving path once a snapshot has been adopted: the engine
+// being in fallback -- a write that could NOT be replayed into the replica
+// (apply.go) -- which this test drives directly (the state is what serving
+// reads; how it got set is Apply's own business, exercised end-to-end by
+// the root package's own suites). A write that CAN be replayed is not
+// exercised here at all: write-through publishes it into the replica
+// before the writing call returns, so the snapshot a later query captures
+// is already current -- there is no separate "did a write make this stale"
+// condition left for a query to fail on.
+func TestTryAllShortestPathsDeclinesInFallback(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
@@ -252,7 +252,7 @@ func TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -278,13 +278,6 @@ func TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback(t *testing.T) {
 		t.Fatalf("TryAllShortestPaths declined right after RebuildNow, want served")
 	}
 
-	// A write, on its own, must not stop the engine serving.
-	eng.NoteWrite(nil)
-	if !serves() {
-		t.Fatalf("TryAllShortestPaths declined after a write; write-through leaves the replica servable")
-	}
-
-	// Fallback does.
 	eng.state.Store(stateFallback)
 	if serves() {
 		t.Fatalf("TryAllShortestPaths served while the engine is in fallback, want declined")
@@ -293,6 +286,54 @@ func TestTryAllShortestPathsSurvivesWritesAndDeclinesInFallback(t *testing.T) {
 	eng.state.Store(stateServing)
 	if !serves() {
 		t.Fatalf("TryAllShortestPaths declined after leaving fallback, want served")
+	}
+}
+
+// TestStartBootLoadsSnapshotWithoutDatapipeStatus is Start's boot-load
+// lifecycle evidence: an enabled Engine must produce a serving snapshot on
+// its own once Start runs, with no dependency on the datapipe_status table
+// the retired poller used to read from.
+//
+// The datapipe_status table is dropped outright, before Start ever runs,
+// so this does not rely on the table simply happening to be absent from a
+// fresh test database (every other suite that needs it creates it itself,
+// ad hoc, and cleans up after -- see engine_serving_integration_test.go's
+// createDatapipeStatusTable in the root package). This is belt-and-suspenders
+// on top of what is now also a compile-level guarantee: poller.go, the one
+// file that ever issued a datapipe_status query, is gone, so grepping this
+// package for "datapipe_status" turns up nothing outside this comment --
+// there is no code path left that could query it even if the table existed.
+// The DROP TABLE is kept anyway because it costs nothing to run and makes
+// the test's own claim ("boot load needs none of this") checkable without
+// having to trust that fact by inspection alone, and it makes the test
+// order-independent: it does not matter whether some earlier test left the
+// table behind.
+func TestStartBootLoadsSnapshotWithoutDatapipeStatus(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+	graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
+
+	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS datapipe_status"); err != nil {
+		t.Fatalf("drop datapipe_status: %v", err)
+	}
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+
+	eng.Start(ctx)
+	defer eng.Stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, fresh := eng.Fresh(); fresh {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("boot load did not produce a serving snapshot within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -338,7 +379,7 @@ func TestTryAllShortestPathsDeclinesSelfEndpoint(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual, time.Time{}); err != nil {
+	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 

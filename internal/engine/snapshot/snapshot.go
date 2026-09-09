@@ -59,9 +59,6 @@ type Snapshot struct {
 	// (e.g. in unit tests) that never went through it.
 	MultiGraph bool
 
-	Generation    uint64    // set by the engine (Task 10)
-	AnalysisStamp time.Time // set by the poller (Task 12)
-
 	idIndex     map[uint64]NodeID
 	kindBitmaps map[KindID]*Bitset
 

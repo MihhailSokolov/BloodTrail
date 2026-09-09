@@ -16,8 +16,9 @@ import (
 //
 // Both conditions are necessary: a brand-new Engine is in stateServing but
 // has no snapshot, and an Engine with a snapshot still declines while it is
-// in stateFallback. Note what is deliberately absent -- a write no longer
-// makes a snapshot unservable, which is the whole point of write-through.
+// in stateFallback. serveState takes no write-history parameter at all --
+// write-through means a published View already reflects every committed
+// write, so whether one may be served depends only on these two things.
 func TestServeStateRequiresSnapshotAndServingState(t *testing.T) {
 	e := New(nil, nil, Config{})
 
@@ -32,13 +33,6 @@ func TestServeStateRequiresSnapshotAndServingState(t *testing.T) {
 		t.Fatalf("serveState() right after storing a snapshot = (%v, %v), want (%v, true)", got, ok, view)
 	}
 
-	// A write, on its own, must NOT stop the engine serving: Apply publishes
-	// the write into the replica, so there is nothing left to go stale.
-	e.NoteWrite(nil)
-	if got, ok := e.serveState(); !ok || got != view {
-		t.Fatalf("serveState() after a write = (%v, %v), want (%v, true) -- write-through leaves the replica servable", got, ok, view)
-	}
-
 	e.state.Store(stateFallback)
 	if got, ok := e.serveState(); ok || got != view {
 		t.Fatalf("serveState() in fallback = (%v, %v), want (%v, false)", got, ok, view)
@@ -50,9 +44,9 @@ func TestServeStateRequiresSnapshotAndServingState(t *testing.T) {
 	}
 }
 
-// TestFreshMirrorsServeState pins Fresh -- the poller's own remaining
-// caller -- to serveState's answer, so the poller's "needs a rebuild" rules
-// see the fallback state rather than the retired generation comparison.
+// TestFreshMirrorsServeState pins Fresh, kept as a test-observability
+// wrapper now that the poller (its last production caller) is retired, to
+// serveState's answer.
 func TestFreshMirrorsServeState(t *testing.T) {
 	e := New(nil, nil, Config{})
 
@@ -101,7 +95,7 @@ func TestAdoptRebuiltViewRejectsRacedApply(t *testing.T) {
 // TestAdoptRebuiltViewExitsFallback pins recovery to adoption rather than to
 // whichever goroutine performed the rebuild: any adopted snapshot is
 // complete and current (that is exactly what the epoch check proves), so it
-// ends the fallback -- a poller or manual rebuild included.
+// ends the fallback -- a boot-load or manual rebuild included.
 func TestAdoptRebuiltViewExitsFallback(t *testing.T) {
 	e := New(nil, nil, Config{})
 	e.state.Store(stateFallback)

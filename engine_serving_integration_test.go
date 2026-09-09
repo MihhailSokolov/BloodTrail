@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/container"
 	"github.com/specterops/dawgs/drivers/pg"
@@ -52,7 +51,7 @@ const servedMarker = "bloodtrail: path engine served"
 const builderServedMarker = "bloodtrail: builder engine served"
 
 // lockedBuffer is a bytes.Buffer safe for concurrent writes from the
-// engine's poller/serving goroutines and reads from the test goroutine.
+// engine's background/serving goroutines and reads from the test goroutine.
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -91,81 +90,6 @@ func installLogCapture(t *testing.T) *lockedBuffer {
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
 	return buf
-}
-
-// createDatapipeStatusTable creates the datapipe_status table with the
-// column names and constraint verified against upstream BloodHound
-// v9.6.0's migrations -- see internal/engine/poller_integration_test.go's
-// identically named helper for the full provenance note; duplicated here
-// since that one is unexported in a different package.
-//
-// Unlike that helper, this one does not register its own t.Cleanup to drop
-// the table: pg.Driver.Close (drivers/pg/driver.go) closes the shared
-// *pgxpool.Pool it was constructed from, and the bt/oracle drivers built on
-// that same pool in these tests are closed via plain defer in the test
-// body -- which always runs before any t.Cleanup callback -- so a
-// t.Cleanup-based drop here would run against an already-closed pool.
-// Callers must instead defer the drop themselves, placed after the
-// bt/oracle Close defers so LIFO ordering runs it first, while the pool is
-// still open.
-func createDatapipeStatusTable(t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-	ctx := context.Background()
-
-	const ddl = `CREATE TABLE IF NOT EXISTS datapipe_status (
-		singleton boolean DEFAULT true NOT NULL,
-		status text NOT NULL,
-		updated_at timestamp with time zone NOT NULL,
-		last_complete_analysis_at timestamp with time zone,
-		last_analysis_run_at timestamp with time zone,
-		last_complete_optimize_at timestamp with time zone,
-		next_scheduled_analysis_at timestamp with time zone,
-		CONSTRAINT singleton_uni CHECK (singleton)
-	)`
-
-	if _, err := pool.Exec(ctx, ddl); err != nil {
-		t.Fatalf("create datapipe_status: %v", err)
-	}
-}
-
-// dropDatapipeStatusTable drops the table created by
-// createDatapipeStatusTable. See that function's doc for why callers defer
-// this explicitly instead of relying on t.Cleanup.
-func dropDatapipeStatusTable(t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-	if _, err := pool.Exec(context.Background(), "DROP TABLE IF EXISTS datapipe_status"); err != nil {
-		t.Errorf("drop datapipe_status: %v", err)
-	}
-}
-
-// insertDatapipeStatus inserts the table's single row. status is
-// deliberately a parameter rather than hardcoded "idle": decideRebuild's
-// rule (c) (internal/engine/poller.go) opportunistically rebuilds on any
-// stale snapshot whenever status == "idle", which would make phase 3 below
-// (a plain write must not itself trigger a rebuild) vacuous. Tests that
-// exercise that phase pass a non-idle status.
-func insertDatapipeStatus(t *testing.T, pool *pgxpool.Pool, status string, stamp time.Time) {
-	t.Helper()
-	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO datapipe_status (singleton, status, updated_at, last_complete_analysis_at) VALUES (true, $1, now(), $2)`,
-		status, stamp,
-	); err != nil {
-		t.Fatalf("insert datapipe_status: %v", err)
-	}
-}
-
-// updateDatapipeStamp advances the row's last_complete_analysis_at, the
-// stamp decideRebuild's rule (b) compares against the current snapshot's
-// AnalysisStamp to decide whether a completed analysis run justifies a
-// rebuild.
-func updateDatapipeStamp(t *testing.T, pool *pgxpool.Pool, stamp time.Time) {
-	t.Helper()
-	if _, err := pool.Exec(context.Background(),
-		`UPDATE datapipe_status SET last_complete_analysis_at = $1, updated_at = now() WHERE singleton`,
-		stamp,
-	); err != nil {
-		t.Fatalf("update datapipe_status: %v", err)
-	}
 }
 
 // shortestPathsViaCriteria runs the same graph.Criteria shape BloodHound's
@@ -208,12 +132,17 @@ func shortestPathsViaCriteria(t *testing.T, ctx context.Context, db graph.Databa
 // servedMarker lines than baseline, up to deadline. Each call actively
 // drives a query through the driver: the served marker is logged only from
 // inside TryAllShortestPaths/TryCypher when a caller's query actually
-// reaches them, never by the poller's background rebuild alone (which logs
-// its own, differently worded "snapshot rebuilt" line), so a caller that
-// only waited passively without issuing calls here would wait forever. It
-// returns the result from the exact call that observed a new marker, so a
-// caller gets both "the engine built/rebuilt" and a live result in one
-// step, with no separate race between the two.
+// reaches them, never by a background rebuild alone (which logs its own,
+// differently worded "snapshot rebuilt" line), so a caller that only
+// waited passively without issuing calls here would wait forever -- this
+// is also what makes the wait correct with no dependency on Start's
+// boot-load goroutine having already adopted a snapshot by the time this
+// is first called: the very first call may simply decline (no snapshot
+// yet) or serve the pre-existing one, and this loop keeps retrying either
+// way until a NEW serve is observed. It returns the result from the exact
+// call that observed a new marker, so a caller gets both "the engine
+// built/rebuilt" and a live result in one step, with no separate race
+// between the two.
 func waitForEngineServe(t *testing.T, buf *lockedBuffer, baseline int, deadline time.Duration, query func() []string) []string {
 	t.Helper()
 
@@ -560,21 +489,17 @@ func bfsCollectNodeIDs(t *testing.T, ctx context.Context, db graph.Database, roo
 
 // TestEngineServesFromLiveDriver is the driver's core serving evidence:
 // opened through dawgs.Open(ctx, bloodtrail.DriverName, cfg) exactly as
-// BloodHound would, with a live datapipe_status row driving the poller, the
-// driver must serve both the Criteria/FetchAllShortestPaths API and
+// BloodHound would, the driver must serve both the Criteria/
+// FetchAllShortestPaths API and
 // cypher-text queries from the in-memory engine once it has built a
-// snapshot, keep serving them correctly straight through a write (which
-// write-through publishes into the replica rather than invalidating it), and
-// keep serving them across a datapipe-stamp-driven rebuild.
+// snapshot, and keep serving them correctly straight through a write (which
+// write-through publishes into the replica rather than invalidating it).
 func TestEngineServesFromLiveDriver(t *testing.T) {
 	dsn := os.Getenv(testPGEnv)
 	if dsn == "" {
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	// Both must be set before dawgs.Open: SettingsFromEnv and the engine's
-	// captured Config.Log are both read exactly once, at Open() time.
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -602,15 +527,6 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 	if err := oracle.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("assert schema on pg: %v", err)
 	}
-
-	createDatapipeStatusTable(t, pool)
-	// Registered after the bt/oracle Close defers above, so LIFO ordering
-	// runs this drop first -- while the pool they share is still open. See
-	// createDatapipeStatusTable's doc.
-	defer dropDatapipeStatusTable(t, pool)
-
-	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
-	insertDatapipeStatus(t, pool, "running", stamp1)
 
 	// --- Phase 1: FetchAllShortestPaths via the Criteria API, waiting for
 	// the engine's first build.
@@ -643,9 +559,8 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 	// --- Phase 3: a write through the driver is replayed into the replica
 	// rather than invalidating it, so the same query keeps being SERVED
 	// (not delegated) and keeps answering correctly -- and the write still
-	// must not itself trigger a rebuild: status stays "running", and with
-	// the replica current there is nothing for any decideRebuild rule to
-	// fire on either.
+	// must not itself trigger a rebuild: write-through replays it directly,
+	// so there is nothing left for a rebuild to fix.
 	servedBefore := strings.Count(buf.String(), servedMarker)
 	rebuiltBefore := strings.Count(buf.String(), rebuiltMarker)
 
@@ -656,10 +571,6 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 		t.Fatalf("WriteTransaction (CreateNode): %v", err)
 	}
 
-	// Several poll intervals' worth of headroom for the poller to
-	// (incorrectly) rebuild, then assert it did not, and that the query is
-	// both still correct and still served from the replica.
-	time.Sleep(10 * 50 * time.Millisecond)
 	if got := shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"]); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("post-write paths differ\n got: %v\nwant: %v", got, want)
 	}
@@ -669,19 +580,6 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 	if rebuiltAfter := strings.Count(buf.String(), rebuiltMarker); rebuiltAfter != rebuiltBefore {
 		t.Fatalf("%q log count changed from %d to %d after a plain write; a replayable write must not cost a rebuild", rebuiltMarker, rebuiltBefore, rebuiltAfter)
 	}
-
-	// --- Phase 4: the datapipe stamp advances, the poller rebuilds, and the
-	// same query still serves the same correct answer from the fresh base.
-	servedBefore = strings.Count(buf.String(), servedMarker)
-	stamp2 := stamp1.Add(time.Hour)
-	updateDatapipeStamp(t, pool, stamp2)
-
-	got = waitForEngineServe(t, buf, servedBefore, 5*time.Second, func() []string {
-		return shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"])
-	})
-	if strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("post-rebuild paths differ\n got: %v\nwant: %v", got, want)
-	}
 }
 
 // rebuiltMarker is the exact message the engine logs (at Info) whenever it
@@ -690,12 +588,12 @@ func TestEngineServesFromLiveDriver(t *testing.T) {
 // WITHOUT one, which is the whole claim write-through makes.
 const rebuiltMarker = "bloodtrail: snapshot rebuilt"
 
-// TestEngineOffDelegatesEverythingAndNeverServes is phase 4: with
-// BLOODTRAIL_ENGINE=off, the driver must answer every query correctly by
-// delegating straight to PostgreSQL, and the engine must never log a served
-// line -- Start is a no-op when disabled (internal/engine/poller.go), so no
-// poller goroutine even runs, and every TryAllShortestPaths/TryCypher call
-// declines immediately (reason "disabled") before ever touching a snapshot.
+// TestEngineOffDelegatesEverythingAndNeverServes covers BLOODTRAIL_ENGINE=off:
+// the driver must answer every query correctly by delegating straight to
+// PostgreSQL, and the engine must never log a served line -- Start is a
+// no-op when disabled (internal/engine/boot.go), so no boot-load goroutine
+// even runs, and every TryAllShortestPaths/TryCypher call declines
+// immediately (reason "disabled") before ever touching a snapshot.
 func TestEngineOffDelegatesEverythingAndNeverServes(t *testing.T) {
 	dsn := os.Getenv(testPGEnv)
 	if dsn == "" {
@@ -779,7 +677,6 @@ func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -803,18 +700,6 @@ func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
 	}
 	ids := loadDatasets(t, ctx, bt)
 
-	createDatapipeStatusTable(t, pool)
-	// Registered after the bt Close defer above, so LIFO ordering runs this
-	// drop first -- while the pool is still open. See
-	// createDatapipeStatusTable's doc.
-	defer dropDatapipeStatusTable(t, pool)
-
-	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
-	// "running", not "idle": decideRebuild's rule (c) opportunistically
-	// rebuilds any stale snapshot whenever status == "idle", which would
-	// make the "no premature rebuild" assertion below vacuous.
-	insertDatapipeStatus(t, pool, "running", stamp1)
-
 	// Build the initial snapshot and confirm it actually serves before the
 	// wipe -- otherwise this test would prove nothing about invalidation.
 	waitForEngineServe(t, buf, 0, 5*time.Second, func() []string {
@@ -836,9 +721,7 @@ func TestWipeGraphInvalidatesEngineSnapshot(t *testing.T) {
 		t.Fatalf("post-wipe query returned paths from a wiped graph: %v", got)
 	}
 
-	// The recovery rebuild restores serving on its own -- no datapipe stamp
-	// advance needed, unlike before write-through, when only the poller's
-	// own rules could ever rebuild.
+	// The recovery rebuild restores serving on its own.
 	got := waitForEngineServe(t, buf, servedBefore, 5*time.Second, func() []string {
 		return shortestPathsViaCriteria(t, ctx, bt, ids["c0"], ids["c10"])
 	})
@@ -872,7 +755,6 @@ func TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly(t *testing.T)
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -890,11 +772,6 @@ func TestFetchAllShortestPathsClosesCursorWhenDelegateReturnsEarly(t *testing.T)
 		t.Fatalf("assert schema: %v", err)
 	}
 	ids := loadDatasets(t, ctx, bt)
-
-	createDatapipeStatusTable(t, pool)
-	defer dropDatapipeStatusTable(t, pool)
-
-	insertDatapipeStatus(t, pool, "running", time.Now().UTC().Truncate(time.Microsecond))
 
 	// Warm the engine: this both builds the initial snapshot and confirms
 	// the query is actually served (not delegated) before moving on.
@@ -964,9 +841,6 @@ func TestNodeQueryServesFromLiveDriver(t *testing.T) {
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	// Must be set before dawgs.Open: SettingsFromEnv and the engine's
-	// captured Config.Log are both read exactly once, at Open() time.
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -994,15 +868,6 @@ func TestNodeQueryServesFromLiveDriver(t *testing.T) {
 	if err := oracle.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("assert schema on pg: %v", err)
 	}
-
-	createDatapipeStatusTable(t, pool)
-	// Registered after the bt/oracle Close defers above, so LIFO ordering
-	// runs this drop first -- while the pool they share is still open. See
-	// createDatapipeStatusTable's doc.
-	defer dropDatapipeStatusTable(t, pool)
-
-	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
-	insertDatapipeStatus(t, pool, "running", stamp1)
 
 	// TraversalNode is carried by every one of traversal_shapes.json's 45
 	// nodes (testdata/dawgs/traversal_shapes.json), so a bare kind filter
@@ -1065,19 +930,15 @@ func TestNodeQueryServesFromLiveDriver(t *testing.T) {
 // single-finalCriteria, ProjectionStartEnd shape Query recognizes with no
 // direction requirement at all (projectionDirectionConsistent's doc).
 // Opened through dawgs.Open exactly as TestNodeQueryServesFromLiveDriver is,
-// with a live datapipe_status row driving the poller, the resulting
-// container.DirectedGraph's edge set must agree exactly with the same call
-// against the pg driver oracle, and the builder-serving path must actually
-// have been used (builderServedMarker).
+// the resulting container.DirectedGraph's edge set must agree exactly with
+// the same call against the pg driver oracle, and the builder-serving path
+// must actually have been used (builderServedMarker).
 func TestContainerFetchDirectedGraphServesFromLiveDriver(t *testing.T) {
 	dsn := os.Getenv(testPGEnv)
 	if dsn == "" {
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	// Must be set before dawgs.Open: SettingsFromEnv and the engine's
-	// captured Config.Log are both read exactly once, at Open() time.
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1105,15 +966,6 @@ func TestContainerFetchDirectedGraphServesFromLiveDriver(t *testing.T) {
 	if err := oracle.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("assert schema on pg: %v", err)
 	}
-
-	createDatapipeStatusTable(t, pool)
-	// Registered after the bt/oracle Close defers above, so LIFO ordering
-	// runs this drop first -- while the pool they share is still open. See
-	// createDatapipeStatusTable's doc.
-	defer dropDatapipeStatusTable(t, pool)
-
-	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
-	insertDatapipeStatus(t, pool, "running", stamp1)
 
 	// traversal_shapes.json's ChainEdge kind: a straight 10-hop chain
 	// c0->c1->...->c10, giving an unambiguous 10-edge answer.
@@ -1165,7 +1017,6 @@ func TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver(t *testing.T
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1192,12 +1043,6 @@ func TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver(t *testing.T
 	if err := oracle.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("assert schema on pg: %v", err)
 	}
-
-	createDatapipeStatusTable(t, pool)
-	defer dropDatapipeStatusTable(t, pool)
-
-	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
-	insertDatapipeStatus(t, pool, "running", stamp1)
 
 	// traversal_shapes.json's FanoutEdge tree: f0 fans out through f1..f3 and
 	// f1a..f3b to a third level (f1a1..f3b1) -- 15 reachable descendants,
@@ -1235,8 +1080,7 @@ func TestTraversalLightweightDriverBreadthFirstServesFromLiveDriver(t *testing.T
 // actually served, not merely recognized) and combined with an OrderBy or
 // Limit that must disqualify them from being served at all.
 //
-// Opened through dawgs.Open exactly like TestNodeQueryServesFromLiveDriver,
-// with a live datapipe_status row driving the poller:
+// Opened through dawgs.Open exactly like TestNodeQueryServesFromLiveDriver:
 //
 //   - Phase 1 proves the served path: a kind-filtered Count/FetchIDs/
 //     FetchTriples/FetchKinds call must each agree with the pg-driver oracle
@@ -1264,9 +1108,6 @@ func TestRelationshipStructuralFetchesServeFromLiveDriver(t *testing.T) {
 		t.Skipf("%s not set", testPGEnv)
 	}
 
-	// Must be set before dawgs.Open: SettingsFromEnv and the engine's
-	// captured Config.Log are both read exactly once, at Open() time.
-	t.Setenv(bloodtrail.EnvEnginePollInterval, "50ms")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1294,15 +1135,6 @@ func TestRelationshipStructuralFetchesServeFromLiveDriver(t *testing.T) {
 	if err := oracle.AssertSchema(ctx, schema); err != nil {
 		t.Fatalf("assert schema on pg: %v", err)
 	}
-
-	createDatapipeStatusTable(t, pool)
-	// Registered after the bt/oracle Close defers above, so LIFO ordering
-	// runs this drop first -- while the pool they share is still open. See
-	// createDatapipeStatusTable's doc.
-	defer dropDatapipeStatusTable(t, pool)
-
-	stamp1 := time.Now().UTC().Truncate(time.Microsecond)
-	insertDatapipeStatus(t, pool, "running", stamp1)
 
 	kind := graph.StringKind("ChainEdge")
 

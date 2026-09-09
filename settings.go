@@ -8,7 +8,6 @@ import (
 	"math"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/specterops/dawgs/util/size"
 )
@@ -33,15 +32,7 @@ const (
 	// When off, every read is delegated to PostgreSQL exactly as in the
 	// pre-engine driver.
 	EnvEngine = "BLOODTRAIL_ENGINE"
-	// EnvEnginePollInterval sets the poller's rebuild cadence, parsed with
-	// time.ParseDuration. Defaults to 5s; the value must be strictly
-	// positive.
-	EnvEnginePollInterval = "BLOODTRAIL_ENGINE_POLL_INTERVAL"
 )
-
-// defaultEnginePollInterval is EnginePollInterval's value when
-// EnvEnginePollInterval is unset.
-const defaultEnginePollInterval = 5 * time.Second
 
 // Settings holds the driver's own configuration.
 type Settings struct {
@@ -66,9 +57,6 @@ type Settings struct {
 	// Engine gates whether the in-memory path engine ever attempts to serve
 	// a query. Defaults to true (on); EnvEngine can turn it off.
 	Engine bool
-	// EnginePollInterval is the engine poller's rebuild cadence. Defaults to
-	// defaultEnginePollInterval.
-	EnginePollInterval time.Duration
 }
 
 // SettingsFromEnv builds Settings from an environment lookup function
@@ -76,9 +64,8 @@ type Settings struct {
 // are errors so a misconfiguration fails at startup, not later.
 func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 	settings := Settings{
-		LogLevel:           slog.LevelInfo,
-		Engine:             true,
-		EnginePollInterval: defaultEnginePollInterval,
+		LogLevel: slog.LevelInfo,
+		Engine:   true,
 	}
 
 	if v, ok := lookup(EnvSnapshotDir); ok {
@@ -108,17 +95,6 @@ func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 			return Settings{}, fmt.Errorf("%s: %w", EnvEngine, err)
 		}
 		settings.Engine = enabled
-	}
-
-	if v, ok := lookup(EnvEnginePollInterval); ok {
-		interval, err := time.ParseDuration(strings.TrimSpace(v))
-		if err != nil {
-			return Settings{}, fmt.Errorf("%s: %w", EnvEnginePollInterval, err)
-		}
-		if interval <= 0 {
-			return Settings{}, fmt.Errorf("%s: must be > 0, got %s", EnvEnginePollInterval, interval)
-		}
-		settings.EnginePollInterval = interval
 	}
 
 	return settings, nil

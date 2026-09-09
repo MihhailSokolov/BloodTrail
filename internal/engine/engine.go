@@ -31,11 +31,6 @@ type Config struct {
 	// query. false declines every call immediately (reason "disabled").
 	Enabled bool
 
-	// PollInterval is the poller's rebuild cadence: poller.go reads it to
-	// pace RebuildNow calls. It lives on Config, rather than on the poller
-	// itself, so Config stays the one place BLOODTRAIL_* settings land.
-	PollInterval time.Duration
-
 	// MemoryLimit bounds a rebuilt snapshot's approximate resident size
 	// (BLOODTRAIL_MEMORY_LIMIT). Zero means unbounded.
 	MemoryLimit size.Size
@@ -68,8 +63,7 @@ type Engine struct {
 	pool     *pgxpool.Pool
 	cfg      Config
 
-	snap       atomic.Pointer[snapshot.View]
-	generation atomic.Uint64
+	snap atomic.Pointer[snapshot.View]
 
 	// state is the serving state (stateServing/stateFallback, apply.go),
 	// read by every serving entry point through serveState and written by
@@ -105,14 +99,11 @@ type Engine struct {
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 
-	// marks is the kind-scoped complement to generation above: which kind
-	// names NoteWrite has touched, and at which generation. See marks.go.
-	marks marks
-
 	// overBudget records whether the most recent RebuildNow refused to
 	// adopt its freshly loaded snapshot because ApproxBytes() exceeded
-	// cfg.MemoryLimit. The poller (poller.go) reads this after every
-	// RebuildNow call to decide whether to remember the refusal.
+	// cfg.MemoryLimit. Boot load and the fallback recovery goroutine
+	// (boot.go, apply.go) read this after every RebuildNow call, via
+	// fallbackRetryDelay, to decide whether to back off their retry.
 	overBudget atomic.Bool
 
 	// refusalLastLoggedNano rate-limits RebuildNow's "snapshot rebuild
@@ -124,24 +115,10 @@ type Engine struct {
 
 	// rebuildAttempts counts every RebuildNow call that actually reached
 	// LoadSnapshot, refused or not. Nothing in production reads it; it
-	// exists purely for test observability -- white-box, for the poller's
-	// retry-suppression behavior (poller_integration_test.go), which the
-	// "refusal warning" log alone cannot distinguish from a repeated
-	// LoadSnapshot attempt whose warning happened to be rate-limited
-	// (refusalLogInterval), and black-box, through RebuildCount, for the
+	// exists purely for test observability, through RebuildCount, for the
 	// write-through tests' central claim that a write is served without any
 	// rebuild at all.
 	rebuildAttempts atomic.Uint64
-
-	// pollStop and pollDone coordinate Start/Stop's poller goroutine
-	// lifecycle (poller.go): Stop closes pollStop to signal the goroutine to
-	// exit, and waits on pollDone, which the goroutine closes as it returns.
-	// Both are nil until Start actually launches the goroutine (Start is a
-	// no-op when !cfg.Enabled); pollStopOnce makes Stop idempotent and safe
-	// to call even then.
-	pollStop     chan struct{}
-	pollDone     chan struct{}
-	pollStopOnce sync.Once
 
 	// mapKind resolves a graph.Kind name to its KindID, as
 	// e.pgDriver.KindMapper().MapKind would. The builder-serving path
@@ -149,17 +126,15 @@ type Engine struct {
 	// Task 7's rel-query siblings) calls this instead of reaching into
 	// pgDriver directly, purely so unit tests can fake kind-name resolution
 	// without standing up a real KindMapper (which needs a live PostgreSQL
-	// connection) -- the same motivation noteResolved's resolve parameter
-	// serves for marks.go, adapted to a field since these methods are
-	// themselves the entry points under test, with no wrapper to hand a
-	// fake resolver into at the call site. New defaults this to the real
-	// KindMapper call; servePathQuery's own kind-mapping calls are
-	// deliberately left untouched, still going through
-	// e.pgDriver.KindMapper() directly.
+	// connection), adapted to a field since these methods are themselves the
+	// entry points under test, with no wrapper to hand a fake resolver into
+	// at the call site. New defaults this to the real KindMapper call;
+	// servePathQuery's own kind-mapping calls are deliberately left
+	// untouched, still going through e.pgDriver.KindMapper() directly.
 	mapKind func(ctx context.Context, kind graph.Kind) (int16, error)
 
 	// mapKindNames resolves KindIDs back to their graph.Kind names, as
-	// e.kindNamesByID (marks.go) would. Same seam, same motivation, and same
+	// e.kindNamesByID (below) would. Same seam, same motivation, and same
 	// New default (e.kindNamesByID) as mapKind above, just for the opposite
 	// direction -- needed by TryNodeFetchKinds to render its
 	// graph.KindsResult output.
@@ -182,15 +157,28 @@ func New(pgDriver *pg.Driver, pool *pgxpool.Pool, cfg Config) *Engine {
 	return e
 }
 
-// Generation returns the engine's current write-generation counter, which
-// NoteWrite (marks.go) still advances on every write. Nothing in the serving
-// path reads it any more -- write-through (apply.go) replaced staleness
-// checks with the SERVING/FALLBACK state -- so it survives only as interim
-// bookkeeping for the poller and for the root package's driver tests, which
-// assert a mutating capability method bumps it on success and leaves it
-// unchanged on error.
-func (e *Engine) Generation() uint64 {
-	return e.generation.Load()
+// kindNamesByID resolves KindIDs back to their graph.Kind names via the
+// driver's KindMapper -- mapKindNames' production default (New, above).
+// context.Background() is used deliberately: this has no ctx of its own to
+// plumb through from mapKindNames' callers, and a kind lookup that outlives
+// whatever request triggered it is fine here, the same way RebuildNow's own
+// background boot-load/recovery goroutines outlive any one caller.
+func (e *Engine) kindNamesByID(ids []snapshot.KindID) (graph.Kinds, error) {
+	return e.pgDriver.KindMapper().MapKindIDs(context.Background(), ids)
+}
+
+// ApplyCount returns how many times Apply (apply.go) has been called,
+// successfully or not: Apply bumps applyEpoch unconditionally, before any of
+// its own early returns can fire, so this is an external, black-box way to
+// prove "Apply ran" (or "did not run yet"). It exists purely for test
+// observability -- the root package's driver tests assert a mutating
+// capability method calls Apply on success and does not on error, and
+// write_observer_test.go pins Apply's own call-ordering guarantees (e.g.
+// that it runs after, not before, a delegate-issued mid-transaction commit)
+// -- neither of which can reach the unexported applyEpoch field directly
+// from outside this package.
+func (e *Engine) ApplyCount() uint64 {
+	return e.applyEpoch.Load()
 }
 
 // RebuildCount returns how many times the engine has loaded a snapshot from
@@ -212,9 +200,13 @@ func (e *Engine) RebuildCount() uint64 {
 // the engine is in fallback, replaying-into-the-replica having failed for
 // some write, until the recovery rebuild completes (apply.go).
 //
-// Its one production caller left is the poller, whose "the snapshot needs
-// rebuilding" rules read it (poller.go). Serving paths use serveState
-// instead, which answers the same question without the poller's framing.
+// Kept as a small test-observability wrapper around serveState now that the
+// poller -- its last production caller -- is retired: integration tests
+// across this package and the root package still use it to assert that
+// boot load or fallback recovery actually converged on a serving snapshot.
+// Serving paths use serveState directly, which answers the same question
+// without this method's "freshness" framing, retired along with the
+// generation/marks staleness checks it used to report on.
 func (e *Engine) Fresh() (*snapshot.View, bool) {
 	return e.serveState()
 }
@@ -243,9 +235,10 @@ func (e *Engine) serveState() (*snapshot.View, bool) {
 //
 // It is the thin, error-only wrapper every caller outside this file uses;
 // rebuildOnce carries the whole implementation, plus the "was it actually
-// adopted" answer that only the fallback recovery goroutine (apply.go) needs.
-func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp time.Time) error {
-	_, err := e.rebuildOnce(ctx, trigger, analysisStamp)
+// adopted" answer that boot load (Start, boot.go) and the fallback recovery
+// goroutine (apply.go) need to decide whether to keep retrying.
+func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
+	_, err := e.rebuildOnce(ctx, trigger)
 	return err
 }
 
@@ -255,41 +248,29 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string, analysisStamp t
 // can still fail to be published: it exceeded cfg.MemoryLimit, or a write was
 // applied while it was loading (see adoptRebuiltView).
 //
-// trigger names why this call is happening (triggerStartup, triggerAnalysis,
-// triggerIdleStale, or triggerAnalyzing from the poller, triggerFallback from
-// the fallback recovery goroutine, or triggerManual for every other caller);
-// it is logged verbatim in the "trigger" attr on the success, refusal, and
-// not-adopted log lines below, so log consumers can tell a poller-driven
-// rebuild from a recovery or manual one. analysisStamp is stamped onto the
-// snapshot's AnalysisStamp field before the memory-limit check (so it is set
-// whether or not the snapshot is actually adopted -- irrelevant either way
-// for a dropped snapshot, but keeping the assignment unconditional avoids a
-// second, easy-to-forget branch); callers with no meaningful reading (every
-// caller but the poller) pass the zero time.Time.
-//
-// The new snapshot's Generation is stamped with the write-generation
-// counter's value as read at the very start of this call. Nothing in the
-// serving path reads it any more (write-through replaced staleness with the
-// SERVING/FALLBACK state), but the poller still compares generations, so the
-// stamp stays until the poller does.
+// trigger names why this call is happening (triggerStartup from Start's
+// boot-load goroutine, triggerFallback from the fallback recovery goroutine,
+// or triggerManual for every other caller, boot.go); it is logged verbatim
+// in the "trigger" attr on the success, refusal, and not-adopted log lines
+// below, so log consumers can tell a boot-load rebuild from a recovery or
+// manual one.
 //
 // A snapshot whose ApproxBytes() exceeds a nonzero cfg.MemoryLimit is
 // dropped rather than adopted: whatever View was previously current (nil or
 // otherwise) stays current, and the refusal is remembered via overBudget for
-// the poller (poller.go) to act on. This is not treated as a failure -- the
-// load itself succeeded -- so the error return stays nil.
+// the caller (boot load or fallback recovery, via fallbackRetryDelay) to back
+// off on. This is not treated as a failure -- the load itself succeeded --
+// so the error return stays nil.
 //
-// The refusal warning itself is rate-limited (shouldLogRefusal), the same
-// way the poller's own query-error warning is (queryErrorLogInterval): the
-// very first refusal always logs, and any later refusal logs again only if
-// at least refusalLogInterval has passed since the last one logged --
-// regardless of whether the calls in between were the poller retrying the
-// exact same reading or genuinely new attempts. This caps log volume for a
-// sustained over-budget condition without depending on decideRebuild's own
-// retry gating to do it alone.
-func (e *Engine) rebuildOnce(ctx context.Context, trigger string, analysisStamp time.Time) (bool, error) {
+// The refusal warning itself is rate-limited (shouldLogRefusal): the very
+// first refusal always logs, and any later refusal logs again only if at
+// least refusalLogInterval has passed since the last one logged --
+// regardless of whether the calls in between were a retry against the exact
+// same reading or a genuinely new attempt. This caps log volume for a
+// sustained over-budget condition without depending on the caller's own
+// retry backoff to do it alone.
+func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) {
 	start := time.Now()
-	generation := e.generation.Load()
 	// Read BEFORE the load begins: see adoptRebuiltView for why an unchanged
 	// epoch at publish time proves this snapshot cannot be missing an applied
 	// write.
@@ -306,8 +287,6 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string, analysisStamp 
 	if err != nil {
 		return false, fmt.Errorf("engine: RebuildNow: %w", err)
 	}
-	snap.Generation = generation
-	snap.AnalysisStamp = analysisStamp
 
 	approxBytes := snap.ApproxBytes()
 	if e.cfg.MemoryLimit > 0 && approxBytes > uint64(e.cfg.MemoryLimit) {
@@ -369,7 +348,7 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string, analysisStamp 
 // the Store.
 //
 // Adoption is also what ENDS a fallback, whoever triggered the rebuild --
-// the recovery goroutine, the poller, or a manual call. The reasoning is the
+// the recovery goroutine, boot load, or a manual call. The reasoning is the
 // same epoch argument: an adopted snapshot holds every write committed before
 // its load began, and the epoch check rules out any write applied since, so
 // the replica is complete and current again regardless of which write
@@ -393,17 +372,15 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 
 // refusalLogInterval rate-limits RebuildNow's "snapshot rebuild refused"
 // warning (shouldLogRefusal): a sustained over-budget condition should not
-// spam the log once per PollInterval. Matches the poller's own
-// queryErrorLogInterval (poller.go).
+// spam the log on every retry attempt.
 const refusalLogInterval = 10 * time.Minute
 
 // shouldLogRefusal reports whether RebuildNow's memory-limit refusal warning
 // should be logged now: true the very first time it is ever called (the
 // zero value of refusalLastLoggedNano means "never logged"), then at most
 // once per refusalLogInterval after that, regardless of how many refused
-// RebuildNow calls happen in between -- a pure sliding window, mirroring
-// the poller's own queryErrorLogInterval check, with no notion of a
-// successful rebuild "resetting" the window.
+// RebuildNow calls happen in between -- a pure sliding window, with no
+// notion of a successful rebuild "resetting" the window.
 func (e *Engine) shouldLogRefusal() bool {
 	now := time.Now()
 	if last := e.refusalLastLoggedNano.Load(); last != 0 && now.Sub(time.Unix(0, last)) < refusalLogInterval {

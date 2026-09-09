@@ -700,11 +700,6 @@ func (v *View) MultiGraph() bool {
 	return v.base.MultiGraph
 }
 
-// Generation returns the base snapshot's generation counter.
-func (v *View) Generation() uint64 {
-	return v.base.Generation
-}
-
 // bytesPerDeltaEdge is deltaEdge's fixed in-memory size, used by
 // ApproxBytes for the delta adjacency index -- computed via a struct
 // literal's field sizes rather than guessed, in the same spirit as

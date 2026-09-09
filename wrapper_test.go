@@ -1266,18 +1266,18 @@ func TestWrappedTransactionNodesReturnsRecordingWrapper(t *testing.T) {
 // calls its own ReadTransaction the same way, and DeleteNodesByKinds /
 // DeleteRelationshipsByKinds use a raw pooled connection -- none of the five
 // ever reaches this package's own WriteTransaction override, so each is
-// overridden separately on *Driver (driver.go) to call engine.NoteWrite()
+// overridden separately on *Driver (driver.go) to call engine.Apply()
 // itself after a nil-error return.
 //
 // A live *pg.Driver is unavoidable here (Driver embeds the concrete type,
-// not an interface), so the success path -- NoteWrite() actually firing --
-// is not covered by these unit tests; it is covered by the engine-serving
+// not an interface), so the success path -- Apply() actually firing -- is
+// not covered by these unit tests; it is covered by the engine-serving
 // integration suite instead (engine_serving_integration_test.go's
 // TestWipeGraphInvalidatesEngineSnapshot). What *is* cleanly testable
 // without a live database is the error path: unreachablePGDriver points at
 // an address nothing listens on, so every one of the five calls fails
 // quickly (observed at single-digit milliseconds; connection refused, not a
-// timeout) with a clean error rather than a panic, and NoteWrite() must not
+// timeout) with a clean error rather than a panic, and Apply() must not
 // fire when the embedded call itself failed.
 
 // unreachablePGDriver returns a *pg.Driver backed by a pool pointed at
@@ -1298,7 +1298,7 @@ func unreachablePGDriver(t *testing.T) *pg.Driver {
 
 // newDriverWithUnreachablePG returns a *Driver embedding unreachablePGDriver
 // and a disabledEngine, plus that same engine for the test to inspect via
-// its exported Generation() (added purely for this kind of test
+// its exported ApplyCount() (added purely for this kind of test
 // observability -- see its doc comment).
 func newDriverWithUnreachablePG(t *testing.T) (*Driver, *engine.Engine) {
 	t.Helper()
@@ -1306,7 +1306,7 @@ func newDriverWithUnreachablePG(t *testing.T) (*Driver, *engine.Engine) {
 	return &Driver{Driver: unreachablePGDriver(t), engine: eng}, eng
 }
 
-func TestDriverMutatingCapabilityMethodsDoNotBumpGenerationOnError(t *testing.T) {
+func TestDriverMutatingCapabilityMethodsDoNotCallApplyOnError(t *testing.T) {
 	cases := []struct {
 		name string
 		call func(ctx context.Context, d *Driver) error
@@ -1344,7 +1344,7 @@ func TestDriverMutatingCapabilityMethodsDoNotBumpGenerationOnError(t *testing.T)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d, eng := newDriverWithUnreachablePG(t)
-			before := eng.Generation()
+			before := eng.ApplyCount()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -1353,8 +1353,8 @@ func TestDriverMutatingCapabilityMethodsDoNotBumpGenerationOnError(t *testing.T)
 				t.Fatalf("%s against an unreachable PostgreSQL: expected an error, got nil", tc.name)
 			}
 
-			if after := eng.Generation(); after != before {
-				t.Fatalf("%s: generation changed from %d to %d after a failed call, want unchanged", tc.name, before, after)
+			if after := eng.ApplyCount(); after != before {
+				t.Fatalf("%s: Apply was called %d time(s) after a failed call, want unchanged (%d)", tc.name, after-before, before)
 			}
 		})
 	}

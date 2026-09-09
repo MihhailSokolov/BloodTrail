@@ -61,16 +61,18 @@ var (
 	applyRunNodeKind    = graph.StringKind("ApplyRunNode")
 )
 
-// openApplyDriver is this file's shared setup: an hour-long poll interval
-// (so the poller's ticker never fires and every rebuild below is one this
-// test asked for), Debug-level log capture, a wiped graph, and a wrapped
-// driver with the default graph asserted.
+// openApplyDriver is this file's shared setup: Debug-level log capture, a
+// wiped graph, and a wrapped driver with the default graph asserted --
+// returned only once boot load's own first rebuild has actually finished
+// (waitForBootLoad), so every RebuildCount comparison a test makes below is
+// against a stable baseline: boot load runs exactly once, ever, so once it
+// has adopted, nothing else in this file's own control triggers a rebuild
+// unasked.
 func openApplyDriver(t *testing.T) (*Driver, graph.Database, *lockedBuffer, context.Context) {
 	t.Helper()
 
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -93,7 +95,29 @@ func openApplyDriver(t *testing.T) (*Driver, graph.Database, *lockedBuffer, cont
 		t.Fatalf("assert schema: %v", err)
 	}
 
+	waitForBootLoad(t, d)
+
 	return d, bt, buf, ctx
+}
+
+// waitForBootLoad blocks until eng's Start-launched boot-load goroutine has
+// adopted its first snapshot, up to a generous deadline. Start (driver.go's
+// Open) launches that goroutine asynchronously, so without this a test's own
+// "before" RebuildCount baseline could race against boot load's one and only
+// rebuild attempt landing later, inside the test's own measurement window.
+func waitForBootLoad(t *testing.T, d *Driver) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, fresh := d.engine.Fresh(); fresh {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("boot load did not produce a serving snapshot within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // applyRelTriples fetches every relationship of kind as a triple through the
@@ -142,7 +166,7 @@ func TestApplyObjectIDUpsertServesNewNode(t *testing.T) {
 
 	// A rebuild against the (empty) graph, so the replica exists and every
 	// answer below is a delta layered onto it.
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -194,7 +218,7 @@ func TestApplyPropertyMergeServesMergedBag(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -247,7 +271,7 @@ func TestApplyBatchDeleteNodeRemovesNodeAndIncidentEdges(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -274,7 +298,7 @@ func TestApplyBatchDeleteNodeRemovesNodeAndIncidentEdges(t *testing.T) {
 	}
 
 	// Differential check: a snapshot loaded from scratch must agree.
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-delete): %v", err)
 	}
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "post-rebuild: the node count agrees with the replica's own answer",
@@ -318,7 +342,7 @@ func TestApplyDeleteRelationshipsByKindsRemovesOnlyThatKind(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -343,7 +367,7 @@ func TestApplyDeleteRelationshipsByKindsRemovesOnlyThatKind(t *testing.T) {
 		t.Fatalf("RebuildCount = %d, want %d -- a kind-scoped relationship delete must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-delete): %v", err)
 	}
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "post-rebuild: the deleted kind's count agrees with the replica's own answer",
@@ -381,7 +405,7 @@ func TestApplyMutatingRunFallsBackAndRecovers(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()

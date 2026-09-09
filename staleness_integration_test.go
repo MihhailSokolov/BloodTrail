@@ -40,10 +40,10 @@
 // unexported access to Driver's own `engine *engine.Engine` field, which
 // bloodtrail_test-package tests (engine_serving_integration_test.go) cannot
 // reach directly. That access is used below for three exported-method calls:
-// d.engine.RebuildNow (a deterministic, on-demand rebuild -- no need to wire
-// up a datapipe_status table and wait on the poller), d.engine.Fresh (is the
-// engine serving at all), and d.engine.RebuildCount (has any rebuild
-// happened).
+// d.engine.RebuildNow (a deterministic, on-demand rebuild), d.engine.Fresh
+// (is the engine serving at all, and -- via waitForBootLoad -- has Start's
+// own boot-load rebuild settled yet), and d.engine.RebuildCount (has any
+// rebuild happened).
 //
 // Everything else stays a black-box proof: every flow issues a real query
 // through the real driver and observes, by exactly how much (0 or 1), the
@@ -66,7 +66,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/graph"
@@ -164,10 +163,11 @@ func markerCount(buf *lockedBuffer, marker string) int {
 //
 // Because before/after are captured immediately around one query call, this
 // stays correct with no shared, running baseline to manage across flows --
-// nothing else is logging either marker while this test runs (the poller is
-// configured with an hour-long interval that never fires during the test;
-// see TestKindScopedStalenessEndToEnd's setup), so any change in the count
-// across exactly this call can only be attributed to this call.
+// nothing else is logging either marker while this test runs (waitForBootLoad,
+// called by every test in this file right after opening the driver, blocks
+// until Start's own one-shot boot-load rebuild has already settled), so any
+// change in the count across exactly this call can only be attributed to
+// this call.
 func requireMarkerDelta[T comparable](t *testing.T, buf *lockedBuffer, marker string, wantDelta int, label string, query func() T, want T) {
 	t.Helper()
 
@@ -293,12 +293,10 @@ func shortestPathCount(t *testing.T, ctx context.Context, db graph.Database, sta
 func TestWriteThroughEndToEnd(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	// An hour-long poll interval means the poller's own ticker will not
-	// fire even once during this test's lifetime, so every rebuild observed
-	// below is the direct, deterministic result of this test's own
-	// d.engine.RebuildNow calls. Must be set before dawgs.Open: Settings are
-	// read from the environment exactly once, at Open time.
-	t.Setenv(EnvEnginePollInterval, "1h")
+	// Every rebuild observed below is the direct, deterministic result of
+	// this test's own d.engine.RebuildNow calls: waitForBootLoad (below)
+	// blocks until Start's own one-shot boot-load rebuild has settled, and
+	// nothing else in this test's own control triggers another.
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -333,6 +331,8 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
 		t.Fatalf("assert schema: %v", err)
 	}
+
+	waitForBootLoad(t, d)
 
 	// --- Fixture: nodes and one edge each for kinds A and C, two bare nodes
 	// (no edge yet) for kind B, all created through one real WriteTransaction
@@ -390,7 +390,7 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	// === Flow 1: one rebuild, then kind-A relationship Count and a
 	// shortest-path query both serve. ===
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (flow 1): %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {
@@ -488,7 +488,7 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 		t.Fatalf("flow 5: RebuildCount = %d, want %d -- no rebuild may happen for a written-through write", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (flow 5): %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {
@@ -528,8 +528,8 @@ var (
 // novel kind.
 //
 // dawgs' pg batch driver unions the full Kinds field into the database row
-// regardless (NodeUpdateParameters.Append/FormatNodesUpdate, see
-// engine.WriteScope.UpsertNodeKinds' doc for the verified SQL), so the node
+// regardless (NodeUpdateParameters.Append/FormatNodesUpdate,
+// drivers/pg/batch.go and drivers/pg/query/format.go), so the node
 // genuinely becomes StalenessUpsertNovel. The original failure this test was
 // written for was subtle and silent: a node Count on the novel kind matched
 // that kind's (empty) bitmap in a snapshot where the kind never existed and
@@ -545,7 +545,6 @@ var (
 func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -568,6 +567,8 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 
+	waitForBootLoad(t, d)
+
 	var baseID graph.ID
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		n, err := tx.CreateNode(graph.NewProperties(), stalenessUpsertBaseKind)
@@ -580,7 +581,7 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (baseline): %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -610,7 +611,7 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 		t.Fatalf("RebuildCount = %d, want %d -- the upsert must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-upsert): %v", err)
 	}
 
@@ -746,7 +747,6 @@ var cypherStalenessNodeKind = graph.StringKind("CypherStalenessNode")
 func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -769,6 +769,8 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 
+	waitForBootLoad(t, d)
+
 	var nodeID graph.ID
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		n, err := tx.CreateNode(graph.NewProperties().Set("name", "before"), cypherStalenessNodeKind)
@@ -781,7 +783,7 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (baseline): %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -815,7 +817,7 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 		t.Fatalf("RebuildCount = %d, want %d -- a property-only write must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-write): %v", err)
 	}
 
@@ -858,7 +860,6 @@ var (
 func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -880,6 +881,8 @@ func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
 		t.Fatalf("assert schema: %v", err)
 	}
+
+	waitForBootLoad(t, d)
 
 	var (
 		startID, endID graph.ID
@@ -904,7 +907,7 @@ func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -941,7 +944,7 @@ func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 		t.Fatalf("RebuildCount = %d, want %d -- edge writes must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-write): %v", err)
 	}
 
@@ -974,7 +977,6 @@ var cypherStaleRecheckNodeKind = graph.StringKind("CypherStaleRecheckNode")
 func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -997,6 +999,8 @@ func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 
+	waitForBootLoad(t, d)
+
 	var nodeID graph.ID
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		n, err := tx.CreateNode(graph.NewProperties().Set("name", "before"), cypherStaleRecheckNodeKind)
@@ -1009,7 +1013,7 @@ func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	rebuilds := d.engine.RebuildCount()
@@ -1120,7 +1124,6 @@ var (
 func TestCypherMultiGraphGuard(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1143,6 +1146,8 @@ func TestCypherMultiGraphGuard(t *testing.T) {
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
 		t.Fatalf("assert schema: %v", err)
 	}
+
+	waitForBootLoad(t, d)
 
 	var nodeID graph.ID
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -1167,7 +1172,7 @@ func TestCypherMultiGraphGuard(t *testing.T) {
 		t.Fatalf("create second graph's node: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {
@@ -1196,7 +1201,7 @@ const writeTxReadObjectID = "WriteTxRead-1"
 // subsequent read run against that same transaction must see PostgreSQL's
 // own view -- including the transaction's own uncommitted write -- and must
 // never be served from the in-memory engine, which only ever learns about a
-// write at commit (Driver.WriteTransaction's own engine.NoteWrite call,
+// write at commit (Driver.WriteTransaction's own engine.Apply call,
 // driver.go). Reading a stale, pre-write snapshot back from inside the very
 // transaction that just wrote would silently hide the caller's own write
 // from itself.
@@ -1227,7 +1232,6 @@ const writeTxReadObjectID = "WriteTxRead-1"
 func TestWriteTransactionReadAfterWriteDelegatesToPG(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1250,6 +1254,8 @@ func TestWriteTransactionReadAfterWriteDelegatesToPG(t *testing.T) {
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
 		t.Fatalf("assert schema: %v", err)
 	}
+
+	waitForBootLoad(t, d)
 
 	text := fmt.Sprintf(`MATCH (n:WriteTxReadNode) WHERE n.objectid = '%s' RETURN n.objectid`, writeTxReadObjectID)
 
@@ -1292,7 +1298,7 @@ func TestWriteTransactionReadAfterWriteDelegatesToPG(t *testing.T) {
 	// transaction has committed and the engine has rebuilt, DOES serve --
 	// proving the marker delta of 0 above was a real decline, not a query
 	// shape TryCypher was never going to recognize in the first place. ===
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {
@@ -1328,8 +1334,8 @@ const batchReadObjectID = "BatchRead-1"
 // Commit call is itself the mid-batch-commit path observingBatch.Commit
 // (write_observer.go) exists for: it also flushes this batch's WriteScope
 // to the engine immediately, rather than waiting for Driver.BatchOperation's
-// own final NoteWrite -- so a read run right after it, through a batch that
-// has now written, has the engine's own bookkeeping already caught up too.
+// own final Apply call -- so a read run right after it, through a batch that
+// has now written, has the engine's own replica already caught up too.
 //
 // See TestWriteTransactionReadAfterWriteDelegatesToPG's doc for the
 // composition finding this pin shares: observingBatch.Nodes() (write_
@@ -1343,7 +1349,6 @@ const batchReadObjectID = "BatchRead-1"
 func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
-	t.Setenv(EnvEnginePollInterval, "1h")
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1379,6 +1384,8 @@ func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("assert schema: %v", err)
 	}
+
+	waitForBootLoad(t, d)
 
 	// === The pin: UpdateNodeBy (an upsert -- no BatchReadNode exists yet,
 	// so this creates one), then Count, inside the SAME BatchOperation. ===
@@ -1432,7 +1439,7 @@ func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
 
 	// === Sanity check on the premise: the identical structural count,
 	// once the batch has committed and the engine has rebuilt, DOES serve. ===
-	if err := d.engine.RebuildNow(ctx, "manual_test", time.Time{}); err != nil {
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 	if _, fresh := d.engine.Fresh(); !fresh {

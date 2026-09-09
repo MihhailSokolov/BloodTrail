@@ -42,24 +42,21 @@
 // PostgreSQL.
 //
 // Before any shape is measured, cypherbench waits for the bloodtrail
-// driver's background poller to build its first in-memory snapshot, exactly
-// as builderbench does: see execute's own wait-duration computation for why
-// this is measured rather than a fixed sleep.
+// driver's Start-launched boot-load goroutine to build its first in-memory
+// snapshot, exactly as builderbench does: see execute's own wait-duration
+// computation for why this is measured rather than a fixed sleep.
 //
 // Usage:
 //
 //	go run ./bench/cypherbench -dsn <dsn> [-runs 5] [-pg-cap 120s] [-bt-cap 15m] [-enforce] [-cpuprofile <file>]
 //
 // cypherbench never imports bench/adgen (a generator, not a library) and
-// never writes to the database (beyond a scratch datapipe_status row it
-// creates and drops itself, needed to drive the poller -- see
-// createDatapipeStatusTable's doc, duplicated from builderbench for the
-// same reason): it finds every adgen kind name purely by duplicating
-// bench/adgen/generate.go's constants, the same convention pathbench and
-// builderbench follow. shape4Text's own ~64-member edge-kind list is a
-// separate matter -- see extractRelKinds' doc for why every kind a query
-// alternates over must be asserted into the schema before the query can run
-// at all, on *either* driver.
+// never writes to the database at all: it finds every adgen kind name
+// purely by duplicating bench/adgen/generate.go's constants, the same
+// convention pathbench and builderbench follow. shape4Text's own ~64-member
+// edge-kind list is a separate matter -- see extractRelKinds' doc for why
+// every kind a query alternates over must be asserted into the schema
+// before the query can run at all, on *either* driver.
 //
 // Every shape prints a human-readable line and a machine-greppable
 // CYPHERBENCH_<SHAPE> summary line (grep '^CYPHERBENCH_'), ending in
@@ -379,11 +376,6 @@ func extractRelKinds(text string) []string {
 	return strings.Split(m[1], "|")
 }
 
-// enginePollInterval is set via BLOODTRAIL_ENGINE_POLL_INTERVAL before
-// opening the bloodtrail driver -- identical to builderbench's own constant
-// and rationale.
-const enginePollInterval = 200 * time.Millisecond
-
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -575,7 +567,6 @@ type benchResult struct {
 	buildEdges    int
 	buildBytes    uint64
 
-	pollInterval time.Duration
 	waitDuration time.Duration
 
 	pgCap time.Duration
@@ -649,25 +640,6 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 	fmt.Printf("CYPHERBENCH_BUILD nodes=%d edges=%d approx_bytes=%d duration_ms=%.3f\n",
 		result.buildNodes, result.buildEdges, result.buildBytes, floatMillis(result.buildDuration))
 
-	if err := createDatapipeStatusTable(ctx, pool); err != nil {
-		return nil, fmt.Errorf("create datapipe_status: %w", err)
-	}
-	defer func() {
-		if err := dropDatapipeStatusTable(ctx, pool); err != nil {
-			fmt.Fprintf(os.Stderr, "cypherbench: drop datapipe_status: %v\n", err)
-		}
-	}()
-	if err := insertDatapipeStatus(ctx, pool, "idle", time.Now().UTC()); err != nil {
-		return nil, fmt.Errorf("insert datapipe_status: %w", err)
-	}
-
-	// Must be set before dawgs.Open below: bloodtrail.Open reads
-	// SettingsFromEnv exactly once, at construction time.
-	if err := os.Setenv(bloodtrail.EnvEnginePollInterval, enginePollInterval.String()); err != nil {
-		return nil, fmt.Errorf("set %s: %w", bloodtrail.EnvEnginePollInterval, err)
-	}
-	result.pollInterval = enginePollInterval
-
 	dawgsCfg := dawgs.Config{ConnectionString: cfg.dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
 
 	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgsCfg)
@@ -687,18 +659,19 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 	}
 
 	// See builderbench's identical wait: there is no exported hook to
-	// observe the bloodtrail driver's poller finishing its first build, so
-	// this waits a safety multiple of the just-measured build cost plus the
-	// poller's own poll interval instead.
-	waitDuration := 2*enginePollInterval + 2*result.buildDuration + 500*time.Millisecond
+	// observe the bloodtrail driver's boot-load goroutine finishing its
+	// first build, so this waits a safety multiple of the just-measured
+	// build cost instead -- boot load is that exact same call, made once,
+	// with no periodic cadence to also account for.
+	waitDuration := 2*result.buildDuration + 500*time.Millisecond
 	if waitDuration < time.Second {
 		waitDuration = time.Second
 	}
 	result.waitDuration = waitDuration
-	fmt.Printf("cypherbench: waiting %s for the bloodtrail driver's poller to build its first snapshot (poll_interval=%s) ...\n",
-		waitDuration, enginePollInterval)
+	fmt.Printf("cypherbench: waiting %s for the bloodtrail driver's boot-load goroutine to build its first snapshot ...\n",
+		waitDuration)
 	time.Sleep(waitDuration)
-	fmt.Printf("CYPHERBENCH_WAIT duration_ms=%.3f poll_interval_ms=%.3f\n", floatMillis(waitDuration), floatMillis(enginePollInterval))
+	fmt.Printf("CYPHERBENCH_WAIT duration_ms=%.3f\n", floatMillis(waitDuration))
 
 	pointLookupText, pointLookupObjectID, err := buildPointLookupText(ctx, pool, graphModel.ID)
 	if err != nil {
@@ -1010,49 +983,6 @@ func pgCappedSuffix(r shapeResult) string {
 		return ""
 	}
 	return " (pg_capped=true; remaining runs skipped)"
-}
-
-// createDatapipeStatusTable, insertDatapipeStatus, and
-// dropDatapipeStatusTable manage a scratch datapipe_status row the
-// bloodtrail driver's poller reads on every tick -- duplicated verbatim
-// from bench/builderbench (a non-test main package cannot import another
-// main package or a _test.go helper); see builderbench's identical
-// functions for the full provenance note and the "dedicated benchmark
-// database only" warning.
-func createDatapipeStatusTable(ctx context.Context, pool *pgxpool.Pool) error {
-	var exists bool
-	if err := pool.QueryRow(ctx, "SELECT to_regclass('datapipe_status') IS NOT NULL").Scan(&exists); err != nil {
-		return fmt.Errorf("check datapipe_status pre-existence: %w", err)
-	}
-	if exists {
-		return fmt.Errorf("datapipe_status table already exists; cypherbench requires a dedicated benchmark database loaded by adgen, never a real BloodHound installation (the deferred DROP would destroy live pipeline state)")
-	}
-
-	const ddl = `CREATE TABLE IF NOT EXISTS datapipe_status (
-		singleton boolean DEFAULT true NOT NULL,
-		status text NOT NULL,
-		updated_at timestamp with time zone NOT NULL,
-		last_complete_analysis_at timestamp with time zone,
-		last_analysis_run_at timestamp with time zone,
-		last_complete_optimize_at timestamp with time zone,
-		next_scheduled_analysis_at timestamp with time zone,
-		CONSTRAINT singleton_uni CHECK (singleton)
-	)`
-	_, err := pool.Exec(ctx, ddl)
-	return err
-}
-
-func insertDatapipeStatus(ctx context.Context, pool *pgxpool.Pool, status string, stamp time.Time) error {
-	_, err := pool.Exec(ctx,
-		`INSERT INTO datapipe_status (singleton, status, updated_at, last_complete_analysis_at) VALUES (true, $1, now(), $2)`,
-		status, stamp,
-	)
-	return err
-}
-
-func dropDatapipeStatusTable(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, "DROP TABLE IF EXISTS datapipe_status")
-	return err
 }
 
 // stringKinds converts kind name strings to graph.Kinds, matching

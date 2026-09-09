@@ -33,7 +33,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/cypher/frontend"
@@ -935,10 +934,9 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 	// through the oracle instance -- LoadCorpusFixture wants a *pg.Driver,
 	// and either instance would physically write the same rows to the same
 	// database, so the choice is arbitrary; using the oracle keeps the
-	// bloodtrail driver's own write path (engine.NoteWrite et al.) out of
-	// the picture entirely, since the very next step (engine.RebuildNow)
-	// reads straight from PostgreSQL regardless of which driver wrote it or
-	// what its generation counter thinks.
+	// bloodtrail driver's own write path (engine.Apply et al.) out of the
+	// picture entirely, since the very next step (engine.RebuildNow) reads
+	// straight from PostgreSQL regardless of which driver wrote it.
 	graphtest.WipeGraph(t, oracle)
 
 	// Asserted on the bloodtrail driver's own embedded *pg.Driver instance
@@ -951,11 +949,11 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 
 	graphtest.LoadCorpusFixture(t, oracle)
 
-	// A deterministic, on-demand rebuild -- no datapipe_status table, no
-	// poller cadence to race -- matching dawgs_corpus_integration_test.go/
-	// builder_differential_matrix_integration_test.go's identical use of
-	// d.engine.RebuildNow.
-	if err := d.engine.RebuildNow(ctx, "manual", time.Time{}); err != nil {
+	// A deterministic, on-demand rebuild, independent of Start's own
+	// one-shot boot-load goroutine (engine/boot.go) -- matching
+	// dawgs_corpus_integration_test.go/builder_differential_matrix_
+	// integration_test.go's identical use of d.engine.RebuildNow.
+	if err := d.engine.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
