@@ -13,6 +13,8 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -334,6 +336,89 @@ func TestStartBootLoadsSnapshotWithoutDatapipeStatus(t *testing.T) {
 			t.Fatalf("boot load did not produce a serving snapshot within 5s")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// -----------------------------------------------------------------------
+// F1 (Task 12 review), integration evidence: the two tests below exercise
+// the real Start/enterFallback race end to end, against a live database,
+// complementing boot_test.go's deterministic unit tests of the same CAS.
+// -----------------------------------------------------------------------
+
+// lockedBuffer is a bytes/strings-backed log sink safe for concurrent writes
+// from the engine's own goroutines and reads from the test goroutine --
+// the same shape the root package's staleness_integration_test.go carries
+// under the identical name, for the identical reason; package boundaries
+// keep the two from sharing one.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForFresh blocks until eng reports a serving snapshot, up to a
+// generous deadline -- the same poll TestStartBootLoadsSnapshotWithoutDatapipeStatus
+// and the root package's waitForBootLoad both use.
+func waitForFresh(t *testing.T, eng *Engine) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, fresh := eng.Fresh(); fresh {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("engine never reached a serving snapshot within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestStartBootLoadLogsNoFallbackEntered pins F1's other half against a real
+// boot sequence, not just the unit-level state check
+// (TestRunBootLoadNeverFlipsToFallbackOnContextCancel, boot_test.go): plain
+// startup, with no write ever failing to replay, must adopt its first
+// snapshot with the "startup" trigger and log neither "fallback entered" nor
+// "fallback exited" -- both would be pure noise for an engine that never
+// tripped a fallback at all.
+func TestStartBootLoadLogsNoFallbackEntered(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+	graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
+
+	buf := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: logger})
+
+	eng.Start(ctx)
+	defer eng.Stop()
+
+	waitForFresh(t, eng)
+
+	logged := buf.String()
+	if strings.Contains(logged, "bloodtrail: fallback entered") {
+		t.Fatalf("plain startup logged \"fallback entered\", want no such line -- nothing here ever failed to replay:\n%s", logged)
+	}
+	if strings.Contains(logged, "bloodtrail: fallback exited") {
+		t.Fatalf("plain startup logged \"fallback exited\", want no such line -- the engine was never in fallback to begin with:\n%s", logged)
+	}
+	if !strings.Contains(logged, `trigger=startup`) {
+		t.Fatalf("boot load's own rebuild never logged trigger=startup, want it to have run at least once:\n%s", logged)
 	}
 }
 

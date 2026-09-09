@@ -208,6 +208,15 @@ func loadRandomCypherFixture(t *testing.T, bt *Driver, oracle *pg.Driver) []grap
 		t.Fatalf("assert adversarial fixture schema on oracle driver: %v", err)
 	}
 
+	// Start's boot-load goroutine (driver.go) races the node/edge creation
+	// below and TestRandomCypherDifferential's own RebuildNow otherwise:
+	// every write below goes through oracle, the raw pg driver, so nothing
+	// bumps applyEpoch, and a still-in-flight boot-load LoadSnapshot could
+	// adopt AFTER that RebuildNow and silently overwrite the freshly
+	// created fixture with whatever (possibly empty) graph existed before
+	// it.
+	waitForBootLoad(t, bt)
+
 	ids := make([]graph.ID, randomCypherFixtureNodeCount)
 	if err := oracle.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		for i := 0; i < randomCypherFixtureNodeCount; i++ {

@@ -990,10 +990,16 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 
 	// Every snapshot observed below is the direct, deterministic result of
 	// this test's own RebuildNow calls, each made right after loading that
-	// graph's own data -- Start's boot-load rebuild (driver.go) may land at
-	// any point before that, against whatever state happened to exist then,
-	// but it is always superseded by this test's own explicit RebuildNow
-	// before any comparison runs, so it needs no suppression here.
+	// graph's own data -- waitForBootLoad (right after AssertSchema, below)
+	// is what makes that true, not mere luck of timing: WipeGraph/LoadDataset
+	// both write through pgDriver, the raw driver, never through bt's Apply
+	// path, so nothing here bumps applyEpoch, and a still-in-flight boot-load
+	// LoadSnapshot call would have no epoch check stopping it from adopting
+	// AFTER this test's own explicit RebuildNow and silently overwriting the
+	// freshly loaded fixture/seed graph with whatever (possibly stale,
+	// possibly mid-wipe) state existed when it started reading. Waiting for
+	// boot load to settle before any of that runs removes the race outright,
+	// rather than merely arguing it away.
 	buf := installLogCapture(t)
 
 	ctx := context.Background()
@@ -1018,6 +1024,8 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
 		t.Fatalf("assert schema (bt): %v", err)
 	}
+
+	waitForBootLoad(t, d)
 
 	oracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
 	if err != nil {

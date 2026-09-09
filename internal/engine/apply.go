@@ -480,23 +480,40 @@ func (e *Engine) enterFallback(ctx context.Context, reason string) {
 }
 
 // startFallbackRebuild launches the single fallback recovery goroutine, if
-// one is not already running. fallbackRebuilding is the whole guard: it is
-// set here and cleared by the goroutine as it returns, so at most one
-// recovery rebuild is ever in flight regardless of how many writes fail
-// while it runs.
-//
-// A disabled engine starts nothing: it declines every query regardless of
-// state, so there is no serving to restore, and rebuilding a replica nobody
-// reads would be pure cost. (This also keeps enterFallback usable from unit
-// tests holding an Engine with no database behind it.)
+// claimRebuildLoop's CAS on fallbackRebuilding says none is already running
+// -- whether that's a previous fallback trip's own recovery goroutine, or
+// Start's boot-load goroutine (boot.go), which claims the same flag through
+// the same method. Either way, one loop is enough: whichever is running
+// will adopt a snapshot and end both jobs at once (adoptRebuiltView adopts,
+// and clears fallback, regardless of which trigger asked for the rebuild
+// that succeeds).
 func (e *Engine) startFallbackRebuild() {
-	if !e.cfg.Enabled {
-		return
-	}
-	if !e.fallbackRebuilding.CompareAndSwap(false, true) {
+	if !e.claimRebuildLoop() {
 		return
 	}
 	go e.runFallbackRebuild()
+}
+
+// claimRebuildLoop attempts to claim fallbackRebuilding: the single gate
+// shared by every retry-until-adopted rebuild loop the engine ever runs --
+// Start's boot-load goroutine (runBootLoad, boot.go) and the fallback
+// recovery goroutine (runFallbackRebuild, below) both claim it through this
+// same method before launching, rather than each carrying its own flag, so
+// that at most one such loop is EVER running regardless of which of the two
+// reaches this first. true means the caller just became that one loop and
+// must launch it; false means one is already running, and the caller must
+// not start a second -- see startFallbackRebuild's and boot.go's Start doc
+// for why the loop that IS running is always sufficient either way.
+//
+// A disabled engine claims nothing: it declines every query regardless of
+// state, so there is no serving to restore, and rebuilding a replica nobody
+// reads would be pure cost. (This also keeps enterFallback/startFallbackRebuild
+// usable from unit tests holding an Engine with no database behind it.)
+func (e *Engine) claimRebuildLoop() bool {
+	if !e.cfg.Enabled {
+		return false
+	}
+	return e.fallbackRebuilding.CompareAndSwap(false, true)
 }
 
 // runFallbackRebuild rebuilds the snapshot until one is actually adopted,
@@ -569,15 +586,18 @@ func (e *Engine) runFallbackRebuild() {
 
 // finishFallbackRebuild clears fallbackRebuilding, then relaunches recovery
 // if the engine has already raced back into stateFallback by the time it
-// does.
+// does. Called from both loops that share the flag (runFallbackRebuild
+// below, and runBootLoad's identical adopted exit, boot.go) -- whichever one
+// just adopted a snapshot, the race it closes and the reasoning are the
+// same.
 //
 // The race it closes: adoptRebuiltView (engine.go) publishes the rebuilt
 // View and flips state back to stateServing BEFORE this goroutine gets a
-// chance to run at all (rebuildOnce returns to runFallbackRebuild, which
-// calls this function, only after adoptRebuiltView has already returned).
-// If some OTHER write's Apply fails in the window between that state flip
-// and this function's own Store(false) below, its enterFallback call flips
-// state back to stateFallback and calls startFallbackRebuild -- which finds
+// chance to run at all (rebuildOnce returns to its caller, which calls this
+// function, only after adoptRebuiltView has already returned). If some
+// OTHER write's Apply fails in the window between that state flip and this
+// function's own Store(false) below, its enterFallback call flips state
+// back to stateFallback and calls startFallbackRebuild -- which finds
 // fallbackRebuilding still true (this goroutine has not cleared it yet) and
 // gives up silently, exactly as it is meant to when a recovery goroutine is
 // genuinely already in flight. But here one is NOT still doing useful work:
@@ -589,11 +609,11 @@ func (e *Engine) runFallbackRebuild() {
 // retired alongside write-through's freshness gates, boot.go), so this
 // recheck is the only thing that can.
 //
-// Only called from the adopted-rebuild return path (see runFallbackRebuild),
-// never from a context-cancelled return: relaunching in response to a state
-// change this goroutine is about to stop observing anyway, right as the
-// engine is shutting down, would just start a new goroutine with nothing
-// left to wait for it.
+// Only called from an adopted-rebuild return path, never from a
+// context-cancelled return: relaunching in response to a state change the
+// exiting goroutine is about to stop observing anyway, right as the engine
+// is shutting down, would just start a new goroutine with nothing left to
+// wait for it.
 func (e *Engine) finishFallbackRebuild() {
 	e.fallbackRebuilding.Store(false)
 	if e.state.Load() == stateFallback {

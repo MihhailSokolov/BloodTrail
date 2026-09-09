@@ -356,6 +356,14 @@ func TestDAWGSCorpus(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 
+	// Start's boot-load goroutine (driver.go) is launched asynchronously by
+	// dawgs.Open above; without waiting for it to settle here, its own
+	// one-shot rebuild could still be in flight when the first dataset
+	// group's ClearGraph/LoadDataset below runs, racing this test's "no
+	// manual rebuild has happened yet" premise for the first group's
+	// "delegating" pass.
+	waitForBootLoad(t, d)
+
 	// Hand-constructed per the brief above: integration.Open's scheme
 	// detection excludes bloodtrail, but Session itself is a plain struct
 	// with exported fields, and WithRollbackFixture (harness.go) needs

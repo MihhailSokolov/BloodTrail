@@ -947,6 +947,14 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 		t.Fatalf("assert corpus schema on bloodtrail driver: %v", err)
 	}
 
+	// Start's boot-load goroutine (driver.go) races the fixture load and
+	// this test's own RebuildNow below otherwise: LoadCorpusFixture writes
+	// through oracle, the raw pg driver, so nothing bumps applyEpoch, and a
+	// still-in-flight boot-load LoadSnapshot could adopt AFTER RebuildNow
+	// and silently overwrite the freshly seeded fixture with whatever state
+	// existed before it.
+	waitForBootLoad(t, d)
+
 	graphtest.LoadCorpusFixture(t, oracle)
 
 	// A deterministic, on-demand rebuild, independent of Start's own

@@ -33,16 +33,41 @@ const triggerManual = "manual"
 // remaining reason to (re)load from PostgreSQL is to obtain the FIRST
 // snapshot at all (this method) or to recover one that Apply gave up
 // replaying into (enterFallback's recovery goroutine, apply.go). Both are
-// one-shot, retry-until-adopted loads, which is exactly what runBootLoad
-// shares with runFallbackRebuild below.
+// one-shot, retry-until-adopted loads with the identical body
+// (runBootLoad/runFallbackRebuild), and -- unlike an earlier version of this
+// doc claimed -- they are NOT kept apart by construction: Apply's nil-scope
+// and HasFallback branches (apply.go, steps 3-4) call enterFallback BEFORE
+// Apply ever checks whether a snapshot has been adopted (step 7), so a
+// Run()/WipeGraph()/unrecognized write landing before boot load's first
+// adoption calls enterFallback while runBootLoad is still retrying. What
+// actually keeps this from becoming two concurrent rebuild loops is
+// claimRebuildLoop's shared CAS on fallbackRebuilding (engine.go), which
+// Start goes through exactly as startFallbackRebuild does: whichever of the
+// two reaches it first runs the one loop that exists; the other finds the
+// flag already held and does not start a second one, correctly relying on
+// the loop that IS running -- whichever trigger started it -- to adopt a
+// snapshot and end both jobs at once (adoptRebuiltView adopts, and clears
+// fallback, regardless of which trigger asked for the rebuild that
+// succeeds). A genuine pre-boot fallback trip still logs "fallback entered"/
+// "fallback exited" honestly around that shared loop's eventual adoption --
+// that pairing is a true event (a write really could not be replayed), not
+// noise; ordinary startup, with no such write, never calls enterFallback at
+// all, so it never logs either line.
 //
 // Start is meant to be called once, followed by exactly one Stop; it is not
-// itself idempotent (calling it twice launches two boot-load goroutines,
-// which race harmlessly against each other -- adoptRebuiltView's epoch
-// check admits only one outcome either way -- but is still not something a
-// caller should do).
+// itself idempotent (a second call's own claimRebuildLoop attempt loses the
+// CAS to the first and simply does nothing -- harmless, but still not
+// something a caller should do).
 func (e *Engine) Start(ctx context.Context) {
 	if !e.cfg.Enabled {
+		return
+	}
+	if !e.claimRebuildLoop() {
+		// Lost the race for the single rebuild-loop gate to a write that
+		// already tripped enterFallback (see this method's own doc) -- that
+		// goroutine is already retrying the exact load boot load itself
+		// would otherwise start, so there is nothing left for boot load to
+		// do.
 		return
 	}
 	go e.runBootLoad(ctx)
@@ -69,28 +94,35 @@ func (e *Engine) Stop() {
 	}
 }
 
-// runBootLoad is the boot-load goroutine body launched by Start: it keeps
-// calling rebuildOnce, labeled triggerStartup, until one is actually
-// adopted, then returns. Retried on the same doubling backoff
+// runBootLoad is the boot-load goroutine body launched by Start, once
+// Start's own claimRebuildLoop call has won the single rebuild-loop gate
+// (fallbackRebuilding): it keeps calling rebuildOnce, labeled
+// triggerStartup, until one is actually adopted, then hands off to
+// finishFallbackRebuild exactly as runFallbackRebuild's own adopted exit
+// does -- both loops share that flag now, so the same race
+// finishFallbackRebuild closes for fallback recovery (a fresh write tripping
+// enterFallback in the narrow window between adoption and the flag actually
+// clearing) applies here too. Retried on the same doubling backoff
 // runFallbackRebuild uses (fallbackRetryInterval..fallbackRetryMax, with a
 // refusal for exceeding cfg.MemoryLimit backed off to
-// fallbackBudgetRetryInterval instead via fallbackRetryDelay) -- boot load
-// and fallback recovery are the same kind of operation (retry a snapshot
-// load until it sticks), just triggered differently and, by construction,
-// never running at the same time: Apply never calls enterFallback while no
-// snapshot has ever been adopted (it returns early instead, apply.go), so
-// there is no snapshot for this goroutine to be racing the fallback
-// recovery goroutine over.
+// fallbackBudgetRetryInterval instead via fallbackRetryDelay): boot load and
+// fallback recovery are the same kind of operation (retry a snapshot load
+// until it sticks), just triggered differently.
 //
 // Runs on the engine's own background context (bgCtx, cancelled by Stop),
 // not ctx: ctx's cancellation is honored too (a caller-supplied way to stop
 // boot load without going through Stop), but bgCtx is what Stop actually
 // cancels, so only checking ctx would leave this goroutine unable to be
-// quiesced by Stop the way the fallback recovery goroutine already is.
+// quiesced by Stop the way the fallback recovery goroutine already is. Both
+// early-return paths below clear fallbackRebuilding directly, the same way
+// runFallbackRebuild's own context-cancelled returns do (and for the same
+// reason: Stop cancelling bgCtx means the engine is shutting down, so there
+// is no reason to run finishFallbackRebuild's relaunch-if-raced recheck).
 func (e *Engine) runBootLoad(ctx context.Context) {
 	backoff := fallbackRetryInterval
 	for {
 		if ctx.Err() != nil || e.bgCtx.Err() != nil {
+			e.fallbackRebuilding.Store(false)
 			return
 		}
 
@@ -99,6 +131,7 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 		case err != nil:
 			e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: boot load failed", slog.Any("error", err))
 		case adopted:
+			e.finishFallbackRebuild()
 			return
 		}
 
@@ -107,8 +140,10 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
+			e.fallbackRebuilding.Store(false)
 			return
 		case <-e.bgCtx.Done():
+			e.fallbackRebuilding.Store(false)
 			return
 		case <-time.After(wait):
 		}

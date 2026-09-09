@@ -84,9 +84,14 @@ type Engine struct {
 	// therefore that the freshly loaded snapshot cannot be missing one.
 	applyEpoch atomic.Uint64
 
-	// fallbackRebuilding is set while the single fallback recovery goroutine
-	// (runFallbackRebuild) is running, so a burst of failing writes starts
-	// one rebuild rather than one per write.
+	// fallbackRebuilding is set while EITHER of the engine's two
+	// retry-until-adopted rebuild loops -- Start's boot-load goroutine
+	// (runBootLoad, boot.go) or the fallback recovery goroutine
+	// (runFallbackRebuild, apply.go) -- is running. Both claim it through
+	// the same method (claimRebuildLoop, apply.go) before launching, so at
+	// most one of the two is ever running regardless of which reaches it
+	// first, and a burst of failing writes starts one recovery rebuild
+	// rather than one per write.
 	fallbackRebuilding atomic.Bool
 
 	// bgCtx/bgCancel scope the engine's own background work (today: the
