@@ -24,12 +24,13 @@
 //
 // This file needs same-package access to Driver's own unexported `engine`
 // field (see staleness_integration_test.go's identically-reasoned doc) so it
-// can force a deterministic rebuild with d.engine.RebuildNow between the two
-// modes described below, rather than depending on the timing of Start's own
-// asynchronous boot-load goroutine (engine/boot.go). That access requires
-// living in package bloodtrail, not bloodtrail_test.
+// can force a deterministic rebuild with d.engine.RebuildNow before running
+// any case, rather than depending on the timing of Start's own asynchronous
+// boot-load goroutine (engine/boot.go) or of the automatic fallback-recovery
+// rebuild described below. That access requires living in package
+// bloodtrail, not bloodtrail_test.
 //
-// # What this runs, and why two modes
+// # What this runs
 //
 // dawgs' own integration test suite ships a Cypher conformance corpus --
 // integration/testdata/cases/*.json (30 files, ~375 cases covering
@@ -41,34 +42,62 @@
 // cannot be imported directly; this file adapts it to run the same corpus
 // against *bloodtrail.Driver instead of a bare pg/neo4j driver.
 //
-// Every read-only case (no "fixture" field) runs twice against each dataset
-// group: once immediately after the dataset loads ("delegating" subtests,
-// named from this suite's pre-write-through era -- Apply now replays every
-// real commit, LoadDataset's edges included, into whatever snapshot
-// currently exists, see write_observer.go/apply.go, so this pass may now
-// exercise engine-served cases too rather than pure delegation; a fuller
-// audit of this file's own doc against write-through is a follow-up, not
-// this task's own concern); and once more after a manual d.engine.RebuildNow,
-// so every shape internal/engine/interpret's Plan
-// actually accepts -- milestone 4's general-purpose Cypher interpreter, a
-// much broader surface than milestone 3's retired shortestPath/
-// allShortestPaths-only recognizer (recognize.FromCypher, removed once
-// TryCypher was rewired to the interpreter) -- gets a real chance to be
-// served from the snapshot ("engine" subtests); the rest of the corpus is
-// shapes Plan declines and TryCypher keeps delegating regardless. A failure
-// that only shows up under "engine" points at a real serving bug, not an
-// adaptation mistake -- see the doc on TestDAWGSCorpus below.
+// Per dataset group, ClearGraph and LoadDataset write through the wrapped
+// driver (db, not a raw pg.Driver) before any case runs. ClearGraph's own
+// delete (tx.Nodes().Delete(), no Filter call at all) is a shape
+// nodeIDsFromCriteria never recognizes (write_observer.go: it needs exactly
+// one InIDs-shaped criteria), so every ClearGraph call unconditionally
+// records a ChangeSet fallback and trips the engine into fallback, starting
+// an automatic background recovery rebuild (apply.go's enterFallback/
+// runFallbackRebuild) before LoadDataset writes a single node. A manual
+// d.engine.RebuildNow call still runs before every read-only case below --
+// not to be the first thing that makes the engine servable (that automatic
+// recovery already raced to do so), but to make the snapshot every case
+// runs against deterministic rather than however far that race happened to
+// get.
+//
+// This suite used to run every read-only case (no "fixture" field) twice per
+// dataset group: once immediately after LoadDataset, on the theory that no
+// rebuild had happened yet and every query would therefore delegate to
+// PostgreSQL ("delegating" subtests), and once more after the manual
+// RebuildNow, once internal/engine/interpret's Plan-accepted shapes could
+// actually be served from a fresh snapshot ("engine" subtests) -- the
+// expectation being that a failure surfacing only under "engine" points at a
+// real serving bug, since "delegating" would have shown the same case
+// passing against PostgreSQL.
+//
+// That premise stopped holding once write-through shipped, and measurably
+// so: ClearGraph's own fallback trip (above) already starts a recovery
+// rebuild before LoadDataset even begins, and that automatic rebuild reads
+// the same committed PostgreSQL state the later manual RebuildNow does,
+// since nothing writes in between. Polling d.engine.Fresh()/RebuildCount
+// immediately after LoadDataset returns, and logging each case's served/
+// declined outcome under both the old "delegating" and "engine" labels
+// (repeated runs, every dataset group), showed the automatic recovery had
+// already adopted a fresh snapshot every time before "delegating" ran a
+// single query, and that the exact same set of cases -- by name, not just by
+// count -- was served under both labels. The two passes were exercising the
+// identical freshly-rebuilt-from-PostgreSQL state twice, not a
+// write-through-applied state versus a rebuilt one, so running every
+// read-only case once, against the state the manual RebuildNow produces, is
+// the whole suite: the removed first pass was not exercising anything the
+// remaining one doesn't already cover. A failure in a case here means the
+// in-memory path engine answers that case differently than the corpus's
+// own fixed expectation -- a real serving bug (internal/engine) if the case
+// was actually served (cypherServedMarker fired), or a bad adaptation
+// (mismapped assertion, bad path, schema gap) if it was not -- see the doc
+// on TestDAWGSCorpus below.
 //
 // Fixture cases (a "fixture" field) run inside a rolled-back write
 // transaction (Session.WithRollbackFixture): Driver.WriteTransaction only
 // calls d.engine.Apply on success (driver.go), and the rollback sentinel
 // withRollback returns makes the underlying call fail, so a fixture's write
-// never reaches Apply and never disturbs either mode's snapshot state.
-// More fundamentally, a write transaction's own Query calls always run
-// directly against the live tx (only wrappedTransaction.Query, built for
-// ReadTransaction, ever consults the engine) -- delegation by construction,
-// not by snapshot staleness -- so there is nothing a second, post-rebuild
-// pass could exercise that the first did not. Each fixture case therefore
+// never reaches Apply and never disturbs the snapshot every read-only case
+// above runs against. More fundamentally, a write transaction's own Query
+// calls always run directly against the live tx (only wrappedTransaction.
+// Query, built for ReadTransaction, ever consults the engine) -- delegation
+// by construction, not by snapshot staleness -- so there is nothing a second
+// pass could exercise that a first did not. Each fixture case therefore
 // runs exactly once, under its own "fixture" subtest.
 package bloodtrail
 
@@ -211,44 +240,45 @@ func fixtureKinds(files []caseFile) (nodeKinds, edgeKinds graph.Kinds) {
 	return nodeKinds, edgeKinds
 }
 
-// dawgsCorpusServedFloor is Task 17's engine-mode served floor: pinned at
-// 70 (~90% of observed, rounded down), just below the 79 read-only cases
-// (across every dataset group's "engine" pass, summed) this corpus's fixed
-// case files actually served as of 2026-09-06 (`go test -tags integration
-// -run TestDAWGSCorpus -v`, totalEngineServed logged at the end of
-// TestDAWGSCorpus), deterministic run to run since RebuildNow and the
-// corpus itself carry no randomness. Most of the corpus's ~375 cases are
-// still shapes interpret.Plan declines outright (aggregation variants,
-// temporal values, updates, and more -- see this file's package doc) or
-// that translateGateOK's own second-guess rejects, so 79 (not "most of the
-// corpus") is the correct, already-measured baseline, not a bug in this
-// count. A regression that makes interpret.Plan/translateGateOK decline
-// far more broadly than expected would still leave every individual
-// "engine" subtest green (a declined case simply delegates to PostgreSQL,
-// which is always correct -- see this file's package doc) -- silently
-// defeating the entire point of running two modes at all. This floor
-// catches that silent regression the per-case assertions cannot. Retune
-// both this constant and its comment together if the corpus (a
-// specterops/dawgs dependency bump) or the interpreter's accepted subset
-// changes enough to move the observed count.
+// dawgsCorpusServedFloor is this suite's served floor: pinned at 70 (~90% of
+// observed, rounded down), just below the 78 read-only cases (across every
+// dataset group's run, summed) this corpus's fixed case files actually
+// served as of 2026-09-09 (`go test -tags integration -run TestDAWGSCorpus
+// -v`, totalEngineServed logged at the end of TestDAWGSCorpus), deterministic
+// run to run since RebuildNow and the corpus itself carry no randomness.
+// Most of the corpus's ~375 cases are still shapes interpret.Plan declines
+// outright (aggregation variants, temporal values, updates, and more -- see
+// this file's package doc) or that translateGateOK's own second-guess
+// rejects, so 78 (not "most of the corpus") is the correct, already-measured
+// baseline, not a bug in this count. A regression that makes interpret.Plan/
+// translateGateOK decline far more broadly than expected would still leave
+// every individual case's own correctness assertion green (a declined case
+// simply delegates to PostgreSQL, which is always correct -- see this file's
+// package doc) -- silently defeating the entire point of tracking which
+// cases the engine actually serves. This floor catches that silent
+// regression the per-case assertions cannot. Retune both this constant and
+// its comment together if the corpus (a specterops/dawgs dependency bump) or
+// the interpreter's accepted subset changes enough to move the observed
+// count.
 const dawgsCorpusServedFloor = 70
 
-// TestDAWGSCorpus is milestone 3's "DAWGS integration corpus green" exit
-// criterion: dawgs' own Cypher conformance corpus, run against
-// *bloodtrail.Driver instead of a bare driver, in both the delegating and
-// engine-serving modes described in this file's package doc.
+// TestDAWGSCorpus is the "DAWGS integration corpus green" exit criterion:
+// dawgs' own Cypher conformance corpus, run against *bloodtrail.Driver
+// instead of a bare driver, against the deterministically-rebuilt snapshot
+// described in this file's package doc.
 //
-// A failure in a "delegating" subtest means this adaptation itself is wrong
-// (a mismapped assertion, a bad path, a schema gap) -- fix the runner, not
-// the driver. A failure that appears only in the matching "engine" subtest,
-// with "delegating" green for the same case, means the in-memory path engine
-// answers that recognized shape differently than PostgreSQL does -- a real
-// serving bug to fix in the engine (internal/engine), with a regression
-// test, not something to paper over here.
+// A failure in a case means either this adaptation itself is wrong (a
+// mismapped assertion, a bad path, a schema gap) or the in-memory path
+// engine answers a recognized shape differently than the corpus's own fixed
+// expectation says it should -- see the failing case's decline/serve status
+// (cypherServedMarker) to tell which: a case the engine actually served is a
+// real serving bug to fix in the engine (internal/engine), with a regression
+// test; a case that delegated to PostgreSQL and still failed is a bad
+// adaptation, not something to paper over here.
 //
-// Task 17 additionally tallies every dataset group's "engine" pass served-
-// case count (totalEngineServed) and asserts dawgsCorpusServedFloor at the
-// end -- see that constant's own doc.
+// This also tallies every dataset group's served-case count
+// (totalEngineServed) and asserts dawgsCorpusServedFloor at the end -- see
+// that constant's own doc.
 func TestDAWGSCorpus(t *testing.T) {
 	dawgsDir := locateDAWGSModuleDir(t)
 
@@ -371,13 +401,13 @@ func TestDAWGSCorpus(t *testing.T) {
 	session := &integration.Session{DB: db, Ctx: ctx}
 
 	// totalEngineServed accumulates a cypherServedMarker delta around every
-	// dataset group's "engine" pass below -- Task 17's served floor
+	// dataset group's read-only pass below -- this suite's served floor
 	// (dawgsCorpusServedFloor's own doc), a suite-wide anti-vacuity tally
 	// distinct from any single case's own pass/fail: a regression that made
 	// interpret.Plan/translateGateOK decline far more broadly could still
-	// leave every individual "engine" case green (delegation to PostgreSQL
-	// is always correct -- see this file's package doc), silently defeating
-	// the entire point of running two modes at all.
+	// leave every individual case green (delegation to PostgreSQL is always
+	// correct -- see this file's package doc), silently defeating the
+	// entire point of tracking which cases the engine actually serves.
 	var totalEngineServed int
 
 	for _, ds := range datasetNames {
@@ -385,60 +415,57 @@ func TestDAWGSCorpus(t *testing.T) {
 
 		t.Run(ds, func(t *testing.T) {
 			// ClearGraph/LoadDataset both write through the wrapped driver
-			// (db, not a raw pg.Driver), so each replays into whatever
-			// snapshot currently exists (driver.go's WriteTransaction/
-			// BatchOperation -> d.engine.Apply) rather than leaving the
-			// previous dataset group's "engine"-pass snapshot untouched --
-			// see this file's own package doc for why the "delegating"
-			// framing below predates write-through.
+			// (db, not a raw pg.Driver) -- see this file's package doc for
+			// why ClearGraph's own delete trips the engine into fallback and
+			// starts an automatic recovery rebuild before LoadDataset even
+			// begins.
 			integration.ClearGraph(t, db, ctx)
 			idMap := session.LoadDataset(t, datasetPath(ds))
 
-			runReadOnlyCases := func(t *testing.T) {
-				for _, cf := range g.files {
-					for _, tc := range cf.Cases {
-						if tc.Fixture != nil {
-							continue
-						}
-
-						tc := tc
-						t.Run(tc.Name, func(t *testing.T) {
-							defer func() {
-								if r := recover(); r != nil {
-									t.Fatalf("panic: %v", r)
-								}
-							}()
-
-							check := parseAssertion(t, tc.Assert)
-							runReadOnly(t, ctx, db, idMap, tc, check)
-						})
-					}
-				}
-			}
-
-			// Mode 1: "delegating" -- no manual rebuild has happened for
-			// this group's data yet (see the package doc's note on this
-			// name predating write-through).
-			t.Run("delegating", runReadOnlyCases)
-
-			// Force a deterministic snapshot rebuild from this group's
-			// data: RebuildNow is a manual, on-demand call, independent of
-			// Start's own one-shot boot-load goroutine (engine/boot.go).
+			// Force a deterministic snapshot rebuild from this group's data
+			// before running any case below: RebuildNow is a manual,
+			// on-demand call, independent of both Start's own one-shot
+			// boot-load goroutine (engine/boot.go) and the automatic
+			// recovery rebuild ClearGraph's own fallback trip already
+			// started (see the package doc for why the two end up reading
+			// the same committed state either way, and why this call exists
+			// for determinism rather than to be the first thing that makes
+			// the engine servable here).
 			if err := d.engine.RebuildNow(ctx, "manual"); err != nil {
 				t.Fatalf("RebuildNow (dataset %q): %v", ds, err)
 			}
 
-			// Mode 2: engine -- same cases, same loaded data, now with a
-			// fresh snapshot so every shape interpret.Plan accepts actually
-			// gets served from it. The cypherServedMarker delta around this
-			// one call counts every case this dataset group's "engine" pass
-			// actually served (each served case logs the marker exactly
-			// once, from TryCypher's own single tx.Query call per case --
-			// see runReadOnly), folded into totalEngineServed for the
-			// suite-wide floor checked after the loop.
-			engineServedBefore := markerCount(buf, cypherServedMarker)
-			t.Run("engine", runReadOnlyCases)
-			totalEngineServed += markerCount(buf, cypherServedMarker) - engineServedBefore
+			// Every shape internal/engine/interpret's Plan actually accepts
+			// gets a real chance to be served from the snapshot RebuildNow
+			// just produced; the rest of the corpus is shapes Plan declines
+			// and TryCypher delegates to PostgreSQL instead. The
+			// cypherServedMarker delta around this loop counts every case
+			// this dataset group actually served (each served case logs the
+			// marker exactly once, from TryCypher's own single tx.Query
+			// call per case -- see runReadOnly), folded into
+			// totalEngineServed for the suite-wide floor checked after the
+			// outer loop.
+			servedBefore := markerCount(buf, cypherServedMarker)
+			for _, cf := range g.files {
+				for _, tc := range cf.Cases {
+					if tc.Fixture != nil {
+						continue
+					}
+
+					tc := tc
+					t.Run(tc.Name, func(t *testing.T) {
+						defer func() {
+							if r := recover(); r != nil {
+								t.Fatalf("panic: %v", r)
+							}
+						}()
+
+						check := parseAssertion(t, tc.Assert)
+						runReadOnly(t, ctx, db, idMap, tc, check)
+					})
+				}
+			}
+			totalEngineServed += markerCount(buf, cypherServedMarker) - servedBefore
 
 			// Fixture cases: each runs once, in a rolled-back write
 			// transaction that never reaches the engine either way (see
