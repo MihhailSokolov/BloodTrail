@@ -186,15 +186,28 @@ func writeKindTable(bw *binWriter, kt *KindTable) {
 	}
 }
 
+// propEntryWireSize is the number of bytes writePropStore/readPropStore
+// actually put on the wire for one propEntry: prop uint16 (2) + kind uint8
+// (1) + num float64 bits as uint64 (8) + ref uint32 (4) + len uint32 (4) =
+// 19. It is deliberately its own named constant, distinct from
+// bytesPerPropEntry (props.go) -- propEntry's padded IN-MEMORY size (24
+// bytes, via unsafe.Sizeof, used for heap-footprint accounting in
+// ApproxBytes) -- so the two can never be silently conflated: one describes
+// what's on disk, the other what's resident in RAM once loaded, and a
+// Go-compiler layout change to propEntry must not be read as a wire format
+// change (see the format-version comment on ReadSnapshotFile).
+const propEntryWireSize = 19
+
 // writePropStore writes p's packed fields in order: names (length-prefixed
-// each, preceded by a count), entries (a fixed 19-byte wire layout per
-// entry -- prop uint16, kind uint8, num float64 bits as uint64, ref uint32,
-// len uint32 -- deliberately NOT propEntry's raw in-memory bytes, since
-// unsafe.Sizeof padding is a Go-compiler implementation detail, not a wire
-// format), nodeOffsets (raw uint32s, N+1 of them, N recoverable from the
-// header so no separate count is written), and finally the arena
-// (length-prefixed raw bytes). p.ids and p.objectIndex/objectIndexDup are
-// derived, not written -- see finalizePropStore.
+// each, preceded by a count), entries (a fixed propEntryWireSize-byte wire
+// layout per entry -- prop uint16, kind uint8, num float64 bits as uint64,
+// ref uint32, len uint32 -- deliberately NOT propEntry's raw in-memory
+// bytes, since unsafe.Sizeof padding is a Go-compiler implementation
+// detail, not a wire format), nodeOffsets (raw uint32s, N+1 of them, N
+// recoverable from the header so no separate count is written), and
+// finally the arena (length-prefixed raw bytes). p.ids and
+// p.objectIndex/objectIndexDup are derived, not written -- see
+// finalizePropStore.
 func writePropStore(bw *binWriter, p *PropStore) {
 	bw.u64(uint64(len(p.names)))
 	for _, name := range p.names {
@@ -369,6 +382,18 @@ func ReadSnapshotFile(path string) (snap *Snapshot, watermark uint64, err error)
 	return s, watermark, nil
 }
 
+// maxKindTableEntries bounds readKindTable's entry count by KindID's own
+// domain -- KindID is an int16 (bitset.go), so at most math.MaxUint16+1
+// distinct values can ever exist -- rather than by the generic
+// maxReadAlloc byte budget. maxReadAlloc alone is the wrong guard here: it
+// compares an entry COUNT against a BYTE budget, so a corrupt count
+// anywhere below maxReadAlloc (e.g. a few hundred million, still far under
+// 1<<40) sails past that check and drives make(map[KindID]string, count)
+// to attempt a preallocation sized for that many buckets -- an
+// unrecoverable OOM well before io.ReadFull, let alone the trailing CRC32,
+// ever gets a chance to reject the file.
+const maxKindTableEntries = uint64(math.MaxUint16) + 1
+
 // readKindTable is writeKindTable's mirror: reads the entry count, then
 // that many (id, name) pairs, and builds them into a KindTable via
 // NewKindTable exactly as Builder.Build does from Builder.SetKinds.
@@ -377,8 +402,8 @@ func readKindTable(br *binReader) *KindTable {
 	if br.err != nil {
 		return nil
 	}
-	if count > maxReadAlloc {
-		br.err = fmt.Errorf("snapshot: refusing to allocate %d kind table entries", count)
+	if count > maxKindTableEntries {
+		br.err = fmt.Errorf("snapshot: kind table entry count %d exceeds KindID's range (max %d)", count, maxKindTableEntries)
 		return nil
 	}
 	pairs := make(map[KindID]string, count)
@@ -402,8 +427,15 @@ func readPropStore(br *binReader, n uint64) *PropStore {
 	if br.err != nil {
 		return nil
 	}
-	if nameCount > maxReadAlloc {
-		br.err = fmt.Errorf("snapshot: refusing to allocate %d property names", nameCount)
+	// Bound nameCount by PropID's own domain (props.go's maxPropID, the
+	// package constant internProp already enforces distinct-name-count
+	// against) rather than the generic maxReadAlloc byte budget -- the same
+	// "count vs. byte budget" gap maxKindTableEntries closes above: a
+	// corrupt nameCount under maxReadAlloc but over maxPropID+1 would
+	// otherwise reach make([]string, nameCount) and attempt an
+	// unrecoverable OOM allocation before the CRC32 trailer is checked.
+	if nameCount > uint64(maxPropID)+1 {
+		br.err = fmt.Errorf("snapshot: property name count %d exceeds PropID's range (max %d)", nameCount, uint64(maxPropID)+1)
 		return nil
 	}
 	names := make([]string, nameCount)
@@ -415,6 +447,18 @@ func readPropStore(br *binReader, n uint64) *PropStore {
 	if br.err != nil {
 		return nil
 	}
+	// The cap below divides maxReadAlloc by bytesPerPropEntry (props.go),
+	// propEntry's padded IN-MEMORY size (24 bytes) -- not by
+	// propEntryWireSize (19 bytes), the number of bytes this loop actually
+	// reads per entry off the wire. That's deliberate, not an oversight:
+	// entryCount drives make([]propEntry, entryCount), a heap allocation
+	// sized by the LARGER in-memory layout, so bytesPerPropEntry is the
+	// divisor that actually bounds that allocation's byte size. Dividing by
+	// the smaller propEntryWireSize instead would LOOSEN this cap -- it
+	// would permit more entries for the same maxReadAlloc budget than the
+	// resulting []propEntry could safely occupy. Keep the two sizes named
+	// separately so a future change to either doesn't quietly conflate
+	// "how big this is on the wire" with "how big this is once loaded".
 	if entryCount > maxReadAlloc/bytesPerPropEntry {
 		br.err = fmt.Errorf("snapshot: refusing to allocate %d prop entries", entryCount)
 		return nil
@@ -546,10 +590,15 @@ func (bw *binWriter) i16s(s []int16) {
 // ReadSnapshotFile/readKindTable/readPropStore read as a flat sequence of
 // field reads with the error checked only where it actually matters (before
 // counts are trusted enough to drive further allocations, and once more at
-// the very end).
+// the very end). buf mirrors binWriter's own scratch field: it backs every
+// fixed-size scalar read (see readScratch) so u8/u16/u32/u64 don't each
+// heap-allocate -- at 5M-node scale a read touches tens of millions of
+// these, so one make([]byte, n) per call was showing up as significant GC
+// pressure.
 type binReader struct {
 	r   io.Reader
 	err error
+	buf [8]byte
 }
 
 // maxReadAlloc caps any single length-prefixed read this package will
@@ -573,8 +622,30 @@ func (br *binReader) read(n int) []byte {
 	return buf
 }
 
+// readScratch reads exactly n (<= len(br.buf)) bytes into br's scratch
+// buffer and returns a slice of it, instead of read's make([]byte, n) --
+// used only by the fixed-size scalar helpers below (u8/u16/u32/u64). Each
+// of those decodes the returned bytes into a typed value (a uint8/16/32/64,
+// never the slice itself) and returns that value, so the caller never
+// retains a reference into br.buf past the call -- the next readScratch
+// (from the very next field read) is free to overwrite it. bytes/u64s/
+// u32s/i16s -- the variable-length and bulk-array reads, which do need
+// exact-size allocations that outlive the call -- deliberately keep using
+// read/make instead.
+func (br *binReader) readScratch(n int) []byte {
+	if br.err != nil {
+		return nil
+	}
+	buf := br.buf[:n]
+	if _, err := io.ReadFull(br.r, buf); err != nil {
+		br.err = err
+		return nil
+	}
+	return buf
+}
+
 func (br *binReader) u8() uint8 {
-	b := br.read(1)
+	b := br.readScratch(1)
 	if b == nil {
 		return 0
 	}
@@ -582,7 +653,7 @@ func (br *binReader) u8() uint8 {
 }
 
 func (br *binReader) u16() uint16 {
-	b := br.read(2)
+	b := br.readScratch(2)
 	if b == nil {
 		return 0
 	}
@@ -592,7 +663,7 @@ func (br *binReader) u16() uint16 {
 func (br *binReader) i16() int16 { return int16(br.u16()) }
 
 func (br *binReader) u32() uint32 {
-	b := br.read(4)
+	b := br.readScratch(4)
 	if b == nil {
 		return 0
 	}
@@ -602,7 +673,7 @@ func (br *binReader) u32() uint32 {
 func (br *binReader) i32() int32 { return int32(br.u32()) }
 
 func (br *binReader) u64() uint64 {
-	b := br.read(8)
+	b := br.readScratch(8)
 	if b == nil {
 		return 0
 	}

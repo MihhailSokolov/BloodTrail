@@ -2,6 +2,7 @@
 package snapshot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -259,6 +260,141 @@ func TestSnapshotFileTruncated(t *testing.T) {
 
 	if _, _, err := ReadSnapshotFile(path); err == nil {
 		t.Fatal("ReadSnapshotFile(truncated file): want error, got nil")
+	}
+}
+
+// snapshotFixedHeaderLen replays, using the exact same binWriter helpers
+// writeSnapshotBody itself uses, every field written before writeKindTable
+// is called (version, graphID, watermark, the three counts, and all twelve
+// packed CSR arrays), and returns len(snapshotMagic) plus how many bytes
+// that took. A real snapshot file writes the magic directly and then
+// writeSnapshotBody's fields in this exact same order (see
+// WriteSnapshotFile/writeSnapshotBody), so the result is the absolute byte
+// offset of the kindCount field within a file written for s -- derived by
+// replaying the real field-writing code rather than hand-computing byte
+// arithmetic that could silently drift from the format.
+func snapshotFixedHeaderLen(t *testing.T, s *Snapshot) int {
+	t.Helper()
+
+	var buf bytes.Buffer
+	bw := &binWriter{w: &buf}
+
+	bw.u32(snapshotFormatVersion)
+	bw.i32(s.GraphID)
+	bw.u64(0) // watermark: any value encodes to the same 8 bytes
+	bw.u64(uint64(s.NodeCount()))
+	bw.u64(uint64(s.EdgeCount()))
+	bw.u64(uint64(len(s.NodeKinds)))
+	bw.u64s(s.GraphIDs)
+	bw.u64s(s.OutOffsets)
+	bw.u32s(s.OutTargets)
+	bw.i16s(s.OutKinds)
+	bw.u64s(s.OutEdgeIDs)
+	bw.u64s(s.InOffsets)
+	bw.u32s(s.InTargets)
+	bw.i16s(s.InKinds)
+	bw.u32s(s.InEdgeIdx)
+	bw.u32s(s.KindOffsets)
+	bw.i16s(s.NodeKinds)
+	bw.u32s(s.edgeIDPerm)
+	if bw.err != nil {
+		t.Fatalf("snapshotFixedHeaderLen: %v", bw.err)
+	}
+
+	return len(snapshotMagic) + buf.Len()
+}
+
+// kindTableWireLen replays writeKindTable in isolation and returns how many
+// bytes it puts on the wire for kt -- combined with snapshotFixedHeaderLen,
+// this locates the propNameCount field that immediately follows the kind
+// table in a real snapshot file.
+func kindTableWireLen(t *testing.T, kt *KindTable) int {
+	t.Helper()
+
+	var buf bytes.Buffer
+	bw := &binWriter{w: &buf}
+	writeKindTable(bw, kt)
+	if bw.err != nil {
+		t.Fatalf("kindTableWireLen: %v", bw.err)
+	}
+	return buf.Len()
+}
+
+// patchU64 overwrites the 8 little-endian bytes at off in data with v --
+// used by the two tests below to corrupt a single length-prefixed count
+// field in place, inside an otherwise fully valid, freshly written
+// snapshot file.
+func patchU64(t *testing.T, data []byte, off int, v uint64) {
+	t.Helper()
+	if off < 0 || off+8 > len(data) {
+		t.Fatalf("patchU64: offset %d out of range for a %d-byte file", off, len(data))
+	}
+	binary.LittleEndian.PutUint64(data[off:off+8], v)
+}
+
+// TestSnapshotFileHugeKindCountRejected patches the kindCount field of an
+// otherwise-valid snapshot file to a value far bigger than KindID (an
+// int16) can ever address, yet still well under the generic maxReadAlloc
+// byte-budget check that used to be readKindTable's only guard. Before that
+// guard was tightened to the domain-specific maxKindTableEntries, a count
+// in this range would sail past maxReadAlloc and reach
+// make(map[KindID]string, count) -- a preallocation sized for billions of
+// buckets, an unrecoverable OOM, long before the file's CRC32 trailer is
+// ever consulted. The fix must reject it fast, as ErrCorrupt, without
+// attempting that allocation.
+func TestSnapshotFileHugeKindCountRejected(t *testing.T) {
+	s := buildFileFixture(t)
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	if err := WriteSnapshotFile(path, s, 1); err != nil {
+		t.Fatalf("WriteSnapshotFile: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kindCountOff := snapshotFixedHeaderLen(t, s)
+	const hugeCount = uint64(1) << 32 // >> maxKindTableEntries (65536), << maxReadAlloc (1<<40)
+	patchU64(t, data, kindCountOff, hugeCount)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = ReadSnapshotFile(path)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("ReadSnapshotFile(huge kind count) = %v, want ErrCorrupt", err)
+	}
+}
+
+// TestSnapshotFileHugePropNameCountRejected is
+// TestSnapshotFileHugeKindCountRejected's PropStore counterpart: it patches
+// the propNameCount field (immediately after the kind table) to a value far
+// bigger than PropID (a uint16) can ever address, again well under the old
+// maxReadAlloc-only guard, and checks readPropStore now rejects it before
+// ever reaching make([]string, nameCount).
+func TestSnapshotFileHugePropNameCountRejected(t *testing.T) {
+	s := buildFileFixture(t)
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	if err := WriteSnapshotFile(path, s, 1); err != nil {
+		t.Fatalf("WriteSnapshotFile: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nameCountOff := snapshotFixedHeaderLen(t, s) + kindTableWireLen(t, s.Kinds)
+	const hugeCount = uint64(1) << 32 // >> maxPropID+1 (65536), << maxReadAlloc (1<<40)
+	patchU64(t, data, nameCountOff, hugeCount)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = ReadSnapshotFile(path)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("ReadSnapshotFile(huge prop name count) = %v, want ErrCorrupt", err)
 	}
 }
 
