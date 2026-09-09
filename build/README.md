@@ -84,8 +84,8 @@ regardless.
 | `snapshot rebuilt` | Info | A full PostgreSQL rebuild ran and was adopted -- `trigger` names why: `startup` (the one-shot boot load), `fallback` (recovery from the line above), or `manual`. |
 | `snapshot file written` | Info | The current replica was folded and written to `BLOODTRAIL_SNAPSHOT_DIR` -- by a clean shutdown, or by a background compaction once it had adopted its result. |
 | `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL. |
-| `snapshot file rejected` | Info | Boot found a file but its watermark did not match PostgreSQL's; it fell back to a rebuild instead. |
-| `no snapshot file` | Debug | Boot found no file at all (feature disabled, or none written yet). |
+| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. Five distinct causes share this marker -- unreadable/corrupt/wrong-version, a failed PostgreSQL watermark read, a watermark mismatch, an over-`BLOODTRAIL_MEMORY_LIMIT` size, and a write racing the load -- distinguished by a `reason` attribute on all but the first, which carries `error` instead. |
+| `no snapshot file` | Debug | Boot found `BLOODTRAIL_SNAPSHOT_DIR` set but no file there yet (the ordinary first-ever boot against a given directory). The feature being disabled outright (`BLOODTRAIL_SNAPSHOT_DIR` unset) logs nothing here at all -- boot returns from the check before it would ever log. |
 | `compaction finished` | Info | A background compaction folded the write-through delta back into the base snapshot. |
 | `path engine served` / `builder engine served` / `cypher engine served` | Info / Debug / Debug | The in-memory engine, not PostgreSQL, answered a shortest-path, structural (node/relationship), or Cypher query respectively. |
 

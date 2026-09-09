@@ -31,17 +31,29 @@ import (
 // DriverName is the value BloodHound's graph_driver setting selects.
 const DriverName = "bloodtrail"
 
-// snapshotSaveTimeout bounds the shutdown snapshot save Close runs on a
-// context deliberately detached from the shutdown's own cancellation -- see
-// Close's doc for why that detachment is required at all, and for why this
-// bound in practice covers only the save's single-row PostgreSQL watermark
-// read (the fold and file write past it take no context).
+// snapshotSaveTimeout bounds only the shutdown snapshot save's single-row
+// PostgreSQL watermark read (saveSnapshotProbe's ReadWatermark round trip,
+// internal/engine/persist.go) -- see Close's own doc for why that read runs
+// on a context deliberately detached from the shutdown's own cancellation
+// in the first place, and for why the fold and file write that follow it
+// (snapshot.Fold, snapshot.WriteSnapshotFile) take no context at all and so
+// are bounded by neither this constant nor anything else, regardless of how
+// large the graph being saved is.
 //
 // Sized to stay comfortably inside a default container stop grace period
 // (`docker stop` and `docker compose restart` both allow 10s before
-// SIGKILL) so that, in the one case this timeout exists for -- a database
-// that has stopped answering -- the save gives up on its own and lets the
-// rest of the shutdown finish, rather than being killed partway through it.
+// SIGKILL) so that, in the one case THIS timeout exists for -- a database
+// that has stopped answering that watermark read -- the read gives up on
+// its own and lets the rest of the shutdown finish, rather than being
+// killed partway through it. It says nothing about whether the unbounded
+// fold+write that follow a successful read fit inside that same grace
+// period at scale: measured at ~350ms for 167K nodes/955K edges
+// (bench/applybench), a figure that does not bound larger graphs, so a
+// SIGKILL can still land mid-write for one -- safely for the .btsnap file
+// itself (WriteSnapshotFile's temp-file-plus-rename, per Close's own doc),
+// but not without leaving a stray temp file behind. That leftover is what
+// internal/engine/boot.go's sweepStaleSnapshotTempFiles reaps at the next
+// boot, rather than something this timeout attempts to prevent.
 const snapshotSaveTimeout = 5 * time.Second
 
 // Version is stamped by the image build (see build/build-image.sh).

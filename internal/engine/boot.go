@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -65,15 +66,20 @@ const triggerManual = "manual"
 // CAS to the first and simply does nothing -- harmless, but still not
 // something a caller should do).
 //
-// ensureWatermarkTable (watermark.go) runs first, unconditionally -- even
-// when !cfg.Enabled: the watermark protocol tracks every mutating write
-// PostgreSQL ever sees regardless of whether THIS engine ever serves a
-// query from an in-memory replica, since a future snapshot-file consumer
-// (possibly a different BloodTrail instance) still needs the counter to be
-// trustworthy. It is a no-op when e.pool is nil (ensureWatermarkTable's own
-// doc), which is what keeps this safe to call from a unit test built with
-// no database behind it at all.
+// sweepStaleSnapshotTempFiles and ensureWatermarkTable (watermark.go) both
+// run first, unconditionally -- even when !cfg.Enabled: the watermark
+// protocol tracks every mutating write PostgreSQL ever sees regardless of
+// whether THIS engine ever serves a query from an in-memory replica, since
+// a future snapshot-file consumer (possibly a different BloodTrail
+// instance) still needs the counter to be trustworthy, and a stale temp
+// file left by an earlier process is worth reaping even for an engine that
+// will not itself write another one this run. ensureWatermarkTable is a
+// no-op when e.pool is nil (its own doc), and sweepStaleSnapshotTempFiles is
+// a no-op when cfg.SnapshotDir == "" (its own doc), which is what keeps
+// both safe to call from a unit test built with no database and no
+// snapshot directory at all.
 func (e *Engine) Start(ctx context.Context) {
+	e.sweepStaleSnapshotTempFiles()
 	e.ensureWatermarkTable(ctx)
 
 	if !e.cfg.Enabled {
@@ -299,6 +305,87 @@ func (e *Engine) snapshotFilePath() (string, bool) {
 		return "", false
 	}
 	return filepath.Join(e.cfg.SnapshotDir, fmt.Sprintf("graph-%d.btsnap", graphModel.ID)), true
+}
+
+// snapshotTempFilePattern is snapshot.WriteSnapshotFile's own os.CreateTemp
+// pattern (internal/engine/snapshot/file.go), repeated here so
+// sweepStaleSnapshotTempFiles recognizes -- and only ever recognizes --
+// exactly the files that pattern can produce, never anything else that
+// happens to live alongside them in cfg.SnapshotDir (a real graph-<id>.btsnap
+// file included).
+const snapshotTempFilePattern = ".snapshot-*.tmp"
+
+// sweepStaleSnapshotTempFiles removes every leftover WriteSnapshotFile temp
+// file (snapshotTempFilePattern) sitting directly in cfg.SnapshotDir -- the
+// one thing nothing else in this codebase ever reaps. WriteSnapshotFile
+// (snapshot/file.go) writes that pattern's directory argument as
+// filepath.Dir(path), and path is always cfg.SnapshotDir joined with a
+// graph-<id>.btsnap leaf (snapshotFilePath, above), so every temp file this
+// engine could ever create lives directly in cfg.SnapshotDir regardless of
+// which graph it was for -- this sweep does not need the graph id to
+// resolve first, unlike snapshotFilePath's own file.
+//
+// WriteSnapshotFile's own defer already removes its temp file on any
+// ordinary error return (its own doc), so the only way one survives is a
+// SIGKILL landing between os.CreateTemp and the rename -- exactly the case
+// driver.go's snapshotSaveTimeout doc calls out: the fold and the write
+// past the watermark read take no context at all, so a database that has
+// stopped answering is not the only way a shutdown save can be running when
+// the container runtime's own grace period expires. Left alone, each such
+// file is full-graph-sized (WriteSnapshotFile's payload is a complete copy
+// of the graph), and repeated hard stops accumulate them indefinitely: the
+// boot loader only ever opens the final graph-<id>.btsnap name
+// (snapshotFilePath), never a *.tmp, so nothing else would ever notice or
+// remove one.
+//
+// Called exactly once, from Start, before this engine's own boot-load
+// goroutine, any background compaction, or Driver.Close's own shutdown save
+// could possibly attempt a write of its own -- which is what makes this
+// safe under this feature's existing single-writer assumption (at most one
+// BloodTrail process owns a given SnapshotDir at a time -- the same
+// assumption snapshotFileTrustedAtBoot's watermark-equality trust already
+// depends on: one BloodHound container, one bind-mounted directory). Under
+// that assumption, sweeping HERE -- and only here -- is provably safe: by
+// construction this process has not attempted a single write of its own
+// yet, so every matching temp file already in the directory can only be a
+// leftover from an EARLIER process's interrupted write, never one a peer is
+// still writing right now. Sweeping again later in this same process's life
+// (e.g. immediately before this process's own next write) would not have
+// that guarantee -- a concurrent compaction save and a concurrent shutdown
+// save could, in principle, both be genuinely mid-write at that point -- so
+// this package deliberately sweeps once, at boot, and never again.
+//
+// A no-op, without ever touching the filesystem, when cfg.SnapshotDir == ""
+// (the feature disabled) -- matching snapshotFilePath's identical
+// short-circuit, and safe to call unconditionally from Start for every
+// engine that never set it, including one built with a nil pgDriver in a
+// test that has no reason to care about this feature at all.
+func (e *Engine) sweepStaleSnapshotTempFiles() {
+	if e.cfg.SnapshotDir == "" {
+		return
+	}
+
+	matches, err := filepath.Glob(filepath.Join(e.cfg.SnapshotDir, snapshotTempFilePattern))
+	if err != nil {
+		// filepath.Glob's only possible error is ErrBadPattern -- unreachable
+		// here since snapshotTempFilePattern is a fixed, valid, compile-time
+		// constant -- so there is nothing an operator could act on; treated
+		// as "nothing found" rather than logged.
+		return
+	}
+
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			e.cfg.Log.WarnContext(context.Background(), "bloodtrail: failed to remove stale snapshot temp file",
+				slog.String("path", path),
+				slog.Any("error", err),
+			)
+			continue
+		}
+		e.cfg.Log.InfoContext(context.Background(), "bloodtrail: removed stale snapshot temp file",
+			slog.String("path", path),
+		)
+	}
 }
 
 // snapshotFileTrustedAtBoot reports whether a snapshot file whose embedded

@@ -4,6 +4,10 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -149,4 +153,65 @@ func TestSnapshotFileTrustedAtBootRequiresExactMatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// -----------------------------------------------------------------------
+// I1 (Task 20 review): a process SIGKILLed between WriteSnapshotFile's
+// os.CreateTemp and its own rename leaves a ".snapshot-*.tmp" file behind
+// that nothing else in the codebase ever reaps -- the boot loader only ever
+// opens the final graph-<id>.btsnap name. sweepStaleSnapshotTempFiles closes
+// that: called once from Start, before this process could possibly have
+// written a temp file of its own, so anything matching the pattern already
+// in cfg.SnapshotDir can only be a leftover from an earlier process's
+// interrupted write.
+// -----------------------------------------------------------------------
+
+// TestSweepStaleSnapshotTempFilesRemovesOnlyTheTempPattern pins the sweep's
+// own selectivity: a leftover ".snapshot-*.tmp" file (WriteSnapshotFile's
+// exact os.CreateTemp pattern, snapshot/file.go) must be removed, while a
+// real .btsnap file and an unrelated file that merely happens to end in
+// ".tmp" -- neither of which WriteSnapshotFile could ever have produced --
+// are left completely untouched.
+func TestSweepStaleSnapshotTempFilesRemovesOnlyTheTempPattern(t *testing.T) {
+	dir := t.TempDir()
+
+	stale := filepath.Join(dir, ".snapshot-123456789.tmp")
+	if err := os.WriteFile(stale, []byte("stale temp file"), 0o600); err != nil {
+		t.Fatalf("write stale temp file: %v", err)
+	}
+
+	realSnapshot := filepath.Join(dir, "graph-1.btsnap")
+	if err := os.WriteFile(realSnapshot, []byte("not a temp file"), 0o600); err != nil {
+		t.Fatalf("write real snapshot file: %v", err)
+	}
+
+	unrelatedTmp := filepath.Join(dir, "unrelated.tmp")
+	if err := os.WriteFile(unrelatedTmp, []byte("not the snapshot pattern"), 0o600); err != nil {
+		t.Fatalf("write unrelated .tmp file: %v", err)
+	}
+
+	e := New(nil, nil, Config{Enabled: true, SnapshotDir: dir})
+	e.sweepStaleSnapshotTempFiles()
+
+	if _, err := os.Stat(stale); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat stale temp file after sweep = %v, want fs.ErrNotExist (the sweep should have removed it)", err)
+	}
+	if _, err := os.Stat(realSnapshot); err != nil {
+		t.Fatalf("stat real snapshot file after sweep = %v, want nil -- the sweep must never touch a real .btsnap file", err)
+	}
+	if _, err := os.Stat(unrelatedTmp); err != nil {
+		t.Fatalf("stat unrelated .tmp file after sweep = %v, want nil -- the sweep must match snapshotTempFilePattern exactly, not any *.tmp file", err)
+	}
+}
+
+// TestSweepStaleSnapshotTempFilesNoopWhenDirEmpty pins the same
+// disabled-feature short-circuit snapshotFilePath already documents: no
+// filesystem I/O at all when cfg.SnapshotDir == "", so this stays safe to
+// call unconditionally from Start for every engine that never set it --
+// including this one, built with a nil pgDriver on purpose, which a
+// filepath.Glob against an empty/relative pattern could otherwise turn into
+// a surprising directory scan.
+func TestSweepStaleSnapshotTempFilesNoopWhenDirEmpty(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+	e.sweepStaleSnapshotTempFiles() // must return immediately without panicking
 }

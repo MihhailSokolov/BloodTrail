@@ -354,6 +354,7 @@ func TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext(t *testing.
 
 	// Everything above was setup; the measurement window starts here.
 	writtenBefore := markerCount(buf, snapshotFileWrittenMarker)
+	notWrittenBefore := markerCount(buf, snapshotFileNotWrittenMarker)
 
 	// Production's own shutdown ordering: the context is cancelled FIRST --
 	// that cancellation is what releases Launch's `<-ctx.Done()` and so what
@@ -377,9 +378,16 @@ func TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext(t *testing.
 	if got := markerCount(buf, snapshotFileWrittenMarker) - writtenBefore; got != 1 {
 		t.Fatalf("%q fired %d time(s) closing with a cancelled shutdown context, want exactly 1\ncaptured log:\n%s", snapshotFileWrittenMarker, got, buf.String())
 	}
-	if strings.Contains(buf.String(), snapshotFileNotWrittenMarker) {
-		t.Fatalf("%q logged for a shutdown save that should have succeeded -- the cancelled context still reached the save's watermark probe\ncaptured log:\n%s",
-			snapshotFileNotWrittenMarker, buf.String())
+	// A delta, like the assertion above, not a whole-buffer
+	// strings.Contains: snapshotFileNotWrittenMarker's text is also emitted
+	// by the epoch-mismatch Warn (internal/engine/persist.go's
+	// saveSnapshotCommit) and by any compaction-driven save, so a
+	// whole-buffer check risks a false failure from an occurrence outside
+	// this measurement window rather than from anything this shutdown save
+	// actually did.
+	if got := markerCount(buf, snapshotFileNotWrittenMarker) - notWrittenBefore; got != 0 {
+		t.Fatalf("%q fired %d time(s) for a shutdown save that should have succeeded -- the cancelled context still reached the save's watermark probe\ncaptured log:\n%s",
+			snapshotFileNotWrittenMarker, got, buf.String())
 	}
 
 	// The file must also be usable, not merely present: a save that stamped
