@@ -95,10 +95,12 @@ const (
 // no particular order: hydrateEdgePropsByIDBatched already deduplicates its
 // input before issuing any query (dedupeUint64s), so there is no reason to
 // do that work twice here. A nil/empty return means rs carries no edge or
-// path value at all -- TryCypher's own signal to skip hydration, and with
-// it the post-hydration snapshotStillCurrent recheck, entirely for a
-// pure-scalar/node result that never touched anything hydration or the
-// recheck could catch.
+// path value at all -- TryCypher's own signal to skip hydration entirely for
+// a pure-scalar/node result that never touched anything hydration could
+// affect. (Write-through (apply.go) retired the post-hydration recheck this
+// doc used to name here -- a published View is immutable and current for
+// the whole life of the query that captured it, so there is nothing left to
+// recheck after hydration either.)
 func collectEdgeIDs(snap *snapshot.View, rs *interpret.ResultSet) []uint64 {
 	var ids []uint64
 	for _, row := range rs.Rows {

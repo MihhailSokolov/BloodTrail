@@ -135,6 +135,16 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 		// A rebuild is already pending, and it reads PostgreSQL's own
 		// post-write state -- applying this delta to a View nothing is
 		// serving from would be pure waste.
+		//
+		// startFallbackRebuild is called defensively before returning, even
+		// though enterFallback already calls it on every path that enters
+		// fallback: it is idempotent (fallbackRebuilding's CAS is a no-op
+		// once a recovery goroutine is already in flight), so this costs
+		// nothing in the common case, and self-heals the one window where it
+		// is not a no-op -- the engine observed in fallback here with no
+		// recovery goroutine actually running (see runFallbackRebuild's doc
+		// for the race that can otherwise leave it stranded that way).
+		e.startFallbackRebuild()
 		return
 	}
 
@@ -506,22 +516,39 @@ func (e *Engine) startFallbackRebuild() {
 // write's caller is long gone by the time recovery finishes, and its ctx
 // being cancelled says nothing about whether the replica should recover.
 //
-// A rebuild that fails outright, is refused for exceeding cfg.MemoryLimit,
-// or cannot be adopted because a write landed while it was loading (see
-// adoptRebuiltView) is retried on a doubling backoff between
-// fallbackRetryInterval and fallbackRetryMax. Only an adopted rebuild exits
-// fallback: adopting is what makes the published View both complete and
-// current, and serving from anything less is exactly what fallback exists to
-// prevent. The state flip itself happens inside adoptRebuiltView, alongside
-// the publish it belongs with, so that a rebuild from any other source (the
-// poller, a manual call) ends the fallback too rather than leaving the
-// engine declining behind an already-trustworthy replica.
+// A rebuild that fails outright, or cannot be adopted because a write landed
+// while it was loading (see adoptRebuiltView), is retried on a doubling
+// backoff between fallbackRetryInterval and fallbackRetryMax -- transient
+// conditions expected to clear within seconds. A rebuild refused for
+// exceeding cfg.MemoryLimit (Engine.overBudget) is different: retrying a
+// full LoadSnapshot on that same fast schedule would repeat, forever, a load
+// whose outcome cannot change until an operator raises the limit or the
+// graph shrinks, so fallbackRetryDelay backs that case off to
+// fallbackBudgetRetryInterval instead and leaves backoff itself untouched --
+// see fallbackRetryDelay's own doc for why that is what makes recovery snap
+// back to a fast retry the moment the refusal lifts.
+//
+// Only an adopted rebuild exits fallback: adopting is what makes the
+// published View both complete and current, and serving from anything less
+// is exactly what fallback exists to prevent. The state flip itself happens
+// inside adoptRebuiltView, alongside the publish it belongs with, so that a
+// rebuild from any other source (the poller, a manual call) ends the
+// fallback too rather than leaving the engine declining behind an
+// already-trustworthy replica.
+//
+// The adopted case hands off to finishFallbackRebuild rather than clearing
+// fallbackRebuilding itself -- see that function's doc for the stranding
+// race it closes. The other two return points (context cancelled, either at
+// the top of the loop or while waiting out a retry) clear the flag directly
+// and do NOT run that recheck: Stop() cancelling bgCtx means the engine is
+// shutting down, and relaunching recovery in response to a state this
+// goroutine is about to stop observing anyway would only start a goroutine
+// with nothing left to wait for it.
 func (e *Engine) runFallbackRebuild() {
-	defer e.fallbackRebuilding.Store(false)
-
 	backoff := fallbackRetryInterval
 	for {
 		if e.bgCtx.Err() != nil {
+			e.fallbackRebuilding.Store(false)
 			return
 		}
 
@@ -532,19 +559,99 @@ func (e *Engine) runFallbackRebuild() {
 		case adopted:
 			// adoptRebuiltView already flipped the state back to serving and
 			// logged the "fallback exited" marker.
+			e.finishFallbackRebuild()
 			return
 		}
 
+		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+		backoff = next
+
 		select {
 		case <-e.bgCtx.Done():
+			e.fallbackRebuilding.Store(false)
 			return
-		case <-time.After(backoff):
-		}
-		if backoff < fallbackRetryMax {
-			backoff *= 2
-			if backoff > fallbackRetryMax {
-				backoff = fallbackRetryMax
-			}
+		case <-time.After(wait):
 		}
 	}
+}
+
+// finishFallbackRebuild clears fallbackRebuilding, then relaunches recovery
+// if the engine has already raced back into stateFallback by the time it
+// does.
+//
+// The race it closes: adoptRebuiltView (engine.go) publishes the rebuilt
+// View and flips state back to stateServing BEFORE this goroutine gets a
+// chance to run at all (rebuildOnce returns to runFallbackRebuild, which
+// calls this function, only after adoptRebuiltView has already returned).
+// If some OTHER write's Apply fails in the window between that state flip
+// and this function's own Store(false) below, its enterFallback call flips
+// state back to stateFallback and calls startFallbackRebuild -- which finds
+// fallbackRebuilding still true (this goroutine has not cleared it yet) and
+// gives up silently, exactly as it is meant to when a recovery goroutine is
+// genuinely already in flight. But here one is NOT still doing useful work:
+// it is moments from exiting, having already committed to leaving fallback
+// exited. Without this recheck, the engine would be left stranded in
+// stateFallback with no goroutine ever again scheduled to recover it, every
+// query declining to PostgreSQL forever (a background poller can paper over
+// this today by rebuilding on its own cadence, but that poller is retired
+// once write-through's freshness gates are, so this cannot depend on it).
+//
+// Only called from the adopted-rebuild return path (see runFallbackRebuild),
+// never from a context-cancelled return: relaunching in response to a state
+// change this goroutine is about to stop observing anyway, right as the
+// engine is shutting down, would just start a new goroutine with nothing
+// left to wait for it.
+func (e *Engine) finishFallbackRebuild() {
+	e.fallbackRebuilding.Store(false)
+	if e.state.Load() == stateFallback {
+		e.startFallbackRebuild()
+	}
+}
+
+// fallbackBudgetRetryInterval is the recovery goroutine's retry cadence for
+// a rebuild attempt refused for exceeding cfg.MemoryLimit (Engine.overBudget
+// -- see rebuildOnce, engine.go). It reuses refusalLogInterval (engine.go)
+// rather than a second constant for the same underlying judgment: how often
+// it is worth re-checking a condition an operator, not the passage of a few
+// seconds, has to resolve (raising the limit, or the graph shrinking) --
+// exactly what RebuildNow's own refusal warning is already rate-limited to.
+// Retrying a full LoadSnapshot every fallbackRetryMax (30s) forever while
+// the graph stays over budget would cost a full snapshot load for a result
+// already known.
+const fallbackBudgetRetryInterval = refusalLogInterval
+
+// fallbackRetryDelay is runFallbackRebuild's retry-cadence decision,
+// extracted as a pure function for unit testing: given whether the rebuild
+// attempt that just ran was refused specifically for being over budget, and
+// the doubling backoff carried in from the previous iteration, it returns
+// how long to wait before the next attempt and the backoff value to carry
+// into the iteration after that.
+//
+// A budget refusal always waits fallbackBudgetRetryInterval and returns
+// backoff UNCHANGED -- deliberately not advanced, and not derived from it at
+// all. The doubling schedule exists for transient conditions (a database
+// blip, an epoch race against a concurrent Apply) expected to clear within
+// seconds, not for a capacity problem nothing but an operator, or the graph
+// shrinking, resolves; leaving backoff untouched is what makes recovery snap
+// back to a fast retry the instant the refusal lifts -- the very next
+// non-budget outcome (a transient failure, an epoch race, or a success)
+// sees backoff still at whatever it was before the over-budget episode
+// began, most commonly still fallbackRetryInterval, since a sustained
+// over-budget stretch never advances it while it lasts.
+//
+// Every other case -- overBudget false, whether because the attempt
+// genuinely failed, lost an epoch race, or simply was not over budget --
+// keeps the pre-existing doubling schedule unchanged: wait the current
+// backoff, then double it, capped at fallbackRetryMax.
+func fallbackRetryDelay(overBudget bool, backoff time.Duration) (wait time.Duration, nextBackoff time.Duration) {
+	if overBudget {
+		return fallbackBudgetRetryInterval, backoff
+	}
+
+	wait = backoff
+	backoff *= 2
+	if backoff > fallbackRetryMax {
+		backoff = fallbackRetryMax
+	}
+	return wait, backoff
 }

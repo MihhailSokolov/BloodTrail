@@ -68,6 +68,11 @@ type fakeTransaction struct {
 
 	commitCalls int
 	commitErr   error
+	// commitHook, when non-nil, is called from within Commit before it
+	// returns -- a seam for asserting what has (or has not) happened by the
+	// time the inner Commit runs, e.g. reading engine state to pin
+	// observingTransaction.Commit's call order (F2 regression coverage).
+	commitHook func()
 
 	withGraphCalls  int
 	withGraphReturn graph.Transaction
@@ -119,6 +124,9 @@ func (f *fakeTransaction) Query(query string, parameters map[string]any) graph.R
 
 func (f *fakeTransaction) Commit() error {
 	f.commitCalls++
+	if f.commitHook != nil {
+		f.commitHook()
+	}
 	return f.commitErr
 }
 
@@ -246,6 +254,9 @@ type fakeBatch struct {
 
 	commitCalls int
 	commitErr   error
+	// commitHook mirrors fakeTransaction's identically-purposed field -- see
+	// its doc.
+	commitHook func()
 }
 
 func (f *fakeBatch) WithGraph(graph.Graph) graph.Batch {
@@ -303,6 +314,9 @@ func (f *fakeBatch) UpdateRelationshipBy(update graph.RelationshipUpdate) error 
 
 func (f *fakeBatch) Commit() error {
 	f.commitCalls++
+	if f.commitHook != nil {
+		f.commitHook()
+	}
 	return f.commitErr
 }
 
@@ -513,13 +527,30 @@ func TestEdgeKindsFromCriteria(t *testing.T) {
 			wantOK:    true,
 		},
 		{
-			name: "conjunction with one relationship kind matcher among other conjuncts",
+			// F1 regression: a KindMatcher over the wrong variable alongside
+			// a real relationship KindMatcher used to be silently dropped as
+			// an "ignored conjunct", reporting only adminTo -- unsound as a
+			// replay criteria, since the actual query only deletes edges
+			// that ALSO match the node-kind conjunct, a subset of "every
+			// adminTo edge". It must now fail the whole conjunction closed.
+			name: "conjunction with a kind matcher over another variable fails closed",
 			criteria: cypher.NewConjunction(
 				cypher.NewKindMatcher(nodeVariable(), graph.Kinds{hasSession}, false),
 				cypher.NewKindMatcher(relVariable(), graph.Kinds{adminTo}, false),
 			),
-			wantKinds: graph.Kinds{adminTo},
-			wantOK:    true,
+			wantOK: false,
+		},
+		{
+			// F1 regression: the same unsoundness for a non-KindMatcher
+			// sibling entirely (a stand-in for a property filter or
+			// endpoint-id constraint) -- must also fail closed rather than
+			// being ignored.
+			name: "conjunction with a non-kind-matcher conjunct fails closed",
+			criteria: cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{adminTo}, false),
+				graph.Criteria("property-filter-stand-in"),
+			),
+			wantOK: false,
 		},
 		{
 			name: "conjunction with two relationship kind matchers unions",
@@ -536,6 +567,11 @@ func TestEdgeKindsFromCriteria(t *testing.T) {
 				cypher.NewKindMatcher(nodeVariable(), graph.Kinds{hasSession}, false),
 			),
 			wantOK: false,
+		},
+		{
+			name:     "empty conjunction",
+			criteria: cypher.NewConjunction(),
+			wantOK:   false,
 		},
 		{
 			name:     "nil conjunction",
@@ -597,6 +633,21 @@ func TestRelationshipDeleteScope(t *testing.T) {
 		{
 			"one unrecognized criteria",
 			[]graph.Criteria{graph.Criteria("not-a-conjunction")},
+			nil,
+			true,
+		},
+		{
+			// F1 regression: Relationships().Filterf(And(KindIn(r, X),
+			// Kind(Start, Y))).Delete()-shaped criteria -- a relationship
+			// kind matcher ANDed with a matcher over a different variable
+			// narrows the actual delete to a subset of kind X's edges, so
+			// reporting kinds=[X] would be unsound to replay. Must fall
+			// back to touchAll.
+			"one criteria: conjunction of a relationship kind matcher and a differently-scoped kind matcher",
+			[]graph.Criteria{cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
+				cypher.NewKindMatcher(nodeVariable(), graph.Kinds{hasSession}, false),
+			)},
 			nil,
 			true,
 		},
@@ -1069,6 +1120,61 @@ func TestObservingTransactionCommitBumpsGenerationEvenWithEmptyScope(t *testing.
 	}
 }
 
+// TestObservingTransactionCommitAppliesAfterTheInnerCommit is F2's regression
+// test for the call order: Apply used to run BEFORE the inner Commit, which
+// meant its read-back would run against pre-commit state. commitHook fires
+// from inside the fake's Commit method, before fakeTransaction.Commit
+// returns -- so if Apply (and the generation bump it triggers via NoteWrite)
+// had already run by that point, the engine's generation observed from
+// inside the hook would already be bumped. The fix makes the inner Commit
+// run first, so the generation must still read as genBefore from inside the
+// hook, and only reach genBefore+1 after tx.Commit() itself returns.
+func TestObservingTransactionCommitAppliesAfterTheInnerCommit(t *testing.T) {
+	inner := &fakeTransaction{}
+	eng := disabledEngine()
+	tx := &observingTransaction{Transaction: inner, scope: engine.NewWriteScope(), eng: eng}
+
+	genBefore := eng.Generation()
+	var genDuringInnerCommit uint64
+	inner.commitHook = func() { genDuringInnerCommit = eng.Generation() }
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: unexpected error: %v", err)
+	}
+
+	if genDuringInnerCommit != genBefore {
+		t.Fatalf("Apply already ran by the time the inner Commit ran: generation = %d during inner Commit, want it unchanged at %d", genDuringInnerCommit, genBefore)
+	}
+	if got := eng.Generation(); got != genBefore+1 {
+		t.Fatalf("generation after Commit = %d, want %d", got, genBefore+1)
+	}
+}
+
+// TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails is F2's
+// regression test for the "apply regardless" half of the fix: Apply must
+// still run (and scope must still reset) even when the inner Commit itself
+// returns an error, mirroring observingBatch.Commit's always-apply
+// rationale (read-back reads PostgreSQL's own current committed state, so
+// applying after a failed commit is always safe).
+func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T) {
+	commitErr := errors.New("commit boom")
+	inner := &fakeTransaction{commitErr: commitErr}
+	eng := disabledEngine()
+	scope := engine.NewWriteScope()
+	tx := &observingTransaction{Transaction: inner, scope: scope, eng: eng}
+
+	genBefore := eng.Generation()
+	if err := tx.Commit(); !errors.Is(err, commitErr) {
+		t.Fatalf("Commit error = %v, want %v", err, commitErr)
+	}
+	if got := eng.Generation(); got != genBefore+1 {
+		t.Fatalf("Commit did not apply after the inner Commit failed: generation = %d, want %d", got, genBefore+1)
+	}
+	if tx.scope == scope || !tx.scope.Empty() {
+		t.Fatalf("Commit did not reset scope after the inner Commit failed")
+	}
+}
+
 // -----------------------------------------------------------------------
 // observingNodeQuery
 // -----------------------------------------------------------------------
@@ -1411,6 +1517,42 @@ func TestObservingRelationshipQueryDeleteUnrecognizedTouchesScopeAndDelegates(t 
 	assertScope(t, scope, nil, nil, false, true, nil, nil)
 	if ok, _ := scope.Changes().HasFallback(); !ok {
 		t.Fatalf("HasFallback() = false after an unrecognized Delete, want true")
+	}
+}
+
+// TestObservingRelationshipQueryDeleteConjunctionWithExtraConjunctFallsBack
+// is F1's regression test: a Relationships().Filterf(And(KindIn(r, X),
+// Kind(Start, Y))).Delete()-shaped criteria -- a relationship kind matcher
+// ANDed with a matcher over some other variable -- must record a fallback,
+// not RecordDeleteRelationshipsByKinds(X). The query this AND actually
+// describes only deletes edges of kind X that ALSO satisfy the other
+// conjunct, a subset of "every X edge"; before this fix, edgeKindsFromCriteria
+// silently dropped the second conjunct and reported kinds=[X] alone, which
+// the applier (apply.go) would then have replayed as "tombstone every X
+// edge" -- deleting edges PostgreSQL never touched.
+func TestObservingRelationshipQueryDeleteConjunctionWithExtraConjunctFallsBack(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	scope := engine.NewWriteScope()
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+
+	kind := graph.StringKind("HasSession")
+	rq.Filter(cypher.NewConjunction(
+		cypher.NewKindMatcher(relVariable(), graph.Kinds{kind}, false),
+		cypher.NewKindMatcher(nodeVariable(), graph.Kinds{kind}, false),
+	))
+
+	if err := rq.Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.deleteCalls != 1 {
+		t.Fatalf("Delete did not delegate to the inner query")
+	}
+	assertScope(t, scope, nil, nil, false, true, nil, nil)
+	if ok, _ := scope.Changes().HasFallback(); !ok {
+		t.Fatalf("HasFallback() = false for a conjunction narrowed by more than kind matchers, want true")
+	}
+	if got := scope.Changes().EdgeKindCriteria(); len(got) != 0 {
+		t.Fatalf("Changes().EdgeKindCriteria() = %v, want none: an unsound narrow scope must never reach the applier", got)
 	}
 }
 
@@ -2293,5 +2435,51 @@ func TestObservingBatchCommitBumpsGenerationEvenWithEmptyScope(t *testing.T) {
 	}
 	if got := eng.Generation(); got != genBefore+1 {
 		t.Fatalf("Commit with an empty scope did not bump the generation: got %d, want %d", got, genBefore+1)
+	}
+}
+
+// TestObservingBatchCommitAppliesAfterTheInnerCommit is
+// TestObservingTransactionCommitAppliesAfterTheInnerCommit's observingBatch
+// half -- see its doc for the F2 regression this pins.
+func TestObservingBatchCommitAppliesAfterTheInnerCommit(t *testing.T) {
+	inner := &fakeBatch{}
+	eng := disabledEngine()
+	b := &observingBatch{Batch: inner, scope: engine.NewWriteScope(), eng: eng}
+
+	genBefore := eng.Generation()
+	var genDuringInnerCommit uint64
+	inner.commitHook = func() { genDuringInnerCommit = eng.Generation() }
+
+	if err := b.Commit(); err != nil {
+		t.Fatalf("Commit: unexpected error: %v", err)
+	}
+
+	if genDuringInnerCommit != genBefore {
+		t.Fatalf("Apply already ran by the time the inner Commit ran: generation = %d during inner Commit, want it unchanged at %d", genDuringInnerCommit, genBefore)
+	}
+	if got := eng.Generation(); got != genBefore+1 {
+		t.Fatalf("generation after Commit = %d, want %d", got, genBefore+1)
+	}
+}
+
+// TestObservingBatchCommitAppliesEvenWhenInnerCommitFails is
+// TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails's
+// observingBatch half -- see its doc for the F2 regression this pins.
+func TestObservingBatchCommitAppliesEvenWhenInnerCommitFails(t *testing.T) {
+	commitErr := errors.New("commit boom")
+	inner := &fakeBatch{commitErr: commitErr}
+	eng := disabledEngine()
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: eng}
+
+	genBefore := eng.Generation()
+	if err := b.Commit(); !errors.Is(err, commitErr) {
+		t.Fatalf("Commit error = %v, want %v", err, commitErr)
+	}
+	if got := eng.Generation(); got != genBefore+1 {
+		t.Fatalf("Commit did not apply after the inner Commit failed: generation = %d, want %d", got, genBefore+1)
+	}
+	if b.scope == scope || !b.scope.Empty() {
+		t.Fatalf("Commit did not reset scope after the inner Commit failed")
 	}
 }

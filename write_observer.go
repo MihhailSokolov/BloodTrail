@@ -258,9 +258,9 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng, ctx: t.ctx}
 }
 
-// Commit applies the accumulated scope to the engine (eng.Apply), then
-// resets scope to a fresh, empty WriteScope, before delegating to the inner
-// transaction's own Commit. Under the pinned dawgs pg driver, a delegate that
+// Commit delegates to the inner transaction's own Commit FIRST, then applies
+// the accumulated scope to the engine (eng.Apply), then resets scope to a
+// fresh, empty WriteScope. Under the pinned dawgs pg driver, a delegate that
 // calls tx.Commit() mid-transaction will cause the outer WriteTransaction's
 // final Commit to return ErrTxClosed; writes persist, and this override
 // ensures the replica is brought up to date at the commit point. This
@@ -272,18 +272,29 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 // point -- which by then may be a different *WriteScope than the one this
 // method reset it to here, exactly as intended).
 //
-// Apply runs BEFORE the inner Commit, which is the pre-existing ordering
-// this override has always had, and is deliberately kept: read-back reads
-// committed state, so a scope applied ahead of the commit that makes its
-// writes visible can only under-report them -- never report a write that
-// then rolls back. The outer Driver.WriteTransaction's own Apply call, made
-// after the whole delegate returns and the transaction has committed,
-// reconciles whatever this early call could not yet see, since read-back is
-// keyed by id rather than by delta.
+// The inner Commit runs BEFORE Apply, and this order is load-bearing, not
+// cosmetic: Apply's read-back queries PostgreSQL on the pool, a separate
+// connection from this transaction, so a read-back run before this
+// transaction's own commit would not see this transaction's own
+// still-uncommitted writes at all (read-back is not looking through this
+// transaction's own eyes) -- Apply would then read the PRE-write state and
+// publish nothing, or the wrong thing, over the current View, and reset
+// scope having never actually replayed the write it just discarded. Calling
+// Commit first is what makes the write visible to Apply's read-back at all.
+//
+// Apply itself runs unconditionally, even when the inner Commit returns an
+// error -- mirroring observingBatch.Commit's identical "apply regardless"
+// choice (see its doc for the full reasoning): read-back reads PostgreSQL's
+// own current committed state per key, so applying after a failed commit is
+// always safe, never wrong -- a key whose write never landed (the whole
+// transaction rolled back) simply reads back as it already was, and a key
+// whose write landed via some other path this call cannot see is reconciled
+// exactly as if this call had never run.
 func (t *observingTransaction) Commit() error {
+	err := t.Transaction.Commit()
 	t.eng.Apply(applyContext(t.ctx), t.scope)
 	t.scope = engine.NewWriteScope()
-	return t.Transaction.Commit()
+	return err
 }
 
 // applyContext returns ctx, or context.Background() when ctx is nil -- the
@@ -536,8 +547,9 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 }
 
 // Delete marks scope via relationshipDeleteScope (see its doc for exactly
-// which shapes are recognized and why ignoring extra conjuncts stays sound)
-// before delegating to the inner query. The recognized branch's ChangeSet
+// which shapes are recognized, and why any conjunct beyond bare relationship
+// KindMatchers falls back rather than being ignored) before delegating to
+// the inner query. The recognized branch's ChangeSet
 // entry is RecordDeleteRelationshipsByKinds(kinds), not an enumerated edge
 // id list: relationshipDeleteScope's own recognized shape is a kind
 // matcher, not an InIDs target list, so "delete every relationship of
@@ -576,17 +588,31 @@ func (r *observingRelationshipQuery) Update(properties *graph.Properties) error 
 }
 
 // relationshipDeleteScope decides what an observingRelationshipQuery.
-// Delete() call should mark, given every criteria its caller filtered by.
+// Delete() call should mark, given every criteria its caller filtered by --
+// for two consumers with different soundness requirements. The
+// TouchEdgeKinds mark only ever needs to be a safe superset (invalidating
+// more than necessary costs nothing but a wasted rebuild trigger), but the
+// RecordDeleteRelationshipsByKinds ChangeSet entry is replayed verbatim by
+// the applier (apply.go) to decide which edges to tombstone in the
+// in-memory replica -- there, a reported kind set that is too WIDE is
+// unsound: PostgreSQL only deleted the rows also matching whatever else the
+// query narrowed by, so the applier would tombstone edges PostgreSQL never
+// touched.
+//
 // When exactly one criteria was recorded and edgeKindsFromCriteria
 // recognizes it with a non-empty result, kinds is that result and touchAll
-// is false: deleting a query narrowed to specific relationship kinds can
-// only ever remove edges of those kinds, no matter what else the query's
-// (ignored) other conjuncts narrow the match by -- a subset of kind K's
-// edges is still only kind K. Every other case -- zero or more than one
-// criteria, an unrecognized shape, or a recognized KindMatcher whose Kinds
-// came back empty (which means "matches every kind", the opposite of a
-// narrow scope, per the KindMatcher/PathQuery.EdgeKinds convention
-// documented on recognize.PathQuery) -- reports touchAll instead.
+// is false: edgeKindsFromCriteria's own recognized shape (see its doc) is
+// now exactly "one or more bare relationship KindMatchers, ANDed together
+// with nothing else that could narrow the match further" -- so the
+// operation the query actually performs really is "delete every edge of
+// these kinds", which is exactly what the applier needs to replay it
+// exactly. Every other case -- zero or more than one criteria, an
+// unrecognized shape, a Conjunction carrying any conjunct that is not
+// itself a bare relationship KindMatcher, or a recognized KindMatcher whose
+// Kinds came back empty (which means "matches every kind", the opposite of
+// a narrow scope, per the KindMatcher/PathQuery.EdgeKinds convention
+// documented on recognize.PathQuery) -- reports touchAll instead, so the
+// applier falls back to a full rebuild rather than guessing.
 func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touchAll bool) {
 	if len(criteria) == 1 {
 		if ks, ok := edgeKindsFromCriteria(criteria[0]); ok && len(ks) > 0 {
@@ -599,47 +625,67 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 // edgeKindsFromCriteria is a minimal stand-in for Task 4's
 // recognize.FromRelCriteria (not written as of this file): it recognizes
 // just enough of a relationship-delete's criteria to scope the delete
-// soundly, without depending on a recognizer package that doesn't exist
-// yet. Recognized shapes are a bare *cypher.KindMatcher over the
-// relationship variable "r" (what dawgs' query.Kind(query.Relationship(),
-// k)/query.KindIn(query.Relationship(), ks...) builds), or a
-// *cypher.Conjunction containing one or more such KindMatchers among any
-// number of other conjuncts. Every other conjunct in a Conjunction is
-// deliberately ignored: a delete additionally narrowed by, say, a property
-// filter or an endpoint id still only removes a subset of the named kinds'
-// edges, which is exactly what the returned kinds already describe -- an
-// ignored conjunct can only make the query's real effect a subset of what
-// this function reports, never a superset, so ignoring it can never make
-// the reported scope unsound. Multiple KindMatchers union their kinds, for
-// the same reason: a delete matching kind K1 or K2 still only touches K1
-// and K2's edges.
+// soundly for BOTH of relationshipDeleteScope's consumers (see its doc),
+// without depending on a recognizer package that doesn't exist yet. Since
+// Task 11, one of those consumers (RecordDeleteRelationshipsByKinds) is
+// replayed verbatim by the applier, so the reported kinds must describe
+// EXACTLY what the delete removes, not merely a safe-to-over-invalidate
+// approximation.
+//
+// Recognized shapes are a bare *cypher.KindMatcher over the relationship
+// variable "r" (what dawgs' query.Kind(query.Relationship(), k)/
+// query.KindIn(query.Relationship(), ks...) builds), or a
+// *cypher.Conjunction all of whose expressions are such KindMatchers --
+// nothing else may appear alongside them. Multiple KindMatchers union their
+// kinds: a delete matching kind K1 or K2 still only touches K1 and K2's
+// edges.
+//
+// This is deliberately NOT the "ignore what you don't recognize" pattern
+// this file's other recognizers use for a mark, where over-invalidating is
+// always safe. A Conjunction additionally narrowed by, say, a property
+// filter or an endpoint id removes only a SUBSET of the named kinds' edges,
+// which means the kinds this function would otherwise report describe a
+// SUPERSET of what the query actually deletes -- fine for a mark, but
+// unsound to hand the applier as an exact tombstone criteria (it would then
+// delete edges PostgreSQL never touched). So any conjunct that is not
+// itself a bare relationship KindMatcher -- whatever kind of expression it
+// is, or a KindMatcher over the wrong variable -- fails the WHOLE
+// Conjunction closed (ok=false) instead of being silently dropped.
 //
 // Anything else -- a nil criteria, one that isn't a Conjunction or bare
-// KindMatcher, a KindMatcher over any variable but "r", or a Conjunction
-// containing no relationship KindMatcher at all -- reports ok=false.
+// KindMatcher, a KindMatcher over any variable but "r", an empty
+// Conjunction, or a Conjunction containing so much as one conjunct that
+// fails the check above -- reports ok=false.
 func edgeKindsFromCriteria(criteria graph.Criteria) (graph.Kinds, bool) {
 	switch typed := criteria.(type) {
 	case *cypher.KindMatcher:
 		return relationshipKindMatcherKinds(typed)
 
 	case *cypher.Conjunction:
-		if typed == nil {
+		if typed == nil || len(typed.Expressions) == 0 {
 			return nil, false
 		}
 
 		var kinds graph.Kinds
-		found := false
 		for _, expr := range typed.Expressions {
 			km, isKindMatcher := expr.(*cypher.KindMatcher)
 			if !isKindMatcher {
-				continue
+				// A non-KindMatcher sibling narrows the match beyond the
+				// kinds alone -- see the doc above for why that makes a
+				// kinds-only report unsound.
+				return nil, false
 			}
-			if ks, matched := relationshipKindMatcherKinds(km); matched {
-				kinds = append(kinds, ks...)
-				found = true
+			ks, matched := relationshipKindMatcherKinds(km)
+			if !matched {
+				// A KindMatcher over some other variable (or reference) is
+				// exactly as narrowing as any other conjunct type here --
+				// fail the whole Conjunction closed rather than dropping
+				// just this one.
+				return nil, false
 			}
+			kinds = append(kinds, ks...)
 		}
-		return kinds, found
+		return kinds, true
 
 	default:
 		return nil, false
@@ -1148,23 +1194,40 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), scope: b.scope, eng: b.eng, ctx: b.ctx}
 }
 
-// Commit flushes scope to the engine immediately -- eng.Apply(scope), then
-// a fresh WriteScope for whatever this batch does next -- before
-// delegating to the inner batch's own Commit. A batch is documented to
-// support being committed mid-delegate and continuing to receive more
-// operations afterward (graph.Batch's own doc on Commit: "calls to commit
-// this batch transaction right away"; dawgs' pg batch implementation
-// executes each buffered operation immediately on the connection rather
-// than inside one long-lived database transaction, which is what actually
-// makes "commit, then keep writing" work at the pg level for a batch in a
-// way it is not documented, or verified, to for a plain WriteTransaction),
-// so a caller relying on that to make an early chunk of a large batch
-// visible needs the engine's replica brought up to date at that same moment,
-// not held back until Driver.BatchOperation's own Apply call after the whole
-// batch delegate returns. observingTransaction.Commit (write_observer.go
-// above) overrides Commit for the same "don't leave a flush invisible"
-// reason, without relying on -- or needing -- that same
-// continue-after-commit guarantee.
+// Commit delegates to the inner batch's own Commit FIRST -- which flushes
+// every operation still sitting in the buffer (graph.Batch's own doc on
+// Commit: "calls to commit this batch transaction right away") -- then
+// flushes scope to the engine (eng.Apply(scope)), then resets scope to a
+// fresh WriteScope for whatever this batch does next. A batch is documented
+// to support being committed mid-delegate and continuing to receive more
+// operations afterward (dawgs' pg batch implementation executes each
+// buffered operation immediately on the connection rather than inside one
+// long-lived database transaction, which is what actually makes "commit,
+// then keep writing" work at the pg level for a batch in a way it is not
+// documented, or verified, to for a plain WriteTransaction -- see driver.go's
+// BatchOperation doc for the verified source-level detail), so a caller
+// relying on that to make an early chunk of a large batch visible needs the
+// engine's replica brought up to date at that same moment, not held back
+// until Driver.BatchOperation's own Apply call after the whole batch
+// delegate returns. observingTransaction.Commit (write_observer.go above)
+// overrides Commit for the same "don't leave a flush invisible" reason,
+// without relying on -- or needing -- that same continue-after-commit
+// guarantee.
+//
+// The inner Commit running before Apply is load-bearing, not cosmetic, for
+// exactly the same reason as observingTransaction.Commit (see its doc):
+// Apply's read-back queries PostgreSQL on the pool, not through this batch's
+// own connection, so anything still buffered (not yet flushed because
+// batchWriteSize's threshold was never reached) would not exist in
+// PostgreSQL at all if Apply ran first -- the inner Commit's own tryFlush is
+// what makes it exist before read-back goes looking for it.
+//
+// Apply runs unconditionally, even when the inner Commit returns an error,
+// for the same "read-back reads whatever is actually there" reasoning
+// Driver.BatchOperation's own always-apply choice documents: whatever
+// chunks did flush (including everything tryFlush(0) just pushed through
+// above) are already durable and worth reflecting, and a key that never
+// landed simply reads back as it already was.
 //
 // Driver.BatchOperation still calls Apply once more after the delegate
 // returns (driver.go), reporting whatever scope accumulated since this
@@ -1173,9 +1236,10 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // different *WriteScope than the one this method reset it to, exactly as
 // intended.
 func (b *observingBatch) Commit() error {
+	err := b.Batch.Commit()
 	b.eng.Apply(applyContext(b.ctx), b.scope)
 	b.scope = engine.NewWriteScope()
-	return b.Batch.Commit()
+	return err
 }
 
 // parseCypherFrontend is cypherMutates' parsing step, factored out into a

@@ -399,8 +399,6 @@ func createDatapipeStatusTable(t *testing.T, pool *pgxpool.Pool) {
 	})
 }
 
-// waitForFreshSnapshot polls eng.Fresh() until it reports a fresh snapshot
-// or timeout elapses, failing the test on timeout.
 // markNeedsRebuild puts eng into the state the poller's rules (c) and (d)
 // fire on, standing in for what a write used to do to the engine's own view
 // of its snapshot.
@@ -422,6 +420,8 @@ func markNeedsRebuild(eng *Engine) {
 	eng.state.Store(stateFallback)
 }
 
+// waitForFreshSnapshot polls eng.Fresh() until it reports a fresh snapshot
+// or timeout elapses, failing the test on timeout.
 func waitForFreshSnapshot(t *testing.T, eng *Engine, timeout time.Duration) *snapshot.View {
 	t.Helper()
 

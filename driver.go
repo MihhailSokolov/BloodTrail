@@ -248,14 +248,37 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 // fresh, still-accumulating WriteScope by the time batchDelegate returns.
 //
 // Apply runs whether or not the delegate reported an error, unlike
-// WriteTransaction's success-only call: a batch executes each operation
-// immediately rather than inside one long-lived transaction, so whatever
-// chunks flushed before the failure are already durable in PostgreSQL, and
-// skipping the apply would leave the replica missing them. Applying is safe
-// for the operations that did NOT land, too, because read-back reads
-// PostgreSQL's own committed state per key -- a key whose write never landed
-// simply reads back as it already was (or as absent), never as the write
-// that failed.
+// WriteTransaction's success-only call, because a batch's chunks are
+// durable as they flush, not held back for one final commit the way a
+// transaction's writes are. Verified against the pinned dawgs v0.8.0 pg
+// driver source rather than assumed: pg.newBatch (drivers/pg/batch.go:59-73)
+// builds its transaction wrapper with allocateTransaction=false
+// (batch.go:60), so transaction.tx (drivers/pg/transaction.go) stays nil for
+// the whole batch; transaction.driver() (transaction.go:75-85) returns the
+// raw pooled connection, not a *pgx.Tx, whenever tx is nil, so every
+// buffered flush (batch.go's tryFlush and the flushNode*/flushRelationship*
+// helpers it calls) executes directly on the connection under PostgreSQL's
+// ordinary per-statement autocommit -- there is no single transaction
+// wrapping the whole delegate that a later failure could roll back. This is
+// also why batch.Commit's own call to transaction.Commit (batch.go:860-866)
+// is a no-op: transaction.Commit (transaction.go:300-306) only calls
+// tx.Commit when tx is non-nil. (The one exception, batch.largeUpdate
+// (batch.go:174-219), used only when a single UpdateNodes call exceeds
+// LargeNodeUpdateThreshold = 1,000,000 nodes, opens its own real *pgx.Tx for
+// that one call's staging-table COPY+MERGE and commits or rolls it back
+// atomically -- but that transaction is scoped to a single flush unit, not
+// the whole batch delegate, so it does not contradict "no transaction wraps
+// the whole batch": a call that fails there rolls back only its own
+// staging-table work, and whatever flushed via ordinary tryFlush calls
+// before or after it is durable regardless.)
+//
+// So whatever chunks flushed before a delegate failure are already durable
+// in PostgreSQL, and skipping the apply would leave the replica missing
+// them. Applying is safe for the operations that did NOT land, too, and
+// this safety does not actually depend on the autocommit-vs-transactional
+// question above -- because read-back reads PostgreSQL's own committed
+// state per key -- a key whose write never landed simply reads back as it
+// already was (or as absent), never as the write that failed.
 func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDelegate, options ...graph.BatchOption) error {
 	observer := &observingBatch{scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
 	err := d.Driver.BatchOperation(ctx, func(batch graph.Batch) error {
@@ -331,13 +354,14 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 // indefinitely (nothing else advances the write generation on its own).
 //
 // A TouchAll scope carrying a ChangeSet fallback is used, exactly like
-// Run/WipeGraph (so Apply rebuilds rather than guesses): retargeting the default graph changes which nodes, edges,
-// and kinds "the graph" even refers to, which is outside anything this
-// package's kind-scoped write tracking (engine/marks.go, write_observer.go's
-// WriteScope) reasons about -- the same "outside what kind-scoped tracking
-// can reason about" call observingTransaction.WithGraph and observingBatch.
-// WithGraph (write_observer.go) already make for a mid-transaction graph
-// retarget, via their own TouchAll() plus RecordFallback.
+// Run/WipeGraph (so Apply rebuilds rather than guesses): retargeting the
+// default graph changes which nodes, edges, and kinds "the graph" even
+// refers to, which is outside anything this package's kind-scoped write
+// tracking (engine/marks.go, write_observer.go's WriteScope) reasons about --
+// the same "outside what kind-scoped tracking can reason about" call
+// observingTransaction.WithGraph and observingBatch.WithGraph
+// (write_observer.go) already make for a mid-transaction graph retarget, via
+// their own TouchAll() plus RecordFallback.
 func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
 	if err := d.Driver.SetDefaultGraph(ctx, graphSchema); err != nil {
 		return err

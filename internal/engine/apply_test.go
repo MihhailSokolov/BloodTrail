@@ -377,3 +377,131 @@ func TestApplyBumpsEpochAndKeepsMarksBookkeeping(t *testing.T) {
 		t.Fatalf("Apply with no snapshot adopted entered fallback, want it to stay serving")
 	}
 }
+
+// -----------------------------------------------------------------------
+// F4: the fallback recovery goroutine must never leave the engine stranded
+// in stateFallback with nothing running to recover it.
+// -----------------------------------------------------------------------
+
+// TestFinishFallbackRebuildRelaunchesWhenStateRacedBackToFallback pins the
+// exact race finishFallbackRebuild closes: the recovery goroutine has
+// already decided to exit (rebuildOnce adopted, adoptRebuiltView already
+// flipped state to stateServing) but has not yet cleared
+// fallbackRebuilding, when some OTHER write's Apply fails and calls
+// enterFallback -- flipping state back to stateFallback and finding
+// fallbackRebuilding still true, so its own startFallbackRebuild call gives
+// up silently (a recovery goroutine looks like it is already in flight).
+// Without the fix, clearing the flag afterward would leave the engine
+// stranded: state == stateFallback with no goroutine ever again scheduled
+// to notice.
+//
+// bgCancel is called first so that IF this relaunches a real goroutine (it
+// must), that goroutine's own top-of-loop bgCtx check returns immediately
+// instead of reaching rebuildOnce -- which would call LoadSnapshot against
+// this test's nil pgDriver/pool and panic. The relaunch itself is still
+// observed synchronously: startFallbackRebuild's CAS on fallbackRebuilding
+// runs in this goroutine, before the "go" statement, so it is visible to
+// the assertion below regardless of when the spawned goroutine actually
+// runs.
+func TestFinishFallbackRebuildRelaunchesWhenStateRacedBackToFallback(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+	e.bgCancel()
+
+	e.fallbackRebuilding.Store(true) // the "not yet cleared" half of the race
+	e.state.Store(stateFallback)     // ...and a concurrent Apply already lost it back to fallback
+
+	e.finishFallbackRebuild()
+
+	if !e.fallbackRebuilding.Load() {
+		t.Fatalf("finishFallbackRebuild left the engine stranded: fallbackRebuilding = false while state = stateFallback, want it to relaunch recovery")
+	}
+}
+
+// TestFinishFallbackRebuildDoesNothingWhenAlreadyServing covers the normal,
+// non-races path: when the state is stateServing by the time
+// finishFallbackRebuild runs (the common case -- nothing raced), it must
+// just clear the flag, not spawn another goroutine.
+func TestFinishFallbackRebuildDoesNothingWhenAlreadyServing(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+
+	e.fallbackRebuilding.Store(true)
+	e.state.Store(stateServing)
+
+	e.finishFallbackRebuild()
+
+	if e.fallbackRebuilding.Load() {
+		t.Fatalf("finishFallbackRebuild relaunched recovery while already serving, want it to just clear the flag")
+	}
+}
+
+// TestApplyEarlyReturnRelaunchesRecoveryWhenNoneIsRunning is F4's other half:
+// Apply's state != stateServing early return must itself call
+// startFallbackRebuild before returning, so that if the engine is
+// (unexpectedly) in fallback with no recovery goroutine actually in flight
+// -- fallbackRebuilding left false here, standing in for whatever window
+// left it that way -- the very next declined write self-heals instead of
+// declining forever.
+//
+// bgCancel is called for the same reason as
+// TestFinishFallbackRebuildRelaunchesWhenStateRacedBackToFallback: it lets
+// the relaunched goroutine's own top-of-loop check return immediately
+// rather than reach rebuildOnce with no real database behind it, while the
+// relaunch itself (the synchronous CAS) is still observed reliably.
+func TestApplyEarlyReturnRelaunchesRecoveryWhenNoneIsRunning(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+	e.bgCancel()
+	e.state.Store(stateFallback)
+
+	scope := NewWriteScope()
+	scope.TouchNodeKinds(graph.Kinds{graph.StringKind("User")})
+	scope.Changes().RecordNodeID(7)
+
+	e.Apply(context.Background(), scope)
+
+	if !e.fallbackRebuilding.Load() {
+		t.Fatalf("Apply's early return while already in fallback did not relaunch recovery: fallbackRebuilding = false, want true")
+	}
+}
+
+// -----------------------------------------------------------------------
+// F5: a budget-refused rebuild must back off far slower than a transient
+// failure or epoch race.
+// -----------------------------------------------------------------------
+
+func TestFallbackRetryDelay(t *testing.T) {
+	// A budget refusal always waits fallbackBudgetRetryInterval and leaves
+	// backoff untouched, regardless of what backoff was carrying.
+	if wait, next := fallbackRetryDelay(true, fallbackRetryInterval); wait != fallbackBudgetRetryInterval || next != fallbackRetryInterval {
+		t.Fatalf("fallbackRetryDelay(true, fallbackRetryInterval) = (%v, %v), want (%v, %v)", wait, next, fallbackBudgetRetryInterval, fallbackRetryInterval)
+	}
+	if wait, next := fallbackRetryDelay(true, fallbackRetryMax); wait != fallbackBudgetRetryInterval || next != fallbackRetryMax {
+		t.Fatalf("fallbackRetryDelay(true, fallbackRetryMax) = (%v, %v), want (%v, %v)", wait, next, fallbackBudgetRetryInterval, fallbackRetryMax)
+	}
+
+	// A non-budget outcome keeps the pre-existing doubling schedule: wait
+	// the current backoff, then double it, capped at fallbackRetryMax.
+	if wait, next := fallbackRetryDelay(false, fallbackRetryInterval); wait != fallbackRetryInterval || next != 2*fallbackRetryInterval {
+		t.Fatalf("fallbackRetryDelay(false, fallbackRetryInterval) = (%v, %v), want (%v, %v)", wait, next, fallbackRetryInterval, 2*fallbackRetryInterval)
+	}
+	if wait, next := fallbackRetryDelay(false, fallbackRetryMax); wait != fallbackRetryMax || next != fallbackRetryMax {
+		t.Fatalf("fallbackRetryDelay(false, fallbackRetryMax) = (%v, %v), want (%v, %v): must stay capped", wait, next, fallbackRetryMax, fallbackRetryMax)
+	}
+	// A near-max backoff doubles past fallbackRetryMax and must clamp, not
+	// overshoot.
+	if wait, next := fallbackRetryDelay(false, fallbackRetryMax-1); wait != fallbackRetryMax-1 || next != fallbackRetryMax {
+		t.Fatalf("fallbackRetryDelay(false, fallbackRetryMax-1) = (%v, %v), want (%v, %v)", wait, next, fallbackRetryMax-1, fallbackRetryMax)
+	}
+
+	// The moment a budget episode ends, the very next non-budget call sees
+	// backoff exactly as it was before the episode began -- proving the
+	// episode never advanced it.
+	preEpisode := fallbackRetryInterval
+	_, duringEpisode := fallbackRetryDelay(true, preEpisode)
+	_, stillDuringEpisode := fallbackRetryDelay(true, duringEpisode)
+	if duringEpisode != preEpisode || stillDuringEpisode != preEpisode {
+		t.Fatalf("a budget episode advanced backoff: got %v then %v, want both to stay %v", duringEpisode, stillDuringEpisode, preEpisode)
+	}
+	if wait, _ := fallbackRetryDelay(false, stillDuringEpisode); wait != preEpisode {
+		t.Fatalf("the first non-budget retry after a budget episode waited %v, want the pre-episode backoff %v", wait, preEpisode)
+	}
+}
