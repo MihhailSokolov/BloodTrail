@@ -75,7 +75,7 @@ func TestAdoptRebuiltViewRejectsRacedApply(t *testing.T) {
 	epoch := e.applyEpoch.Load()
 	fresh := snapshot.NewView(&snapshot.Snapshot{})
 
-	if !e.adoptRebuiltView(context.Background(), fresh, epoch) {
+	if !e.adoptRebuiltView(context.Background(), fresh, epoch, e.settledDirtyGen.Load()) {
 		t.Fatalf("adoptRebuiltView with an unchanged epoch = false, want true")
 	}
 	if got := e.snap.Load(); got != fresh {
@@ -84,7 +84,7 @@ func TestAdoptRebuiltViewRejectsRacedApply(t *testing.T) {
 
 	e.applyEpoch.Add(1) // an Apply landed while the next rebuild was loading
 	racedOut := snapshot.NewView(&snapshot.Snapshot{})
-	if e.adoptRebuiltView(context.Background(), racedOut, epoch) {
+	if e.adoptRebuiltView(context.Background(), racedOut, epoch, e.settledDirtyGen.Load()) {
 		t.Fatalf("adoptRebuiltView with a bumped epoch = true, want false")
 	}
 	if got := e.snap.Load(); got != fresh {
@@ -100,7 +100,7 @@ func TestAdoptRebuiltViewExitsFallback(t *testing.T) {
 	e := New(nil, nil, Config{})
 	e.state.Store(stateFallback)
 
-	if !e.adoptRebuiltView(context.Background(), snapshot.NewView(&snapshot.Snapshot{}), e.applyEpoch.Load()) {
+	if !e.adoptRebuiltView(context.Background(), snapshot.NewView(&snapshot.Snapshot{}), e.applyEpoch.Load(), e.settledDirtyGen.Load()) {
 		t.Fatalf("adoptRebuiltView with an unchanged epoch = false, want true")
 	}
 	if got := e.state.Load(); got != stateServing {
@@ -109,7 +109,7 @@ func TestAdoptRebuiltViewExitsFallback(t *testing.T) {
 
 	e.state.Store(stateFallback)
 	e.applyEpoch.Add(1)
-	if e.adoptRebuiltView(context.Background(), snapshot.NewView(&snapshot.Snapshot{}), 0) {
+	if e.adoptRebuiltView(context.Background(), snapshot.NewView(&snapshot.Snapshot{}), 0, e.settledDirtyGen.Load()) {
 		t.Fatalf("adoptRebuiltView with a bumped epoch = true, want false")
 	}
 	if got := e.state.Load(); got != stateFallback {

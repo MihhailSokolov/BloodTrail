@@ -212,16 +212,18 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // own doc -- because a batch's earlier chunks are already durable by the
 // time a later one fails.)
 //
-// The error branch instead calls advanceIfBumped (write_observer.go) on
+// The error branch instead calls resolveAbandonedWrite (write_observer.go) on
 // whatever scope observer last held: the watermark protocol's own spec
 // amendment (internal/engine/watermark.go's BumpWatermark doc) requires the
 // pg counter to advance even for a write that rolled back, since the
 // observer's first mutating call already bumped it eagerly, before this
 // transaction's own pg effect -- long before its outcome was known. That
 // bump has to resolve (fold into e.appliedWatermark, retire its
-// e.inflightBumps entry) regardless, which advanceIfBumped does directly,
-// without a full Apply: a rolled-back transaction has no committed effect
-// for a read-back to replay. observer can be nil here only if
+// e.inflightBumps entry) regardless, and a bump that FAILED has to settle its
+// own watermark trust generation, since a rolled-back transaction left
+// nothing uncounted behind it -- both of which resolveAbandonedWrite does
+// directly, without a full Apply: a rolled-back transaction has no committed
+// effect for a read-back to replay. observer can be nil here only if
 // d.Driver.WriteTransaction's own delegate closure never ran at all (never
 // observed in the pinned pg driver, but checked defensively).
 //
@@ -267,7 +269,7 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 		return txDelegate(observer)
 	}, options...); err != nil {
 		if observer != nil {
-			advanceIfBumped(ctx, d.engine, observer.scope)
+			resolveAbandonedWrite(ctx, d.engine, observer.scope)
 		}
 		return err
 	}
@@ -356,7 +358,7 @@ func (d *Driver) Close(ctx context.Context) error {
 // ensureBumped runs first, before d.Driver.Run even attempts its own pg
 // effect -- the watermark protocol's spec amendment (internal/engine/
 // watermark.go's BumpWatermark doc) requires every mutating entry point to
-// bump eagerly, this one included. On failure, advanceIfBumped resolves
+// bump eagerly, this one included. On failure, resolveAbandonedWrite resolves
 // that bump directly (no read-back to perform -- the call never reached
 // PostgreSQL at all) rather than calling the full Apply this method uses on
 // success.
@@ -365,7 +367,7 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 	ensureBumped(ctx, d.engine, scope)
 
 	if err := d.Driver.Run(ctx, query, parameters); err != nil {
-		advanceIfBumped(ctx, d.engine, scope)
+		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
 	scope.Changes().RecordFallback("Run: raw Cypher outside a transaction escapes changelog tracking")
@@ -379,14 +381,14 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 // keep serving shortest paths through data PostgreSQL no longer has. See
 // Run's doc for why an override is needed at all, for why the scope handed
 // to Apply carries a ChangeSet fallback rather than replaying anything
-// narrowly, and for why ensureBumped/advanceIfBumped bracket the call the
+// narrowly, and for why ensureBumped/resolveAbandonedWrite bracket the call the
 // same way.
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
 	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
-		advanceIfBumped(ctx, d.engine, scope)
+		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
 	scope.Changes().RecordFallback("WipeGraph: full graph truncation escapes changelog tracking")
@@ -413,14 +415,14 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 // WriteScope/ChangeSet) reasons about -- the same "outside what tracking
 // can reason about" call observingTransaction.WithGraph and
 // observingBatch.WithGraph (write_observer.go) already make for a
-// mid-transaction graph retarget. ensureBumped/advanceIfBumped bracket the
+// mid-transaction graph retarget. ensureBumped/resolveAbandonedWrite bracket the
 // call exactly as Run's doc describes.
 func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
 	if err := d.Driver.SetDefaultGraph(ctx, graphSchema); err != nil {
-		advanceIfBumped(ctx, d.engine, scope)
+		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
 	scope.Changes().RecordFallback("SetDefaultGraph: default graph retarget escapes changelog tracking")
@@ -438,13 +440,13 @@ func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) e
 // tombstoneNodeWithCascade derives directly from the View rather than
 // needing this call to report anything about edges at all. See Run's doc
 // for why an override is needed at all, and for why ensureBumped/
-// advanceIfBumped bracket the call the same way.
+// resolveAbandonedWrite bracket the call the same way.
 func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
 	if err := d.Driver.DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
-		advanceIfBumped(ctx, d.engine, scope)
+		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
 	scope.Changes().RecordDeleteNodesByKinds(includeAny, excludeAny)
@@ -460,13 +462,13 @@ func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds,
 // cascade -- removing an edge never removes a node or any other edge -- so
 // kinds fully describes what this call could possibly have touched. See
 // Run's doc for why an override is needed at all, and for why ensureBumped/
-// advanceIfBumped bracket the call the same way.
+// resolveAbandonedWrite bracket the call the same way.
 func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kinds) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
 	if err := d.Driver.DeleteRelationshipsByKinds(ctx, kinds); err != nil {
-		advanceIfBumped(ctx, d.engine, scope)
+		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
 	scope.Changes().RecordDeleteRelationshipsByKinds(kinds)

@@ -36,17 +36,19 @@ import (
 // engine.ErrWatermarkUnavailable is BumpWatermark's own signal that this
 // engine was never going to track a watermark at all (no pg pool bound to
 // it -- see that error's own doc): distinct from every other bump failure,
-// this never logs, never records a ChangeSet fallback, and never sets
-// watermarkDirty, matching the same tolerance the nil-eng branch above
-// already gives unit tests (write_observer_test.go's disabledEngine()
+// this never logs, never records a ChangeSet fallback, and never opens a
+// watermark trust generation, matching the same tolerance the nil-eng branch
+// above already gives unit tests (write_observer_test.go's disabledEngine()
 // helper is exactly Enabled: false with a nil pool).
 //
 // Any other error is a genuine failure: BumpWatermark's own protocol
-// promise is that it never blocks the write it guards, so this logs once
-// (via eng.NoteWatermarkBumpFailure), records a ChangeSet fallback -- the
-// applier can no longer trust a narrow delta for a write whose counter was
-// never recorded -- and leaves eng.watermarkDirty set until a later
-// successful bump+apply pair clears it again.
+// promise is that it never blocks the write it guards, so this logs once and
+// opens a watermark trust generation for this write (via
+// eng.NoteWatermarkBumpFailure, which also marks scope as the one thing that
+// can later settle it), and records a ChangeSet fallback -- the applier can no
+// longer trust a narrow delta for a write whose counter was never recorded,
+// and that same fallback record is what starts the rebuild whose adoption
+// eventually restores trust (engine.WatermarkTrusted's own doc).
 func ensureBumped(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope) {
 	if eng == nil || scope == nil {
 		return
@@ -71,30 +73,27 @@ func ensureBumped(ctx context.Context, eng *engine.Engine, scope *engine.WriteSc
 	case errors.Is(err, engine.ErrWatermarkUnavailable):
 		// Nothing to do -- see this function's own doc.
 	default:
-		eng.NoteWatermarkBumpFailure(ctx, err)
+		eng.NoteWatermarkBumpFailure(ctx, scope, err)
 		scope.Changes().RecordFallback(fmt.Sprintf("watermark: bump failed: %v", err))
 	}
 }
 
-// advanceIfBumped resolves scope's watermark bookkeeping
-// (engine.AdvanceWatermark) without a full Apply, for a write known to have
-// produced no committed effect at all: driver.go's WriteTransaction error
+// resolveAbandonedWrite resolves scope's watermark bookkeeping
+// (engine.ResolveAbandonedWrite) without a full Apply, for a write known to
+// have produced no committed effect at all: driver.go's WriteTransaction error
 // branch, and the error branch of every driver-level method that bumps
 // eagerly at its own top (Run, WipeGraph, SetDefaultGraph,
-// DeleteNodesByKinds, DeleteRelationshipsByKinds) -- see AdvanceWatermark's
-// own doc for why the pg counter itself still has to resolve even though
-// nothing else did.
+// DeleteNodesByKinds, DeleteRelationshipsByKinds). See that method's own doc
+// for both halves it resolves -- a bump that succeeded still has to fold into
+// the applied counter, and a bump that FAILED settles here, since a write that
+// returned an error left nothing behind for the replica to be missing.
 //
-// A no-op when scope never bumped (a bump failure, or a call that never
-// reached ensureBumped at all) or when eng is nil (mirroring ensureBumped's
-// own tolerance).
-func advanceIfBumped(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope) {
+// A no-op when eng or scope is nil, mirroring ensureBumped's own tolerance.
+func resolveAbandonedWrite(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope) {
 	if eng == nil || scope == nil {
 		return
 	}
-	if counter, bumped := scope.Watermark(); bumped {
-		eng.AdvanceWatermark(applyContext(ctx), counter)
-	}
+	eng.ResolveAbandonedWrite(applyContext(ctx), scope)
 }
 
 // nodeIDSymbol and edgeIDSymbol are the Cypher variable symbols dawgs/query's

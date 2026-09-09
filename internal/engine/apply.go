@@ -96,65 +96,57 @@ const (
 // context.Background(); ctx bounds the read-back queries only.
 //
 // Watermark bookkeeping (watermark.go) is folded into this same sequence,
-// deliberately unconditional on everything below: if scope was bumped
-// (scope.Watermark's own flag), this method's own two watermark steps run on
+// deliberately unconditional on everything below: both of its steps run on
 // every one of the branches below -- the disabled-engine return, every
 // enterFallback branch, the empty-ChangeSet no-op, and the ordinary
-// published-segment path alike. The pg watermark counter already advanced
-// the instant BumpWatermark's own UPDATE committed, independent of what this
-// call goes on to do with the write's own effect, so this scope's bump has
-// to resolve regardless of which of those branches actually fires.
+// published-segment path alike -- because both are statements about a write
+// PostgreSQL has already seen, independent of what this call goes on to do
+// with the write's own effect:
 //
-// The two steps run on either side of applyMu, deliberately NOT both inside
-// it the way an earlier version of this method had them (folding counter
-// into e.appliedWatermark and retiring this scope's e.inflightBumps entry,
-// then -- while watermarkDirty was set -- re-checking convergence with a
-// live pg round trip, all one deferred AdvanceWatermark call made while
-// still holding the lock):
+//   - If scope bumped (scope.Watermark's own flag), AdvanceWatermark folds
+//     its counter into e.appliedWatermark and retires its e.inflightBumps
+//     entry. The pg counter already advanced the instant BumpWatermark's own
+//     UPDATE committed, so this scope's bump has to resolve regardless of
+//     which branch fires.
+//   - If scope's own eager bump FAILED (settleWatermarkFailure), this call is
+//     the proof that the write it guarded has landed -- Apply is only ever
+//     called once a write has actually committed -- which is exactly what
+//     settles that failure's watermark trust generation. Settling it BEFORE
+//     the applyEpoch bump below is what lets a concurrent rebuild's
+//     epoch check catch a settle it did not observe (rebuildOnce's own doc);
+//     the rebuild request that follows is what guarantees an adopted snapshot
+//     will eventually resolve the generation (WatermarkTrusted's own doc).
 //
-//   - foldWatermarkCounter, the cheap, lock-free-safe atomic bookkeeping
-//     (watermark.go's own doc covers why it needs no lock at all), runs
-//     inside applyLocked below, before that method's own defer releases
-//     applyMu -- so e.appliedWatermark/e.inflightBumps are always resolved
-//     before this Apply call returns, exactly as before.
-//   - recheckWatermarkDirty, the live pg read watermarkDirty's recovery rule
-//     needs (watermarkConverged, and now also e.state -- see that method's
-//     own doc for the full soundness argument), is deferred here in Apply's
-//     own outer frame instead, which is what makes it run strictly AFTER
-//     applyLocked has already returned -- Unlock included. Under sustained
-//     watermarkDirty, every write used to pay for that round trip while
-//     still holding applyMu, serializing every OTHER concurrent write's own
-//     Apply call behind it; deferring it out here means the lock is free for
-//     the next Apply the instant this one's own locked work finishes, and
-//     only the write that happened to trigger the recheck pays its latency.
+// Both are cheap atomic bookkeeping with no pg round trip of their own, so
+// they cost the applyMu-holding sequence nothing measurable. Trust itself is
+// never computed here: WatermarkTrusted derives it on demand from the
+// generations, so no Apply call has to reason about whether some other
+// write's failure has been made good yet.
 func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
-	var counter uint64
-	var bumped bool
-	if scope != nil {
-		counter, bumped = scope.Watermark()
-	}
-	if bumped {
-		defer e.recheckWatermarkDirty(ctx)
-	}
-
-	e.applyLocked(ctx, scope, counter, bumped)
-}
-
-// applyLocked is Apply's entire original sequence, run under applyMu: bump
-// applyEpoch, fold this scope's watermark counter in if it bumped, then
-// either give up early or build and publish a delta segment -- see Apply's
-// own doc for the seven-step pipeline and why folding the counter here
-// (rather than the live convergence recheck, which Apply itself defers
-// outside this method) still belongs under the lock.
-func (e *Engine) applyLocked(ctx context.Context, scope *WriteScope, counter uint64, bumped bool) {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 
-	if bumped {
-		e.foldWatermarkCounter(counter)
+	if scope != nil {
+		if counter, bumped := scope.Watermark(); bumped {
+			e.AdvanceWatermark(counter)
+		}
 	}
+	settledFailure := e.settleWatermarkFailure(scope)
 
 	e.applyEpoch.Add(1)
+
+	if settledFailure {
+		// Belt and braces. The write carrying a failed bump also carries the
+		// ChangeSet fallback record ensureBumped (write_observer.go) pairs
+		// with it, so the cs.HasFallback() branch below already enters
+		// fallback and starts a recovery rebuild -- but only on the branches
+		// that reach it, and only while that pairing holds. Requesting the
+		// rebuild here instead makes "a settled failure always has a rebuild
+		// coming" a property of this method alone. It is idempotent
+		// (claimRebuildLoop's CAS) and only ever fires for a write whose
+		// watermark bump genuinely failed.
+		e.startFallbackRebuild()
+	}
 
 	if !e.cfg.Enabled {
 		return
@@ -665,6 +657,20 @@ func (e *Engine) runFallbackRebuild() {
 // retired alongside write-through's freshness gates, boot.go), so this
 // recheck is the only thing that can.
 //
+// The watermark trust generations get the identical recheck, for the
+// identical race in its other guise: this goroutine's own adoption resolved
+// whatever settledDirtyGen value it read before its load began
+// (adoptRebuiltView), and a watermark failure that settled after that read --
+// including one settled by a write that produced no effect at all, which
+// never enters fallback and so would leave the state check above unmoved --
+// needs another adoption to resolve it. Its own settle already called
+// startFallbackRebuild, but that call finds this goroutine's flag still held
+// and gives up, exactly as it should when a recovery goroutine is genuinely
+// still working; here one is not. Without this second half of the recheck the
+// engine would keep serving correctly but stay permanently distrusted
+// (WatermarkTrusted), with nothing left scheduled that could ever change
+// that.
+//
 // Only called from an adopted-rebuild return path, never from a
 // context-cancelled return: relaunching in response to a state change the
 // exiting goroutine is about to stop observing anyway, right as the engine
@@ -672,9 +678,25 @@ func (e *Engine) runFallbackRebuild() {
 // wait for it.
 func (e *Engine) finishFallbackRebuild() {
 	e.fallbackRebuilding.Store(false)
-	if e.state.Load() == stateFallback {
+	if rebuildStillNeeded(e.state.Load(), e.settledDirtyGen.Load(), e.resolvedDirtyGen.Load()) {
 		e.startFallbackRebuild()
 	}
+}
+
+// rebuildStillNeeded is finishFallbackRebuild's own decision, extracted as a
+// pure function for unit testing (mirroring fallbackRetryDelay's identical
+// treatment above): given the engine's state and its watermark settled/
+// resolved generations at the moment the exiting rebuild goroutine cleared
+// the flag, it reports whether another rebuild has to be launched.
+//
+// Either condition alone is enough, and they cover the two independent
+// reasons an adopted rebuild can leave work behind -- a write that tripped
+// fallback again in the window before the flag cleared, and a watermark
+// failure that settled after this rebuild's own load began (and whose own
+// request to rebuild therefore found the flag still held). See
+// finishFallbackRebuild's doc for both races in full.
+func rebuildStillNeeded(state int32, settledGen, resolvedGen uint64) bool {
+	return state == stateFallback || settledGen != resolvedGen
 }
 
 // fallbackBudgetRetryInterval is the recovery goroutine's retry cadence for

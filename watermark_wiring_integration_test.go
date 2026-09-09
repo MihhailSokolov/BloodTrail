@@ -8,7 +8,7 @@
 // an import cycle, since the real observer/driver wiring lives up here) or
 // never touched the watermark protocol at all (apply_integration_test.go's
 // write-shape suite). Neither proves the wiring itself -- write_observer.go's
-// ensureBumped/advanceIfBumped, and driver.go's own call sites -- actually
+// ensureBumped/resolveAbandonedWrite, and driver.go's own call sites -- actually
 // reaches BumpWatermark/Apply/AdvanceWatermark correctly when driven through
 // the real *Driver, nor that a nested Driver.BatchOperation call issued from
 // inside a WriteTransaction delegate (the shape BloodHound's own
@@ -106,6 +106,9 @@ func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing
 	if _, converged := d.engine.WatermarkConverged(ctx); !converged {
 		t.Fatalf("WatermarkConverged = false after both the outer transaction's and the nested batch's scopes should have resolved, want true")
 	}
+	if !d.engine.WatermarkTrusted(ctx) {
+		t.Fatalf("WatermarkTrusted = false after two ordinary, fully resolved writes through the real wiring, want true")
+	}
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "the outer transaction's own node is counted, served",
 		func() int64 { return nodeCountByKind(t, ctx, bt, watermarkWiringOuterKind) }, 1)
@@ -124,7 +127,7 @@ func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing
 // driver-level write paths, each asserting that the watermark counter
 // (d.engine.ReadWatermark) and convergence (d.engine.WatermarkConverged)
 // advance through the REAL write_observer.go/driver.go wiring --
-// ensureBumped's eager bump and Apply/advanceIfBumped's resolution -- rather
+// ensureBumped's eager bump and Apply/resolveAbandonedWrite's resolution -- rather
 // than internal/engine's own white-box simulation of that same sequence
 // (watermark_integration_test.go's own doc on why it cannot drive the real
 // wiring at all).
@@ -201,13 +204,16 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 		if _, converged := d.engine.WatermarkConverged(ctx); !converged {
 			t.Fatalf("WatermarkConverged = false after the transaction's own scope resolved via the success path (driver.go's own Apply call), want true")
 		}
+		if !d.engine.WatermarkTrusted(ctx) {
+			t.Fatalf("WatermarkTrusted = false after an ordinary successful write, want true: no watermark failure was ever noted, the counters converged, and the engine is serving")
+		}
 	})
 
 	// I4's own tx-error branch: a delegate that writes, then returns an
 	// error, rolls the transaction back -- but the eager bump already
 	// landed before that write was even attempted (BumpWatermark's own
 	// ordering doc), so driver.go's WriteTransaction error branch must still
-	// resolve it (advanceIfBumped), reaching convergence despite there being
+	// resolve it (resolveAbandonedWrite), reaching convergence despite there being
 	// no committed effect at all for Apply to replay.
 	t.Run("WriteTransaction error branch", func(t *testing.T) {
 		d, bt, _, ctx := openApplyDriver(t)
@@ -233,11 +239,14 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("ReadWatermark after: %v", err)
 		}
 		if delta := after - before; delta != 1 {
-			t.Fatalf("watermark counter advanced by %d through a rolled-back WriteTransaction, want exactly 1 (the eager bump still resolves via advanceIfBumped despite the rollback)", delta)
+			t.Fatalf("watermark counter advanced by %d through a rolled-back WriteTransaction, want exactly 1 (the eager bump still resolves via resolveAbandonedWrite despite the rollback)", delta)
 		}
 
 		if _, converged := d.engine.WatermarkConverged(ctx); !converged {
-			t.Fatalf("WatermarkConverged = false after the rolled-back transaction's bump resolved via advanceIfBumped, want true")
+			t.Fatalf("WatermarkConverged = false after the rolled-back transaction's bump resolved via resolveAbandonedWrite, want true")
+		}
+		if !d.engine.WatermarkTrusted(ctx) {
+			t.Fatalf("WatermarkTrusted = false after a rolled-back write whose bump succeeded, want true")
 		}
 
 		if got := nodeCountByKind(t, ctx, bt, watermarkWiringTxErrKind); got != 0 {

@@ -33,6 +33,13 @@ type WriteScope struct {
 	// them.
 	watermark       uint64
 	watermarkBumped bool
+
+	// watermarkBumpFailed records that this write's own eager bump genuinely
+	// failed (NoteWatermarkBumpFailure, watermark.go) -- the mutually
+	// exclusive opposite of watermarkBumped, and the only thing that can
+	// ever settle the watermark trust generation that failure opened. It is
+	// CONSUMED, not merely read, by takeWatermarkBumpFailure below.
+	watermarkBumpFailed bool
 }
 
 // NewWriteScope returns an empty WriteScope, ready for its Changes()
@@ -86,9 +93,36 @@ func (s *WriteScope) SetWatermark(counter uint64) {
 // Watermark returns the counter SetWatermark last recorded, and whether it
 // was ever called at all. false means this scope's eager bump either never
 // ran, or ran and failed (BumpWatermark's own caller records a ChangeSet
-// fallback and sets e.watermarkDirty instead of calling SetWatermark in
-// that case) -- either way, there is no counter here for
-// Apply/AdvanceWatermark to fold in.
+// fallback and calls NoteWatermarkBumpFailure instead of SetWatermark in that
+// case, which is what markWatermarkBumpFailed below records) -- either way,
+// there is no counter here for Apply/AdvanceWatermark to fold in.
 func (s *WriteScope) Watermark() (uint64, bool) {
 	return s.watermark, s.watermarkBumped
+}
+
+// markWatermarkBumpFailed records that this scope's own eager bump genuinely
+// failed, so that whichever call site later learns this write's outcome is
+// final in PostgreSQL (Apply, or ResolveAbandonedWrite for a write that
+// produced no effect) can settle the watermark trust generation that failure
+// opened. Called only by NoteWatermarkBumpFailure (watermark.go), which
+// advances that generation in the same breath -- the two must not drift
+// apart, which is why neither is exported on its own.
+func (s *WriteScope) markWatermarkBumpFailed() {
+	s.watermarkBumpFailed = true
+}
+
+// takeWatermarkBumpFailure reports whether this scope carries an unsettled
+// bump failure, CONSUMING it: a second call returns false.
+//
+// Consuming rather than merely reading is what makes settleWatermarkFailure's
+// counter (e.settledDirtyGen, watermark.go) exact. That counter is only
+// meaningful compared against e.dirtyGen -- equality means "every failure ever
+// noted has settled" -- so counting one failure twice would push settled past
+// dirty and make trust unrecoverable, exactly as counting it zero times would
+// make trust unearned. A scope reaching both settling call sites, or an Apply
+// running twice for one scope, therefore still counts once.
+func (s *WriteScope) takeWatermarkBumpFailure() bool {
+	failed := s.watermarkBumpFailed
+	s.watermarkBumpFailed = false
+	return failed
 }

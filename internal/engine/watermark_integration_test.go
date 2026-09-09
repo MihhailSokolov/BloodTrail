@@ -32,7 +32,48 @@ func resetWatermarkTable(t *testing.T, ctx context.Context, eng *Engine) {
 	}
 	eng.appliedWatermark.Store(0)
 	eng.inflightBumps.Store(0)
-	eng.watermarkDirty.Store(false)
+	eng.dirtyGen.Store(0)
+	eng.settledDirtyGen.Store(0)
+	eng.resolvedDirtyGen.Store(0)
+}
+
+// parkRebuildLoop claims the engine's single rebuild-loop gate
+// (fallbackRebuilding, engine.go) for the test itself, so that nothing any
+// test below does -- entering fallback, settling a watermark failure --
+// launches a background rebuild goroutine that could adopt a snapshot at an
+// unpredictable moment. Every adoption in these tests is then driven
+// explicitly through adoptOneRebuild, which is what makes assertions about
+// exactly WHEN trust returns deterministic.
+func parkRebuildLoop(eng *Engine) {
+	eng.fallbackRebuilding.Store(true)
+}
+
+// adoptOneRebuild runs one real rebuild (rebuildOnce: a live LoadSnapshot
+// against PostgreSQL, the epoch check, and the adoption) and fails the test
+// unless the snapshot was actually adopted -- adoption being the only thing
+// that ever advances resolvedDirtyGen (adoptRebuiltView).
+func adoptOneRebuild(t *testing.T, ctx context.Context, eng *Engine) {
+	t.Helper()
+
+	adopted, err := eng.rebuildOnce(ctx, triggerManual)
+	if err != nil {
+		t.Fatalf("rebuildOnce: %v", err)
+	}
+	if !adopted {
+		t.Fatalf("rebuildOnce did not adopt its snapshot, want adopted")
+	}
+}
+
+// wantTrusted asserts WatermarkTrusted, reporting the three generations and
+// the engine state alongside a failure so a break is diagnosable without a
+// debugger.
+func wantTrusted(t *testing.T, ctx context.Context, eng *Engine, want bool, why string) {
+	t.Helper()
+
+	if got := eng.WatermarkTrusted(ctx); got != want {
+		t.Fatalf("WatermarkTrusted = %v, want %v (%s); generations = (dirty %d, settled %d, resolved %d), state = %d",
+			got, want, why, eng.dirtyGen.Load(), eng.settledDirtyGen.Load(), eng.resolvedDirtyGen.Load(), eng.state.Load())
+	}
 }
 
 // TestWatermarkTwoWritesConverge is the brief's Step 1(a): two writes bump
@@ -132,8 +173,8 @@ func TestWatermarkRolledBackWriteTransactionStillConverges(t *testing.T) {
 
 	// The transaction rolled back: nothing for a read-back to replay, so
 	// the error path resolves the bump directly -- exactly what driver.go's
-	// own WriteTransaction error branch does via advanceIfBumped.
-	eng.AdvanceWatermark(ctx, counter)
+	// own WriteTransaction error branch does via resolveAbandonedWrite.
+	eng.AdvanceWatermark(counter)
 
 	countAfter, err := nodeCount(ctx, pgDriver)
 	if err != nil {
@@ -233,112 +274,146 @@ func TestWatermarkConcurrentBumpsConverge(t *testing.T) {
 	}
 }
 
-// TestWatermarkDirtyClearsOnLaterConvergedBump exercises watermarkDirty's
-// own recovery rule against a real pg watermark table: once set (standing
-// in for an earlier bump that genuinely failed -- NoteWatermarkBumpFailure,
-// unit-tested against a nil pool in watermark_test.go), it must stay set
-// through a bump+apply pair that does NOT reach convergence, and clear the
-// moment one does -- AdvanceWatermark's own documented "later successful
-// bump+apply pair" recovery.
-func TestWatermarkDirtyClearsOnLaterConvergedBump(t *testing.T) {
+// TestWatermarkTrustReturnsOnlyAfterFailureSettlesAndSnapshotAdopts walks
+// one watermark failure through its entire life against a real pg watermark
+// table, asserting WatermarkTrusted (watermark.go) at each of the four
+// moments that matter. Trust is withdrawn the instant the failure is noted,
+// and comes back only when BOTH of the things the generations track have
+// happened: the failing write's outcome became final in PostgreSQL, and a
+// snapshot whose load began after that was actually adopted.
+//
+// The third step is the one worth reading twice: an adoption that happens
+// while the failing write is still in flight resolves nothing, because
+// rebuildOnce captures the settled generation BEFORE its load begins, and at
+// that moment the failure had not settled.
+func TestWatermarkTrustReturnsOnlyAfterFailureSettlesAndSnapshotAdopts(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	defer eng.Stop()
 	resetWatermarkTable(t, ctx, eng)
+	parkRebuildLoop(eng)
 
-	eng.watermarkDirty.Store(true)
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "converged and serving, with no watermark failure ever noted")
 
-	// A bump whose own AdvanceWatermark call is deliberately NOT made yet:
-	// inflightBumps stays at 1, so watermarkConverged can't report true,
-	// and dirty must stay set.
-	counter1, err := eng.BumpWatermark(ctx)
-	if err != nil {
-		t.Fatalf("BumpWatermark #1: %v", err)
-	}
-	if _, converged := eng.watermarkConverged(ctx); converged {
-		t.Fatalf("watermarkConverged = true with an unresolved bump in flight, want false")
-	}
+	// W's eager bump fails; W itself has not even reached PostgreSQL yet.
+	scopeW := NewWriteScope()
+	eng.NoteWatermarkBumpFailure(ctx, scopeW, errors.New("simulated bump failure"))
+	wantTrusted(t, ctx, eng, false, "a bump failure was just noted; its write is still in flight")
 
-	// A second bump, resolved immediately: AdvanceWatermark's own re-check
-	// still sees inflightBumps == 1 (counter1's own bump is still
-	// unresolved), so dirty must still not clear.
-	counter2, err := eng.BumpWatermark(ctx)
-	if err != nil {
-		t.Fatalf("BumpWatermark #2: %v", err)
-	}
-	eng.AdvanceWatermark(ctx, counter2)
-	if !eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty cleared while counter1's own bump is still unresolved, want it to stay set")
-	}
+	// An adoption while W is still in flight cannot resolve W.
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, false, "this snapshot's load began before W's failure settled")
 
-	// Resolving counter1 now retires the last unresolved bump: convergence
-	// is reachable, so this AdvanceWatermark call must clear dirty.
-	eng.AdvanceWatermark(ctx, counter1)
-	if eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty stayed set after every bumped scope resolved and the engine reached convergence, want it cleared")
+	// W lands, and its Apply settles the failure -- carrying the same
+	// ChangeSet fallback record ensureBumped (write_observer.go) pairs with
+	// every genuine bump failure, so this also trips the engine into
+	// fallback.
+	scopeW.Changes().RecordFallback("watermark: bump failed: simulated bump failure")
+	eng.Apply(ctx, scopeW)
+	if got := eng.state.Load(); got != stateFallback {
+		t.Fatalf("state = %d after W's Apply saw a ChangeSet fallback record, want stateFallback (%d)", got, stateFallback)
 	}
+	wantTrusted(t, ctx, eng, false, "W settled, but no adopted snapshot contains it yet")
 
-	if got, converged := eng.watermarkConverged(ctx); !converged || got != counter2 {
-		t.Fatalf("watermarkConverged = (%d, %v), want (%d, true)", got, converged, counter2)
-	}
+	// One adoption now does both jobs at once: it ends the fallback and
+	// resolves the generation W's failure opened.
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "an adopted snapshot's load began after W settled")
 }
 
-// TestWatermarkDirtyStaysSetUntilStateReturnsToServing pins C1's own fix
-// directly against a real pg watermark table: recheckWatermarkDirty
-// (watermark.go) must not clear watermarkDirty on watermarkConverged alone
-// while the engine is still in stateFallback -- see that method's own doc
-// for the full soundness argument this exercises. e.state is manipulated
-// directly here (a same-package whitebox test, mirroring
-// TestWatermarkDirtyClearsOnLaterConvergedBump's own direct
-// watermarkDirty.Store(true) setup, above) rather than through a real
-// enterFallback trip, so the scenario is deterministic and does not race a
-// real background rebuild goroutine --
-// TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack, below, already
-// proves enterFallback itself flips state correctly end to end; this test's
-// own job is just the recheck's gating logic once state is whatever it is.
-func TestWatermarkDirtyStaysSetUntilStateReturnsToServing(t *testing.T) {
+// TestWatermarkTrustWithheldWhileInFallback pins the third condition of the
+// predicate on its own: generations fully resolved and counters converged is
+// not enough while the replica itself is not trustworthy. state is driven
+// directly here (a same-package whitebox test) so the assertion is about the
+// predicate rather than about how some write happened to trip fallback.
+func TestWatermarkTrustWithheldWhileInFallback(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	defer eng.Stop()
 	resetWatermarkTable(t, ctx, eng)
+	parkRebuildLoop(eng)
 
-	eng.watermarkDirty.Store(true)
-	eng.state.Store(stateFallback) // standing in for an unresolved fallback trip
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "converged and serving")
 
-	// A bump+resolve cycle that reaches convergence on the counters alone:
-	// pg's counter and appliedWatermark agree, and nothing is left in
-	// flight -- exactly the state a write with zero counter trace (C1's own
-	// scenario) leaves behind for some LATER, unrelated write to walk into.
-	counter, err := eng.BumpWatermark(ctx)
-	if err != nil {
-		t.Fatalf("BumpWatermark: %v", err)
-	}
-	eng.AdvanceWatermark(ctx, counter)
+	eng.state.Store(stateFallback)
+	wantTrusted(t, ctx, eng, false, "the replica is in fallback, whatever the generations say")
 
-	if _, converged := eng.watermarkConverged(ctx); !converged {
-		t.Fatalf("watermarkConverged = false, want true: this bump was the only one outstanding")
-	}
-	if !eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty cleared while state is still stateFallback, want it to stay set (C1: convergence on the counters alone does not prove the fallback rebuild that resolves the missed write has been adopted)")
-	}
-
-	// The rebuild that resolved this fallback trip has now adopted.
 	eng.state.Store(stateServing)
+	wantTrusted(t, ctx, eng, true, "serving again")
+}
 
-	// The next bump+resolve cycle's recheck now sees both halves hold.
-	counter2, err := eng.BumpWatermark(ctx)
+// TestWatermarkTrustNotRestoredByAConcurrentWriteResolving is the direct
+// regression test for the wrong-trust race that a clearable dirty flag could
+// not close, whatever it was gated on.
+//
+// The race: write W's eager bump fails, which is noted BEFORE W's own pg
+// effect is even attempted -- so at that instant W has left no trace anywhere
+// else in the engine (no counter, nothing in flight, and its Apply, the thing
+// that would trip fallback, has not run). A concurrent write C, whose own
+// bump succeeded, then resolves completely: it observes a fully converged
+// engine in stateServing and, under the old design, cleared the dirty flag on
+// exactly that evidence -- while W was still in flight.
+//
+// This test reproduces that interleaving deterministically (C's whole
+// lifecycle runs between W's failure and W's Apply) and asserts that both
+// conditions the old rule checked really do hold at that moment, and that
+// WatermarkTrusted still reports false anyway -- because trust is computed
+// from the generations, and W's generation is not settled, so there is
+// nothing for C to clear.
+func TestWatermarkTrustNotRestoredByAConcurrentWriteResolving(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	defer eng.Stop()
+	resetWatermarkTable(t, ctx, eng)
+	parkRebuildLoop(eng)
+
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "converged and serving before either write starts")
+
+	// W: the eager bump fails. W's own write and Apply are still to come.
+	scopeW := NewWriteScope()
+	eng.NoteWatermarkBumpFailure(ctx, scopeW, errors.New("simulated bump failure"))
+
+	// C: a concurrent write whose bump succeeded, resolved end to end.
+	counterC, err := eng.BumpWatermark(ctx)
 	if err != nil {
-		t.Fatalf("BumpWatermark #2: %v", err)
+		t.Fatalf("BumpWatermark (C): %v", err)
 	}
-	eng.AdvanceWatermark(ctx, counter2)
+	scopeC := NewWriteScope()
+	scopeC.SetWatermark(counterC)
+	eng.Apply(ctx, scopeC)
 
-	if eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty stayed set once state returned to stateServing and the engine converged, want it cleared")
+	// Exactly the evidence the old clear-on-(converged && serving) rule
+	// accepted, asserted here so this test would fail loudly if the scenario
+	// ever stopped reproducing the race rather than silently passing.
+	if _, converged := eng.watermarkConverged(ctx); !converged {
+		t.Fatalf("watermarkConverged = false after C resolved, want true: this test only reproduces the race if C sees a converged engine")
 	}
+	if got := eng.state.Load(); got != stateServing {
+		t.Fatalf("state = %d after C resolved, want stateServing (%d): W's Apply must not have run yet for this test to reproduce the race", got, stateServing)
+	}
+
+	wantTrusted(t, ctx, eng, false, "C1: W's bump failure has not settled, so C's own resolution proves nothing about W")
+
+	// W's Apply finally runs, and the recovery it triggers restores trust --
+	// the failure's generation settles, then an adopted snapshot resolves it.
+	scopeW.Changes().RecordFallback("watermark: bump failed: simulated bump failure")
+	eng.Apply(ctx, scopeW)
+	wantTrusted(t, ctx, eng, false, "W settled, but no adopted snapshot contains it yet")
+
+	adoptOneRebuild(t, ctx, eng)
+	wantTrusted(t, ctx, eng, true, "an adopted snapshot's load began after W settled")
 }
 
 // unreachableEnginePool returns a *pgxpool.Pool pointed at 127.0.0.1 on a low
@@ -363,10 +438,10 @@ func unreachableEnginePool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack is the real,
+// TestWatermarkGenuineBumpFailureOpensAGenerationAndFallsBack is the real,
 // live-pool counterpart to watermark_test.go's
-// TestNoteWatermarkBumpFailureSetsDirty (which pins NoteWatermarkBumpFailure
-// in isolation) and to TestDriverMutatingCapabilityMethodsDoNotCallApplyOnError
+// TestNoteWatermarkBumpFailureOpensGenerationAndMarksScope (which pins
+// NoteWatermarkBumpFailure in isolation) and to TestDriverMutatingCapabilityMethodsDoNotCallApplyOnError
 // (wrapper_test.go), whose own disabledEngine() gives the ENGINE a nil pool
 // -- so every bump attempt there returns ErrWatermarkUnavailable without
 // ever reaching a network at all, never the genuine-failure path this test
@@ -383,10 +458,11 @@ func unreachableEnginePool(t *testing.T) *pgxpool.Pool {
 // Asserts, in order, exactly what ensureBumped's genuine-failure branch
 // (write_observer.go) and Apply's own cs.HasFallback() branch (apply.go)
 // together promise: the bump failure never blocks the write (the node is
-// created), watermarkDirty is set, and Apply -- seeing the ChangeSet
+// created), the failure opens a watermark trust generation that stays
+// unsettled while the write is in flight, and Apply -- seeing the ChangeSet
 // fallback record ensureBumped itself would have recorded for this same
-// error -- trips the engine into fallback.
-func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
+// error -- settles that generation and trips the engine into fallback.
+func TestWatermarkGenuineBumpFailureOpensAGenerationAndFallsBack(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
@@ -395,6 +471,7 @@ func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
 
 	eng := New(pgDriver, unreachableEnginePool(t), Config{Enabled: true, Log: testEngineLogger()})
 	defer eng.Stop()
+	parkRebuildLoop(eng)
 
 	countBefore, err := nodeCount(ctx, pgDriver)
 	if err != nil {
@@ -410,10 +487,18 @@ func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
 	if errors.Is(bumpErr, ErrWatermarkUnavailable) {
 		t.Fatalf("BumpWatermark = %v, want a real network error (this engine's own pool is non-nil, just unreachable), not ErrWatermarkUnavailable", bumpErr)
 	}
-	eng.NoteWatermarkBumpFailure(ctx, bumpErr)
+	// The scope this failure is recorded against is the write's own, exactly
+	// as ensureBumped (write_observer.go) hands it its own scope: the mark it
+	// leaves there is the only thing that can ever settle the generation the
+	// failure opens.
+	scope := NewWriteScope()
+	eng.NoteWatermarkBumpFailure(ctx, scope, bumpErr)
 
-	if !eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty = false after a genuine bump failure, want true")
+	if got, settled := eng.dirtyGen.Load(), eng.settledDirtyGen.Load(); got != 1 || settled != 0 {
+		t.Fatalf("generations = (dirty %d, settled %d) after a genuine bump failure, want (1, 0)", got, settled)
+	}
+	if eng.WatermarkTrusted(ctx) {
+		t.Fatalf("WatermarkTrusted = true after a genuine bump failure, want false")
 	}
 
 	// The write proceeds regardless -- through the real, reachable pgDriver
@@ -422,7 +507,6 @@ func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
 	// cannot import the root package's write_observer.go without an import
 	// cycle -- see this package's own doc on that constraint, e.g.
 	// engine.go's ApplyCount doc).
-	scope := NewWriteScope()
 	scope.Changes().RecordFallback(fmt.Sprintf("watermark: bump failed: %v", bumpErr))
 
 	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -446,8 +530,14 @@ func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
 
 	eng.Apply(ctx, scope)
 
-	if !eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty cleared, want it to stay set: this scope never bumped, so its own Apply call cannot resolve it")
+	if got, settled := eng.dirtyGen.Load(), eng.settledDirtyGen.Load(); got != 1 || settled != 1 {
+		t.Fatalf("generations = (dirty %d, settled %d) after the failing write's Apply, want (1, 1): the write has landed, so its failure has settled", got, settled)
+	}
+	if eng.resolvedDirtyGen.Load() != 0 {
+		t.Fatalf("resolvedDirtyGen = %d with no snapshot adopted since the failure settled, want 0", eng.resolvedDirtyGen.Load())
+	}
+	if eng.WatermarkTrusted(ctx) {
+		t.Fatalf("WatermarkTrusted = true after the failing write landed, want false: no adopted snapshot contains it yet")
 	}
 	if got := eng.state.Load(); got != stateFallback {
 		t.Fatalf("state = %d after Apply saw a ChangeSet fallback record, want stateFallback (%d)", got, stateFallback)
@@ -457,22 +547,32 @@ func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
 	}
 }
 
-// TestEnsureWatermarkTableSetsDirtyOnLiveFailure is
+// TestEnsureWatermarkTableSelfSettlesOnLiveFailure is
 // TestEnsureWatermarkTableIsNoOpWithNoPool's (watermark_test.go) live-pool
 // counterpart: a nil pool is a deliberate no-op (ensureWatermarkTable's own
 // doc), but a real, non-nil pool that genuinely fails the DDL exec -- here,
-// because nothing is listening on the other end -- must still set
-// watermarkDirty, exactly as any other genuine watermark failure does. No
-// live database is actually required for this one: pgxpool.New itself never
-// blocks on a connection, so the unreachable pool is enough on its own,
-// without graphtest.PGAvailable's own live-DB skip guard.
-func TestEnsureWatermarkTableSetsDirtyOnLiveFailure(t *testing.T) {
+// because nothing is listening on the other end -- must still withdraw trust.
+// It is the one failure shape that settles itself immediately
+// (noteSelfSettlingWatermarkFailure: a failed DDL exec guarded no write, so
+// no write's settling could ever retire it), leaving the next adopted
+// snapshot to resolve it -- at boot, Start's own boot load. No live database
+// is actually required for this one: pgxpool.New itself never blocks on a
+// connection, so the unreachable pool is enough on its own, without
+// graphtest.PGAvailable's own live-DB skip guard.
+func TestEnsureWatermarkTableSelfSettlesOnLiveFailure(t *testing.T) {
+	ctx := context.Background()
 	eng := New(nil, unreachableEnginePool(t), Config{Enabled: true, Log: testEngineLogger()})
 	defer eng.Stop()
 
-	eng.ensureWatermarkTable(context.Background())
+	eng.ensureWatermarkTable(ctx)
 
-	if !eng.watermarkDirty.Load() {
-		t.Fatalf("watermarkDirty = false after ensureWatermarkTable failed against an unreachable pool, want true")
+	if dirty, settled, resolved := eng.dirtyGen.Load(), eng.settledDirtyGen.Load(), eng.resolvedDirtyGen.Load(); dirty != 1 || settled != 1 || resolved != 0 {
+		t.Fatalf("generations = (dirty %d, settled %d, resolved %d) after a failed DDL exec, want (1, 1, 0)", dirty, settled, resolved)
+	}
+	if eng.watermarkGensResolved() {
+		t.Fatalf("watermarkGensResolved = true with no snapshot adopted since the DDL failure, want false")
+	}
+	if eng.WatermarkTrusted(ctx) {
+		t.Fatalf("WatermarkTrusted = true after a failed watermark-table DDL exec, want false")
 	}
 }

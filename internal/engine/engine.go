@@ -141,23 +141,41 @@ type Engine struct {
 	// not yet known to be reconciled.
 	inflightBumps atomic.Int64
 
-	// watermarkDirty is set the instant a BumpWatermark call genuinely
-	// fails (NoteWatermarkBumpFailure) -- never for ErrWatermarkUnavailable,
-	// which means this engine was never tracking a watermark at all, not
-	// that a bump was missed. A missed bump means the pg watermark counter
-	// and this engine's own bookkeeping have silently diverged, which a
-	// future snapshot-file writer (watermarkConverged's own consumer) must
-	// never trust as convergence even if the numbers happen to line up
-	// again by coincidence. It clears only when a later bumped scope's
-	// recheckWatermarkDirty call (watermark.go) finds BOTH watermarkConverged
-	// true (a live pg read) AND state == stateServing -- see
-	// recheckWatermarkDirty's own doc for the full soundness argument for why
-	// the state half is required too: a genuine bump failure's own write
-	// always trips the engine into stateFallback, and that write has zero
-	// counter trace of its own, so watermarkConverged alone can read true
-	// well before the fallback rebuild it triggered has actually been
-	// adopted.
-	watermarkDirty atomic.Bool
+	// dirtyGen, settledDirtyGen and resolvedDirtyGen are the watermark
+	// protocol's trust generations (watermark.go). Trust is COMPUTED from
+	// them -- WatermarkTrusted, whose doc carries the full soundness
+	// argument -- and never stored, so nothing can ever clear a trust flag
+	// out from under a write that is still in flight. All three are
+	// monotonically increasing, and the invariant
+	// resolvedDirtyGen <= settledDirtyGen <= dirtyGen holds at all times.
+	//
+	//   - dirtyGen counts every genuine watermark failure this engine has
+	//     ever seen: a BumpWatermark call that genuinely failed
+	//     (NoteWatermarkBumpFailure -- never ErrWatermarkUnavailable, which
+	//     means this engine was never tracking a watermark at all), and a
+	//     failed watermark-table DDL exec (ensureWatermarkTable). Each such
+	//     failure means the pg watermark counter and this engine's own
+	//     bookkeeping may have silently diverged -- a write may have landed
+	//     in PostgreSQL without ever being counted -- which a snapshot-file
+	//     writer must never trust as convergence even if the numbers happen
+	//     to line up again by coincidence.
+	//   - settledDirtyGen counts those same failures once the write each one
+	//     guarded is SETTLED in PostgreSQL: committed (its Apply ran) or
+	//     known to have produced nothing (its driver-level call returned an
+	//     error, ResolveAbandonedWrite). A DDL failure guards no write at
+	//     all, so it settles itself immediately. settledDirtyGen ==
+	//     dirtyGen therefore means "every failure ever noted belongs to a
+	//     write whose outcome is already final in PostgreSQL".
+	//   - resolvedDirtyGen is the largest settledDirtyGen value that was
+	//     read BEFORE the load of a snapshot this engine went on to ADOPT
+	//     (rebuildOnce/adoptRebuiltView). It is the only one of the three
+	//     that is not advanced by a failure at all: it is advanced purely by
+	//     evidence -- an adopted snapshot whose load began after those
+	//     failures' writes had already settled, and which therefore contains
+	//     them.
+	dirtyGen         atomic.Uint64
+	settledDirtyGen  atomic.Uint64
+	resolvedDirtyGen atomic.Uint64
 
 	// mapKind resolves a graph.Kind name to its KindID, as
 	// e.pgDriver.KindMapper().MapKind would. The builder-serving path
@@ -314,6 +332,19 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 	// epoch at publish time proves this snapshot cannot be missing an applied
 	// write.
 	epoch := e.applyEpoch.Load()
+	// Also read before the load begins, and deliberately AFTER epoch: this is
+	// the watermark trust generation an adoption resolves (adoptRebuiltView,
+	// below). Reading it before LoadSnapshot is what gives it its meaning --
+	// every watermark failure counted in it belongs to a write whose outcome
+	// was already final in PostgreSQL when this value was read, so a load
+	// starting after that read sees those writes' committed rows. Reading it
+	// after epoch is what keeps a failure that settles DURING this load from
+	// being silently skipped: Apply settles a failure before it bumps
+	// applyEpoch (apply.go), so a settle this read missed necessarily bumped
+	// the epoch after this call read it, and the adoption below is refused
+	// rather than wrongly resolving a generation it does not contain. See
+	// WatermarkTrusted (watermark.go) for the whole argument.
+	settledGen := e.settledDirtyGen.Load()
 	// Deferred (not incremented up front) so that by the time a test
 	// observes rebuildAttempts advance, this call's logging decision
 	// (shouldLogRefusal or the InfoContext below) has already run --
@@ -343,7 +374,7 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 	}
 	e.overBudget.Store(false)
 
-	if !e.adoptRebuiltView(ctx, snapshot.NewView(snap), epoch) {
+	if !e.adoptRebuiltView(ctx, snapshot.NewView(snap), epoch, settledGen) {
 		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot rebuild not adopted: a write was applied while it loaded",
 			slog.String("trigger", trigger),
 			slog.Duration("duration", time.Since(start)),
@@ -394,7 +425,17 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 // originally tripped the fallback. Tying recovery to adoption rather than to
 // one goroutine is what keeps "the engine is serving again" a property of
 // the data, not of who happened to reload it.
-func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoch uint64) bool {
+//
+// settledGen is the watermark trust generation rebuildOnce read before this
+// snapshot's load began (see its own doc for why "before" is load-bearing,
+// and WatermarkTrusted's for the full argument). Adoption -- and ONLY
+// adoption, never a load that was refused or dropped -- advances
+// resolvedDirtyGen to it, which is the sole way a watermark failure is ever
+// resolved. The monotonic max is what keeps a slow rebuild that started
+// before a faster one from ever regressing it; every write to
+// resolvedDirtyGen happens here, under applyMu, so the load/store pair needs
+// no CAS loop of its own.
+func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoch uint64, settledGen uint64) bool {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 
@@ -402,6 +443,7 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 		return false
 	}
 	e.snap.Store(view)
+	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 
 	if e.state.CompareAndSwap(stateFallback, stateServing) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: fallback exited")
