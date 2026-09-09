@@ -160,6 +160,7 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 	eng := engine.New(pgDriver, cfg.Pool, engine.Config{
 		Enabled:     settings.Engine,
 		MemoryLimit: settings.MemoryLimit,
+		SnapshotDir: settings.SnapshotDir,
 		Log:         logger,
 	})
 	// A driver-scoped background context, deliberately not ctx: the boot-load
@@ -353,10 +354,21 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 }
 
 // Close stops the engine's background goroutines (boot load, fallback
-// recovery) before closing the embedded PostgreSQL driver, so no engine
-// goroutine outlives the driver.
+// recovery), then gives the engine one best-effort chance to persist its
+// current View to a snapshot file (engine.SaveSnapshot) while the embedded
+// PostgreSQL driver -- and therefore its connection pool -- is still open,
+// before finally closing that driver, so no engine goroutine outlives the
+// driver.
+//
+// SaveSnapshot's own error is deliberately ignored here, not just left
+// unlogged: it already logs (Warn) any failure itself, and a snapshot file
+// is purely an optimization for the NEXT boot (BLOODTRAIL_SNAPSHOT_DIR
+// unset, or a save that fails outright, simply means the next boot falls
+// back to its own PostgreSQL rebuild, exactly as it always has) -- never a
+// reason a graceful shutdown should block or report an error of its own.
 func (d *Driver) Close(ctx context.Context) error {
 	d.engine.Stop()
+	_ = d.engine.SaveSnapshot(ctx)
 	return d.Driver.Close(ctx)
 }
 

@@ -35,6 +35,16 @@ type Config struct {
 	// (BLOODTRAIL_MEMORY_LIMIT). Zero means unbounded.
 	MemoryLimit size.Size
 
+	// SnapshotDir enables the snapshot-file boot/save cycle
+	// (BLOODTRAIL_SNAPSHOT_DIR) when non-empty: Start's boot-load goroutine
+	// tries loading <SnapshotDir>/graph-<id>.btsnap before falling back to
+	// a full PostgreSQL rebuild (boot.go's tryLoadSnapshotFile), and
+	// SaveSnapshot (persist.go) writes that same file back on a clean
+	// shutdown. Empty (the zero value) disables the feature outright: no
+	// file is ever read or written, and snapshotFilePath (boot.go) reports
+	// so via its own ok return.
+	SnapshotDir string
+
 	// Log receives the engine's rebuild/serve/decline events. New defaults
 	// this to slog.Default() when nil, so a zero Config is still safe to
 	// log with.

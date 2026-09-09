@@ -107,6 +107,24 @@ func (v *View) SegmentCount() int {
 	return len(v.segments)
 }
 
+// Segments returns every delta Segment layered onto this View's base
+// snapshot, oldest first -- the same slice WithSegment/ensureDelta read
+// internally, exposed so a caller outside this package can hand them to
+// Fold without reaching into an unexported field. Its one caller today is
+// the engine's own SaveSnapshot (persist.go), folding a View back into a
+// single flat Snapshot before writing a snapshot file.
+//
+// Safe to return the backing slice directly, with no defensive copy: a View
+// is immutable once constructed (this file's own package doc), and
+// WithSegment always allocates a fresh backing array rather than appending
+// to v's own -- so nothing a caller does with the returned slice, short of
+// writing through its elements (each a *Segment, and Segment is documented
+// immutable in its own right), can ever affect v or any other View sharing
+// its tail.
+func (v *View) Segments() []*Segment {
+	return v.segments
+}
+
 // ensureDelta lazily computes merged (the newest-wins collapse of v's
 // segment stack) and the virtual dense id assignment derived from it, at
 // most once per View. Every pg id merged carries a non-tombstoned record

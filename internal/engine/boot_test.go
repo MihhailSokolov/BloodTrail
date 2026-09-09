@@ -86,3 +86,52 @@ func TestRunBootLoadNeverFlipsToFallbackOnContextCancel(t *testing.T) {
 		t.Fatalf("fallbackRebuilding still true after runBootLoad's context-cancelled return, want it cleared")
 	}
 }
+
+// -----------------------------------------------------------------------
+// Task 15: snapshot-file boot load. The two tests below pin the pure,
+// database-free pieces (snapshotFilePath's disabled short-circuit,
+// snapshotFileTrustedAtBoot's own predicate); the full read-compare-adopt
+// sequence (tryLoadSnapshotFile) is exercised end to end, against a live
+// PostgreSQL watermark table and real snapshot files, by
+// file_boot_integration_test.go.
+// -----------------------------------------------------------------------
+
+// TestSnapshotFilePathDisabledWhenDirEmpty pins the order snapshotFilePath
+// must check things in: cfg.SnapshotDir == "" has to return before ever
+// calling e.pgDriver.DefaultGraph(), so that the snapshot-file feature is a
+// genuine no-op -- no default-graph lookup, no filesystem I/O -- for every
+// engine that never set it, including this one, built with a nil pgDriver
+// on purpose: reordering the checks would turn this test into a nil-pointer
+// panic instead of a clean assertion.
+func TestSnapshotFilePathDisabledWhenDirEmpty(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+
+	if path, ok := e.snapshotFilePath(); ok || path != "" {
+		t.Fatalf("snapshotFilePath() = (%q, %v) with SnapshotDir empty, want (\"\", false)", path, ok)
+	}
+}
+
+// TestSnapshotFileTrustedAtBootRequiresExactMatch pins
+// snapshotFileTrustedAtBoot's own predicate: trust requires the file's
+// embedded watermark to equal PostgreSQL's current counter exactly --
+// never merely "not behind" (a file somehow ahead of pg, which should
+// never happen in practice, is refused exactly as a file behind it is).
+func TestSnapshotFileTrustedAtBootRequiresExactMatch(t *testing.T) {
+	cases := []struct {
+		name     string
+		file, pg uint64
+		want     bool
+	}{
+		{"exact match, zero", 0, 0, true},
+		{"exact match, nonzero", 42, 42, true},
+		{"file behind pg (a write landed after the file was saved)", 41, 42, false},
+		{"file ahead of pg (should never happen; refused all the same)", 43, 42, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := snapshotFileTrustedAtBoot(tc.file, tc.pg); got != tc.want {
+				t.Fatalf("snapshotFileTrustedAtBoot(%d, %d) = %v, want %v", tc.file, tc.pg, got, tc.want)
+			}
+		})
+	}
+}

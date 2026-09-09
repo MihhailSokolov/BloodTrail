@@ -36,8 +36,17 @@ const (
 
 // Settings holds the driver's own configuration.
 type Settings struct {
-	// SnapshotDir is where replica snapshots will be written. Unused in the
-	// delegating driver; parsed and kept so the setting is stable from day one.
+	// SnapshotDir enables the snapshot-file boot/save cycle
+	// (BLOODTRAIL_SNAPSHOT_DIR) when non-empty: on boot, the engine tries
+	// loading <SnapshotDir>/graph-<id>.btsnap before falling back to a full
+	// PostgreSQL rebuild, gated on the file's embedded watermark exactly
+	// matching PostgreSQL's own watermark counter at that moment -- a stale
+	// or unreadable file is always rejected, never trusted (see
+	// internal/engine/boot.go's tryLoadSnapshotFile). On a clean shutdown,
+	// Driver.Close writes that same file back (internal/engine/persist.go's
+	// SaveSnapshot), best-effort, after the engine itself has stopped.
+	// Empty (the default) disables the feature outright: no file is ever
+	// read or written.
 	SnapshotDir string
 	// MemoryLimit bounds the in-memory replica. Zero means unset.
 	MemoryLimit size.Size
