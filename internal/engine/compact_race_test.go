@@ -20,16 +20,29 @@ import (
 const raceStressBound = 50 * time.Second
 
 // raceIDBase keeps every synthetic node id this test generates strictly
-// above buildApplyView's own base ids (1-3): Fold's bigserial-monotonicity
-// assertion (snapshot/fold.go) requires every delta-added node's id to
-// exceed the CURRENT base's highest id at fold time, and since a
-// compaction's own folded output becomes the next base, staying above the
-// ORIGINAL base's ids is not enough on its own -- what actually makes this
-// safe is that every id below is drawn from one shared, monotonically
-// increasing atomic.Uint64 counter (raceStressIDCounter, below): a
-// freshly-generated id is, by construction, larger than every id any
-// earlier segment (already folded into some prior base, or not) could
-// possibly carry.
+// above buildApplyView's own base ids (1-3), purely so this test's own ids
+// are trivially distinguishable from the fixture's while reading a failure.
+//
+// It buys no ORDERING guarantee on its own, and must not be read as one: an
+// id is drawn from idCounter (a single shared, monotonically increasing
+// atomic.Uint64 below) strictly before the goroutine that drew it calls
+// publishAppend, so DRAW order and PUBLISH order can diverge -- an applier
+// goroutine can draw a low id, then lose the CPU for long enough that
+// another applier draws AND PUBLISHES a higher id first. A lower id can
+// therefore land in the segment stack after some compaction has already
+// folded a base whose own max id exceeds it -- exactly the "ordinary
+// concurrency" shape the F2 finding names (task-16 report): two commits
+// landing at Apply in an order that does not match the order PostgreSQL's
+// bigserial sequence numbered them. This test relies on Fold tolerating
+// that (foldNodes' two-pointer ascending merge, snapshot/fold.go), not on
+// any ordering property of how ids happen to be generated here -- and
+// TestCompactRace's own final CompactionCount() assertion below, not this
+// constant, is what actually proves the reliance pays off: against the
+// pre-F2-fix Fold, a low id landing after a compaction had already raised
+// the base's max would poison every later fold for good (the F2 finding's
+// own wording), driving adopted compactions toward a low, stuck count well
+// short of what CompactEntries=30 forcing a trigger every 50 applies should
+// produce.
 const raceIDBase = 10_000
 
 // mustRaceNodeSegment builds a one-node-upsert Segment for id, the same
@@ -46,15 +59,23 @@ func mustRaceNodeSegment(id uint64) *snapshot.Segment {
 	return b.Build()
 }
 
-// forceCompactionAttempt mirrors maybeStartCompaction's own capture-and-spawn
-// logic (compact.go) exactly, minus the size-threshold check: it is this
-// test's way of forcing a compaction attempt on a schedule the production
-// thresholds don't control, while still going through the exact same
-// capture discipline (segments captured under applyMu, alongside the base
-// they layer onto) and the exact same `compacting` CAS every real trigger
-// respects -- so a forced attempt that loses the CAS to an already-running
-// compaction is dropped exactly as a threshold-triggered one would be,
-// never queued or retried.
+// forceCompactionAttempt is this test's way of forcing a compaction attempt
+// on a schedule the production thresholds don't control. It follows the
+// same OVERALL shape maybeStartCompaction does -- capture (base, segments)
+// consistently, then respect the same `compacting` CAS every real trigger
+// goes through, so a forced attempt that loses the CAS to an already-running
+// compaction is dropped exactly as a threshold-triggered one would be, never
+// queued or retried -- but it is not a line-for-line mirror of it "minus the
+// size-threshold check", and should not be described as one: maybeStartCompaction
+// runs entirely under the applyMu its own caller (Apply, via
+// maintainAfterPublish) already holds, so its capture and its CAS both
+// execute inside that ONE critical section its caller opened. This helper is
+// called from a goroutine that holds no lock of its own (one of this test's
+// own applier goroutines, right after publishAppend below), so it takes
+// applyMu itself just long enough to capture (base, segments) consistently,
+// then RELEASES it before the CAS -- a real (if harmless -- the CAS is an
+// independent atomic, and a lost race here is simply dropped) ordering
+// difference from the production path.
 func forceCompactionAttempt(e *Engine) {
 	e.applyMu.Lock()
 	view := e.snap.Load()
@@ -110,7 +131,7 @@ func checkViewAccessors(t *testing.T, view *snapshot.View) {
 // TestCompactRace is this file's mandatory `-race` stress test (the brief's
 // Step 2): 4 applier goroutines publish synthetic segments concurrently
 // through the exact same publishAppend seam the unit tests above use (so
-// every real Apply-tail code path -- mergeSegmentTailIfNeeded,
+// every real Apply-tail code path -- collapseSegmentStackIfNeeded,
 // maybeStartCompaction, and (via forceCompactionAttempt above) the
 // compaction goroutine itself -- runs for real, concurrently, under the
 // race detector), while 8 reader goroutines concurrently walk View
@@ -196,24 +217,34 @@ func TestCompactRace(t *testing.T) {
 		}()
 	}
 
+	// settleErr carries waitCompactionSettled's result out of the spawned
+	// goroutine below to this test's own main goroutine, which alone may
+	// call t.Fatal on it (waitCompactionSettled's own doc): the write here
+	// happens-before close(done), and the read below happens-after <-done,
+	// so this plain variable needs no lock of its own -- the channel close
+	// already provides the synchronization.
+	var settleErr error
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		applierWG.Wait()
 		close(publishedIDs)
 		// Let readers keep hammering the View while any trailing
 		// compaction (forced by the very last few applies) is still
 		// in flight, then stop them and wait for the final one to
 		// settle before the correctness pass below.
-		waitCompactionSettled(t, e)
+		settleErr = waitCompactionSettled(e)
 		close(stop)
 		readerWG.Wait()
-		close(done)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(raceStressBound):
 		t.Fatalf("compact race stress test did not complete within %s", raceStressBound)
+	}
+	if settleErr != nil {
+		t.Fatal(settleErr)
 	}
 
 	// Correctness oracle: every id any applier published must still
@@ -239,6 +270,27 @@ func TestCompactRace(t *testing.T) {
 
 	if err := snapshot.CheckViewConsistent(final); err != nil {
 		t.Fatalf("CheckViewConsistent(final): %v", err)
+	}
+
+	// This used to only t.Logf the count, asserting nothing -- so a
+	// compaction that silently stopped adopting entirely (e.g. the F2
+	// finding: a low-id tail poisoning every later fold for good) would
+	// pass this test regardless, since data loss was never this test's own
+	// failure mode (the correctness oracle above already covers that; a
+	// discarded fold just leaves the delta uncompacted, never drops a
+	// write). With CompactEntries=30 forcing organic triggers constantly,
+	// plus forceCompactionAttempt every forceCompactionEvery applies, at
+	// least one adoption is expected reliably; the forced attempt just
+	// below exists purely so this assertion cannot flake on an unusually
+	// scheduled run that happened to lose every CAS race until now.
+	if e.CompactionCount() == 0 {
+		forceCompactionAttempt(e)
+		if err := waitCompactionSettled(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := e.CompactionCount(); got == 0 {
+		t.Fatal("CompactionCount() = 0, want at least one adopted compaction")
 	}
 
 	t.Logf("compact race stress: %d applies, %d compactions adopted", len(ids), e.CompactionCount())

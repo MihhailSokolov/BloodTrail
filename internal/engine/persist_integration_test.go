@@ -115,7 +115,7 @@ func TestSaveSnapshotRefusesWhenApplyRacesTheProbe(t *testing.T) {
 	// and the commit below.
 	racedNodeID := applyOneWrite(t, ctx, eng)
 
-	if err := eng.saveSnapshotCommit(ctx, path, epoch, pgCounter, converged); err != nil {
+	if err := eng.saveSnapshotCommit(ctx, path, epoch, pgCounter, converged, false); err != nil {
 		t.Fatalf("saveSnapshotCommit after a racing Apply returned an error, want nil (a refusal, not a failure): %v", err)
 	}
 

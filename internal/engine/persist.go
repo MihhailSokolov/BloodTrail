@@ -21,14 +21,24 @@ import (
 // match (snapshotFileTrustedAtBoot) -- so this is the write side of the
 // same watermark-gated contract boot.go enforces on the read side.
 //
-// Driver.Close calls this, best-effort, strictly AFTER engine.Stop() has
-// already run, while the pg pool is still open. That ordering is why the
-// save preconditions below are not simply WatermarkTrusted(ctx): see
-// saveSnapshotPreconditionsFor's own doc for exactly what changes, and
-// what does not, once Stop has already run -- and see saveSnapshotCommit's
-// own doc for the epoch guard that closes the specific TOCTOU window that
-// ordering alone does NOT rule out (an Apply call already in flight when
-// Stop ran, racing this method's own view/counter sampling).
+// This is the shutdown caller's entry point: Driver.Close calls this,
+// best-effort, strictly AFTER engine.Stop() has already run, while the pg
+// pool is still open. That ordering is why the save preconditions below are
+// not simply WatermarkTrusted(ctx): see saveSnapshotPreconditionsFor's own
+// doc for exactly what changes, and what does not, once Stop has already
+// run -- and see saveSnapshotCommit's own doc for the epoch guard that
+// closes the specific TOCTOU window that ordering alone does NOT rule out
+// (an Apply call already in flight when Stop ran, racing this method's own
+// view/counter sampling).
+//
+// There is a SECOND caller of this same save machinery -- runCompaction
+// (compact.go), which runs while the engine is very much still serving live
+// traffic, Stop's own guarantees notwithstanding -- reached through
+// saveSnapshotAfterCompaction, below, rather than through this exported
+// method: the two share every step here except one, gated by the
+// requireEmptyDelta parameter saveSnapshotCommit's own doc explains in
+// full. This method always passes false (fold whatever delta is there, the
+// original shutdown-caller behavior, unchanged).
 //
 // The work is split into saveSnapshotProbe (read-only: sample applyEpoch,
 // then run the pg watermark round trip) and saveSnapshotCommit (locked:
@@ -46,11 +56,13 @@ import (
 //     snapshotFilePath reports this without ever touching the filesystem.
 //   - No snapshot has ever been adopted (e.snap.Load() == nil).
 //   - The save preconditions don't hold, epoch included -- logged (Debug
-//     for an ordinary precondition miss, Warn for an epoch mismatch, since
-//     that specifically means a write was almost lost) purely for an
-//     operator's observability; Driver.Close treats every SaveSnapshot
-//     outcome as best-effort regardless, so neither is ever surfaced as
-//     something the caller has to react to.
+//     for an ordinary precondition miss, Warn for an epoch mismatch) purely
+//     for an operator's observability; every caller of this save machinery
+//     treats its outcome as best-effort regardless, so neither is ever
+//     surfaced as something the caller has to react to. What an epoch
+//     mismatch actually costs differs by caller -- see the Warn log's own
+//     doc in saveSnapshotCommit for why this is worded caller-neutrally
+//     rather than assuming the shutdown caller's stakes.
 //
 // A failure past that point -- Fold, or WriteSnapshotFile itself -- is
 // logged at Warn and returned as an error. Driver.Close logs nothing
@@ -58,6 +70,24 @@ import (
 // (see its own doc): SaveSnapshot must never be the reason a graceful
 // shutdown blocks or aborts.
 func (e *Engine) SaveSnapshot(ctx context.Context) error {
+	return e.saveSnapshot(ctx, false)
+}
+
+// saveSnapshotAfterCompaction is runCompaction's own entry point into this
+// file's save machinery (compact.go, right after a successful
+// adoptCompaction): identical to the exported SaveSnapshot except it passes
+// requireEmptyDelta=true through to saveSnapshotCommit, whose own doc
+// explains exactly what that changes and why a caller running against live
+// traffic -- rather than after Stop, SaveSnapshot's own guarantee -- needs
+// it.
+func (e *Engine) saveSnapshotAfterCompaction(ctx context.Context) error {
+	return e.saveSnapshot(ctx, true)
+}
+
+// saveSnapshot is SaveSnapshot's and saveSnapshotAfterCompaction's shared
+// body -- see either exported/semi-exported wrapper's own doc for what
+// requireEmptyDelta means to saveSnapshotCommit.
+func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error {
 	path, ok := e.snapshotFilePath()
 	if !ok {
 		return nil
@@ -68,7 +98,7 @@ func (e *Engine) SaveSnapshot(ctx context.Context) error {
 	}
 
 	epoch, pgCounter, converged := e.saveSnapshotProbe(ctx)
-	return e.saveSnapshotCommit(ctx, path, epoch, pgCounter, converged)
+	return e.saveSnapshotCommit(ctx, path, epoch, pgCounter, converged, requireEmptyDelta)
 }
 
 // saveSnapshotProbe is SaveSnapshot's read-only preparation, run BEFORE
@@ -119,10 +149,9 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // blocked waiting for applyMu because an Apply is CURRENTLY holding it is
 // covered the same way: by the time Lock() returns, that Apply has already
 // bumped the epoch, so the recheck still catches it. A changed epoch is
-// therefore treated as a flat refusal -- logged at Warn, since (unlike an
-// ordinary precondition miss) this specifically means a write was almost
-// folded into a file that would have claimed not to be missing it -- with
-// no file written, exactly like every other "nothing to save this time"
+// therefore treated as a flat refusal -- logged at Warn (see that log call's
+// own doc, below, for exactly what it does and does not claim) -- with no
+// file written, exactly like every other "nothing to save this time"
 // outcome SaveSnapshot's own doc lists.
 //
 // Once the epoch is confirmed unchanged, the View, state and the trust
@@ -142,30 +171,81 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // from false to true either, so a converged=true sample never understates
 // what has actually landed.)
 //
-// Fold runs INSIDE the lock, deliberately: folding a View this size costs
-// nothing shutdown cares about (Stop has already run, so there is no
-// serving traffic contending for applyMu here, and any write racing this
-// call would fail the epoch check above regardless of how long the fold
-// takes). The file WRITE does not: applyMu is released before
-// WriteSnapshotFile's own I/O, capturing the folded snapshot and pgCounter
-// as one pair first. That release reopens a narrow window -- an Apply that
-// lands between the unlock and the write completing -- but it cannot
-// reintroduce the bug this method exists to fix: the captured (snapshot,
-// pgCounter) pair is still mutually consistent (the data folded is exactly
-// what pgCounter described when this call verified it), and the racing
-// Apply's own AdvanceWatermark moves pg's watermark counter PAST pgCounter
-// -- so the file this call is about to write will be REJECTED by the very
-// next boot's exact-match check (snapshotFileTrustedAtBoot), never trusted
-// as complete when it is not. Rejecting a file is always safe (boot.go's
-// own fallback is a genuine PostgreSQL rebuild); silently trusting a wrong
-// one is the only outcome this whole feature exists to rule out.
-func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgCounter uint64, converged bool) error {
+// requireEmptyDelta is where this method's two callers (SaveSnapshot and
+// saveSnapshotAfterCompaction, above) actually diverge, and it exists
+// because they no longer share one premise the ORIGINAL version of this
+// method -- written when SaveSnapshot had exactly one caller -- was built
+// on: "Stop has already run, so there is no serving traffic contending for
+// applyMu here" (the reasoning that used to justify folding unconditionally
+// inside this lock). That is still exactly true for SaveSnapshot's own
+// caller, Driver.Close, which calls it strictly after engine.Stop() -- but
+// saveSnapshotAfterCompaction's caller, runCompaction (compact.go), calls
+// this WHILE the engine is still serving live Apply traffic, by design: a
+// compaction runs entirely in the background, concurrently with whatever
+// writes keep arriving. A View can legitimately have a large delta layered
+// on it at that exact moment -- not the just-adopted compaction's own tiny
+// rebased tail (adoptCompaction's own doc), but whatever ordinary Apply
+// traffic has piled onto it again in the time since -- and folding THAT
+// under applyMu would block every one of those Applies for as long as the
+// fold takes, exactly the live-traffic cost this whole background-compactor
+// feature exists to avoid paying inline.
+//
+// So: when requireEmptyDelta is true, this method folds ONLY when
+// view.Segments() is already empty at this exact instant (checked below,
+// under this same lock, immediately after the precondition check) --
+// nothing layered on since whatever last cleared the delta -- in which case
+// snap is already just view.Base() and no Fold call happens AT ALL, empty
+// or not (see the code below); a non-empty delta is left entirely alone,
+// logged at Debug, and NOT written this time -- the next compaction's own
+// save attempt gets another chance once ITS OWN adoption has cleared the
+// delta again. When requireEmptyDelta is false (SaveSnapshot, the shutdown
+// caller), the original behavior is unchanged: Fold runs inside the lock
+// whenever the delta is non-empty, because for THAT caller specifically the
+// "no live traffic" premise above still holds, and a shutdown gets exactly
+// one attempt to persist whatever delta exists, empty or not.
+//
+// The file WRITE, once a snap is decided (folded or bare base), never runs
+// inside the lock either way: applyMu is released before WriteSnapshotFile's
+// own I/O, capturing the folded snapshot and pgCounter as one pair first.
+// That release reopens a narrow window -- an Apply that lands between the
+// unlock and the write completing -- but it cannot reintroduce the bug this
+// method exists to fix: the captured (snapshot, pgCounter) pair is still
+// mutually consistent (the data folded is exactly what pgCounter described
+// when this call verified it), and the racing Apply's own AdvanceWatermark
+// moves pg's watermark counter PAST pgCounter -- so the file this call is
+// about to write will be REJECTED by the very next boot's exact-match check
+// (snapshotFileTrustedAtBoot), never trusted as complete when it is not.
+// Rejecting a file is always safe (boot.go's own fallback is a genuine
+// PostgreSQL rebuild); silently trusting a wrong one is the only outcome
+// this whole feature exists to rule out.
+func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgCounter uint64, converged bool, requireEmptyDelta bool) error {
 	start := time.Now()
 
 	e.applyMu.Lock()
 
 	if e.applyEpoch.Load() != epoch {
 		e.applyMu.Unlock()
+		// Worded caller-neutrally, deliberately: an epoch mismatch means an
+		// Apply call raced this method's own probe (saveSnapshotProbe,
+		// above), so THIS save attempt cannot trust the (pgCounter,
+		// converged) pair it sampled and refuses rather than risk stamping
+		// a file with a watermark that overstates what it actually
+		// captured. Whether that write gets another chance depends
+		// entirely on which caller reached here, and this log line does
+		// not know or assume: SaveSnapshot's own shutdown caller
+		// (Driver.Close) calls this once, right before closing the pg pool
+		// for good, so a race here really can mean this file save's one
+		// and only chance to capture that write is gone (never that the
+		// write itself is "lost" -- it already landed in the live View and
+		// PostgreSQL regardless of what this file save does; only the FILE
+		// misses it, and the next boot falls back to a PostgreSQL rebuild
+		// exactly as it would with no file at all).
+		// saveSnapshotAfterCompaction's caller (runCompaction) calls this
+		// again after every future compaction, so the identical race there
+		// is simply retried next time, not a near-miss of anything. Either
+		// way, every caller of this save machinery treats its return value
+		// as best-effort (SaveSnapshot's own doc), so neither reacts to
+		// this beyond the log line.
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
 			slog.String("reason", "an Apply call landed while probing the watermark"),
 			slog.Uint64("epoch_at_probe", epoch),
@@ -188,11 +268,21 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 		return nil
 	}
 
+	segments := view.Segments()
+	if requireEmptyDelta && len(segments) > 0 {
+		e.applyMu.Unlock()
+		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot file skipped",
+			slog.String("reason", "segments pending since adoption; the next compaction's own save covers it"),
+			slog.Int("segments", len(segments)),
+		)
+		return nil
+	}
+
 	foldStart := time.Now()
 	base := view.Base()
 	snap := base
 	var foldErr error
-	if segments := view.Segments(); len(segments) > 0 {
+	if len(segments) > 0 {
 		snap, foldErr = snapshot.Fold(base, segments)
 	}
 	foldDuration := time.Since(foldStart)
@@ -303,6 +393,16 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 // earlier, successful save already left behind (or no file at all)
 // untouched for the next boot to fall back to its own pg rebuild -- always
 // correct, if sometimes slower.
+//
+// saveSnapshotAfterCompaction's caller (runCompaction, compact.go) is
+// gated by this exact same check too, unmodified: state == stateServing
+// rules out a fallback entered while that compaction's own fold was
+// running (the same reasoning adoptCompaction's own state recheck already
+// applies to publishing the fold itself, just now applied a second time to
+// persisting it), and the generation/converged half is just as meaningful
+// for that caller as for the shutdown one. What differs by caller is
+// requireEmptyDelta (saveSnapshotCommit's own doc), a check layered AFTER
+// this one, not a reason to weaken this one.
 func saveSnapshotPreconditionsFor(state int32, dirtyGen, resolvedGen uint64, converged bool) bool {
 	return state == stateServing && dirtyGen == resolvedGen && converged
 }

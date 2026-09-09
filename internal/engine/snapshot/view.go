@@ -110,9 +110,14 @@ func (v *View) SegmentCount() int {
 // Segments returns every delta Segment layered onto this View's base
 // snapshot, oldest first -- the same slice WithSegment/ensureDelta read
 // internally, exposed so a caller outside this package can hand them to
-// Fold without reaching into an unexported field. Its one caller today is
-// the engine's own SaveSnapshot (persist.go), folding a View back into a
-// single flat Snapshot before writing a snapshot file.
+// Fold without reaching into an unexported field. Its callers today are all
+// in the engine package: SaveSnapshot (persist.go), folding a View back
+// into a single flat Snapshot before writing a snapshot file, and the
+// background compactor (compact.go), which reads this slice (alongside
+// Base()) to capture what a fold should run against, decide when the stack
+// itself needs collapsing or is due for compaction, and identify exactly
+// which segments a captured prefix's tail consists of once a fold is ready
+// to adopt.
 //
 // Safe to return the backing slice directly, with no defensive copy: a View
 // is immutable once constructed (this file's own package doc), and

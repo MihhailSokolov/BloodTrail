@@ -29,11 +29,14 @@ func quietCompactTestLogger() *slog.Logger {
 // NodesOfKind/Kinds() comparisons the same way a real write-through delta
 // would.
 //
-// id must exceed every node id buildApplyView's base already carries (1-3):
-// Fold's own bigserial-monotonicity assertion (snapshot/fold.go) requires
-// every delta-added node's database id to exceed the base snapshot's
-// highest, exactly as PostgreSQL's own bigserial guarantees for a genuinely
-// new row.
+// id should avoid buildApplyView's own base ids (1-3) purely so a caller
+// gets a genuinely NEW node rather than an accidental override of one of
+// the fixture's -- not because Fold requires it: a delta-added id below
+// the base's own max id is ordinary, valid input (the F2 fix,
+// TestCompactionSurvivesLowIDTailAcrossTwoCompactions below and
+// TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips, snapshot/fold_test.go), not
+// a bigserial-monotonicity violation the way an EARLIER version of Fold
+// once mistakenly rejected it as.
 func newNodeSegment(t *testing.T, id uint64) *snapshot.Segment {
 	t.Helper()
 
@@ -61,19 +64,32 @@ func publishAppend(ctx context.Context, e *Engine, seg *snapshot.Segment) *snaps
 }
 
 // waitCompactionSettled polls until no compaction is running (e.compacting
-// back to false), or fails the test past a generous bound. Every
-// compaction in this file's tests folds a handful of nodes, so anything
-// still running past this bound is a bug (or a wedged goroutine), not a
-// slow machine.
-func waitCompactionSettled(t *testing.T, e *Engine) {
-	t.Helper()
+// back to false), returning an error past a generous bound rather than
+// failing the test itself. Every compaction in this file's and
+// TestCompactRace's own tests folds at most a handful to a few thousand
+// nodes, so anything still running past this bound is a bug (or a wedged
+// goroutine), not a slow machine.
+//
+// Returning an error, rather than calling t.Fatal directly the way an
+// earlier version of this helper did, is deliberate: t.Fatal (and the rest
+// of the FailNow family) may only be called from the goroutine actually
+// running the test function, per the testing package's own concurrency
+// contract -- and this helper is called from two different goroutines
+// across this package's tests. compact_test.go's own callers run in the
+// test's own goroutine and may call t.Fatal on the returned error directly;
+// TestCompactRace (compact_race_test.go) calls this from a SEPARATE
+// goroutine it spawns, and reports the error back through a variable for
+// the test's own main goroutine to act on -- see that call site's own
+// comment.
+func waitCompactionSettled(e *Engine) error {
 	deadline := time.Now().Add(5 * time.Second)
 	for e.compacting.Load() {
 		if time.Now().After(deadline) {
-			t.Fatal("compaction did not settle within 5s")
+			return fmt.Errorf("compaction did not settle within 5s")
 		}
 		time.Sleep(time.Millisecond)
 	}
+	return nil
 }
 
 // ---- Step 1's four required cases ---------------------------------------
@@ -104,7 +120,9 @@ func TestCompactionTriggersExactlyOnceAndMatchesUncompactedStack(t *testing.T) {
 		publishAppend(ctx, e, seg)
 	}
 
-	waitCompactionSettled(t, e)
+	if err := waitCompactionSettled(e); err != nil {
+		t.Fatal(err)
+	}
 
 	if got := e.CompactionCount(); got != 1 {
 		t.Fatalf("CompactionCount() = %d, want exactly 1", got)
@@ -224,6 +242,99 @@ func TestAdoptCompactionDiscardsWhenBaseSwapped(t *testing.T) {
 	}
 }
 
+// TestCompactionSurvivesLowIDTailAcrossTwoCompactions is the F2 finding's
+// own end-to-end reproduction at the compaction level (task-16 review): the
+// "ordinary concurrency" scenario the finding names, played out across TWO
+// real compactions rather than Fold alone (TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips,
+// snapshot/fold_test.go, covers the same shape one layer down).
+//
+// Tx B (database id 501) commits and is published FIRST; tx A (database id
+// 500, allocated by PostgreSQL's bigserial sequence BEFORE 501, but slower
+// to reach Apply) is published SECOND, landing on the view while the first
+// compaction's fold is already "in flight" (captured but not yet adopted) --
+// exactly TestAdoptCompactionRebasesSegmentsAddedDuringFold's own
+// mid-fold-injection shape. The first compaction folds base+segB only, so it
+// never sees id 500 at all; adoption rebases segA (id 500) as the new base's
+// own tail. The SECOND compaction then must fold that new base (whose max id
+// is now 501) together with segA -- a delta-added id (500) BELOW the base's
+// own max, id-for-id the shape the F2 finding says can poison every fold
+// from here on: a pre-fix Fold rejects 500 as a bigserial-monotonicity
+// violation, adoption never gets a folded snapshot to publish, the tail is
+// never cleared, and the identical failure repeats on every later attempt
+// (compaction AND SaveSnapshot) forever. This test's critical assertion is
+// that the second Fold succeeds -- see the task-16 report for this test's
+// own RED evidence against the pre-fix code.
+func TestCompactionSurvivesLowIDTailAcrossTwoCompactions(t *testing.T) {
+	ctx := context.Background()
+	baseView := buildApplyView(t) // ids 1-3
+
+	e := New(nil, nil, Config{Enabled: true, Log: quietCompactTestLogger()})
+	e.snap.Store(baseView)
+
+	// Tx B (id 501) commits first.
+	segB := newNodeSegment(t, 501)
+	v1 := publishAppend(ctx, e, segB)
+
+	// Compaction #1 captures (base, [segB]) and folds it.
+	capturedBase1 := v1.Base()
+	capturedSegs1 := v1.Segments()
+	folded1, err := snapshot.Fold(capturedBase1, capturedSegs1)
+	if err != nil {
+		t.Fatalf("Fold #1: %v", err)
+	}
+
+	// Tx A (id 500, numerically LOWER, allocated before 501 by PostgreSQL's
+	// own sequence, but slower to reach Apply) lands on the view while that
+	// fold was "in flight".
+	segA := newNodeSegment(t, 500)
+	publishAppend(ctx, e, segA)
+
+	if !e.adoptCompaction(capturedBase1, capturedSegs1, folded1) {
+		t.Fatal("adoptCompaction #1 refused; want it to adopt and rebase segA as the new tail")
+	}
+	if e.CompactionCount() != 1 {
+		t.Fatalf("CompactionCount() = %d after adoption #1, want 1", e.CompactionCount())
+	}
+
+	adopted1 := e.snap.Load()
+	if adopted1.Base() != folded1 {
+		t.Fatal("adopted1's base is not the freshly folded snapshot")
+	}
+	if adopted1.SegmentCount() != 1 {
+		t.Fatalf("SegmentCount() after adoption #1 = %d, want 1 (segA rebased as the tail)", adopted1.SegmentCount())
+	}
+
+	// Compaction #2: fold folded1 (max base id 501) together with the
+	// rebased tail carrying id 500 -- a delta-added id BELOW the base's own
+	// max. This is the exact call that fails forever under the pre-fix
+	// two-phase Fold.
+	capturedBase2 := adopted1.Base()
+	capturedSegs2 := adopted1.Segments()
+	folded2, err := snapshot.Fold(capturedBase2, capturedSegs2)
+	if err != nil {
+		t.Fatalf("Fold #2 (delta-added id 500 below base max 501): %v -- this is exactly the F2 poisoning the fix must close", err)
+	}
+
+	if !e.adoptCompaction(capturedBase2, capturedSegs2, folded2) {
+		t.Fatal("adoptCompaction #2 refused; want it to adopt")
+	}
+	if e.CompactionCount() != 2 {
+		t.Fatalf("CompactionCount() = %d after adoption #2, want 2", e.CompactionCount())
+	}
+
+	adopted2 := e.snap.Load()
+	if adopted2.SegmentCount() != 0 {
+		t.Fatalf("SegmentCount() after adoption #2 = %d, want 0", adopted2.SegmentCount())
+	}
+
+	// Content must equal the never-compacted reference: baseView + segB +
+	// segA, in publish order.
+	reference := baseView.WithSegment(segB).WithSegment(segA)
+	if err := snapshot.CheckViewsEquivalent(adopted2, reference); err != nil {
+		t.Fatalf("twice-compacted view diverges from the never-compacted reference: %v", err)
+	}
+}
+
 // ---- additional targeted coverage ---------------------------------------
 
 // TestAdoptCompactionDiscardsWhenNotServing covers adoptCompaction's second
@@ -261,7 +372,7 @@ func TestAdoptCompactionDiscardsWhenNotServing(t *testing.T) {
 // TestAdoptCompactionDiscardsWhenSegmentTailCollapsed covers the third
 // refusal condition -- segmentsAfter finding the captured prefix no longer
 // intact -- via the one production path that can actually cause it: a
-// concurrent mergeSegmentTailIfNeeded collapsing the ENTIRE segment stack
+// concurrent collapseSegmentStackIfNeeded collapsing the ENTIRE segment stack
 // (including the captured prefix) into one merged Segment while a fold was
 // in flight. The base pointer is unchanged and state stays serving, so
 // only the prefix-identity check can be what refuses this.
@@ -282,7 +393,7 @@ func TestAdoptCompactionDiscardsWhenSegmentTailCollapsed(t *testing.T) {
 		t.Fatalf("Fold: %v", err)
 	}
 
-	// Simulate mergeSegmentTailIfNeeded firing mid-fold: the same base,
+	// Simulate collapseSegmentStackIfNeeded firing mid-fold: the same base,
 	// but the one captured segment replaced by a merged Segment that is a
 	// different, freshly-built *Segment (not pointer-equal to capturedSegs[0],
 	// even though it carries equivalent content).
@@ -299,12 +410,12 @@ func TestAdoptCompactionDiscardsWhenSegmentTailCollapsed(t *testing.T) {
 	}
 }
 
-// TestMergeSegmentTailIfNeededCollapsesPastMaxSegments pins the
+// TestCollapseSegmentStackIfNeededCollapsesPastMaxSegments pins the
 // synchronous half of this file's two size bounds (Produces item (a)):
 // once a View's segment stack grows past maxSegments, the very next
 // publish collapses it down to exactly one segment, with content
 // unchanged.
-func TestMergeSegmentTailIfNeededCollapsesPastMaxSegments(t *testing.T) {
+func TestCollapseSegmentStackIfNeededCollapsesPastMaxSegments(t *testing.T) {
 	ctx := context.Background()
 	baseView := buildApplyView(t)
 
@@ -323,7 +434,7 @@ func TestMergeSegmentTailIfNeededCollapsesPastMaxSegments(t *testing.T) {
 		t.Fatalf("SegmentCount() = %d after exceeding maxSegments (%d), want 1 (collapsed)", current.SegmentCount(), maxSegments)
 	}
 	if current.Base() != baseView.Base() {
-		t.Fatal("mergeSegmentTailIfNeeded changed the base snapshot; it must only ever collapse segments, never fold")
+		t.Fatal("collapseSegmentStackIfNeeded changed the base snapshot; it must only ever collapse segments, never fold")
 	}
 
 	if err := snapshot.CheckViewsEquivalent(current, reference); err != nil {

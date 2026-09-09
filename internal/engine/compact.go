@@ -14,7 +14,7 @@ import (
 
 // maxSegments bounds how many delta Segments Apply lets a View's overlay
 // stack grow to before collapsing it, synchronously, into one merged
-// Segment (mergeSegmentTailIfNeeded). Every overlay accessor's first read
+// Segment (collapseSegmentStackIfNeeded). Every overlay accessor's first read
 // of a View pays for a full MergeSegments pass over the whole stack
 // (View.ensureDelta, snapshot/view.go) -- bounding the stack bounds that
 // one-time cost, independent of how large cfg.CompactEntries/CompactBytes
@@ -53,19 +53,58 @@ const (
 // deltaSize sums the entries (NodeCount()+EdgeCount(), tombstones
 // included -- cheap, since both are just len() of the Segment's own id
 // slices) and ApproxBytes() of every Segment in segs, without merging them
-// first.
+// first, unconditionally computing both numbers.
 //
 // This is a trigger heuristic, not the compaction itself: double-counting
 // an id two segments both touch costs nothing worse than a slightly eager
 // trigger, and computing this sum is far cheaper than computing (or
 // reusing) the fully merged delta just to decide whether it is time to
 // replace it with one.
+//
+// Unconditionally computing both numbers is the right cost model HERE --
+// runCompaction's own one-time "compaction started" log line, below -- but
+// not for maybeStartCompaction's per-Apply trigger check: a compaction is
+// already committed to running by the time runCompaction calls this, so a
+// complete log line is worth the (now O(#segments), since
+// Segment.ApproxBytes is memoized -- see its own doc) cost of computing
+// both. See deltaEntries/deltaBytes below for the two halves
+// maybeStartCompaction calls separately, and in cheapest-first order, on
+// every single Apply regardless of whether anything is actually about to
+// trigger.
 func deltaSize(segs []*snapshot.Segment) (entries int, bytes uint64) {
 	for _, seg := range segs {
 		entries += seg.NodeCount() + seg.EdgeCount()
 		bytes += seg.ApproxBytes()
 	}
 	return entries, bytes
+}
+
+// deltaEntries sums just the entry counts (NodeCount()+EdgeCount(),
+// tombstones included) of every Segment in segs -- a len() read per
+// segment, so this alone costs O(#segments) regardless of how large any
+// individual segment's own node/edge maps or property bags are.
+// maybeStartCompaction's own cost model (see its doc) computes this FIRST,
+// before ever touching ApproxBytes.
+func deltaEntries(segs []*snapshot.Segment) int {
+	var entries int
+	for _, seg := range segs {
+		entries += seg.NodeCount() + seg.EdgeCount()
+	}
+	return entries
+}
+
+// deltaBytes sums ApproxBytes() of every Segment in segs. Segment.ApproxBytes
+// is itself memoized at construction time (see its own doc), so this costs
+// O(#segments), not O(total delta size) -- but maybeStartCompaction still
+// only calls it when cfg.CompactBytes > 0 AND the entries side alone did not
+// already trip the threshold (see its doc): a sum a caller can skip entirely
+// still costs strictly less than one it has to compute, memoized or not.
+func deltaBytes(segs []*snapshot.Segment) uint64 {
+	var bytes uint64
+	for _, seg := range segs {
+		bytes += seg.ApproxBytes()
+	}
+	return bytes
 }
 
 // compactionThresholdExceeded reports whether entries/bytes have grown past
@@ -84,6 +123,14 @@ func deltaSize(segs []*snapshot.Segment) (entries int, bytes uint64) {
 // exceed. Production defaults to nonzero values for both (settings.go), so
 // this only ever behaves as "never compact" for a Config that explicitly,
 // or by test omission, leaves both at zero.
+//
+// maybeStartCompaction leans on that same zero-means-unbounded convention to
+// check the two dimensions SEPARATELY rather than always computing both up
+// front: passing 0 for whichever threshold it isn't ready to check yet (its
+// own doc) disables that half of this function for that call, without this
+// function needing a third mode of its own -- the "both zero" row this
+// type's own unit test already pins is exactly the behavior that makes a
+// single-dimension call safe.
 func compactionThresholdExceeded(compactEntries int, compactBytes size.Size, entries int, bytes uint64) bool {
 	if compactEntries > 0 && entries > compactEntries {
 		return true
@@ -94,7 +141,7 @@ func compactionThresholdExceeded(compactEntries int, compactBytes size.Size, ent
 	return false
 }
 
-// mergeSegmentTailIfNeeded is the synchronous half of this file's two size
+// collapseSegmentStackIfNeeded is the synchronous half of this file's two size
 // bounds: once view's segment stack has grown past maxSegments, it
 // collapses the ENTIRE stack into one merged Segment (MergeSegments --
 // oldest first, newest wins, exactly like the lazy per-read collapse every
@@ -126,7 +173,7 @@ func compactionThresholdExceeded(compactEntries int, compactBytes size.Size, ent
 // Returns the View the caller should treat as current from this point on:
 // either view unchanged (SegmentCount() <= maxSegments, the common case),
 // or the freshly collapsed and already-published replacement.
-func (e *Engine) mergeSegmentTailIfNeeded(ctx context.Context, view *snapshot.View) *snapshot.View {
+func (e *Engine) collapseSegmentStackIfNeeded(ctx context.Context, view *snapshot.View) *snapshot.View {
 	segs := view.Segments()
 	if len(segs) <= maxSegments {
 		return view
@@ -143,30 +190,52 @@ func (e *Engine) mergeSegmentTailIfNeeded(ctx context.Context, view *snapshot.Vi
 }
 
 // maybeStartCompaction spawns the background compaction goroutine
-// (runCompaction) exactly when three things all hold: the engine is
+// (runCompaction) exactly when four things all hold, checked in an order
+// deliberately chosen so each is at least as cheap to rule out as the one
+// before it: no compaction is already running (e.compacting.Load(), a
+// single atomic read, checked FIRST -- see below for why); the engine is
 // actually serving right now (state == stateServing -- a fallback recovery
 // rebuild is about to load a whole fresh base of its own, which would make
 // any compaction against the CURRENT base pointless work before it even
-// starts), view's delta has grown past cfg.CompactEntries or
-// cfg.CompactBytes (compactionThresholdExceeded), and no compaction is
-// already running (the `compacting` CAS -- deliberately its own flag,
-// separate from fallbackRebuilding: a compaction and a fallback rebuild are
-// unrelated operations that happen to share nothing but the applyMu they
-// each eventually take to publish, so serializing them against EACH OTHER
-// via a shared flag, rather than only against a same-kind sibling, would be
-// pure unneeded contention -- the two are kept from racing destructively by
-// adoptCompaction's own state/base rechecks at publish time instead, not by
-// preventing them from ever overlapping in the first place).
+// starts); view's delta has grown past cfg.CompactEntries or
+// cfg.CompactBytes; and, last, the `compacting` CAS itself (deliberately its
+// own flag, separate from fallbackRebuilding: a compaction and a fallback
+// rebuild are unrelated operations that happen to share nothing but the
+// applyMu they each eventually take to publish, so serializing them against
+// EACH OTHER via a shared flag, rather than only against a same-kind
+// sibling, would be pure unneeded contention -- the two are kept from racing
+// destructively by adoptCompaction's own state/base rechecks at publish time
+// instead, not by preventing them from ever overlapping in the first
+// place).
 //
-// Called from Apply, still under applyMu, right after publishing (and,
-// where it fired, after mergeSegmentTailIfNeeded has already run) -- so the
-// (base, segments) pair captured here for the spawned goroutine is exactly
-// what the very next reader would see, and capturing it under the same lock
-// that serializes every publish is what makes the capture race-free: no
-// OTHER Apply can still be appending to view's own segments slice
-// concurrently (WithSegment never mutates a View in place -- snapshot/
-// view.go's own package doc), only ever build a newer View of its own on
-// top of it.
+// This whole method is called from Apply's own tail, still under applyMu,
+// on EVERY single Apply, regardless of whether anything is actually about
+// to trigger -- so its cost in the common case (no compaction due) is this
+// method's entire concern, not a footnote. The compacting.Load() bail is
+// checked before this method ever touches view.Segments() at all,
+// specifically because every other check below costs at least O(#segments):
+// a compaction already running (the overwhelmingly common state in between
+// two triggers, once one has fired) makes every one of them -- walking
+// view's own segment slice, summing entry counts, possibly summing
+// ApproxBytes too -- pure repeated work for as long as that compaction
+// takes, for a CAS that was always going to fail anyway. The entries/bytes
+// check itself is layered the same way: deltaEntries (len()-cheap:
+// NodeCount()+EdgeCount() per segment) is computed and checked against
+// cfg.CompactEntries FIRST; deltaBytes only runs at all when
+// cfg.CompactBytes > 0 AND the entries side did not already trip the
+// threshold on its own (deltaEntries'/deltaBytes' own docs) -- a sum this
+// method can skip entirely still costs strictly less than one it has to
+// compute, independent of whether Segment.ApproxBytes is itself memoized
+// (it is; see its own doc).
+//
+// Called right after publishing (and, where it fired, after
+// collapseSegmentStackIfNeeded has already run) -- so the (base, segments) pair
+// captured here for the spawned goroutine is exactly what the very next
+// reader would see, and capturing it under the same lock that serializes
+// every publish is what makes the capture race-free: no OTHER Apply can
+// still be appending to view's own segments slice concurrently
+// (WithSegment never mutates a View in place -- snapshot/view.go's own
+// package doc), only ever build a newer View of its own on top of it.
 //
 // A fallback entered WHILE a compaction this call just started is running
 // is NOT prevented here -- state is only checked at trigger time, not for
@@ -175,6 +244,9 @@ func (e *Engine) mergeSegmentTailIfNeeded(ctx context.Context, view *snapshot.Vi
 // fold rather than adopt it over a replica that might no longer be
 // trustworthy. See that method's doc.
 func (e *Engine) maybeStartCompaction(ctx context.Context, view *snapshot.View) {
+	if e.compacting.Load() {
+		return
+	}
 	if e.state.Load() != stateServing {
 		return
 	}
@@ -184,8 +256,15 @@ func (e *Engine) maybeStartCompaction(ctx context.Context, view *snapshot.View) 
 		return
 	}
 
-	entries, bytes := deltaSize(segs)
-	if !compactionThresholdExceeded(e.cfg.CompactEntries, e.cfg.CompactBytes, entries, bytes) {
+	entries := deltaEntries(segs)
+	tripped := compactionThresholdExceeded(e.cfg.CompactEntries, 0, entries, 0)
+
+	var bytes uint64
+	if !tripped && e.cfg.CompactBytes > 0 {
+		bytes = deltaBytes(segs)
+		tripped = compactionThresholdExceeded(0, e.cfg.CompactBytes, 0, bytes)
+	}
+	if !tripped {
 		return
 	}
 
@@ -213,10 +292,10 @@ func (e *Engine) maybeStartCompaction(ctx context.Context, view *snapshot.View) 
 //
 // view must already be the engine's current, published View (e.snap.Store
 // already called) when this runs, and the caller must still hold applyMu:
-// see mergeSegmentTailIfNeeded's and maybeStartCompaction's own docs for
+// see collapseSegmentStackIfNeeded's and maybeStartCompaction's own docs for
 // why both size checks need to run inside that same critical section.
 func (e *Engine) maintainAfterPublish(ctx context.Context, view *snapshot.View) {
-	current := e.mergeSegmentTailIfNeeded(ctx, view)
+	current := e.collapseSegmentStackIfNeeded(ctx, view)
 	e.maybeStartCompaction(ctx, current)
 }
 
@@ -227,20 +306,28 @@ func (e *Engine) maintainAfterPublish(ctx context.Context, view *snapshot.View) 
 //
 // Pointer identity, not deep equality, is the right check, and is sound
 // because of one property View.WithSegment guarantees by construction
-// (snapshot/view.go): every View's segments slice is APPEND-ONLY across the
-// whole lineage descended from one base -- WithSegment always allocates a
-// fresh backing array and copies the receiver's own elements into its
-// prefix verbatim; it never mutates or reorders them. So for any two Views
-// descended from the same lineage, one's segments slice is always either an
-// exact prefix of the other's (by pointer, element for element) or the two
-// have diverged onto different bases entirely (a rebuild) -- there is no
-// third case where the same prefix LENGTH holds different segments.
-// adoptCompaction's caller already rules out the diverged-base case (its
-// own current.Base() == capturedBase check) before this ever runs, so by
-// the time this is called, a length/pointer mismatch here can only mean
-// mergeSegmentTailIfNeeded collapsed across the captured boundary while the
-// fold this is validating was in flight (see its own doc) -- and this
-// reports that honestly as "no valid tail" rather than guessing at one.
+// (snapshot/view.go): WithSegment always allocates a fresh backing array and
+// copies the receiver's own elements into its prefix verbatim; it never
+// mutates or reorders them. So for any two Views descended from the same
+// lineage PURELY through WithSegment calls, one's segments slice is always
+// either an exact prefix of the other's (by pointer, element for element) or
+// the two have diverged onto different bases entirely (a rebuild).
+//
+// That is NOT the only case this function can see, though, and it would be
+// wrong to claim it were: collapseSegmentStackIfNeeded (this file, above) is
+// a second, deliberate way for one View's segments slice to depart from
+// another's, and it does not fit either half of the append-only claim above
+// -- it REPLACES the entire stack with one freshly merged Segment, same
+// base, so the result is neither a prefix of the pre-collapse slice nor
+// prefixed by it (a length-1 slice holding a brand-new *Segment against a
+// longer one holding the originals). adoptCompaction's caller already rules
+// out the diverged-base case (its own current.Base() == capturedBase check)
+// before this ever runs, so by the time this is called, a length/pointer
+// mismatch has exactly one remaining explanation in this codebase: a
+// collapseSegmentStackIfNeeded collapse racing the fold this is validating
+// (see its own doc) -- not a mysterious third case with no explanation, and
+// not "impossible" either. Either way, this reports the mismatch honestly as
+// "no valid tail" rather than guessing at one.
 func segmentsAfter(current, captured []*snapshot.Segment) (tail []*snapshot.Segment, ok bool) {
 	if len(current) < len(captured) {
 		return nil, false
@@ -277,7 +364,7 @@ func segmentsAfter(current, captured []*snapshot.Segment) (tail []*snapshot.Segm
 //     its own trustworthy base regardless of what this compaction does.
 //  3. segmentsAfter(current.Segments(), capturedSegs) must find capturedSegs
 //     as an exact, identical prefix -- see its own doc for the one thing
-//     that can make this fail (a concurrent mergeSegmentTailIfNeeded
+//     that can make this fail (a concurrent collapseSegmentStackIfNeeded
 //     collapsing across the capture boundary) and why finding it false is
 //     always the correct, safe answer rather than a bug.
 //
@@ -341,21 +428,46 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 // returns, not before -- acceptable, since the fold's cost is bounded by
 // the very delta size that triggered this compaction, never unbounded.
 //
-// Always clears `compacting` on return (deferred, first) so a failed or
-// discarded compaction never wedges every future trigger shut.
+// `compacting` is always cleared before this goroutine's last possible
+// action, one way or another, so a failed or discarded compaction never
+// wedges every future trigger shut -- but WHEN it clears differs by exit
+// path, deliberately. Every early return (both bgCtx checks, a Fold
+// failure, and adoptCompaction's own refusal) clears it via the deferred
+// call at the top, right there at that return, since none of those paths
+// does anything further this flag needs to keep excluded. The one path
+// that reaches adoption successfully clears it EXPLICITLY, right after
+// adoptCompaction returns true and BEFORE the save below runs (the
+// deferred call at the top still fires when this goroutine actually
+// returns, but by then it is a harmless no-op second Store(false) on an
+// already-false flag) -- letting a fresh trigger (maybeStartCompaction, on
+// the very next Apply) start a NEW compaction while THIS goroutine's own
+// post-adoption save is still running, rather than block behind it purely
+// because they happen to share this goroutine.
 //
-// A successful adoption's own file save (SaveSnapshot, persist.go) is
-// best-effort, and needs no special handling to stay correct here: it runs
-// its OWN fresh probe/commit cycle (saveSnapshotProbe/saveSnapshotCommit)
-// against whatever is current by the time it acquires applyMu -- which may
-// already be newer than what this call just adopted, if another Apply or
-// even another compaction trigger ran in between -- so this call never
-// needs to hand SaveSnapshot anything about what was just adopted, and a
-// racing write can never make it persist something stale (the epoch guard
-// saveSnapshotCommit's own doc proves in full covers this exactly as it
-// covers every other SaveSnapshot caller). A failure here is logged and
-// otherwise ignored, the same tolerance Driver.Close's own SaveSnapshot
-// call extends to it.
+// That early release is safe specifically because of two things true
+// together: (1) the save below, saveSnapshotAfterCompaction, no longer
+// folds a View under applyMu the way the shutdown caller's SaveSnapshot
+// still may (saveSnapshotCommit's own doc, persist.go) -- it writes a file
+// only when the tail is already empty, so it never blocks a concurrently
+// running NEW compaction's own applyMu-guarded adoption behind a fold of
+// arbitrary size; and (2) every actual correctness question -- whether a
+// fold is still valid to adopt, whether a save still reflects the engine's
+// CURRENT state -- is answered independently by adoptCompaction's own
+// pointer/state checks and saveSnapshotCommit's own epoch check, neither of
+// which consults `compacting` at all. `compacting` exists purely to avoid
+// wasted, duplicate background work (two folds racing pointlessly over
+// updated data), never as a correctness guard substituting for those two --
+// so a NEW compaction starting while this one's save is still in flight is
+// exactly the ordinary "two independent applyMu-guarded operations
+// interleave safely" case those checks already exist to make safe, not a
+// new race this change introduces. (The file WRITE itself, if both saves
+// somehow overlap, is no different: WriteSnapshotFile, persist.go, writes
+// to a fresh temp file and renames it into place atomically, so the worst
+// two overlapping writers can do to each other is decide, via whichever
+// rename lands last, which of two self-consistent, watermark-stamped files
+// survives -- never a corrupt one; snapshotFileTrustedAtBoot's exact-match
+// check tolerates either outcome the same way it already tolerates a save
+// that simply never ran this cycle.)
 func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment) {
 	defer e.compacting.Store(false)
 
@@ -391,13 +503,19 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 		return
 	}
 
+	// Release the trigger gate BEFORE the save -- see this method's own
+	// doc for exactly why that ordering is safe. The deferred Store(false)
+	// above still fires when this goroutine returns; it is a harmless
+	// no-op by then.
+	e.compacting.Store(false)
+
 	e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction finished",
 		slog.Int("nodes", folded.NodeCount()),
 		slog.Int("edges", folded.EdgeCount()),
 		slog.Duration("duration", time.Since(start)),
 	)
 
-	if err := e.SaveSnapshot(e.bgCtx); err != nil {
+	if err := e.saveSnapshotAfterCompaction(e.bgCtx); err != nil {
 		e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: compaction snapshot save failed", slog.Any("error", err))
 	}
 }

@@ -469,21 +469,56 @@ func TestFoldAllNodesTombstoned(t *testing.T) {
 	}
 }
 
-// TestFoldAscendingIDViolationErrors covers a delta that stages a "new" node
-// id that does not exceed the base's own max id -- a bigserial monotonicity
-// violation Fold must reject by name rather than silently miscompact.
-func TestFoldAscendingIDViolationErrors(t *testing.T) {
-	base, _ := buildOverlayFixture(t) // max base id is 60
+// TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips is the F2 finding's own
+// regression test (task-16 review): a delta-added node id BELOW the base's
+// own max id must fold successfully, interleaved into its correct ascending
+// position, rather than be rejected as a bigserial-monotonicity violation.
+//
+// id 45 sits strictly between base nodes 40 and 60 (buildOverlayFixture's
+// own doc: nodes 10..60, step 10) and is not itself a base id, so
+// base.Dense(45) correctly reports it as delta-ADDED, not delta-overridden.
+// This is exactly the ordinary-concurrency shape the finding names: two
+// commits assigned ids 500 and 501 by PostgreSQL's bigserial sequence (so
+// 500 was allocated first) can still reach Apply, and therefore this
+// engine's segment stack, in either commit order -- id 501's segment can be
+// published before id 500's. A base that has already folded up through 501
+// then sees 500 arrive as a delta-added id below its own max, which is
+// indistinguishable, at Fold's level, from this fixture's deliberately
+// out-of-order id 45. Fold must merge it in ascending position, not treat
+// it as corrupt input.
+//
+// Against the pre-fix Fold (foldBaseNodes then foldAddedNodes, the latter
+// asserting every delta-added id exceeds the base's own max), this test
+// fails with "delta-added node 45 does not exceed the base snapshot's max
+// database id 60" -- see the task-16 report's RED evidence. The fix (this
+// package's foldNodes, a two-pointer ascending merge of base ids and
+// delta-added ids) makes it pass.
+func TestFoldDeltaAddedNodeBelowBaseMaxRoundTrips(t *testing.T) {
+	base, _ := buildOverlayFixture(t) // nodes 10..60 (step 10); max base id 60
+
 	sb := &SegmentBuilder{}
-	mustAddNodeState(t, sb, 45, []KindID{1}, `{}`) // 45 < 60 and not a base id
+	mustAddNodeState(t, sb, 45, []KindID{1}, `{"objectid":"S-obj-45","name":"n45"}`)
 	seg := sb.Build()
 
-	_, err := Fold(base, []*Segment{seg})
-	if err == nil {
-		t.Fatal("Fold: want an error for a delta-added node id not exceeding the base's max id, got nil")
+	folded, err := Fold(base, []*Segment{seg})
+	if err != nil {
+		t.Fatalf("Fold: %v", err)
 	}
-	if !strings.Contains(err.Error(), "45") {
-		t.Fatalf("Fold error = %v, want it to name the violating id 45", err)
+
+	foldedView := NewView(folded)
+	stacked := NewView(base).WithSegment(seg)
+
+	if foldedView.Overlay() {
+		t.Fatal("NewView(folded).Overlay() = true, want false -- Fold's output must be a plain base snapshot with no segments of its own")
+	}
+	compareViewContents(t, foldedView, stacked)
+
+	if _, ok := foldedView.Dense(45); !ok {
+		t.Fatal("folded view lost node 45 (the delta-added, below-base-max id)")
+	}
+
+	if err := CheckViewConsistent(foldedView); err != nil {
+		t.Fatalf("CheckViewConsistent(foldedView): %v", err)
 	}
 }
 

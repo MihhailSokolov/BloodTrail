@@ -49,6 +49,16 @@ type Segment struct {
 	// NodesByObjectID's single-slice-return signature is served directly
 	// from one map with no fast/slow-path split.
 	objectIndex map[string][]uint64
+
+	// approxBytes memoizes ApproxBytes' result, computed once by
+	// computeSegmentApproxBytes at construction time (SegmentBuilder.Build
+	// or MergeSegments) rather than walked afresh on every call. A Segment
+	// is immutable for the whole of its lifetime once built (this type's
+	// own doc), so computing this once is exactly as accurate as computing
+	// it on every call, and turns ApproxBytes into a plain field read --
+	// see ApproxBytes' own doc for why that matters to compact.go's
+	// deltaSize, the trigger heuristic this field exists to make cheap.
+	approxBytes uint64
 }
 
 // NodeSegState is one node's post-write state as recorded in a Segment:
@@ -233,10 +243,22 @@ const (
 	approxSegObjectIndexEntryBytes  = 24 // map bucket/pointer overhead for one objectIndex key
 )
 
-// ApproxBytes estimates this segment's own directly-owned memory footprint:
-// its id slices, state maps, added-kinds table, objectid index, and (for a
-// segment built directly by SegmentBuilder) its own prop-name table and
-// arena.
+// ApproxBytes returns this segment's own directly-owned memory footprint,
+// as estimated once by computeSegmentApproxBytes at construction time (see
+// approxBytes' own doc for why this is a memoized field read, not a fresh
+// walk of this segment's maps on every call).
+func (s *Segment) ApproxBytes() uint64 {
+	return s.approxBytes
+}
+
+// computeSegmentApproxBytes computes the estimate ApproxBytes returns: this
+// segment's id slices, state maps, added-kinds table, objectid index, and
+// (for a segment built directly by SegmentBuilder) its own prop-name table
+// and arena. Called exactly once per segment, by SegmentBuilder.Build and
+// MergeSegments, right after every other field is already set -- s itself
+// is never mutated again after that (Segment's own doc), so there is no
+// later point at which recomputing this could ever produce a different
+// answer.
 //
 // This deliberately does not follow a NodeSegState's seg pointer to any
 // *other* segment: a Segment produced by MergeSegments carries some
@@ -249,7 +271,7 @@ const (
 // the same spirit as Snapshot's and PropStore's own ApproxBytes) is worth.
 // The memory those inputs hold is the caller's to account for, by the same
 // reasoning that decides how long to keep them reachable at all.
-func (s *Segment) ApproxBytes() uint64 {
+func computeSegmentApproxBytes(s *Segment) uint64 {
 	var total uint64
 
 	total += uint64(len(s.nodeIDs)) * bytesPerUint64
@@ -517,6 +539,7 @@ func (b *SegmentBuilder) Build() *Segment {
 	s.edgeIDs = edgeIDs
 	s.edgeStates = edgeStates
 	s.objectIndex = buildSegmentObjectIndex(nodeIDs, nodeStates)
+	s.approxBytes = computeSegmentApproxBytes(s)
 
 	return s
 }
@@ -593,7 +616,7 @@ func MergeSegments(segs []*Segment) *Segment {
 	nodeIDs := sortedUint64Keys(nodeStates)
 	edgeIDs := sortedUint64Keys(edgeStates)
 
-	return &Segment{
+	merged := &Segment{
 		nodeIDs:     nodeIDs,
 		nodeStates:  nodeStates,
 		edgeIDs:     edgeIDs,
@@ -601,6 +624,8 @@ func MergeSegments(segs []*Segment) *Segment {
 		addedKinds:  addedKinds,
 		objectIndex: buildSegmentObjectIndex(nodeIDs, nodeStates),
 	}
+	merged.approxBytes = computeSegmentApproxBytes(merged)
+	return merged
 }
 
 // sortedUint64Keys returns m's keys sorted ascending. Used by MergeSegments
