@@ -5,14 +5,18 @@ packaged as a [DAWGS](https://github.com/SpecterOps/DAWGS) driver, so that attac
 analysis and every other graph query stay fast on large Active Directory environments
 and ordinary hardware.
 
-**Status:** milestone 4 (Cypher interpreter). Shortest paths, all shortest paths, and a
-defined set of structural node/relationship queries BloodHound's query builder issues are
-served from an in-memory replica when it is fresh, and so, now, is a much broader surface of
-Cypher itself -- property predicates and scans, point lookups, `shortestPath`/
-`allShortestPaths` patterns, and a range of aggregations -- reached through a real Cypher
-interpreter rather than pattern-matching a handful of recognized shapes. Every query the
-interpreter cannot (or should not) answer from memory delegates to PostgreSQL, exactly as
-before.
+**Status:** milestone 5 (write-through). Shortest paths, all shortest paths, a defined set of
+structural node/relationship queries BloodHound's query builder issues, and a broad surface
+of Cypher itself -- property predicates and scans, point lookups, `shortestPath`/
+`allShortestPaths` patterns, and a range of aggregations, reached through a real Cypher
+interpreter rather than pattern-matching a handful of recognized shapes -- are all served from
+an in-memory replica that is now kept in sync with PostgreSQL write by write instead of
+rebuilt wholesale by a poller: a recognized write updates the replica synchronously, before
+the call that made it returns, so the very next query -- even the one that write's own caller
+issues immediately after -- already sees it. Only a small, closed list of write shapes that
+cannot be expressed that way fall back to PostgreSQL temporarily while the replica rebuilds in
+the background; see [Write-through](#write-through). Every query the engine cannot (or should
+not) answer from memory delegates to PostgreSQL, exactly as before.
 
 ## Why
 
@@ -43,17 +47,110 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   [Query-builder serving](#query-builder-serving), and
   [Cypher interpreter](#cypher-interpreter) for what is actually served from the
   replica today.
-- PostgreSQL remains the system of record. Writes go to PostgreSQL first; the replica
-  itself is rebuilt wholesale from PostgreSQL by a poller (after every completed
-  analysis run, and again once the ingest/analysis pipeline goes idle following a
-  write) rather than updated write-through, and there is no snapshot-file restart yet.
+- PostgreSQL remains the system of record. Writes go to PostgreSQL first, through
+  BloodTrail's own driver; the driver then replays that same write into its in-memory
+  replica before returning to the caller -- no rebuild, no polling, no window in which
+  the replica is stale for a write it has already told the caller succeeded. See
+  [Write-through](#write-through) for exactly which writes this covers and what happens
+  to the rare ones it doesn't.
+- A snapshot file (`BLOODTRAIL_SNAPSHOT_DIR`) lets a restart skip PostgreSQL entirely:
+  the current replica is written to disk, stamped with a watermark counter, on a clean
+  shutdown and after every background compaction; the next boot loads it only if that
+  stamp still matches PostgreSQL's own counter exactly, and falls back to a normal
+  PostgreSQL rebuild otherwise. See [Write-through](#write-through).
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
   rollback.
-- **Planned, not yet built** (see [Roadmap](#roadmap)): write-through updates to the
-  replica on commit instead of a poller-driven rebuild, and loading/restoring the
-  replica from a snapshot file on startup.
+
+## Write-through
+
+Every write BloodHound's driver call makes -- ingest's objectid-keyed upserts, analysis's
+node/relationship creates and updates, tagging, derived-edge recomputation's deletes, and
+so on -- is replayed into the in-memory replica synchronously, inside the same call that
+performs the write, before that call returns to its caller. There is no rebuild in the
+normal case, and no window in which the replica can be stale relative to a write the
+caller has already been told committed.
+
+- **How.** BloodTrail's write observers record what each write actually did -- not just
+  which kinds it touched -- into a change log. Once the write has committed in
+  PostgreSQL, the driver reads back every key that change log named (by id, objectid, or
+  endpoint triple) and turns the result into one new immutable delta layered on top of
+  the engine's current in-memory state: a row that still exists is an upsert, a row
+  that's gone is a tombstone -- this covers ordinary deletes, cascaded edge removal, and
+  a partially-applied batch uniformly, since "absent on read-back" means the same thing
+  regardless of which of those produced it. That delta is what every query issued after
+  the write returns already sees.
+- **SERVING and FALLBACK.** The engine is always in one of two states. In **SERVING**
+  (the normal state), every query is answered from an up-to-date in-memory view and
+  every write updates it as above. A write whose effect cannot be expressed as such a
+  delta -- the closed list below -- flips the engine to **FALLBACK**: every query
+  delegates to PostgreSQL (still correct, just not accelerated) while one background
+  rebuild reloads the whole replica from PostgreSQL from scratch; the engine returns to
+  SERVING the instant that rebuild lands. This is the only rebuild that ever happens
+  outside of process startup.
+- **The closed fallback list.** Only these write shapes trip FALLBACK -- every other
+  write applies incrementally as above:
+  - Mutating Cypher sent through `Query`/`Raw` (raw Cypher text can do anything, so it
+    isn't parsed to find out what it actually changed).
+  - `Run`, the driver-level raw-connection call (same reasoning).
+  - `WipeGraph` (a full graph truncation -- rebuilding an empty graph afterwards is
+    instant anyway).
+  - `SetDefaultGraph` (retargeting which graph is "the" graph the engine is replicating).
+  - A write issued through `WithGraph` against a graph other than the default one.
+  - A `NodeQuery`/`RelationshipQuery` `.Update`/`.Delete` call whose criteria aren't one
+    of the shapes BloodTrail's recognizer can enumerate (an id-list criterion is;
+    an arbitrary predicate isn't).
+
+  Every one of these is rare in an ordinary BloodHound deployment -- an admin action, not
+  anything ingest or analysis routinely does -- which is exactly why falling back to a
+  background rebuild, rather than teaching the replica to interpret arbitrary mutating
+  Cypher or arbitrary delete/update criteria, is the right answer for them. The
+  write-through differential test suite enforces that the list stays exhaustive: every
+  write shape not on it is asserted to apply incrementally with the replica left equal to
+  PostgreSQL, immediately, with rebuilds disabled.
+- **Single-writer trust model.** PostgreSQL stays the system of record, and the same
+  trust assumption the pre-write-through engine already made still holds: this engine
+  only knows about writes that go through *this* driver instance. A write made directly
+  against PostgreSQL (`psql`, a second, unpatched server) is invisible to it, exactly as
+  it always was. A second *BloodTrail-patched* server writing the same database is now at
+  least detected at boot -- see Watermark, next -- rather than silently missed forever,
+  but the supported deployment shape is still a single API server process.
+- **Watermark.** A single-row table, `bloodtrail_watermark`, holds a counter that every
+  mutating driver call bumps before its own effect reaches PostgreSQL (inside the same
+  transaction where one exists, so a rolled-back write's bump rolls back with it). This
+  is what makes the snapshot file (next) safe to trust: a file stamped with counter N is
+  provably complete for every write up to N, because the counter cannot have advanced
+  without a write whose effect the file's own build would then be missing.
+- **Snapshot file.** Set `BLOODTRAIL_SNAPSHOT_DIR` to let a restart skip the PostgreSQL
+  rebuild. The engine writes a versioned binary snapshot of its current in-memory state,
+  stamped with the watermark counter that was live at that instant, at two points: on a
+  graceful shutdown, and after every background compaction (next). At boot, it loads
+  that file only if its stamped counter is *exactly* equal to PostgreSQL's counter at
+  that moment -- ahead or behind either one, the file is rejected and the engine falls
+  back to a normal PostgreSQL rebuild. Equality, not "close enough," is deliberate: any
+  write that landed between the file being written and the process starting again makes
+  the file wrong, not merely stale, and there is no safe way to patch it up short of
+  rebuilding. (A freshly started process needs one thing before either load can even be
+  attempted: which graph is the default one, which only resolves once the caller makes
+  its own `AssertSchema` call -- unavoidable, since the driver's `Open` call has to
+  return that same caller its driver handle before it can call anything on it at all.
+  Every ordinary boot briefly waits out that one call, logged at Debug
+  (`bloodtrail: boot load waiting for the default graph`) since it is expected on every
+  startup, not a fault; a caller that never makes that call at all is a broken
+  integration -- one with no default graph to query at all, not a supported deployment
+  shape -- so this stays a Debug-level detail rather than an operator-facing warning.)
+- **Compaction.** Every applied write layers one more delta on top of the engine's base
+  snapshot; past a size threshold (`BLOODTRAIL_COMPACT_ENTRIES`/`BLOODTRAIL_COMPACT_BYTES`,
+  see Configuration below), a background compaction folds the base and every delta into
+  a fresh base entirely in memory -- no PostgreSQL round trip, no JSON parsing, the two
+  costs that make a full rebuild slow. Ordinary writes keep applying (as further deltas)
+  while a compaction runs; when it finishes, it also writes the snapshot file, so a
+  restart always resumes from something no older than the last compaction.
+
+See [bench/applybench](bench/applybench) for the write-through path's own measurements
+(apply overhead against a write-through-disabled baseline, query latency while a delta is
+populated, compaction duration, and snapshot file write/load/boot time, all at 5M scale).
 
 ## In-memory path engine
 
@@ -72,51 +169,78 @@ are correct regardless of the replica's state.
   retired in its favor). Every other read -- entity panels, node search, tagging -- is
   unaffected and always goes to PostgreSQL, exactly as in milestone 1.
 
-- **Freshness and fallback.** The engine keeps a compressed in-memory replica (node/edge ids,
-  kinds, and, as of milestone 4, node property bags; edge properties are still hydrated from
-  PostgreSQL per query -- see [Cypher interpreter](#cypher-interpreter)), rebuilt from
-  PostgreSQL after every completed analysis run and again after a write once the
-  ingest/analysis pipeline goes idle.
-  A query is served from memory only if the engine is enabled, a snapshot exists, that snapshot
-  is still current (no write has landed since it was built), the query's endpoints resolve
-  inside it, and the traversal fits the request's own memory budget. Any of these failing --
-  disabled, no snapshot yet, a write in flight, an unrecognized query shape, or too large a
+- **Serving.** The engine keeps a compressed in-memory replica (node/edge ids, kinds, node
+  property bags, and, since milestone 5, every write-through delta layered on top of it --
+  see [Write-through](#write-through)); edge properties are still hydrated from PostgreSQL
+  per query -- see [Cypher interpreter](#cypher-interpreter). A path query is served from
+  memory only if the engine is in the SERVING state (not FALLBACK), the query's endpoints
+  resolve inside the current view, and the traversal fits the request's own memory budget.
+  Any of these failing -- disabled, FALLBACK, an unrecognized query shape, or too large a
   traversal -- makes the engine decline outright and PostgreSQL answers instead; the only
   difference an operator or user should ever see is latency.
 
-- **Single-writer assumption.** PostgreSQL stays the system of record: every write goes there
-  first, through BloodTrail's own driver. The engine notices a write happened (invalidating its
-  current snapshot) through that same driver call, then rebuilds once the pipeline is next idle
-  or an analysis run completes. This means the engine assumes it is the only path writes take
-  to the graph tables -- the normal shape of a BloodHound CE deployment, a single API server
-  process. A second process writing to the same PostgreSQL graph without going through this
-  driver instance would go unnoticed until the next analysis run.
-
 - **Configuration** (environment variables, read once at driver startup):
   - `BLOODTRAIL_ENGINE` -- `on` (default) or `off` (also accepts `true`/`false`/`1`/`0`).
-    `off` makes every read delegate straight to PostgreSQL, as in milestone 1.
-  - `BLOODTRAIL_ENGINE_POLL_INTERVAL` -- the poller's rebuild-check cadence, parsed with Go's
-    `time.ParseDuration` (e.g. `5s`, `1m`). Defaults to `5s`.
+    `off` makes every read delegate straight to PostgreSQL, as in milestone 1; writes still
+    bump the watermark (see [Write-through](#write-through)) but the engine never applies or
+    serves anything.
+  - `BLOODTRAIL_SNAPSHOT_DIR` -- directory for the snapshot file described in
+    [Write-through](#write-through). Unset (the default) disables the feature entirely: no
+    file is ever read or written, and every boot rebuilds from PostgreSQL.
+  - `BLOODTRAIL_COMPACT_ENTRIES` / `BLOODTRAIL_COMPACT_BYTES` -- how large the write-through
+    delta may grow, in entries and approximate bytes respectively, before a background
+    compaction folds it back into the base snapshot (see [Write-through](#write-through)).
+    Default to `1000000` entries and `512MiB`. `0` on either means "no bound on that
+    dimension" (the same convention `BLOODTRAIL_MEMORY_LIMIT` below uses), not "compact on
+    every write"; `0` on both disables compaction outright.
   - `BLOODTRAIL_MEMORY_LIMIT` -- caps the replica's approximate resident size (e.g. `4GiB`,
-    `512MiB`, or a plain byte count). A rebuild that would exceed it is refused, and the engine
-    keeps serving from (or falling back from) whatever snapshot it already had. Unset or `0`
-    means unbounded.
+    `512MiB`, or a plain byte count). A rebuild, or an applied write, that would push the
+    replica's base-plus-delta size past this limit is refused instead: the engine enters
+    FALLBACK and retries the resulting rebuild on the existing rate-limited backoff, the same
+    way it already recovers from any other fallback trigger. Unset or `0` means unbounded.
   - `BLOODTRAIL_LOG_LEVEL` -- `debug`, `info`, `warn`, or `error`. When set, it widens the
     minimum level BloodTrail's own log lines are guaranteed to be visible at, on top of
     whatever already configures the process's logger -- it can only add visibility, never
     take it away. Left unset, it is a complete no-op. `debug` is what surfaces e.g.
-    `bloodtrail: builder engine served`.
+    `bloodtrail: builder engine served` and `bloodtrail: write-through applied`.
 
-- **Log markers**, all under a `bloodtrail:` prefix: `bloodtrail: snapshot rebuilt` (Info, on
-  every successful rebuild), `bloodtrail: snapshot rebuild refused: exceeds memory limit`
-  (Warn, rate-limited), `bloodtrail: path engine served` (Info, once per shortest-path query
-  actually answered from memory), `bloodtrail: path engine declined` (Debug, with a `reason`
-  attr, whenever a shortest-path query fell back to PostgreSQL), their query-builder
-  counterparts `bloodtrail: builder engine served` / `bloodtrail: builder engine declined`,
-  and their Cypher-interpreter counterparts `bloodtrail: cypher engine served` /
-  `bloodtrail: cypher engine declined` (all three of these last pairs Debug -- a structural
-  or Cypher query runs far more often than a shortest-path one, so these stay one level
-  quieter).
+- **Log markers**, all under a `bloodtrail:` prefix, grouped by what they cover:
+  - **Serving**: `bloodtrail: path engine served` (Info, once per shortest-path query
+    actually answered from memory) / `bloodtrail: path engine declined` (Debug, with a
+    `reason` attr); their query-builder counterpart `bloodtrail: builder engine served` /
+    `bloodtrail: builder engine declined` (both Debug); and the Cypher interpreter's own
+    `bloodtrail: cypher engine served` (Debug) -- a *declined* Cypher query logs the
+    shared `bloodtrail: path engine declined` line above rather than a distinct marker of
+    its own, since only the served side needed one to stay distinguishable from the path
+    engine's identically-shaped success case.
+  - **Write-through apply**: `bloodtrail: write-through applied` (Debug, per committed write
+    that updated the replica) and `bloodtrail: segment stack merged` (Debug, when an
+    overgrown delta stack is synchronously collapsed -- an internal bookkeeping event, not a
+    fallback).
+  - **Fallback**: `bloodtrail: fallback entered` (Warn, with a `reason` attr -- one of the
+    closed list in [Write-through](#write-through), a read-back/segment-build/memory-limit
+    failure, or a watermark bump that itself failed) and `bloodtrail: fallback exited`
+    (Info, once the recovery rebuild lands and serving resumes).
+  - **Rebuild** (boot, or fallback recovery -- the only two triggers left): `bloodtrail:
+    snapshot rebuilt` (Info, on every successful rebuild), `bloodtrail: snapshot rebuild
+    refused: exceeds memory limit` (Warn, rate-limited), `bloodtrail: boot load waiting for
+    the default graph` (Debug, expected on every ordinary startup -- see
+    [Write-through](#write-through)'s own note), `bloodtrail: boot load failed` (Warn) and
+    `bloodtrail: fallback rebuild failed` (Warn).
+  - **Watermark**: `bloodtrail: watermark bump failed` (Warn) and `bloodtrail: watermark table
+    DDL failed` (Warn).
+  - **Snapshot file**: `bloodtrail: snapshot file loaded` (Info), `bloodtrail: snapshot file
+    rejected` (Info, with a `reason` attr) / `bloodtrail: no snapshot file` (Debug, the
+    ordinary first-boot case), `bloodtrail: snapshot file written` (Info) / `bloodtrail:
+    snapshot file not written` (Debug or Warn, depending on why) / `bloodtrail: snapshot file
+    skipped` (Debug), `bloodtrail: snapshot file write failed` (Warn), and `bloodtrail:
+    removed stale snapshot temp file` (Info, a boot-time reap of a file an earlier process's
+    write left half-finished).
+  - **Compaction**: `bloodtrail: compaction triggered` (Debug), `bloodtrail: compaction
+    started` / `bloodtrail: compaction finished` (Info, the latter with `duration`, `nodes`
+    and `edges` attrs), `bloodtrail: compaction discarded` (Info, a stale fold safely thrown
+    away rather than adopted) and `bloodtrail: compaction failed` / `bloodtrail: compaction
+    snapshot save failed` (Warn).
 
 ## Query-builder serving
 
@@ -125,12 +249,13 @@ builder** -- the fluent `Nodes()`/`Relationships()` API BloodHound's own Go code
 internally, as distinct from a user's Cypher text. This is what backs, among other
 things, the entity panel's member and controller listings and the structural scans
 analysis itself issues while recomputing derived edges and tags. When a builder query
-matches one of a defined set of structural shapes, and the replica is fresh enough for
-it, BloodTrail answers it from memory instead of PostgreSQL:
+matches one of a defined set of structural shapes, and the engine is in the SERVING
+state (see [Write-through](#write-through)), BloodTrail answers it from memory instead
+of PostgreSQL:
 
 - **Node queries** -- count, fetch ids, or fetch id-plus-kind listings -- for any query
-  constrained by at least one node-kind filter. An `id()`-only filter has no kind to
-  check freshness against, so it always delegates.
+  constrained by at least one node-kind filter. An `id()`-only filter matches none of the
+  recognizer's shapes (all of which key off a kind constraint), so it always delegates.
 - **Relationship queries** -- count, fetch ids, fetch (id, start, end) triples, and fetch
   id-plus-kind-annotated triples -- for any combination of an edge-kind filter and
   endpoint id/kind filters.
@@ -150,18 +275,16 @@ ordering/offset/limit the engine doesn't implement, or a caller-supplied row
 projection -- the same "engine declines, PostgreSQL always answers correctly" contract
 the path engine already has.
 
-- **Kind-scoped freshness.** Every write is now recorded against the specific node and
-  edge kinds it actually touched, not only as a blanket "something changed." A builder
-  query is served only if every kind it can observe is clean since the replica was
-  built: a node query's own kind constraints; a relationship query's edge-kind filter,
-  plus, if it also constrains either endpoint by kind, that endpoint's kinds too. A
-  write to an unrelated kind elsewhere in the graph no longer blocks it. Shortest-path
-  queries are unaffected by this and keep milestone 2's coarser rule -- any write at all
-  invalidates them until the next rebuild. That rebuild now also happens, up to twice,
-  *during* a running analysis: once as analysis starts, so builder queries over
-  untouched source kinds keep serving fresh reads while analysis is still writing its
-  own derived kinds, and once more if that first rebuild is itself made stale by
-  analysis's own earliest writes.
+- **Serving.** Every recognized builder-query shape above is served whenever the engine
+  is in the SERVING state and resolves against the current in-memory view -- the same
+  SERVING/FALLBACK model every other serving path uses; see
+  [Write-through](#write-through). Milestone 3's original per-kind freshness marks (a
+  builder query served only if the specific kinds it touched hadn't been written to
+  since the replica was last rebuilt) are gone: write-through means the replica's delta
+  already reflects every kind's own latest state at all times, so there is no separate
+  freshness check left to make -- the same single SERVING check that already covered
+  shortest-path queries now covers builder queries too, and just as cheaply (a read
+  against an empty delta costs nothing beyond what it always cost).
 
 - **Memory.** Serving relationship queries needs a bit more than the path engine's bare
   topology: each edge's own database id (~8 bytes), a reverse-index pointer back to it
@@ -170,9 +293,9 @@ the path engine already has.
   properties and an objectid index on top of that in turn -- see
   [Cypher interpreter](#cypher-interpreter)'s own Memory note for the full formula and
   the measured total at 4.76 million nodes / ~48.9 million edges. `BLOODTRAIL_MEMORY_LIMIT`
-  (see Configuration above) caps the whole replica the same way it always has: a
-  rebuild that would exceed it is refused, and the engine keeps serving (or falling
-  back from) whatever snapshot it already had.
+  (see Configuration above) caps the whole replica -- base snapshot plus any
+  write-through delta layered on it -- the same way it always has: a rebuild, or an
+  applied write, that would exceed it is refused instead.
 
 See [bench/builderbench](bench/builderbench) for the measurement.
 
@@ -249,14 +372,14 @@ query BloodHound's UI ships.
     the two clocks (and the two instants) drift apart -- ordinarily far too small to
     change which rows an `inactive for N days`-style query returns, but a real
     difference in principle, not merely a rounding note.
-- **Freshness.** Unlike milestone 3's kind-scoped builder-query freshness, Cypher
-  serving uses the coarser whole-generation rule shortest-path queries already have:
-  the replica must be the current, unmodified snapshot from the moment planning starts
-  through the moment execution finishes -- any write landing in between, anywhere in
-  the graph, makes the engine decline and PostgreSQL answers instead. A Cypher query
-  can touch far more of the schema than a single builder-query shape's own kind
-  constraints can express, so this milestone keeps the simpler, stricter rule rather
-  than trying to derive per-query kind scopes for arbitrary Cypher.
+- **Serving.** Cypher queries are served under the same SERVING/FALLBACK model as every
+  other serving path (see [Write-through](#write-through)): a query runs from planning
+  through execution against one immutable in-memory view -- the current base-plus-delta
+  state at the moment it starts -- with no recheck needed once execution finishes. That
+  matches what a single Cypher statement against PostgreSQL already does (one statement,
+  one PostgreSQL snapshot), so the two stay equivalent without this engine needing its
+  own per-query kind scoping the way milestone 3's now-retired builder-query freshness
+  marks once attempted.
 - **Budgets.** A served query is capped at 100,000 result rows and a generous internal
   work-unit budget (node/adjacency inspections during execution), and an unbounded
   variable-length relationship pattern (a bare `*`, `*1..`, `*..`) is capped at 15 hops
@@ -287,9 +410,9 @@ query BloodHound's UI ships.
   objectid index, and the kind name table together -- comes to about 3.76 GiB (~4.0 GB).
 
 `BLOODTRAIL_MEMORY_LIMIT` bounds the whole replica -- topology, builder-query indices,
-properties, and the objectid index together -- exactly as it always has: a rebuild that
-would exceed it is refused, and the engine keeps serving (or falling back from)
-whatever snapshot it already had.
+properties, and the objectid index together, plus any write-through delta layered on
+top -- exactly as it always has: a rebuild, or an applied write, that would exceed it is
+refused instead (see [Write-through](#write-through)).
 
 See [bench/cypherbench](bench/cypherbench) for the measurement.
 
@@ -356,14 +479,22 @@ v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
 2. Path engine: shortest paths, all shortest paths and reachability from memory.
 3. Query-builder execution from the replica: entity panels, post-processing, tagging.
 4. Cypher interpreter for pre-built and user queries.
-5. Write-through, so the replica is never stale.
+5. Write-through, so the replica is never stale. **Done.** What's still explicitly out of
+   scope: interpreting mutating Cypher and arbitrary update/delete criteria (both stay a
+   fallback trigger rather than an incremental apply -- see
+   [Write-through](#write-through)'s closed fallback list); and cache coherence across more
+   than one BloodTrail-patched process writing the same database, beyond the boot-time
+   watermark detection [Write-through](#write-through) already describes.
 
 ## Repository layout
 
 ```
-internal/engine/       The in-memory engine: snapshot rebuild/poller, kind-scoped
-                       freshness marks, endpoint resolution and traversal, builder-query
-                       serving, and the Cypher interpreter (internal/engine/interpret)
+internal/engine/       The in-memory engine: write-through apply and the SERVING/FALLBACK
+                       state (apply.go), the watermark trust protocol (watermark.go), the
+                       snapshot file and background compaction (persist.go, compact.go),
+                       boot-load and fallback recovery (boot.go), endpoint resolution and
+                       traversal, builder-query serving, and the Cypher interpreter
+                       (internal/engine/interpret)
 cmd/bloodtrail/        CLI: installs/verifies/reports on/rolls back the driver in an
                        existing BloodHound CE compose deployment
 bench/csrbench/        CSR traversal micro-benchmark (self-contained Go module)
@@ -371,6 +502,7 @@ bench/adgen/           Generates a synthetic AD-shaped graph and loads it into P
 bench/pathbench/       Benchmarks the in-memory path engine against a loaded graph
 bench/builderbench/    Benchmarks query-builder serving against a loaded graph
 bench/cypherbench/     Benchmarks Cypher-interpreter serving against a loaded graph
+bench/applybench/      Benchmarks the write-through apply path against a loaded graph
 build/                 Builds a BloodHound CE image with the BloodTrail driver compiled
                        in (build-image.sh) and the e2e smoke-test script (e2e.sh)
 patches/               The upstream BloodHound CE source patch this driver is built

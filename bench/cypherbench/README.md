@@ -46,10 +46,10 @@ per driver (comparing result row counts as a correctness guard) followed by
 
 Before any shape is measured, `cypherbench` measures a snapshot build
 (`engine.LoadSnapshot`, reporting nodes/edges/`ApproxBytes`), then waits for
-the bloodtrail driver's background poller to build its own first snapshot,
-exactly as `builderbench` does (there is no exported hook to observe that
-completing, so the wait is a safety multiple of the just-measured build cost
-plus the poller's own poll interval, printed alongside it). After all five
+the bloodtrail driver's boot-load goroutine to finish loading its own first
+snapshot from PostgreSQL, exactly as `builderbench` does (there is no
+exported hook to observe that completing, so the wait is a safety multiple
+of the just-measured build cost, printed alongside it). After all five
 shapes, it runs a second, separately timed `LoadSnapshot` call purely to
 report rebuild cost.
 

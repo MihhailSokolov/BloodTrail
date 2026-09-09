@@ -5,9 +5,9 @@ dawgs' structural `Nodes()`/`Relationships()` query builder, as opposed to
 [`bench/pathbench`](../pathbench)'s shortest-path queries -- against a graph
 already loaded into PostgreSQL, normally by [`bench/adgen`](../adgen).
 
-Unlike `pathbench` (which constructs `internal/engine` directly, bypassing
-the poller via a manual rebuild call), `builderbench` opens the *real*
-production driver -- `dawgs.Open(ctx, bloodtrail.DriverName, cfg)`, exactly
+Unlike `pathbench` (which constructs `internal/engine` directly, calling
+`LoadSnapshot` itself rather than opening a driver), `builderbench` opens the
+*real* production driver -- `dawgs.Open(ctx, bloodtrail.DriverName, cfg)`, exactly
 as BloodHound would -- because the shapes benchmarked here are intercepted
 by the driver's `Nodes()`/`Relationships()` wrapping, not by
 `internal/engine`'s traverse package. A second `dawgs.Open(ctx,
@@ -59,26 +59,20 @@ faster serving from memory is than delegating to PostgreSQL.
 ### Waiting for the snapshot
 
 Before any shape is measured, `builderbench` waits for the bloodtrail
-driver's background poller to build its first in-memory snapshot. There is
-no exported way to observe that build completing from outside the driver,
-so `builderbench` instead:
+driver's boot-load goroutine (`internal/engine`'s `Start`, launched from
+`dawgs.Open`) to finish loading its first in-memory snapshot from
+PostgreSQL -- the one rebuild write-through still does, at process startup
+(see the root README's [Write-through](../../README.md#write-through)).
+There is no exported way to observe that load completing from outside the
+driver, so `builderbench` instead:
 
 - times its own throwaway `engine.LoadSnapshot` call against the same data
   (this doubles as the cheap node/edge/byte counts it prints), then
-- sets `BLOODTRAIL_ENGINE_POLL_INTERVAL=200ms` before opening the
-  bloodtrail driver, and
-- sleeps a safety multiple of the measured build cost plus the poll
-  interval, printing the wait duration (`BUILDERBENCH_WAIT`).
+- sleeps a safety multiple of that measured cost, printing the wait
+  duration (`BUILDERBENCH_WAIT`).
 
 This scales with graph size automatically, unlike a fixed sleep -- at 5M
-nodes the wait is dominated by the measured build cost, not the poll
-interval.
-
-`builderbench` also creates a scratch `datapipe_status` row (dropped when
-it's done) so the poller's tick -- which otherwise does nothing at all if
-that table doesn't exist -- can succeed at all. See `createDatapipeStatusTable`'s
-doc in `main.go` for why: without it, the engine never builds a snapshot and
-every ratio comes back near 1x, not an error.
+nodes the wait is dominated by the measured build cost.
 
 ## `-enforce`
 
@@ -189,12 +183,6 @@ go run ./bench/adgen -dsn "$BLOODTRAIL_TEST_PG" -users 2000 -wipe
 go run ./bench/builderbench -dsn "$BLOODTRAIL_TEST_PG"
 ```
 
-**Important: `builderbench` requires a dedicated benchmark database.** It
-will refuse to run if `datapipe_status` already exists, since this guards
-against accidentally running against a real BloodHound installation where the
-deferred table drop would destroy live pipeline state. Always point `-dsn` at
-a database created and loaded by `adgen` for benchmarking only.
-
 Do **not** pass `-enforce` at small scale: a 2,000-user graph is small
 enough that PostgreSQL itself answers most of these shapes from cache in a
 millisecond or two, so the ratios (while still visibly greater than 1x on
@@ -206,9 +194,8 @@ realistically sized graph (see the 5M workflow below), the same way
 `-wipe` truncates the `node`/`edge` tables for *every* graph in the
 database, not just the one about to be loaded -- fine for a disposable test
 database (integration tests reseed their own data on every run), but don't
-point it at anything you care about. `builderbench` itself never writes
-graph data; the only write is its own scratch `datapipe_status` row,
-created and dropped within one run.
+point it at anything you care about. `builderbench` itself never writes any
+graph data of its own.
 
 ### Smoke-testing the `-pg-cap` path
 
