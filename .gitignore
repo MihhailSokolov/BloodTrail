@@ -7,6 +7,7 @@
 /pathbench
 /builderbench
 /cypherbench
+/applybench
 bench/csrbench/csrbench
 
 # Benchmark and render scratch

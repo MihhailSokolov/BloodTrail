@@ -1,4 +1,4 @@
-.PHONY: test lint integration build-image tidy bench-path bench-builder bench-cypher
+.PHONY: test lint integration build-image tidy bench-path bench-builder bench-cypher bench-apply
 
 test:
 	go test ./...
@@ -39,6 +39,19 @@ bench-builder: ## run the builder-query benchmark against BLOODTRAIL_TEST_PG
 # PostgreSQL query; never pass -enforce in CI (see bench/cypherbench).
 bench-cypher: ## run the cypher-interpreter benchmark against BLOODTRAIL_TEST_PG
 	go run ./bench/cypherbench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
+
+# Generates a fresh graph via bench/adgen (ARGS forwarded to adgen -- e.g.
+# ARGS='-users 50000') and then runs the write-through apply benchmark
+# (sustained apply throughput, query latency during active ingest,
+# compaction duration, snapshot file write/load duration) against it.
+# -enforce fails the build if apply overhead or during-ingest p95 miss their
+# (PROVISIONAL, see bench/applybench/README.md) bars; every phase is bounded
+# by applybench's own -cap watchdog (default 10m per operation), which
+# ABORTS THE WHOLE RUN on a trip rather than ever waiting unbounded; never
+# pass -enforce in CI (see bench/applybench).
+bench-apply: ## generate a graph then run the write-through apply benchmark against BLOODTRAIL_TEST_PG
+	go run ./bench/adgen -dsn "$(BLOODTRAIL_TEST_PG)" -wipe $(ARGS)
+	go run ./bench/applybench -dsn "$(BLOODTRAIL_TEST_PG)" -enforce
 
 # Usage: make build-image UPSTREAM_TAG=v9.6.0
 UPSTREAM_TAG ?= v9.6.0
