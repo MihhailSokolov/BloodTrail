@@ -392,11 +392,21 @@ func TestApplyBumpsEpochBeforeAnyEarlyReturn(t *testing.T) {
 // bgCancel is called first so that IF this relaunches a real goroutine (it
 // must), that goroutine's own top-of-loop bgCtx check returns immediately
 // instead of reaching rebuildOnce -- which would call LoadSnapshot against
-// this test's nil pgDriver/pool and panic. The relaunch itself is still
-// observed synchronously: startFallbackRebuild's CAS on fallbackRebuilding
-// runs in this goroutine, before the "go" statement, so it is visible to
-// the assertion below regardless of when the spawned goroutine actually
-// runs.
+// this test's nil pgDriver/pool and panic.
+//
+// The relaunch is asserted through rebuildLoopStarts (engine.go), not
+// fallbackRebuilding: the CAS that proves a relaunch happened runs in this
+// goroutine, synchronously, before the "go" statement -- but the spawned
+// goroutine, finding bgCtx already cancelled, immediately clears
+// fallbackRebuilding and returns. That clear races the assertion with no
+// ordering guarantee between them (the Go memory model gives none for two
+// unsynchronized atomics touched from different goroutines), so asserting
+// the flag itself is flaky: on an unlucky schedule the spawned goroutine's
+// own Store(false) can complete before this goroutine's next statement
+// runs. rebuildLoopStarts only ever increases and is bumped in this
+// goroutine before the spawn, so comparing it against its value from
+// before the call is race-free regardless of how the spawned goroutine is
+// scheduled.
 func TestFinishFallbackRebuildRelaunchesWhenStateRacedBackToFallback(t *testing.T) {
 	e := New(nil, nil, Config{Enabled: true})
 	e.bgCancel()
@@ -404,10 +414,12 @@ func TestFinishFallbackRebuildRelaunchesWhenStateRacedBackToFallback(t *testing.
 	e.fallbackRebuilding.Store(true) // the "not yet cleared" half of the race
 	e.state.Store(stateFallback)     // ...and a concurrent Apply already lost it back to fallback
 
+	startsBefore := e.rebuildLoopStarts.Load()
+
 	e.finishFallbackRebuild()
 
-	if !e.fallbackRebuilding.Load() {
-		t.Fatalf("finishFallbackRebuild left the engine stranded: fallbackRebuilding = false while state = stateFallback, want it to relaunch recovery")
+	if got := e.rebuildLoopStarts.Load(); got != startsBefore+1 {
+		t.Fatalf("finishFallbackRebuild left the engine stranded: rebuildLoopStarts = %d, want %d (state = stateFallback should have relaunched recovery exactly once)", got, startsBefore+1)
 	}
 }
 
@@ -439,8 +451,17 @@ func TestFinishFallbackRebuildDoesNothingWhenAlreadyServing(t *testing.T) {
 // bgCancel is called for the same reason as
 // TestFinishFallbackRebuildRelaunchesWhenStateRacedBackToFallback: it lets
 // the relaunched goroutine's own top-of-loop check return immediately
-// rather than reach rebuildOnce with no real database behind it, while the
-// relaunch itself (the synchronous CAS) is still observed reliably.
+// rather than reach rebuildOnce with no real database behind it.
+//
+// The relaunch is asserted through rebuildLoopStarts rather than
+// fallbackRebuilding, for the same reason given in that sibling test's doc:
+// the spawned goroutine clears fallbackRebuilding again the instant it
+// observes bgCtx already cancelled, and nothing orders that clear after
+// this goroutine's assertion, so the flag itself is flaky under -race on a
+// loaded scheduler. rebuildLoopStarts is bumped synchronously by the
+// winning CAS, in this goroutine, before Apply ever returns, and never
+// moves backwards, so it proves the relaunch happened regardless of when
+// the spawned goroutine runs.
 func TestApplyEarlyReturnRelaunchesRecoveryWhenNoneIsRunning(t *testing.T) {
 	e := New(nil, nil, Config{Enabled: true})
 	e.bgCancel()
@@ -449,10 +470,12 @@ func TestApplyEarlyReturnRelaunchesRecoveryWhenNoneIsRunning(t *testing.T) {
 	scope := NewWriteScope()
 	scope.Changes().RecordNodeID(7)
 
+	startsBefore := e.rebuildLoopStarts.Load()
+
 	e.Apply(context.Background(), scope)
 
-	if !e.fallbackRebuilding.Load() {
-		t.Fatalf("Apply's early return while already in fallback did not relaunch recovery: fallbackRebuilding = false, want true")
+	if got := e.rebuildLoopStarts.Load(); got != startsBefore+1 {
+		t.Fatalf("Apply's early return while already in fallback did not relaunch recovery: rebuildLoopStarts = %d, want %d", got, startsBefore+1)
 	}
 }
 

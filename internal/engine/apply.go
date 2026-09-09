@@ -570,11 +570,21 @@ func (e *Engine) startFallbackRebuild() {
 // state, so there is no serving to restore, and rebuilding a replica nobody
 // reads would be pure cost. (This also keeps enterFallback/startFallbackRebuild
 // usable from unit tests holding an Engine with no database behind it.)
+//
+// Every winning CAS also bumps rebuildLoopStarts (engine.go), in this same
+// calling goroutine, before the caller's own "go" statement runs the loop --
+// that is what makes rebuildLoopStarts a race-free way for a test to observe
+// "a relaunch happened" even when the relaunched goroutine goes on to clear
+// fallbackRebuilding again immediately.
 func (e *Engine) claimRebuildLoop() bool {
 	if !e.cfg.Enabled {
 		return false
 	}
-	return e.fallbackRebuilding.CompareAndSwap(false, true)
+	won := e.fallbackRebuilding.CompareAndSwap(false, true)
+	if won {
+		e.rebuildLoopStarts.Add(1)
+	}
+	return won
 }
 
 // runFallbackRebuild rebuilds the snapshot until one is actually adopted,

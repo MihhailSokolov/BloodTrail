@@ -118,6 +118,20 @@ type Engine struct {
 	// rather than one per write.
 	fallbackRebuilding atomic.Bool
 
+	// rebuildLoopStarts counts every time claimRebuildLoop's CAS on
+	// fallbackRebuilding actually wins -- i.e. every relaunch of either
+	// retry-until-adopted rebuild loop, regardless of which of the two
+	// triggered it. It only ever increases, and the increment happens
+	// synchronously in the claiming goroutine, before that goroutine's own
+	// "go" statement runs the loop itself. That is what makes it useful for
+	// a test asserting "a relaunch happened": unlike fallbackRebuilding,
+	// which the spawned loop goroutine can legitimately clear again moments
+	// later (e.g. because bgCtx is already cancelled), this can never move
+	// backwards, so reading it before and after is race-free regardless of
+	// how the spawned goroutine happens to be scheduled. Nothing in
+	// production reads it; it exists purely for test observability.
+	rebuildLoopStarts atomic.Uint64
+
 	// compacting is set while a background compaction (compact.go) is
 	// running, claimed via the same CAS pattern fallbackRebuilding uses but
 	// kept as its own, separate flag: a compaction and a fallback rebuild
