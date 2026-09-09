@@ -329,3 +329,59 @@ func TestFileBootDisabledWhenSnapshotDirEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestFileBootQuietlyMissesWithNoSnapshotFileYet is I1's regression: a real,
+// non-empty SnapshotDir (the feature genuinely enabled) whose directory
+// simply has no graph-<id>.btsnap file in it yet -- the ordinary shape of
+// the very first boot ever against a given SnapshotDir, before any
+// Driver.Close has had a chance to call SaveSnapshot even once -- must fall
+// straight through to the pg rebuild loop exactly like the SnapshotDir-empty
+// case above, but is NOT the same code path: tryLoadSnapshotFile's own
+// ReadSnapshotFile call actually runs and gets a real fs.ErrNotExist, which
+// its own doc says logs the quiet Debug "bloodtrail: no snapshot file"
+// marker rather than the noisier Info "snapshot file rejected" one a
+// present-but-untrustworthy file would earn. Nothing before this task
+// exercised that specific branch: TestFileBootDisabledWhenSnapshotDirEmpty
+// never reaches ReadSnapshotFile at all (snapshotFilePath's own empty-string
+// check returns false first), and every other file_boot test in this file
+// seeds a real file before booting from it.
+func TestFileBootQuietlyMissesWithNoSnapshotFileYet(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+	graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
+
+	dir := t.TempDir() // real directory, deliberately left empty: no .btsnap file
+	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	resetWatermarkTable(t, ctx, eng)
+
+	eng.Start(ctx)
+	defer eng.Stop()
+
+	waitForFresh(t, eng)
+
+	if got := eng.RebuildCount(); got == 0 {
+		t.Fatalf("RebuildCount = 0 booting against an empty SnapshotDir with no file yet, want at least one pg rebuild")
+	}
+
+	view, serving := eng.Fresh()
+	if !serving {
+		t.Fatalf("engine not serving after boot with no snapshot file present")
+	}
+	if view.NodeCount() == 0 {
+		t.Fatalf("boot's own pg rebuild adopted an empty view, want the hydrated fixture's nodes")
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "bloodtrail: no snapshot file") {
+		t.Fatalf("did not log the quiet \"no snapshot file\" marker for a first boot with no file present:\n%s", logged)
+	}
+	if strings.Contains(logged, "bloodtrail: snapshot file rejected") {
+		t.Fatalf("logged \"snapshot file rejected\" noise for a merely-missing file, want the quiet miss only:\n%s", logged)
+	}
+	if strings.Contains(logged, "bloodtrail: snapshot file loaded") {
+		t.Fatalf("logged \"snapshot file loaded\" with no file ever present:\n%s", logged)
+	}
+}
