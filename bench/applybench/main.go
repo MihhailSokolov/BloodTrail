@@ -89,12 +89,14 @@
 // APPLYBENCH_RESULT PASS or FAIL. With -enforce, applybench exits nonzero if
 // (a)'s overhead exceeds applyOverheadMaxPct or (b)'s during-ingest p95
 // exceeds idleP95Multiplier times the idle p95 -- see both constants' docs
-// for why they are PROVISIONAL. (c) and (d) are reported only, never
-// enforced: this task's brief calls for evidence-based caps on those to be
-// set once they have been measured at production scale, which is a later
-// task's job (see the README's cap-table convention, matching
-// bench/builderbench's/bench/cypherbench's measured-physics caps). CI must
-// never pass -enforce. Any other failure (a database error, a missing base
+// for the 5M-scale evidence behind each. (c) and (d) are reported only,
+// never enforced: both are background/operational costs a served query
+// never waits on, not costs with the "a user is waiting on this" property
+// (a)/(b) have -- see the README's own "Why (c) and (d) have no bar at all
+// yet" section, which revisits that question now that real 5M-scale
+// numbers exist for both (matching bench/builderbench's/
+// bench/cypherbench's measured-physics caps convention). CI must never
+// pass -enforce. Any other failure (a database error, a missing base
 // graph, a phase exceeding its own -cap watchdog) aborts the run with a
 // nonzero exit regardless of -enforce.
 //
@@ -214,22 +216,26 @@ const (
 
 // applyOverheadMaxPct is -enforce's bar for (a): the engine-enabled write
 // wall time must not exceed the engine-disabled baseline by more than this
-// percentage. PROVISIONAL, per the task brief: this number was chosen
-// before any measurement at production scale existed at all, so it is a
-// placeholder bar, not evidence. A later task must replace it with an
-// evidence-based cap (measured worst overhead x 1.75, per the m4.5
-// measured-physics convention -- see bench/builderbench's/
-// bench/cypherbench's shapeThresholds docs for that convention applied
-// elsewhere) once a 5M-scale run has actually measured this number, and
-// document the measurement in this package's README cap table the same
-// way.
-const applyOverheadMaxPct = 25.0
+// percentage. Evidence-based, per the m4.5 measured-physics convention (see
+// bench/builderbench's/bench/cypherbench's shapeThresholds docs for that
+// convention applied elsewhere): three 5M-scale runs (2026-09, see this
+// package's README cap-rationale table) measured 33.52% / 25.22% / 26.05%;
+// 60.0 is the worst of those (33.52%) x ~1.75, rounded up to a clean number.
+// Replacing this value requires fresh 5M-scale evidence recorded alongside
+// the change, in the README table and in TestMeasuredEngineOverheadCaps
+// (main_test.go) together -- the exact discipline
+// bench/builderbench's/bench/cypherbench's own absolute-cap pins already
+// enforce for their shapes.
+const applyOverheadMaxPct = 60.0
 
-// idleP95Multiplier is -enforce's bar for (b): the during-ingest p95 must
-// not exceed this multiple of the idle p95. PROVISIONAL for the identical
-// reason applyOverheadMaxPct is -- see its doc, which applies here
-// unchanged.
-const idleP95Multiplier = 3.0
+// idleP95Multiplier is -enforce's bar for (b): the during-ingest,
+// delta-populated p95 must not exceed this multiple of the idle p95.
+// Evidence-based for the identical reason applyOverheadMaxPct is -- see its
+// doc. The same three 5M-scale runs measured a delta-p95/idle-p95 ratio of
+// 0.44 / 0.48 / 0.98 (idle p95 itself carries a wide tail on this shared,
+// loaded machine, from 349ms to 846ms across the three runs -- see the
+// README table); 1.75 is the worst of those (0.98) x ~1.75, rounded up.
+const idleP95Multiplier = 1.75
 
 // defaultCap is -cap's default: see the package doc's "Watchdog" section.
 const defaultCap = 10 * time.Minute
@@ -291,7 +297,7 @@ func run(args []string) int {
 		seed           = fs.Int64("seed", 1, "seed for deterministic query-pair sampling")
 		runID          = fs.String("run-id", "", "objectid namespace for every node/edge this run writes; defaults to a timestamp so a re-run against an un-wiped database inserts rather than silently updating (see README)")
 		cap            = fs.Duration("cap", defaultCap, "per-operation wall-clock watchdog; any single operation exceeding this ABORTS THE WHOLE RUN (nonzero exit, never a data point) -- see README")
-		enforce        = fs.Bool("enforce", false, "exit nonzero if apply overhead or during-ingest p95 miss their (PROVISIONAL) bars (never pass this in CI)")
+		enforce        = fs.Bool("enforce", false, "exit nonzero if apply overhead or during-ingest p95 miss their evidence-based bars (never pass this in CI)")
 		cpuprofile     = fs.String("cpuprofile", "", "write a pprof CPU profile to this file")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -1380,13 +1386,12 @@ func runPairQuery(ctx context.Context, db graph.Database, startID, endID graph.I
 // measureCompaction opens a driver with BLOODTRAIL_COMPACT_ENTRIES set to
 // cfg.compactEntries (deliberately low), captures the engine's own logging
 // via logCapture (see its doc for why: CompactionCount is unreachable from
-// outside package bloodtrail through the real driver), drives enough
-// ingest-shaped writes -- chunked so each flush's delta comfortably exceeds
-// the threshold -- to trigger at least cfg.repeats background compactions,
-// then waits (watchdog-capped, polling with progress) for that many
-// "bloodtrail: compaction finished" lines to have been logged, reading
-// each one's own engine-measured duration attribute straight off the log
-// record.
+// outside package bloodtrail through the real driver), and drives
+// cfg.repeats separate flushes -- each one, on its own, comfortably over
+// the threshold -- waiting after EACH for that flush's own compaction to be
+// adopted before issuing the next one, so every trigger gets an isolated
+// chance to fold and finish (see the "one flush at a time" note below for
+// why a single burst cannot do this at production node counts).
 func measureCompaction(ctx context.Context, cfg config, base *baseGraph, result *benchResult) error {
 	capture, restore := installLogCapture()
 	defer restore()
@@ -1401,11 +1406,7 @@ func measureCompaction(ctx context.Context, cfg config, base *baseGraph, result 
 	defer cleanup()
 	waitForBoot(base.buildDuration)
 
-	// Each flush's own delta should comfortably exceed compactEntries, and
-	// enough flushes should run to observe several triggers even if some
-	// overlap while a prior compaction is still folding
-	// (maybeStartCompaction, compact.go, skips re-triggering while one is
-	// already running).
+	// Each flush's own delta should comfortably exceed compactEntries.
 	//
 	// The two units are NOT interchangeable, and conflating them was a real
 	// bug here: one ingest unit is 2 delta entries (1 node + 1 edge) AND 2
@@ -1417,29 +1418,56 @@ func measureCompaction(ctx context.Context, cfg config, base *baseGraph, result 
 	// threshold this measurement exists to cross.
 	unitsPerFlush := cfg.compactEntries/2 + 1
 	opsPerFlush := 2 * unitsPerFlush
-	totalUnits := unitsPerFlush * (cfg.repeats*3 + 1)
-	fmt.Printf("applybench: forcing compaction: compact_entries=%d units_per_flush=%d ops_per_flush=%d total_units=%d\n",
-		cfg.compactEntries, unitsPerFlush, opsPerFlush, totalUnits)
-	if _, err := writeIngestBatch(capCtx, db, base.hubObjectID, totalUnits, opsPerFlush, cfg.runID, "compact", 0); err != nil {
-		if errors.Is(capCtx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("compaction-forcing ingest exceeded -cap=%s: %w", cfg.cap, err)
-		}
-		return fmt.Errorf("compaction-forcing ingest: %w", err)
-	}
 
+	// One flush at a time, not one burst of cfg.repeats*3+1 flushes: an
+	// earlier version wrote every flush in a single writeIngestBatch call
+	// before ever checking capture.count, on the theory that "enough
+	// flushes should run to observe several triggers even if some overlap
+	// while a prior compaction is still folding". That theory fails at
+	// production node counts specifically because maybeStartCompaction
+	// (compact.go) is only ever invoked from Apply's own tail -- it is not
+	// a periodic background check -- so it only gets a chance to trigger
+	// compaction 2 (or 3) if ANOTHER write lands after compaction 1 has
+	// adopted. A whole burst of flushes issued back-to-back, with nothing
+	// pausing between them, finishes writing (a few seconds, per (a)'s own
+	// measurement) long before a single fold over a multi-million-node base
+	// snapshot can complete; every flush after the first lands while
+	// `compacting` is still true, gets skipped by maybeStartCompaction's own
+	// CAS guard, and piles up as one large tail segment with nothing left
+	// to write afterward that could ever re-check the threshold. The result
+	// measured at 5M (2026-09, see this package's README cap-rationale
+	// table): exactly 1 compaction observed, then an unconditional 10-minute
+	// stall with 0% CPU and static RSS -- not a hang, just genuinely nothing
+	// left to trigger a second one, correctly reported as an honest timeout
+	// by the loop below rather than a silent hang. Spacing the flushes out,
+	// one at a time, and waiting for each one's own compaction to land
+	// before issuing the next, is what lets every trigger actually get a
+	// turn.
 	target := cfg.repeats
-	for {
-		n := capture.count(msgCompactionFinished)
-		if n >= target {
-			break
+	fmt.Printf("applybench: forcing compaction: compact_entries=%d units_per_flush=%d ops_per_flush=%d target_compactions=%d\n",
+		cfg.compactEntries, unitsPerFlush, opsPerFlush, target)
+	for i := 0; i < target; i++ {
+		if _, err := writeIngestBatch(capCtx, db, base.hubObjectID, unitsPerFlush, opsPerFlush, cfg.runID, "compact", i); err != nil {
+			if errors.Is(capCtx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("compaction-forcing ingest exceeded -cap=%s: %w", cfg.cap, err)
+			}
+			return fmt.Errorf("compaction-forcing ingest (flush %d/%d): %w", i+1, target, err)
 		}
-		if capCtx.Err() != nil {
-			return fmt.Errorf("timed out waiting for %d compactions (-cap=%s); observed %d so far", target, cfg.cap, n)
-		}
-		fmt.Printf("applybench: ... waiting for compaction %d/%d\n", n, target)
-		select {
-		case <-time.After(2 * time.Second):
-		case <-capCtx.Done():
+
+		want := i + 1
+		for {
+			n := capture.count(msgCompactionFinished)
+			if n >= want {
+				break
+			}
+			if capCtx.Err() != nil {
+				return fmt.Errorf("timed out waiting for %d compactions (-cap=%s); observed %d so far", target, cfg.cap, n)
+			}
+			fmt.Printf("applybench: ... waiting for compaction %d/%d\n", n, target)
+			select {
+			case <-time.After(2 * time.Second):
+			case <-capCtx.Done():
+			}
 		}
 	}
 
@@ -1782,7 +1810,7 @@ func (r *benchResult) report(enforce bool) bool {
 	fmt.Printf("applybench: arms are symmetric (neither runs a concurrent reader) and interleaved on/off; engine applied %d time(s) across the on arm\n", r.onApplies)
 	fmt.Printf("applybench: engine-on  write wall time p50=%s (n=%d): %s\n", fmtSeconds(onP50), len(r.onDurations), fmtDurationsSeconds(r.onDurations))
 	fmt.Printf("applybench: engine-off write wall time p50=%s (n=%d): %s\n", fmtSeconds(offP50), len(r.offDurations), fmtDurationsSeconds(r.offDurations))
-	fmt.Printf("applybench: apply+read-back overhead = %.2f%% (max %.2f%%, PROVISIONAL -- see README): %s\n", overheadPct, applyOverheadMaxPct, passFail(overheadOK))
+	fmt.Printf("applybench: apply+read-back overhead = %.2f%% (max %.2f%%, evidence-based -- see README): %s\n", overheadPct, applyOverheadMaxPct, passFail(overheadOK))
 	fmt.Printf("APPLYBENCH_APPLY_THROUGHPUT on_p50_ms=%.3f off_p50_ms=%.3f overhead_pct=%.3f max_pct=%.3f applies=%d ok=%t\n",
 		floatMillis(onP50), floatMillis(offP50), overheadPct, applyOverheadMaxPct, r.onApplies, overheadOK)
 
@@ -1791,7 +1819,7 @@ func (r *benchResult) report(enforce bool) bool {
 	fmt.Printf("applybench: ingest, all     p50=%s p95=%s (n=%d, window=%s)\n", fmtMillis(duringP50), fmtMillis(duringP95), len(r.duringDurations), fmtSeconds(r.duringWindow))
 	fmt.Printf("applybench: ingest, delta   p50=%s p95=%s (n=%d of %d samples were taken after the window's first Apply; %d applies, %d engine-served)\n",
 		fmtMillis(deltaP50), fmtMillis(deltaP95), len(r.duringDeltaDurations), len(r.duringDurations), r.duringApplies, r.duringServed)
-	fmt.Printf("applybench: delta-populated p95 within %.1fx idle p95 (PROVISIONAL -- see README): %s\n", idleP95Multiplier, passFail(latencyOK))
+	fmt.Printf("applybench: delta-populated p95 within %.1fx idle p95 (evidence-based -- see README): %s\n", idleP95Multiplier, passFail(latencyOK))
 	fmt.Printf("APPLYBENCH_LATENCY_DURING_INGEST idle_p50_ms=%.3f idle_p95_ms=%.3f idle_n=%d idle_window_ms=%.3f during_p50_ms=%.3f during_p95_ms=%.3f during_n=%d during_window_ms=%.3f delta_p50_ms=%.3f delta_p95_ms=%.3f delta_n=%d applies=%d served=%d multiplier=%.3f ok=%t\n",
 		floatMillis(idleP50), floatMillis(idleP95), len(r.idleDurations), floatMillis(r.idleWindow),
 		floatMillis(duringP50), floatMillis(duringP95), len(r.duringDurations), floatMillis(r.duringWindow),

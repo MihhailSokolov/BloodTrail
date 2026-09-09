@@ -46,23 +46,20 @@ func TestOverheadPercent(t *testing.T) {
 	}
 }
 
-// TestApplyOverheadMaxPctIsProvisional pins applyOverheadMaxPct's current
-// PROVISIONAL value so a change to it is a deliberate, reviewed edit (e.g.
-// the follow-up task that measures at 5M and replaces it with an
-// evidence-based cap per the m4.5 measured-physics convention), not an
-// accidental one -- mirroring bench/builderbench's
-// TestMeasuredEngineAbsoluteCaps pinning its own measured caps.
-func TestApplyOverheadMaxPctIsProvisional(t *testing.T) {
-	if applyOverheadMaxPct != 25.0 {
-		t.Fatalf("applyOverheadMaxPct = %v, want 25.0 -- if this changed deliberately, update this pin and the README's cap-table doc together", applyOverheadMaxPct)
+// TestMeasuredEngineOverheadCaps pins the two evidence-based caps derived
+// from three 5M-scale runs (2026-09, see this package's README
+// cap-rationale table and both constants' own docs in main.go) to their
+// measured-worst x ~1.75 values -- mirroring bench/builderbench's
+// TestMeasuredEngineAbsoluteCaps pinning its own measured caps. These
+// values are measurement-derived; changing either requires fresh 5M-scale
+// evidence recorded alongside the change, in the README table and here
+// together, so a silent edit fails this test.
+func TestMeasuredEngineOverheadCaps(t *testing.T) {
+	if applyOverheadMaxPct != 60.0 {
+		t.Fatalf("applyOverheadMaxPct = %v, want 60.0 -- worst measured overhead (33.52%%) x ~1.75, rounded; update this pin and the README's cap-table doc together", applyOverheadMaxPct)
 	}
-}
-
-// TestIdleP95MultiplierIsProvisional is applyOverheadMaxPct's pin, for
-// idleP95Multiplier.
-func TestIdleP95MultiplierIsProvisional(t *testing.T) {
-	if idleP95Multiplier != 3.0 {
-		t.Fatalf("idleP95Multiplier = %v, want 3.0 -- if this changed deliberately, update this pin and the README's cap-table doc together", idleP95Multiplier)
+	if idleP95Multiplier != 1.75 {
+		t.Fatalf("idleP95Multiplier = %v, want 1.75 -- worst measured delta/idle p95 ratio (0.98) x ~1.75, rounded; update this pin and the README's cap-table doc together", idleP95Multiplier)
 	}
 }
 

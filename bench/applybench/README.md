@@ -225,51 +225,72 @@ missed:
 
 | Measurement                     | Bar                                    |
 |----------------------------------|-----------------------------------------|
-| (a) apply overhead               | `<= 25%` of the engine-disabled write wall time |
-| (b) during-ingest, **delta-populated** query p95 | `<= 3x` the idle p95    |
+| (a) apply overhead               | `<= 60%` of the engine-disabled write wall time |
+| (b) during-ingest, **delta-populated** query p95 | `<= 1.75x` the idle p95    |
 
-**(c) and (d) are reported only, never enforced.** Both bars above, and the
-absence of any bar on (c)/(d), are explained below.
+**(c) and (d) are reported only, never enforced** -- see below for why, now
+that both have real 5M-scale numbers behind them.
 
 **CI must never pass `-enforce`.** Any other failure (a database error, a
 missing base graph, a phase exceeding its own `-cap` watchdog) aborts the run
 with a nonzero exit regardless of `-enforce`.
 
-### These two bars are PROVISIONAL
+### Cap derivation: evidence-based, per the m4.5 convention
 
-`applyOverheadMaxPct` (25%) and `idleP95Multiplier` (3x) are placeholders
-chosen before any measurement at production scale existed -- **not**
-evidence, unlike every cap in `bench/builderbench`'s and
-`bench/cypherbench`'s own README cap tables. Per the task brief, a follow-up
-task must:
+`applyOverheadMaxPct` and `idleP95Multiplier` were placeholders (25%, 3x)
+until a 5M-scale measurement existed to anchor them to -- the same
+"measured worst case x ~1.75, rounded" convention `bench/builderbench`'s
+`shapeThresholds` doc and `bench/cypherbench`'s `ridSuffixScanMinRatio`/
+`flagScanMinRatio` docs already establish and justify at length (a bar set
+from an invented number, rather than a measurement, has twice been proven
+undersized on this project -- see either README's own incident history).
+Three full runs against `bench/adgen -users 2800000 -domains 4 -seed 1`
+(~4.76M-4.94M nodes across the three runs -- `applybench` writes real rows
+into the same database run over run, per-run namespaced; see "Re-running
+without re-wiping" below), on an otherwise-busy shared machine:
 
-1. Run `applybench -enforce` against a 5M-scale graph
-   (`bench/adgen -users 2800000 -domains 4 -wipe`, matching the other
-   benches' large-scale workflow), several times to see the honest spread
-   under ordinary machine-load variance.
-2. Replace both constants (`main.go`) with evidence-based bars: **measured
-   worst case x ~1.75**, rounded -- the exact convention
-   `bench/builderbench`'s `shapeThresholds` doc and
-   `bench/cypherbench`'s `ridSuffixScanMinRatio`/`flagScanMinRatio` docs
-   already establish and justify at length (a bar set from an invented
-   number, rather than a measurement, has twice been proven undersized on
-   this project -- see either README's own incident history).
-3. Fill in this section with the measured numbers and the resulting bar,
-   the same way those two READMEs' own "Measured at 5M" sections do.
-4. Consider whether (c) and (d) deserve enforced bars of their own once
-   their own 5M-scale numbers exist (this task deliberately left them
-   unenforced -- see below).
+| Run | (a) overhead | (b) delta p95 / idle p95 |
+|---|---:|---:|
+| 1 | 33.52% (on p50 1193ms / off p50 894ms) | 0.44x (359ms / 817ms) |
+| 2 | 25.22% (on p50 1230ms / off p50 982ms) | 0.48x (402ms / 846ms) |
+| 3 | 26.05% (on p50 1241ms / off p50 984ms) | 0.98x (341ms / 349ms) |
+| **worst** | **33.52%** | **0.98x** |
 
-### Why (c) and (d) have no bar at all yet
+Both bars are the worst of the three x ~1.75, rounded up to a clean number:
+`applyOverheadMaxPct = 60.0` (33.52 x 1.75 = 58.66) and
+`idleP95Multiplier = 1.75` (0.98 x 1.75 = 1.71). Pinned by
+`TestMeasuredEngineOverheadCaps` (`main_test.go`); changing either requires
+fresh 5M-scale evidence recorded here and in that test together. A fourth
+confirmation run with these caps compiled in passed both (see "Measured at
+5M" below).
 
-Compaction duration and snapshot file I/O duration both scale with the size
-of what they're folding/serializing/parsing -- the base snapshot for (d),
-the accumulated delta for (c) -- in a way this task's small-scale smoke run
-cannot usefully bound. Rather than invent a placeholder number with no
-measurement behind it at all (exactly the mistake the PROVISIONAL bars
-above already are, once), this task leaves them reported-only; the
-follow-up task's 5M run should give both a first real number to anchor a
-cap to.
+(b)'s own spread is the more interesting number here: the delta/idle ratio
+swings nearly 2.2x across three runs (0.44x to 0.98x) not because
+during-ingest latency is unstable -- `during_p95` sits in a tight
+340-402ms band across all three -- but because **idle p95 itself** carries
+a wide tail on this shared machine (349-846ms over 200 samples), the same
+kind of ambient-load noise `bench/pathbench`'s own p95 bar has shown
+repeatedly on this project (see the root README's own measured-results
+history). A wider idle tail shrinks the ratio, not the other way round, so
+this spread is a statement about the denominator's noise, not about the
+engine's own during-ingest behavior degrading.
+
+### Why (c) and (d) have no bar at all yet, even with real numbers now
+
+Both now have real 5M-scale evidence (below), but neither gates `-enforce`:
+compaction and snapshot-file I/O are **background/operational** costs, not
+costs a served query ever waits on. A slow compaction fold runs
+concurrently with ordinary serving (Apply keeps applying new deltas while
+it folds, per this package's own README on write-through); a slow snapshot
+save/load only affects a graceful shutdown or a cold boot, never a query
+in between. Regressing either is worth noticing -- which is exactly what
+reporting the numbers here achieves -- but gating a build on them would
+conflate "got slower" with "a user would notice," the same distinction
+`bench/builderbench`'s own `group_members_bfs` shape drew before it got an
+absolute cap instead of a ratio: these two just don't have the "a user is
+waiting on this" property that (a) and (b) do. Revisit this once there is
+a history of runs to judge "how much slower is concerning" against, rather
+than one measurement session's worth.
 
 ## Watchdog
 
@@ -333,10 +354,115 @@ go run ./bench/adgen -dsn <pg dsn> -users 2800000 -domains 4 -wipe
 go run ./bench/applybench -dsn <pg dsn> -enforce
 ```
 
-**Do not run this from within this task** -- see the task's own brief: a 5M
-measurement is a follow-up task's job, and it needs the machine for a long
-time. This section exists so that follow-up task does not have to guess the
-invocation.
+## Measured at 5M (`bench/adgen`'s ~4.76M-4.94M-node graph)
+
+Four runs total (2026-09), on an otherwise-busy shared machine: three that
+produced the cap derivation above, plus a fourth confirmation run with the
+resulting caps compiled in.
+
+**(a)/(b)** -- see the cap-derivation table above for the first three runs;
+the fourth (confirmation) run, with the resulting caps compiled in,
+measured 19.18% overhead (PASS against the 60% cap) and a 0.93x delta/idle
+ratio (968ms / 1039ms, PASS against 1.75x) -- `APPLYBENCH_RESULT PASS`.
+
+**(c) compaction duration** -- three compactions observed per run (matching
+`-repeats`, each triggered by one isolated, threshold-crossing flush --
+see "One flush at a time" in `main.go`'s `measureCompaction` doc for why
+that has to be spaced out rather than issued as one burst at this node
+count):
+
+| Run | Observed durations | p50 |
+|---|---|---:|
+| 1 | 25972 / 27466 / 26130 ms | 26130ms |
+| 2 | 25757 / 24553 / 28476 ms | 25757ms |
+| 3 | 24355 / 25649 / 36223 ms | 25649ms |
+| 4 (confirmation) | 25805 / 26652 / 27417 ms | 26652ms |
+
+Tight and consistent across 11 of 12 individual observations (24.4-28.5s);
+one outlier (36.2s, run 3's third compaction) under whatever else was
+sharing the machine at that moment. Folding this graph's ~4.9M nodes /
+~49M edges **entirely in memory, with no PostgreSQL round trip and no JSON
+parse** -- the two dominant costs `internal/engine/boot.go`'s own doc
+attributes the ~46-52s full rebuild (below) to -- costs roughly half that,
+consistently: this is the write-through design's central bet (see the root
+README's [Write-through](../../README.md#write-through) section) paying
+off as measured, not merely as argued.
+
+**(d) snapshot file save/load/boot** -- three repeats per run (`-repeats`,
+default 3):
+
+| Run | save (Close wall / engine-logged), p50 | load (parse only), p50 | boot (open -> loaded), p50 |
+|---|---:|---:|---:|
+| 1 | 29892ms / 29889ms | 9228ms | 13999ms |
+| 2 | 27505ms / 27503ms | 7988ms | 13521ms |
+| 3 | 28098ms / 28096ms | 9128ms | 10429ms |
+| 4 (confirmation) | 26905ms / 26904ms | 8535ms | 10578ms |
+
+Save (fold + write a ~3.9GiB file) and boot (open the whole driver stack up
+to a loaded, servable snapshot) both swing noticeably run to run (save:
+26.9-29.9s; boot: 10.4-14.0s) -- consistent with the same shared-machine
+variance (a) and (b)'s own spread already shows, not a sign that either
+cost scales unpredictably with graph size. Load alone (the pure
+`ReadSnapshotFile` parse, excluding the boot path's own watermark round
+trip and adoption) is the tightest of the three, 7.99-9.23s, matching
+`internal/engine/snapshot/file.go`'s own claim that parsing -- unlike a
+PostgreSQL rebuild -- has no I/O-bound round trips to absorb noise from,
+only CPU-bound decode work.
+
+For scale, this run's own `engine.LoadSnapshot` (a full PostgreSQL
+rebuild) measured 45.1-50.7s across the three base-graph loads (the
+`APPLYBENCH_BUILD` line each run prints) -- boot from the snapshot file
+(10.4-14.0s, including the driver-open overhead a bare `LoadSnapshot` call
+doesn't pay) is **roughly 3-5x faster** than rebuilding from PostgreSQL at
+this scale, the whole reason the snapshot file exists.
+
+### A harness bug this run found and fixed
+
+The first attempt at (c) wrote all `-repeats*3+1` compaction-forcing
+flushes in one uninterrupted burst before ever checking whether a
+compaction had landed, on the theory that "enough flushes should run to
+observe several triggers even if some overlap." That theory holds at
+small scale but not at 4.76M+ nodes: `maybeStartCompaction`
+(`internal/engine/compact.go`) is only ever invoked from `Apply`'s own
+tail, never on a timer, so a compaction 2 or 3 only gets a chance to
+trigger if ANOTHER write lands after compaction 1 has already adopted. A
+whole burst finishes writing in a few seconds (per (a)'s own measurement)
+-- long before a single fold over a multi-million-node base can complete --
+so every flush after the first lands while a fold is already running,
+gets skipped by `maybeStartCompaction`'s own re-trigger guard, and piles up
+as one large tail segment with nothing left to write afterward that could
+ever re-check the threshold. Measured directly: exactly 1 compaction
+observed, then a full 10-minute `-cap` timeout with 0% CPU and static RSS
+on the `applybench` process -- not a hang, just genuinely nothing left to
+trigger a second one, and `-cap` correctly reported it as an honest timeout
+rather than the run silently wedging. `measureCompaction` (`main.go`) now
+issues one flush at a time, each large enough to cross the threshold on
+its own, waiting for that flush's own compaction to be observed before
+issuing the next -- which is what produced the three-per-run counts in the
+table above.
+
+### `compactEntries`/`compactBytes` defaults, revisited at this scale
+
+`DefaultCompactEntries`/`DefaultCompactBytes` (`internal/engine/compact.go`,
+1,000,000 entries / 512 MiB) are unchanged by this measurement. (c) above
+deliberately forces compaction at a much lower threshold
+(`-compact-entries 2000`) specifically so several fire during one
+bench run -- it says nothing about whether the *default* threshold sits at
+a good point, since (a)/(b) both ingest far too few rows (12,000 units =
+24,000 entries per repeat) to ever reach 1,000,000 entries and trigger the
+default at all. What (c) *does* say about the defaults: a compaction fold
+at this node count costs ~25-28s typical (independent of how small the
+triggering delta was -- the cost is dominated by rebuilding the ~4.9M-node
+base, not by the entries that tipped it over), so the defaults' actual
+effect is exposure time, not fold cost -- how large a delta (and its
+per-read overlay overhead) is allowed to accumulate before that ~25-28s
+fold reclaims it. Answering "is 1,000,000 entries too generous an exposure
+window" needs a sustained-ingest run at the *default* threshold measuring
+query latency as the delta approaches it, which nothing in this task
+measured; changing the defaults without that evidence would repeat the
+exact "invented number, not measurement" mistake (a)/(b)'s own caps just
+moved away from. Left unchanged, with this reasoning recorded for whichever
+future measurement takes it on.
 
 ## Flags
 
