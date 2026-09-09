@@ -122,9 +122,9 @@ be reported as the engine's latency when they are PostgreSQL's.
 
 Compaction is deliberately disabled for this measurement
 (`BLOODTRAIL_COMPACT_ENTRIES` set effectively unbounded) so the delta stays
-populated and pre-compaction throughout -- exactly the state the task brief
-calls for. (c) below measures compaction separately, with its own low
-threshold.
+populated and pre-compaction throughout -- exactly the state this
+measurement is meant to characterize. (c) below measures compaction
+separately, with its own low threshold.
 
 ### (c) Compaction duration at scale
 
@@ -235,7 +235,7 @@ that both have real 5M-scale numbers behind them.
 missing base graph, a phase exceeding its own `-cap` watchdog) aborts the run
 with a nonzero exit regardless of `-enforce`.
 
-### Cap derivation: evidence-based, per the m4.5 convention
+### Cap derivation: evidence-based
 
 `applyOverheadMaxPct` and `idleP95Multiplier` were placeholders (25%, 3x)
 until a 5M-scale measurement existed to anchor them to -- the same
@@ -458,11 +458,65 @@ effect is exposure time, not fold cost -- how large a delta (and its
 per-read overlay overhead) is allowed to accumulate before that ~25-28s
 fold reclaims it. Answering "is 1,000,000 entries too generous an exposure
 window" needs a sustained-ingest run at the *default* threshold measuring
-query latency as the delta approaches it, which nothing in this task
-measured; changing the defaults without that evidence would repeat the
+query latency as the delta approaches it, which no measurement here has
+done; changing the defaults without that evidence would repeat the
 exact "invented number, not measurement" mistake (a)/(b)'s own caps just
 moved away from. Left unchanged, with this reasoning recorded for whichever
 future measurement takes it on.
+
+## Known performance characteristics
+
+Two properties of the write path are worth stating plainly, because both
+are invisible in the numbers above and both get *worse* at settings this
+benchmark did not exercise. Neither is a bug, and neither is being fixed
+here -- they are recorded so a future measurement knows where to look.
+
+### Delta reads cost O(total delta), per published View
+
+`View.WithSegment` returns a **new** `View` sharing the base and the segment
+stack, but with every memoized field zero-valued: the merged delta, the
+virtual id assignment, the kind bitmaps, the edge-tombstone set and the
+delta adjacency index are all per-`View` memoizations, and a fresh `View`
+has none of them. So the first overlay read against each newly published
+`View` re-runs `MergeSegments` over the *whole* stack and rebuilds whatever
+projections it needs -- work proportional to the total delta accumulated
+since the last compaction fold, not to the segment that was just added.
+Every `Apply` publishes a new `View`, so that cost recurs per write.
+
+`maxSegments` (32, `internal/engine/compact.go`) does **not** bound this. It
+bounds how many segments the stack may hold, collapsing them when it grows
+past that; the collapsed result is still one segment holding every entry, so
+total delta *size* keeps growing until a compaction fold rebuilds the base.
+
+This lands under the apply lock, on the write path, whenever
+`BLOODTRAIL_MEMORY_LIMIT` is configured: `Apply`'s memory-limit check calls
+`newView.ApproxBytes()` (guarded on the limit being set at all --
+`internal/engine/apply.go`), and an overlay `View`'s `ApproxBytes` forces
+`ensureEdgeTomb` and `ensureDeltaAdjacency` precisely so the estimate does
+not depend on which accessors ran first. With the limit unset, the same work
+still happens, but lazily, on whichever read touches the new `View` first.
+
+**The measurement gap:** `deltaEntries` counts one entry per delta node and
+one per delta edge, so (a)/(b)'s 12,000 ingest units (1 node + 1 edge each)
+grow the delta to about **24,000 entries** per repeat -- against a shipped
+`BLOODTRAIL_COMPACT_ENTRIES` default of **1,000,000**. The deltas actually
+benchmarked are therefore roughly **40x smaller** (~2.4% of the default)
+than what the shipped configuration permits before a fold reclaims them,
+and no measurement here ever reached the default threshold at all. The
+19-34% apply overhead is a floor for the shipped configuration, not a
+ceiling.
+
+### Write concurrency is effectively 1
+
+`Engine.Apply` takes `applyMu` for its entire sequence, and step 4 of that
+sequence is the read-back's PostgreSQL round trip (`readback.go`). The lock
+is held across that network round trip, not just across the in-memory
+publish, so concurrent writers serialize behind each other's read-backs.
+The serialization is deliberate -- it is what stops two writes deriving
+Views from the same base and losing one another's delta -- but the cost of
+holding it across a round trip is a real limit on write throughput, and it
+is not what the apply-overhead number above measures: (a) drives a single
+writer, so it reports one writer's latency with the lock uncontended.
 
 ## Flags
 

@@ -83,6 +83,25 @@ caller has already been told committed.
   a partially-applied batch uniformly, since "absent on read-back" means the same thing
   regardless of which of those produced it. That delta is what every query issued after
   the write returns already sees.
+- **What it costs.** Write-through is not free, and the cost lands on ingest. Measured
+  against the same ingest with `BLOODTRAIL_ENGINE=off`, applying a write costs
+  **19-34% additional write wall time (median ~25-26%)** at the benchmarked scale --
+  the read-back round trip plus building and publishing the delta. Budget roughly a
+  quarter more ingest time for the accelerated reads. (The `60%` figure in the
+  benchmark's own enforcement table is *not* this cost: it is a CI tripwire set at the
+  measured worst case times ~1.75 headroom, so that ordinary run-to-run variance does
+  not fail a build.) See [`bench/applybench`](bench/applybench) for the harness and the
+  per-run numbers.
+
+  Two caveats make that range a **floor, not a ceiling**. It was measured with writes
+  serialized through a single apply lock, so it describes one writer's latency and not
+  what happens when several contend. And it was measured with the delta held at roughly
+  **2.4% of the shipped `BLOODTRAIL_COMPACT_ENTRIES` default** (about 24,000 entries
+  against a 1,000,000-entry default, some 40x smaller) -- and reading through a delta
+  costs time proportional to its total size, so a delta allowed to grow to the shipped
+  threshold before compaction folds it would cost more per apply than anything measured
+  here. See [`bench/applybench/README.md`](bench/applybench/README.md) for both in
+  detail.
 - **SERVING and FALLBACK.** The engine is always in one of two states. In **SERVING**
   (the normal state), every query is answered from an up-to-date in-memory view and
   every write updates it as above. A write whose effect cannot be expressed as such a
@@ -103,14 +122,42 @@ caller has already been told committed.
   - A `NodeQuery`/`RelationshipQuery` `.Update`/`.Delete` call whose criteria aren't one
     of the shapes BloodTrail's recognizer can enumerate (an id-list criterion is;
     an arbitrary predicate isn't).
+  - `Batch.CreateNode` for a node with neither a pre-assigned graph id nor a string
+    `objectid` property -- a plain `INSERT` with nothing for the read-back to key on, so
+    the applier cannot find the row it just created.
+  - `Batch.UpdateNodeBy` whose `IdentityProperties` is anything other than exactly
+    `["objectid"]` (or whose node carries no string value under that key).
+  - `Batch.UpdateRelationshipBy` where *either* endpoint fails that same check -- the
+    upsert this mirrors writes both endpoint nodes and the relationship in one
+    statement, so the edge triple is only sound to record when both endpoints resolve.
 
-  Every one of these is rare in an ordinary BloodHound deployment -- an admin action, not
-  anything ingest or analysis routinely does -- which is exactly why falling back to a
-  background rebuild, rather than teaching the replica to interpret arbitrary mutating
-  Cypher or arbitrary delete/update criteria, is the right answer for them. The
-  write-through differential test suite enforces that the list stays exhaustive: every
-  write shape not on it is asserted to apply incrementally with the replica left equal to
-  PostgreSQL, immediately, with rebuilds disabled.
+  The first six are rare in an ordinary BloodHound deployment -- admin actions, not
+  anything ingest or analysis routinely does. **The last three are not.** They are
+  ingest-shaped: they sit on the very batch API ingest itself writes through, and what
+  keeps them off the hot path is not the call but the *shape* of its identity. The
+  objectid-keyed upsert BloodTrail recognizes is the shape BloodHound's ingest uses, so
+  in practice the fallback branch is reached only by a caller keying a batch write some
+  other way -- a different or additional identity property, or a create carrying neither
+  an id nor an objectid. That is a narrower and more fragile guarantee than "an admin
+  did something unusual": it depends on a caller's identity convention rather than on an
+  operator's rare deliberate act, and an upstream change to how ingest keys its writes
+  would move traffic onto this branch without anything here changing.
+
+  They are on the list rather than taught to the replica because the alternatives are
+  worse: a create with neither an id nor an objectid genuinely offers nothing to re-read
+  the new row by, and widening the identity recognizer past bare `objectid` would mean
+  reimplementing PostgreSQL's own upsert-key resolution in the observer -- exactly the
+  kind of second, drifting implementation of someone else's semantics this design
+  avoids everywhere else.
+
+  Separately, and not a write shape at all: a **failed watermark bump** also trips
+  FALLBACK. The counter is what makes a delta trustworthy (see Watermark below), so a
+  write whose bump never landed cannot be trusted to a narrow delta, and the rebuild is
+  what restores trust.
+
+  The write-through differential test suite enforces that the list stays exhaustive:
+  every write shape not on it is asserted to apply incrementally with the replica left
+  equal to PostgreSQL, immediately, with rebuilds disabled.
 - **Single-writer trust model.** PostgreSQL stays the system of record, and the same
   trust assumption the pre-write-through engine already made still holds: this engine
   only knows about writes that go through *this* driver instance. A write made directly
@@ -215,7 +262,12 @@ are correct regardless of the replica's state.
     compaction folds it back into the base snapshot (see [Write-through](#write-through)).
     Default to `1000000` entries and `512MiB`. `0` on either means "no bound on that
     dimension" (the same convention `BLOODTRAIL_MEMORY_LIMIT` below uses), not "compact on
-    every write"; `0` on both disables compaction outright.
+    every write"; `0` on both disables compaction outright. These thresholds govern how
+    large the delta is allowed to get, and reading through a delta costs time
+    proportional to its total size on each newly published view -- so a larger threshold
+    trades write and read overhead for less frequent folding. The shipped defaults are
+    considerably larger than any delta measured so far; see [Known performance
+    characteristics](bench/applybench/README.md#known-performance-characteristics).
   - `BLOODTRAIL_MEMORY_LIMIT` -- caps the replica's approximate resident size (e.g. `4GiB`,
     `512MiB`, or a plain byte count). A rebuild, or an applied write, that would push the
     replica's base-plus-delta size past this limit is refused instead: the engine enters
