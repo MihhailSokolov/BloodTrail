@@ -254,20 +254,24 @@ func (b *Builder) Build() (*Snapshot, error) {
 	graphIDs := make([]uint64, n)
 	copy(graphIDs, b.ids)
 
-	idIndex := make(map[uint64]NodeID, n)
+	// lookup resolves staged edge endpoints to dense NodeIDs below. It is
+	// deliberately a local, throwaway map rather than the Snapshot's own
+	// idIndex: the latter is derived once, uniformly for both this path and
+	// ReadSnapshotFile's, by finalizeDerived below (see its doc).
+	lookup := make(map[uint64]NodeID, n)
 	for i, id := range graphIDs {
-		idIndex[id] = NodeID(i)
+		lookup[id] = NodeID(i)
 	}
 
 	dEdges := make([]denseEdge, 0, len(b.edges))
 	dropped := 0
 	for _, e := range b.edges {
-		src, ok := idIndex[e.start]
+		src, ok := lookup[e.start]
 		if !ok {
 			dropped++
 			continue
 		}
-		dst, ok := idIndex[e.end]
+		dst, ok := lookup[e.end]
 		if !ok {
 			dropped++
 			continue
@@ -284,29 +288,7 @@ func (b *Builder) Build() (*Snapshot, error) {
 	nodeKinds := make([]KindID, len(b.kindsFlat))
 	copy(nodeKinds, b.kindsFlat)
 
-	var maxKind KindID
-	kindBitmaps := make(map[KindID]*Bitset)
-	for i := 0; i < n; i++ {
-		lo, hi := kindOffsets[i], kindOffsets[i+1]
-		for _, k := range nodeKinds[lo:hi] {
-			if k > maxKind {
-				maxKind = k
-			}
-			bm, ok := kindBitmaps[k]
-			if !ok {
-				bm = NewBitset(n)
-				kindBitmaps[k] = bm
-			}
-			bm.Set(NodeID(i))
-		}
-	}
-	for _, e := range dEdges {
-		if e.kind > maxKind {
-			maxKind = e.kind
-		}
-	}
-
-	return &Snapshot{
+	s := &Snapshot{
 		GraphID:      b.graphID,
 		GraphIDs:     graphIDs,
 		OutOffsets:   outOffsets,
@@ -319,15 +301,112 @@ func (b *Builder) Build() (*Snapshot, error) {
 		InEdgeIdx:    inEdgeIdx,
 		KindOffsets:  kindOffsets,
 		NodeKinds:    nodeKinds,
-		MaxKindID:    maxKind,
 		Kinds:        NewKindTable(b.kindTable),
-		Props:        b.buildPropStore(n),
+		Props:        b.buildPropStore(),
 		DroppedEdges: dropped,
 		BuiltAt:      time.Now(),
-		idIndex:      idIndex,
-		kindBitmaps:  kindBitmaps,
 		edgeIDPerm:   edgeIDPerm,
-	}, nil
+	}
+	finalizeDerived(s)
+	return s, nil
+}
+
+// finalizeDerived rebuilds every index a Snapshot derives from its packed
+// arrays rather than stores directly: idIndex (from GraphIDs), kindBitmaps
+// and MaxKindID (from NodeKinds/KindOffsets and OutKinds), and
+// Props.ids/Props.objectIndex/Props.objectIndexDup (from Props.names and
+// Props.entries, via finalizePropStore). It is the single derivation shared
+// by Build, right after packing a fresh Builder's arrays, and by
+// ReadSnapshotFile, right after reloading a snapshot's packed arrays
+// verbatim from disk -- so the two construction paths can never derive
+// these differently.
+//
+// s's packed arrays (GraphIDs, Out*/In*/Kind*/NodeKinds, edgeIDPerm) and
+// s.Props's own packed fields (names/entries/nodeOffsets/arena) must already
+// be populated; finalizeDerived only fills in the fields listed above.
+func finalizeDerived(s *Snapshot) {
+	n := s.NodeCount()
+
+	idIndex := make(map[uint64]NodeID, n)
+	for i, id := range s.GraphIDs {
+		idIndex[id] = NodeID(i)
+	}
+	s.idIndex = idIndex
+
+	// maxKind and kindBitmaps mirror the original inline Build logic: every
+	// node's kind (from NodeKinds/KindOffsets) sets its bitmap bit and is a
+	// MaxKindID candidate; every edge's kind (from OutKinds, one entry per
+	// edge regardless of direction) is a MaxKindID candidate too, but never
+	// touches a bitmap (bitmaps are node-kind-only).
+	var maxKind KindID
+	kindBitmaps := make(map[KindID]*Bitset)
+	for i := 0; i < n; i++ {
+		lo, hi := s.KindOffsets[i], s.KindOffsets[i+1]
+		for _, k := range s.NodeKinds[lo:hi] {
+			if k > maxKind {
+				maxKind = k
+			}
+			bm, ok := kindBitmaps[k]
+			if !ok {
+				bm = NewBitset(n)
+				kindBitmaps[k] = bm
+			}
+			bm.Set(NodeID(i))
+		}
+	}
+	for _, k := range s.OutKinds {
+		if k > maxKind {
+			maxKind = k
+		}
+	}
+	s.kindBitmaps = kindBitmaps
+	s.MaxKindID = maxKind
+
+	finalizePropStore(s.Props, n)
+}
+
+// finalizePropStore rebuilds p's name->PropID map from its dense names
+// slice, then rebuilds the objectid index over p's entries -- the
+// PropStore-specific half of finalizeDerived's job. It mirrors exactly what
+// buildPropStore's tail used to do inline, before ReadSnapshotFile needed
+// the same derivation over a PropStore that never went through a Builder at
+// all.
+func finalizePropStore(p *PropStore, n int) {
+	ids := make(map[string]PropID, len(p.names))
+	for i, name := range p.names {
+		ids[name] = PropID(i)
+	}
+	p.ids = ids
+
+	objID, hasObjID := p.IDByName("objectid")
+	p.objectIndex = make(map[string]NodeID)
+	p.objectIndexDup = nil
+	if !hasObjID {
+		return
+	}
+	for i := 0; i < n; i++ {
+		v, ok := p.Value(NodeID(i), objID)
+		if !ok {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		id := NodeID(i)
+		prev, seen := p.objectIndex[s]
+		switch {
+		case !seen:
+			p.objectIndex[s] = id
+		case p.objectIndexDup[s] != nil:
+			p.objectIndexDup[s] = append(p.objectIndexDup[s], id)
+		default:
+			if p.objectIndexDup == nil {
+				p.objectIndexDup = make(map[string][]NodeID)
+			}
+			p.objectIndexDup[s] = []NodeID{prev, id}
+		}
+	}
 }
 
 // packForward counting-sorts dEdges into forward CSR form keyed by source

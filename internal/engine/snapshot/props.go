@@ -448,55 +448,24 @@ func (b *Builder) commitNodeProps(parsed []parsedProp) error {
 	return nil
 }
 
-// buildPropStore finalizes the Builder's staged property data (copied, not
+// buildPropStore copies the Builder's staged property data (copied, not
 // aliased, matching how Build copies every other staged slice into the
-// Snapshot) into an immutable PropStore, then builds the objectid index
-// over the finished store.
-func (b *Builder) buildPropStore(n int) *PropStore {
+// Snapshot) into a PropStore whose packed fields -- names, entries,
+// nodeOffsets, arena -- are ready, but whose derived fields (ids, the
+// name->PropID map; objectIndex/objectIndexDup, the objectid index) are
+// not: those are filled in uniformly for every construction path by
+// finalizePropStore (see its doc and finalizeDerived's), which Build calls
+// right after this.
+func (b *Builder) buildPropStore() *PropStore {
 	names := append([]string(nil), b.propNames...)
-	ids := make(map[string]PropID, len(b.propIDs))
-	for k, v := range b.propIDs {
-		ids[k] = v
-	}
 	entries := append([]propEntry(nil), b.propEntries...)
 	nodeOffsets := append([]uint32(nil), b.propOffsets...)
 	arena := append([]byte(nil), b.propArena...)
 
-	p := &PropStore{
+	return &PropStore{
 		names:       names,
-		ids:         ids,
 		entries:     entries,
 		nodeOffsets: nodeOffsets,
 		arena:       arena,
 	}
-
-	objID, hasObjID := p.IDByName("objectid")
-	p.objectIndex = make(map[string]NodeID)
-	if hasObjID {
-		for i := 0; i < n; i++ {
-			v, ok := p.Value(NodeID(i), objID)
-			if !ok {
-				continue
-			}
-			s, ok := v.(string)
-			if !ok {
-				continue
-			}
-			id := NodeID(i)
-			prev, seen := p.objectIndex[s]
-			switch {
-			case !seen:
-				p.objectIndex[s] = id
-			case p.objectIndexDup[s] != nil:
-				p.objectIndexDup[s] = append(p.objectIndexDup[s], id)
-			default:
-				if p.objectIndexDup == nil {
-					p.objectIndexDup = make(map[string][]NodeID)
-				}
-				p.objectIndexDup[s] = []NodeID{prev, id}
-			}
-		}
-	}
-
-	return p
 }
