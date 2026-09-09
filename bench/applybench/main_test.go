@@ -168,6 +168,116 @@ func TestLogCapture(t *testing.T) {
 	if _, ok := c.latest("never logged"); ok {
 		t.Fatal("latest(never logged) reported found")
 	}
+
+	// firstAfter finds the earliest record at or after a cut-off, which is
+	// how (b) ignores an Apply that happened during its warm-up.
+	at, ok := c.firstAfter("bloodtrail: compaction finished", t0.Add(500*time.Millisecond))
+	if !ok || !at.Equal(t0.Add(time.Second)) {
+		t.Fatalf("firstAfter(compaction finished, t0+500ms) = (%v, %t), want (%v, true)", at, ok, t0.Add(time.Second))
+	}
+	if at, ok := c.firstAfter("bloodtrail: compaction finished", t0); !ok || !at.Equal(t0) {
+		t.Fatalf("firstAfter(compaction finished, t0) = (%v, %t), want (%v, true) -- the cut-off is inclusive", at, ok, t0)
+	}
+	if _, ok := c.firstAfter("bloodtrail: compaction finished", t0.Add(time.Hour)); ok {
+		t.Fatal("firstAfter(compaction finished, t0+1h) reported found, want not found")
+	}
+}
+
+// TestLogCaptureForwardsToPreviousHandler pins the tee installLogCapture
+// relies on: a capture must not silence whatever handler it replaced, or
+// installing one would blind an operator to the driver's own warnings for
+// as long as a measurement runs.
+func TestLogCaptureForwardsToPreviousHandler(t *testing.T) {
+	var forwarded strings.Builder
+	c := newLogCapture()
+	c.next = slog.NewTextHandler(&forwarded, &slog.HandlerOptions{Level: slog.LevelWarn})
+
+	warn := slog.NewRecord(time.Now(), slog.LevelWarn, "loud", 0)
+	debug := slog.NewRecord(time.Now(), slog.LevelDebug, "quiet", 0)
+	for _, r := range []slog.Record{warn, debug} {
+		if err := c.Handle(context.Background(), r); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+	}
+
+	// Both are captured (logCapture.Enabled is unconditional) ...
+	if got := c.count("loud") + c.count("quiet"); got != 2 {
+		t.Fatalf("captured %d records, want 2", got)
+	}
+	// ... but only the one the wrapped handler's own level accepts is forwarded.
+	out := forwarded.String()
+	if !strings.Contains(out, "loud") {
+		t.Fatalf("the Warn record was not forwarded to the previous handler:\n%s", out)
+	}
+	if strings.Contains(out, "quiet") {
+		t.Fatalf("a Debug record was forwarded to a Warn-level handler:\n%s", out)
+	}
+}
+
+// TestSplitByFirstApply table-tests (b)'s delta-population split: the pure
+// function deciding which samples actually queried a populated delta and
+// which ran before the window's first write-through Apply and so measured
+// the base snapshot -- the distinction that made the difference between
+// (b) reporting a number about write-through and reporting one about
+// roughly 83% empty-delta queries.
+func TestSplitByFirstApply(t *testing.T) {
+	t0 := time.Now()
+	samples := []latencySample{
+		{at: t0, d: 1 * time.Millisecond},
+		{at: t0.Add(time.Second), d: 2 * time.Millisecond},
+		{at: t0.Add(2 * time.Second), d: 3 * time.Millisecond},
+	}
+
+	empty, populated := splitByFirstApply(samples, t0.Add(time.Second), true)
+	if len(empty) != 1 || empty[0] != 1*time.Millisecond {
+		t.Fatalf("empty-delta half = %v, want [1ms]", empty)
+	}
+	if len(populated) != 2 || populated[0] != 2*time.Millisecond || populated[1] != 3*time.Millisecond {
+		t.Fatalf("delta-populated half = %v, want [2ms 3ms] (the cut-off itself counts as populated)", populated)
+	}
+
+	// No Apply observed at all: every sample is honestly empty-delta.
+	empty, populated = splitByFirstApply(samples, time.Time{}, false)
+	if len(empty) != 3 || len(populated) != 0 {
+		t.Fatalf("with no Apply observed: empty=%d populated=%d, want 3 and 0", len(empty), len(populated))
+	}
+
+	if empty, populated := splitByFirstApply(nil, t0, true); empty != nil || populated != nil {
+		t.Fatalf("splitByFirstApply(nil, ...) = (%v, %v), want (nil, nil)", empty, populated)
+	}
+}
+
+// TestResolveRunID pins both halves of the objectid-namespacing fix: an
+// explicit -run-id is used verbatim (so an operator can correlate two runs
+// deliberately), and an absent one produces a fresh value per invocation
+// (so two runs against the same un-wiped database do not silently upsert
+// over each other -- see resolveRunID's own doc).
+func TestResolveRunID(t *testing.T) {
+	if got := resolveRunID("fixed"); got != "fixed" {
+		t.Fatalf("resolveRunID(%q) = %q, want it used verbatim", "fixed", got)
+	}
+
+	first := resolveRunID("")
+	if first == "" {
+		t.Fatal("resolveRunID(\"\") returned an empty id")
+	}
+	time.Sleep(time.Millisecond)
+	if second := resolveRunID(""); second == first {
+		t.Fatalf("two resolveRunID(\"\") calls returned the same id %q, want distinct per invocation", first)
+	}
+}
+
+// TestAllDurations pins the timestamp-dropping helper (b)'s full-window
+// reporting uses.
+func TestAllDurations(t *testing.T) {
+	t0 := time.Now()
+	got := allDurations([]latencySample{{at: t0, d: time.Millisecond}, {at: t0, d: 2 * time.Millisecond}})
+	if len(got) != 2 || got[0] != time.Millisecond || got[1] != 2*time.Millisecond {
+		t.Fatalf("allDurations = %v, want [1ms 2ms]", got)
+	}
+	if got := allDurations(nil); len(got) != 0 {
+		t.Fatalf("allDurations(nil) = %v, want empty", got)
+	}
 }
 
 // TestLogMessagesMatchEngineSource guards msgCompactionFinished/
@@ -187,6 +297,10 @@ func TestLogMessagesMatchEngineSource(t *testing.T) {
 	}{
 		{msgCompactionFinished, "../../internal/engine/compact.go"},
 		{msgSnapshotWritten, "../../internal/engine/persist.go"},
+		{msgSnapshotFileLoaded, "../../internal/engine/boot.go"},
+		{msgSnapshotFileRejected, "../../internal/engine/boot.go"},
+		{msgWriteThroughApplied, "../../internal/engine/apply.go"},
+		{msgPathEngineServed, "../../internal/engine/engine.go"},
 	}
 
 	for _, c := range cases {

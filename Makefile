@@ -43,7 +43,11 @@ bench-cypher: ## run the cypher-interpreter benchmark against BLOODTRAIL_TEST_PG
 # Generates a fresh graph via bench/adgen (ARGS forwarded to adgen -- e.g.
 # ARGS='-users 50000') and then runs the write-through apply benchmark
 # (sustained apply throughput, query latency during active ingest,
-# compaction duration, snapshot file write/load duration) against it.
+# compaction duration, snapshot file save/load/boot duration) against it.
+# NOTE: -wipe is passed unconditionally, so this target TRUNCATES the
+# node/edge tables of EVERY graph in BLOODTRAIL_TEST_PG -- with no ARGS at
+# all too, which then regenerates at adgen's own default size. Point it only
+# at a disposable test database.
 # -enforce fails the build if apply overhead or during-ingest p95 miss their
 # (PROVISIONAL, see bench/applybench/README.md) bars; every phase is bounded
 # by applybench's own -cap watchdog (default 10m per operation), which
