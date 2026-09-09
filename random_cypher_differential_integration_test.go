@@ -106,16 +106,28 @@ var randomCypherArrayPool = [][]string{
 	{"UP", "low"},
 }
 
-// randomCypherNodeProperties builds node i's properties (i in [0,
-// randomCypherFixtureNodeCount)): each of the four keys independently cycles
-// through "missing entirely" / "present as an explicit JSON null" / "present
-// with a pool value", using a different modulus (and modulus offset) per key
-// so the four keys' missing/null/present patterns don't all coincide on the
-// same nodes. A missing key and an explicit Set(key, nil) both are real,
-// distinct traps: the former never reaches PostgreSQL's jsonb column at
-// all, decodeJSONValue material never sees an entry for it; the latter
-// stores a genuine JSON `null` the property store and the pg driver's own
-// decodeJSONValue must each resolve to Cypher NULL the same way.
+// randomCypherNodeProperties builds node i's properties: each of the four
+// keys independently cycles through "missing entirely" / "present as an
+// explicit JSON null" / "present with a pool value", using a different
+// modulus (and modulus offset) per key so the four keys' missing/null/
+// present patterns don't all coincide on the same nodes. A missing key and
+// an explicit Set(key, nil) both are real, distinct traps: the former
+// never reaches PostgreSQL's jsonb column at all, decodeJSONValue material
+// never sees an entry for it; the latter stores a genuine JSON `null` the
+// property store and the pg driver's own decodeJSONValue must each resolve
+// to Cypher NULL the same way.
+//
+// i's domain is NOT bounded to [0, randomCypherFixtureNodeCount): every
+// modulus/switch below is well-defined for any non-negative i, and
+// applyRandomCypherMutation's "create" case calls this with
+// len(*idsPtr) -- the running node-id catalog's own current size, which
+// grows past randomCypherFixtureNodeCount every time an earlier mutation
+// in the sweep creates a node. That is by design (a later create's
+// properties keep cycling through the same trap coverage a fixture node's
+// would, never falling back to some narrower or degenerate shape once i
+// exceeds the fixture's own original 40), not a bug in either this
+// function or its caller -- documented here so a future reader does not
+// "fix" loadRandomCypherFixture's own call site to somehow clamp i instead.
 func randomCypherNodeProperties(i int) *graph.Properties {
 	props := graph.NewProperties()
 
@@ -617,15 +629,28 @@ const (
 
 // randomCypherMutationInterval resolves the effective interval:
 // randomCypherMutationIntervalEnv's value when it parses as a non-negative
-// integer, randomCypherMutationIntervalDefault otherwise (unset, empty, or
-// unparseable).
-func randomCypherMutationInterval() int {
-	if v := os.Getenv(randomCypherMutationIntervalEnv); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			return n
-		}
+// integer, randomCypherMutationIntervalDefault when the env var is unset or
+// empty. An env var that IS set but fails to parse (not an integer, or
+// negative) fails the test loudly via t.Fatalf instead of silently falling
+// back to the default -- a typo'd override (e.g. "5 " with a trailing
+// space, or "-1") would otherwise run with a value the caller never
+// intended and never learn why, defeating the whole point of an explicit
+// override.
+func randomCypherMutationInterval(t *testing.T) int {
+	t.Helper()
+
+	v := os.Getenv(randomCypherMutationIntervalEnv)
+	if v == "" {
+		return randomCypherMutationIntervalDefault
 	}
-	return randomCypherMutationIntervalDefault
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		t.Fatalf("%s=%q: not an integer: %v", randomCypherMutationIntervalEnv, v, err)
+	}
+	if n < 0 {
+		t.Fatalf("%s=%q: must be >= 0 (0 disables the mutation phase)", randomCypherMutationIntervalEnv, v)
+	}
+	return n
 }
 
 // applyRandomCypherMutation performs one small, seeded-deterministic
@@ -687,7 +712,16 @@ func applyRandomCypherMutation(t *testing.T, ctx context.Context, bt, oracleDB g
 		return fmt.Sprintf("mutation seed=%d: updated node id=%d (str/val)", mutationSeed, id)
 
 	default: // delete: batch.DeleteRelationship by id.
-		result, err := runCorpusQuery(t, ctx, oracleDB, `MATCH ()-[r]->() RETURN r LIMIT 200`)
+		// ORDER BY id(r): without it, this scan's own row order (and hence
+		// which up-to-200 edges even appear before the LIMIT cuts it off)
+		// is unspecified and free to shift on every call as the sweep's own
+		// earlier mutations change the table's physical layout -- silently
+		// contradicting this suite's "reproducible by seed alone" doc
+		// (TestRandomCypherDifferential's own, and applyRandomCypherMutation's),
+		// since rng.Intn(len(edgeIDs)) below would then index a
+		// run-varying slice even though the RNG draw itself is fixed by
+		// mutationSeed.
+		result, err := runCorpusQuery(t, ctx, oracleDB, `MATCH ()-[r]->() RETURN r ORDER BY id(r) LIMIT 200`)
 		if err != nil {
 			t.Fatalf("random differential mutation (seed=%d, delete): locate candidate edge: %v", mutationSeed, err)
 		}
@@ -844,14 +878,14 @@ func TestRandomCypherDifferential(t *testing.T) {
 	rebuildsBeforeSweep := d.engine.RebuildCount()
 	fallbacksBeforeSweep := markerCount(buf, fallbackEnteredMarker)
 
-	mutationInterval := randomCypherMutationInterval()
+	mutationInterval := randomCypherMutationInterval(t)
 
 	var (
 		servedCount   int
 		nonEmptyCount int
 		totalCount    int
 		globalIter    int
-		lastMutation  string
+		mutationTrace []string // every mutation summary so far, in order -- see the failure log below
 	)
 
 	for seed := int64(1); seed <= randomCypherDifferentialSeeds; seed++ {
@@ -866,13 +900,20 @@ func TestRandomCypherDifferential(t *testing.T) {
 				// (1..randomCypherDifferentialSeeds) or query index, so this
 				// mutation's own rand.Rand draws never correlate with
 				// either.
-				lastMutation = applyRandomCypherMutation(t, ctx, bt, oracleDB, &ids, int64(900000+globalIter))
+				mutationTrace = append(mutationTrace, applyRandomCypherMutation(t, ctx, bt, oracleDB, &ids, int64(900000+globalIter)))
 			}
 
 			t.Run(fmt.Sprintf("seed=%d/query=%d", seed, q), func(t *testing.T) {
+				// globalIter and the FULL mutationTrace so far (not just the
+				// most recent entry) -- a divergence caused by mutation N-3
+				// interacting with mutation N-1 is only reproducible if the
+				// failure log names the whole sequence, not just whichever
+				// mutation happened to run most recently before this query.
+				iterAtFailure, traceAtFailure := globalIter, append([]string(nil), mutationTrace...)
 				defer func() {
 					if t.Failed() {
-						t.Logf("reproduce with: seed=%d query=%d\nquery: %s\nmost recent mutation: %s", seed, q, text, lastMutation)
+						t.Logf("reproduce with: seed=%d query=%d (global iteration %d)\nquery: %s\nmutation trace so far (%d entries):\n%s",
+							seed, q, iterAtFailure, text, len(traceAtFailure), strings.Join(traceAtFailure, "\n"))
 					}
 				}()
 
@@ -891,7 +932,17 @@ func TestRandomCypherDifferential(t *testing.T) {
 						t.Fatalf("error string mismatch:\n  bloodtrail: %s\n  oracle:     %s\n(query: %s)", gotErr.Error(), wantErr.Error(), text)
 					}
 				default:
-					assertCorpusResultsMatch(t, false, gotResult, wantResult)
+					// sortPackedPathAllowed is unconditionally true here:
+					// every randomCypherTemplates entry returns a bare
+					// node/relationship/scalar projection (RETURN n /
+					// RETURN DISTINCT n.flag AS flag / RETURN cnt / ...),
+					// never a path variable (no template ever binds one via
+					// "MATCH p = (...)" or "MATCH p = shortestPath(...)")
+					// -- see projectsPathVariable's own doc, prebuilt_
+					// corpus_integration_test.go, for why that distinction,
+					// not len(Paths), is what actually gates whether
+					// sortFlatPathNodesAndEdges may run.
+					assertCorpusResultsMatch(t, false, true, gotResult, wantResult)
 				}
 
 				totalCount++

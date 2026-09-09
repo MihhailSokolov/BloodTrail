@@ -1128,7 +1128,11 @@ func runBuilderMatrixWriteThroughPreamble(t *testing.T, ctx context.Context, bt,
 	// upserting a fresh (rather than merged) node under that empty-string
 	// objectid, which still exercises the same write shape, just without an
 	// existing target to merge onto.
-	existingOID := cypherStringValue(t, ctx, oracle, `MATCH (n) WHERE n.objectid IS NOT NULL RETURN n.objectid LIMIT 1`)
+	// ORDER BY id(n) makes "first" deterministic (id order) rather than an
+	// unordered scan's own incidental, unspecified row order -- see I4's
+	// own fix at prebuilt_corpus_integration_test.go's identical
+	// existingUserOID read.
+	existingOID := cypherStringValue(t, ctx, oracle, `MATCH (n) WHERE n.objectid IS NOT NULL RETURN n.objectid ORDER BY id(n) LIMIT 1`)
 
 	// Asserted through a THROWAWAY *pg.Driver sharing bt's own connection
 	// pool, never through bt (or pgDriver/oracle) itself -- see
@@ -1141,6 +1145,15 @@ func runBuilderMatrixWriteThroughPreamble(t *testing.T, ctx context.Context, bt,
 	// re-assert into a no-op that never issues the real CREATE UNIQUE INDEX
 	// -- confirmed the same way for this file (PostgreSQL error 42P10 on
 	// the very next UpdateNodeBy) before this fix.
+	//
+	// Never explicitly closed, deliberately: pg.Driver.Close closes the
+	// *pgxpool.Pool it was given -- here, bt's own shared pool -- and every
+	// other driver in this test (bt, pgDriver, oracle) keeps using that
+	// same pool for the rest of TestBuilderQueryDifferentialMatrix. Closing
+	// it out from under them to tidy up this one throwaway value would
+	// break the whole suite, not just this call; the small, bounded leak
+	// of one Go value for the test process' lifetime is the correct
+	// trade-off, not something a future "leak fix" should touch.
 	schema := graph.Schema{DefaultGraph: graph.Graph{
 		Name:            graphtest.GraphName,
 		NodeConstraints: []graph.Constraint{{Field: "objectid", Type: graph.BTreeIndex}},
@@ -1150,16 +1163,16 @@ func runBuilderMatrixWriteThroughPreamble(t *testing.T, ctx context.Context, bt,
 	}
 
 	primaryKind := nodeKinds[0]
-	tempKind := graph.StringKind("WT18MatrixTemp")
-	taggedKind := graph.StringKind("WT18MatrixTagged")
-	mergedKind := graph.StringKind("WT18MatrixMerged")
+	tempKind := graph.StringKind("WriteThroughMatrixTemp")
+	taggedKind := graph.StringKind("WriteThroughMatrixTagged")
+	mergedKind := graph.StringKind("WriteThroughMatrixMerged")
 
 	// Class 1: objectid upsert creating a brand-new node of a REAL fixture
 	// kind, counted by that kind's Count/FetchIDs/FetchKinds checks in the
 	// rerun that follows.
-	const newObjectID = "WT18-MatrixPreambleNode"
+	const newObjectID = "WriteThroughMatrixPreambleNode"
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
-		return batch.UpdateNodeBy(objectIDUpdate(newObjectID, graph.NewProperties().Set("wt18temp", "gone-soon"), primaryKind, tempKind))
+		return batch.UpdateNodeBy(objectIDUpdate(newObjectID, graph.NewProperties().Set("writethroughtemp", "gone-soon"), primaryKind, tempKind))
 	}); err != nil {
 		t.Fatalf("write-through preamble: objectid upsert create: %v", err)
 	}
@@ -1177,7 +1190,7 @@ func runBuilderMatrixWriteThroughPreamble(t *testing.T, ctx context.Context, bt,
 	// Class 2: objectid upsert merging a kind onto whichever node
 	// existingOID (read above, before any write) names.
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
-		return batch.UpdateNodeBy(objectIDUpdate(existingOID, graph.NewProperties().Set("wt18merged", "yes"), mergedKind))
+		return batch.UpdateNodeBy(objectIDUpdate(existingOID, graph.NewProperties().Set("writethroughmerged", "yes"), mergedKind))
 	}); err != nil {
 		t.Fatalf("write-through preamble: objectid upsert merge: %v", err)
 	}
@@ -1185,7 +1198,7 @@ func runBuilderMatrixWriteThroughPreamble(t *testing.T, ctx context.Context, bt,
 	// Class 5: batch.UpdateNodes carrying AddedKinds/DeletedKinds and a
 	// deleted property, targeting the class-1 node above by id.
 	update := &graph.Node{ID: newNodeID, Kinds: graph.Kinds{taggedKind}, DeletedKinds: graph.Kinds{tempKind}, Properties: graph.NewProperties()}
-	update.Properties.Delete("wt18temp")
+	update.Properties.Delete("writethroughtemp")
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.UpdateNodes([]*graph.Node{update})
 	}); err != nil {

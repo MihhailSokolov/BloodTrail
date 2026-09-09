@@ -496,6 +496,75 @@ func hasOrderBy(query string) bool {
 	return strings.Contains(strings.ToUpper(query), "ORDER BY")
 }
 
+// pathVariableBindingPattern matches a Cypher MATCH clause that binds a
+// PATH-TYPED variable: "MATCH <name> = (" (a plain path pattern) or
+// "MATCH <name> = shortestPath(" / "MATCH <name> = allShortestPaths("
+// (Cypher's two path-returning functions) -- case-insensitively, mirroring
+// hasOrderBy's own keyword-case handling. Anchored to the MATCH keyword
+// specifically (not a bare "<name> = (" anywhere in the query text) so an
+// unrelated parenthesized WHERE-clause sub-expression is never mistaken for
+// a path binding.
+var pathVariableBindingPattern = regexp.MustCompile(`(?i)MATCH\s+([A-Za-z_]\w*)\s*=\s*(?:shortestPath|allShortestPaths)?\s*\(`)
+
+// returnClauseTextPattern extracts everything after a query's own RETURN
+// keyword, case-insensitively -- projectsPathVariable's own helper.
+var returnClauseTextPattern = regexp.MustCompile(`(?i)RETURN\s+([\s\S]*)`)
+
+// projectsPathVariable reports whether query's RETURN clause returns a
+// genuine Cypher path-typed value -- a variable bound via "<name> = (...)"
+// or "<name> = shortestPath(...)/allShortestPaths(...)" in an earlier MATCH
+// clause -- as opposed to bare node/relationship/scalar values.
+//
+// This, not len(ops.QueryResult.Paths), is the correct gate for whether
+// "unordered" comparison may reorder a packed pseudo-path's own contents
+// (sortFlatPathNodesAndEdges): a path variable's internal node/edge
+// SEQUENCE is traversal-order-significant -- it IS the actual route the
+// query matched -- so it must never be sorted, even when the query happens
+// to return exactly one such path against a given fixture. That "exactly
+// one path" case is exactly where len(Paths) becomes ambiguous: it is also
+// what a genuinely bare "RETURN n" projection produces when its own result
+// happens to be exactly one row (ops.FetchByQuery packs every row of a bare
+// projection into ONE shared, accumulated graph.Path -- see
+// sortFlatPathNodesAndEdges' own doc). Only the query's own projection
+// SHAPE -- fixed by its text, independent of how many rows any particular
+// fixture happens to produce -- can distinguish the two.
+//
+// Verified against every active query in testdata/prebuilt/{agt,agi,
+// selectors}.json (2026-09-09): 129 of the corpus' 222 active queries
+// project a path variable this way (all named "p", always returned bare,
+// e.g. "MATCH p = (:Domain)-[:SameForestTrust|CrossForestTrust]->(:Domain)
+// RETURN p LIMIT 1000" or "MATCH p=shortestPath((s)-[:...]->(t)) ... RETURN
+// p LIMIT 1000") -- of those, 82 return exactly one path with two or more
+// nodes against this fixture, the exact shape a naive len(Paths)==1 guard
+// cannot tell apart from a bare packed pseudo-path. Reversing one of those
+// 82 queries' own returned path and re-comparing demonstrates the
+// difference directly: with sortFlatPathNodesAndEdges gated on this
+// predicate (sortPackedPathAllowed=false for these), the reversed path
+// compares UNEQUAL to the original, as it must; gated on len(Paths)!=1
+// alone (this suite's previous, buggy state), it wrongly compared EQUAL --
+// see this file's own write-through-preamble report appendix for the
+// measured evidence.
+func projectsPathVariable(query string) bool {
+	bindings := pathVariableBindingPattern.FindAllStringSubmatch(query, -1)
+	if len(bindings) == 0 {
+		return false
+	}
+
+	retMatch := returnClauseTextPattern.FindStringSubmatch(query)
+	if retMatch == nil {
+		return false
+	}
+	returnClause := retMatch[1]
+
+	for _, b := range bindings {
+		name := b[1]
+		if regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\b`).MatchString(returnClause) {
+			return true
+		}
+	}
+	return false
+}
+
 // extractNodeIDs, extractEdgeIDs, and extractLiteralSignatures flatten an
 // ops.QueryResult into the three comparable projections this suite's brief
 // calls for: node ids, edge ids, and literal signatures (Key plus a
@@ -667,16 +736,18 @@ func renderPathSignatures(ps graph.PathSet) []string {
 // n" results is not a correctness divergence; it is exactly what
 // "unordered" was always supposed to tolerate.
 //
-// Deliberately a no-op when paths does not hold EXACTLY one entry:
-// ops.FetchByQuery gives a query whose RETURN clause instead projects a
-// genuine, per-row graph.Path value (e.g. a shortestPath result) its OWN
-// distinct entry in the returned PathSet for each such row, in which case
-// len(Paths) > 1, and that path's own internal node/edge sequence IS
-// traversal-order-significant -- reordering it would be wrong, not merely
-// unnecessary. The two shapes cannot be mixed within one query's result
-// (whether a given RETURN column produces a bare entity or a path value is
-// fixed by the query's own projection, uniformly across every row), so
-// this len-1 guard reliably distinguishes them.
+// Also a no-op when paths does not hold EXACTLY one entry -- a secondary,
+// defensive guard only, not this function's primary safety mechanism: the
+// PRIMARY gate is now the caller's own sortPackedPathAllowed argument to
+// assertCorpusResultsMatch (see projectsPathVariable's own doc for why
+// len(Paths) alone cannot reliably tell a genuine single-row path apart
+// from a bare-projection query that merely happens to return one row
+// against a given fixture). A correctly gated caller never reaches this
+// function at all for a path-projecting query, so this length check should
+// never actually fire in practice; it stays as a last-resort safety net
+// against a future caller mistake, since sorting only ever makes sense for
+// the single-packed-blob shape regardless of how that shape was
+// determined.
 func sortFlatPathNodesAndEdges(paths graph.PathSet) {
 	if len(paths) != 1 {
 		return
@@ -711,14 +782,24 @@ func sortFlatPathNodesAndEdges(paths graph.PathSet) {
 // and literals by (scalarSignature-normalized) deep equality -- ordered
 // sequences instead of set/multiset comparisons when ordered is true (see
 // hasOrderBy).
-func assertCorpusResultsMatch(t *testing.T, ordered bool, got, want ops.QueryResult) {
+//
+// sortPackedPathAllowed must be true only when the query's own RETURN
+// clause is known NOT to project a genuine path-typed value (see
+// projectsPathVariable's own doc) -- callers compute it once, from the
+// query's own text, and must never derive it from len(got.Paths)/
+// len(want.Paths): both a bare-projection query's packed pseudo-path and a
+// genuine single-row path-projection query produce len(Paths)==1 against a
+// given fixture, and only the query's own projection shape (fixed by its
+// text) can tell them apart. Ignored when ordered is true, since that
+// branch never calls sortFlatPathNodesAndEdges at all.
+func assertCorpusResultsMatch(t *testing.T, ordered, sortPackedPathAllowed bool, got, want ops.QueryResult) {
 	t.Helper()
 
 	if len(got.Paths) != len(want.Paths) {
 		t.Errorf("path count mismatch: got %d paths, want %d", len(got.Paths), len(want.Paths))
 	}
 
-	if !ordered {
+	if !ordered && sortPackedPathAllowed {
 		// See sortFlatPathNodesAndEdges's own doc: a bare-node/relationship
 		// projection ("RETURN n", never a genuine path-typed value) packs
 		// every row into ONE shared pseudo-path, in row-ENCOUNTER order --
@@ -728,10 +809,12 @@ func assertCorpusResultsMatch(t *testing.T, ordered bool, got, want ops.QueryRes
 		// pseudo-path contents before rendering makes what follows
 		// insensitive to that meaningless order, restoring genuine SET
 		// semantics for exactly the queries "unordered" was always meant to
-		// cover -- a no-op for the genuine-multi-path case (len(Paths) > 1,
-		// e.g. several distinct shortestPath rows), where each path's own
-		// internal node/edge sequence remains traversal-order-significant
-		// and untouched.
+		// cover. sortPackedPathAllowed being false skips this entirely for
+		// a query whose RETURN clause projects a genuine path variable
+		// (projectsPathVariable): that path's own internal node/edge
+		// sequence remains traversal-order-significant and must stay
+		// untouched, whether the query returns one such path against this
+		// fixture or several.
 		sortFlatPathNodesAndEdges(got.Paths)
 		sortFlatPathNodesAndEdges(want.Paths)
 	}
@@ -942,7 +1025,15 @@ func assertOrderedCorpusResult(t *testing.T, ctx context.Context, oracleDB graph
 		return
 	}
 
-	assertCorpusResultsMatch(t, true, got, want)
+	// sortPackedPathAllowed's value is inert here: ordered=true never
+	// reaches assertCorpusResultsMatch's sort branch. Passed as false
+	// (the more conservative value) purely so this call site does not need
+	// its own query text to compute the real answer -- this fallback path
+	// has no query text on hand (only name), and today it is unreachable in
+	// practice: TestPrebuiltCorpusDifferential's own inventory tripwire
+	// guarantees every ORDER BY query in the corpus is orderedCorpusQueryName,
+	// which returns above instead of reaching here.
+	assertCorpusResultsMatch(t, true, false, got, want)
 }
 
 // TestPrebuiltCorpusDifferential is milestone 4's Task 16 exit criterion --
@@ -1212,7 +1303,13 @@ func runOneCorpusQueryComparison(t *testing.T, ctx context.Context, buf *lockedB
 	} else if ordered {
 		assertOrderedCorpusResult(t, ctx, oracleDB, q.name, gotResult, wantResult)
 	} else {
-		assertCorpusResultsMatch(t, false, gotResult, wantResult)
+		// sortPackedPathAllowed must come from the query's own projection
+		// SHAPE (projectsPathVariable), never from len(Paths): both a bare
+		// projection's packed pseudo-path and a genuine single-row path
+		// projection produce len(Paths)==1 against this fixture, and only
+		// the query's own text can tell them apart -- see
+		// projectsPathVariable's own doc for the measured evidence.
+		assertCorpusResultsMatch(t, false, !projectsPathVariable(q.query), gotResult, wantResult)
 	}
 
 	nonEmpty = len(wantResult.Paths) > 0 || len(wantResult.Literals) > 0
@@ -1238,12 +1335,44 @@ func runOneCorpusQueryComparison(t *testing.T, ctx context.Context, buf *lockedB
 // then reruns the IDENTICAL 222-query comparison (runOneCorpusQueryComparison,
 // shared with the original pass) against whatever state the write-through
 // path alone produced. Because the mutation touches real corpus data (a
-// real :User node's own objectid; a real :MemberOf edge) rather than an
-// inert namespace of its own, the rerun's queries see genuinely different
-// results than the first pass did -- not a no-op rerun of the same
-// comparison against unchanged data, the shape this package's own recent
-// history (TestDAWGSCorpus's redundant "delegating" pass, since removed)
-// warns against reintroducing.
+// real :User node's own objectid; a real :CrossForestTrust edge) rather
+// than an inert namespace of its own, the rerun's queries see genuinely
+// different results than the first pass did -- not a no-op rerun of the
+// same comparison against unchanged data, the shape this package's own
+// recent history (TestDAWGSCorpus's redundant "delegating" pass, since
+// removed) warns against reintroducing.
+//
+// # Measured blast radius
+//
+// Exactly 9 of the 222 active queries return different content in the
+// rerun (measured 2026-09-09 by diffing each query's own rendered result,
+// oracle-side only, before vs. after runCorpusWriteThroughPreamble against
+// a freshly loaded fixture -- independent of bt/write-through fidelity,
+// which the rerun itself separately checks): "All Kerberoastable users"
+// and "Kerberoastable members of Tier Zero / High Value groups" (agt+agi
+// each, from class 1/2's own hasspn/admincount properties -- see
+// runCorpusWriteThroughPreamble's own doc), "Map domain trusts" and
+// "Cross-forest trusts with abusable configuration" (agt+agi each, from
+// class 7's own CrossForestTrust deletion), and the "Administrator"
+// selector (from class 2 merging directly onto that well-known principal,
+// whose own objectid happens to be this fixture's first :User by scan
+// order). This replaces an earlier version of this preamble that moved
+// only 7 of 222 (a narrower class-1/2 property set, and a class-7 deletion
+// targeting a low-salience filler :MemberOf edge instead) -- narrower than
+// this doc previously (inaccurately) described as "dozens". This corpus's
+// own :User-scanning queries that DON'T also filter on hasspn/
+// admincount/enabled (the properties this preamble's class 1/2 nodes
+// actually carry) never notice the new/merged node at all: seeing it show
+// up in exactly the queries whose predicates it satisfies, and nowhere
+// else, is the correct outcome of a targeted mutation, not evidence of a
+// weak one -- see runCorpusWriteThroughPreamble's own doc for why this
+// preamble's class-7 target changed for a correctness reason (I3-shaped:
+// provably outside every shortestPath(...) traversal's own relationship-
+// kind alternation) independent of this blast-radius question, and why
+// widening class 1/2 further (e.g. a MemberOf edge into a real corpus
+// group) was deliberately left for a future pass rather than risking
+// interaction with orderedCorpusQueryName's own tie-aware comparison
+// without dedicated validation.
 //
 // writeThroughPreambleEnabled gates this whole phase (shared with
 // builder_differential_matrix_integration_test.go's own "fixtures_writethrough"
@@ -1281,16 +1410,64 @@ func writeThroughPreambleEnabled() bool {
 // own objectid (class 2's target, read live from oracleDB, never
 // hardcoded, matching builder_differential_matrix_integration_test.go's own
 // firstEdgeAnchor/firstNodeKindOf precedent for deriving anchors from real
-// data rather than fixture-internal literals), and a real :MemberOf edge
-// (class 7's target) -- rather than an inert namespace of its own, so the
-// mutations are visible to, not invisible to, the 222-query rerun that
-// follows: any :User-scanning query's own result set now includes the
-// class-1 node and reflects the class-2 node's merged property/kind, and
-// any query touching the deleted class-7 relationship's endpoints sees one
-// fewer edge. Because both bt and oracleDB read the identical post-mutation
+// data rather than fixture-internal literals), and a real :CrossForestTrust
+// edge (class 7's target) -- rather than an inert namespace of its own, so
+// the mutations are visible to, not invisible to, the 222-query rerun that
+// follows. Because both bt and oracleDB read the identical post-mutation
 // PostgreSQL state, the rerun's pass/fail verdict never depends on knowing
 // the "right" answer in advance -- only on whether the two sides still
 // agree.
+//
+// # Class 1/2 properties: hasspn/admincount, not just a bare :User
+//
+// The class-1/class-2 nodes carry hasspn=true and admincount=true (on top
+// of enabled=true), not just a kind and a throwaway marker property --
+// these are properties several real corpus predicate families actually
+// filter on (the Kerberoastable-user family's own `u.hasspn = true AND
+// u.enabled = true AND ...`; the "admincount" hygiene/selector family).
+// Without them, an earlier version of this preamble's class-1/2 nodes were
+// only ever visible to a query that scans :User with NO further predicate
+// at all -- vanishingly few of the corpus' actual :User-touching queries,
+// since almost every one of them filters on something. See this file's own
+// "write-through rerun" section doc, above, for the measured before/after
+// blast radius this widened property set (together with the class-7
+// retarget below) produces.
+//
+// # Class 7 target: CrossForestTrust, not a :MemberOf edge
+//
+// An earlier version of this preamble deleted the highest-id :MemberOf
+// edge (seedFillerPopulation runs last in LoadCorpusFixture's own seeding
+// order, internal/graphtest/corpusfixture.go, so that edge is very likely
+// one of its own low-salience filler group memberships). Measured
+// (2026-09-09): that deletion moved 6 of the corpus' 22 shortestPath(...)
+// queries -- entirely legitimate, deterministic content changes in
+// themselves (removing a filler group's only edge removes that group's own
+// row from every unconstrained-source shortestPath query it used to
+// qualify for), but landing squarely in the one corpus family
+// (knownAmbiguousQueries, above) whose own tie-allowlist was calibrated
+// against the PRE-mutation graph and whose comparison is by exact path
+// signature: a shortestPath tie is implementation-defined by construction
+// (either engine may pick a different one of several equally-short
+// candidates), so widening this preamble's edge-deletion footprint inside
+// that specific family is exactly the wrong place to add mutation risk --
+// a future edit disturbing the graph's tie structure near this edge could
+// make bt and the oracle pick different tied paths and fail spuriously,
+// with no actual write-through bug behind it.
+//
+// CrossForestTrust carries no such risk: it is not a member of ANY
+// shortestPath(...) query's own relationship-kind alternation list
+// anywhere in the corpus (verified 2026-09-09 by parsing every
+// shortestPath(...) pattern in testdata/prebuilt/{agt,agi,selectors}.json
+// and checking CrossForestTrust's absence from all 106 relationship kinds
+// those alternations collectively reference) -- deleting it is therefore
+// PROVABLY, not just empirically, outside every shortestPath traversal's
+// reach, by the query text alone, independent of this fixture's own
+// current tie structure. It is still a real, visible mutation: "Map domain
+// trusts" and "Cross-forest trusts with abusable configuration" (agt+agi
+// each) both match CrossForestTrust directly in a plain (non-shortestPath)
+// MATCH, so deleting the fixture's one such edge (domain1 -> domain2,
+// seedTrustsAndRelay) removes exactly one row from each, a deterministic
+// change both bt and the oracle must agree on.
 //
 // The objectid unique index classes 1/2 need (UpdateNodeBy's ON CONFLICT
 // target) is asserted here, against this fixture specifically -- verified
@@ -1337,9 +1514,20 @@ func runCorpusWriteThroughPreamble(t *testing.T, ctx context.Context, bt, oracle
 	// Read BEFORE any write below: class 2 merges onto whichever :User the
 	// oracle's own current data names here, so this must be a genuinely
 	// pre-existing fixture principal, not (by scan-order accident) the
-	// brand-new node class 1 is about to create.
-	existingUserOID := cypherStringValue(t, ctx, oracleDB, `MATCH (u:User) WHERE u.objectid IS NOT NULL RETURN u.objectid LIMIT 1`)
+	// brand-new node class 1 is about to create. ORDER BY id(u) makes
+	// "first" deterministic (id order) rather than an unordered scan's own
+	// incidental, unspecified row order.
+	existingUserOID := cypherStringValue(t, ctx, oracleDB, `MATCH (u:User) WHERE u.objectid IS NOT NULL RETURN u.objectid ORDER BY id(u) LIMIT 1`)
 
+	// Never explicitly closed: pg.Driver.Close closes the *pgxpool.Pool it
+	// was given -- here, bt's own shared pool -- and closing that out from
+	// under a driver instance every other part of this suite keeps using
+	// (bt, oracleDB) would break them, not just this throwaway driver. A
+	// one-off *pg.Driver value sharing pool solely to reach the real
+	// AssertSchema diff-and-sync path once (see "Why the constraint is
+	// asserted through a THROWAWAY driver" below) is worth that small,
+	// bounded leak of one Go value for this test process' lifetime; it is
+	// not worth (or safe to) "fix" by adding a Close call here.
 	schema := graph.Schema{DefaultGraph: graph.Graph{
 		Name:            graphtest.GraphName,
 		NodeConstraints: []graph.Constraint{{Field: "objectid", Type: graph.BTreeIndex}},
@@ -1349,16 +1537,21 @@ func runCorpusWriteThroughPreamble(t *testing.T, ctx context.Context, bt, oracle
 	}
 
 	userKind := graph.StringKind("User")
-	tempKind := graph.StringKind("WT18Temp")
-	taggedKind := graph.StringKind("WT18Tagged")
-	mergedKind := graph.StringKind("WT18Merged")
+	tempKind := graph.StringKind("WriteThroughPreambleTemp")
+	taggedKind := graph.StringKind("WriteThroughPreambleTagged")
+	mergedKind := graph.StringKind("WriteThroughPreambleMerged")
 
 	// Class 1: objectid upsert creating a brand-new User node -- visible to
-	// every corpus query that scans :User.
-	const newObjectID = "WT18-PreambleUser"
+	// every corpus query that scans :User AND filters on hasspn/admincount/
+	// enabled (see this function's own "Class 1/2 properties" doc for why
+	// those specific properties, not just enabled, and this file's "write-
+	// through rerun" section doc for the measured resulting blast radius).
+	const newObjectID = "WriteThroughPreambleUser"
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.UpdateNodeBy(objectIDUpdate(newObjectID,
-			graph.NewProperties().Set("name", "WT18 Preamble User").Set("enabled", true).Set("wt18temp", "gone-soon"),
+			graph.NewProperties().Set("name", "Write-Through Preamble User").Set("enabled", true).
+				Set("hasspn", true).Set("admincount", true).Set("gmsa", false).Set("msa", false).
+				Set("writethroughtemp", "gone-soon"),
 			userKind, tempKind))
 	}); err != nil {
 		t.Fatalf("write-through preamble: objectid upsert create: %v", err)
@@ -1374,10 +1567,15 @@ func runCorpusWriteThroughPreamble(t *testing.T, ctx context.Context, bt, oracle
 	}
 	newNodeID := newIDs[0]
 
-	// Class 2: objectid upsert merging a property and unioning a kind onto
-	// an EXISTING corpus :User.
+	// Class 2: objectid upsert merging properties and unioning a kind onto
+	// an EXISTING corpus :User -- the same hasspn/admincount pair class 1
+	// carries, so this genuinely pre-existing principal also becomes
+	// visible to the same predicate families, not just the merge marker
+	// itself.
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
-		return batch.UpdateNodeBy(objectIDUpdate(existingUserOID, graph.NewProperties().Set("wt18merged", "yes"), mergedKind))
+		return batch.UpdateNodeBy(objectIDUpdate(existingUserOID,
+			graph.NewProperties().Set("writethroughmerged", "yes").Set("hasspn", true).Set("admincount", true),
+			mergedKind))
 	}); err != nil {
 		t.Fatalf("write-through preamble: objectid upsert merge: %v", err)
 	}
@@ -1387,26 +1585,26 @@ func runCorpusWriteThroughPreamble(t *testing.T, ctx context.Context, bt, oracle
 	// a throwaway second kind and property for exactly this step to
 	// remove).
 	update := &graph.Node{ID: newNodeID, Kinds: graph.Kinds{taggedKind}, DeletedKinds: graph.Kinds{tempKind}, Properties: graph.NewProperties()}
-	update.Properties.Delete("wt18temp")
+	update.Properties.Delete("writethroughtemp")
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.UpdateNodes([]*graph.Node{update})
 	}); err != nil {
 		t.Fatalf("write-through preamble: batch UpdateNodes: %v", err)
 	}
 
-	// Class 7: batch.DeleteRelationship by id -- the most recently created
-	// MemberOf edge (seedFillerPopulation runs last in LoadCorpusFixture's
-	// own seeding order, internal/graphtest/corpusfixture.go, so the
-	// highest-id MemberOf edge is very likely one of its low-salience
-	// filler memberships rather than a specific, individually-queried
-	// fixture edge).
-	lastMemberOf, err := runCorpusQuery(t, ctx, oracleDB, `MATCH ()-[r:MemberOf]->() RETURN r ORDER BY id(r) DESC LIMIT 1`)
+	// Class 7: batch.DeleteRelationship by id -- this fixture's one
+	// CrossForestTrust edge (domain1 -> domain2, seedTrustsAndRelay), never
+	// a :MemberOf edge -- see this function's own "Class 7 target" doc for
+	// why: CrossForestTrust is provably outside every shortestPath(...)
+	// query's own relationship-kind alternation in the corpus, so deleting
+	// it can never perturb a shortestPath tie, unlike a :MemberOf edge.
+	crossForestTrust, err := runCorpusQuery(t, ctx, oracleDB, `MATCH ()-[r:CrossForestTrust]->() RETURN r LIMIT 1`)
 	if err != nil {
-		t.Fatalf("write-through preamble: locate MemberOf edge to delete: %v", err)
+		t.Fatalf("write-through preamble: locate CrossForestTrust edge to delete: %v", err)
 	}
-	relIDs := extractEdgeIDs(lastMemberOf)
+	relIDs := extractEdgeIDs(crossForestTrust)
 	if len(relIDs) != 1 {
-		t.Fatalf("write-through preamble: locate MemberOf edge to delete: got %d, want 1", len(relIDs))
+		t.Fatalf("write-through preamble: locate CrossForestTrust edge to delete: got %d, want 1", len(relIDs))
 	}
 	if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
 		return batch.DeleteRelationship(relIDs[0])
