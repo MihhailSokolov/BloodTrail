@@ -339,7 +339,7 @@ func TestDAWGSCorpus(t *testing.T) {
 
 	// Must be installed before dawgs.Open constructs the bloodtrail driver
 	// below -- see installLogCapture's own doc (staleness_integration_test.go)
-	// -- so Task 17's engine-mode served-floor tally (dawgsCorpusServedFloor's
+	// -- so the engine-mode served-floor tally (dawgsCorpusServedFloor's
 	// own doc) can count cypherServedMarker occurrences.
 	buf := installLogCapture(t)
 
@@ -387,11 +387,9 @@ func TestDAWGSCorpus(t *testing.T) {
 	}
 
 	// Start's boot-load goroutine (driver.go) is launched asynchronously by
-	// dawgs.Open above; without waiting for it to settle here, its own
-	// one-shot rebuild could still be in flight when the first dataset
-	// group's ClearGraph/LoadDataset below runs, racing this test's "no
-	// manual rebuild has happened yet" premise for the first group's
-	// "delegating" pass.
+	// dawgs.Open above. Waiting for it to settle here ensures the test's
+	// RebuildCount and serving baselines are deterministic, not dependent on
+	// the boot-load's own one-shot rebuild timing.
 	waitForBootLoad(t, d)
 
 	// Hand-constructed per the brief above: integration.Open's scheme
