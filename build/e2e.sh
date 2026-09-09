@@ -341,14 +341,71 @@ echo "==> Restarting the API container to prove the snapshot file survives it"
 # The point of this phase is narrower than "serves correctly after a
 # restart": a boot that silently fell back to a full PostgreSQL rebuild
 # would still answer the query below correctly, which would make a check
-# that stopped there pass vacuously. Proving the FILE -- not a rebuild that
-# happens to produce the same answer -- was actually used needs all three
-# marker assertions below together: a shutdown-time write, a boot-time
-# load that is neither "rejected" nor silently absent, and (the strongest
-# of the three) zero new "snapshot rebuilt" lines from this boot --
-# tryLoadSnapshotFile's successful path returns before rebuildOnce is ever
-# called (boot.go), so a genuine file load costs exactly zero rebuilds, by
-# construction.
+# that stopped there pass vacuously. So the shutdown-side write is asserted
+# unconditionally, and the boot side is then required to land on exactly one
+# of two named outcomes -- ADOPTED or SUPERSEDED -- with everything else
+# still a failure.
+#
+# ADOPTED is the outcome the feature exists for: "snapshot file loaded" with
+# zero new "snapshot rebuilt" lines. tryLoadSnapshotFile's successful path
+# returns before rebuildOnce is ever called (internal/engine/boot.go), so a
+# genuine file load costs exactly zero rebuilds, by construction -- which is
+# what makes the zero-rebuild half of that assertion proof the FILE, and not
+# a rebuild that happened to produce the same answer, is what the boot served
+# from.
+#
+# SUPERSEDED is what a graph write landing during the restart's own boot
+# produces, and it is equally correct -- not a flake being tolerated. The
+# watermark protocol (internal/engine/watermark.go) is what makes that so.
+# Every mutating driver call bumps the single-row `bloodtrail_watermark`
+# counter EAGERLY, before its own effect reaches PostgreSQL, and SaveSnapshot
+# stamps the file with the counter that was live at the moment it folded. A
+# boot therefore trusts the file only on exact equality
+# (snapshotFileTrustedAtBoot, boot.go), and a boot-time write breaks that
+# equality permanently: the file is then genuinely stale, not merely unlucky,
+# so re-reading it could never help and falling back to a PostgreSQL rebuild
+# is the only sound answer. The assertions below require that rebuild to
+# actually happen, and the query in the next phase to still be correct.
+#
+# One boot-time write, two log shapes. Which one appears depends only on
+# whether the write's eager bump commits before or after the boot's own
+# ReadWatermark call, and both are the SAME event:
+#
+#   - bump lands AFTER the boot read pg's counter (so equality still held at
+#     read time) but the write's Apply lands before adoption:
+#     adoptRebuiltView's applyEpoch check refuses to publish, and the boot
+#     logs reason="a write was applied while the file was loading".
+#   - bump lands BEFORE the boot read pg's counter: the boot sees pg already
+#     ahead of the file and logs reason="watermark mismatch" with
+#     pg_watermark > file_watermark.
+#
+# Both are accepted here; the mismatch form additionally requires pg to be
+# AHEAD (a file ahead of pg is impossible under a monotonic counter and stays
+# a failure), and requires the file the boot read to be the very file this
+# phase's own shutdown just wrote, compared by stamped watermark.
+#
+# Which outcome a given restart lands on is a genuine race, and this
+# deployment loses it more often than it wins. BloodHound queues a full
+# analysis request on every boot and starts its Data Pipe Daemon with a zero
+# start delay, so AD post-processing (FixWellKnownNodeTypes,
+# RunDomainAssociations, LinkWellKnownNodes) writes to the graph within
+# milliseconds of "Server started successfully" -- on every boot, with no new
+# ingest and nothing to do. The boot load cannot even begin before the
+# caller's own AssertSchema resolves the default graph (boot.go's
+# runBootLoad) and re-checks for that on a 100ms backoff
+# (fallbackRetryInterval), so whether the file attempt or the first analysis
+# write goes first is decided by which side of a backoff tick AssertSchema
+# lands on. ADOPTED is therefore asserted as one legitimate outcome, never as
+# THE expected one -- and README.md states the same limitation plainly, so
+# the documented restart benefit is best-effort rather than a promise the
+# product cannot keep for any deployment whose startup writes to the graph.
+#
+# Everything else still fails, and these are the cases that would be real
+# defects: a rejection for a corrupt or wrong-version file, a failed pg
+# watermark read, an over-memory-limit file, a mismatch in the impossible
+# direction, a boot that read a DIFFERENT file than the one just written, or
+# no file attempt at all (both deltas zero -- what a silently unreachable
+# file boot looks like, which is exactly the defect this phase was added for).
 #
 # `docker compose restart` -- unlike the `up -d` calls above and below,
 # which recreate the container because the compose config just changed --
@@ -372,10 +429,28 @@ echo "==> Restarting the API container to prove the snapshot file survives it"
 # closed with a live context passed throughout -- so this phase, which
 # stops the container the way an operator does, is the end-to-end guard
 # for it. See driver.go's Close for the fix and its own regression test.
+# The two superseded shapes, each matched as one pattern spanning message and
+# reason (the JSON line always puts "message" first) so neither can ever be
+# satisfied by some other line that happens to share a phrase -- in
+# particular the Debug "snapshot rebuild not adopted: a write was applied
+# while it loaded", which is a different message with different wording.
+RACE_REJECTION='bloodtrail: snapshot file rejected.*"reason":"a write was applied while the file was loading"'
+MISMATCH_REJECTION='bloodtrail: snapshot file rejected.*"reason":"watermark mismatch"'
+
+# json_num prints the value of a numeric JSON field from the LAST log line
+# carrying the given message: $1 message, $2 field. Field names are matched
+# with their opening quote, so asking for "watermark" never matches
+# "file_watermark" or "pg_watermark".
+json_num() {
+  grep -o "\"message\":\"$1\"[^}]*\"$2\":[0-9]*" "$WORK/bloodhound-logs.txt" | tail -1 | sed 's/.*:\([0-9]*\)$/\1/'
+}
+
 bh_logs
 written_before="$(grep -c "bloodtrail: snapshot file written" "$WORK/bloodhound-logs.txt" || true)"
 loaded_before="$(grep -c "bloodtrail: snapshot file loaded" "$WORK/bloodhound-logs.txt" || true)"
 rejected_before="$(grep -c "bloodtrail: snapshot file rejected" "$WORK/bloodhound-logs.txt" || true)"
+raced_before="$(grep -c "$RACE_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
+mismatched_before="$(grep -c "$MISMATCH_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
 rebuilt_before="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
 
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" -f "$OVERRIDE_FILE" restart --timeout 30 bloodhound
@@ -386,15 +461,64 @@ bh_logs
 written_after="$(grep -c "bloodtrail: snapshot file written" "$WORK/bloodhound-logs.txt" || true)"
 loaded_after="$(grep -c "bloodtrail: snapshot file loaded" "$WORK/bloodhound-logs.txt" || true)"
 rejected_after="$(grep -c "bloodtrail: snapshot file rejected" "$WORK/bloodhound-logs.txt" || true)"
+raced_after="$(grep -c "$RACE_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
+mismatched_after="$(grep -c "$MISMATCH_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
 rebuilt_after="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
 
-[ "$((written_after - written_before))" -ge 1 ] || { echo "the shutdown triggered by \"docker compose restart\" never logged \"snapshot file written\" (count $written_before -> $written_after); the graceful-shutdown save did not run" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
-[ "$((rejected_after - rejected_before))" -eq 0 ] || { echo "the restart's boot rejected the snapshot file it had just written (\"snapshot file rejected\" count $rejected_before -> $rejected_after)" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
-[ "$((loaded_after - loaded_before))" -ge 1 ] || { echo "the restart's boot never logged \"snapshot file loaded\" (count $loaded_before -> $loaded_after); it did not use the file" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
-[ "$((rebuilt_after - rebuilt_before))" -eq 0 ] || { echo "the restart's boot logged a snapshot rebuild (\"snapshot rebuilt\" count $rebuilt_before -> $rebuilt_after) despite also logging a file load; it silently fell back to a PostgreSQL rebuild instead of proving the file was used" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+written_delta=$((written_after - written_before))
+loaded_delta=$((loaded_after - loaded_before))
+rejected_delta=$((rejected_after - rejected_before))
+raced_delta=$((raced_after - raced_before))
+mismatched_delta=$((mismatched_after - mismatched_before))
+rebuilt_delta=$((rebuilt_after - rebuilt_before))
+
+# The shutdown side is unconditional: whichever outcome the boot lands on,
+# this phase is only meaningful if the file path was genuinely exercised, and
+# the save running at all is the half that never races anything.
+[ "$written_delta" -ge 1 ] || { echo "the shutdown triggered by \"docker compose restart\" never logged \"snapshot file written\" (count $written_before -> $written_after); the graceful-shutdown save did not run" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
 ls "$SNAPSHOT_HOST_DIR"/graph-*.btsnap >/dev/null 2>&1 || { echo "no graph-*.btsnap file found on the bind-mounted host directory $SNAPSHOT_HOST_DIR after the restart" >&2; exit 1; }
 
-echo "==> Querying after the restart to confirm the reloaded snapshot serves correctly"
+# The watermark stamped into the file this phase's own shutdown just wrote.
+# Both accepted outcomes below compare the boot's view of the file against
+# it, so neither can be satisfied by a boot that read some other, older file.
+saved_watermark="$(json_num "bloodtrail: snapshot file written" "watermark")"
+[ -n "$saved_watermark" ] || { echo "could not read the watermark stamped into the snapshot file at shutdown" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+
+# Exactly one attempt is made per boot (tryLoadSnapshotFile is one-shot), so
+# the outcomes below are mutually exclusive by construction. "No file attempt
+# at all" -- every delta zero -- falls through to the failure branch, as does
+# any rejection whose reason is not one of the two boot-write shapes.
+if [ "$loaded_delta" -ge 1 ] && [ "$rejected_delta" -eq 0 ] && [ "$rebuilt_delta" -eq 0 ]; then
+  loaded_watermark="$(json_num "bloodtrail: snapshot file loaded" "watermark")"
+  [ "$loaded_watermark" = "$saved_watermark" ] || { echo "the boot loaded a snapshot file stamped $loaded_watermark, but the shutdown wrote $saved_watermark; it did not read the file this phase produced" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+  echo "    restart outcome: ADOPTED -- the boot loaded the snapshot file (watermark $loaded_watermark) and rebuilt nothing"
+elif [ "$loaded_delta" -eq 0 ] && [ "$rejected_delta" -ge 1 ] && [ "$((raced_delta + mismatched_delta))" -eq "$rejected_delta" ] && [ "$rebuilt_delta" -ge 1 ]; then
+  if [ "$mismatched_delta" -ge 1 ]; then
+    file_watermark="$(json_num "bloodtrail: snapshot file rejected" "file_watermark")"
+    pg_watermark="$(json_num "bloodtrail: snapshot file rejected" "pg_watermark")"
+    [ "$file_watermark" = "$saved_watermark" ] || { echo "the boot rejected a snapshot file stamped $file_watermark, but the shutdown wrote $saved_watermark; it did not read the file this phase produced" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+    [ "$pg_watermark" -gt "$file_watermark" ] || { echo "the boot rejected the file for a watermark mismatch with PostgreSQL at $pg_watermark and the file at $file_watermark; only PostgreSQL being AHEAD is a boot-time write superseding the file, and the counter is monotonic, so this is a real defect" >&2; cat "$WORK/bloodhound-logs.txt" >&2; exit 1; }
+    echo "    restart outcome: SUPERSEDED -- writes landed during the restart's own boot (PostgreSQL at $pg_watermark, file at $file_watermark), so the file was correctly refused and the boot rebuilt from PostgreSQL"
+  else
+    echo "    restart outcome: SUPERSEDED -- a write was applied while the file was loading, so the file was correctly refused and the boot rebuilt from PostgreSQL"
+  fi
+else
+  {
+    echo "the restart's boot landed on neither accepted outcome."
+    echo "  deltas: snapshot file loaded=$loaded_delta, snapshot file rejected=$rejected_delta (boot-write race=$raced_delta, watermark mismatch=$mismatched_delta), snapshot rebuilt=$rebuilt_delta"
+    echo "  accepted: ADOPTED    (loaded>=1, rejected=0, rebuilt=0)"
+    echo "         or SUPERSEDED (loaded=0, rejected>=1 and every one of them a boot-time write superseding the file, rebuilt>=1)"
+    echo "  a rejection for corruption, a bad version, a failed watermark read or the memory limit is a real defect, as is no file attempt at all."
+  } >&2
+  cat "$WORK/bloodhound-logs.txt" >&2
+  exit 1
+fi
+
+echo "==> Querying after the restart to confirm the engine serves correctly either way"
+# Asserted for BOTH accepted outcomes above, deliberately: an adopted file and
+# a rebuild that superseded it must be indistinguishable to a caller, and this
+# is what proves it. On the SUPERSEDED path it is also the check that the
+# fallback actually recovered rather than leaving the engine unable to serve.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
 TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token after the restart" >&2; exit 1; }

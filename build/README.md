@@ -61,11 +61,24 @@ run against that same fixture, still installed, before rollback:
 5. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
    directory (so the file survives the container recreate the config change itself causes),
    then `docker compose restart` the same container -- no further config change, so the
-   container is not recreated -- and assert the logs show `snapshot file written` at that
-   shutdown, `snapshot file loaded` (never `snapshot file rejected`) at the reboot, and **no**
-   new `snapshot rebuilt` line: proof the file itself, not a rebuild that happened to produce
-   the same answer, is what the reboot served from. One more `GET /api/v2/graphs/shortest-path`
-   confirms the reloaded engine still answers correctly.
+   container is not recreated. `snapshot file written` at that shutdown is asserted
+   unconditionally; the reboot is then required to land on exactly one of two outcomes,
+   with anything else a failure:
+   - **adopted** -- `snapshot file loaded` with **no** new `snapshot rebuilt` line: proof the
+     file itself, not a rebuild that happened to produce the same answer, is what the reboot
+     served from.
+   - **superseded** -- `snapshot file rejected` because a write landed during the reboot
+     (`reason` is `a write was applied while the file was loading`, or `watermark mismatch`
+     with PostgreSQL's counter ahead of the file's), followed by a successful rebuild.
+     BloodHound writes to the graph on every boot (it queues a full analysis request at
+     startup and runs the data-pipe daemon with no start delay), so this outcome is common
+     and correct -- the watermark protocol is refusing a file that is genuinely stale. See
+     the snapshot-file section of the top-level [README](../README.md#write-through).
+
+   Either way the boot must have read the file this phase's own shutdown wrote (compared by
+   stamped watermark), and a rejection for a corrupt or wrong-version file, a failed
+   watermark read, the memory limit, or no file attempt at all still fails. One more
+   `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths.
 
 Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Run it
 with `PLATFORM=linux/arm64 ./build/e2e.sh` on Apple Silicon to avoid amd64 emulation.
@@ -84,7 +97,7 @@ regardless.
 | `snapshot rebuilt` | Info | A full PostgreSQL rebuild ran and was adopted -- `trigger` names why: `startup` (the one-shot boot load), `fallback` (recovery from the line above), or `manual`. |
 | `snapshot file written` | Info | The current replica was folded and written to `BLOODTRAIL_SNAPSHOT_DIR` -- by a clean shutdown, or by a background compaction once it had adopted its result. |
 | `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL. |
-| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. Five distinct causes share this marker -- unreadable/corrupt/wrong-version, a failed PostgreSQL watermark read, a watermark mismatch, an over-`BLOODTRAIL_MEMORY_LIMIT` size, and a write racing the load -- distinguished by a `reason` attribute on all but the first, which carries `error` instead. |
+| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. Five distinct causes share this marker -- unreadable/corrupt/wrong-version, a failed PostgreSQL watermark read, a watermark mismatch, an over-`BLOODTRAIL_MEMORY_LIMIT` size, and a write racing the load -- distinguished by a `reason` attribute on all but the first, which carries `error` instead. The last two are the ordinary outcome of a write landing during the boot (BloodHound's startup analysis produces one on every boot) and are not a fault: the file is genuinely stale and the rebuild that follows is correct. |
 | `no snapshot file` | Debug | Boot found `BLOODTRAIL_SNAPSHOT_DIR` set but no file there yet (the ordinary first-ever boot against a given directory). The feature being disabled outright (`BLOODTRAIL_SNAPSHOT_DIR` unset) logs nothing here at all -- boot returns from the check before it would ever log. |
 | `compaction finished` | Info | A background compaction folded the write-through delta back into the base snapshot. |
 | `path engine served` / `builder engine served` / `cypher engine served` | Info / Debug / Debug | The in-memory engine, not PostgreSQL, answered a shortest-path, structural (node/relationship), or Cypher query respectively. |

@@ -53,11 +53,13 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   the replica is stale for a write it has already told the caller succeeded. See
   [Write-through](#write-through) for exactly which writes this covers and what happens
   to the rare ones it doesn't.
-- A snapshot file (`BLOODTRAIL_SNAPSHOT_DIR`) lets a restart skip PostgreSQL entirely:
-  the current replica is written to disk, stamped with a watermark counter, on a clean
-  shutdown and after every background compaction; the next boot loads it only if that
-  stamp still matches PostgreSQL's own counter exactly, and falls back to a normal
-  PostgreSQL rebuild otherwise. See [Write-through](#write-through).
+- A snapshot file (`BLOODTRAIL_SNAPSHOT_DIR`) lets a restart skip PostgreSQL when nothing
+  wrote to the graph in between: the current replica is written to disk, stamped with a
+  watermark counter, on a clean shutdown and after every background compaction; the next
+  boot loads it only if that stamp still matches PostgreSQL's own counter exactly, and
+  falls back to a normal PostgreSQL rebuild otherwise. Any write landing during the boot
+  itself legitimately supersedes the file, so this is a best-effort saving, not a
+  guaranteed one -- see [Write-through](#write-through) for when it actually applies.
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
@@ -123,7 +125,8 @@ caller has already been told committed.
   provably complete for every write up to N, because the counter cannot have advanced
   without a write whose effect the file's own build would then be missing.
 - **Snapshot file.** Set `BLOODTRAIL_SNAPSHOT_DIR` to let a restart skip the PostgreSQL
-  rebuild. The engine writes a versioned binary snapshot of its current in-memory state,
+  rebuild when nothing wrote to the graph in between (see the promise this does and does
+  not make, below). The engine writes a versioned binary snapshot of its in-memory state,
   stamped with the watermark counter that was live at that instant, at two points: on a
   graceful shutdown, and after every background compaction (next). At boot, it loads
   that file only if its stamped counter is *exactly* equal to PostgreSQL's counter at
@@ -140,6 +143,26 @@ caller has already been told committed.
   startup, not a fault; a caller that never makes that call at all is a broken
   integration -- one with no default graph to query at all, not a supported deployment
   shape -- so this stays a Debug-level detail rather than an operator-facing warning.)
+
+  **What this does and does not promise.** The file is written reliably; whether a boot
+  gets to *use* it is not something BloodTrail controls. The load can only start after
+  that `AssertSchema` call resolves the default graph, and BloodHound starts writing to
+  the graph very shortly afterwards on every boot -- it queues a full analysis request
+  at startup unconditionally and runs its data-pipe daemon with no start delay, so AD
+  post-processing writes land within milliseconds of the API coming up, with no new
+  ingest and nothing to do. Whichever of the two gets there first decides the outcome:
+  the file is adopted, or a boot-time write supersedes it and the engine rebuilds from
+  PostgreSQL as it always did. Both are correct, and a caller cannot tell them apart --
+  serving is identical either way, and correctness never depends on which happened.
+  Practically, expect the saving on a graph small enough that the load finishes inside
+  that window, and expect it to be lost as the graph grows: a load measured in seconds
+  at multi-million-node scale is very unlikely to beat a write measured in
+  milliseconds. Treat the file as an optimization that sometimes applies, not as the
+  reason a restart is fast. The rejection is logged at Info with a `reason` --
+  `a write was applied while the file was loading` when the write landed after the boot
+  read PostgreSQL's counter, or `watermark mismatch` (with the counter ahead of the
+  file) when it landed before -- and is followed by an ordinary
+  `snapshot rebuilt` line.
 - **Compaction.** Every applied write layers one more delta on top of the engine's base
   snapshot; past a size threshold (`BLOODTRAIL_COMPACT_ENTRIES`/`BLOODTRAIL_COMPACT_BYTES`,
   see Configuration below), a background compaction folds the base and every delta into
