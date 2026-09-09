@@ -7,9 +7,11 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
@@ -280,5 +282,197 @@ func TestWatermarkDirtyClearsOnLaterConvergedBump(t *testing.T) {
 
 	if got, converged := eng.watermarkConverged(ctx); !converged || got != counter2 {
 		t.Fatalf("watermarkConverged = (%d, %v), want (%d, true)", got, converged, counter2)
+	}
+}
+
+// TestWatermarkDirtyStaysSetUntilStateReturnsToServing pins C1's own fix
+// directly against a real pg watermark table: recheckWatermarkDirty
+// (watermark.go) must not clear watermarkDirty on watermarkConverged alone
+// while the engine is still in stateFallback -- see that method's own doc
+// for the full soundness argument this exercises. e.state is manipulated
+// directly here (a same-package whitebox test, mirroring
+// TestWatermarkDirtyClearsOnLaterConvergedBump's own direct
+// watermarkDirty.Store(true) setup, above) rather than through a real
+// enterFallback trip, so the scenario is deterministic and does not race a
+// real background rebuild goroutine --
+// TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack, below, already
+// proves enterFallback itself flips state correctly end to end; this test's
+// own job is just the recheck's gating logic once state is whatever it is.
+func TestWatermarkDirtyStaysSetUntilStateReturnsToServing(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	resetWatermarkTable(t, ctx, eng)
+
+	eng.watermarkDirty.Store(true)
+	eng.state.Store(stateFallback) // standing in for an unresolved fallback trip
+
+	// A bump+resolve cycle that reaches convergence on the counters alone:
+	// pg's counter and appliedWatermark agree, and nothing is left in
+	// flight -- exactly the state a write with zero counter trace (C1's own
+	// scenario) leaves behind for some LATER, unrelated write to walk into.
+	counter, err := eng.BumpWatermark(ctx)
+	if err != nil {
+		t.Fatalf("BumpWatermark: %v", err)
+	}
+	eng.AdvanceWatermark(ctx, counter)
+
+	if _, converged := eng.watermarkConverged(ctx); !converged {
+		t.Fatalf("watermarkConverged = false, want true: this bump was the only one outstanding")
+	}
+	if !eng.watermarkDirty.Load() {
+		t.Fatalf("watermarkDirty cleared while state is still stateFallback, want it to stay set (C1: convergence on the counters alone does not prove the fallback rebuild that resolves the missed write has been adopted)")
+	}
+
+	// The rebuild that resolved this fallback trip has now adopted.
+	eng.state.Store(stateServing)
+
+	// The next bump+resolve cycle's recheck now sees both halves hold.
+	counter2, err := eng.BumpWatermark(ctx)
+	if err != nil {
+		t.Fatalf("BumpWatermark #2: %v", err)
+	}
+	eng.AdvanceWatermark(ctx, counter2)
+
+	if eng.watermarkDirty.Load() {
+		t.Fatalf("watermarkDirty stayed set once state returned to stateServing and the engine converged, want it cleared")
+	}
+}
+
+// unreachableEnginePool returns a *pgxpool.Pool pointed at 127.0.0.1 on a low
+// port nothing listens on, mirroring the root package's own
+// unreachablePGDriver (wrapper_test.go) but scoped to just the pool:
+// BumpWatermark/ensureWatermarkTable/LoadSnapshot all reach PostgreSQL
+// through e.pool alone, so handing an Engine one of these while its pgDriver
+// stays real and reachable (TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack,
+// below) is what lets a test drive a GENUINE bump failure -- a real network
+// error from e.pool.QueryRow -- rather than the nil-pool
+// ErrWatermarkUnavailable short-circuit every other bump-failure-adjacent
+// test in this file exercises.
+func unreachableEnginePool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+
+	pool, err := pgxpool.New(context.Background(), "postgres://bloodtrail:bloodtrail@127.0.0.1:1/bloodtrail")
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	return pool
+}
+
+// TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack is the real,
+// live-pool counterpart to watermark_test.go's
+// TestNoteWatermarkBumpFailureSetsDirty (which pins NoteWatermarkBumpFailure
+// in isolation) and to TestDriverMutatingCapabilityMethodsDoNotCallApplyOnError
+// (wrapper_test.go), whose own disabledEngine() gives the ENGINE a nil pool
+// -- so every bump attempt there returns ErrWatermarkUnavailable without
+// ever reaching a network at all, never the genuine-failure path this test
+// exercises.
+//
+// This engine's own pool is a real, live *pgxpool.Pool pointed at an address
+// nothing listens on (unreachableEnginePool), while pgDriver/pool (from
+// graphtest.OpenPG) are real and reachable -- the same split production
+// always has (the engine's watermark pool and the driver's graph-write pool
+// are never the same connection by construction), which is what lets
+// BumpWatermark's own UPDATE genuinely fail here while the write it guards
+// still lands.
+//
+// Asserts, in order, exactly what ensureBumped's genuine-failure branch
+// (write_observer.go) and Apply's own cs.HasFallback() branch (apply.go)
+// together promise: the bump failure never blocks the write (the node is
+// created), watermarkDirty is set, and Apply -- seeing the ChangeSet
+// fallback record ensureBumped itself would have recorded for this same
+// error -- trips the engine into fallback.
+func TestWatermarkGenuineBumpFailureSetsDirtyAndFallsBack(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, _ := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	eng := New(pgDriver, unreachableEnginePool(t), Config{Enabled: true, Log: testEngineLogger()})
+	defer eng.Stop()
+
+	countBefore, err := nodeCount(ctx, pgDriver)
+	if err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+
+	// Simulates write_observer.go's ensureBumped: attempt the eager bump
+	// first, exactly as every real mutating call does.
+	_, bumpErr := eng.BumpWatermark(ctx)
+	if bumpErr == nil {
+		t.Fatalf("BumpWatermark against an unreachable pool succeeded, want a genuine error")
+	}
+	if errors.Is(bumpErr, ErrWatermarkUnavailable) {
+		t.Fatalf("BumpWatermark = %v, want a real network error (this engine's own pool is non-nil, just unreachable), not ErrWatermarkUnavailable", bumpErr)
+	}
+	eng.NoteWatermarkBumpFailure(ctx, bumpErr)
+
+	if !eng.watermarkDirty.Load() {
+		t.Fatalf("watermarkDirty = false after a genuine bump failure, want true")
+	}
+
+	// The write proceeds regardless -- through the real, reachable pgDriver
+	// -- carrying the same fallback record ensureBumped itself records for
+	// this exact error (its literal text is reproduced here since this file
+	// cannot import the root package's write_observer.go without an import
+	// cycle -- see this package's own doc on that constraint, e.g.
+	// engine.go's ApplyCount doc).
+	scope := NewWriteScope()
+	scope.Changes().RecordFallback(fmt.Sprintf("watermark: bump failed: %v", bumpErr))
+
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties(), graph.StringKind("BumpFailureProbe"))
+		if err != nil {
+			return err
+		}
+		scope.Changes().RecordNodeID(n.ID)
+		return nil
+	}); err != nil {
+		t.Fatalf("WriteTransaction (a bump failure must never block the write it guards): %v", err)
+	}
+
+	countAfter, err := nodeCount(ctx, pgDriver)
+	if err != nil {
+		t.Fatalf("count after: %v", err)
+	}
+	if countAfter != countBefore+1 {
+		t.Fatalf("node count = %d after the write, want %d -- the write must have proceeded despite the bump failure", countAfter, countBefore+1)
+	}
+
+	eng.Apply(ctx, scope)
+
+	if !eng.watermarkDirty.Load() {
+		t.Fatalf("watermarkDirty cleared, want it to stay set: this scope never bumped, so its own Apply call cannot resolve it")
+	}
+	if got := eng.state.Load(); got != stateFallback {
+		t.Fatalf("state = %d after Apply saw a ChangeSet fallback record, want stateFallback (%d)", got, stateFallback)
+	}
+	if _, serving := eng.Fresh(); serving {
+		t.Fatalf("Fresh() reports serving after a genuine bump failure's write, want fallback")
+	}
+}
+
+// TestEnsureWatermarkTableSetsDirtyOnLiveFailure is
+// TestEnsureWatermarkTableIsNoOpWithNoPool's (watermark_test.go) live-pool
+// counterpart: a nil pool is a deliberate no-op (ensureWatermarkTable's own
+// doc), but a real, non-nil pool that genuinely fails the DDL exec -- here,
+// because nothing is listening on the other end -- must still set
+// watermarkDirty, exactly as any other genuine watermark failure does. No
+// live database is actually required for this one: pgxpool.New itself never
+// blocks on a connection, so the unreachable pool is enough on its own,
+// without graphtest.PGAvailable's own live-DB skip guard.
+func TestEnsureWatermarkTableSetsDirtyOnLiveFailure(t *testing.T) {
+	eng := New(nil, unreachableEnginePool(t), Config{Enabled: true, Log: testEngineLogger()})
+	defer eng.Stop()
+
+	eng.ensureWatermarkTable(context.Background())
+
+	if !eng.watermarkDirty.Load() {
+		t.Fatalf("watermarkDirty = false after ensureWatermarkTable failed against an unreachable pool, want true")
 	}
 }

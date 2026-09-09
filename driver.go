@@ -237,6 +237,29 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // builds the observer once outside the closure (same scope across retries),
 // WriteTransaction builds a fresh observer inside the closure per invocation
 // (each attempt gets a fresh scope -- deliberately tighter).
+//
+// Forward-looking guard note, watermark protocol specifically: "a fresh
+// scope per invocation" is exactly what would ORPHAN a bump if
+// d.Driver.WriteTransaction (the embedded pg driver) ever retried
+// txDelegate internally -- e.g. on a serialization failure -- rather than
+// only ever invoking it once per call, as the pinned dawgs pg driver is
+// believed to today (unverified against its source, the same caveat
+// observingTransaction.Commit's own doc already carries for a different
+// retry question). A retried attempt #2 would construct its own fresh
+// WriteScope (line below), ensureBumped its own eager bump, and overwrite
+// the `observer` variable this method reads -- so attempt #1's own bump,
+// if it landed before the retry, would never be resolved by the success or
+// error branch below at all: its e.inflightBumps entry would never be
+// retired, permanently breaking watermarkConverged (watermark.go's own
+// doc), and its counter value would never fold into e.appliedWatermark.
+// BatchOperation does not share this risk -- its observer/scope is built
+// ONCE outside its own delegate closure (see its doc), so ensureBumped's
+// own bumped-flag guard correctly skips re-bumping on any retry the
+// embedded driver's BatchOperation might perform. If the pinned dawgs pg
+// driver ever starts retrying WriteTransaction's delegate internally, this
+// method would need to stop reconstructing a fresh WriteScope per
+// invocation (or otherwise resolve every attempt's own bump, not just the
+// last one's) before that behavior could be trusted.
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
 	var observer *observingTransaction
 	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {

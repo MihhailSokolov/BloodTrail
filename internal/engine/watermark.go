@@ -158,15 +158,48 @@ func maxWatermark(cur, candidate uint64) uint64 {
 	return cur
 }
 
-// AdvanceWatermark folds counter into e.appliedWatermark's monotonic max
-// (maxWatermark) and retires exactly one e.inflightBumps entry -- the
-// bookkeeping every bumped WriteScope needs exactly once, regardless of how
-// its write turned out. Callers must only ever pass a counter a successful
-// BumpWatermark call actually returned for THIS scope (every real caller
-// gets there via WriteScope.Watermark's own bumped flag, never by
-// guessing): this method trusts its caller completely and decrements
-// inflightBumps unconditionally, so calling it for a scope that never
+// AdvanceWatermark resolves counter's bumped scope completely: folds it into
+// e.appliedWatermark's monotonic max, retires its e.inflightBumps entry
+// (foldWatermarkCounter), and -- if watermarkDirty is currently set --
+// re-checks whether the engine has recovered (recheckWatermarkDirty). Callers
+// must only ever pass a counter a successful BumpWatermark call actually
+// returned for THIS scope (every real caller gets there via
+// WriteScope.Watermark's own bumped flag, never by guessing): see
+// foldWatermarkCounter's own doc for why passing one for a scope that never
 // bumped would corrupt the count.
+//
+// Two callers, both giving this the same "this scope is now fully resolved"
+// meaning:
+//
+//   - driver.go's WriteTransaction error branch (and the error branch of
+//     every driver-level method that bumps eagerly at its own top: Run,
+//     WipeGraph, SetDefaultGraph, DeleteNodesByKinds,
+//     DeleteRelationshipsByKinds), calling this directly instead of a full
+//     Apply: a rolled-back transaction, or a failed one-shot call, has no
+//     committed effect for a read-back to replay, but the counter itself
+//     still has to resolve. Nothing here holds applyMu, so both of this
+//     method's steps running in one call costs nothing extra.
+//   - Every other test in this package (and this file's own doc examples)
+//     that drives the engine-side protocol directly without going through
+//     Apply at all.
+//
+// Apply itself (apply.go) does NOT call this method as one unit any more --
+// see its own doc for why the two steps are split across applyMu there
+// (foldWatermarkCounter inside the lock, recheckWatermarkDirty deferred
+// until after it is released), which is exactly this method's own two
+// steps, just with a lock boundary between them for that one caller.
+func (e *Engine) AdvanceWatermark(ctx context.Context, counter uint64) {
+	e.foldWatermarkCounter(counter)
+	e.recheckWatermarkDirty(ctx)
+}
+
+// foldWatermarkCounter folds counter into e.appliedWatermark's monotonic max
+// (maxWatermark) and retires exactly one e.inflightBumps entry -- the half of
+// AdvanceWatermark's bookkeeping that is pure atomic arithmetic, with no pg
+// round trip and, despite Apply's own call site running it under applyMu,
+// nothing that actually REQUIRES that lock: both appliedWatermark's
+// CompareAndSwap loop and inflightBumps' Add are already safe under
+// concurrent, unsynchronized callers on their own.
 //
 // The max-advance, rather than a plain overwrite, is what makes this safe
 // under concurrency: two bumped scopes can finish resolving in either
@@ -175,30 +208,12 @@ func maxWatermark(cur, candidate uint64) uint64 {
 // concurrent call already advanced past -- folding in the smaller value
 // must never regress appliedWatermark.
 //
-// Two callers, both giving this the same "this scope is now fully
-// resolved" meaning:
-//
-//   - Apply's own deferred call (apply.go), for every write whose eager
-//     bump succeeded -- on every branch Apply can take, success or a fresh
-//     trip into fallback, not just the "published a new View" branch: the
-//     pg watermark counter already advanced the moment the bump committed,
-//     independent of what Apply goes on to do with the write's own effect.
-//   - driver.go's WriteTransaction error branch (and the error branch of
-//     every driver-level method that bumps eagerly at its own top: Run,
-//     WipeGraph, SetDefaultGraph, DeleteNodesByKinds,
-//     DeleteRelationshipsByKinds), calling this directly instead of a full
-//     Apply: a rolled-back transaction, or a failed one-shot call, has no
-//     committed effect for a read-back to replay, but the counter itself
-//     still has to resolve.
-//
-// If watermarkDirty is currently set, this also re-checks watermarkConverged
-// (a live pg read -- see its own doc) and clears watermarkDirty the instant
-// convergence is reached again: a later successful bump+apply pair is
-// exactly the recovery watermarkDirty's own doc promises. Skipped while
-// dirty is already clear, so the overwhelmingly common case -- no bump has
-// ever failed -- never pays for that extra round trip on every single
-// write.
-func (e *Engine) AdvanceWatermark(ctx context.Context, counter uint64) {
+// Callers must only ever pass a counter a successful BumpWatermark call
+// actually returned for THIS scope (every real caller gets there via
+// WriteScope.Watermark's own bumped flag, never by guessing): this method
+// trusts its caller completely and decrements inflightBumps unconditionally,
+// so calling it for a scope that never bumped would corrupt the count.
+func (e *Engine) foldWatermarkCounter(counter uint64) {
 	for {
 		cur := e.appliedWatermark.Load()
 		next := maxWatermark(cur, counter)
@@ -211,11 +226,105 @@ func (e *Engine) AdvanceWatermark(ctx context.Context, counter uint64) {
 	}
 
 	e.inflightBumps.Add(-1)
+}
 
-	if e.watermarkDirty.Load() {
-		if _, converged := e.watermarkConverged(ctx); converged {
-			e.watermarkDirty.Store(false)
-		}
+// recheckWatermarkDirty is AdvanceWatermark's other half: while
+// watermarkDirty is set, it re-checks whether the engine has recovered --
+// watermarkConverged's live pg read, AND (see below) e.state being back to
+// stateServing -- and clears watermarkDirty the instant both hold. Skipped
+// entirely while dirty is already clear, so the overwhelmingly common case
+// -- no bump has ever failed -- never pays for the extra round trip on every
+// single write.
+//
+// # Why watermarkConverged alone is not enough
+//
+// A genuine bump failure (NoteWatermarkBumpFailure, called by
+// write_observer.go's ensureBumped) sets watermarkDirty, but never calls
+// WriteScope.SetWatermark for the write it guarded -- there is no counter to
+// record, since the bump itself is what failed. That write W therefore
+// proceeds (BumpWatermark's own protocol promise: never block the write it
+// guards) with a scope that is bumped=false and carries a ChangeSet fallback
+// record (ensureBumped's own doc). When W's own Apply eventually runs --
+// whether via observingTransaction/observingBatch.Commit or one of driver.
+// go's own top-of-method callers -- cs.HasFallback() is true, so
+// applyLocked's cs.HasFallback() branch (apply.go) calls enterFallback
+// UNCONDITIONALLY: every genuine bump failure trips the engine into
+// stateFallback, with an async recovery rebuild launched to bring the
+// replica back. But because W's own scope never bumped, Apply's own bumped
+// check (Apply's own doc) never schedules a recheckWatermarkDirty call for
+// W at all -- W's Apply call cannot itself resolve watermarkDirty. Clearing
+// it is left entirely to some LATER, unrelated write's own successful
+// bump+resolve.
+//
+// That later write's watermarkConverged reads pg's current counter and
+// compares it against e.appliedWatermark/e.inflightBumps -- bookkeeping that
+// W never touched at all (it has zero counter trace), so those two values
+// can already agree, and no bump can be in flight, well before W's own
+// triggered rebuild has been adopted. Clearing watermarkDirty on
+// watermarkConverged alone would therefore open a window where dirty reads
+// as clear while the replica (and, in the future, a snapshot file stamped
+// from it) still does not actually reflect W: the "no bump was ever missed"
+// signal watermarkConverged gives is true, but it says nothing about
+// whether a write that WAS missed from the counter's own bookkeeping has
+// since been reconciled by other means (the fallback rebuild).
+//
+// # Why e.state == stateServing closes that window
+//
+// Every genuine bump failure's write routes through enterFallback (see
+// above) -- there is no bump-failure path that skips it. enterFallback
+// flips e.state to stateFallback (idempotently) the moment it runs, which is
+// necessarily AFTER W's own pg effect committed (Apply, whichever call site
+// invokes it, is only ever called once a write has actually landed -- see
+// Apply's own doc). state returns to stateServing only through
+// adoptRebuiltView (engine.go), and only for a rebuild whose epoch check
+// passes: rebuildOnce reads e.applyEpoch BEFORE its LoadSnapshot call starts,
+// and adoptRebuiltView refuses to publish unless that same value still
+// matches e.applyEpoch at publish time. applyEpoch is bumped as the very
+// first action of every applyLocked call (apply.go), including the one that
+// ran enterFallback for W -- strictly before that branch executes -- and it
+// only ever increases. So any rebuild attempt whose epoch check actually
+// passes must have READ epoch at a point already at or after W's own
+// increment (an attempt that read an earlier value would see epoch change
+// during its own load, once W's Apply call ran, and would be refused, not
+// adopted); Go's memory model guarantees that an atomic load observing a
+// given store is ordered after it, so that read -- and therefore the
+// LoadSnapshot call immediately following it -- happens after W's own
+// applyEpoch increment, which happens after W's own commit. PostgreSQL's own
+// read-transaction visibility then guarantees that load sees W's committed
+// row. Only once such a rebuild is actually adopted does state flip back to
+// stateServing, and adoption is exactly what ends fallback for whichever
+// write tripped it, regardless of which trigger's own rebuild loop happens
+// to be the one that succeeds (adoptRebuiltView's own doc makes the
+// identical point about ending fallback in general).
+//
+// So observing e.state == stateServing at the moment of this recheck proves
+// every fallback ever entered up to that point -- W's specifically included,
+// since W is exactly the write whose enterFallback call this argument
+// starts from -- has already been resolved by an adopted rebuild that is
+// guaranteed to include it. Requiring it, in addition to watermarkConverged,
+// is what closes the wrong-trust window above.
+//
+// # The boot-time DDL-failure case does not need this gate, and is not hurt by it
+//
+// ensureWatermarkTable (Start, boot.go) sets watermarkDirty on a DDL exec
+// failure without ever calling enterFallback -- state is untouched by that
+// path, and its zero value is stateServing (engine.go's own doc on state),
+// so this method's state check is trivially satisfied for it regardless of
+// whether boot load has adopted a first snapshot yet. This is sound, not a
+// gap this gate happens to miss: a DDL hiccup alone, with no accompanying
+// bump failure, never leaves e.appliedWatermark/e.inflightBumps actually
+// diverged from pg's own counter in the first place -- every real write
+// afterward still goes through the exact same BumpWatermark call, which
+// either succeeds (correctly tracked, same as always) or genuinely fails
+// (which DOES call enterFallback, and is then covered by the argument
+// above). The state check costs this path nothing and closes a real gap for
+// the other one.
+func (e *Engine) recheckWatermarkDirty(ctx context.Context) {
+	if !e.watermarkDirty.Load() {
+		return
+	}
+	if _, converged := e.watermarkConverged(ctx); converged && e.state.Load() == stateServing {
+		e.watermarkDirty.Store(false)
 	}
 }
 
@@ -256,4 +365,18 @@ func (e *Engine) watermarkConverged(ctx context.Context) (uint64, bool) {
 		return 0, false
 	}
 	return pgCounter, watermarkConvergedFor(pgCounter, e.appliedWatermark.Load(), e.inflightBumps.Load())
+}
+
+// WatermarkConverged is watermarkConverged's exported form, added purely for
+// test observability -- mirroring ApplyCount/RebuildCount/Fresh's identical
+// role (engine.go's own doc on each): the root package's own integration
+// suites drive writes through the real Driver.WriteTransaction/
+// BatchOperation/Run wiring (write_observer.go's ensureBumped/
+// advanceIfBumped), which this package cannot exercise directly without an
+// import cycle (this file's own package-placement constraint -- see
+// apply_integration_test.go's doc for the identical reasoning applied to
+// Apply's own write-shape suite), and need a way to assert convergence from
+// outside this package without reaching into the unexported method above.
+func (e *Engine) WatermarkConverged(ctx context.Context) (uint64, bool) {
+	return e.watermarkConverged(ctx)
 }

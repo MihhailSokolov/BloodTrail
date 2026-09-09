@@ -149,8 +149,14 @@ type Engine struct {
 	// future snapshot-file writer (watermarkConverged's own consumer) must
 	// never trust as convergence even if the numbers happen to line up
 	// again by coincidence. It clears only when a later bumped scope's
-	// Apply/AdvanceWatermark call finds the engine genuinely converged
-	// again, via a live pg read (AdvanceWatermark's own doc).
+	// recheckWatermarkDirty call (watermark.go) finds BOTH watermarkConverged
+	// true (a live pg read) AND state == stateServing -- see
+	// recheckWatermarkDirty's own doc for the full soundness argument for why
+	// the state half is required too: a genuine bump failure's own write
+	// always trips the engine into stateFallback, and that write has zero
+	// counter trace of its own, so watermarkConverged alone can read true
+	// well before the fallback rebuild it triggered has actually been
+	// adopted.
 	watermarkDirty atomic.Bool
 
 	// mapKind resolves a graph.Kind name to its KindID, as

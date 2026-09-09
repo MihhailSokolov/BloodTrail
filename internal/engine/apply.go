@@ -97,26 +97,61 @@ const (
 //
 // Watermark bookkeeping (watermark.go) is folded into this same sequence,
 // deliberately unconditional on everything below: if scope was bumped
-// (scope.Watermark's own flag), a deferred AdvanceWatermark call is queued
-// BEFORE any of the branches below can return, so it runs on every one of
-// them -- the disabled-engine return, every enterFallback branch, the
-// empty-ChangeSet no-op, and the ordinary published-segment path alike.
-// The pg watermark counter already advanced the instant BumpWatermark's
-// own UPDATE committed, independent of what this call goes on to do with
-// the write's own effect, so this scope's bump has to resolve regardless of
-// which of those branches actually fires. Also serialized under applyMu,
-// for simplicity: nothing about it strictly requires the lock, but running
-// it there costs nothing in the common case (watermarkDirty is false, so
-// AdvanceWatermark never reaches the pool at all) and keeps this method's
-// whole sequence easy to reason about as one block.
+// (scope.Watermark's own flag), this method's own two watermark steps run on
+// every one of the branches below -- the disabled-engine return, every
+// enterFallback branch, the empty-ChangeSet no-op, and the ordinary
+// published-segment path alike. The pg watermark counter already advanced
+// the instant BumpWatermark's own UPDATE committed, independent of what this
+// call goes on to do with the write's own effect, so this scope's bump has
+// to resolve regardless of which of those branches actually fires.
+//
+// The two steps run on either side of applyMu, deliberately NOT both inside
+// it the way an earlier version of this method had them (folding counter
+// into e.appliedWatermark and retiring this scope's e.inflightBumps entry,
+// then -- while watermarkDirty was set -- re-checking convergence with a
+// live pg round trip, all one deferred AdvanceWatermark call made while
+// still holding the lock):
+//
+//   - foldWatermarkCounter, the cheap, lock-free-safe atomic bookkeeping
+//     (watermark.go's own doc covers why it needs no lock at all), runs
+//     inside applyLocked below, before that method's own defer releases
+//     applyMu -- so e.appliedWatermark/e.inflightBumps are always resolved
+//     before this Apply call returns, exactly as before.
+//   - recheckWatermarkDirty, the live pg read watermarkDirty's recovery rule
+//     needs (watermarkConverged, and now also e.state -- see that method's
+//     own doc for the full soundness argument), is deferred here in Apply's
+//     own outer frame instead, which is what makes it run strictly AFTER
+//     applyLocked has already returned -- Unlock included. Under sustained
+//     watermarkDirty, every write used to pay for that round trip while
+//     still holding applyMu, serializing every OTHER concurrent write's own
+//     Apply call behind it; deferring it out here means the lock is free for
+//     the next Apply the instant this one's own locked work finishes, and
+//     only the write that happened to trigger the recheck pays its latency.
 func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
+	var counter uint64
+	var bumped bool
+	if scope != nil {
+		counter, bumped = scope.Watermark()
+	}
+	if bumped {
+		defer e.recheckWatermarkDirty(ctx)
+	}
+
+	e.applyLocked(ctx, scope, counter, bumped)
+}
+
+// applyLocked is Apply's entire original sequence, run under applyMu: bump
+// applyEpoch, fold this scope's watermark counter in if it bumped, then
+// either give up early or build and publish a delta segment -- see Apply's
+// own doc for the seven-step pipeline and why folding the counter here
+// (rather than the live convergence recheck, which Apply itself defers
+// outside this method) still belongs under the lock.
+func (e *Engine) applyLocked(ctx context.Context, scope *WriteScope, counter uint64, bumped bool) {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 
-	if scope != nil {
-		if counter, bumped := scope.Watermark(); bumped {
-			defer e.AdvanceWatermark(ctx, counter)
-		}
+	if bumped {
+		e.foldWatermarkCounter(counter)
 	}
 
 	e.applyEpoch.Add(1)
