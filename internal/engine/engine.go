@@ -125,6 +125,34 @@ type Engine struct {
 	// rebuild at all.
 	rebuildAttempts atomic.Uint64
 
+	// appliedWatermark is the largest pg watermark counter value any bumped
+	// WriteScope's Apply/AdvanceWatermark call has folded in so far (see
+	// watermark.go) -- a monotonic max, not a plain overwrite, since
+	// concurrent writers' bumped scopes can finish applying out of order
+	// (AdvanceWatermark's own doc).
+	appliedWatermark atomic.Uint64
+
+	// inflightBumps counts every bumped WriteScope whose write has not yet
+	// been resolved by Apply or AdvanceWatermark: incremented the instant
+	// BumpWatermark's own UPDATE commits, decremented exactly once per
+	// bumped scope by AdvanceWatermark. Zero is the value watermarkConverged
+	// requires: nonzero means some write's pg watermark counter has already
+	// advanced while that write's own effect (committed or rolled back) is
+	// not yet known to be reconciled.
+	inflightBumps atomic.Int64
+
+	// watermarkDirty is set the instant a BumpWatermark call genuinely
+	// fails (NoteWatermarkBumpFailure) -- never for ErrWatermarkUnavailable,
+	// which means this engine was never tracking a watermark at all, not
+	// that a bump was missed. A missed bump means the pg watermark counter
+	// and this engine's own bookkeeping have silently diverged, which a
+	// future snapshot-file writer (watermarkConverged's own consumer) must
+	// never trust as convergence even if the numbers happen to line up
+	// again by coincidence. It clears only when a later bumped scope's
+	// Apply/AdvanceWatermark call finds the engine genuinely converged
+	// again, via a live pg read (AdvanceWatermark's own doc).
+	watermarkDirty atomic.Bool
+
 	// mapKind resolves a graph.Kind name to its KindID, as
 	// e.pgDriver.KindMapper().MapKind would. The builder-serving path
 	// (serve_builder.go: TryNodeCount/TryNodeFetchIDs/TryNodeFetchKinds and

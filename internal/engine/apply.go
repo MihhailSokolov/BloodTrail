@@ -94,9 +94,30 @@ const (
 //
 // Safe for concurrent use. A caller that has no ctx of its own may pass
 // context.Background(); ctx bounds the read-back queries only.
+//
+// Watermark bookkeeping (watermark.go) is folded into this same sequence,
+// deliberately unconditional on everything below: if scope was bumped
+// (scope.Watermark's own flag), a deferred AdvanceWatermark call is queued
+// BEFORE any of the branches below can return, so it runs on every one of
+// them -- the disabled-engine return, every enterFallback branch, the
+// empty-ChangeSet no-op, and the ordinary published-segment path alike.
+// The pg watermark counter already advanced the instant BumpWatermark's
+// own UPDATE committed, independent of what this call goes on to do with
+// the write's own effect, so this scope's bump has to resolve regardless of
+// which of those branches actually fires. Also serialized under applyMu,
+// for simplicity: nothing about it strictly requires the lock, but running
+// it there costs nothing in the common case (watermarkDirty is false, so
+// AdvanceWatermark never reaches the pool at all) and keeps this method's
+// whole sequence easy to reason about as one block.
 func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
+
+	if scope != nil {
+		if counter, bumped := scope.Watermark(); bumped {
+			defer e.AdvanceWatermark(ctx, counter)
+		}
+	}
 
 	e.applyEpoch.Add(1)
 

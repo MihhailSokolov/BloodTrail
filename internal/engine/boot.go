@@ -58,7 +58,18 @@ const triggerManual = "manual"
 // itself idempotent (a second call's own claimRebuildLoop attempt loses the
 // CAS to the first and simply does nothing -- harmless, but still not
 // something a caller should do).
+//
+// ensureWatermarkTable (watermark.go) runs first, unconditionally -- even
+// when !cfg.Enabled: the watermark protocol tracks every mutating write
+// PostgreSQL ever sees regardless of whether THIS engine ever serves a
+// query from an in-memory replica, since a future snapshot-file consumer
+// (possibly a different BloodTrail instance) still needs the counter to be
+// trustworthy. It is a no-op when e.pool is nil (ensureWatermarkTable's own
+// doc), which is what keeps this safe to call from a unit test built with
+// no database behind it at all.
 func (e *Engine) Start(ctx context.Context) {
+	e.ensureWatermarkTable(ctx)
+
 	if !e.cfg.Enabled {
 		return
 	}
