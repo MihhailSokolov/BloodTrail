@@ -75,7 +75,7 @@ func TestTryAllShortestPathsDifferential(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestTryAllShortestPathsDeclinesInFallback(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -464,7 +464,7 @@ func TestTryAllShortestPathsDeclinesSelfEndpoint(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 

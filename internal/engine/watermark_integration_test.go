@@ -55,7 +55,7 @@ func parkRebuildLoop(eng *Engine) {
 func adoptOneRebuild(t *testing.T, ctx context.Context, eng *Engine) {
 	t.Helper()
 
-	adopted, err := eng.rebuildOnce(ctx, triggerManual)
+	adopted, err := eng.rebuildOnce(ctx, "manual")
 	if err != nil {
 		t.Fatalf("rebuildOnce: %v", err)
 	}

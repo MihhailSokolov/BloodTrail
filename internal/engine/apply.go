@@ -33,9 +33,11 @@ const (
 )
 
 // triggerFallback labels the RebuildNow calls the fallback recovery
-// goroutine makes, alongside boot.go's own triggerStartup and triggerManual,
-// so a rebuild driven by a failed apply is distinguishable in the log from a
-// boot-load- or test-driven one.
+// goroutine makes, alongside boot.go's own triggerStartup, so a rebuild
+// driven by a failed apply is distinguishable in the log from a boot-load-
+// or test-driven one (every manual/test caller passes its own literal
+// "manual" -- see triggerStartup's doc for why there is no shared constant
+// for that one).
 const triggerFallback = "fallback"
 
 // fallbackRetryInterval and fallbackRetryMax bound the fallback recovery

@@ -372,10 +372,11 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
 //
 // trigger names why this call is happening (triggerStartup from Start's
 // boot-load goroutine, triggerFallback from the fallback recovery goroutine,
-// or triggerManual for every other caller, boot.go); it is logged verbatim
-// in the "trigger" attr on the success, refusal, and not-adopted log lines
-// below, so log consumers can tell a boot-load rebuild from a recovery or
-// manual one.
+// or the literal "manual" every other caller uses -- boot.go's
+// triggerStartup doc explains why that one has no shared named constant);
+// it is logged verbatim in the "trigger" attr on the success, refusal, and
+// not-adopted log lines below, so log consumers can tell a boot-load
+// rebuild from a recovery or manual one.
 //
 // A snapshot whose ApproxBytes() exceeds a nonzero cfg.MemoryLimit is
 // dropped rather than adopted: whatever View was previously current (nil or

@@ -2226,6 +2226,41 @@ func TestObservingBatchWithGraphRecordsFallbackAndKeepsObserving(t *testing.T) {
 	}
 }
 
+// TestObservingBatchWroteFalseInitially and TestObservingBatchWroteTrueAfterWrite
+// mirror TestObservingTransactionWroteFalseInitially/
+// TestObservingTransactionWroteTrueAfterWrite above: observingBatch.wrote's
+// own doc says its reasoning is identical to observingTransaction.wrote's,
+// substituting "batch" for "transaction" throughout, so these pin the same
+// contract for the batch wrapper. There is no batch equivalent of
+// TestObservingTransactionWroteFalseAfterPureRead: graph.Batch has no read
+// method at all (only creates, deletes, and the Node/RelationshipQuery
+// builders, all of which record a ChangeSet entry), so a batch never has a
+// pure read to leave wrote() unflipped after.
+func TestObservingBatchWroteFalseInitially(t *testing.T) {
+	inner := &fakeBatch{}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	if b.wrote() {
+		t.Fatalf("wrote() = true on a batch that has not made a single call yet")
+	}
+}
+
+func TestObservingBatchWroteTrueAfterWrite(t *testing.T) {
+	inner := &fakeBatch{}
+	scope := engine.NewWriteScope()
+	b := &observingBatch{Batch: inner, scope: scope, eng: disabledEngine()}
+
+	node := &graph.Node{ID: graph.UnregisteredNodeID, Kinds: graph.Kinds{graph.StringKind("User")}}
+	if err := b.CreateNode(node); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+
+	if !b.wrote() {
+		t.Fatalf("wrote() = false after CreateNode recorded a ChangeSet entry, want true")
+	}
+}
+
 func TestObservingBatchCommitFlushesNowAndResetsScope(t *testing.T) {
 	inner := &fakeBatch{}
 	eng := disabledEngine()

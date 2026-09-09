@@ -320,6 +320,51 @@ func kindTableWireLen(t *testing.T, kt *KindTable) int {
 	return buf.Len()
 }
 
+// propEntriesWireLen replays, in isolation, exactly the per-entry loop
+// inside writePropStore (file.go) -- prop uint16, kind uint8, num float64
+// bits as uint64, ref uint32, len uint32, for each of entries -- and
+// returns how many bytes it puts on the wire.
+func propEntriesWireLen(t *testing.T, entries []propEntry) int {
+	t.Helper()
+
+	var buf bytes.Buffer
+	bw := &binWriter{w: &buf}
+	for _, e := range entries {
+		bw.u16(uint16(e.prop))
+		bw.u8(e.kind)
+		bw.f64(e.num)
+		bw.u32(e.ref)
+		bw.u32(e.len)
+	}
+	if bw.err != nil {
+		t.Fatalf("propEntriesWireLen: %v", bw.err)
+	}
+	return buf.Len()
+}
+
+// TestPropEntryWireSizeMatchesEncoder pins propEntryWireSize (file.go) to
+// what writePropStore's hand-written per-entry loop actually puts on the
+// wire, using the fixture snapshot's real property entries (buildFileFixture)
+// rather than a synthetic count. This is the invariant propEntryWireSize
+// exists to name -- its own doc comment already derives it as
+// 2+1+8+4+4 == 19, but a future change to the entries loop that silently
+// adds, removes, or resizes a field (there or here) should break a test,
+// not just leave a comment's arithmetic stale.
+func TestPropEntryWireSizeMatchesEncoder(t *testing.T) {
+	s := buildFileFixture(t)
+	entries := s.Props.entries
+	if len(entries) == 0 {
+		t.Fatal("fixture has no property entries (fixture assumption broken)")
+	}
+
+	got := propEntriesWireLen(t, entries)
+	want := len(entries) * propEntryWireSize
+	if got != want {
+		t.Fatalf("propEntriesWireLen(%d entries) = %d bytes, want %d (propEntryWireSize=%d)",
+			len(entries), got, want, propEntryWireSize)
+	}
+}
+
 // patchU64 overwrites the 8 little-endian bytes at off in data with v --
 // used by the two tests below to corrupt a single length-prefixed count
 // field in place, inside an otherwise fully valid, freshly written

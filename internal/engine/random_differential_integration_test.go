@@ -75,7 +75,7 @@ func TestRandomDifferential(t *testing.T) {
 		graphtest.WipeGraph(t, pgDriver)
 		ids := graphtest.LoadRandom(t, pgDriver, seed)
 
-		if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+		if err := eng.RebuildNow(ctx, "manual"); err != nil {
 			t.Fatalf("seed=%d: RebuildNow: %v", seed, err)
 		}
 

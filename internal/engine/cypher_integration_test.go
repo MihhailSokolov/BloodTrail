@@ -317,7 +317,7 @@ func TestTryCypherDifferential(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -467,7 +467,7 @@ func TestTryCypherRejectsUpdatingClause(t *testing.T) {
 	graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -497,7 +497,7 @@ func TestTryCypherParams(t *testing.T) {
 	ids := graphtest.LoadDataset(t, pgDriver, hydrateFixturePath)
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -602,7 +602,7 @@ func TestTryCypherAggregationQuery(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -720,7 +720,7 @@ func TestTryCypherCollectAntiJoinQuery(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -790,7 +790,7 @@ func TestTryCypherReturnPropertyLiteralMatchesOracleType(t *testing.T) {
 	}
 
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	if err := eng.RebuildNow(ctx, triggerManual); err != nil {
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 

@@ -50,7 +50,7 @@ func seedFileBootSnapshot(t *testing.T, ctx context.Context, pgDriver *pg.Driver
 	engA := New(pgDriver, pool, Config{Enabled: true, SnapshotDir: dir, Log: testEngineLogger()})
 	resetWatermarkTable(t, ctx, engA)
 
-	if err := engA.RebuildNow(ctx, triggerManual); err != nil {
+	if err := engA.RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("seedFileBootSnapshot: initial RebuildNow: %v", err)
 	}
 

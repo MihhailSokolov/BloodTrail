@@ -16,16 +16,19 @@ import (
 )
 
 // triggerStartup labels the RebuildNow calls Start's boot-load goroutine
-// makes (runBootLoad, below), alongside apply.go's triggerFallback and
-// triggerManual, so a rebuild driven by the initial load is distinguishable
-// in the log from a fallback-recovery or test/admin-driven one.
+// makes (runBootLoad, below), alongside apply.go's triggerFallback, so a
+// rebuild driven by the initial load is distinguishable in the log from a
+// fallback-recovery or test/admin-driven one.
+//
+// There is deliberately no equivalent named constant for a manual or
+// test-driven rebuild: every such caller is either an integration test in
+// this package (which passes the literal "manual" directly -- there is
+// nothing to share the label with under the plain, tag-less build every
+// other caller in this package is compiled under) or code outside this
+// package calling the exported RebuildNow directly (bench/pathbench, for
+// one), which cannot see an unexported constant here regardless and chooses
+// its own literal by the same "manual" convention.
 const triggerStartup = "startup"
-
-// triggerManual is what every RebuildNow caller outside Start's boot-load
-// goroutine and apply.go's fallback recovery goroutine uses: every test in
-// this package that drives a rebuild directly, and any future admin-
-// triggered rebuild.
-const triggerManual = "manual"
 
 // Start launches the engine's boot-load goroutine, which loads the first
 // snapshot from PostgreSQL so the engine can begin serving without waiting
