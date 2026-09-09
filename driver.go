@@ -158,10 +158,12 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 	logger := buildLogger(settings, slog.Default().Handler())
 
 	eng := engine.New(pgDriver, cfg.Pool, engine.Config{
-		Enabled:     settings.Engine,
-		MemoryLimit: settings.MemoryLimit,
-		SnapshotDir: settings.SnapshotDir,
-		Log:         logger,
+		Enabled:        settings.Engine,
+		MemoryLimit:    settings.MemoryLimit,
+		SnapshotDir:    settings.SnapshotDir,
+		CompactEntries: settings.CompactEntries,
+		CompactBytes:   settings.CompactBytes,
+		Log:            logger,
 	})
 	// A driver-scoped background context, deliberately not ctx: the boot-load
 	// goroutine Start launches must outlive this Open call and keep running

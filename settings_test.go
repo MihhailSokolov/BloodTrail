@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/specterops/dawgs/util/size"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine"
 )
 
 func lookupFrom(m map[string]string) func(string) (string, bool) {
@@ -30,14 +32,22 @@ func TestSettingsFromEnvDefaults(t *testing.T) {
 	if s.Engine != true {
 		t.Errorf("Engine default = %v, want true (on by default)", s.Engine)
 	}
+	if s.CompactEntries != engine.DefaultCompactEntries {
+		t.Errorf("CompactEntries default = %d, want %d", s.CompactEntries, engine.DefaultCompactEntries)
+	}
+	if s.CompactBytes != engine.DefaultCompactBytes {
+		t.Errorf("CompactBytes default = %d, want %d", s.CompactBytes, engine.DefaultCompactBytes)
+	}
 }
 
 func TestSettingsFromEnvParsesAll(t *testing.T) {
 	s, err := SettingsFromEnv(lookupFrom(map[string]string{
-		EnvSnapshotDir: "/var/lib/bloodtrail",
-		EnvMemoryLimit: "4GiB",
-		EnvLogLevel:    "debug",
-		EnvEngine:      "off",
+		EnvSnapshotDir:    "/var/lib/bloodtrail",
+		EnvMemoryLimit:    "4GiB",
+		EnvLogLevel:       "debug",
+		EnvEngine:         "off",
+		EnvCompactEntries: "42",
+		EnvCompactBytes:   "8MiB",
 	}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -56,6 +66,28 @@ func TestSettingsFromEnvParsesAll(t *testing.T) {
 	}
 	if s.Engine != false {
 		t.Errorf("Engine = %v, want false", s.Engine)
+	}
+	if s.CompactEntries != 42 {
+		t.Errorf("CompactEntries = %d, want 42", s.CompactEntries)
+	}
+	if s.CompactBytes != 8*size.Mebibyte {
+		t.Errorf("CompactBytes = %d, want %d", s.CompactBytes, 8*size.Mebibyte)
+	}
+}
+
+// TestSettingsFromEnvCompactEntriesZeroMeansUnbounded pins the one
+// zero-adjacent behavior worth a dedicated test: "0" is a valid,
+// successfully-parsed entry count (unlike a negative one, rejected by
+// TestSettingsFromEnvRejectsMalformed below), and it means "no bound on
+// this dimension" -- the same convention EnvMemoryLimit already uses --
+// not "compact on every write". See EnvCompactEntries' own doc.
+func TestSettingsFromEnvCompactEntriesZeroMeansUnbounded(t *testing.T) {
+	s, err := SettingsFromEnv(lookupFrom(map[string]string{EnvCompactEntries: "0"}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.CompactEntries != 0 {
+		t.Errorf("CompactEntries = %d, want 0", s.CompactEntries)
 	}
 }
 
@@ -109,10 +141,13 @@ func TestSettingsFromEnvEngineToggleValues(t *testing.T) {
 
 func TestSettingsFromEnvRejectsMalformed(t *testing.T) {
 	cases := map[string]map[string]string{
-		"bad size":          {EnvMemoryLimit: "lots"},
-		"bad unit":          {EnvMemoryLimit: "4 parsecs"},
-		"bad level":         {EnvLogLevel: "loud"},
-		"bad engine toggle": {EnvEngine: "maybe"},
+		"bad size":                 {EnvMemoryLimit: "lots"},
+		"bad unit":                 {EnvMemoryLimit: "4 parsecs"},
+		"bad level":                {EnvLogLevel: "loud"},
+		"bad engine toggle":        {EnvEngine: "maybe"},
+		"bad compact entries":      {EnvCompactEntries: "lots"},
+		"negative compact entries": {EnvCompactEntries: "-1"},
+		"bad compact bytes":        {EnvCompactBytes: "4 parsecs"},
 	}
 	for name, env := range cases {
 		t.Run(name, func(t *testing.T) {

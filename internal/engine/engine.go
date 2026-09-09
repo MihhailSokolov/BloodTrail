@@ -45,6 +45,20 @@ type Config struct {
 	// so via its own ok return.
 	SnapshotDir string
 
+	// CompactEntries and CompactBytes (BLOODTRAIL_COMPACT_ENTRIES/_BYTES)
+	// bound how large the write-through delta layered on the engine's
+	// current View may grow, in entries and approximate bytes
+	// respectively, before a background compaction folds it back into the
+	// base snapshot (compact.go's maybeStartCompaction/deltaSize). Zero on
+	// either field means "no bound on that dimension" -- the same
+	// convention MemoryLimit uses below -- so a Config that leaves both at
+	// their zero value (every existing unit test in this package that
+	// never mentions compaction) never triggers one; production defaults
+	// to DefaultCompactEntries/DefaultCompactBytes (compact.go) via
+	// settings.go.
+	CompactEntries int
+	CompactBytes   size.Size
+
 	// Log receives the engine's rebuild/serve/decline events. New defaults
 	// this to slog.Default() when nil, so a zero Config is still safe to
 	// log with.
@@ -104,13 +118,24 @@ type Engine struct {
 	// rather than one per write.
 	fallbackRebuilding atomic.Bool
 
-	// bgCtx/bgCancel scope the engine's own background work (today: the
-	// fallback recovery goroutine) to the engine's lifetime rather than to
-	// any one caller's request context: the write whose failure tripped the
-	// fallback has long returned by the time recovery finishes, and its
-	// ctx being cancelled says nothing about whether the replica should
-	// recover. Stop cancels bgCtx, which is what makes an in-flight
-	// recovery goroutine exit promptly.
+	// compacting is set while a background compaction (compact.go) is
+	// running, claimed via the same CAS pattern fallbackRebuilding uses but
+	// kept as its own, separate flag: a compaction and a fallback rebuild
+	// are unrelated operations, and serializing them against each other
+	// through a shared flag would be pure unneeded contention -- the two are
+	// instead kept from racing destructively by adoptCompaction's own
+	// state/base rechecks at publish time (compact.go's own doc walks
+	// through why that is enough).
+	compacting atomic.Bool
+
+	// bgCtx/bgCancel scope the engine's own background work (the fallback
+	// recovery goroutine, and a running compaction) to the engine's
+	// lifetime rather than to any one caller's request context: the write
+	// whose failure tripped the fallback has long returned by the time
+	// recovery finishes, and its ctx being cancelled says nothing about
+	// whether the replica should recover. Stop cancels bgCtx, which is what
+	// makes an in-flight recovery goroutine -- and a compaction, at its own
+	// next checkpoint, compact.go's runCompaction -- exit promptly.
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 
@@ -134,6 +159,15 @@ type Engine struct {
 	// write-through tests' central claim that a write is served without any
 	// rebuild at all.
 	rebuildAttempts atomic.Uint64
+
+	// compactionCount counts every background compaction actually adopted
+	// (compact.go's adoptCompaction, on its success path only -- a
+	// discarded or failed fold never increments this). Nothing in
+	// production reads it; it exists purely for test observability, through
+	// CompactionCount, mirroring RebuildCount/ApplyCount's identical role --
+	// the compactor's own tests assert "exactly one compaction ran" against
+	// this rather than inferring it from timing.
+	compactionCount atomic.Uint64
 
 	// appliedWatermark is the largest pg watermark counter value any bumped
 	// WriteScope's Apply/AdvanceWatermark call has folded in so far (see
@@ -269,6 +303,13 @@ func (e *Engine) ApplyCount() uint64 {
 // between, which is exactly "this count did not change".
 func (e *Engine) RebuildCount() uint64 {
 	return e.rebuildAttempts.Load()
+}
+
+// CompactionCount returns how many background compactions have actually
+// been adopted (compact.go's adoptCompaction). Test observability only --
+// see compactionCount's own doc.
+func (e *Engine) CompactionCount() uint64 {
+	return e.compactionCount.Load()
 }
 
 // Fresh returns the engine's current View and whether the engine is

@@ -91,6 +91,10 @@ const (
 //     the result would exceed cfg.MemoryLimit -- the same limit RebuildNow
 //     applies to a freshly loaded snapshot, applied here to the View the
 //     delta produces -- in which case enterFallback instead.
+//  7. Still under applyMu: run the two size-triggered maintenance steps
+//     compact.go implements -- collapse the segment stack if it has grown
+//     past maxSegments, and spawn a background compaction if the delta has
+//     grown past cfg.CompactEntries/CompactBytes (maintainAfterPublish).
 //
 // Safe for concurrent use. A caller that has no ctx of its own may pass
 // context.Background(); ctx bounds the read-back queries only.
@@ -230,6 +234,13 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 		slog.Int("edges", seg.EdgeCount()),
 		slog.Int("segments", newView.SegmentCount()),
 	)
+
+	// Two size-triggered maintenance steps, still under applyMu (this
+	// method's own defer hasn't unlocked yet): a synchronous collapse of an
+	// overgrown segment stack, and the decision to spawn a background
+	// compaction -- see compact.go's maintainAfterPublish for why both need
+	// to run inside this same critical section.
+	e.maintainAfterPublish(ctx, newView)
 }
 
 // buildApplySegment turns one read-back result, plus whatever kind-scoped

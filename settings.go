@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/specterops/dawgs/util/size"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine"
 )
 
 // Environment variables the driver reads. BloodHound's configuration struct is
@@ -32,6 +34,16 @@ const (
 	// When off, every read is delegated to PostgreSQL exactly as in the
 	// pre-engine driver.
 	EnvEngine = "BLOODTRAIL_ENGINE"
+	// EnvCompactEntries and EnvCompactBytes bound how large the
+	// write-through delta layered on the engine's current View may grow,
+	// in entries and approximate bytes respectively, before a background
+	// compaction folds it back into the base snapshot. Both default to
+	// engine.DefaultCompactEntries/DefaultCompactBytes. "0" means "no bound
+	// on that dimension" (the same convention EnvMemoryLimit uses), not
+	// "compact on every write"; setting both to "0" disables compaction
+	// outright.
+	EnvCompactEntries = "BLOODTRAIL_COMPACT_ENTRIES"
+	EnvCompactBytes   = "BLOODTRAIL_COMPACT_BYTES"
 )
 
 // Settings holds the driver's own configuration.
@@ -66,6 +78,13 @@ type Settings struct {
 	// Engine gates whether the in-memory path engine ever attempts to serve
 	// a query. Defaults to true (on); EnvEngine can turn it off.
 	Engine bool
+	// CompactEntries and CompactBytes (EnvCompactEntries/EnvCompactBytes)
+	// bound the write-through delta size that triggers a background
+	// compaction. Default to engine.DefaultCompactEntries/
+	// DefaultCompactBytes; see EnvCompactEntries' own doc for the zero
+	// convention.
+	CompactEntries int
+	CompactBytes   size.Size
 }
 
 // SettingsFromEnv builds Settings from an environment lookup function
@@ -73,8 +92,10 @@ type Settings struct {
 // are errors so a misconfiguration fails at startup, not later.
 func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 	settings := Settings{
-		LogLevel: slog.LevelInfo,
-		Engine:   true,
+		LogLevel:       slog.LevelInfo,
+		Engine:         true,
+		CompactEntries: engine.DefaultCompactEntries,
+		CompactBytes:   engine.DefaultCompactBytes,
 	}
 
 	if v, ok := lookup(EnvSnapshotDir); ok {
@@ -106,7 +127,41 @@ func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 		settings.Engine = enabled
 	}
 
+	if v, ok := lookup(EnvCompactEntries); ok {
+		entries, err := parseCompactEntries(v)
+		if err != nil {
+			return Settings{}, fmt.Errorf("%s: %w", EnvCompactEntries, err)
+		}
+		settings.CompactEntries = entries
+	}
+
+	if v, ok := lookup(EnvCompactBytes); ok {
+		bytes, err := ParseSize(v)
+		if err != nil {
+			return Settings{}, fmt.Errorf("%s: %w", EnvCompactBytes, err)
+		}
+		settings.CompactBytes = bytes
+	}
+
 	return settings, nil
+}
+
+// parseCompactEntries parses EnvCompactEntries' value: a non-negative
+// integer entry count, with surrounding whitespace trimmed. Negative counts
+// are rejected outright -- unlike EnvMemoryLimit's size.Size (an unsigned
+// type that cannot even represent a negative value), a plain int threshold
+// has to reject one explicitly to keep "0 means unbounded" (this dimension
+// never triggers) the only zero-adjacent meaning this setting can carry.
+func parseCompactEntries(text string) (int, error) {
+	text = strings.TrimSpace(text)
+	value, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, fmt.Errorf("entry count %q: %w", text, err)
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("entry count %q must not be negative", text)
+	}
+	return value, nil
 }
 
 // parseEngineToggle parses EnvEngine's value: "on"/"off", or true/false/1/0,
