@@ -30,6 +30,17 @@
 // happen, once the default graph resolves, rather than being spent (and
 // lost) on the one instant at which it is guaranteed to be impossible.
 //
+// # The other half of the same mistake: the shutdown context
+//
+// The save side had an exactly analogous defect, and for the same reason --
+// every test of it handed Close a context production can never hand it. See
+// TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext below for
+// the full account; in short, upstream defers Graph.Close(ctx) with the SAME
+// context whose cancellation is what began the shutdown, so the save's own
+// pg watermark round trip ran on an already-cancelled context and could
+// never converge. Both halves are the same class of bug: a feature proven
+// against a lifecycle only a test can produce.
+//
 // Lives in package bloodtrail (not bloodtrail_test) for the same two reasons
 // apply_integration_test.go does: only the root package can drive the real
 // Open path, and only an in-package test can read Driver's unexported engine
@@ -57,9 +68,11 @@ import (
 // operator grepping logs, or this test) sees them -- see
 // internal/engine/boot.go's tryLoadSnapshotFile for each one's meaning.
 const (
-	snapshotFileLoadedMarker   = "bloodtrail: snapshot file loaded"
-	snapshotFileRejectedMarker = "bloodtrail: snapshot file rejected"
-	noSnapshotFileMarker       = "bloodtrail: no snapshot file"
+	snapshotFileLoadedMarker     = "bloodtrail: snapshot file loaded"
+	snapshotFileRejectedMarker   = "bloodtrail: snapshot file rejected"
+	noSnapshotFileMarker         = "bloodtrail: no snapshot file"
+	snapshotFileWrittenMarker    = "bloodtrail: snapshot file written"
+	snapshotFileNotWrittenMarker = "bloodtrail: snapshot file not written"
 )
 
 // fileBootWiringKind is this file's own fixture kind, named distinctly from
@@ -266,5 +279,127 @@ func TestOpenWithNoSnapshotFileStillRebuildsThroughProductionOrdering(t *testing
 	}
 	if strings.Contains(buf.String(), "bloodtrail: boot load failed") {
 		t.Fatalf("boot load logged a failure while merely waiting for the default graph to resolve -- that is an ordinary startup wait, not an error\ncaptured log:\n%s", buf.String())
+	}
+}
+
+// TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext is the
+// save-side counterpart to this file's boot-side crux above, and the
+// regression test for a defect that made the graceful-shutdown save
+// unreachable in EVERY real deployment while every test of it passed.
+//
+// # The context production actually hands Close
+//
+// Upstream's bootstrap.Initializer.Launch (cmd/api/src/bootstrap/
+// initializer.go) builds one daemon context, defers the graph database's
+// Close against it, and then blocks on that same context:
+//
+//	ctx = NewDaemonContext(parentCtx)   // cancelled by SIGTERM/SIGINT
+//	defer databaseConnections.Graph.Close(ctx)
+//	...
+//	<-ctx.Done()                        // the signal arrives -> shutdown
+//
+// So the ONLY way that deferred Close is ever reached on a signal-driven
+// shutdown is by ctx being cancelled first: cancellation is the trigger,
+// not an edge case. Close therefore always runs with an already-cancelled
+// context -- there is no signal-driven shutdown in which it does not.
+//
+// # Why that silently disabled the save
+//
+// Driver.Close passes that context straight into engine.SaveSnapshot, whose
+// probe (internal/engine/persist.go's saveSnapshotProbe) runs a live
+// PostgreSQL watermark round trip -- ReadWatermark -- to learn the counter
+// it must stamp the file with and whether the engine has converged on it. A
+// cancelled context fails that query unconditionally, before it can reach
+// the database at all, and watermarkConverged answers (0, false) for any
+// read error. converged=false fails saveSnapshotPreconditionsFor, so the
+// save declined every single time, logging only a Debug-level
+// "snapshot file not written" with converged=false. Nothing errored,
+// nothing warned, and BLOODTRAIL_SNAPSHOT_DIR quietly never produced a file
+// on shutdown in production -- while the tests, which all closed with a
+// live context, kept passing.
+//
+// The fix (driver.go's Close) detaches the save's context from the
+// shutdown's cancellation, bounded by its own timeout so a save can still
+// never outlast the container stop grace period it runs inside.
+//
+// This test reproduces production's ordering exactly -- cancel first, then
+// Close -- and requires a real file on disk plus the positive log marker.
+// Before the fix it failed on both, with snapshotFileNotWrittenMarker in
+// the captured log instead.
+func TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	t.Setenv(EnvSnapshotDir, dir)
+
+	buf := installLogCapture(t)
+
+	pool := newFileBootPool(t, dsn)
+	pgDriver := pg.NewDriver(size.Gibibyte, pool)
+	if err := pgDriver.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
+		t.Fatalf("assert schema: %v", err)
+	}
+	graphtest.WipeGraph(t, pgDriver)
+
+	d, bt := openProductionOrdered(t, ctx, dsn, pool)
+	waitForBootLoad(t, d)
+
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		_, err := tx.CreateNode(graph.NewProperties().Set("objectid", "SHUTDOWN-CTX-1"), fileBootWiringKind)
+		return err
+	}); err != nil {
+		t.Fatalf("write node: %v", err)
+	}
+
+	// Everything above was setup; the measurement window starts here.
+	writtenBefore := markerCount(buf, snapshotFileWrittenMarker)
+
+	// Production's own shutdown ordering: the context is cancelled FIRST --
+	// that cancellation is what releases Launch's `<-ctx.Done()` and so what
+	// reaches the deferred Close at all -- and Close then runs against it.
+	shutdownCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	if err := bt.Close(shutdownCtx); err != nil {
+		t.Fatalf("Close with an already-cancelled shutdown context: %v", err)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(dir, "*.btsnap"))
+	if err != nil {
+		t.Fatalf("glob %s: %v", dir, err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("want exactly one .btsnap file in %s after a graceful shutdown, found %d (%v) -- the save did not run against the only context production ever hands Close\ncaptured log:\n%s",
+			dir, len(matches), matches, buf.String())
+	}
+
+	if got := markerCount(buf, snapshotFileWrittenMarker) - writtenBefore; got != 1 {
+		t.Fatalf("%q fired %d time(s) closing with a cancelled shutdown context, want exactly 1\ncaptured log:\n%s", snapshotFileWrittenMarker, got, buf.String())
+	}
+	if strings.Contains(buf.String(), snapshotFileNotWrittenMarker) {
+		t.Fatalf("%q logged for a shutdown save that should have succeeded -- the cancelled context still reached the save's watermark probe\ncaptured log:\n%s",
+			snapshotFileNotWrittenMarker, buf.String())
+	}
+
+	// The file must also be usable, not merely present: a save that stamped
+	// a watermark the next boot rejects would be no better than no file.
+	snapshotDir := dir
+	pool2 := newFileBootPool(t, dsn)
+	loadedBefore := markerCount(buf, snapshotFileLoadedMarker)
+	rejectedBefore := markerCount(buf, snapshotFileRejectedMarker)
+	d2, _ := openProductionOrdered(t, ctx, dsn, pool2)
+	t.Cleanup(func() { _ = d2.Close(ctx) })
+	waitForBootLoad(t, d2)
+
+	if got := markerCount(buf, snapshotFileLoadedMarker) - loadedBefore; got != 1 {
+		t.Fatalf("%q fired %d time(s) booting against the file the cancelled-context shutdown wrote to %s, want exactly 1\ncaptured log:\n%s",
+			snapshotFileLoadedMarker, got, snapshotDir, buf.String())
+	}
+	if got := markerCount(buf, snapshotFileRejectedMarker) - rejectedBefore; got != 0 {
+		t.Fatalf("%q fired %d time(s) for the file the shutdown save wrote, want 0\ncaptured log:\n%s", snapshotFileRejectedMarker, got, buf.String())
+	}
+	if got := d2.engine.RebuildCount(); got != 0 {
+		t.Fatalf("RebuildCount = %d booting from the shutdown-written file, want 0", got)
 	}
 }

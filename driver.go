@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
@@ -29,6 +30,19 @@ import (
 
 // DriverName is the value BloodHound's graph_driver setting selects.
 const DriverName = "bloodtrail"
+
+// snapshotSaveTimeout bounds the shutdown snapshot save Close runs on a
+// context deliberately detached from the shutdown's own cancellation -- see
+// Close's doc for why that detachment is required at all, and for why this
+// bound in practice covers only the save's single-row PostgreSQL watermark
+// read (the fold and file write past it take no context).
+//
+// Sized to stay comfortably inside a default container stop grace period
+// (`docker stop` and `docker compose restart` both allow 10s before
+// SIGKILL) so that, in the one case this timeout exists for -- a database
+// that has stopped answering -- the save gives up on its own and lets the
+// rest of the shutdown finish, rather than being killed partway through it.
+const snapshotSaveTimeout = 5 * time.Second
 
 // Version is stamped by the image build (see build/build-image.sh).
 var Version = "dev"
@@ -368,9 +382,52 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 // unset, or a save that fails outright, simply means the next boot falls
 // back to its own PostgreSQL rebuild, exactly as it always has) -- never a
 // reason a graceful shutdown should block or report an error of its own.
+//
+// # Why the save does not run on ctx
+//
+// ctx here is, in production, ALWAYS already cancelled. BloodHound's
+// bootstrap.Initializer.Launch (upstream cmd/api/src/bootstrap/
+// initializer.go) builds a single signal-driven daemon context, defers this
+// Close against it, and blocks on it:
+//
+//	ctx = NewDaemonContext(parentCtx)   // cancelled by SIGTERM/SIGINT
+//	defer databaseConnections.Graph.Close(ctx)
+//	...
+//	<-ctx.Done()                        // the signal arrives -> shutdown
+//
+// The cancellation is the very thing that releases that wait and so reaches
+// this deferred call: on any signal-driven shutdown -- which is every
+// ordinary container stop, `docker compose restart` included -- there is no
+// path here on which ctx is still live.
+//
+// Handing that context to SaveSnapshot made the shutdown save impossible
+// rather than merely slower. The save's own probe runs a live PostgreSQL
+// watermark round trip (internal/engine/persist.go's saveSnapshotProbe ->
+// ReadWatermark) to learn the counter to stamp the file with; a cancelled
+// context fails that query before it reaches the database, and
+// watermarkConverged reports (0, false) for any read error, which fails
+// saveSnapshotPreconditionsFor. So every graceful shutdown declined to
+// write, logging only a Debug "snapshot file not written" with
+// converged=false -- no error, no warning, and BLOODTRAIL_SNAPSHOT_DIR
+// silently never producing a file outside of a compaction's own save
+// (internal/engine/compact.go). context.WithoutCancel detaches the save
+// from that cancellation; it is the shutdown's LAST piece of work, not
+// something the shutdown is waiting to abandon.
+//
+// snapshotSaveTimeout then re-bounds it, so detaching cannot turn a wedged
+// database into a shutdown that hangs until the container runtime's own
+// SIGKILL. In practice it bounds only that watermark round trip: the fold
+// and the file write past it (snapshot.Fold, snapshot.WriteSnapshotFile)
+// take no context at all, and WriteSnapshotFile is temp-file-plus-rename,
+// so even a SIGKILL landing mid-write leaves a stray .tmp rather than a
+// half-written .btsnap a later boot could read.
 func (d *Driver) Close(ctx context.Context) error {
 	d.engine.Stop()
-	_ = d.engine.SaveSnapshot(ctx)
+
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotSaveTimeout)
+	_ = d.engine.SaveSnapshot(saveCtx)
+	cancel()
+
 	return d.Driver.Close(ctx)
 }
 
