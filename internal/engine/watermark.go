@@ -290,6 +290,13 @@ func (e *Engine) ResolveAbandonedWrite(ctx context.Context, scope *WriteScope) {
 		e.AdvanceWatermark(counter)
 	}
 
+	// The boot gap buffer needs this write's counter too (counter-only --
+	// there is nothing to replay for a write that committed nothing), or a
+	// rolled-back boot write would leave a hole in the counter sequence and
+	// force the snapshot file's rejection for no reason
+	// (observeAbandoned's own doc, bootgap.go).
+	e.bootGap.observeAbandoned(scope)
+
 	if e.settleWatermarkFailure(scope) {
 		e.cfg.Log.DebugContext(ctx, "bloodtrail: watermark failure settled by a write that produced no effect; rebuild requested to restore trust")
 		e.startFallbackRebuild()

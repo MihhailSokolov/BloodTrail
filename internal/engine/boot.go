@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -88,6 +89,17 @@ func (e *Engine) Start(ctx context.Context) {
 	if !e.cfg.Enabled {
 		return
 	}
+
+	// Arm the boot gap buffer before the boot-load goroutine below could
+	// possibly race a write into Apply: from here until the file attempt
+	// concludes (runBootLoad) or any View is adopted, every committed
+	// write's ChangeSet is buffered so the snapshot file can be adopted
+	// despite it (bootgap.go). Only worth arming when there is a file that
+	// could ever benefit.
+	if e.cfg.SnapshotDir != "" {
+		e.bootGap.activate()
+	}
+
 	if !e.claimRebuildLoop() {
 		// Lost the race for the single rebuild-loop gate to a write that
 		// already tripped enterFallback (see this method's own doc) -- that
@@ -189,9 +201,10 @@ func (e *Engine) Stop() {
 // loop's own adopted-rebuild exits return before ever reaching another
 // attempt, so this guard is only about adoptions from OUTSIDE this loop; it
 // is a cheap, explicit statement of an invariant rather than a race to win,
-// since adoptRebuiltView's epoch check and snapshotFileTrustedAtBoot's
-// watermark equality both independently refuse a file that would lose a
-// write.
+// since adoptSnapshotFileView re-checks it under applyMu and independently
+// refuses a file whose watermark gap its buffered writes cannot cover
+// (bootGapCovered), so a file that would lose a write is refused either
+// way.
 //
 // A successful, adopted file load hands off to finishFallbackRebuild exactly
 // as an adopted pg rebuild would, and returns without rebuildOnce ever being
@@ -228,6 +241,12 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 					e.finishFallbackRebuild()
 					return
 				}
+				// The one file attempt is spent: nothing can ever consume
+				// the boot gap buffer now (adoption through the pg rebuild
+				// path reads post-write state and needs no replay), so stop
+				// paying for it. Idempotent when the attempt already
+				// consumed the buffer itself (adoptSnapshotFileView's take).
+				e.bootGap.deactivate()
 			}
 
 			var adopted bool
@@ -346,8 +365,9 @@ const snapshotTempFilePattern = ".snapshot-*.tmp"
 // could possibly attempt a write of its own -- which is what makes this
 // safe under this feature's existing single-writer assumption (at most one
 // BloodTrail process owns a given SnapshotDir at a time -- the same
-// assumption snapshotFileTrustedAtBoot's watermark-equality trust already
-// depends on: one BloodHound container, one bind-mounted directory). Under
+// assumption adoptSnapshotFileView's watermark-gap trust (bootGapCovered)
+// already depends on: one BloodHound container, one bind-mounted
+// directory). Under
 // that assumption, sweeping HERE -- and only here -- is provably safe: by
 // construction this process has not attempted a single write of its own
 // yet, so every matching temp file already in the directory can only be a
@@ -391,51 +411,6 @@ func (e *Engine) sweepStaleSnapshotTempFiles() {
 	}
 }
 
-// snapshotFileTrustedAtBoot reports whether a snapshot file whose embedded
-// watermark is fileWatermark may be trusted at boot, given PostgreSQL's
-// current watermark counter pgWatermark: exactly fileWatermark ==
-// pgWatermark. Extracted as a pure function so this one-line decision has
-// a direct unit test, mirroring watermarkTrustedFor's identical treatment
-// (watermark.go).
-//
-// This is deliberately NOT WatermarkTrusted (watermark.go), and cannot be:
-// that predicate requires this engine's own appliedWatermark bookkeeping to
-// equal pg's counter, but a freshly constructed Engine starts with
-// appliedWatermark == 0 regardless of what pg's counter actually is -- it
-// has applied nothing yet, in memory or otherwise -- so watermarkConverged
-// would read false for almost any real, previously-running database's
-// nonzero counter, at exactly the moment (boot) a file is most useful to
-// trust. WatermarkTrusted's generation pair (dirtyGen == resolvedGen) is
-// equally beside the point here: both are legitimately zero at boot
-// regardless of the file's own trustworthiness, since nothing has had a
-// chance to fail yet.
-//
-// The boot question is narrower than WatermarkTrusted's, and answerable
-// without any of that bookkeeping. SaveSnapshot (persist.go) only ever
-// writes a file while stamping it with the exact pg watermark counter that
-// was true, live, at the moment it decided to proceed -- so the file's own
-// counter is, by construction, PostgreSQL's committed counter as of some
-// past instant. If pg's counter right now is still that same value, then
-// no mutating write has committed since: BumpWatermark's UPDATE is the
-// only thing that ever advances the counter, and every mutating write
-// bumps it eagerly, before its own effect ever reaches PostgreSQL
-// (watermark.go's own doc) -- so an unchanged counter proves an empty set
-// of writes landed in between, and the file's contents are therefore
-// exactly PostgreSQL's current committed state for this graph.
-//
-// The comparison is plain equality, not "file <= pg", deliberately: a file
-// behind pg's counter is missing at least one committed write and must
-// never be trusted (this whole feature exists to make that refusal
-// automatic), and a file AHEAD of pg's counter should never happen at all
-// (the counter only advances), so treating that case as anything other
-// than "something is wrong, don't trust it" would be guessing rather than
-// reasoning from evidence. Equality is also exactly what NEVER trusting on
-// a mismatch requires: there is no direction in which this check is
-// lenient.
-func snapshotFileTrustedAtBoot(fileWatermark, pgWatermark uint64) bool {
-	return fileWatermark == pgWatermark
-}
-
 // tryLoadSnapshotFile makes one attempt to boot this engine straight from
 // its own snapshot file (snapshotFilePath) instead of PostgreSQL, reporting
 // whether it actually adopted one. Called once per successful boot, from
@@ -447,12 +422,16 @@ func snapshotFileTrustedAtBoot(fileWatermark, pgWatermark uint64) bool {
 // here simply falls through to the retry loop that already exists for the pg
 // path.
 //
-// epoch and settledGen are read BEFORE ReadSnapshotFile even opens the
-// file, mirroring rebuildOnce's identical ordering and for the identical
-// reason (that method's own doc): an unchanged applyEpoch at adoption time
-// proves no write was applied while this load ran, so the file's contents
-// (had they been trusted) cannot be missing one, and settledGen is the
-// watermark trust generation this adoption is entitled to resolve.
+// settledGen is read BEFORE ReadSnapshotFile even opens the file, mirroring
+// rebuildOnce's identical ordering and for the identical reason (that
+// method's own doc): it is the watermark trust generation this adoption is
+// entitled to resolve. There is no applyEpoch read to pair it with anymore:
+// a write applied while the file loads is no longer a reason to reject it --
+// the boot gap buffer captured it, and adoptSnapshotFileView replays it --
+// so the epoch check's job is done instead by that adoption's own
+// counter-coverage proof (bootGapCovered) plus its settledDirtyGen re-check
+// under applyMu, which together refuse exactly the writes the replay cannot
+// account for.
 //
 // Every rejection is logged at Info as "bloodtrail: snapshot file
 // rejected" -- an e2e/observability grep target -- naming why, with one
@@ -464,24 +443,23 @@ func snapshotFileTrustedAtBoot(fileWatermark, pgWatermark uint64) bool {
 // returns false and lets the caller fall back to PostgreSQL -- there is no
 // path from a rejected file to a "trust it anyway" outcome.
 //
-// Adoption goes through adoptRebuiltView, the exact same publish path
-// rebuildOnce itself uses -- reused rather than duplicated so a
-// file-sourced snapshot is subject to the identical epoch check, the
-// identical stateFallback-clearing behavior, and (via the memory-limit
-// check just before it) the identical cfg.MemoryLimit budget a pg-sourced
-// one is. An over-limit file is refused exactly like an over-limit
-// pg-loaded snapshot (rebuildOnce's own doc): the file is not adopted, and
-// the caller falls through to the pg rebuild loop, whose own budget
-// backoff (fallbackRetryDelay) takes over from there -- there is
-// deliberately no separate over-limit retry schedule for the file path
-// itself.
+// Adoption goes through adoptSnapshotFileView (below), which publishes
+// under the same applyMu serialization adoptRebuiltView does and applies
+// the identical cfg.MemoryLimit budget to the view it actually publishes
+// (base plus replayed segments). The base snapshot's own over-limit check
+// still runs here first, before any lock is taken: a file that is too big
+// on its own cannot become smaller by replaying writes onto it, and
+// refusing it early keeps the applyMu hold time for genuine candidates
+// only. An over-limit file is refused exactly like an over-limit pg-loaded
+// snapshot (rebuildOnce's own doc): the caller falls through to the pg
+// rebuild loop, whose own budget backoff (fallbackRetryDelay) takes over
+// from there.
 func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 	path, ok := e.snapshotFilePath()
 	if !ok {
 		return false
 	}
 
-	epoch := e.applyEpoch.Load()
 	settledGen := e.settledDirtyGen.Load()
 
 	snap, fileWatermark, err := snapshot.ReadSnapshotFile(path)
@@ -497,26 +475,6 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 		return false
 	}
 
-	pgWatermark, err := e.ReadWatermark(ctx)
-	if err != nil {
-		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
-			slog.String("path", path),
-			slog.String("reason", "read pg watermark failed"),
-			slog.Any("error", err),
-		)
-		return false
-	}
-
-	if !snapshotFileTrustedAtBoot(fileWatermark, pgWatermark) {
-		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
-			slog.String("path", path),
-			slog.String("reason", "watermark mismatch"),
-			slog.Uint64("file_watermark", fileWatermark),
-			slog.Uint64("pg_watermark", pgWatermark),
-		)
-		return false
-	}
-
 	approxBytes := snap.ApproxBytes()
 	if e.cfg.MemoryLimit > 0 && approxBytes > uint64(e.cfg.MemoryLimit) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
@@ -528,11 +486,8 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 		return false
 	}
 
-	if !e.adoptRebuiltView(ctx, snapshot.NewView(snap), epoch, settledGen) {
-		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
-			slog.String("path", path),
-			slog.String("reason", "a write was applied while the file was loading"),
-		)
+	replayed, adopted := e.adoptSnapshotFileView(ctx, path, snap, fileWatermark, settledGen)
+	if !adopted {
 		return false
 	}
 
@@ -541,6 +496,147 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 		slog.Uint64("watermark", fileWatermark),
 		slog.Int("nodes", snap.NodeCount()),
 		slog.Int("edges", snap.EdgeCount()),
+		slog.Int("replayed_writes", replayed),
 	)
 	return true
+}
+
+// adoptSnapshotFileView is the snapshot-file boot's publish step: it
+// decides, under applyMu, whether the file-loaded snapshot plus a replay of
+// the boot gap buffer's writes reproduces PostgreSQL's current state, and
+// publishes the combined View if so. Reports how many buffered writes it
+// replayed, and whether it adopted at all; every rejection logs its own
+// "bloodtrail: snapshot file rejected" line naming why, so the caller has
+// nothing left to log on the false path.
+//
+// The proof it demands, all of it evaluated under applyMu so no Apply can
+// move anything mid-decision:
+//
+//   - No View was adopted while the file was loading (a concurrent manual
+//     RebuildNow, say) -- publishing an older file over one would lose
+//     whatever that adoption contained.
+//   - The engine is still stateServing: a write that tripped fallback
+//     during the load could not be replayed then and cannot be now.
+//   - settledDirtyGen has not moved since the pre-load read: a watermark
+//     failure that settled mid-load belongs to a write whose bump never
+//     produced a counter, which the coverage check below is therefore
+//     blind to -- rejecting is the only sound answer, exactly as the
+//     retired epoch check would have. (Apply-side settles cannot race this
+//     -- Apply holds applyMu -- and a ResolveAbandonedWrite settle slipping
+//     in after this check changed nothing in PostgreSQL, so the file is
+//     still faithful; its trust generation stays unresolved until
+//     finishFallbackRebuild's recheck relaunches a rebuild for it, the
+//     same handling that race already has everywhere else.)
+//   - bootGapCovered: pg's current counter, read live inside the lock (one
+//     single-row SELECT -- precedent: Apply's own read-back round trip
+//     already runs under applyMu), is exactly the file's counter plus the
+//     buffered writes' own bumps, with no hole and nothing the buffer
+//     could not faithfully replay (a poisoned buffer rejects first).
+//
+// The replay itself is Apply's own machinery, reused verbatim per buffered
+// write -- readBack for pg's post-commit truth on every key the ChangeSet
+// names, buildApplySegment, WithSegment -- onto an UNPUBLISHED view, in
+// ascending counter order, with nothing stored until every segment landed:
+// a reader either sees no snapshot at all (declining to pg, exactly as it
+// did all boot) or the fully replayed result, never a half-replayed file.
+// Read-backs running here rather than at each write's own commit change
+// nothing: read-back always returns pg's current committed truth for a
+// key, so a later write to the same key simply means both replays stage
+// that same final truth (and that write's own delta lands on top once
+// applyMu releases, exactly as it would against any published View).
+//
+// cfg.MemoryLimit is applied to the view actually being published --
+// base plus replay segments -- mirroring Apply's identical check on the
+// view IT publishes; maintainAfterPublish then runs for the same reason
+// Apply runs it (a replay-heavy adoption can arrive with an overgrown
+// segment stack, and the compaction trigger owns that judgment).
+//
+// resolvedDirtyGen advances to the pre-load settledGen exactly as
+// adoptRebuiltView's identical line does, and for the identical reason
+// (its own doc): the settledDirtyGen re-check above proves no failure
+// settled between that read and this publish, so every failure counted in
+// settledGen belongs to a write whose committed rows are either in the
+// file or in the replay.
+func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *snapshot.Snapshot, fileWatermark, settledGen uint64) (replayed int, adopted bool) {
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
+	reject := func(reason string, attrs ...any) {
+		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
+			append([]any{slog.String("path", path), slog.String("reason", reason)}, attrs...)...)
+	}
+
+	if e.snap.Load() != nil {
+		reject("a view was already adopted while the file was loading")
+		return 0, false
+	}
+	if e.state.Load() != stateServing {
+		reject("the engine entered fallback while the file was loading")
+		return 0, false
+	}
+	if e.settledDirtyGen.Load() != settledGen {
+		reject("a watermark failure settled while the file was loading")
+		return 0, false
+	}
+
+	pgWatermark, err := e.ReadWatermark(ctx)
+	if err != nil {
+		reject("read pg watermark failed", slog.Any("error", err))
+		return 0, false
+	}
+
+	entries, poisoned := e.bootGap.take()
+	if poisoned != "" {
+		reject("boot write buffer poisoned: " + poisoned)
+		return 0, false
+	}
+
+	counters := make([]uint64, len(entries))
+	for i, entry := range entries {
+		counters[i] = entry.counter
+	}
+	if !bootGapCovered(fileWatermark, pgWatermark, counters) {
+		reject("boot gap not covered by buffered writes",
+			slog.Uint64("file_watermark", fileWatermark),
+			slog.Uint64("pg_watermark", pgWatermark),
+			slog.Int("buffered_writes", len(entries)),
+		)
+		return 0, false
+	}
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].counter < entries[j].counter })
+
+	view := snapshot.NewView(snap)
+	for _, entry := range entries {
+		if entry.cs == nil {
+			continue
+		}
+		rb, err := e.readBack(ctx, entry.cs)
+		if err != nil {
+			reject("boot write replay failed", slog.Any("error", err))
+			return 0, false
+		}
+		seg, err := buildApplySegment(view, rb, entry.cs)
+		if err != nil {
+			reject("boot write replay failed", slog.Any("error", err))
+			return 0, false
+		}
+		view = view.WithSegment(seg)
+		replayed++
+	}
+
+	if e.cfg.MemoryLimit > 0 {
+		if viewBytes := view.ApproxBytes(); viewBytes > uint64(e.cfg.MemoryLimit) {
+			reject("exceeds memory limit",
+				slog.Uint64("bytes", viewBytes),
+				slog.Uint64("limit", uint64(e.cfg.MemoryLimit)),
+			)
+			return 0, false
+		}
+	}
+
+	e.snap.Store(view)
+	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
+	e.maintainAfterPublish(ctx, view)
+	return replayed, true
 }

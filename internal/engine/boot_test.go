@@ -107,12 +107,12 @@ func TestDefaultGraphResolvedIsNilSafe(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// Snapshot-file boot load. The two tests below pin the pure,
-// database-free pieces (snapshotFilePath's disabled short-circuit,
-// snapshotFileTrustedAtBoot's own predicate); the full read-compare-adopt
-// sequence (tryLoadSnapshotFile) is exercised end to end, against a live
-// PostgreSQL watermark table and real snapshot files, by
-// file_boot_integration_test.go.
+// Snapshot-file boot load. The test below pins snapshotFilePath's disabled
+// short-circuit; the trust predicate's own pure tests live in
+// bootgap_test.go (bootGapCovered), and the full read-compare-adopt
+// sequence (tryLoadSnapshotFile/adoptSnapshotFileView) is exercised end to
+// end, against a live PostgreSQL watermark table and real snapshot files,
+// by file_boot_integration_test.go.
 // -----------------------------------------------------------------------
 
 // TestSnapshotFilePathDisabledWhenDirEmpty pins the order snapshotFilePath
@@ -127,31 +127,6 @@ func TestSnapshotFilePathDisabledWhenDirEmpty(t *testing.T) {
 
 	if path, ok := e.snapshotFilePath(); ok || path != "" {
 		t.Fatalf("snapshotFilePath() = (%q, %v) with SnapshotDir empty, want (\"\", false)", path, ok)
-	}
-}
-
-// TestSnapshotFileTrustedAtBootRequiresExactMatch pins
-// snapshotFileTrustedAtBoot's own predicate: trust requires the file's
-// embedded watermark to equal PostgreSQL's current counter exactly --
-// never merely "not behind" (a file somehow ahead of pg, which should
-// never happen in practice, is refused exactly as a file behind it is).
-func TestSnapshotFileTrustedAtBootRequiresExactMatch(t *testing.T) {
-	cases := []struct {
-		name     string
-		file, pg uint64
-		want     bool
-	}{
-		{"exact match, zero", 0, 0, true},
-		{"exact match, nonzero", 42, 42, true},
-		{"file behind pg (a write landed after the file was saved)", 41, 42, false},
-		{"file ahead of pg (should never happen; refused all the same)", 43, 42, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := snapshotFileTrustedAtBoot(tc.file, tc.pg); got != tc.want {
-				t.Fatalf("snapshotFileTrustedAtBoot(%d, %d) = %v, want %v", tc.file, tc.pg, got, tc.want)
-			}
-		})
 	}
 }
 

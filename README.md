@@ -53,13 +53,14 @@ arrays, and a single CPU core sweeps every edge in under a second. See
   the replica is stale for a write it has already told the caller succeeded. See
   [Write-through](#write-through) for exactly which writes this covers and what happens
   to the rare ones it doesn't.
-- A snapshot file (`BLOODTRAIL_SNAPSHOT_DIR`) lets a restart skip PostgreSQL when nothing
-  wrote to the graph in between: the current replica is written to disk, stamped with a
-  watermark counter, on a clean shutdown and after every background compaction; the next
-  boot loads it only if that stamp still matches PostgreSQL's own counter exactly, and
-  falls back to a normal PostgreSQL rebuild otherwise. Any write landing during the boot
-  itself legitimately supersedes the file, so this is a best-effort saving, not a
-  guaranteed one -- see [Write-through](#write-through) for when it actually applies.
+- A snapshot file (`BLOODTRAIL_SNAPSHOT_DIR`) lets a restart skip the PostgreSQL rebuild:
+  the current replica is written to disk, stamped with a watermark counter, on a clean
+  shutdown and after every background compaction; the next boot loads it, replays onto it
+  whatever recognized writes landed while it was loading (BloodHound writes to the graph
+  on every boot, so this replay is what makes the file usable at all in practice), and
+  proves via the watermark counters that nothing else got in between -- falling back to a
+  normal PostgreSQL rebuild whenever that proof fails, e.g. after a crash or an
+  unrecognizable boot-time write. See [Write-through](#write-through) for details.
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
@@ -127,9 +128,10 @@ caller has already been told committed.
     the applier cannot find the row it just created.
   - `Batch.UpdateNodeBy` whose `IdentityProperties` is anything other than exactly
     `["objectid"]` (or whose node carries no string value under that key).
-  - `Batch.UpdateRelationshipBy` where *either* endpoint fails that same check -- the
-    upsert this mirrors writes both endpoint nodes and the relationship in one
-    statement, so the edge triple is only sound to record when both endpoints resolve.
+  - `Batch.UpdateRelationshipBy` where *either* endpoint fails that same check, or the
+    update carries no relationship at all -- the upsert this mirrors writes both
+    endpoint nodes and the relationship in one statement, so the edge triple is only
+    sound to record when both endpoints resolve and there is a relationship to key it.
 
   The first six are rare in an ordinary BloodHound deployment -- admin actions, not
   anything ingest or analysis routinely does. **The last three are not.** They are
@@ -172,44 +174,39 @@ caller has already been told committed.
   provably complete for every write up to N, because the counter cannot have advanced
   without a write whose effect the file's own build would then be missing.
 - **Snapshot file.** Set `BLOODTRAIL_SNAPSHOT_DIR` to let a restart skip the PostgreSQL
-  rebuild when nothing wrote to the graph in between (see the promise this does and does
-  not make, below). The engine writes a versioned binary snapshot of its in-memory state,
-  stamped with the watermark counter that was live at that instant, at two points: on a
-  graceful shutdown, and after every background compaction (next). At boot, it loads
-  that file only if its stamped counter is *exactly* equal to PostgreSQL's counter at
-  that moment -- ahead or behind either one, the file is rejected and the engine falls
-  back to a normal PostgreSQL rebuild. Equality, not "close enough," is deliberate: any
-  write that landed between the file being written and the process starting again makes
-  the file wrong, not merely stale, and there is no safe way to patch it up short of
-  rebuilding. (A freshly started process needs one thing before either load can even be
-  attempted: which graph is the default one, which only resolves once the caller makes
-  its own `AssertSchema` call -- unavoidable, since the driver's `Open` call has to
-  return that same caller its driver handle before it can call anything on it at all.
-  Every ordinary boot briefly waits out that one call, logged at Debug
-  (`bloodtrail: boot load waiting for the default graph`) since it is expected on every
-  startup, not a fault; a caller that never makes that call at all is a broken
-  integration -- one with no default graph to query at all, not a supported deployment
-  shape -- so this stays a Debug-level detail rather than an operator-facing warning.)
+  rebuild. The engine writes a versioned binary snapshot of its in-memory state, stamped
+  with the watermark counter that was live at that instant, at two points: on a graceful
+  shutdown, and after every background compaction (next). At boot, it loads that file
+  and adopts it when the watermark counters prove nothing is missing: every write that
+  lands while no replica exists yet is buffered (its counter and the keys it touched),
+  and the file is adopted exactly when the file's stamped counter plus those buffered
+  writes' own counters account for PostgreSQL's counter with no hole -- the buffered
+  writes are then replayed onto the loaded snapshot, through the same read-back
+  machinery ordinary write-through uses, before the result is published as one view. A
+  quiet restart is the degenerate case (no buffered writes, counters exactly equal).
+  This buffering is what makes the file useful in practice at all: BloodHound queues a
+  full analysis request at startup unconditionally and runs its data-pipe daemon with no
+  start delay, so AD post-processing writes land within milliseconds of the API coming
+  up on *every* boot -- against a multi-second file load at large scale, an
+  equality-only check would lose that race essentially always. (A freshly started
+  process needs one thing before the load can even be attempted: which graph is the
+  default one, which only resolves once the caller makes its own `AssertSchema` call --
+  unavoidable, since the driver's `Open` call has to return that same caller its driver
+  handle before it can call anything on it at all. Every ordinary boot briefly waits out
+  that one call, logged at Debug (`bloodtrail: boot load waiting for the default
+  graph`) since it is expected on every startup, not a fault.)
 
-  **What this does and does not promise.** The file is written reliably; whether a boot
-  gets to *use* it is not something BloodTrail controls. The load can only start after
-  that `AssertSchema` call resolves the default graph, and BloodHound starts writing to
-  the graph very shortly afterwards on every boot -- it queues a full analysis request
-  at startup unconditionally and runs its data-pipe daemon with no start delay, so AD
-  post-processing writes land within milliseconds of the API coming up, with no new
-  ingest and nothing to do. Whichever of the two gets there first decides the outcome:
-  the file is adopted, or a boot-time write supersedes it and the engine rebuilds from
-  PostgreSQL as it always did. Both are correct, and a caller cannot tell them apart --
-  serving is identical either way, and correctness never depends on which happened.
-  Practically, expect the saving on a graph small enough that the load finishes inside
-  that window, and expect it to be lost as the graph grows: a load measured in seconds
-  at multi-million-node scale is very unlikely to beat a write measured in
-  milliseconds. Treat the file as an optimization that sometimes applies, not as the
-  reason a restart is fast. The rejection is logged at Info with a `reason` --
-  `a write was applied while the file was loading` when the write landed after the boot
-  read PostgreSQL's counter, or `watermark mismatch` (with the counter ahead of the
-  file) when it landed before -- and is followed by an ordinary
-  `snapshot rebuilt` line.
+  **When the file is still rejected.** Adoption is a proof, not a hope, and every way
+  the proof can fail falls back to a normal PostgreSQL rebuild -- always correct, just
+  slower, and a caller cannot tell the outcomes apart. A counter the boot cannot
+  account for rejects the file (`boot gap not covered by buffered writes`): a write
+  from a previous process's crash window, or any writer this process never observed. A
+  boot-time write whose effect cannot be expressed as a replay -- raw Cypher, a wipe,
+  the same closed list ordinary write-through falls back on -- trips fallback and
+  rejects the file too, as does a buffer that outgrew its caps (1024 writes / 262,144
+  keys) under a genuinely heavy boot. Each rejection is logged at Info with a `reason`
+  and is followed by an ordinary `snapshot rebuilt` line; an adoption logs
+  `snapshot file loaded` with a `replayed_writes` count.
 - **Compaction.** Every applied write layers one more delta on top of the engine's base
   snapshot; past a size threshold (`BLOODTRAIL_COMPACT_ENTRIES`/`BLOODTRAIL_COMPACT_BYTES`,
   see Configuration below), a background compaction folds the base and every delta into

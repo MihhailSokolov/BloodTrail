@@ -17,9 +17,11 @@ import (
 // file (snapshotFilePath, boot.go), stamped with the pg watermark counter
 // that was live and converged at the moment this call decided to proceed.
 // A later boot's tryLoadSnapshotFile compares that stamped counter against
-// pg's own counter at boot time, and trusts the file only on an exact
-// match (snapshotFileTrustedAtBoot) -- so this is the write side of the
-// same watermark-gated contract boot.go enforces on the read side.
+// pg's own counter at boot time, and trusts the file only when the gap
+// between the two is exactly covered by that boot's own buffered writes
+// (adoptSnapshotFileView's bootGapCovered check; a quiet boot's empty gap
+// is the degenerate cover) -- so this is the write side of the same
+// watermark-gated contract boot.go enforces on the read side.
 //
 // This is the shutdown caller's entry point: Driver.Close calls this,
 // best-effort, strictly AFTER engine.Stop() has already run, while the pg
@@ -132,9 +134,8 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // View (before the Apply's Store), then sample a watermark that has already
 // resolved past the Apply's write (converged, pgCounter == C+1) -- folding
 // stale data and stamping it with a counter that promises it is not stale.
-// A later boot (snapshotFileTrustedAtBoot, boot.go) would then trust that
-// file on an exact-match basis and silently serve a replica missing the
-// write.
+// A later boot (adoptSnapshotFileView's empty-gap case, boot.go) would
+// then trust that file and silently serve a replica missing the write.
 //
 // The fix mirrors adoptRebuiltView's own proof (engine.go), applied to the
 // opposite direction: rebuildOnce samples epoch/settledGen BEFORE its load
@@ -213,8 +214,10 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // mutually consistent (the data folded is exactly what pgCounter described
 // when this call verified it), and the racing Apply's own AdvanceWatermark
 // moves pg's watermark counter PAST pgCounter -- so the file this call is
-// about to write will be REJECTED by the very next boot's exact-match check
-// (snapshotFileTrustedAtBoot), never trusted as complete when it is not.
+// about to write will be REJECTED by the very next boot's watermark-gap
+// check (bootGapCovered): the racing write's counter belongs to THIS
+// process, so no later boot's own buffer can ever account for it, and the
+// gap can never be covered -- never trusted as complete when it is not.
 // Rejecting a file is always safe (boot.go's own fallback is a genuine
 // PostgreSQL rebuild); silently trusting a wrong one is the only outcome
 // this whole feature exists to rule out.
@@ -387,7 +390,7 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 // with a watermark that a later boot's tryLoadSnapshotFile would consider
 // a perfect match and load without question: exactly the wrong-trust
 // outcome this whole feature exists to make impossible on the read side
-// (snapshotFileTrustedAtBoot's own doc), reintroduced from the write side
+// (bootGapCovered's own doc), reintroduced from the write side
 // instead. Keeping this check is what closes that: a shutdown caught mid-
 // fallback simply skips writing a file at all, leaving whatever file an
 // earlier, successful save already left behind (or no file at all)

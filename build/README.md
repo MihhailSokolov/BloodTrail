@@ -66,13 +66,15 @@ run against that same fixture, still installed, before rollback:
    with anything else a failure:
    - **adopted** -- `snapshot file loaded` with **no** new `snapshot rebuilt` line: proof the
      file itself, not a rebuild that happened to produce the same answer, is what the reboot
-     served from.
-   - **superseded** -- `snapshot file rejected` because a write landed during the reboot
-     (`reason` is `a write was applied while the file was loading`, or `watermark mismatch`
-     with PostgreSQL's counter ahead of the file's), followed by a successful rebuild.
-     BloodHound writes to the graph on every boot (it queues a full analysis request at
-     startup and runs the data-pipe daemon with no start delay), so this outcome is common
-     and correct -- the watermark protocol is refusing a file that is genuinely stale. See
+     served from. This is the expected outcome: BloodHound writes to the graph on every boot
+     (it queues a full analysis request at startup and runs the data-pipe daemon with no
+     start delay), and those writes are buffered during the file load and replayed onto it
+     (the marker's `replayed_writes` attribute counts them).
+   - **superseded** -- `snapshot file rejected` for a boot-time write the replay could not
+     account for (`reason` is `boot gap not covered by buffered writes` with PostgreSQL's
+     counter ahead of the file's, or `the engine entered fallback while the file was
+     loading` for a fallback-shaped write), followed by a successful rebuild. Rare but
+     correct -- the watermark protocol is refusing a file it cannot prove complete. See
      the snapshot-file section of the top-level [README](../README.md#write-through).
 
    Either way the boot must have read the file this phase's own shutdown wrote (compared by
@@ -96,8 +98,8 @@ regardless.
 | `fallback entered` / `fallback exited` | Warn / Info | A write could not be replayed narrowly; every query declines to PostgreSQL until the recovery rebuild below adopts a fresh snapshot. |
 | `snapshot rebuilt` | Info | A full PostgreSQL rebuild ran and was adopted -- `trigger` names why: `startup` (the one-shot boot load), `fallback` (recovery from the line above), or `manual`. |
 | `snapshot file written` | Info | The current replica was folded and written to `BLOODTRAIL_SNAPSHOT_DIR` -- by a clean shutdown, or by a background compaction once it had adopted its result. |
-| `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL. |
-| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. Five distinct causes share this marker -- unreadable/corrupt/wrong-version, a failed PostgreSQL watermark read, a watermark mismatch, an over-`BLOODTRAIL_MEMORY_LIMIT` size, and a write racing the load -- distinguished by a `reason` attribute on all but the first, which carries `error` instead. The last two are the ordinary outcome of a write landing during the boot (BloodHound's startup analysis produces one on every boot) and are not a fault: the file is genuinely stale and the rebuild that follows is correct. |
+| `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL, after replaying `replayed_writes` boot-time writes onto it (0 on a quiet restart). |
+| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. The causes sharing this marker -- unreadable/corrupt/wrong-version, a failed PostgreSQL watermark read, an over-`BLOODTRAIL_MEMORY_LIMIT` size, a watermark gap the boot's own buffered writes could not cover, a fallback-shaped boot-time write, a poisoned or overflowed boot-write buffer, and a replay failure -- are distinguished by a `reason` attribute on all but the first, which carries `error` instead. The gap and fallback shapes are the legitimate outcome of boot-time writes the replay cannot account for, not a fault: the file cannot be proven complete and the rebuild that follows is correct. |
 | `no snapshot file` | Debug | Boot found `BLOODTRAIL_SNAPSHOT_DIR` set but no file there yet (the ordinary first-ever boot against a given directory). The feature being disabled outright (`BLOODTRAIL_SNAPSHOT_DIR` unset) logs nothing here at all -- boot returns from the check before it would ever log. |
 | `compaction finished` | Info | A background compaction folded the write-through delta back into the base snapshot. |
 | `path engine served` / `builder engine served` / `cypher engine served` | Info / Debug / Debug | The in-memory engine, not PostgreSQL, answered a shortest-path, structural (node/relationship), or Cypher query respectively. |

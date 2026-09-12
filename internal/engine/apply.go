@@ -79,7 +79,10 @@ const (
 //     never serves), an engine already in fallback (whose pending rebuild
 //     reads post-write state anyway), or an engine with no snapshot adopted
 //     yet (the boot-load rebuild will read post-write state anyway, for the
-//     same reason).
+//     same reason -- and when the boot is instead trying its snapshot FILE,
+//     the boot gap buffer has already recorded this scope, right after the
+//     watermark bookkeeping, so the file can be adopted despite this write
+//     by replaying it: bootgap.go, adoptSnapshotFileView).
 //  3. A nil scope, or a ChangeSet carrying a fallback record, means this
 //     write's effect cannot be expressed as a delta at all: enterFallback,
 //     which is the honest answer rather than a guess.
@@ -140,6 +143,14 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 	settledFailure := e.settleWatermarkFailure(scope)
 
 	e.applyEpoch.Add(1)
+
+	// Recorded before ANY of the early returns below, so a bumped write
+	// whose ChangeSet is empty -- dropped at the cs.Empty() branch -- still
+	// gets its counter accounted, and a write the buffer cannot faithfully
+	// replay poisons it (observe's own doc). A no-op past one atomic load
+	// whenever the buffer is not armed, which is everywhere outside the
+	// boot file-attempt window.
+	e.bootGap.observe(scope)
 
 	if settledFailure {
 		// Belt and braces. The write carrying a failed bump also carries the

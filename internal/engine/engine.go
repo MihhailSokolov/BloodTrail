@@ -108,6 +108,15 @@ type Engine struct {
 	// therefore that the freshly loaded snapshot cannot be missing one.
 	applyEpoch atomic.Uint64
 
+	// bootGap buffers the writes that arrive while no View exists yet, so
+	// the boot's snapshot-file attempt can adopt the file despite them by
+	// replaying their ChangeSets onto it (bootgap.go,
+	// adoptSnapshotFileView). Armed by Start when the snapshot-file feature
+	// is on, disarmed the moment it can no longer matter -- the file
+	// attempt concluding, or any View being adopted -- after which every
+	// Apply pays one atomic load here and nothing more.
+	bootGap bootGapBuffer
+
 	// fallbackRebuilding is set while EITHER of the engine's two
 	// retry-until-adopted rebuild loops -- Start's boot-load goroutine
 	// (runBootLoad, boot.go) or the fallback recovery goroutine
@@ -524,6 +533,12 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 	}
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
+
+	// A pg-loaded snapshot read post-write state, so whatever the boot gap
+	// buffer was still holding is already in this view -- disarm it rather
+	// than let it accumulate until the file attempt gets around to
+	// concluding (bootgap.go's deactivate doc).
+	e.bootGap.deactivate()
 
 	if e.state.CompareAndSwap(stateFallback, stateServing) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: fallback exited")

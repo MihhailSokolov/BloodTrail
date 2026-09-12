@@ -286,6 +286,17 @@ func (c *ChangeSet) Empty() bool {
 		len(c.fallbacks) == 0
 }
 
+// keyCount is the number of distinct keys and criteria c has recorded --
+// the boot gap buffer's unit for its total-size cap (bootgap.go). Counted
+// straight off the map lengths rather than through the sorted accessor
+// slices, so it allocates nothing.
+func (c *ChangeSet) keyCount() int {
+	return len(c.nodeIDs) + len(c.nodeObjectIDs) +
+		len(c.edgeIDs) +
+		len(c.edgeTriples) + len(c.edgeTriplesOID) +
+		len(c.nodeKindDeletes) + len(c.edgeKindDeletes)
+}
+
 // HasFallback reports whether RecordFallback has ever been called on c,
 // alongside every distinct reason recorded, in sorted order. ok is false,
 // and reasons is nil, when RecordFallback has never been called.

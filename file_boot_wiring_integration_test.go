@@ -134,8 +134,9 @@ func openProductionOrdered(t *testing.T, ctx context.Context, dsn string, pool *
 // lifecycle -- open, assert schema, write a node, Close -- so that Close's
 // own SaveSnapshot leaves behind a real snapshot file stamped with
 // PostgreSQL's current watermark counter. Nothing writes after it returns,
-// so that file's watermark still equals PostgreSQL's, which is exactly the
-// condition snapshotFileTrustedAtBoot (internal/engine/boot.go) requires.
+// so that file's watermark still equals PostgreSQL's -- the empty-gap case
+// of the coverage condition adoptSnapshotFileView requires (bootGapCovered,
+// internal/engine/bootgap.go).
 //
 // Returns the written file's path, having already failed the test if no file
 // was produced: a seeding failure must never be mistaken for the boot-side
