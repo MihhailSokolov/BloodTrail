@@ -115,6 +115,32 @@ func snapshotFilePathFor(t *testing.T, pgDriver *pg.Driver, dir string) string {
 	return filepath.Join(dir, fmt.Sprintf("graph-%d.btsnap", graphModel.ID))
 }
 
+// waitForBootMarker blocks until buf's captured log contains marker, as a
+// companion to waitForFresh, not a replacement. The two observe different
+// instants: Fresh() flips true inside the adoption's own applyMu critical
+// section, while the "snapshot file loaded" line a test goes on to assert
+// is printed by tryLoadSnapshotFile only after that adoption returns -- so
+// a test that reads the buffer the moment Fresh() flips can see a served
+// engine and a still-missing marker in the same breath. CI measured
+// exactly that once, in this file's own default-graph test (its failure
+// dump shows no rebuild and no rejection: the file was genuinely adopted,
+// its line simply not yet printed). The root package's wiring tests carry
+// the identical wait (waitForFileAttemptOutcome) for the identical reason.
+func waitForBootMarker(t *testing.T, buf *lockedBuffer, marker string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if strings.Contains(buf.String(), marker) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("boot never logged %q within 5s of serving:\n%s", marker, buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // newLogCapturingEngine builds an *Engine wired to dir, over pgDriver/pool,
 // whose log output is captured into the returned *lockedBuffer (defined in
 // engine_integration_test.go, this package's own log-capture helper) at
@@ -149,6 +175,7 @@ func TestFileBootLoadsMatchingWatermarkSnapshot(t *testing.T) {
 	defer engB.Stop()
 
 	waitForFresh(t, engB)
+	waitForBootMarker(t, buf, "bloodtrail: snapshot file loaded")
 
 	if got := engB.RebuildCount(); got != 0 {
 		t.Fatalf("RebuildCount = %d after booting from a matching-watermark snapshot file, want 0 (no pg rebuild should ever have run)", got)
@@ -162,11 +189,7 @@ func TestFileBootLoadsMatchingWatermarkSnapshot(t *testing.T) {
 		t.Fatalf("engine B's loaded snapshot is missing the node engine A wrote through and saved")
 	}
 
-	logged := buf.String()
-	if !strings.Contains(logged, "bloodtrail: snapshot file loaded") {
-		t.Fatalf("boot did not log \"snapshot file loaded\":\n%s", logged)
-	}
-	if strings.Contains(logged, "bloodtrail: snapshot file rejected") {
+	if logged := buf.String(); strings.Contains(logged, "bloodtrail: snapshot file rejected") {
 		t.Fatalf("boot logged \"snapshot file rejected\" for a matching-watermark file:\n%s", logged)
 	}
 }
@@ -225,6 +248,7 @@ func TestFileBootWaitsForTheDefaultGraphToResolve(t *testing.T) {
 	}
 
 	waitForFresh(t, engB)
+	waitForBootMarker(t, buf, "bloodtrail: snapshot file loaded")
 
 	if got := engB.RebuildCount(); got != 0 {
 		t.Fatalf("RebuildCount = %d after the deferred file attempt should have adopted, want 0 (no pg rebuild should ever have run)", got)
@@ -238,11 +262,7 @@ func TestFileBootWaitsForTheDefaultGraphToResolve(t *testing.T) {
 		t.Fatalf("engine B's loaded snapshot is missing the node engine A wrote through and saved")
 	}
 
-	logged := buf.String()
-	if !strings.Contains(logged, "bloodtrail: snapshot file loaded") {
-		t.Fatalf("boot did not log \"snapshot file loaded\" once the default graph resolved:\n%s", logged)
-	}
-	if strings.Contains(logged, "bloodtrail: boot load failed") {
+	if logged := buf.String(); strings.Contains(logged, "bloodtrail: boot load failed") {
 		t.Fatalf("boot load logged a failure while merely waiting for the default graph -- an ordinary startup wait is not an error:\n%s", logged)
 	}
 }
