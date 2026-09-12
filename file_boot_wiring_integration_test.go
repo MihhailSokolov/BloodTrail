@@ -54,6 +54,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/specterops/dawgs"
@@ -128,6 +129,34 @@ func openProductionOrdered(t *testing.T, ctx context.Context, dsn string, pool *
 	}
 
 	return d, bt
+}
+
+// waitForFileAttemptOutcome blocks until the boot's one-shot snapshot-file
+// attempt has ANNOUNCED its outcome -- the loaded or rejected marker moving
+// past its pre-open count -- as a companion to waitForBootLoad's Fresh()
+// poll, not a replacement. The two waits observe different instants:
+// Fresh() flips true inside the adoption's own applyMu critical section,
+// while the marker this file's tests go on to COUNT is printed by
+// tryLoadSnapshotFile only after that adoption returns. A test that
+// asserts marker counts the moment Fresh() flips can therefore observe a
+// served engine and a still-zero count in the same breath -- CI measured
+// exactly that once (a 0-count "never became reachable" failure for a file
+// that was genuinely adopted, with the loaded line simply not yet
+// printed). Waiting for the announcement itself is what makes the counts
+// assertable.
+func waitForFileAttemptOutcome(t *testing.T, buf *lockedBuffer, loadedBefore, rejectedBefore int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if markerCount(buf, snapshotFileLoadedMarker) > loadedBefore || markerCount(buf, snapshotFileRejectedMarker) > rejectedBefore {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the boot's snapshot-file attempt announced no outcome (neither %q nor %q) within 5s", snapshotFileLoadedMarker, snapshotFileRejectedMarker)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // seedSnapshotFileThroughRealClose drives one full production-shaped
@@ -216,6 +245,7 @@ func TestOpenLoadsSnapshotFileWithProductionAssertSchemaOrdering(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close(ctx) })
 
 	waitForBootLoad(t, d)
+	waitForFileAttemptOutcome(t, buf, loadedBefore, rejectedBefore)
 
 	if got := markerCount(buf, snapshotFileLoadedMarker) - loadedBefore; got != 1 {
 		t.Fatalf("%q fired %d time(s) booting with a valid matching-watermark file at %s, want exactly 1 -- the file attempt never became reachable through the production Open/AssertSchema ordering\ncaptured log:\n%s",
@@ -400,6 +430,7 @@ func TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext(t *testing.
 	d2, _ := openProductionOrdered(t, ctx, dsn, pool2)
 	t.Cleanup(func() { _ = d2.Close(ctx) })
 	waitForBootLoad(t, d2)
+	waitForFileAttemptOutcome(t, buf, loadedBefore, rejectedBefore)
 
 	if got := markerCount(buf, snapshotFileLoadedMarker) - loadedBefore; got != 1 {
 		t.Fatalf("%q fired %d time(s) booting against the file the cancelled-context shutdown wrote to %s, want exactly 1\ncaptured log:\n%s",
