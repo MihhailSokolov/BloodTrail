@@ -132,7 +132,7 @@ func deltaBytes(segs []*snapshot.Segment) uint64 {
 // the given compaction thresholds. Extracted as a pure function for direct
 // unit testing, mirroring this package's other pure-decision extractions
 // (saveSnapshotPreconditionsFor, fallbackRetryDelay, relaunchAfterAdoption,
-// bootGapCovered).
+// bootGapCoveredAt).
 //
 // Zero on either threshold means "no bound on that dimension" -- the same
 // convention Config.MemoryLimit already uses (apply.go's own
@@ -487,7 +487,7 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 // two overlapping writers can do to each other is decide, via whichever
 // rename lands last, which of two self-consistent, watermark-stamped files
 // survives -- never a corrupt one; the boot's watermark-gap check
-// (bootGapCovered, boot.go) tolerates either outcome the same way it
+// (bootGapCoveredAt, boot.go) tolerates either outcome the same way it
 // already tolerates a save that simply never ran this cycle.)
 func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment) {
 	defer e.compacting.Store(false)

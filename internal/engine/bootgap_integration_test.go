@@ -8,6 +8,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/specterops/dawgs/graph"
 
@@ -215,13 +216,22 @@ func TestFileBootReplaysAbandonedWriteCounter(t *testing.T) {
 }
 
 // TestFileBootRejectsUncoveredGap pins the conservative half: a counter
-// advance nothing in this process accounted for (an out-of-band bump here;
-// in production a previous process's crash-window write, another writer, or
-// an Apply still in flight) must reject the file with the gap-specific
-// reason, and the engine must still come up correctly via the pg rebuild.
+// advance nothing in this process will EVER account for (an out-of-band
+// bump here; in production a previous process's crash-window write or
+// another writer) must still reject the file with the gap-specific reason,
+// and the engine must still come up correctly via the pg rebuild. Since
+// the settle-wait, "still" means after waiting out bootGapSettleTimeout --
+// an in-flight write's Apply could yet fill such a hole, and only the
+// deadline distinguishes "in flight" from "never coming" -- so the test
+// shortens the window rather than stalling the suite for the real 5s, and
+// asserts the rejection line reports how long it waited.
 func TestFileBootRejectsUncoveredGap(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
+
+	oldTimeout := bootGapSettleTimeout
+	bootGapSettleTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { bootGapSettleTimeout = oldTimeout })
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
@@ -236,16 +246,172 @@ func TestFileBootRejectsUncoveredGap(t *testing.T) {
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engB.bootGap.activate()
 
+	start := time.Now()
 	if engB.tryLoadSnapshotFile(ctx) {
 		t.Fatalf("tryLoadSnapshotFile adopted a file whose watermark gap nothing covered")
+	}
+	if waited := time.Since(start); waited < bootGapSettleTimeout {
+		t.Fatalf("rejection came after %v, want at least the %v settle window (the wait must precede the give-up)", waited, bootGapSettleTimeout)
 	}
 
 	logged := buf.String()
 	if !strings.Contains(logged, "boot gap not covered by buffered writes") {
 		t.Fatalf("rejection did not name the uncovered gap:\n%s", logged)
 	}
+	if !strings.Contains(logged, "waited=") {
+		t.Fatalf("the uncovered-gap rejection did not report how long it waited:\n%s", logged)
+	}
 	if !strings.Contains(logged, "bloodtrail: snapshot file rejected") {
 		t.Fatalf("no \"snapshot file rejected\" marker logged:\n%s", logged)
+	}
+}
+
+// TestFileBootWaitsForInFlightWriteAndAdopts is milestone 7's headline
+// case: a write whose eager bump has committed but whose Apply has not yet
+// run when the file attempt starts -- the shape that made a one-instant
+// decision reject under any concurrent writer (a batch's bump lands at its
+// first buffered operation, its Apply only at the flush). The attempt must
+// WAIT, not reject: once the write's Apply lands, mid-wait, the very next
+// coverage check adopts the file with the write replayed.
+func TestFileBootWaitsForInFlightWriteAndAdopts(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	dir := t.TempDir()
+	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
+
+	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.bootGap.activate()
+
+	// The in-flight write: bumped now, applied only after the attempt is
+	// already waiting on it.
+	counter, err := engB.BumpWatermark(ctx)
+	if err != nil {
+		t.Fatalf("BumpWatermark: %v", err)
+	}
+
+	adopted := make(chan bool, 1)
+	go func() { adopted <- engB.tryLoadSnapshotFile(ctx) }()
+
+	// Give the attempt a few retry intervals to observe the hole and start
+	// waiting. Not load-bearing for correctness -- if the attempt were
+	// somehow slower than this, the Apply below simply lands before its
+	// first check and the test degrades to the plain replay case -- but in
+	// practice this orders "waiting" before "filled".
+	time.Sleep(4 * bootGapSettleRetryInterval)
+
+	var nodeID graph.ID
+	if err := engB.pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties().Set("objectid", "in-flight-write"), fileBootKind)
+		if err != nil {
+			return err
+		}
+		nodeID = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	scope := NewWriteScope()
+	scope.SetWatermark(counter)
+	scope.Changes().RecordNodeID(nodeID)
+	engB.Apply(ctx, scope)
+
+	if !<-adopted {
+		t.Fatalf("tryLoadSnapshotFile rejected instead of waiting for the in-flight write to settle:\n%s", buf.String())
+	}
+	if got := engB.RebuildCount(); got != 0 {
+		t.Fatalf("RebuildCount = %d after a settled file boot, want 0", got)
+	}
+
+	view, serving := engB.Fresh()
+	if !serving {
+		t.Fatalf("engine B not serving after the settled adoption")
+	}
+	for _, id := range []graph.ID{savedNodeID, nodeID} {
+		if _, ok := view.Dense(uint64(id)); !ok {
+			t.Fatalf("node %d missing from the adopted view:\n%s", id, buf.String())
+		}
+	}
+	if logged := buf.String(); !strings.Contains(logged, "replayed_writes=1") {
+		t.Fatalf("the loaded marker did not report the settled write as replayed:\n%s", logged)
+	}
+}
+
+// TestFileBootReplaysPostFreezeWriteAndAdopts pins the frozen target's
+// other tolerance: a whole write landing AFTER the attempt froze its pg
+// snapshot -- bump, commit and Apply all mid-wait -- needs no accounting
+// against the target (bootGapCoveredAt ignores its counter) but was
+// observed by the still-armed buffer, so it must ride the replay rather
+// than be lost. The wait itself is still resolved by the pre-freeze
+// write's late Apply, exactly as in the test above.
+//
+// The 4-interval sleep before the post-freeze write orders it after the
+// attempt's freeze in practice; if the freeze were somehow slower, the
+// write's counter lands inside the target and the test degrades to two
+// late-applied writes -- still a pass, merely less discriminating.
+func TestFileBootReplaysPostFreezeWriteAndAdopts(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	dir := t.TempDir()
+	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
+
+	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.bootGap.activate()
+
+	counter, err := engB.BumpWatermark(ctx)
+	if err != nil {
+		t.Fatalf("BumpWatermark: %v", err)
+	}
+
+	adopted := make(chan bool, 1)
+	go func() { adopted <- engB.tryLoadSnapshotFile(ctx) }()
+
+	time.Sleep(4 * bootGapSettleRetryInterval)
+
+	// The post-freeze write: a complete bump+commit+Apply landing while the
+	// attempt is waiting on the pre-freeze hole.
+	postFreezeNode := bootGapWrite(t, ctx, engB, "post-freeze-write")
+
+	// Now fill the pre-freeze hole and let the attempt adopt.
+	var inFlightNode graph.ID
+	if err := engB.pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		n, err := tx.CreateNode(graph.NewProperties().Set("objectid", "pre-freeze-write"), fileBootKind)
+		if err != nil {
+			return err
+		}
+		inFlightNode = n.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	scope := NewWriteScope()
+	scope.SetWatermark(counter)
+	scope.Changes().RecordNodeID(inFlightNode)
+	engB.Apply(ctx, scope)
+
+	if !<-adopted {
+		t.Fatalf("tryLoadSnapshotFile rejected despite the target being covered once the in-flight write settled:\n%s", buf.String())
+	}
+
+	view, serving := engB.Fresh()
+	if !serving {
+		t.Fatalf("engine B not serving after the settled adoption")
+	}
+	for _, id := range []graph.ID{savedNodeID, inFlightNode, postFreezeNode} {
+		if _, ok := view.Dense(uint64(id)); !ok {
+			t.Fatalf("node %d missing from the adopted view (saved %d, pre-freeze %d, post-freeze %d):\n%s",
+				id, savedNodeID, inFlightNode, postFreezeNode, buf.String())
+		}
+	}
+	if logged := buf.String(); !strings.Contains(logged, "replayed_writes=2") {
+		t.Fatalf("the loaded marker did not report both writes as replayed:\n%s", logged)
 	}
 }
 

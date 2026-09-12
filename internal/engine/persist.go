@@ -19,7 +19,7 @@ import (
 // A later boot's tryLoadSnapshotFile compares that stamped counter against
 // pg's own counter at boot time, and trusts the file only when the gap
 // between the two is exactly covered by that boot's own buffered writes
-// (adoptSnapshotFileView's bootGapCovered check; a quiet boot's empty gap
+// (adoptSnapshotFileView's bootGapCoveredAt check; a quiet boot's empty gap
 // is the degenerate cover) -- so this is the write side of the same
 // watermark-gated contract boot.go enforces on the read side.
 //
@@ -215,7 +215,7 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // when this call verified it), and the racing Apply's own AdvanceWatermark
 // moves pg's watermark counter PAST pgCounter -- so the file this call is
 // about to write will be REJECTED by the very next boot's watermark-gap
-// check (bootGapCovered): the racing write's counter belongs to THIS
+// check (bootGapCoveredAt): the racing write's counter belongs to THIS
 // process, so no later boot's own buffer can ever account for it, and the
 // gap can never be covered -- never trusted as complete when it is not.
 // Rejecting a file is always safe (boot.go's own fallback is a genuine
@@ -390,7 +390,7 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 // with a watermark that a later boot's tryLoadSnapshotFile would consider
 // a perfect match and load without question: exactly the wrong-trust
 // outcome this whole feature exists to make impossible on the read side
-// (bootGapCovered's own doc), reintroduced from the write side
+// (bootGapCoveredAt's own doc), reintroduced from the write side
 // instead. Keeping this check is what closes that: a shutdown caught mid-
 // fallback simply skips writing a file at all, leaving whatever file an
 // earlier, successful save already left behind (or no file at all)

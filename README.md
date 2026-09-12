@@ -180,10 +180,19 @@ caller has already been told committed.
   and adopts it when the watermark counters prove nothing is missing: every write that
   lands while no replica exists yet is buffered (its counter and the keys it touched),
   and the file is adopted exactly when the file's stamped counter plus those buffered
-  writes' own counters account for PostgreSQL's counter with no hole -- the buffered
-  writes are then replayed onto the loaded snapshot, through the same read-back
-  machinery ordinary write-through uses, before the result is published as one view. A
-  quiet restart is the degenerate case (no buffered writes, counters exactly equal).
+  writes' own counters account for a fixed target -- PostgreSQL's counter as read once,
+  when the attempt starts -- with no hole. The buffered writes are then replayed onto
+  the loaded snapshot, through the same read-back machinery ordinary write-through
+  uses, before the result is published as one view. A hole is not refused on sight:
+  a write's counter is claimed eagerly (at a batch's first buffered operation) while
+  the buffering happens when the write commits, so a busy boot always has a few
+  claimed-but-uncommitted counters in flight, and the attempt simply waits -- re-checking
+  every 50ms, for up to 5s -- for those writes to finish and fill their own holes.
+  Writes that start after the target was read need no accounting at all: whichever
+  side of the publish they land on, they end up in the view through the ordinary
+  paths. This is what lets a restart landing in the middle of an active ingest still
+  adopt the file. A quiet restart is the degenerate case (no buffered writes, counters
+  exactly equal, no waiting).
   This buffering is what makes the file useful in practice at all: BloodHound queues a
   full analysis request at startup unconditionally and runs its data-pipe daemon with no
   start delay, so AD post-processing writes land within milliseconds of the API coming
@@ -199,14 +208,16 @@ caller has already been told committed.
   **When the file is still rejected.** Adoption is a proof, not a hope, and every way
   the proof can fail falls back to a normal PostgreSQL rebuild -- always correct, just
   slower, and a caller cannot tell the outcomes apart. A counter the boot cannot
-  account for rejects the file (`boot gap not covered by buffered writes`): a write
-  from a previous process's crash window, or any writer this process never observed. A
-  boot-time write whose effect cannot be expressed as a replay -- raw Cypher, a wipe,
-  the same closed list ordinary write-through falls back on -- trips fallback and
-  rejects the file too, as does a buffer that outgrew its caps (1024 writes / 262,144
-  keys) under a genuinely heavy boot. Each rejection is logged at Info with a `reason`
-  and is followed by an ordinary `snapshot rebuilt` line; an adoption logs
-  `snapshot file loaded` with a `replayed_writes` count.
+  account for even after the settle window rejects the file (`boot gap not covered by
+  buffered writes`, with a `waited` duration): a write from a previous process's crash
+  window, any writer this process never observed, or an in-flight write that outlived
+  the 5s wait. A boot-time write whose effect cannot be expressed as a replay -- raw
+  Cypher, a wipe, the same closed list ordinary write-through falls back on -- trips
+  fallback and rejects the file immediately (nothing to wait for), as does a buffer
+  that outgrew its caps (1024 writes / 262,144 keys) under a genuinely heavy boot.
+  Each rejection is logged at Info with a `reason` and is followed by an ordinary
+  `snapshot rebuilt` line; an adoption logs `snapshot file loaded` with a
+  `replayed_writes` count.
 - **Compaction.** Every applied write layers one more delta on top of the engine's base
   snapshot; past a size threshold (`BLOODTRAIL_COMPACT_ENTRIES`/`BLOODTRAIL_COMPACT_BYTES`,
   see Configuration below), a background compaction folds the base and every delta into

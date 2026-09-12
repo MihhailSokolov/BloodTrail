@@ -109,7 +109,7 @@ func TestDefaultGraphResolvedIsNilSafe(t *testing.T) {
 // -----------------------------------------------------------------------
 // Snapshot-file boot load. The test below pins snapshotFilePath's disabled
 // short-circuit; the trust predicate's own pure tests live in
-// bootgap_test.go (bootGapCovered), and the full read-compare-adopt
+// bootgap_test.go (bootGapCoveredAt), and the full read-compare-adopt
 // sequence (tryLoadSnapshotFile/adoptSnapshotFileView) is exercised end to
 // end, against a live PostgreSQL watermark table and real snapshot files,
 // by file_boot_integration_test.go.

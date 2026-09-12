@@ -16,9 +16,10 @@ import (
 // entries' ChangeSets collectively name, since one batch flush can record
 // thousands of keys in a single entry. Both are sized for the real window
 // they cover -- the seconds a snapshot-file load takes at boot, during which
-// BloodHound's startup analysis writes land -- not for a sustained ingest,
-// which is exactly the case the overflow poison exists to hand to the
-// rebuild path honestly.
+// BloodHound's startup analysis writes land, plus adoption's bounded settle
+// wait (bootGapSettleTimeout, boot.go) -- not for an unbounded ingest
+// backlog, which is exactly the case the overflow poison exists to hand to
+// the rebuild path honestly.
 const (
 	maxBootGapEntries = 1024
 	maxBootGapKeys    = 1 << 18
@@ -38,10 +39,11 @@ type bootGapEntry struct {
 // bootGapBuffer records the writes that arrive while the engine has no View
 // yet, so that a snapshot-file boot can adopt the file DESPITE those writes:
 // at adoption time their counters prove they are exactly the writes between
-// the file's stamped watermark and pg's current one (bootGapCovered), and
-// their ChangeSets are replayed onto the file-loaded snapshot through the
-// same read-back/segment machinery Apply uses (adoptSnapshotFileView,
-// boot.go). Without it, BloodHound's own startup analysis -- which writes to
+// the file's stamped watermark and the attempt's frozen pg target
+// (bootGapCoveredAt) -- waiting out any still in flight
+// (adoptSnapshotFileView's settle-wait) -- and their ChangeSets are replayed
+// onto the file-loaded snapshot through the same read-back/segment machinery
+// Apply uses (adoptSnapshotFileView, boot.go). Without it, BloodHound's own startup analysis -- which writes to
 // the graph within milliseconds of every boot -- supersedes the file on
 // every restart whose load takes longer than the first write, which at
 // production scale is every restart.
@@ -215,53 +217,80 @@ func (b *bootGapBuffer) take() (entries []bootGapEntry, poisoned string) {
 	return entries, poisoned
 }
 
-// bootGapCovered reports whether a snapshot file stamped fileWatermark may
-// be adopted given PostgreSQL's current counter pgWatermark and the
-// counters of every write the boot gap buffer accounted for: exactly when
-// the counters are precisely {fileWatermark+1, ..., pgWatermark}, each once.
-// Extracted as a pure function so the decision has a direct unit test,
-// mirroring watermarkTrustedFor's identical treatment (watermark.go). It
-// generalizes the plain equality check this file's loader used before the
-// boot gap buffer existed: an empty gap (pgWatermark == fileWatermark, no
-// counters) is the degenerate cover, and is still what a quiet restart
-// produces.
+// peek returns a copy of the recorded entries plus the poison reason,
+// WITHOUT consuming or deactivating anything: the settle-wait adoption loop
+// (adoptSnapshotFileView, boot.go) checks coverage attempt after attempt
+// while the buffer keeps observing the very Applies it is waiting for, and
+// only the final, covered attempt calls take. The entries are copied so the
+// caller reads a stable snapshot while later observes keep appending to the
+// live slice.
+func (b *bootGapBuffer) peek() (entries []bootGapEntry, poisoned string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return append([]bootGapEntry(nil), b.entries...), b.poisoned
+}
+
+// bootGapCoveredAt reports whether a snapshot file stamped fileWatermark may
+// be adopted given the decision's FROZEN pg counter pgSnapshot and the
+// counters of every write the boot gap buffer has accounted for so far:
+// exactly when the counters at or below pgSnapshot are precisely
+// {fileWatermark+1, ..., pgSnapshot}, each once. Extracted as a pure
+// function so the decision has a direct unit test, mirroring
+// watermarkTrustedFor's identical treatment (watermark.go). An empty gap
+// (pgSnapshot == fileWatermark, no counters) is the degenerate cover, and
+// is still what a quiet restart produces.
 //
 // The reasoning is the watermark protocol's own (BumpWatermark,
 // watermark.go): every mutating write bumps the single pg counter eagerly,
 // before its own effect, and each bump's value is unique and strictly
 // increasing. SaveSnapshot stamps the file with the counter that was live
-// when it decided to proceed, so every write the file could be missing
-// carries a counter in (fileWatermark, pgWatermark]. If the buffer holds
-// exactly those counters, then every such write was seen by THIS process's
-// own observers -- replayable from its ChangeSet, or known to have committed
-// nothing -- and file + replay reproduces PostgreSQL's state at pgWatermark.
-// A hole means some write landed that nothing accounted for (another
-// process, a crash-window write from the previous one, or an Apply still in
-// flight when the decision ran), and the file must be rejected exactly as
-// the old equality check rejected any advance at all.
+// when it decided to proceed, so every write the file could be missing AS
+// OF THE FROZEN TARGET carries a counter in (fileWatermark, pgSnapshot]. If
+// the buffer holds exactly those counters, then every such write was seen
+// by THIS process's own observers -- replayable from its ChangeSet, or
+// known to have committed nothing -- and file + replay reproduces
+// PostgreSQL's state at pgSnapshot. A hole means some write landed that
+// nothing accounted for (another process, or a crash-window write from the
+// previous one), and the file must be rejected exactly as the plain
+// equality check this generalizes rejected any advance at all. The
+// settle-wait design (adoptSnapshotFileView) exists because a hole can
+// also be transient -- an Apply still in flight -- which waiting, not
+// rejecting, resolves; this predicate stays time-blind and answers only
+// "is the target covered RIGHT NOW".
 //
-// A file AHEAD of pg (pgWatermark < fileWatermark) should never happen
-// under a monotonic counter, and is refused outright rather than reasoned
-// about -- the identical judgment the old equality check made. Counters
-// outside the (fileWatermark, pgWatermark] range fail the match too: below
-// the range would mean a write the file already contains was somehow
-// re-observed, and above it a bump newer than the decision's own pg read --
-// both "something is wrong, don't trust it".
+// Counters ABOVE pgSnapshot are permitted and simply ignored here: they
+// belong to writes that landed after the target was frozen, whose safety
+// is the adoption path's argument (observed ones ride the replay; parked
+// ones land as ordinary deltas after publish -- both stage read-back
+// truth, so order cannot matter). What is NOT tolerated, above or below:
+// a duplicate counter (the protocol guarantees uniqueness, so a duplicate
+// means the accounting itself is wrong) or a counter at or below
+// fileWatermark (a write the file already contains was somehow
+// re-observed) -- both "something is wrong, don't trust it". A file AHEAD
+// of pg (pgSnapshot < fileWatermark) should never happen under a monotonic
+// counter, and is refused outright rather than reasoned about.
 //
 // counters is sorted in place; callers pass a slice they own.
-func bootGapCovered(fileWatermark, pgWatermark uint64, counters []uint64) bool {
-	if pgWatermark < fileWatermark {
-		return false
-	}
-	if uint64(len(counters)) != pgWatermark-fileWatermark {
+func bootGapCoveredAt(fileWatermark, pgSnapshot uint64, counters []uint64) bool {
+	if pgSnapshot < fileWatermark {
 		return false
 	}
 
 	sort.Slice(counters, func(i, j int) bool { return counters[i] < counters[j] })
+
+	inRange := 0
 	for i, c := range counters {
-		if c != fileWatermark+1+uint64(i) {
+		if i > 0 && c == counters[i-1] {
 			return false
 		}
+		if c > pgSnapshot {
+			continue // sorted: everything from here up is post-freeze, but keep scanning for duplicates
+		}
+		if c != fileWatermark+1+uint64(inRange) {
+			return false
+		}
+		inRange++
 	}
-	return true
+	return uint64(inRange) == pgSnapshot-fileWatermark
 }

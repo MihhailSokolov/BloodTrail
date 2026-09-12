@@ -203,7 +203,7 @@ func (e *Engine) Stop() {
 // is a cheap, explicit statement of an invariant rather than a race to win,
 // since adoptSnapshotFileView re-checks it under applyMu and independently
 // refuses a file whose watermark gap its buffered writes cannot cover
-// (bootGapCovered), so a file that would lose a write is refused either
+// (bootGapCoveredAt), so a file that would lose a write is refused either
 // way.
 //
 // A successful, adopted file load hands off to finishFallbackRebuild exactly
@@ -365,7 +365,7 @@ const snapshotTempFilePattern = ".snapshot-*.tmp"
 // could possibly attempt a write of its own -- which is what makes this
 // safe under this feature's existing single-writer assumption (at most one
 // BloodTrail process owns a given SnapshotDir at a time -- the same
-// assumption adoptSnapshotFileView's watermark-gap trust (bootGapCovered)
+// assumption adoptSnapshotFileView's watermark-gap trust (bootGapCoveredAt)
 // already depends on: one BloodHound container, one bind-mounted
 // directory). Under
 // that assumption, sweeping HERE -- and only here -- is provably safe: by
@@ -429,7 +429,7 @@ func (e *Engine) sweepStaleSnapshotTempFiles() {
 // a write applied while the file loads is no longer a reason to reject it --
 // the boot gap buffer captured it, and adoptSnapshotFileView replays it --
 // so the epoch check's job is done instead by that adoption's own
-// counter-coverage proof (bootGapCovered) plus its settledDirtyGen re-check
+// counter-coverage proof (bootGapCoveredAt) plus its settledDirtyGen re-check
 // under applyMu, which together refuse exactly the writes the replay cannot
 // account for.
 //
@@ -501,37 +501,94 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 	return true
 }
 
+// bootGapSettleTimeout and bootGapSettleRetryInterval pace the settle-wait
+// in adoptSnapshotFileView: how long an adoption may wait, in how fine a
+// step, for the boot gap buffer to cover the frozen watermark target before
+// giving the file up to the pg rebuild. The wait a covered adoption
+// actually needs is the remaining lifetime of the slowest write in flight
+// at freeze time -- a batch chunk's bump commits at its first buffered
+// operation, its Apply at the flush that commits the chunk, and
+// bench/applybench measured its largest chunks (20k-op flushes at 5M)
+// taking ~1.5-2s wall between the two; ordinary BloodHound ingest flushes
+// are smaller. 5s is ~2.5x that worst case, and the cost of exhausting it
+// is bounded and honest: 5s plus exactly the rebuild that would have run
+// anyway. Vars rather than consts so the integration tests can exercise
+// the timeout path without a five-second stall; deliberately NOT Config --
+// there is no operator judgment to invite here.
+var (
+	bootGapSettleTimeout       = 5 * time.Second
+	bootGapSettleRetryInterval = 50 * time.Millisecond
+)
+
+// adoptAttempt is one adoption attempt's verdict. Adopted and rejected are
+// terminal (a rejected attempt has already logged its reason); notYetCovered
+// is the one verdict the settle-wait loop sleeps on and retries -- the gap
+// to the frozen target has a hole that an in-flight write's own Apply may
+// yet fill.
+type adoptAttempt int
+
+const (
+	adoptAttemptAdopted adoptAttempt = iota
+	adoptAttemptRejected
+	adoptAttemptNotYetCovered
+)
+
 // adoptSnapshotFileView is the snapshot-file boot's publish step: it
-// decides, under applyMu, whether the file-loaded snapshot plus a replay of
-// the boot gap buffer's writes reproduces PostgreSQL's current state, and
-// publishes the combined View if so. Reports how many buffered writes it
-// replayed, and whether it adopted at all; every rejection logs its own
-// "bloodtrail: snapshot file rejected" line naming why, so the caller has
-// nothing left to log on the false path.
+// decides whether the file-loaded snapshot plus a replay of the boot gap
+// buffer's writes reproduces PostgreSQL's state at a FROZEN watermark
+// target, and publishes the combined View if so -- waiting, bounded, for
+// in-flight writes to settle rather than sampling a single instant.
+// Reports how many buffered writes it replayed, and whether it adopted at
+// all; every rejection logs its own "bloodtrail: snapshot file rejected"
+// line naming why, so the caller has nothing left to log on the false path.
 //
-// The proof it demands, all of it evaluated under applyMu so no Apply can
-// move anything mid-decision:
+// The settle-wait exists because the one-instant decision this replaces
+// could not survive concurrent writes at all: a batch write's bump commits
+// eagerly at the chunk's first buffered operation while the Apply the
+// buffer observes runs only at the flush that commits it, so under any
+// sustained write stream there is an unaccounted in-flight bump at
+// essentially every instant, and sampling one instant rejects essentially
+// every time (bench/applybench measured a flat-out writer losing 3/3).
+// Freezing the target once and WAITING for the buffer -- still armed, still
+// observing -- to cover it converges under any write pattern in which
+// individual writes finish inside bootGapSettleTimeout: every bump at or
+// below the frozen target belongs to a committed write of THIS process,
+// whose Apply (or ResolveAbandonedWrite) arrives within that write's own
+// remaining lifetime. Bumps ABOVE the target need no accounting at all,
+// by cases: a post-freeze write whose Apply already ran (a no-op against
+// the nil snapshot) is in the buffer and rides the replay below; one whose
+// Apply is parked on applyMu lands after publish as an ordinary delta.
+// Both stage read-back truth -- pg's current committed state per key,
+// never the write's own payload -- so replay order cannot matter, the
+// same argument the replay paragraph below already makes for same-key
+// rewrites. The freeze itself therefore needs no lock: earlier bumps are
+// waited for, later ones are tolerated by construction.
 //
-//   - No View was adopted while the file was loading (a concurrent manual
-//     RebuildNow, say) -- publishing an older file over one would lose
-//     whatever that adoption contained.
+// The proof each attempt demands, evaluated under applyMu so no Apply can
+// move anything mid-attempt:
+//
+//   - No View was adopted while the file was loading or the wait was
+//     waiting (a concurrent manual RebuildNow, say) -- publishing an older
+//     file over one would lose whatever that adoption contained.
 //   - The engine is still stateServing: a write that tripped fallback
-//     during the load could not be replayed then and cannot be now.
+//     could not be replayed then and cannot be now.
 //   - settledDirtyGen has not moved since the pre-load read: a watermark
-//     failure that settled mid-load belongs to a write whose bump never
-//     produced a counter, which the coverage check below is therefore
-//     blind to -- rejecting is the only sound answer, exactly as the
-//     retired epoch check would have. (Apply-side settles cannot race this
-//     -- Apply holds applyMu -- and a ResolveAbandonedWrite settle slipping
-//     in after this check changed nothing in PostgreSQL, so the file is
-//     still faithful; its trust generation stays unresolved until
+//     failure that settled mid-load or mid-wait belongs to a write whose
+//     bump never produced a counter, which the coverage check below is
+//     therefore blind to -- rejecting is the only sound answer, exactly as
+//     the retired epoch check would have. (Apply-side settles cannot race
+//     this -- Apply holds applyMu -- and a ResolveAbandonedWrite settle
+//     slipping in after this check changed nothing in PostgreSQL, so the
+//     file is still faithful; its trust generation stays unresolved until
 //     finishFallbackRebuild's recheck relaunches a rebuild for it, the
 //     same handling that race already has everywhere else.)
-//   - bootGapCovered: pg's current counter, read live inside the lock (one
-//     single-row SELECT -- precedent: Apply's own read-back round trip
-//     already runs under applyMu), is exactly the file's counter plus the
-//     buffered writes' own bumps, with no hole and nothing the buffer
-//     could not faithfully replay (a poisoned buffer rejects first).
+//   - bootGapCoveredAt: the buffered counters at or below the frozen
+//     target are exactly the file's counter through the target, with no
+//     hole and nothing the buffer could not faithfully replay (a poisoned
+//     buffer rejects immediately -- poison never heals, so there is
+//     nothing to wait for). The attempt PEEKS for this check and only the
+//     covered attempt take()s, so the buffer keeps observing the very
+//     Applies the wait is waiting for.
 //
 // The replay itself is Apply's own machinery, reused verbatim per buffered
 // write -- readBack for pg's post-commit truth on every key the ChangeSet
@@ -558,50 +615,95 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 // settledGen belongs to a write whose committed rows are either in the
 // file or in the replay.
 func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *snapshot.Snapshot, fileWatermark, settledGen uint64) (replayed int, adopted bool) {
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
-
 	reject := func(reason string, attrs ...any) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
 			append([]any{slog.String("path", path), slog.String("reason", reason)}, attrs...)...)
 	}
 
-	if e.snap.Load() != nil {
-		reject("a view was already adopted while the file was loading")
-		return 0, false
-	}
-	if e.state.Load() != stateServing {
-		reject("the engine entered fallback while the file was loading")
-		return 0, false
-	}
-	if e.settledDirtyGen.Load() != settledGen {
-		reject("a watermark failure settled while the file was loading")
-		return 0, false
-	}
-
-	pgWatermark, err := e.ReadWatermark(ctx)
+	// The frozen target (see the doc above for why no lock is needed here):
+	// everything at or below it must be accounted for before adoption,
+	// everything above it is safe by construction.
+	pgSnapshot, err := e.ReadWatermark(ctx)
 	if err != nil {
 		reject("read pg watermark failed", slog.Any("error", err))
 		return 0, false
 	}
 
+	start := time.Now()
+	deadline := start.Add(bootGapSettleTimeout)
+	for {
+		replayed, verdict, buffered := e.adoptSnapshotFileAttempt(ctx, snap, fileWatermark, pgSnapshot, settledGen, reject)
+		switch verdict {
+		case adoptAttemptAdopted:
+			return replayed, true
+		case adoptAttemptRejected:
+			return 0, false
+		}
+
+		if time.Now().After(deadline) {
+			reject("boot gap not covered by buffered writes",
+				slog.Uint64("file_watermark", fileWatermark),
+				slog.Uint64("pg_watermark", pgSnapshot),
+				slog.Int("buffered_writes", buffered),
+				slog.Duration("waited", time.Since(start)),
+			)
+			return 0, false
+		}
+		select {
+		case <-ctx.Done():
+			reject("boot cancelled while waiting for in-flight writes to settle",
+				slog.Duration("waited", time.Since(start)))
+			return 0, false
+		case <-time.After(bootGapSettleRetryInterval):
+		}
+	}
+}
+
+// adoptSnapshotFileAttempt is one locked attempt of the settle-wait loop
+// above: prechecks, coverage against the frozen target, and -- only when
+// covered -- the take, replay and publish. Terminal rejections log through
+// reject before returning adoptAttemptRejected; adoptAttemptNotYetCovered
+// logs nothing (the loop owns the eventual timeout line) and reports how
+// many writes were buffered at the time, for that line's use.
+func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Snapshot, fileWatermark, pgSnapshot, settledGen uint64, reject func(string, ...any)) (replayed int, verdict adoptAttempt, buffered int) {
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
+	if e.snap.Load() != nil {
+		reject("a view was already adopted while the file was loading")
+		return 0, adoptAttemptRejected, 0
+	}
+	if e.state.Load() != stateServing {
+		reject("the engine entered fallback while the file was loading")
+		return 0, adoptAttemptRejected, 0
+	}
+	if e.settledDirtyGen.Load() != settledGen {
+		reject("a watermark failure settled while the file was loading")
+		return 0, adoptAttemptRejected, 0
+	}
+
+	peeked, poisoned := e.bootGap.peek()
+	if poisoned != "" {
+		reject("boot write buffer poisoned: " + poisoned)
+		return 0, adoptAttemptRejected, 0
+	}
+
+	counters := make([]uint64, len(peeked))
+	for i, entry := range peeked {
+		counters[i] = entry.counter
+	}
+	if !bootGapCoveredAt(fileWatermark, pgSnapshot, counters) {
+		return 0, adoptAttemptNotYetCovered, len(peeked)
+	}
+
+	// Covered: consume. A ResolveAbandonedWrite observe landing between the
+	// peek and this take rides along harmlessly -- counter-only entries are
+	// skipped by the replay -- but a poison landing in that window must
+	// still reject, so the take's own poison answer is checked again.
 	entries, poisoned := e.bootGap.take()
 	if poisoned != "" {
 		reject("boot write buffer poisoned: " + poisoned)
-		return 0, false
-	}
-
-	counters := make([]uint64, len(entries))
-	for i, entry := range entries {
-		counters[i] = entry.counter
-	}
-	if !bootGapCovered(fileWatermark, pgWatermark, counters) {
-		reject("boot gap not covered by buffered writes",
-			slog.Uint64("file_watermark", fileWatermark),
-			slog.Uint64("pg_watermark", pgWatermark),
-			slog.Int("buffered_writes", len(entries)),
-		)
-		return 0, false
+		return 0, adoptAttemptRejected, 0
 	}
 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].counter < entries[j].counter })
@@ -614,12 +716,12 @@ func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *s
 		rb, err := e.readBack(ctx, entry.cs)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
-			return 0, false
+			return 0, adoptAttemptRejected, 0
 		}
 		seg, err := buildApplySegment(view, rb, entry.cs)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
-			return 0, false
+			return 0, adoptAttemptRejected, 0
 		}
 		view = view.WithSegment(seg)
 		replayed++
@@ -631,12 +733,12 @@ func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *s
 				slog.Uint64("bytes", viewBytes),
 				slog.Uint64("limit", uint64(e.cfg.MemoryLimit)),
 			)
-			return 0, false
+			return 0, adoptAttemptRejected, 0
 		}
 	}
 
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 	e.maintainAfterPublish(ctx, view)
-	return replayed, true
+	return replayed, adoptAttemptAdopted, 0
 }

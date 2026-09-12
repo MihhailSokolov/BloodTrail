@@ -280,6 +280,15 @@ func TestFileBootRejectsStaleWatermarkAndRebuilds(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
+	// The out-of-band bump below is a hole nothing will ever fill, so since
+	// the settle-wait the rejection only comes once bootGapSettleTimeout
+	// expires -- shortened here so the pg rebuild this test is actually
+	// about starts inside waitForFresh's own window (the same treatment
+	// TestFileBootRejectsUncoveredGap gives it, and its doc explains).
+	oldTimeout := bootGapSettleTimeout
+	bootGapSettleTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { bootGapSettleTimeout = oldTimeout })
+
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 

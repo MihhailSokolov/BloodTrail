@@ -8,12 +8,17 @@ import (
 	"github.com/specterops/dawgs/graph"
 )
 
-// TestBootGapCovered pins the trust predicate the snapshot-file boot rests
-// on: the file may be adopted exactly when the buffered counters are
-// precisely {fileWatermark+1, ..., pgWatermark} -- the old equality check's
-// empty gap included -- and never on a hole, an out-of-range counter, or a
-// file somehow ahead of pg.
-func TestBootGapCovered(t *testing.T) {
+// TestBootGapCoveredAt pins the trust predicate the snapshot-file boot rests
+// on: the file may be adopted exactly when the buffered counters at or below
+// the decision's FROZEN pg snapshot are precisely
+// {fileWatermark+1, ..., pgSnapshot} -- the old equality check's empty gap
+// included -- and never on a hole, a counter the file already contains, a
+// duplicate anywhere, or a file somehow ahead of pg. Counters ABOVE the
+// frozen snapshot are permitted (and their entries replayed): they belong to
+// writes that landed after the target was frozen, which the settle-wait
+// design explicitly tolerates -- observed ones ride the replay, parked ones
+// land as ordinary deltas after publish (adoptSnapshotFileView's doc).
+func TestBootGapCoveredAt(t *testing.T) {
 	cases := []struct {
 		name     string
 		file, pg uint64
@@ -27,15 +32,18 @@ func TestBootGapCovered(t *testing.T) {
 		{"gap with nothing buffered (out-of-band write)", 41, 42, nil, false},
 		{"hole in the middle", 42, 45, []uint64{43, 45}, false},
 		{"counter below the gap (already in the file)", 42, 44, []uint64{42, 43}, false},
-		{"counter above pg's own read", 42, 43, []uint64{44}, false},
-		{"more counters than the gap holds", 42, 43, []uint64{43, 44}, false},
+		{"counter above the frozen snapshot alone (write after freeze, gap empty)", 42, 42, []uint64{43}, true},
+		{"gap covered plus counters above the freeze", 42, 44, []uint64{43, 44, 45, 46}, true},
+		{"hole below the freeze is not excused by counters above it", 42, 45, []uint64{43, 45, 46}, false},
+		{"duplicate below the freeze", 42, 44, []uint64{43, 43, 44}, false},
+		{"duplicate above the freeze", 42, 43, []uint64{43, 44, 44}, false},
 		{"file ahead of pg (should never happen; refused all the same)", 43, 42, nil, false},
 		{"file ahead of pg with counters", 43, 42, []uint64{43}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := bootGapCovered(tc.file, tc.pg, tc.counters); got != tc.want {
-				t.Fatalf("bootGapCovered(%d, %d, %v) = %v, want %v", tc.file, tc.pg, tc.counters, got, tc.want)
+			if got := bootGapCoveredAt(tc.file, tc.pg, tc.counters); got != tc.want {
+				t.Fatalf("bootGapCoveredAt(%d, %d, %v) = %v, want %v", tc.file, tc.pg, tc.counters, got, tc.want)
 			}
 		})
 	}
@@ -243,6 +251,38 @@ func TestBootGapBufferOverflowPoisons(t *testing.T) {
 // method, and against what it deliberately excludes: fallback reasons are
 // not keys (they poison the buffer through HasFallback long before any
 // size cap matters).
+// TestBootGapBufferPeekDoesNotConsume pins peek's whole contract: it
+// reports what the buffer holds without disarming it or dropping anything
+// -- an observe AFTER a peek still lands (the settle-wait loop depends on
+// exactly this: it peeks while the Applies it is waiting for are still
+// arriving), and the eventual take still returns everything exactly once.
+func TestBootGapBufferPeekDoesNotConsume(t *testing.T) {
+	var b bootGapBuffer
+	b.activate()
+
+	b.observe(bumpedScope(7))
+
+	entries, poisoned := b.peek()
+	if poisoned != "" || len(entries) != 1 || entries[0].counter != 7 {
+		t.Fatalf("peek after one observe = (%d entries, poisoned %q), want exactly counter 7 and no poison", len(entries), poisoned)
+	}
+
+	b.observe(bumpedScope(8)) // must still land: peek must not disarm
+
+	entries, _ = b.peek()
+	if len(entries) != 2 {
+		t.Fatalf("peek after a post-peek observe = %d entries, want 2 (peek disarmed or dropped the buffer)", len(entries))
+	}
+
+	taken, poisoned := b.take()
+	if poisoned != "" || len(taken) != 2 {
+		t.Fatalf("take after peeks = (%d entries, poisoned %q), want both entries and no poison", len(taken), poisoned)
+	}
+	if b.active.Load() {
+		t.Fatalf("buffer still active after take")
+	}
+}
+
 func TestChangeSetKeyCount(t *testing.T) {
 	var c ChangeSet
 	if got := c.keyCount(); got != 0 {
