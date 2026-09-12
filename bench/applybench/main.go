@@ -472,16 +472,25 @@ type benchResult struct {
 	loadDurations       []time.Duration
 	bootDurations       []time.Duration
 
-	// (e)'s outcomes: how many boots adopted the file (with how many
-	// buffered writes replayed onto it, and how long the open->loaded path
-	// took) versus how many were superseded by the one legitimate
-	// conservative race (a gap-rejection), plus how many ingest units the
-	// concurrent writer landed per repeat.
+	// (e)'s outcomes, one set per writer scenario: how many boots adopted
+	// the file (with how many buffered writes replayed onto it, and how
+	// long the open->loaded path took) versus how many were superseded by a
+	// gap-rejection, plus how many ingest units the concurrent writer
+	// landed per repeat. replay* is the burst scenario (BloodHound's
+	// ordinary startup-analysis shape); sustainedReplay* is the flat-out
+	// writer (a restart landing mid-ingest), the case the adoption path's
+	// settle-wait exists for.
 	replayAdopted     int
 	replayGapRejected int
 	replayCounts      []int64
 	replayBootDurs    []time.Duration
 	replayWritten     []int
+
+	sustainedReplayAdopted     int
+	sustainedReplayGapRejected int
+	sustainedReplayCounts      []int64
+	sustainedReplayBootDurs    []time.Duration
+	sustainedReplayWritten     []int
 }
 
 // execute runs every measurement against cfg.dsn and returns the collected
@@ -1723,34 +1732,39 @@ func runSnapshotBoot(ctx context.Context, cfg config, dir string, repeat int) (t
 // at it from the moment the open returns, so the writes land inside the
 // boot-load window and are done before it ends.
 //
-// The burst shape is load-bearing, not a convenience. A batch write's
-// watermark bump commits when its first operation is buffered (eager,
-// write_observer.go's ensureBumped) while its Apply -- the call the boot
-// gap buffer observes -- only runs at the flush that commits the chunk, so
-// a writer that never stops keeps an unaccounted in-flight bump alive at
-// essentially every instant, and the adoption decision, refusing to guess
-// about a counter nothing accounts for, correctly rejects essentially every
-// time (a smoke run measured exactly that: a flat-out writer lost 3/3).
-// That is the documented behavior for a restart landing mid-ingest --
-// sustained writes supersede the file, today as before -- and this phase
-// exists to prove the case the feature is FOR: the burst-then-quiet shape
-// every ordinary BloodHound boot produces.
+// Two writer scenarios run cfg.repeats boots each, distinguished by what
+// they prove:
 //
-// Two outcomes are legitimate, and both are reported rather than barred
-// (like (c) and (d), this phase measures; only an outcome neither of these
+//   - BURST (4x25 units, then silence): BloodHound's ordinary boot shape --
+//     the startup analysis writes within milliseconds of the API coming up,
+//     then goes quiet. The original phase, kept as the baseline.
+//   - SUSTAINED (flat out until the attempt concludes): a restart landing
+//     mid-ingest. A batch write's watermark bump commits when its first
+//     operation is buffered (eager, write_observer.go's ensureBumped) while
+//     its Apply -- the call the boot gap buffer observes -- only runs at
+//     the flush that commits the chunk, so a writer that never stops keeps
+//     an unaccounted in-flight bump alive at essentially every instant. A
+//     one-instant adoption decision therefore lost this scenario 3/3 when
+//     it was first measured; the settle-wait (adoptSnapshotFileView's
+//     frozen-target wait, internal/engine/boot.go) exists precisely to win
+//     it, and this scenario is its regression proof at scale.
+//
+// Two outcomes are legitimate per boot, and both are reported rather than
+// barred (like (c) and (d), this phase measures; only an outcome neither
 // explains fails the run):
 //
 //   - ADOPTED: "snapshot file loaded", with the marker's replayed_writes
-//     attr counting the buffered writes folded in. The expected outcome, and
-//     at least one repeat must land on it -- a phase that never once proves
-//     the replay is not evidence of anything. (On a graph small enough that
-//     the load outruns the burst's first commit, replayed_writes is
-//     legitimately 0 -- the writes simply landed after adoption, as ordinary
-//     deltas; only a large graph makes this phase bite.)
+//     attr counting the buffered writes folded in. The expected outcome in
+//     BOTH scenarios now; each scenario must land it at least once, or the
+//     phase proved nothing about that scenario. (On a graph small enough
+//     that the load outruns the burst's first commit, replayed_writes can
+//     legitimately be 0 -- the writes simply landed after adoption, as
+//     ordinary deltas; only a large graph makes the burst scenario bite.)
 //   - GAP-REJECTED: "snapshot file rejected" with reason "boot gap not
-//     covered by buffered writes": one of the burst's own bumps was still
-//     in flight at the decision instant. Rare under a finite burst, and the
-//     boot's fallback to a pg rebuild is correct when it happens.
+//     covered by buffered writes": a bump was still unaccounted when the
+//     settle window closed -- a write outliving the wait. Rare in either
+//     scenario now, and the boot's fallback to a pg rebuild is correct
+//     when it happens.
 //
 // Any other rejection reason, or a boot that never reaches either marker
 // inside -cap, is a real defect and aborts the run.
@@ -1761,30 +1775,45 @@ func measureBootReplay(ctx context.Context, cfg config, base *baseGraph, result 
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 
-	for i := 0; i < cfg.repeats; i++ {
-		if _, _, err := runSnapshotSave(ctx, cfg, base, dir, i); err != nil {
-			return fmt.Errorf("boot-replay save (repeat %d): %w", i, err)
-		}
-
-		adopted, replayed, bootDur, written, err := runBootWithConcurrentWrites(ctx, cfg, base, dir, i)
-		if err != nil {
-			return err
-		}
-		result.replayWritten = append(result.replayWritten, written)
-		if adopted {
-			result.replayAdopted++
-			result.replayCounts = append(result.replayCounts, replayed)
-			result.replayBootDurs = append(result.replayBootDurs, bootDur)
-			fmt.Printf("applybench: repeat %d: boot ADOPTED the file, replayed_writes=%d open->loaded=%s (writer landed %d units meanwhile)\n",
-				i+1, replayed, fmtMillis(bootDur), written)
-		} else {
-			result.replayGapRejected++
-			fmt.Printf("applybench: repeat %d: boot GAP-REJECTED the file (the documented conservative race; writer landed %d units)\n", i+1, written)
-		}
+	scenarios := []struct {
+		name      string
+		sustained bool
+		adopted   *int
+		rejected  *int
+		counts    *[]int64
+		bootDurs  *[]time.Duration
+		written   *[]int
+	}{
+		{"burst", false, &result.replayAdopted, &result.replayGapRejected, &result.replayCounts, &result.replayBootDurs, &result.replayWritten},
+		{"sustained", true, &result.sustainedReplayAdopted, &result.sustainedReplayGapRejected, &result.sustainedReplayCounts, &result.sustainedReplayBootDurs, &result.sustainedReplayWritten},
 	}
 
-	if result.replayAdopted == 0 {
-		return fmt.Errorf("no repeat ever adopted the snapshot file under concurrent writes (%d/%d gap-rejected): the conservative race losing every time is indistinguishable from the replay never working -- investigate before trusting this build's restart path", result.replayGapRejected, cfg.repeats)
+	for _, sc := range scenarios {
+		for i := 0; i < cfg.repeats; i++ {
+			if _, _, err := runSnapshotSave(ctx, cfg, base, dir, i); err != nil {
+				return fmt.Errorf("boot-replay save (%s, repeat %d): %w", sc.name, i, err)
+			}
+
+			adopted, replayed, bootDur, written, err := runBootWithConcurrentWrites(ctx, cfg, base, dir, i, sc.sustained)
+			if err != nil {
+				return err
+			}
+			*sc.written = append(*sc.written, written)
+			if adopted {
+				*sc.adopted++
+				*sc.counts = append(*sc.counts, replayed)
+				*sc.bootDurs = append(*sc.bootDurs, bootDur)
+				fmt.Printf("applybench: %s repeat %d: boot ADOPTED the file, replayed_writes=%d open->loaded=%s (writer landed %d units meanwhile)\n",
+					sc.name, i+1, replayed, fmtMillis(bootDur), written)
+			} else {
+				*sc.rejected++
+				fmt.Printf("applybench: %s repeat %d: boot GAP-REJECTED the file (a write outlived the settle window; writer landed %d units)\n", sc.name, i+1, written)
+			}
+		}
+
+		if *sc.adopted == 0 {
+			return fmt.Errorf("no %s-writer repeat ever adopted the snapshot file (%d/%d gap-rejected): losing every time is indistinguishable from the replay (or its settle-wait) never working -- investigate before trusting this build's restart path", sc.name, *sc.rejected, cfg.repeats)
+		}
 	}
 	return nil
 }
@@ -1811,11 +1840,14 @@ const (
 
 // runBootWithConcurrentWrites is (e)'s boot half for one repeat: open a
 // fresh production driver against dir and, from the moment the open
-// returns, fire the write burst through that same driver -- so the writes
-// land inside the load window and exercise the boot gap buffer, not after
-// adoption. The writer's own error fails the repeat: a write refused during
-// boot would silently turn this phase into a quiet-restart measurement.
-func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGraph, dir string, repeat int) (adopted bool, replayed int64, bootDur time.Duration, written int, err error) {
+// returns, write through that same driver -- so the writes land inside the
+// load window and exercise the boot gap buffer, not after adoption. The
+// writer is the scenario: a finite burst (sustained=false), or flat out
+// until the attempt concludes (sustained=true; stopped by the outcome
+// poll's cancel below). The writer's own error fails the repeat: a write
+// refused during boot would silently turn this phase into a quiet-restart
+// measurement.
+func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGraph, dir string, repeat int, sustained bool) (adopted bool, replayed int64, bootDur time.Duration, written int, err error) {
 	capture, restore := installLogCapture()
 	defer restore()
 
@@ -1829,8 +1861,11 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 	}
 	defer cleanup()
 
+	writerCtx, stopWriter := context.WithCancel(capCtx)
+	defer stopWriter()
+
 	// writerUnits is atomic because the outcome poll below prints it live
-	// while the burst goroutine is still advancing it; writerErr needs no
+	// while the writer goroutine is still advancing it; writerErr needs no
 	// synchronization beyond writerDone, which is always received before it
 	// is read.
 	var (
@@ -1840,9 +1875,16 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 	)
 	go func() {
 		defer close(writerDone)
-		for call := 0; call < bootReplayBurstCalls; call++ {
-			if _, err := writeIngestBatch(capCtx, db, base.hubObjectID, bootReplayBurstUnits, 2*bootReplayBurstUnits, cfg.runID, fmt.Sprintf("bootreplay%d", repeat), call); err != nil {
-				if capCtx.Err() == nil {
+		tag := fmt.Sprintf("bootreplay%d", repeat)
+		if sustained {
+			tag = fmt.Sprintf("bootreplaysus%d", repeat)
+		}
+		for call := 0; sustained || call < bootReplayBurstCalls; call++ {
+			if writerCtx.Err() != nil {
+				return
+			}
+			if _, err := writeIngestBatch(writerCtx, db, base.hubObjectID, bootReplayBurstUnits, 2*bootReplayBurstUnits, cfg.runID, tag, call); err != nil {
+				if writerCtx.Err() == nil {
 					writerErr = err
 				}
 				return
@@ -1882,13 +1924,14 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 
 	adopted, err = outcome()
 	bootDur = time.Since(t0)
+	stopWriter()
 	<-writerDone
 	written = int(writerUnits.Load())
 	if err != nil {
 		return false, 0, 0, written, err
 	}
 	if writerErr != nil {
-		return false, 0, 0, written, fmt.Errorf("repeat %d: the burst writer failed mid-boot: %w", repeat, writerErr)
+		return false, 0, 0, written, fmt.Errorf("repeat %d: the writer failed mid-boot: %w", repeat, writerErr)
 	}
 
 	if adopted {
@@ -2145,12 +2188,18 @@ func (r *benchResult) report(enforce bool) bool {
 		floatMillis(saveP50), floatMillis(saveLoggedP50), floatMillis(loadP50), floatMillis(bootP50))
 
 	replayBootP50 := percentile(r.replayBootDurs, 0.50)
+	sustainedBootP50 := percentile(r.sustainedReplayBootDurs, 0.50)
 	fmt.Printf("\n=== (e) boot adoption under concurrent writes (reported only, not enforced) ===\n")
-	fmt.Printf("applybench: adopted=%d gap_rejected=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
+	fmt.Printf("applybench: burst:     adopted=%d gap_rejected=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
 		r.replayAdopted, r.replayGapRejected, r.replayAdopted+r.replayGapRejected, r.replayCounts, r.replayWritten)
-	fmt.Printf("applybench: boot under writes, open -> file loaded  p50=%s: %s\n", fmtMillis(replayBootP50), fmtDurationsMs(r.replayBootDurs))
+	fmt.Printf("applybench: sustained: adopted=%d gap_rejected=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
+		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, r.sustainedReplayAdopted+r.sustainedReplayGapRejected, r.sustainedReplayCounts, r.sustainedReplayWritten)
+	fmt.Printf("applybench: boot under burst writes,     open -> file loaded  p50=%s: %s\n", fmtMillis(replayBootP50), fmtDurationsMs(r.replayBootDurs))
+	fmt.Printf("applybench: boot under sustained writes, open -> file loaded  p50=%s: %s\n", fmtMillis(sustainedBootP50), fmtDurationsMs(r.sustainedReplayBootDurs))
 	fmt.Printf("APPLYBENCH_BOOT_REPLAY adopted=%d gap_rejected=%d boot_p50_ms=%.3f max_replayed=%d\n",
 		r.replayAdopted, r.replayGapRejected, floatMillis(replayBootP50), maxInt64(r.replayCounts))
+	fmt.Printf("APPLYBENCH_BOOT_REPLAY_SUSTAINED adopted=%d gap_rejected=%d boot_p50_ms=%.3f max_replayed=%d\n",
+		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, floatMillis(sustainedBootP50), maxInt64(r.sustainedReplayCounts))
 
 	allOK := overheadOK && latencyOK
 	fmt.Printf("\nAPPLYBENCH_ENFORCE checked=%t ok=%t\n", enforce, allOK)

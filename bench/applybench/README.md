@@ -184,31 +184,40 @@ be unreachable in production -- exactly what the plain watermark-equality
 check used to make it at scale.
 
 Each repeat saves a file through a real driver `Close` exactly as (d) does,
-then opens a fresh production driver and fires a **burst** of (a)'s own
-objectid-keyed ingest shape at it from the instant the open returns -- 4
-batch calls of 25 units, then silence -- so writes land inside the
-boot-load window and are done committing before it ends. The burst shape is
-load-bearing: a batch write's watermark bump commits when its first
-operation is buffered (eagerly) while its Apply only lands at the flush
-that commits the chunk, so a writer that *never* stops keeps an
-unaccounted in-flight bump alive at essentially every instant and the
-adoption correctly rejects essentially every time (measured: a flat-out
-writer lost 3/3 at smoke scale). That is the documented outcome for a
-restart landing mid-ingest -- sustained writes supersede the file, exactly
-as before the buffer existed -- while every ordinary BloodHound boot
-produces the burst-then-quiet shape this phase models. Two outcomes are
-legitimate:
+then opens a fresh production driver and writes (a)'s own objectid-keyed
+ingest shape through it from the instant the open returns, so writes land
+inside the boot-load window. Two writer scenarios run per bench run:
+
+- **burst** -- 4 batch calls of 25 units, then silence: BloodHound's
+  ordinary boot shape (the startup analysis writes within milliseconds of
+  the API coming up, then goes quiet).
+- **sustained** -- flat out until the boot's file attempt concludes: a
+  restart landing mid-ingest. A batch write's watermark bump commits when
+  its first operation is buffered (eagerly) while its Apply only lands at
+  the flush that commits the chunk, so a writer that never stops keeps an
+  unaccounted in-flight bump alive at essentially every instant -- and a
+  one-instant adoption decision measurably lost this scenario 3/3 when it
+  was first tried. The adoption path's settle-wait (freeze the watermark
+  target once, wait -- bounded, 5s -- for the in-flight writes at or below
+  it to finish and be accounted; `internal/engine/boot.go`) exists to win
+  exactly this, and the scenario is its regression proof: post-settle-wait,
+  the same flat-out writer adopts 3/3 at smoke scale, replaying 16-35
+  in-flight writes per boot.
+
+Two outcomes are legitimate per boot:
 
 - **ADOPTED** -- `"bloodtrail: snapshot file loaded"` with its
   `replayed_writes` attribute counting the buffered writes folded onto the
-  file before publication. The expected outcome; at least one repeat must
-  land on it or the phase fails. (On a graph small enough that the load
-  outruns the burst's first commit, `replayed_writes` can be legitimately
-  0 -- the writes simply landed after adoption as ordinary deltas.)
+  file before publication. The expected outcome in BOTH scenarios; each
+  scenario must land it at least once or the phase fails. (On a graph small
+  enough that the load outruns the burst's first commit, `replayed_writes`
+  can be legitimately 0 -- the writes simply landed after adoption as
+  ordinary deltas.)
 - **GAP-REJECTED** -- `"bloodtrail: snapshot file rejected"` with reason
-  `boot gap not covered by buffered writes`: one of the burst's own bumps
-  was still in flight at the decision instant. Rare under a finite burst,
-  and the pg-rebuild fallback is correct when it happens.
+  `boot gap not covered by buffered writes` and a `waited` duration: a
+  bump was still unaccounted when the settle window closed, i.e. a write
+  outlived the 5s wait. Rare in either scenario, and the pg-rebuild
+  fallback is correct when it happens.
 
 Any other rejection reason, a writer error mid-boot, or a boot that reaches
 neither marker inside `-cap` aborts the run. Reported only, never enforced
