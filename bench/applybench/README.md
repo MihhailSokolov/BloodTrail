@@ -482,7 +482,9 @@ load window and all four buffered ChangeSets replayed onto the file before
 publication -- the boot gap buffer doing at production scale exactly what
 it was built for, at a boot cost indistinguishable from (d)'s quiet boots
 (8.6-11.8s individual observations vs (d)'s 10.4-14.0s p50 range). The
-buffer's caps were never approached: 4 entries against 1024, ~200 keys
+buffer's caps were never approached: 4 entries against the then-1024 entry
+cap (4096 since the sustained scenario's own measurement moved it -- see
+the milestone-7 results below), ~200 keys
 against 262,144 -- a real BloodHound boot's startup-analysis burst is the
 same order of magnitude as this phase's, far below either cap.
 
@@ -494,6 +496,28 @@ the day's I/O-worn disk, (d)'s save driver reached `Close` before any View
 existed, and the phase failed on a race the harness itself manufactured.
 Every phase now waits on the engine's own adoption marker
 (`waitForAdoption`, main.go) instead of predicting boot duration.
+
+**Milestone-7 results (2026-09-13, same graph recipe, ~4.8M nodes):** with
+the engine's settle-wait adoption in place and the scenario split into
+burst + sustained, one full run measured:
+
+| Scenario | Outcomes (of 3 boots) | replayed_writes per adoption | boot (open -> loaded), p50 |
+|---|---|---|---:|
+| burst | 3x ADOPTED | 4 / 4 / 4 | 8449ms |
+| sustained | 3x ADOPTED | 844 / 1765 / 943 | 10168ms |
+
+The sustained scenario -- the writer that lost 3/3 against the one-instant
+decision -- now adopts every boot, replaying its entire load-window
+backlog; its cost scales with that backlog (the 1765-replay boot took
+19.2s end to end against 44,150 units written meanwhile) and stays
+well under the ~45-60s rebuild it replaces. Both enforced bars passed in
+the same run ((a) 27.6% against 60, (b) 1.75x at bar). An aborted first
+attempt of this run is itself recorded evidence: at the previous 1024
+entry cap the sustained writer measured 914 and 997 buffered writes across
+a ~11s 5M boot window and overflowed on the third boot -- the measurement
+`maxBootGapEntries`' current value (4096) and its pin test are derived
+from (internal/engine/bootgap.go); at the new cap this run's worst boot
+buffered 1765 with zero overflows.
 
 ### A harness bug this run found and fixed
 

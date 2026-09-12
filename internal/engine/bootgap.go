@@ -12,16 +12,26 @@ import (
 // Boot gap buffer size caps. Exceeding either poisons the buffer (the file
 // is then rejected at adoption and boot falls through to the pg rebuild, the
 // pre-buffer behavior), so these bound memory without ever risking a wrong
-// adoption. The entry cap bounds the slice; the key cap bounds what the
-// entries' ChangeSets collectively name, since one batch flush can record
-// thousands of keys in a single entry. Both are sized for the real window
-// they cover -- the seconds a snapshot-file load takes at boot, during which
-// BloodHound's startup analysis writes land, plus adoption's bounded settle
-// wait (bootGapSettleTimeout, boot.go) -- not for an unbounded ingest
-// backlog, which is exactly the case the overflow poison exists to hand to
-// the rebuild path honestly.
+// adoption. The entry cap bounds the entries slice itself -- a counter and
+// a pointer each, ~64KiB at the cap -- while the key cap is what actually
+// bounds memory: it limits what the entries' ChangeSets collectively name,
+// since one batch flush can record thousands of keys in a single entry.
+//
+// The entry cap is evidence-based (measured 2026-09-13, 5M graph, pinned by
+// TestMeasuredBootGapCaps): applybench's sustained-writer boot scenario --
+// deliberately adversarial, tiny 25-unit batches issued flat out, ~90
+// ChangeSets/s, a shape that maximizes entries per second the way no real
+// ingest's large flushes do -- filled ~1000 entries across a ~11s 5M boot
+// window (8-9s file load plus part of the settle wait), landing exactly at
+// the previous cap of 1024 (repeats measured 914 and 997 buffered writes
+// replayed; the third overflowed). 4096 covers that measured worst rate
+// across the whole worst window (~9s load + the full 5s settle ≈ 14s x
+// 90/s ≈ 1260) with ~3x headroom, for ~48KiB more slice at the cap.
+// Real ingest shapes exhaust the key cap long before the entry cap; an
+// ingest backlog beyond EITHER cap is exactly the case the overflow poison
+// exists to hand to the rebuild path honestly.
 const (
-	maxBootGapEntries = 1024
+	maxBootGapEntries = 4096
 	maxBootGapKeys    = 1 << 18
 )
 

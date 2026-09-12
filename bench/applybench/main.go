@@ -482,12 +482,14 @@ type benchResult struct {
 	// settle-wait exists for.
 	replayAdopted     int
 	replayGapRejected int
+	replayOverflowed  int
 	replayCounts      []int64
 	replayBootDurs    []time.Duration
 	replayWritten     []int
 
 	sustainedReplayAdopted     int
 	sustainedReplayGapRejected int
+	sustainedReplayOverflowed  int
 	sustainedReplayCounts      []int64
 	sustainedReplayBootDurs    []time.Duration
 	sustainedReplayWritten     []int
@@ -1765,6 +1767,15 @@ func runSnapshotBoot(ctx context.Context, cfg config, dir string, repeat int) (t
 //     settle window closed -- a write outliving the wait. Rare in either
 //     scenario now, and the boot's fallback to a pg rebuild is correct
 //     when it happens.
+//   - OVERFLOW-REJECTED: "snapshot file rejected" for a buffer-cap poison
+//     ("boot write buffer poisoned: overflow: ..."): the writer
+//     outproduced the boot gap buffer's caps across the whole boot window
+//     -- the bounded-memory design handing the boot to the rebuild path
+//     honestly, exactly as documented. Counted and reported so a run at a
+//     scale beyond the caps' envelope says so instead of aborting; the
+//     caps themselves are sized from this scenario's own measurement
+//     (maxBootGapEntries' doc, internal/engine/bootgap.go), so at current
+//     caps and scale the expected count is zero.
 //
 // Any other rejection reason, or a boot that never reaches either marker
 // inside -cap, is a real defect and aborts the run.
@@ -1776,16 +1787,17 @@ func measureBootReplay(ctx context.Context, cfg config, base *baseGraph, result 
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	scenarios := []struct {
-		name      string
-		sustained bool
-		adopted   *int
-		rejected  *int
-		counts    *[]int64
-		bootDurs  *[]time.Duration
-		written   *[]int
+		name       string
+		sustained  bool
+		adopted    *int
+		rejected   *int
+		overflowed *int
+		counts     *[]int64
+		bootDurs   *[]time.Duration
+		written    *[]int
 	}{
-		{"burst", false, &result.replayAdopted, &result.replayGapRejected, &result.replayCounts, &result.replayBootDurs, &result.replayWritten},
-		{"sustained", true, &result.sustainedReplayAdopted, &result.sustainedReplayGapRejected, &result.sustainedReplayCounts, &result.sustainedReplayBootDurs, &result.sustainedReplayWritten},
+		{"burst", false, &result.replayAdopted, &result.replayGapRejected, &result.replayOverflowed, &result.replayCounts, &result.replayBootDurs, &result.replayWritten},
+		{"sustained", true, &result.sustainedReplayAdopted, &result.sustainedReplayGapRejected, &result.sustainedReplayOverflowed, &result.sustainedReplayCounts, &result.sustainedReplayBootDurs, &result.sustainedReplayWritten},
 	}
 
 	for _, sc := range scenarios {
@@ -1794,35 +1806,57 @@ func measureBootReplay(ctx context.Context, cfg config, base *baseGraph, result 
 				return fmt.Errorf("boot-replay save (%s, repeat %d): %w", sc.name, i, err)
 			}
 
-			adopted, replayed, bootDur, written, err := runBootWithConcurrentWrites(ctx, cfg, base, dir, i, sc.sustained)
+			outcome, replayed, bootDur, written, err := runBootWithConcurrentWrites(ctx, cfg, base, dir, i, sc.sustained)
 			if err != nil {
 				return err
 			}
 			*sc.written = append(*sc.written, written)
-			if adopted {
+			switch outcome {
+			case bootReplayAdopted:
 				*sc.adopted++
 				*sc.counts = append(*sc.counts, replayed)
 				*sc.bootDurs = append(*sc.bootDurs, bootDur)
 				fmt.Printf("applybench: %s repeat %d: boot ADOPTED the file, replayed_writes=%d open->loaded=%s (writer landed %d units meanwhile)\n",
 					sc.name, i+1, replayed, fmtMillis(bootDur), written)
-			} else {
+			case bootReplayGapRejected:
 				*sc.rejected++
 				fmt.Printf("applybench: %s repeat %d: boot GAP-REJECTED the file (a write outlived the settle window; writer landed %d units)\n", sc.name, i+1, written)
+			case bootReplayOverflowRejected:
+				*sc.overflowed++
+				fmt.Printf("applybench: %s repeat %d: boot OVERFLOW-REJECTED the file (the writer outproduced the boot gap buffer's caps across the whole window; writer landed %d units)\n", sc.name, i+1, written)
 			}
 		}
 
 		if *sc.adopted == 0 {
-			return fmt.Errorf("no %s-writer repeat ever adopted the snapshot file (%d/%d gap-rejected): losing every time is indistinguishable from the replay (or its settle-wait) never working -- investigate before trusting this build's restart path", sc.name, *sc.rejected, cfg.repeats)
+			return fmt.Errorf("no %s-writer repeat ever adopted the snapshot file (%d/%d gap-rejected, %d/%d overflowed): losing every time is indistinguishable from the replay (or its settle-wait) never working -- investigate before trusting this build's restart path", sc.name, *sc.rejected, cfg.repeats, *sc.overflowed, cfg.repeats)
 		}
 	}
 	return nil
 }
 
 // bootReplayGapReason is adoptSnapshotFileView's uncovered-gap rejection
-// reason (internal/engine/boot.go), the one rejection (e)'s own writer can
-// legitimately race the boot into; TestLogMessagesMatchEngineSource pins it
-// against the engine source alongside the message literals.
-const bootReplayGapReason = "boot gap not covered by buffered writes"
+// reason (internal/engine/boot.go): a write outlived the settle window.
+// bootReplayOverflowPrefix matches the buffer-poisoned rejection for a cap
+// overflow ("boot write buffer poisoned: " from the adoption path,
+// "overflow: ..." from the buffer's own poison reasons) -- the bounded-
+// memory design working as documented when a writer outproduces the caps
+// across the whole boot window. These are the two rejections (e)'s own
+// writers can legitimately drive the boot into; both pieces are pinned
+// against the engine source by TestLogMessagesMatchEngineSource alongside
+// the message literals.
+const (
+	bootReplayGapReason      = "boot gap not covered by buffered writes"
+	bootReplayOverflowPrefix = "boot write buffer poisoned: overflow: too many buffered"
+)
+
+// bootReplayOutcome is one (e) boot's result.
+type bootReplayOutcome int
+
+const (
+	bootReplayAdopted bootReplayOutcome = iota
+	bootReplayGapRejected
+	bootReplayOverflowRejected
+)
 
 // bootReplayBurstCalls and bootReplayBurstUnits shape (e)'s write burst:
 // bootReplayBurstCalls back-to-back writeIngestBatch calls of
@@ -1847,7 +1881,7 @@ const (
 // poll's cancel below). The writer's own error fails the repeat: a write
 // refused during boot would silently turn this phase into a quiet-restart
 // measurement.
-func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGraph, dir string, repeat int, sustained bool) (adopted bool, replayed int64, bootDur time.Duration, written int, err error) {
+func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGraph, dir string, repeat int, sustained bool) (outcome bootReplayOutcome, replayed int64, bootDur time.Duration, written int, err error) {
 	capture, restore := installLogCapture()
 	defer restore()
 
@@ -1857,7 +1891,7 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 	t0 := time.Now()
 	db, cleanup, err := openPhaseDriver(capCtx, cfg.dsn, phaseEnv{engineOn: true, compactEntries: 1 << 30, snapshotDir: dir})
 	if err != nil {
-		return false, 0, 0, 0, fmt.Errorf("open boot-replay driver (repeat %d): %w", repeat, err)
+		return bootReplayGapRejected, 0, 0, 0, fmt.Errorf("open boot-replay driver (repeat %d): %w", repeat, err)
 	}
 	defer cleanup()
 
@@ -1893,23 +1927,28 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 		}
 	}()
 
-	outcome := func() (bool, error) {
+	decide := func() (bootReplayOutcome, error) {
 		lastProgress := t0
 		for {
 			if capture.count(msgSnapshotFileLoaded) > 0 {
-				return true, nil
+				return bootReplayAdopted, nil
 			}
 			if capture.count(msgSnapshotFileRejected) > 0 {
 				reasons := capture.reasons(msgSnapshotFileRejected)
 				for _, r := range reasons {
-					if r != bootReplayGapReason {
-						return false, fmt.Errorf("repeat %d: boot rejected the file for %q -- only %q is a legitimate outcome of this phase's own writer racing the boot", repeat, r, bootReplayGapReason)
+					if r != bootReplayGapReason && !strings.HasPrefix(r, bootReplayOverflowPrefix) {
+						return bootReplayGapRejected, fmt.Errorf("repeat %d: boot rejected the file for %q -- only %q or a %q cap overflow is a legitimate outcome of this phase's own writers", repeat, r, bootReplayGapReason, bootReplayOverflowPrefix)
 					}
 				}
-				return false, nil
+				for _, r := range reasons {
+					if strings.HasPrefix(r, bootReplayOverflowPrefix) {
+						return bootReplayOverflowRejected, nil
+					}
+				}
+				return bootReplayGapRejected, nil
 			}
 			if capCtx.Err() != nil {
-				return false, fmt.Errorf("repeat %d: timed out waiting for the boot's file attempt to conclude (-cap=%s)", repeat, cfg.cap)
+				return bootReplayGapRejected, fmt.Errorf("repeat %d: timed out waiting for the boot's file attempt to conclude (-cap=%s)", repeat, cfg.cap)
 			}
 			if time.Since(lastProgress) >= 2*time.Second {
 				fmt.Printf("applybench: ... boot-replay repeat %d waiting for the file attempt (%s elapsed, writer at %d units)\n", repeat+1, fmtSeconds(time.Since(t0)), writerUnits.Load())
@@ -1922,26 +1961,26 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 		}
 	}
 
-	adopted, err = outcome()
+	outcome, err = decide()
 	bootDur = time.Since(t0)
 	stopWriter()
 	<-writerDone
 	written = int(writerUnits.Load())
 	if err != nil {
-		return false, 0, 0, written, err
+		return outcome, 0, 0, written, err
 	}
 	if writerErr != nil {
-		return false, 0, 0, written, fmt.Errorf("repeat %d: the writer failed mid-boot: %w", repeat, writerErr)
+		return outcome, 0, 0, written, fmt.Errorf("repeat %d: the writer failed mid-boot: %w", repeat, writerErr)
 	}
 
-	if adopted {
+	if outcome == bootReplayAdopted {
 		counts := capture.replayedCounts(msgSnapshotFileLoaded)
 		if len(counts) == 0 {
-			return false, 0, 0, written, fmt.Errorf("repeat %d: %q carried no replayed_writes attribute -- the marker contract changed under this bench", repeat, msgSnapshotFileLoaded)
+			return outcome, 0, 0, written, fmt.Errorf("repeat %d: %q carried no replayed_writes attribute -- the marker contract changed under this bench", repeat, msgSnapshotFileLoaded)
 		}
 		replayed = counts[len(counts)-1]
 	}
-	return adopted, replayed, bootDur, written, nil
+	return outcome, replayed, bootDur, written, nil
 }
 
 // ============================================================================
@@ -2190,16 +2229,16 @@ func (r *benchResult) report(enforce bool) bool {
 	replayBootP50 := percentile(r.replayBootDurs, 0.50)
 	sustainedBootP50 := percentile(r.sustainedReplayBootDurs, 0.50)
 	fmt.Printf("\n=== (e) boot adoption under concurrent writes (reported only, not enforced) ===\n")
-	fmt.Printf("applybench: burst:     adopted=%d gap_rejected=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
-		r.replayAdopted, r.replayGapRejected, r.replayAdopted+r.replayGapRejected, r.replayCounts, r.replayWritten)
-	fmt.Printf("applybench: sustained: adopted=%d gap_rejected=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
-		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, r.sustainedReplayAdopted+r.sustainedReplayGapRejected, r.sustainedReplayCounts, r.sustainedReplayWritten)
+	fmt.Printf("applybench: burst:     adopted=%d gap_rejected=%d overflowed=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
+		r.replayAdopted, r.replayGapRejected, r.replayOverflowed, r.replayAdopted+r.replayGapRejected+r.replayOverflowed, r.replayCounts, r.replayWritten)
+	fmt.Printf("applybench: sustained: adopted=%d gap_rejected=%d overflowed=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
+		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, r.sustainedReplayOverflowed, r.sustainedReplayAdopted+r.sustainedReplayGapRejected+r.sustainedReplayOverflowed, r.sustainedReplayCounts, r.sustainedReplayWritten)
 	fmt.Printf("applybench: boot under burst writes,     open -> file loaded  p50=%s: %s\n", fmtMillis(replayBootP50), fmtDurationsMs(r.replayBootDurs))
 	fmt.Printf("applybench: boot under sustained writes, open -> file loaded  p50=%s: %s\n", fmtMillis(sustainedBootP50), fmtDurationsMs(r.sustainedReplayBootDurs))
-	fmt.Printf("APPLYBENCH_BOOT_REPLAY adopted=%d gap_rejected=%d boot_p50_ms=%.3f max_replayed=%d\n",
-		r.replayAdopted, r.replayGapRejected, floatMillis(replayBootP50), maxInt64(r.replayCounts))
-	fmt.Printf("APPLYBENCH_BOOT_REPLAY_SUSTAINED adopted=%d gap_rejected=%d boot_p50_ms=%.3f max_replayed=%d\n",
-		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, floatMillis(sustainedBootP50), maxInt64(r.sustainedReplayCounts))
+	fmt.Printf("APPLYBENCH_BOOT_REPLAY adopted=%d gap_rejected=%d overflowed=%d boot_p50_ms=%.3f max_replayed=%d\n",
+		r.replayAdopted, r.replayGapRejected, r.replayOverflowed, floatMillis(replayBootP50), maxInt64(r.replayCounts))
+	fmt.Printf("APPLYBENCH_BOOT_REPLAY_SUSTAINED adopted=%d gap_rejected=%d overflowed=%d boot_p50_ms=%.3f max_replayed=%d\n",
+		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, r.sustainedReplayOverflowed, floatMillis(sustainedBootP50), maxInt64(r.sustainedReplayCounts))
 
 	allOK := overheadOK && latencyOK
 	fmt.Printf("\nAPPLYBENCH_ENFORCE checked=%t ok=%t\n", enforce, allOK)

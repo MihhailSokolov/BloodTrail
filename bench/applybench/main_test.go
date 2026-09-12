@@ -299,9 +299,14 @@ func TestLogMessagesMatchEngineSource(t *testing.T) {
 		{msgSnapshotFileRejected, "../../internal/engine/boot.go"},
 		{msgWriteThroughApplied, "../../internal/engine/apply.go"},
 		{msgPathEngineServed, "../../internal/engine/engine.go"},
-		// Not a message but pinned by the same discipline: (e)'s one
-		// accepted rejection reason must stay the engine's own literal.
+		// Not messages but pinned by the same discipline: (e)'s accepted
+		// rejection reasons must stay the engine's own literals -- the
+		// uncovered-gap reason, and the two pieces bootReplayOverflowPrefix
+		// is assembled from (the adoption path's poisoned-buffer prefix
+		// plus the buffer's own overflow reason).
 		{bootReplayGapReason, "../../internal/engine/boot.go"},
+		{"boot write buffer poisoned: ", "../../internal/engine/boot.go"},
+		{"overflow: too many buffered writes", "../../internal/engine/bootgap.go"},
 	}
 
 	for _, c := range cases {

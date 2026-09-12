@@ -214,7 +214,7 @@ caller has already been told committed.
   the 5s wait. A boot-time write whose effect cannot be expressed as a replay -- raw
   Cypher, a wipe, the same closed list ordinary write-through falls back on -- trips
   fallback and rejects the file immediately (nothing to wait for), as does a buffer
-  that outgrew its caps (1024 writes / 262,144 keys) under a genuinely heavy boot.
+  that outgrew its caps (4,096 writes / 262,144 keys) under a genuinely heavy boot.
   Each rejection is logged at Info with a `reason` and is followed by an ordinary
   `snapshot rebuilt` line; an adoption logs `snapshot file loaded` with a
   `replayed_writes` count.
