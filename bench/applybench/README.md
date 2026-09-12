@@ -173,6 +173,48 @@ the file. The wait below doubles as the harness-side regression check for
 that: if the boot path ever stops reaching the file again, (d) fails loudly
 instead of quietly reporting a parse timing in its place.
 
+### (e) Boot adoption under concurrent writes
+
+The end-to-end proof of the boot gap buffer (`internal/engine/bootgap.go`):
+recognized writes landing while the snapshot file loads must not cost the
+file its adoption. BloodHound writes to the graph within milliseconds of
+every real boot (its startup analysis request plus a zero-start-delay data
+pipe), so a restart path that only worked on a perfectly quiet boot would
+be unreachable in production -- exactly what the plain watermark-equality
+check used to make it at scale.
+
+Each repeat saves a file through a real driver `Close` exactly as (d) does,
+then opens a fresh production driver and fires a **burst** of (a)'s own
+objectid-keyed ingest shape at it from the instant the open returns -- 4
+batch calls of 25 units, then silence -- so writes land inside the
+boot-load window and are done committing before it ends. The burst shape is
+load-bearing: a batch write's watermark bump commits when its first
+operation is buffered (eagerly) while its Apply only lands at the flush
+that commits the chunk, so a writer that *never* stops keeps an
+unaccounted in-flight bump alive at essentially every instant and the
+adoption correctly rejects essentially every time (measured: a flat-out
+writer lost 3/3 at smoke scale). That is the documented outcome for a
+restart landing mid-ingest -- sustained writes supersede the file, exactly
+as before the buffer existed -- while every ordinary BloodHound boot
+produces the burst-then-quiet shape this phase models. Two outcomes are
+legitimate:
+
+- **ADOPTED** -- `"bloodtrail: snapshot file loaded"` with its
+  `replayed_writes` attribute counting the buffered writes folded onto the
+  file before publication. The expected outcome; at least one repeat must
+  land on it or the phase fails. (On a graph small enough that the load
+  outruns the burst's first commit, `replayed_writes` can be legitimately
+  0 -- the writes simply landed after adoption as ordinary deltas.)
+- **GAP-REJECTED** -- `"bloodtrail: snapshot file rejected"` with reason
+  `boot gap not covered by buffered writes`: one of the burst's own bumps
+  was still in flight at the decision instant. Rare under a finite burst,
+  and the pg-rebuild fallback is correct when it happens.
+
+Any other rejection reason, a writer error mid-boot, or a boot that reaches
+neither marker inside `-cap` aborts the run. Reported only, never enforced
+(the same judgment as (c)/(d): correctness either way, and the cost either
+way is a background rebuild, not a served query's latency).
+
 Every measurement prints a human-readable line and a machine-greppable
 `APPLYBENCH_*` summary line (`grep '^APPLYBENCH_'`), ending in
 `APPLYBENCH_RESULT PASS` or `FAIL`.
@@ -333,8 +375,8 @@ make bench-apply ARGS='-users 50000'
 comfortably in about a minute at this scale against ordinary hardware -- `-cap`'s 10-minute default
 is a safety ceiling for this smoke run, not the expected runtime. Do **not**
 pass `-enforce` at this scale for anything beyond validating the harness
-itself runs end to end: 50,000 users is far too small a graph, and the two
-enforced bars are themselves PROVISIONAL (see above) -- a pass or fail here
+itself runs end to end: 50,000 users is far too small a graph for the two
+enforced bars' 5M-scale derivations to mean anything -- a pass or fail here
 proves the harness works, not that the engine meets its real bar.
 
 `applybench` requires a graph already loaded (it discovers an existing
@@ -415,6 +457,34 @@ rebuild) measured 45.1-50.7s across the three base-graph loads (the
 (10.4-14.0s, including the driver-open overhead a bare `LoadSnapshot` call
 doesn't pay) is **roughly 3-5x faster** than rebuilding from PostgreSQL at
 this scale, the whole reason the snapshot file exists.
+
+**(e) boot adoption under concurrent writes** -- measured 2026-09-12, two
+full 5M-scale runs (the phase landed after the four runs above; same graph
+recipe, ~4.8M nodes / ~48.9M edges, same shared machine):
+
+| Run | Outcomes (of 3 boots) | replayed_writes per adoption | boot under writes (open -> loaded), p50 |
+|---|---|---|---:|
+| 1 | 3x ADOPTED | 4 / 4 / 4 | 8787ms |
+| 2 | 3x ADOPTED | 4 / 4 / 4 | 11513ms |
+
+**Six boots, six adoptions, zero gap-rejections**, each with a 100-unit
+burst (200 upsert operations across 4 batch scopes) landing inside the
+load window and all four buffered ChangeSets replayed onto the file before
+publication -- the boot gap buffer doing at production scale exactly what
+it was built for, at a boot cost indistinguishable from (d)'s quiet boots
+(8.6-11.8s individual observations vs (d)'s 10.4-14.0s p50 range). The
+buffer's caps were never approached: 4 entries against 1024, ~200 keys
+against 262,144 -- a real BloodHound boot's startup-analysis burst is the
+same order of magnitude as this phase's, far below either cap.
+
+These two runs also re-passed both enforced bars on the same day's
+heavily-reused database (run 2: (a) 46.0% against the 60% cap, (b) 1.75x
+exactly at its bar) -- and a run between them produced this package's
+adoption-wait fix: a fixed 2x-build-duration sleep undershot one boot on
+the day's I/O-worn disk, (d)'s save driver reached `Close` before any View
+existed, and the phase failed on a race the harness itself manufactured.
+Every phase now waits on the engine's own adoption marker
+(`waitForAdoption`, main.go) instead of predicting boot duration.
 
 ### A harness bug this run found and fixed
 

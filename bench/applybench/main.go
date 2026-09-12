@@ -69,6 +69,16 @@
 //     load runs on its own background goroutine with no other way to
 //     observe adoption from outside the driver). See measureSnapshotIO for
 //     what each of the three includes and excludes.
+//   - (e) snapshot-file boot adoption under concurrent writes: (d)'s save,
+//     then a fresh production driver opened against the same directory with
+//     (a)'s ingest shape hammering it from the instant the open returns, so
+//     writes land inside the boot-load window -- the bench-side stand-in
+//     for BloodHound's own startup-analysis writes, which land within
+//     milliseconds of every real boot. Asserts the boot gap buffer's whole
+//     point end to end: the file is still ADOPTED, with the loaded marker's
+//     replayed_writes counting the buffered writes folded in (the one
+//     legitimate alternative is the documented conservative gap-rejection
+//     race; anything else fails). See measureBootReplay.
 //
 // (a) and (b) additionally assert, via the engine's own log markers, that
 // the engine really applied ("bloodtrail: write-through applied") and, for
@@ -145,6 +155,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -207,6 +218,7 @@ var (
 // bench/cypherbench's own served-marker assertion makes.
 const (
 	msgCompactionFinished   = "bloodtrail: compaction finished"
+	msgSnapshotRebuilt      = "bloodtrail: snapshot rebuilt"
 	msgSnapshotWritten      = "bloodtrail: snapshot file written"
 	msgSnapshotFileLoaded   = "bloodtrail: snapshot file loaded"
 	msgSnapshotFileRejected = "bloodtrail: snapshot file rejected"
@@ -459,6 +471,17 @@ type benchResult struct {
 	saveLoggedDurations []time.Duration
 	loadDurations       []time.Duration
 	bootDurations       []time.Duration
+
+	// (e)'s outcomes: how many boots adopted the file (with how many
+	// buffered writes replayed onto it, and how long the open->loaded path
+	// took) versus how many were superseded by the one legitimate
+	// conservative race (a gap-rejection), plus how many ingest units the
+	// concurrent writer landed per repeat.
+	replayAdopted     int
+	replayGapRejected int
+	replayCounts      []int64
+	replayBootDurs    []time.Duration
+	replayWritten     []int
 }
 
 // execute runs every measurement against cfg.dsn and returns the collected
@@ -498,6 +521,11 @@ func execute(ctx context.Context, cfg config) (*benchResult, error) {
 		return nil, fmt.Errorf("snapshot file I/O: %w", err)
 	}
 
+	fmt.Println("\n=== running (e) snapshot-file boot adoption under concurrent writes ===")
+	if err := measureBootReplay(ctx, cfg, base, result); err != nil {
+		return nil, fmt.Errorf("boot replay: %w", err)
+	}
+
 	return result, nil
 }
 
@@ -522,9 +550,11 @@ type baseGraph struct {
 // User's MemberOf hub, and a pool of (User, Computer) id pairs to sample
 // for the latency measurements. It also times one throwaway
 // engine.LoadSnapshot call, exactly as bench/builderbench/bench/cypherbench
-// do, both to report the base graph's size and as the safety-multiple input
-// waitForBoot uses before any later phase starts issuing writes/queries
-// against a freshly opened driver.
+// do, to report the base graph's size and build cost. (An earlier version
+// also used that duration as the safety multiple behind a fixed
+// wait-for-boot sleep; every phase now waits on the engine's own adoption
+// marker instead -- waitForAdoption's doc has the failure that forced
+// this.)
 //
 // The returned cleanup func drops the scratch objectid-upsert unique
 // constraint benchSchema's own AssertSchema call creates (see its doc for
@@ -818,19 +848,44 @@ func nodeByKindOffset(ctx context.Context, pool *pgxpool.Pool, graphID int32, ki
 	return uint64(id), obj, err
 }
 
-// waitForBoot sleeps a safety multiple of buildDuration -- see
-// bench/builderbench's/bench/cypherbench's identical wait for the full
-// rationale: there is no exported hook to observe the bloodtrail driver's
-// Start-launched boot-load goroutine actually adopting its first snapshot,
-// so this waits a safety multiple of the throwaway build cost
-// discoverBaseGraph already measured instead. A 1s floor keeps a
-// near-instant build (a tiny smoke-scale graph) from racing it.
-func waitForBoot(buildDuration time.Duration) {
-	wait := 2*buildDuration + 500*time.Millisecond
-	if wait < time.Second {
-		wait = time.Second
+// waitForAdoption blocks until the engine whose logs capture is recording
+// announces its first adopted snapshot -- a PostgreSQL boot rebuild
+// ("bloodtrail: snapshot rebuilt") or a snapshot-file boot ("bloodtrail:
+// snapshot file loaded") -- and replaces the fixed sleep this package used
+// to take here. The sleep (2x a build duration measured once, at run
+// start) undershot exactly once, on a run whose own earlier phases had
+// left the database's I/O slower than the measurement's: (d)'s save driver
+// then reached Close before any View existed, SaveSnapshot declined on its
+// preconditions, and the phase failed on a race the harness itself
+// manufactured. The engine says, in its own log, when it has adopted;
+// waiting for that statement instead of predicting it is the same
+// check-progress-not-liveness discipline every other wait in this package
+// already follows (runSnapshotBoot, runBootWithConcurrentWrites).
+//
+// cap bounds the wait through its own context: a boot that never adopts is
+// a real failure the caller must report, not sleep through.
+func waitForAdoption(ctx context.Context, capture *logCapture, cap time.Duration) error {
+	deadline, cancel := context.WithTimeout(ctx, cap)
+	defer cancel()
+
+	start := time.Now()
+	lastProgress := start
+	for {
+		if capture.count(msgSnapshotRebuilt) > 0 || capture.count(msgSnapshotFileLoaded) > 0 {
+			return nil
+		}
+		if deadline.Err() != nil {
+			return fmt.Errorf("timed out waiting for the engine's first adoption (%q or %q) after %s (-cap=%s)", msgSnapshotRebuilt, msgSnapshotFileLoaded, fmtSeconds(time.Since(start)), cap)
+		}
+		if time.Since(lastProgress) >= 10*time.Second {
+			fmt.Printf("applybench: ... waiting for the engine's first adoption (%s elapsed)\n", fmtSeconds(time.Since(start)))
+			lastProgress = time.Now()
+		}
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-deadline.Done():
+		}
 	}
-	time.Sleep(wait)
 }
 
 // phaseEnv is one dawgs.Open call's worth of BloodTrail environment
@@ -992,12 +1047,14 @@ func runArm(ctx context.Context, cfg config, base *baseGraph, env phaseEnv, tag 
 	defer cleanup()
 
 	if env.engineOn {
-		waitForBoot(base.buildDuration)
+		if err := waitForAdoption(ctx, capture, cfg.cap); err != nil {
+			return 0, 0, fmt.Errorf("%s arm (repeat %d): %w", tag, repeat, err)
+		}
 	}
-	// No waitForBoot when the engine is off: Start is a no-op for a disabled
-	// engine (internal/engine/boot.go's Start), so there is no boot-load
-	// goroutine to wait for -- and waiting anyway would only lengthen the
-	// wall clock this arm is not being timed on.
+	// No adoption wait when the engine is off: Start is a no-op for a
+	// disabled engine (internal/engine/boot.go's Start), so there is no
+	// boot-load goroutine to wait for -- and waiting anyway would only
+	// lengthen the wall clock this arm is not being timed on.
 
 	d, err := runIngestCapped(ctx, db, base.hubObjectID, cfg.ingest, cfg.flush, cfg.runID, tag, repeat, cfg.cap)
 	if err != nil {
@@ -1054,7 +1111,9 @@ func measureLatencyUnderIngest(ctx context.Context, cfg config, base *baseGraph,
 		return fmt.Errorf("open latency driver: %w", err)
 	}
 	defer cleanup()
-	waitForBoot(base.buildDuration)
+	if err := waitForAdoption(ctx, capture, cfg.cap); err != nil {
+		return fmt.Errorf("latency driver boot: %w", err)
+	}
 
 	fmt.Printf("applybench: warming up (%d discarded queries) ...\n", warmupQueries)
 	if _, err := sampleQueryLatenciesCapped(ctx, db, base.pairs, warmupQueries, cfg.cap); err != nil {
@@ -1404,7 +1463,9 @@ func measureCompaction(ctx context.Context, cfg config, base *baseGraph, result 
 		return fmt.Errorf("open compaction-forcing driver: %w", err)
 	}
 	defer cleanup()
-	waitForBoot(base.buildDuration)
+	if err := waitForAdoption(capCtx, capture, cfg.cap); err != nil {
+		return fmt.Errorf("compaction driver boot: %w", err)
+	}
 
 	// Each flush's own delta should comfortably exceed compactEntries.
 	//
@@ -1571,7 +1632,12 @@ func runSnapshotSave(ctx context.Context, cfg config, base *baseGraph, dir strin
 	if err != nil {
 		return 0, 0, fmt.Errorf("open save driver (repeat %d): %w", repeat, err)
 	}
-	waitForBoot(base.buildDuration)
+	if err := waitForAdoption(capCtx, capture, cfg.cap); err != nil {
+		// cleanup here, not deferred: the ordinary path times cleanup()
+		// itself as the measured Close, so only this early exit owns it.
+		cleanup()
+		return 0, 0, fmt.Errorf("save driver boot (repeat %d): %w", repeat, err)
+	}
 
 	// A tiny write gives every repeat's file a fresh, distinguishable
 	// watermark; small enough not to matter to the timing. It is also what
@@ -1641,6 +1707,201 @@ func runSnapshotBoot(ctx context.Context, cfg config, dir string, repeat int) (t
 }
 
 // ============================================================================
+// (e): snapshot-file boot adoption under concurrent writes
+// ============================================================================
+
+// measureBootReplay proves, at whatever scale the loaded graph provides, the
+// property the boot gap buffer exists for (internal/engine/bootgap.go):
+// recognized writes landing while the snapshot file loads must not cost the
+// file its adoption -- they are buffered, proven complete against the
+// watermark gap, and replayed onto the loaded snapshot before it is
+// published. BloodHound does this to every real boot (its startup analysis
+// writes within milliseconds of the API coming up, then goes quiet), so this
+// phase is the bench-side stand-in for a production restart: per repeat,
+// save a file through a real driver Close exactly as (d) does, then reopen a
+// fresh production driver and fire a BURST of (a)'s own ingest write shape
+// at it from the moment the open returns, so the writes land inside the
+// boot-load window and are done before it ends.
+//
+// The burst shape is load-bearing, not a convenience. A batch write's
+// watermark bump commits when its first operation is buffered (eager,
+// write_observer.go's ensureBumped) while its Apply -- the call the boot
+// gap buffer observes -- only runs at the flush that commits the chunk, so
+// a writer that never stops keeps an unaccounted in-flight bump alive at
+// essentially every instant, and the adoption decision, refusing to guess
+// about a counter nothing accounts for, correctly rejects essentially every
+// time (a smoke run measured exactly that: a flat-out writer lost 3/3).
+// That is the documented behavior for a restart landing mid-ingest --
+// sustained writes supersede the file, today as before -- and this phase
+// exists to prove the case the feature is FOR: the burst-then-quiet shape
+// every ordinary BloodHound boot produces.
+//
+// Two outcomes are legitimate, and both are reported rather than barred
+// (like (c) and (d), this phase measures; only an outcome neither of these
+// explains fails the run):
+//
+//   - ADOPTED: "snapshot file loaded", with the marker's replayed_writes
+//     attr counting the buffered writes folded in. The expected outcome, and
+//     at least one repeat must land on it -- a phase that never once proves
+//     the replay is not evidence of anything. (On a graph small enough that
+//     the load outruns the burst's first commit, replayed_writes is
+//     legitimately 0 -- the writes simply landed after adoption, as ordinary
+//     deltas; only a large graph makes this phase bite.)
+//   - GAP-REJECTED: "snapshot file rejected" with reason "boot gap not
+//     covered by buffered writes": one of the burst's own bumps was still
+//     in flight at the decision instant. Rare under a finite burst, and the
+//     boot's fallback to a pg rebuild is correct when it happens.
+//
+// Any other rejection reason, or a boot that never reaches either marker
+// inside -cap, is a real defect and aborts the run.
+func measureBootReplay(ctx context.Context, cfg config, base *baseGraph, result *benchResult) error {
+	dir, err := os.MkdirTemp("", "applybench-bootreplay-*")
+	if err != nil {
+		return fmt.Errorf("create scratch snapshot dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	for i := 0; i < cfg.repeats; i++ {
+		if _, _, err := runSnapshotSave(ctx, cfg, base, dir, i); err != nil {
+			return fmt.Errorf("boot-replay save (repeat %d): %w", i, err)
+		}
+
+		adopted, replayed, bootDur, written, err := runBootWithConcurrentWrites(ctx, cfg, base, dir, i)
+		if err != nil {
+			return err
+		}
+		result.replayWritten = append(result.replayWritten, written)
+		if adopted {
+			result.replayAdopted++
+			result.replayCounts = append(result.replayCounts, replayed)
+			result.replayBootDurs = append(result.replayBootDurs, bootDur)
+			fmt.Printf("applybench: repeat %d: boot ADOPTED the file, replayed_writes=%d open->loaded=%s (writer landed %d units meanwhile)\n",
+				i+1, replayed, fmtMillis(bootDur), written)
+		} else {
+			result.replayGapRejected++
+			fmt.Printf("applybench: repeat %d: boot GAP-REJECTED the file (the documented conservative race; writer landed %d units)\n", i+1, written)
+		}
+	}
+
+	if result.replayAdopted == 0 {
+		return fmt.Errorf("no repeat ever adopted the snapshot file under concurrent writes (%d/%d gap-rejected): the conservative race losing every time is indistinguishable from the replay never working -- investigate before trusting this build's restart path", result.replayGapRejected, cfg.repeats)
+	}
+	return nil
+}
+
+// bootReplayGapReason is adoptSnapshotFileView's uncovered-gap rejection
+// reason (internal/engine/boot.go), the one rejection (e)'s own writer can
+// legitimately race the boot into; TestLogMessagesMatchEngineSource pins it
+// against the engine source alongside the message literals.
+const bootReplayGapReason = "boot gap not covered by buffered writes"
+
+// bootReplayBurstCalls and bootReplayBurstUnits shape (e)'s write burst:
+// bootReplayBurstCalls back-to-back writeIngestBatch calls of
+// bootReplayBurstUnits units each, fired the moment the driver open
+// returns and then STOPPED -- the burst-then-quiet shape
+// measureBootReplay's own doc explains is load-bearing. 4x25 units lands
+// ~100 writes (200 upsert operations) across a handful of batch commits:
+// comfortably inside a multi-second load window at 5M scale, done
+// committing long before the adoption decision runs, and an order of
+// magnitude below the boot gap buffer's own entry cap.
+const (
+	bootReplayBurstCalls = 4
+	bootReplayBurstUnits = 25
+)
+
+// runBootWithConcurrentWrites is (e)'s boot half for one repeat: open a
+// fresh production driver against dir and, from the moment the open
+// returns, fire the write burst through that same driver -- so the writes
+// land inside the load window and exercise the boot gap buffer, not after
+// adoption. The writer's own error fails the repeat: a write refused during
+// boot would silently turn this phase into a quiet-restart measurement.
+func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGraph, dir string, repeat int) (adopted bool, replayed int64, bootDur time.Duration, written int, err error) {
+	capture, restore := installLogCapture()
+	defer restore()
+
+	capCtx, cancel := context.WithTimeout(ctx, cfg.cap)
+	defer cancel()
+
+	t0 := time.Now()
+	db, cleanup, err := openPhaseDriver(capCtx, cfg.dsn, phaseEnv{engineOn: true, compactEntries: 1 << 30, snapshotDir: dir})
+	if err != nil {
+		return false, 0, 0, 0, fmt.Errorf("open boot-replay driver (repeat %d): %w", repeat, err)
+	}
+	defer cleanup()
+
+	// writerUnits is atomic because the outcome poll below prints it live
+	// while the burst goroutine is still advancing it; writerErr needs no
+	// synchronization beyond writerDone, which is always received before it
+	// is read.
+	var (
+		writerDone  = make(chan struct{})
+		writerUnits atomic.Int64
+		writerErr   error
+	)
+	go func() {
+		defer close(writerDone)
+		for call := 0; call < bootReplayBurstCalls; call++ {
+			if _, err := writeIngestBatch(capCtx, db, base.hubObjectID, bootReplayBurstUnits, 2*bootReplayBurstUnits, cfg.runID, fmt.Sprintf("bootreplay%d", repeat), call); err != nil {
+				if capCtx.Err() == nil {
+					writerErr = err
+				}
+				return
+			}
+			writerUnits.Add(bootReplayBurstUnits)
+		}
+	}()
+
+	outcome := func() (bool, error) {
+		lastProgress := t0
+		for {
+			if capture.count(msgSnapshotFileLoaded) > 0 {
+				return true, nil
+			}
+			if capture.count(msgSnapshotFileRejected) > 0 {
+				reasons := capture.reasons(msgSnapshotFileRejected)
+				for _, r := range reasons {
+					if r != bootReplayGapReason {
+						return false, fmt.Errorf("repeat %d: boot rejected the file for %q -- only %q is a legitimate outcome of this phase's own writer racing the boot", repeat, r, bootReplayGapReason)
+					}
+				}
+				return false, nil
+			}
+			if capCtx.Err() != nil {
+				return false, fmt.Errorf("repeat %d: timed out waiting for the boot's file attempt to conclude (-cap=%s)", repeat, cfg.cap)
+			}
+			if time.Since(lastProgress) >= 2*time.Second {
+				fmt.Printf("applybench: ... boot-replay repeat %d waiting for the file attempt (%s elapsed, writer at %d units)\n", repeat+1, fmtSeconds(time.Since(t0)), writerUnits.Load())
+				lastProgress = time.Now()
+			}
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-capCtx.Done():
+			}
+		}
+	}
+
+	adopted, err = outcome()
+	bootDur = time.Since(t0)
+	<-writerDone
+	written = int(writerUnits.Load())
+	if err != nil {
+		return false, 0, 0, written, err
+	}
+	if writerErr != nil {
+		return false, 0, 0, written, fmt.Errorf("repeat %d: the burst writer failed mid-boot: %w", repeat, writerErr)
+	}
+
+	if adopted {
+		counts := capture.replayedCounts(msgSnapshotFileLoaded)
+		if len(counts) == 0 {
+			return false, 0, 0, written, fmt.Errorf("repeat %d: %q carried no replayed_writes attribute -- the marker contract changed under this bench", repeat, msgSnapshotFileLoaded)
+		}
+		replayed = counts[len(counts)-1]
+	}
+	return adopted, replayed, bootDur, written, nil
+}
+
+// ============================================================================
 // logCapture
 // ============================================================================
 
@@ -1681,9 +1942,12 @@ type logCapture struct {
 }
 
 type logEvent struct {
-	at       time.Time
-	duration time.Duration
-	hasDur   bool
+	at          time.Time
+	duration    time.Duration
+	hasDur      bool
+	replayed    int64
+	hasReplayed bool
+	reason      string
 }
 
 func newLogCapture() *logCapture {
@@ -1711,9 +1975,15 @@ func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
 func (c *logCapture) Handle(ctx context.Context, r slog.Record) error {
 	ev := logEvent{at: r.Time}
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "duration" && a.Value.Kind() == slog.KindDuration {
+		switch {
+		case a.Key == "duration" && a.Value.Kind() == slog.KindDuration:
 			ev.duration = a.Value.Duration()
 			ev.hasDur = true
+		case a.Key == "replayed_writes" && a.Value.Kind() == slog.KindInt64:
+			ev.replayed = a.Value.Int64()
+			ev.hasReplayed = true
+		case a.Key == "reason" && a.Value.Kind() == slog.KindString:
+			ev.reason = a.Value.String()
 		}
 		return true
 	})
@@ -1750,6 +2020,38 @@ func (c *logCapture) durations(message string) []time.Duration {
 	for _, e := range c.events[message] {
 		if e.hasDur {
 			out = append(out, e.duration)
+		}
+	}
+	return out
+}
+
+// replayedCounts returns the "replayed_writes" attribute of every captured
+// record matching message that carried one, in capture order -- how (e)
+// reads the loaded marker's replay count (internal/engine/boot.go's
+// tryLoadSnapshotFile stamps it on "bloodtrail: snapshot file loaded").
+func (c *logCapture) replayedCounts(message string) []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int64, 0, len(c.events[message]))
+	for _, e := range c.events[message] {
+		if e.hasReplayed {
+			out = append(out, e.replayed)
+		}
+	}
+	return out
+}
+
+// reasons returns the "reason" attribute of every captured record matching
+// message that carried one, in capture order -- how (e) discriminates the
+// one legitimate rejection its own writer can race the boot into from every
+// rejection that would be a real defect.
+func (c *logCapture) reasons(message string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.events[message]))
+	for _, e := range c.events[message] {
+		if e.reason != "" {
+			out = append(out, e.reason)
 		}
 	}
 	return out
@@ -1842,6 +2144,14 @@ func (r *benchResult) report(enforce bool) bool {
 	fmt.Printf("APPLYBENCH_SNAPSHOT_IO save_p50_ms=%.3f save_logged_p50_ms=%.3f load_p50_ms=%.3f boot_p50_ms=%.3f\n",
 		floatMillis(saveP50), floatMillis(saveLoggedP50), floatMillis(loadP50), floatMillis(bootP50))
 
+	replayBootP50 := percentile(r.replayBootDurs, 0.50)
+	fmt.Printf("\n=== (e) boot adoption under concurrent writes (reported only, not enforced) ===\n")
+	fmt.Printf("applybench: adopted=%d gap_rejected=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
+		r.replayAdopted, r.replayGapRejected, r.replayAdopted+r.replayGapRejected, r.replayCounts, r.replayWritten)
+	fmt.Printf("applybench: boot under writes, open -> file loaded  p50=%s: %s\n", fmtMillis(replayBootP50), fmtDurationsMs(r.replayBootDurs))
+	fmt.Printf("APPLYBENCH_BOOT_REPLAY adopted=%d gap_rejected=%d boot_p50_ms=%.3f max_replayed=%d\n",
+		r.replayAdopted, r.replayGapRejected, floatMillis(replayBootP50), maxInt64(r.replayCounts))
+
 	allOK := overheadOK && latencyOK
 	fmt.Printf("\nAPPLYBENCH_ENFORCE checked=%t ok=%t\n", enforce, allOK)
 	if allOK {
@@ -1913,6 +2223,19 @@ func percentile(durations []time.Duration, p float64) time.Duration {
 		idx = len(sorted) - 1
 	}
 	return sorted[idx]
+}
+
+// maxInt64 returns the largest value in vs, or 0 for an empty slice -- (e)'s
+// summary line reports the largest per-boot replay count observed, the
+// number to compare against the boot gap buffer's own entry cap.
+func maxInt64(vs []int64) int64 {
+	var m int64
+	for _, v := range vs {
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
 
 func passFail(ok bool) string {

@@ -293,11 +293,15 @@ func TestLogMessagesMatchEngineSource(t *testing.T) {
 		file    string
 	}{
 		{msgCompactionFinished, "../../internal/engine/compact.go"},
+		{msgSnapshotRebuilt, "../../internal/engine/engine.go"},
 		{msgSnapshotWritten, "../../internal/engine/persist.go"},
 		{msgSnapshotFileLoaded, "../../internal/engine/boot.go"},
 		{msgSnapshotFileRejected, "../../internal/engine/boot.go"},
 		{msgWriteThroughApplied, "../../internal/engine/apply.go"},
 		{msgPathEngineServed, "../../internal/engine/engine.go"},
+		// Not a message but pinned by the same discipline: (e)'s one
+		// accepted rejection reason must stay the engine's own literal.
+		{bootReplayGapReason, "../../internal/engine/boot.go"},
 	}
 
 	for _, c := range cases {
