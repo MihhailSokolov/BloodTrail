@@ -44,10 +44,12 @@ import (
 // explicit upper bound in the query text (`*1..5`) always overrides this,
 // even if it is larger than 15 -- see buildStep.
 //
-// This constant's natural home is the engine package, alongside
-// maxCypherRows/maxCypherWork/edgePropsBatchSize (engine/serve_cypher.go);
-// it is defined here, exported, so this package stays self-contained, and a
-// caller can be re-pointed at the engine's copy without changing its value.
+// This constant's natural home would be the engine package, alongside
+// maxCypherRows/maxCypherWork/edgePropsBatchSize (engine/serve_cypher.go),
+// but this package sits below the engine in the import graph (the engine
+// imports interpret, never the reverse), so the authoritative copy must
+// live here, exported and self-contained -- the budget-constants doc in
+// engine/serve_cypher.go explains the same constraint from its side.
 const MaxExpansionDepth = 15
 
 // --- Query IR ---------------------------------------------------------------

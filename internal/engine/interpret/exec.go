@@ -1227,8 +1227,8 @@ func candidateIdentity(snap *snapshot.View, c adjCandidate) uint64 {
 //   - Direction == Both, step.FromSym == step.ToSym (a literal same-symbol
 //     pattern, e.g. `(n)-[:E]-(n)`): the inequality guard above does not
 //     apply -- excluding other == bound here would make every such pattern
-//     deterministically match nothing, which is exactly Finding 1 of the
-//     2026-09-05 milestone-4 review. This mirrors dawgs'
+//     deterministically match nothing, silently diverging from pg, which
+//     does match self-loops for this shape. This mirrors dawgs'
 //     buildSelfReferentialDirectionlessTraversalRoot, the branch reached for
 //     exactly this shape, which applies no equivalent inequality guard
 //     (its comment: "push the right-node join condition into WHERE so that
