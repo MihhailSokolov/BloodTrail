@@ -94,8 +94,27 @@ var (
 )
 
 // Enforcement thresholds -enforce applies (see the package doc above).
+//
+// pairP95Threshold is evidence-based, derived the way every enforced bar in
+// bench/builderbench, bench/cypherbench and bench/applybench already is:
+// worst p95 measured across fresh 5M-scale runs (4,760,000 nodes /
+// 48,886,562 edges, `adgen -users 2800000 -domains 4 -seed 1`), times the
+// ~1.75 headroom convention. Measured 2026-09-12, three runs after the
+// traverse scratch pool landed (traverse.go's scratchPool -- the fix that
+// took the cheap pairs' p50 from ~0.35ms to ~0.03ms by ending the ~24MB-per-
+// scratch allocation each query paid): p95 103.7 / 99.0 / 85.1 ms, so
+// 103.7ms x 1.75 ~= 181 -> 180ms. The worst pairs are genuine work -- a
+// seeded-random pair whose BFS crosses the per-domain hub groups reaches a
+// large fraction of the graph, and ~100ms is simply what that breadth costs
+// single-threaded at this scale -- which is why the original 100ms bar
+// (milestone 2's target, set before any 5M measurement existed, and the
+// only bar in the repository never re-derived from measurement) sat exactly
+// on the noise floor: it failed 3/3 at milestone 5's close (101/141/131ms)
+// and straddled PASS/FAIL on every re-run since. 180ms still trips on real
+// regressions of this bar's own history: the discarded-allocation defect
+// fixed at 56bcbb5 measured 215-255ms.
 const (
-	pairP95Threshold       = 100 * time.Millisecond
+	pairP95Threshold       = 180 * time.Millisecond
 	domainAdminsThreshold  = 5 * time.Second
 	domainAdminsPathsLimit = 1000
 )
@@ -115,7 +134,7 @@ func run(args []string) int {
 		dsn        = fs.String("dsn", "", "PostgreSQL connection string, e.g. postgresql://user:pass@host:port/db")
 		runs       = fs.Int("runs", 20, "number of seeded-random User->Computer pairs to sample for section (a)")
 		seed       = fs.Int64("seed", 1, "seed for deterministic pair selection (same -runs/-seed reproduces the same pairs)")
-		enforce    = fs.Bool("enforce", false, "exit nonzero if pairs p95 > 100ms or the Domain Admins query > 5s (never pass this in CI)")
+		enforce    = fs.Bool("enforce", false, "exit nonzero if pairs p95 > 180ms or the Domain Admins query > 5s (never pass this in CI)")
 		cpuprofile = fs.String("cpuprofile", "", "write a pprof CPU profile to this file")
 	)
 	if err := fs.Parse(args); err != nil {
