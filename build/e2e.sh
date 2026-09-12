@@ -44,11 +44,21 @@ awk '
 mv "$WORK/docker-compose.yml.tmp" "$WORK/docker-compose.yml"
 grep -q "BLOODTRAIL_LOG_LEVEL=debug" "$WORK/docker-compose.yml"
 printf 'BLOODHOUND_TAG=%s\n' "$DOCKERHUB_TAG" > "$WORK/.env"
+# Tear down whatever a previous local run left behind FIRST -- containers
+# and, critically, volumes. `rm -rf $WORK` above wipes the compose file but
+# not the docker project it named, so a rerun on a developer machine would
+# otherwise attach to days-old app-db/graph-db volumes: the admin user then
+# already exists, no "Initial Password Set To" line is ever printed, and the
+# run dies at the password extraction below. A no-op on a fresh CI runner.
+docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" down -v --remove-orphans 2>/dev/null || true
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" up -d
 for _ in $(seq 1 90); do api_ready && break; sleep 5; done
 api_ready
-PASSWORD="$(docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" logs bloodhound | grep -o 'Initial Password Set To: *[^ #]*' | awk '{print $NF}' | tail -1)"
-[ -n "$PASSWORD" ] || { echo "could not read the initial admin password from the logs" >&2; exit 1; }
+# `|| true` on the extraction pipeline: with pipefail, a log with no match
+# makes grep's own exit status kill the whole script SILENTLY -- before the
+# guard below can say what actually went wrong.
+PASSWORD="$(docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" logs bloodhound | grep -o 'Initial Password Set To: *[^ #]*' | awk '{print $NF}' | tail -1 || true)"
+[ -n "$PASSWORD" ] || { echo "could not read the initial admin password from the logs -- was this stack's app-db volume left over from an earlier run?" >&2; exit 1; }
 
 echo "==> Installing BloodTrail"
 (cd "$ROOT" && go run ./cmd/bloodtrail install --compose-file "$WORK/docker-compose.yml" --image "$IMAGE" --admin-password "$PASSWORD" --migration-timeout 30m --yes)
