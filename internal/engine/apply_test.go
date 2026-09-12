@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/specterops/dawgs/graph"
 
@@ -476,6 +477,113 @@ func TestApplyEarlyReturnRelaunchesRecoveryWhenNoneIsRunning(t *testing.T) {
 
 	if got := e.rebuildLoopStarts.Load(); got != startsBefore+1 {
 		t.Fatalf("Apply's early return while already in fallback did not relaunch recovery: rebuildLoopStarts = %d, want %d", got, startsBefore+1)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Trust-only rebuild launches are rate-limited (requestTrustRebuild):
+// a sustained stream of settling bump failures must not run full snapshot
+// loads back to back on an engine that is serving correctly.
+// -----------------------------------------------------------------------
+
+// TestTrustRebuildDelay pins the limiter's pure timing decision: launch
+// immediately once trustRebuildMinInterval has elapsed since the last
+// launch (a never-launched engine's zero stamp trivially qualifies), and
+// otherwise wait exactly the remainder.
+func TestTrustRebuildDelay(t *testing.T) {
+	if launchNow, wait := trustRebuildDelay(int64(trustRebuildMinInterval), 0); !launchNow || wait != 0 {
+		t.Fatalf("trustRebuildDelay(interval, 0) = (%v, %v), want (true, 0)", launchNow, wait)
+	}
+	if launchNow, wait := trustRebuildDelay(1, 0); launchNow || wait != trustRebuildMinInterval-1 {
+		t.Fatalf("trustRebuildDelay(1, 0) = (%v, %v), want (false, interval-1ns)", launchNow, wait)
+	}
+	now := int64(10 * trustRebuildMinInterval)
+	if launchNow, wait := trustRebuildDelay(now, now-int64(trustRebuildMinInterval)/2); launchNow || wait != trustRebuildMinInterval/2 {
+		t.Fatalf("trustRebuildDelay(now, now-interval/2) = (%v, %v), want (false, interval/2)", launchNow, wait)
+	}
+}
+
+// TestRequestTrustRebuildLaunchesImmediatelyWhenQuiet pins the common case:
+// nothing has launched within the interval (the zero stamp of a fresh
+// engine), so the request launches recovery right away -- asserted through
+// rebuildLoopStarts for the same race-freedom reason the F4 tests give.
+// bgCancel keeps the spawned loop from ever reaching a nil database.
+func TestRequestTrustRebuildLaunchesImmediatelyWhenQuiet(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+	e.bgCancel()
+	e.settledDirtyGen.Store(1) // one settled failure, unresolved
+
+	startsBefore := e.rebuildLoopStarts.Load()
+	e.requestTrustRebuild()
+	if got := e.rebuildLoopStarts.Load(); got != startsBefore+1 {
+		t.Fatalf("rebuildLoopStarts = %d after a quiet-engine trust request, want %d (should launch immediately)", got, startsBefore+1)
+	}
+}
+
+// TestRequestTrustRebuildCoalescesInsideTheInterval pins the limit itself:
+// with the last launch stamped just now, further requests must not launch
+// another loop synchronously -- they hand off to the one delayed launcher
+// (whose own firing is untestable here without waiting out the interval;
+// bgCancel makes it exit promptly instead, which is also what proves the
+// synchronous path launched nothing).
+func TestRequestTrustRebuildCoalescesInsideTheInterval(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+	e.bgCancel()
+	e.settledDirtyGen.Store(1)
+	e.lastTrustRebuildNano.Store(time.Now().UnixNano())
+
+	startsBefore := e.rebuildLoopStarts.Load()
+	e.requestTrustRebuild()
+	e.requestTrustRebuild()
+	e.requestTrustRebuild()
+	if got := e.rebuildLoopStarts.Load(); got != startsBefore {
+		t.Fatalf("rebuildLoopStarts = %d after requests inside the interval, want %d (no synchronous launch)", got, startsBefore)
+	}
+}
+
+// TestRequestTrustRebuildDisabledEngineIsANoOp: a disabled engine never
+// rebuilds (claimRebuildLoop), so the limiter must not even spawn its
+// delayed launcher for one.
+func TestRequestTrustRebuildDisabledEngineIsANoOp(t *testing.T) {
+	e := New(nil, nil, Config{})
+	e.settledDirtyGen.Store(1)
+
+	e.requestTrustRebuild()
+	if e.rebuildLoopStarts.Load() != 0 {
+		t.Fatalf("a disabled engine launched a trust rebuild")
+	}
+	if e.trustRebuildPending.Load() {
+		t.Fatalf("a disabled engine armed a delayed trust launcher")
+	}
+}
+
+// TestFinishFallbackRebuildRateLimitsTrustOnlyRelaunch pins the routing:
+// an adopted exit that leaves only a trust generation behind goes through
+// the limiter (no synchronous relaunch inside the interval; an immediate
+// one when quiet), while the raced-back-to-fallback case in the F4 test
+// above stays immediate unconditionally.
+func TestFinishFallbackRebuildRateLimitsTrustOnlyRelaunch(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true})
+	e.bgCancel()
+	e.state.Store(stateServing)
+	e.settledDirtyGen.Store(1) // settled after the exiting rebuild's load began
+	e.fallbackRebuilding.Store(true)
+
+	// Inside the interval: no synchronous relaunch.
+	e.lastTrustRebuildNano.Store(time.Now().UnixNano())
+	startsBefore := e.rebuildLoopStarts.Load()
+	e.finishFallbackRebuild()
+	if got := e.rebuildLoopStarts.Load(); got != startsBefore {
+		t.Fatalf("rebuildLoopStarts = %d after a trust-only relaunch inside the interval, want %d (rate-limited)", got, startsBefore)
+	}
+
+	// Quiet: the same relaunch fires immediately.
+	e.lastTrustRebuildNano.Store(0)
+	e.fallbackRebuilding.Store(true)
+	startsBefore = e.rebuildLoopStarts.Load()
+	e.finishFallbackRebuild()
+	if got := e.rebuildLoopStarts.Load(); got != startsBefore+1 {
+		t.Fatalf("rebuildLoopStarts = %d after a quiet trust-only relaunch, want %d", got, startsBefore+1)
 	}
 }
 

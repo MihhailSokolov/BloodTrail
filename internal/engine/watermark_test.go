@@ -404,26 +404,30 @@ func TestNoteSelfSettlingWatermarkFailureSettlesItself(t *testing.T) {
 	}
 }
 
-// TestRebuildStillNeeded pins finishFallbackRebuild's own relaunch decision
-// in isolation -- both reasons an adopted rebuild can leave work behind, and
-// the one case where it may exit for good.
-func TestRebuildStillNeeded(t *testing.T) {
+// TestRelaunchAfterAdoption pins finishFallbackRebuild's own relaunch
+// decision in isolation -- both reasons an adopted rebuild can leave work
+// behind (with their differing urgency: a fallback state relaunches
+// immediately, a trust-only gap goes through the rate limiter), the one
+// case where it may exit for good, and the precedence when both reasons
+// hold at once (fallback wins: a suspect replica is never made to wait on
+// a trust rate limit).
+func TestRelaunchAfterAdoption(t *testing.T) {
 	cases := []struct {
 		name     string
 		state    int32
 		settled  uint64
 		resolved uint64
-		want     bool
+		want     relaunchKind
 	}{
-		{"serving, every settled failure resolved", stateServing, 2, 2, false},
-		{"raced back into fallback", stateFallback, 2, 2, true},
-		{"a failure settled after this rebuild's load began", stateServing, 3, 2, true},
-		{"both", stateFallback, 3, 2, true},
+		{"serving, every settled failure resolved", stateServing, 2, 2, relaunchNone},
+		{"raced back into fallback", stateFallback, 2, 2, relaunchRecovery},
+		{"a failure settled after this rebuild's load began", stateServing, 3, 2, relaunchTrust},
+		{"both (fallback wins)", stateFallback, 3, 2, relaunchRecovery},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rebuildStillNeeded(tc.state, tc.settled, tc.resolved); got != tc.want {
-				t.Fatalf("rebuildStillNeeded(%d, %d, %d) = %v, want %v", tc.state, tc.settled, tc.resolved, got, tc.want)
+			if got := relaunchAfterAdoption(tc.state, tc.settled, tc.resolved); got != tc.want {
+				t.Fatalf("relaunchAfterAdoption(%d, %d, %d) = %v, want %v", tc.state, tc.settled, tc.resolved, got, tc.want)
 			}
 		})
 	}

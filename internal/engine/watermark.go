@@ -280,7 +280,10 @@ func (e *Engine) settleWatermarkFailure(scope *WriteScope) bool {
 // doc). The engine does NOT enter fallback: the replica is not suspect (the
 // write landed nothing), only this engine's authority to call a snapshot file
 // trustworthy is, so queries keep being served from memory while the rebuild
-// runs.
+// runs -- which is also why the request goes through requestTrustRebuild's
+// rate limiter (apply.go) rather than launching directly: a sustained stream
+// of errored writes with failed bumps must not run full snapshot loads back
+// to back on an engine that is serving correctly.
 func (e *Engine) ResolveAbandonedWrite(ctx context.Context, scope *WriteScope) {
 	if scope == nil {
 		return
@@ -299,7 +302,7 @@ func (e *Engine) ResolveAbandonedWrite(ctx context.Context, scope *WriteScope) {
 
 	if e.settleWatermarkFailure(scope) {
 		e.cfg.Log.DebugContext(ctx, "bloodtrail: watermark failure settled by a write that produced no effect; rebuild requested to restore trust")
-		e.startFallbackRebuild()
+		e.requestTrustRebuild()
 	}
 }
 
@@ -493,7 +496,12 @@ func (e *Engine) watermarkGensResolved() bool {
 // that running loop's own adoption may predate the settle it needed to see --
 // so finishFallbackRebuild relaunches whenever settledDirtyGen is still ahead
 // of resolvedDirtyGen (apply.go), the same recheck it already performs for a
-// state that raced back into fallback.
+// state that raced back into fallback. Trust-only launches -- this recheck's
+// generations case, and both settle-time requests above -- are rate-limited
+// to one per trustRebuildMinInterval (requestTrustRebuild, apply.go); that
+// delays resolution, never loses it: the limiter's delayed launcher re-checks
+// and relaunches through the same path, so every unresolved generation still
+// gets its adopted rebuild.
 //
 // A disabled engine (cfg.Enabled false) is the one place a failure can stay
 // unresolved indefinitely: it never rebuilds at all (claimRebuildLoop), so

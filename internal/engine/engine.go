@@ -127,6 +127,16 @@ type Engine struct {
 	// rather than one per write.
 	fallbackRebuilding atomic.Bool
 
+	// lastTrustRebuildNano and trustRebuildPending are the trust-rebuild
+	// rate limiter's state (requestTrustRebuild, apply.go): the UnixNano of
+	// the last trust-restoring rebuild launch, and whether one delayed
+	// launcher goroutine is already waiting out the interval. Only
+	// trust-only launches -- engine serving, settledDirtyGen ahead of
+	// resolvedDirtyGen -- go through them; genuine fallback recovery is
+	// never rate-limited.
+	lastTrustRebuildNano atomic.Int64
+	trustRebuildPending  atomic.Bool
+
 	// rebuildLoopStarts counts every time claimRebuildLoop's CAS on
 	// fallbackRebuilding actually wins -- i.e. every relaunch of either
 	// retry-until-adopted rebuild loop, regardless of which of the two

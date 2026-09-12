@@ -159,10 +159,13 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 		// fallback and starts a recovery rebuild -- but only on the branches
 		// that reach it, and only while that pairing holds. Requesting the
 		// rebuild here instead makes "a settled failure always has a rebuild
-		// coming" a property of this method alone. It is idempotent
-		// (claimRebuildLoop's CAS) and only ever fires for a write whose
-		// watermark bump genuinely failed.
-		e.startFallbackRebuild()
+		// coming" a property of this method alone. It only ever fires for a
+		// write whose watermark bump genuinely failed, and goes through the
+		// trust-rebuild rate limiter rather than launching directly: when
+		// the pairing holds, the fallback branch below launches immediately
+		// anyway (a suspect replica is never made to wait), so the limiter
+		// only ever delays the pure trust-restoration case.
+		e.requestTrustRebuild()
 	}
 
 	if !e.cfg.Enabled {
@@ -666,6 +669,105 @@ func (e *Engine) runFallbackRebuild() {
 	}
 }
 
+// trustRebuildMinInterval rate-limits trust-restoring rebuild launches
+// (requestTrustRebuild, below): at most one per interval. The judgment is
+// fallbackRetryMax's, applied to launches instead of retries -- a
+// trust-only rebuild runs while the engine is serving correctly (only
+// WatermarkTrusted, and therefore snapshot-file stamping, waits on it), so
+// there is no urgency that would justify letting a sustained stream of
+// settling bump failures turn into back-to-back full snapshot loads, each
+// tens of seconds of load at production scale, forever. One load per
+// interval bounds that cost to what a single fallback recovery retry cycle
+// already tolerates, while a quiet engine still gets its trust back on the
+// very first request.
+const trustRebuildMinInterval = fallbackRetryMax
+
+// trustRebuildDelay is requestTrustRebuild's pure timing decision, extracted
+// for unit testing (mirroring fallbackRetryDelay's identical treatment):
+// given now and the last trust launch, both UnixNano, it returns whether a
+// launch may happen immediately, and otherwise how long a delayed launcher
+// must wait for the interval to elapse.
+func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Duration) {
+	elapsed := nowNano - lastNano
+	if elapsed >= int64(trustRebuildMinInterval) {
+		return true, 0
+	}
+	return false, time.Duration(int64(trustRebuildMinInterval) - elapsed)
+}
+
+// requestTrustRebuild asks for the adopted rebuild that resolves a settled
+// watermark trust generation (WatermarkTrusted's liveness section), through
+// a rate limiter: the first request on a quiet engine launches immediately,
+// and requests inside trustRebuildMinInterval of the last launch coalesce
+// into one delayed launcher that fires when the interval is up -- re-checking
+// that the generations still disagree first, since an adoption during the
+// wait is exactly the resolution being waited for.
+//
+// This exists for the one launch path that is not urgent. Genuine fallback
+// recovery -- a suspect replica, every query declining -- never comes
+// through here and is never delayed: enterFallback and the
+// state-based relaunches call startFallbackRebuild directly. What does come
+// through here is trust restoration while the engine serves correctly
+// (ResolveAbandonedWrite's settle, Apply's belt-and-braces settle, and
+// finishFallbackRebuild's generations-only recheck), where an unlimited
+// launch rate would let a sustained stream of settling bump failures --
+// e.g. a watermark table that errors while the data tables still work --
+// run full snapshot loads back to back indefinitely for no serving benefit.
+//
+// Liveness is preserved, not traded away: every request either launches,
+// coalesces into a launcher that will run within the interval and re-request
+// through the same startFallbackRebuild the direct path uses, or finds the
+// generations already equal -- and a launcher cut short by bgCtx belongs to
+// an engine that is shutting down. The pending flag never strands: its
+// holder clears it on every exit path.
+//
+// A disabled engine returns immediately: claimRebuildLoop would refuse the
+// launch anyway (a replica nobody reads is never rebuilt), and spawning a
+// delayed launcher for it would be a goroutine with nothing to ever do.
+func (e *Engine) requestTrustRebuild() {
+	if !e.cfg.Enabled {
+		return
+	}
+
+	now := time.Now().UnixNano()
+	last := e.lastTrustRebuildNano.Load()
+	if launchNow, _ := trustRebuildDelay(now, last); launchNow {
+		if e.lastTrustRebuildNano.CompareAndSwap(last, now) {
+			e.startFallbackRebuild()
+			return
+		}
+		// Lost the stamp to a concurrent request that is launching right
+		// now; coalesce with it below exactly as an inside-the-interval
+		// request would.
+	}
+
+	if !e.trustRebuildPending.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer e.trustRebuildPending.Store(false)
+
+		// Recompute against the stamp as it is NOW -- the winner of a lost
+		// CAS above has stored a fresher value than this goroutine's caller
+		// read -- so the wait always measures from the actual last launch.
+		_, wait := trustRebuildDelay(time.Now().UnixNano(), e.lastTrustRebuildNano.Load())
+
+		select {
+		case <-e.bgCtx.Done():
+			return
+		case <-time.After(wait):
+		}
+
+		if e.settledDirtyGen.Load() == e.resolvedDirtyGen.Load() {
+			// Resolved while waiting -- an adoption happened, which is the
+			// outcome this launcher existed to cause.
+			return
+		}
+		e.lastTrustRebuildNano.Store(time.Now().UnixNano())
+		e.startFallbackRebuild()
+	}()
+}
+
 // finishFallbackRebuild clears fallbackRebuilding, then relaunches recovery
 // if the engine has already raced back into stateFallback by the time it
 // does. Called from both loops that share the flag (runFallbackRebuild
@@ -712,25 +814,52 @@ func (e *Engine) runFallbackRebuild() {
 // wait for it.
 func (e *Engine) finishFallbackRebuild() {
 	e.fallbackRebuilding.Store(false)
-	if rebuildStillNeeded(e.state.Load(), e.settledDirtyGen.Load(), e.resolvedDirtyGen.Load()) {
+	switch relaunchAfterAdoption(e.state.Load(), e.settledDirtyGen.Load(), e.resolvedDirtyGen.Load()) {
+	case relaunchRecovery:
 		e.startFallbackRebuild()
+	case relaunchTrust:
+		e.requestTrustRebuild()
 	}
 }
 
-// rebuildStillNeeded is finishFallbackRebuild's own decision, extracted as a
-// pure function for unit testing (mirroring fallbackRetryDelay's identical
-// treatment above): given the engine's state and its watermark settled/
-// resolved generations at the moment the exiting rebuild goroutine cleared
-// the flag, it reports whether another rebuild has to be launched.
+// relaunchKind is relaunchAfterAdoption's answer: whether the rebuild
+// goroutine that just cleared fallbackRebuilding must relaunch, and with
+// what urgency.
+type relaunchKind int
+
+const (
+	relaunchNone     relaunchKind = iota // nothing left behind
+	relaunchRecovery                     // state raced back to fallback: relaunch immediately
+	relaunchTrust                        // only a trust generation is unresolved: rate-limited
+)
+
+// relaunchAfterAdoption is finishFallbackRebuild's own decision, extracted
+// as a pure function for unit testing (mirroring fallbackRetryDelay's
+// identical treatment above): given the engine's state and its watermark
+// settled/resolved generations at the moment the exiting rebuild goroutine
+// cleared the flag, it reports whether another rebuild has to be launched,
+// and through which path.
 //
-// Either condition alone is enough, and they cover the two independent
-// reasons an adopted rebuild can leave work behind -- a write that tripped
-// fallback again in the window before the flag cleared, and a watermark
-// failure that settled after this rebuild's own load began (and whose own
-// request to rebuild therefore found the flag still held). See
-// finishFallbackRebuild's doc for both races in full.
-func rebuildStillNeeded(state int32, settledGen, resolvedGen uint64) bool {
-	return state == stateFallback || settledGen != resolvedGen
+// The two conditions cover the two independent reasons an adopted rebuild
+// can leave work behind -- a write that tripped fallback again in the
+// window before the flag cleared, and a watermark failure that settled
+// after this rebuild's own load began (and whose own request to rebuild
+// therefore found the flag still held) -- see finishFallbackRebuild's doc
+// for both races in full. They differ in urgency, which is why the answer
+// is a kind rather than a bool: a state stuck in fallback means every query
+// is declining and recovery relaunches immediately, while an unresolved
+// trust generation on a serving engine only delays snapshot-file stamping
+// and goes through requestTrustRebuild's rate limiter, so a sustained
+// stream of settling failures cannot turn adopted rebuilds into
+// back-to-back full loads.
+func relaunchAfterAdoption(state int32, settledGen, resolvedGen uint64) relaunchKind {
+	if state == stateFallback {
+		return relaunchRecovery
+	}
+	if settledGen != resolvedGen {
+		return relaunchTrust
+	}
+	return relaunchNone
 }
 
 // fallbackBudgetRetryInterval is the recovery goroutine's retry cadence for
