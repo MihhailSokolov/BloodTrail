@@ -50,8 +50,57 @@ func newScratch(n int) *scratch {
 }
 
 // reset invalidates every distance written since the previous reset.
+//
+// The epoch wrapping back to zero is the one value that cannot be used: a
+// brand-new scratch's mark array is all zeros, and a pooled scratch
+// (scratchPool, below) can carry marks written billions of resets ago, so
+// an epoch of zero would resurrect every one of those as a valid distance.
+// Wrap is once per 2^32 resets -- unreachable for the per-query scratches
+// this package used to allocate, reachable in principle for a pooled one in
+// a long-lived process -- and handled by clearing the marks once and
+// skipping zero, which preserves "mark[v] == epoch means written since the
+// last reset" across the wrap.
 func (s *scratch) reset() {
 	s.epoch++
+	if s.epoch == 0 {
+		clear(s.mark)
+		s.epoch = 1
+	}
+}
+
+// scratchPool recycles scratch buffers across AllShortestPaths calls.
+//
+// A scratch is sized to the snapshot's node count -- 5 bytes per node, so
+// ~24 MB at 5M nodes, and strategy A takes three of them -- and before this
+// pool existed, every call allocated its own fresh set. The zeroed pages a
+// fresh multi-megabyte allocation hands back are not free: the cost (zero
+// fill on span reuse, page faults on first touch) is paid during the BFS,
+// in proportion to how much of the graph the query actually reaches, which
+// concentrated tens of milliseconds of pure allocator work onto exactly
+// the hub-heavy queries that already do the most traversal -- measured as
+// the difference between bench/pathbench's passing and failing p95 runs at
+// 5M scale. The epoch trick was designed for reuse; the pool is what makes
+// the reuse actually span queries.
+//
+// get returns a scratch with at least n valid slots, reusing a pooled one
+// when it is big enough (every consumer resets before writing, bfsFrom's
+// own doc, so no stale state survives into a reuse -- see reset for the
+// one wrap-around case) and dropping under-sized ones for the GC: a pool
+// hit after a snapshot grew would otherwise index out of range. put gives
+// one back; a scratch must not be used after being put.
+var scratchPool sync.Pool
+
+func getScratch(n int) *scratch {
+	if v := scratchPool.Get(); v != nil {
+		if sc := v.(*scratch); len(sc.mark) >= n {
+			return sc
+		}
+	}
+	return newScratch(n)
+}
+
+func putScratch(sc *scratch) {
+	scratchPool.Put(sc)
 }
 
 // get returns v's distance and whether it has been set since the last
@@ -426,7 +475,10 @@ func pathCap(limit, have int, oneMore bool) (cap int, done bool) {
 // scratch buffers and stopping once Limit is reached.
 func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget) ([]Path, error) {
 	n := s.NodeCount()
-	scF, scT, scTmp := newScratch(n), newScratch(n), newScratch(n)
+	scF, scT, scTmp := getScratch(n), getScratch(n), getScratch(n)
+	defer putScratch(scF)
+	defer putScratch(scT)
+	defer putScratch(scTmp)
 	oneMore := q.Mode == ModeOne
 
 	var out []Path
@@ -501,7 +553,7 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 		}
 		g.Go(func() error {
 			for i := lo; i < hi; i++ {
-				sc := newScratch(n)
+				sc := getScratch(n)
 				bfsFrom(s, elems[i], forward, kinds, maxDepth, sc)
 				results[i] = smallSideDist{elem: elems[i], dists: sc}
 			}
@@ -539,6 +591,17 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 	// small side = roots -> forward BFS (dist-from-root) per root.
 	// small side = terminals -> reverse BFS (dist-to-terminal) per terminal.
 	results := bfsSmallSide(s, elems, smallIsRoots, kinds, maxDepth)
+	// The merge phases below are the scratches' last readers; recycle them
+	// once whichever merge ran has returned (scratchPool's own doc). A nil
+	// dists only exists on the workers<1 path, which leaves zero-value
+	// entries behind.
+	defer func() {
+		for _, res := range results {
+			if res.dists != nil {
+				putScratch(res.dists)
+			}
+		}
+	}()
 
 	if smallIsRoots {
 		return mergeSmallRoots(s, q, kinds, budget, results)
