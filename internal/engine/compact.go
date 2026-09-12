@@ -42,10 +42,32 @@ const maxSegments = 32
 // of duplicating the numbers: both packages then have exactly one place,
 // this one, that states what "large" means for a delta.
 //
-// Provisional: both values are worth revisiting once a dedicated
-// write-throughput benchmark measures compaction cost at scale.
+// The entries default is evidence-based (measured 2026-09-12; pinned by
+// TestMeasuredCompactDefaults). What the threshold actually controls is the
+// per-write cost of the delta: every Apply publishes a fresh View, whose
+// first overlay read -- made by the NEXT Apply's own segment build, under
+// applyMu -- re-runs MergeSegments over the whole accumulated delta
+// (snapshot/view.go's per-View memos; README.md's "Delta reads cost
+// O(total delta)" section). BenchmarkFirstOverlayRead
+// (snapshot/view_overlay_bench_test.go) measured that cost linear at
+// roughly 290ns per delta entry (M3 Pro): ~4.7ms at 16Ki entries, ~21ms at
+// 64Ki, ~74ms at 256Ki, ~303ms at 1Mi. The previous provisional default of
+// 1,000,000 therefore allowed the merge alone to reach ~300ms per write --
+// two orders of magnitude over the write's own measured work -- before a
+// fold reclaimed it. 65,536 caps that exposure at ~21ms, the same class as
+// one write's own read-back and apply cost, while still sitting 2.7-5x
+// above the ~12-24K entries bench/applybench measured a full ingest
+// actually accumulating -- so routine operation still never folds, exactly
+// the profile every applybench number was measured under. Folding more
+// often under sustained bulk writes costs nothing extra per fold: a fold's
+// ~25-28s at 5M is dominated by rebuilding the base, independent of the
+// delta that tipped it (bench/applybench/README.md).
+//
+// The bytes default stays a coarse memory guard for oversized property
+// bags, not a tuning point: at ordinary bag sizes the entries side trips
+// first by a wide margin.
 const (
-	DefaultCompactEntries = 1_000_000
+	DefaultCompactEntries = 65_536
 	DefaultCompactBytes   = 512 * size.Mebibyte
 )
 
@@ -109,7 +131,7 @@ func deltaBytes(segs []*snapshot.Segment) uint64 {
 // compactionThresholdExceeded reports whether entries/bytes have grown past
 // the given compaction thresholds. Extracted as a pure function for direct
 // unit testing, mirroring this package's other pure-decision extractions
-// (saveSnapshotPreconditionsFor, fallbackRetryDelay, rebuildStillNeeded,
+// (saveSnapshotPreconditionsFor, fallbackRetryDelay, relaunchAfterAdoption,
 // bootGapCovered).
 //
 // Zero on either threshold means "no bound on that dimension" -- the same

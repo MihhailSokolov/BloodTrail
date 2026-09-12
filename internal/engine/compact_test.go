@@ -511,3 +511,19 @@ func TestSegmentsAfter(t *testing.T) {
 		}
 	})
 }
+
+// TestMeasuredCompactDefaults pins the evidence-based compaction defaults to
+// their documented values (DefaultCompactEntries' own doc carries the
+// derivation; BenchmarkFirstOverlayRead in the snapshot package is the
+// measurement), mirroring the bench packages' identical convention
+// (builderbench's TestMeasuredEngineAbsoluteCaps and siblings): these values
+// are measurement-derived, so changing one requires fresh evidence recorded
+// alongside the change -- a silent edit fails here.
+func TestMeasuredCompactDefaults(t *testing.T) {
+	if DefaultCompactEntries != 65_536 {
+		t.Errorf("DefaultCompactEntries = %d, want 65536 (~21ms first-overlay-read merge at the threshold, measured ~290ns/entry; re-derive with fresh evidence before moving it)", DefaultCompactEntries)
+	}
+	if DefaultCompactBytes != 512*size.Mebibyte {
+		t.Errorf("DefaultCompactBytes = %v, want 512MiB (a coarse memory guard, not a measured tuning point)", DefaultCompactBytes)
+	}
+}

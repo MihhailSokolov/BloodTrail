@@ -443,26 +443,33 @@ table above.
 
 ### `compactEntries`/`compactBytes` defaults, revisited at this scale
 
-`DefaultCompactEntries`/`DefaultCompactBytes` (`internal/engine/compact.go`,
-1,000,000 entries / 512 MiB) are unchanged by this measurement. (c) above
-deliberately forces compaction at a much lower threshold
+(c) above deliberately forces compaction at a much lower threshold
 (`-compact-entries 2000`) specifically so several fire during one
 bench run -- it says nothing about whether the *default* threshold sits at
 a good point, since (a)/(b) both ingest far too few rows (12,000 units =
-24,000 entries per repeat) to ever reach 1,000,000 entries and trigger the
-default at all. What (c) *does* say about the defaults: a compaction fold
-at this node count costs ~25-28s typical (independent of how small the
-triggering delta was -- the cost is dominated by rebuilding the ~4.9M-node
-base, not by the entries that tipped it over), so the defaults' actual
-effect is exposure time, not fold cost -- how large a delta (and its
-per-read overlay overhead) is allowed to accumulate before that ~25-28s
-fold reclaims it. Answering "is 1,000,000 entries too generous an exposure
-window" needs a sustained-ingest run at the *default* threshold measuring
-query latency as the delta approaches it, which no measurement here has
-done; changing the defaults without that evidence would repeat the
-exact "invented number, not measurement" mistake (a)/(b)'s own caps just
-moved away from. Left unchanged, with this reasoning recorded for whichever
-future measurement takes it on.
+24,000 entries per repeat) to ever reach the default at all. What (c)
+*does* say about the defaults: a compaction fold at this node count costs
+~25-28s typical (independent of how small the triggering delta was -- the
+cost is dominated by rebuilding the ~4.9M-node base, not by the entries
+that tipped it over), so the defaults' actual effect is exposure time, not
+fold cost -- how large a delta (and its per-read overlay overhead) is
+allowed to accumulate before that ~25-28s fold reclaims it.
+
+An earlier revision of this section left the then-default of 1,000,000
+entries unchanged for lack of a measurement of that exposure, and asked for
+one. `BenchmarkFirstOverlayRead`
+(`internal/engine/snapshot/view_overlay_bench_test.go`) is that
+measurement, taken 2026-09-12: the per-View first-read merge is linear at
+roughly 290ns per delta entry (M3 Pro) -- ~4.7ms at 16Ki entries, ~21ms at
+64Ki, ~74ms at 256Ki, ~303ms at 1Mi -- and every apply pays it, under the
+apply lock, via its own walk of the current `View`. At 1,000,000 entries
+the merge alone could therefore reach ~300ms per write before a fold
+reclaimed it, two orders of magnitude over the write's own measured work.
+`DefaultCompactEntries` is now **65,536**: exposure tops out around ~21ms
+(the same class as one write's read-back and apply), while routine full
+ingests (~24,000 entries, above) still never trigger the default -- the
+exact operational profile every number in this README was measured under.
+Pinned by `TestMeasuredCompactDefaults` (`internal/engine/compact_test.go`).
 
 ## Known performance characteristics
 
@@ -496,15 +503,16 @@ This lands under the apply lock, on the write path, whenever
 not depend on which accessors ran first. With the limit unset, the same work
 still happens, but lazily, on whichever read touches the new `View` first.
 
-**The measurement gap:** `deltaEntries` counts one entry per delta node and
-one per delta edge, so (a)/(b)'s 12,000 ingest units (1 node + 1 edge each)
-grow the delta to about **24,000 entries** per repeat -- against a shipped
-`BLOODTRAIL_COMPACT_ENTRIES` default of **1,000,000**. The deltas actually
-benchmarked are therefore roughly **40x smaller** (~2.4% of the default)
-than what the shipped configuration permits before a fold reclaims them,
-and no measurement here ever reached the default threshold at all. The
-19-34% apply overhead is a floor for the shipped configuration, not a
-ceiling.
+**How large can it get?** `deltaEntries` counts one entry per delta node
+and one per delta edge, so (a)/(b)'s 12,000 ingest units (1 node + 1 edge
+each) grow the delta to about **24,000 entries** per repeat -- against a
+shipped `BLOODTRAIL_COMPACT_ENTRIES` default of **65,536**, at which point
+a fold reclaims it. The cost itself is now measured rather than open-ended
+(`BenchmarkFirstOverlayRead`, and the defaults section above): linear at
+~290ns per entry, so the shipped configuration bounds this term at ~21ms
+per apply at the threshold, ~7ms at the deltas (a)/(b) actually ran with.
+The 19-34% apply overhead was measured inside that bound; a raised
+`BLOODTRAIL_COMPACT_ENTRIES` raises the ceiling proportionally.
 
 ### Write concurrency is effectively 1
 

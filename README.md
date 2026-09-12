@@ -94,15 +94,15 @@ caller has already been told committed.
   not fail a build.) See [`bench/applybench`](bench/applybench) for the harness and the
   per-run numbers.
 
-  Two caveats make that range a **floor, not a ceiling**. It was measured with writes
-  serialized through a single apply lock, so it describes one writer's latency and not
-  what happens when several contend. And it was measured with the delta held at roughly
-  **2.4% of the shipped `BLOODTRAIL_COMPACT_ENTRIES` default** (about 24,000 entries
-  against a 1,000,000-entry default, some 40x smaller) -- and reading through a delta
-  costs time proportional to its total size, so a delta allowed to grow to the shipped
-  threshold before compaction folds it would cost more per apply than anything measured
-  here. See [`bench/applybench/README.md`](bench/applybench/README.md) for both in
-  detail.
+  Two caveats qualify that range. It was measured with writes serialized through a
+  single apply lock, so it describes one writer's latency and not what happens when
+  several contend. And reading through the accumulated delta costs time proportional
+  to its total size (measured ~290ns per entry, linear), a cost every apply pays --
+  which is exactly what sizes the shipped `BLOODTRAIL_COMPACT_ENTRIES` default
+  (65,536): at the threshold that read costs ~21ms, the same class as the write's own
+  work, and compaction folds the delta away before it can grow past that. The range
+  above was measured at ~24,000-entry deltas, comfortably inside that bound. See
+  [`bench/applybench/README.md`](bench/applybench/README.md) for both in detail.
 - **SERVING and FALLBACK.** The engine is always in one of two states. In **SERVING**
   (the normal state), every query is answered from an up-to-date in-memory view and
   every write updates it as above. A write whose effect cannot be expressed as such a
@@ -257,7 +257,7 @@ are correct regardless of the replica's state.
   - `BLOODTRAIL_COMPACT_ENTRIES` / `BLOODTRAIL_COMPACT_BYTES` -- how large the write-through
     delta may grow, in entries and approximate bytes respectively, before a background
     compaction folds it back into the base snapshot (see [Write-through](#write-through)).
-    Default to `1000000` entries and `512MiB`. `0` on either means "no bound on that
+    Default to `65536` entries and `512MiB`. `0` on either means "no bound on that
     dimension" (the same convention `BLOODTRAIL_MEMORY_LIMIT` below uses), not "compact on
     every write"; `0` on both disables compaction outright. These thresholds govern how
     large the delta is allowed to get, and reading through a delta costs time
