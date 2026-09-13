@@ -490,7 +490,21 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 // (bootGapCoveredAt, boot.go) tolerates either outcome the same way it
 // already tolerates a save that simply never ran this cycle.)
 func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment) {
-	defer e.compacting.Store(false)
+	// The gate is released exactly once, by whichever of the two paths below
+	// gets there first: the explicit early release on the adopted path, or
+	// this deferred one on every return before it. Releasing twice is not
+	// harmless -- the second Store(false) lands after the early release has
+	// already let a NEW compaction claim the gate, so it clears a claim that
+	// belongs to a goroutine still running, and the next Apply past the
+	// threshold starts a third fold alongside it. Two concurrent folds are
+	// two full base rebuilds and two whole-graph copies resident at once,
+	// one of which adoptCompaction then throws away.
+	released := false
+	defer func() {
+		if !released {
+			e.compacting.Store(false)
+		}
+	}()
 
 	start := time.Now()
 	entries, bytes := deltaSize(capturedSegs)
@@ -525,9 +539,11 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 	}
 
 	// Release the trigger gate BEFORE the save -- see this method's own
-	// doc for exactly why that ordering is safe. The deferred Store(false)
-	// above still fires when this goroutine returns; it is a harmless
-	// no-op by then.
+	// doc for exactly why that ordering is safe. Marking it released keeps
+	// the deferred release above from firing a second time once this
+	// goroutine finally returns, by which point the gate may belong to a
+	// newer compaction.
+	released = true
 	e.compacting.Store(false)
 
 	e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction finished",

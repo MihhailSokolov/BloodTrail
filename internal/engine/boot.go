@@ -231,31 +231,51 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 			return
 		}
 
-		var err error
+		// Waiting for the default graph is not a failure, so it polls on a
+		// fixed short interval and leaves the backoff untouched. Open calls
+		// Start before it returns the driver, so this branch is always
+		// taken at least once; advancing the doubling backoff through it
+		// parked the loop in multi-second sleeps purely for waiting. The
+		// one snapshot file attempt sits behind that sleep, and every write
+		// BloodHound issues meanwhile buffers into the boot gap, so the
+		// delay widens the very window the buffer's caps are sized against
+		// -- far enough and a boot that would have adopted the file
+		// overflows instead and pays for a full rebuild. The backoff should
+		// only ever reflect genuine load failures.
 		if !e.defaultGraphResolved() {
 			e.cfg.Log.DebugContext(e.bgCtx, "bloodtrail: boot load waiting for the default graph")
-		} else {
-			if !fileTried {
-				fileTried = true
-				if e.snap.Load() == nil && e.tryLoadSnapshotFile(e.bgCtx) {
-					e.finishFallbackRebuild()
-					return
-				}
-				// The one file attempt is spent: nothing can ever consume
-				// the boot gap buffer now (adoption through the pg rebuild
-				// path reads post-write state and needs no replay), so stop
-				// paying for it. Idempotent when the attempt already
-				// consumed the buffer itself (adoptSnapshotFileView's take).
-				e.bootGap.deactivate()
+			select {
+			case <-ctx.Done():
+				e.fallbackRebuilding.Store(false)
+				return
+			case <-e.bgCtx.Done():
+				e.fallbackRebuilding.Store(false)
+				return
+			case <-time.After(graphResolveRetryInterval):
 			}
+			continue
+		}
 
-			var adopted bool
-			if adopted, err = e.rebuildOnce(e.bgCtx, triggerStartup); err != nil {
-				e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: boot load failed", slog.Any("error", err))
-			} else if adopted {
+		if !fileTried {
+			fileTried = true
+			if e.snap.Load() == nil && e.tryLoadSnapshotFile(e.bgCtx) {
 				e.finishFallbackRebuild()
 				return
 			}
+			// The one file attempt is spent: nothing can ever consume the
+			// boot gap buffer now (adoption through the pg rebuild path
+			// reads post-write state and needs no replay), so stop paying
+			// for it. Idempotent when the attempt already consumed the
+			// buffer itself (adoptSnapshotFileView's take).
+			e.bootGap.deactivate()
+		}
+
+		adopted, err := e.rebuildOnce(e.bgCtx, triggerStartup)
+		if err != nil {
+			e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: boot load failed", slog.Any("error", err))
+		} else if adopted {
+			e.finishFallbackRebuild()
+			return
 		}
 
 		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
@@ -319,7 +339,7 @@ func (e *Engine) defaultGraphResolved() bool {
 // no such constraint -- by the time anything is worth saving, a snapshot has
 // been adopted, which cannot have happened without the graph resolving.
 func (e *Engine) snapshotFilePath() (string, bool) {
-	if e.cfg.SnapshotDir == "" {
+	if e.cfg.SnapshotDir == "" || e.pgDriver == nil {
 		return "", false
 	}
 	graphModel, ok := e.pgDriver.DefaultGraph()
@@ -328,6 +348,13 @@ func (e *Engine) snapshotFilePath() (string, bool) {
 	}
 	return filepath.Join(e.cfg.SnapshotDir, fmt.Sprintf("graph-%d.btsnap", graphModel.ID)), true
 }
+
+// graphResolveRetryInterval is how often runBootLoad rechecks whether the
+// default graph has resolved. It is the same 100ms the fallback loop starts
+// its own backoff at, and deliberately NOT that backoff: this wait is for
+// the caller's own AssertSchema to land, not for a failure to clear, and the
+// boot gap buffer is filling the whole time.
+const graphResolveRetryInterval = fallbackRetryInterval
 
 // snapshotTempFilePattern is snapshot.WriteSnapshotFile's own os.CreateTemp
 // pattern (internal/engine/snapshot/file.go), repeated here so
