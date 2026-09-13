@@ -30,6 +30,14 @@ type Manifest struct {
 	UpstreamTag       string  `json:"upstream_tag"`
 	PGUser            string  `json:"pg_user"`
 	PGDatabase        string  `json:"pg_database"`
+	// EnvComposeFileCreated records that this install wrote the .env
+	// COMPOSE_FILE entry that had not been there before, so rollback knows
+	// to remove the whole line rather than just the installer's own file:
+	// any COMPOSE_FILE line at all keeps compose's file discovery switched
+	// off, which would leave the operator's conventional override file
+	// unloaded for good. Absent in manifests written before this was
+	// recorded, which decodes to false -- the old behaviour.
+	EnvComposeFileCreated bool `json:"env_compose_file_created,omitempty"`
 }
 
 // Path returns the manifest location for a compose project directory.

@@ -77,6 +77,23 @@ func (s Compose) ExecEnv(ctx context.Context, service string, env []string, stdi
 	return s.run(ctx, stdin, append(sub, args...)...)
 }
 
+// ExecTo is Exec for a command whose output is too large to hold in memory:
+// it writes the container command's standard output straight to stdout when
+// the Runner can stream (StreamRunner), and otherwise falls back to the
+// buffered path so a plain Runner still works.
+func (s Compose) ExecTo(ctx context.Context, stdout io.Writer, service string, stdin io.Reader, args ...string) error {
+	sub := append([]string{"exec", "-T", service}, args...)
+	if streamer, ok := s.Runner.(StreamRunner); ok {
+		return streamer.RunTo(ctx, stdout, stdin, "docker", s.Args(sub...)...)
+	}
+	out, err := s.Runner.Run(ctx, stdin, "docker", s.Args(sub...)...)
+	if err != nil {
+		return err
+	}
+	_, err = stdout.Write(out)
+	return err
+}
+
 // Logs returns the service's logs.
 func (s Compose) Logs(ctx context.Context, service string) ([]byte, error) {
 	return s.run(ctx, nil, "logs", "--no-color", service)
