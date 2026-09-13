@@ -400,7 +400,7 @@ func decodeScalarString(s string) any {
 // projection: no conversion is applied, and the interpreter's post-JSON
 // value (nil | string | float64 | bool | []any | map[string]any) passes
 // through materializeScalar unchanged (aside from decodeScalarString's
-// double-decode rule, which applies uniformly regardless of valueKind).
+// double-decode rule, which applies to every kind except valueText).
 type valueKind uint8
 
 const (
@@ -411,6 +411,12 @@ const (
 	// coalesce()/split(), or a datetime() component other than epochseconds/
 	// epochmillis.
 	valueDefault valueKind = iota
+	// valueText applies to a projection PostgreSQL renders as a `text`
+	// column rather than jsonb -- toLower()/toUpper()/coalesce() and a bare
+	// string literal (projectsTextColumn). It carries no numeric
+	// conversion; what it changes is that the scalar double-decode is NOT
+	// applied, matching dawgs' own decode-by-column-type rule.
+	valueText
 	// valueInt64 applies to id(), datetime().epochseconds, datetime().
 	// epochmillis, and any bare reference (renamed or not) to a WITH
 	// COUNT(...) alias -- the pinned pg-parity type for all four is int64.
@@ -472,9 +478,52 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 		}
 		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil && countAliases[v.Symbol] {
 			kinds[i] = valueInt64
+			continue
+		}
+		if projectsTextColumn(item.Expr) {
+			kinds[i] = valueText
 		}
 	}
 	return kinds
+}
+
+// projectsTextColumn reports whether dawgs renders this RETURN item as a
+// PostgreSQL `text` column rather than a jsonb one -- the distinction that
+// decides whether the scalar double-decode applies at all.
+//
+// dawgs' own decodeJSONValues (drivers/pg/result.go) consults each column's
+// DataTypeOID and decodes ONLY JSON/JSONB columns, leaving a text column's
+// value exactly as PostgreSQL returned it. decodeScalarString mirrors the
+// decode faithfully but was applied to every string regardless of column
+// type, so a text-typed projection of a property whose own text happens to
+// look like JSON came back decoded here and undecoded from PostgreSQL:
+// `toLower(n.name)` over a name of `{"A": 1}` returned map[string]any here
+// and the plain string from stock BloodHound, and a name of `"Admins"` lost
+// its quotes.
+//
+// The shapes listed here are the ones dawgs' translator explicitly casts to
+// text (toLower/toUpper render as `lower(...)::text`, coalesce sets
+// CastType Text) plus a bare string literal, which PostgreSQL never types
+// as jsonb. Everything else keeps the decode, which is what a bare property
+// lookup -- the jsonb column the rule exists for -- needs.
+func projectsTextColumn(expr cypher.Expression) bool {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return false
+		}
+		switch strings.ToLower(e.Name) {
+		case "tolower", "toupper", "coalesce":
+			return true
+		}
+	case *cypher.Literal:
+		if e == nil || e.Null {
+			return false
+		}
+		_, isString := e.Value.(string)
+		return isString
+	}
+	return false
 }
 
 // unwrapParens strips any number of *cypher.Parenthetical wrappers off expr,
@@ -504,8 +553,13 @@ func unwrapParens(expr cypher.Expression) cypher.Expression {
 // call might) leaves the value unconverted rather than panicking or
 // coercing a NULL into a numeric zero.
 func materializeScalar(v any, vk valueKind) any {
-	if s, isString := v.(string); isString {
-		v = decodeScalarString(s)
+	// Only a jsonb column gets the double-decode: dawgs decodes by column
+	// type, so a text-typed projection's value must pass through exactly as
+	// PostgreSQL would have returned it (projectsTextColumn).
+	if vk != valueText {
+		if s, isString := v.(string); isString {
+			v = decodeScalarString(s)
+		}
 	}
 	switch vk {
 	case valueInt64:

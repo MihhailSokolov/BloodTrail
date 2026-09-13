@@ -845,3 +845,112 @@ func TestTryCypherReturnPropertyLiteralMatchesOracleType(t *testing.T) {
 		t.Fatalf("engine value = %#v, want %q", engineValue, "Administrator")
 	}
 }
+
+// TestTryCypherTextColumnProjectionMatchesOracle settles the one rule
+// decodeScalarString cannot state for itself: whether the scalar
+// double-decode applies to a projection PostgreSQL renders as `text`.
+//
+// dawgs' decodeJSONValues decodes by column type, touching JSON/JSONB
+// columns only. The engine applied its mirror of that decode to every
+// string, so a text-typed projection of a property whose text happens to
+// look like JSON diverged: `toLower(n.name)` over `{"A": 1}` came back as a
+// decoded map here and as the plain string from PostgreSQL, and a name of
+// `"Admins"` lost its quotes. The property values below are chosen to make
+// that difference observable; a plain name like "Administrator" cannot see
+// it at all, which is why the sibling test above passes either way.
+func TestTryCypherTextColumnProjectionMatchesOracle(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	textNodeKind := graph.StringKind("TextNode")
+	// Each value's own text is valid JSON, which is exactly what triggers
+	// the decode: an object, an array, and a quoted string.
+	values := map[string]string{
+		"objectish": `{"A": 1}`,
+		"arrayish":  `[1, 2]`,
+		"quoted":    `"admins"`,
+		"plain":     `administrator`,
+	}
+	ids := make(map[string]graph.ID, len(values))
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		for name, value := range values {
+			n, err := tx.CreateNode(graph.NewProperties().Set("name", value), textNodeKind)
+			if err != nil {
+				return err
+			}
+			ids[name] = n.ID
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed nodes: %v", err)
+	}
+
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	readOne := func(t *testing.T, result graph.Result, query string) any {
+		t.Helper()
+		defer result.Close()
+		if !result.Next() {
+			t.Fatalf("no rows (query: %s)", query)
+		}
+		values := result.Values()
+		if len(values) != 1 {
+			t.Fatalf("%d columns, want 1 (query: %s)", len(values), query)
+		}
+		if err := result.Error(); err != nil {
+			t.Fatalf("result.Error(): %v", err)
+		}
+		return values[0]
+	}
+
+	for name, id := range ids {
+		for shapeIdx, shape := range []string{
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN toLower(n.name)`,
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN toUpper(n.name)`,
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN coalesce(n.name, 'fallback')`,
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN toLower(n.name) AS x`,
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN toUpper(n.name) AS x`,
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN coalesce(n.name, 'fallback') AS x`,
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN n.name AS x`,
+			`MATCH (n:TextNode) WHERE id(n) = %d WITH n, toLower(n.name) AS lowered RETURN lowered`,
+			// The jsonb side of the same rule: a bare property lookup must
+			// keep the decode it has always had.
+			`MATCH (n:TextNode) WHERE id(n) = %d RETURN n.name`,
+		} {
+			query := fmt.Sprintf(shape, id)
+			t.Run(fmt.Sprintf("%s/shape%d", name, shapeIdx), func(t *testing.T) {
+				var engineValue any
+				if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+					result, served := eng.TryCypher(ctx, tx, query, nil)
+					if !served {
+						t.Skipf("TryCypher declined this shape: %s", query)
+						return nil
+					}
+					engineValue = readOne(t, result, query)
+					return nil
+				}); err != nil {
+					t.Fatalf("ReadTransaction (engine): %v", err)
+				}
+
+				var oracleValue any
+				if err := pgDriver.ReadTransaction(ctx, func(tx graph.Transaction) error {
+					oracleValue = readOne(t, tx.Query(query, map[string]any{}), query)
+					return nil
+				}); err != nil {
+					t.Fatalf("ReadTransaction (oracle): %v", err)
+				}
+
+				if !reflect.DeepEqual(engineValue, oracleValue) {
+					t.Fatalf("engine = %#v (%T), PostgreSQL = %#v (%T)\nquery: %s",
+						engineValue, engineValue, oracleValue, oracleValue, query)
+				}
+			})
+		}
+	}
+}
