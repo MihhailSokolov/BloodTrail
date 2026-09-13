@@ -110,7 +110,15 @@ func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 		settings.MemoryLimit = limit
 	}
 
-	if v, ok := lookup(EnvLogLevel); ok {
+	// An empty value counts as absent, not as "info". A declared-but-unset
+	// compose or shell variable arrives as ("", true), and treating that as
+	// an explicit setting would set LogLevelSet and make Open install
+	// debugOverrideHandler at Info -- forcing every BloodTrail Info line
+	// back on in a deployment that had deliberately turned its ambient
+	// logging down to Warn or Error. LogLevelSet's whole purpose is to keep
+	// that from happening to an operator who never set the variable. The
+	// other three parsers in this file already reject an empty value.
+	if v, ok := lookup(EnvLogLevel); ok && strings.TrimSpace(v) != "" {
 		level, err := parseLogLevel(v)
 		if err != nil {
 			return Settings{}, fmt.Errorf("%s: %w", EnvLogLevel, err)
@@ -181,7 +189,7 @@ func parseLogLevel(text string) (slog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(text)) {
 	case "debug":
 		return slog.LevelDebug, nil
-	case "info", "":
+	case "info":
 		return slog.LevelInfo, nil
 	case "warn", "warning":
 		return slog.LevelWarn, nil

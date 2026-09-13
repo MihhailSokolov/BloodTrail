@@ -42,9 +42,20 @@ type wrappedTransaction struct {
 // unchanged) and returns a fresh wrapper around the result with declined set
 // -- once a transaction has been retargeted, the engine must not attempt to
 // serve any query run under it.
+//
+// The receiver is declined too, not just the returned wrapper. dawgs' pg
+// transaction retargets itself and returns the same object (it assigns its
+// own targetSchema and returns the receiver), so after this call the
+// PostgreSQL side of THIS wrapper answers for g as well -- and every query
+// wrapper already handed out from it binds that same retargeted
+// transaction. Leaving the receiver undeclined let a caller that retargets
+// and keeps using its original handle get default-graph answers out of the
+// snapshot for a transaction PostgreSQL had moved to another graph.
 func (t *wrappedTransaction) WithGraph(g graph.Graph) graph.Transaction {
+	inner := t.Transaction.WithGraph(g)
+	t.declined = true
 	return &wrappedTransaction{
-		Transaction: t.Transaction.WithGraph(g),
+		Transaction: inner,
 		engine:      t.engine,
 		declined:    true,
 	}
