@@ -183,6 +183,28 @@ func main() {
 	alpha := flag.Float64("alpha", 3.0, "skew exponent for hub targets (higher = more concentrated)")
 	seed := flag.Uint64("seed", 42, "seed")
 	flag.Parse()
+
+	// Validate before any of it reaches the generator, where a bad value is
+	// a panic rather than a message: -n 0 divides by zero on the first
+	// `r.next() % uint64(N)`, and an -alpha of 0 makes math.Pow(x, 0) == 1
+	// for every x, so every hub target becomes exactly N -- one past the
+	// last node -- and the reverse CSR build indexes off[N+1] out of range.
+	// A negative alpha is worse still, producing targets near 2^32.
+	switch {
+	case *n <= 0:
+		fmt.Fprintln(os.Stderr, "csrbench: -n must be at least 1")
+		os.Exit(2)
+	case *m < 0:
+		fmt.Fprintln(os.Stderr, "csrbench: -m cannot be negative")
+		os.Exit(2)
+	case *alpha <= 0:
+		fmt.Fprintln(os.Stderr, "csrbench: -alpha must be greater than 0 (hub targets are drawn as pow(u, alpha), so alpha <= 0 lands outside the node range)")
+		os.Exit(2)
+	case *hubFrac < 0 || *hubFrac > 1:
+		fmt.Fprintln(os.Stderr, "csrbench: -hub must be a fraction between 0 and 1")
+		os.Exit(2)
+	}
+
 	N, M := *n, *m
 	r := &rng{*seed}
 

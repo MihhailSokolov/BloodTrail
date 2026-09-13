@@ -301,12 +301,15 @@ func TestLogMessagesMatchEngineSource(t *testing.T) {
 		{msgPathEngineServed, "../../internal/engine/engine.go"},
 		// Not messages but pinned by the same discipline: (e)'s accepted
 		// rejection reasons must stay the engine's own literals -- the
-		// uncovered-gap reason, and the two pieces bootReplayOverflowPrefix
-		// is assembled from (the adoption path's poisoned-buffer prefix
-		// plus the buffer's own overflow reason).
+		// uncovered-gap reason, the adoption path's poisoned-buffer prefix
+		// bootReplayOverflowPrefix is assembled on, and both of the
+		// buffer's own cap-overflow reasons that prefix has to match
+		// (TestBootReplayOverflowPrefixMatchesEngineReasons pins the
+		// assembly itself).
 		{bootReplayGapReason, "../../internal/engine/boot.go"},
-		{"boot write buffer poisoned: ", "../../internal/engine/boot.go"},
-		{"overflow: too many buffered writes", "../../internal/engine/bootgap.go"},
+		{bootReplayPoisonPrefix, "../../internal/engine/boot.go"},
+		{bootReplayOverflowReasons[0], "../../internal/engine/bootgap.go"},
+		{bootReplayOverflowReasons[1], "../../internal/engine/bootgap.go"},
 	}
 
 	for _, c := range cases {
@@ -319,5 +322,31 @@ func TestLogMessagesMatchEngineSource(t *testing.T) {
 				t.Fatalf("%s not found verbatim (quoted) in %s -- this package's copy has drifted out of sync with the engine source", c.message, c.file)
 			}
 		})
+	}
+}
+
+// bootReplayOverflowReasons are the boot gap buffer's two cap-overflow
+// poison reasons (internal/engine/bootgap.go's append), copied here the
+// way the message literals are and pinned against that source by
+// TestLogMessagesMatchEngineSource.
+var bootReplayOverflowReasons = []string{
+	"overflow: too many buffered writes",
+	"overflow: too many buffered keys",
+}
+
+// TestBootReplayOverflowPrefixMatchesEngineReasons pins what the literal
+// pins above cannot: that bootReplayOverflowPrefix matches the rejection
+// the adoption path actually logs for EACH cap overflow -- its
+// poisoned-buffer prefix followed by the buffer's own reason (boot.go's
+// reject("boot write buffer poisoned: " + poisoned)). A typo in the
+// assembled constant, or an overflow reason drifting off the "overflow: "
+// stem, would pass every literal pin yet turn a legitimate
+// OVERFLOW-REJECTED boot into a run-aborting unknown reason.
+func TestBootReplayOverflowPrefixMatchesEngineReasons(t *testing.T) {
+	for _, reason := range bootReplayOverflowReasons {
+		logged := bootReplayPoisonPrefix + reason
+		if !strings.HasPrefix(logged, bootReplayOverflowPrefix) {
+			t.Errorf("bootReplayOverflowPrefix = %q does not match the logged overflow rejection %q", bootReplayOverflowPrefix, logged)
+		}
 	}
 }

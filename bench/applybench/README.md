@@ -204,7 +204,7 @@ inside the boot-load window. Two writer scenarios run per bench run:
   the same flat-out writer adopts 3/3 at smoke scale, replaying 16-35
   in-flight writes per boot.
 
-Two outcomes are legitimate per boot:
+Three outcomes are legitimate per boot:
 
 - **ADOPTED** -- `"bloodtrail: snapshot file loaded"` with its
   `replayed_writes` attribute counting the buffered writes folded onto the
@@ -218,6 +218,16 @@ Two outcomes are legitimate per boot:
   bump was still unaccounted when the settle window closed, i.e. a write
   outlived the 5s wait. Rare in either scenario, and the pg-rebuild
   fallback is correct when it happens.
+- **OVERFLOW-REJECTED** -- `"bloodtrail: snapshot file rejected"` with a
+  reason of the form `boot write buffer poisoned: overflow: ...`: the
+  writer outproduced the boot gap buffer's caps across the whole boot
+  window, and the bounded-memory design handed the boot to the pg rebuild
+  honestly. Counted and reported (`overflowed=` in both
+  `APPLYBENCH_BOOT_REPLAY*` lines) so a run at a scale beyond the caps'
+  envelope says so per boot instead of dying on the first one; the caps
+  are sized from this scenario's own measurement (`maxBootGapEntries`,
+  `internal/engine/bootgap.go`), so at current caps and scale the expected
+  count is zero.
 
 Any other rejection reason, a writer error mid-boot, or a boot that reaches
 neither marker inside `-cap` aborts the run. Reported only, never enforced
@@ -510,14 +520,15 @@ The sustained scenario -- the writer that lost 3/3 against the one-instant
 decision -- now adopts every boot, replaying its entire load-window
 backlog; its cost scales with that backlog (the 1765-replay boot took
 19.2s end to end against 44,150 units written meanwhile) and stays
-well under the ~45-60s rebuild it replaces. Both enforced bars passed in
+well under the full pg rebuild it replaces (45.1-50.7s recorded for this
+graph above). Both enforced bars passed in
 the same run ((a) 27.6% against 60, (b) 1.75x at bar). An aborted first
 attempt of this run is itself recorded evidence: at the previous 1024
 entry cap the sustained writer measured 914 and 997 buffered writes across
 a ~11s 5M boot window and overflowed on the third boot -- the measurement
-`maxBootGapEntries`' current value (4096) and its pin test are derived
-from (internal/engine/bootgap.go); at the new cap this run's worst boot
-buffered 1765 with zero overflows.
+that `maxBootGapEntries`' current value (4096) and its pin test are derived
+from (see internal/engine/bootgap.go); at the new cap this run's worst boot
+buffered 1765 with zero overflows (the cap is ~2.3x that).
 
 ### A harness bug this run found and fixed
 

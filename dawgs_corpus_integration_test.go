@@ -152,14 +152,20 @@ type testCase struct {
 func locateDAWGSModuleDir(t *testing.T) string {
 	t.Helper()
 
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/specterops/dawgs").Output()
+	// Fatal, never skipped. dawgs is a hard go.mod dependency, so any
+	// environment that can compile this test can also resolve it -- and a
+	// skip here silently retires the whole ~375-case conformance corpus
+	// along with the dawgsCorpusServedFloor tally that exists to keep it
+	// from passing vacuously. A green run that asserted nothing is the one
+	// outcome this suite must not produce.
+	out, err := exec.CommandContext(context.Background(), "go", "list", "-m", "-f", "{{.Dir}}", "github.com/specterops/dawgs").Output()
 	if err != nil {
-		t.Skipf("locate github.com/specterops/dawgs module directory: %v", err)
+		t.Fatalf("locate github.com/specterops/dawgs module directory: %v", err)
 	}
 
 	dir := strings.TrimSpace(string(out))
 	if dir == "" {
-		t.Skip("github.com/specterops/dawgs module directory is empty")
+		t.Fatal("github.com/specterops/dawgs module directory is empty: the corpus cannot be loaded, and skipping it would retire the whole conformance suite silently")
 	}
 	return dir
 }

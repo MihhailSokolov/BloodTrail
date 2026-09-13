@@ -143,6 +143,12 @@ With no pg measurement left, `evaluateShape` judges a `pg_capped=true` shape
 on the **bloodtrail driver's own absolute p50** instead of a ratio, against
 `shapeThreshold.engineAbsoluteCap` -- see the table above.
 
+A row-count mismatch the warmup already measured still fails the shape: the
+warmup runs before any capping is possible, so a recorded `match=false` is a
+real disagreement between the two drivers, and a slow pg baseline does not
+retract it. Only a comparison that never ran (`match_checked=false`) is
+passed over.
+
 Forcing the capped path for a smoke test (e.g. `-pg-cap 1ms`) makes every
 shape's pg baseline trip immediately, which is a convenient way to verify
 the whole `pg_capped=true` code path end to end without waiting for a real
