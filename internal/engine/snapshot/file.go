@@ -377,6 +377,13 @@ func ReadSnapshotFile(path string) (snap *Snapshot, watermark uint64, err error)
 		MultiGraph: multiGraph,
 		edgeIDPerm: edgeIDPerm,
 	}
+	// The CRC above proves these are the bytes that were written, not that
+	// they describe a graph. finalizeDerived and every later reader index
+	// straight into these arrays -- one of them through unsafe.String --
+	// so the structure is checked before anything touches it.
+	if validateErr := validateSnapshotStructure(s); validateErr != nil {
+		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: %w", validateErr)
+	}
 	finalizeDerived(s)
 
 	return s, watermark, nil
