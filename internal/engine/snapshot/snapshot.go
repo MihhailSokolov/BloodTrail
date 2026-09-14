@@ -62,6 +62,12 @@ type Snapshot struct {
 	idIndex     map[uint64]NodeID
 	kindBitmaps map[KindID]*Bitset
 
+	// selfLoopKinds holds every edge kind with at least one self-loop edge
+	// (start == end) in this snapshot; nil when there are none (the ordinary
+	// case). Derived by finalizeDerived on every construction path -- see its
+	// doc -- and read through View.SelfLoopHazard.
+	selfLoopKinds map[KindID]struct{}
+
 	// edgeIDPerm holds forward-CSR indices 0..EdgeCount()-1 permuted into
 	// ascending OutEdgeIDs order, letting EdgeByID binary-search by database
 	// edge id without a separate id->index map.

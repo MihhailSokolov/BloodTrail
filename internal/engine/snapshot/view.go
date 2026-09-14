@@ -130,6 +130,54 @@ func (v *View) Segments() []*Segment {
 	return v.segments
 }
 
+// SelfLoopHazard reports whether this View may contain a self-loop edge
+// (start == end) whose kind is admitted by kinds -- an empty kinds list, the
+// "any relationship type" pattern, admits every kind. It is an
+// over-approximation by design: the base snapshot's set is derived at build
+// time and a delta tombstone never clears a base kind's bit (only a
+// compaction, which re-derives from what actually survives, does), so a
+// true return means "a self-loop of an admitted kind may exist", while a
+// false return is a proof that none does.
+//
+// The interpreter's variable-length trail executor declines to serve when
+// this returns true: PostgreSQL's recursive-CTE expansion applies its
+// self-loop dead-end rule to whichever pattern edge sits on the CTE's own
+// SEED side, and dawgs chooses that side per query through
+// version-specific optimizer heuristics (pattern reversal, per-step
+// direction flips, constraint balancing) this engine deliberately does not
+// mirror. With no admissible self-loop in the graph the rule can never
+// fire, so the seeding choice is unobservable and serving is provably
+// equivalent; with one present, delegating is the only answer that cannot
+// silently diverge. See expand.go's package doc in interpret.
+func (v *View) SelfLoopHazard(kinds []KindID) bool {
+	if setAdmitsSelfLoop(v.base.selfLoopKinds, kinds) {
+		return true
+	}
+	for _, seg := range v.segments {
+		if setAdmitsSelfLoop(seg.selfLoopKinds, kinds) {
+			return true
+		}
+	}
+	return false
+}
+
+// setAdmitsSelfLoop reports whether set (a self-loop kind set, possibly nil)
+// contains any kind admitted by kinds (empty = every kind).
+func setAdmitsSelfLoop(set map[KindID]struct{}, kinds []KindID) bool {
+	if len(set) == 0 {
+		return false
+	}
+	if len(kinds) == 0 {
+		return true
+	}
+	for _, k := range kinds {
+		if _, ok := set[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureDelta lazily computes merged (the newest-wins collapse of v's
 // segment stack) and the virtual dense id assignment derived from it, at
 // most once per View. Every pg id merged carries a non-tombstoned record
