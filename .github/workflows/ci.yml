@@ -23,11 +23,23 @@ jobs:
       - run: go test -race -tags integration -count=1 -p 1 ./...
         env:
           BLOODTRAIL_TEST_PG: postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail
+      # bench/csrbench is its own module, invisible to the ./... patterns above.
+      - name: csrbench module
+        working-directory: bench/csrbench
+        run: |
+          go vet ./...
+          go test ./...
   patch-guard:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # v9.6.0 is the e2e-validated tag; newer published tags get at least
+        # this apply-check per change (see README "Upstream versions").
+        upstream: [v9.6.0, v9.7.0]
     steps:
       - uses: actions/checkout@v4
-      - name: Apply the patch to the supported upstream tag
+      - name: Apply the patch to ${{ matrix.upstream }}
         run: |
-          git clone --depth 1 --branch v9.6.0 https://github.com/SpecterOps/BloodHound.git /tmp/upstream
+          git clone --depth 1 --branch ${{ matrix.upstream }} https://github.com/SpecterOps/BloodHound.git /tmp/upstream
           git -C /tmp/upstream apply --check "$GITHUB_WORKSPACE/patches/bloodhound-driver.patch"
