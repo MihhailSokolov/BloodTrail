@@ -35,7 +35,7 @@ jobs:
             --jq '[.[] | select(.isPrerelease|not) | .tagName] | .[0:3]')
           missing="[]"
           for t in $(echo "$latest" | jq -r '.[]'); do
-            if ! docker manifest inspect "ghcr.io/mihhailsokolov/bloodhound-bloodtrail:$t" >/dev/null 2>&1; then
+            if ! docker manifest inspect "ghcr.io/mihhailsokolov/bloodtrail:$t" >/dev/null 2>&1; then
               missing=$(echo "$missing" | jq -c --arg t "$t" '. + [$t]')
             fi
           done

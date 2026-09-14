@@ -572,7 +572,7 @@ To undo everything:
     bloodtrail rollback
 
 Supported upstream releases are the tags published at
-`ghcr.io/mihhailsokolov/bloodhound-bloodtrail`. Images are built from the upstream
+`ghcr.io/mihhailsokolov/bloodtrail`. Images are built from the upstream
 Dockerfile with a one-file patch (`patches/bloodhound-driver.patch`); see
 [Upstream versions](#upstream-versions) for which tags exist and how they are
 validated.

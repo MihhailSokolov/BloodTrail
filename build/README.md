@@ -17,11 +17,15 @@ the main module transitively imports, vendored ones included. Everything else un
 `internal/` -- the installer, its CLI, the verify fixtures -- is operator tooling with no
 business inside the served image and stays out.
 
-Images are tagged `ghcr.io/mihhailsokolov/bloodhound-bloodtrail:<tag>-bt<driver version>`
+Images are tagged `ghcr.io/mihhailsokolov/bloodtrail:<tag>-bt<driver version>`
 and `:<tag>`. The second is a moving alias for the newest driver build against that
 upstream release; the installer falls back to it when the tag for its own version has
 not been published. A leading `v` is stripped from the driver version, so the same
 string is stamped into `Version` and used in the image tag.
+
+(Releases up to and including v0.1.0 were built against the package's original name,
+`ghcr.io/mihhailsokolov/bloodhound-bloodtrail`; those CLI binaries keep pulling from
+it, so delete that package only once no such install matters anymore.)
 
 Requires Go 1.26+, Docker with Buildx, and network access to GitHub.
 
@@ -114,9 +118,9 @@ released CLI can install anything. In order (the ordering is load-bearing twice:
 `release.yml` refuses to run until the package is public, and the `image` workflow can
 only be dispatched from a ref that already exists):
 
-1. Set the GHCR package `bloodhound-bloodtrail` to public in its package settings.
+1. Set the GHCR package `bloodtrail` to public in its package settings.
 2. Confirm an unauthenticated client can see it:
-   `docker logout ghcr.io && docker manifest inspect ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0`.
+   `docker logout ghcr.io && docker manifest inspect ghcr.io/mihhailsokolov/bloodtrail:v9.6.0`.
 3. Push the `vX.Y.Z` tag to trigger `release.yml`, which verifies that anonymous pull
    itself and then builds the CLI archives, `checksums.txt` and `install.sh`.
 4. For each supported upstream tag, dispatch the `image` workflow from the release tag

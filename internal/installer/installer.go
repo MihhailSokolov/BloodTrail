@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	DefaultImageRepo  = "ghcr.io/mihhailsokolov/bloodhound-bloodtrail"
+	DefaultImageRepo  = "ghcr.io/mihhailsokolov/bloodtrail"
 	DefaultAPIURL     = "http://127.0.0.1:8080"
 	DefaultAdminUser  = "admin"
 	toolAPIBaseURL    = "http://bloodhound:2112"

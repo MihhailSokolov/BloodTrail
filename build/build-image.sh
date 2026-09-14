@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 WORK="$REPO_ROOT/.build/upstream-$TAG"
-IMAGE_REPO="${IMAGE_REPO:-ghcr.io/mihhailsokolov/bloodhound-bloodtrail}"
+IMAGE_REPO="${IMAGE_REPO:-ghcr.io/mihhailsokolov/bloodtrail}"
 IMAGE="$IMAGE_REPO:$TAG-bt$DRIVER_VERSION"
 ALIAS="$IMAGE_REPO:$TAG"
 MODULE="github.com/MihhailSokolov/BloodTrail"

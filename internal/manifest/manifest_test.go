@@ -20,7 +20,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		OriginalDriverRow: &row,
 		BackupDir:         filepath.Join(dir, ".bloodtrail", "backups", "20260902T120000Z"),
 		OverrideFile:      filepath.Join(dir, "docker-compose.bloodtrail.yml"),
-		TargetImage:       "ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0-bt0.1.0",
+		TargetImage:       "ghcr.io/mihhailsokolov/bloodtrail:v9.6.0-bt0.1.0",
 		UpstreamTag:       "v9.6.0",
 		PGUser:            "bloodhound",
 		PGDatabase:        "bloodhound",

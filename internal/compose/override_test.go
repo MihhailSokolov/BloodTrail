@@ -10,7 +10,7 @@ import (
 func TestOverrideRender(t *testing.T) {
 	o := Override{
 		Service: "bloodhound",
-		Image:   "ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0-bt0.1.0",
+		Image:   "ghcr.io/mihhailsokolov/bloodtrail:v9.6.0-bt0.1.0",
 		Environment: map[string]string{
 			"bhe_graph_driver":     "bloodtrail",
 			"BLOODTRAIL_LOG_LEVEL": "info",
@@ -18,7 +18,7 @@ func TestOverrideRender(t *testing.T) {
 	}
 	got := o.Render()
 	for _, want := range []string{
-		"services:\n  bloodhound:\n    image: ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0-bt0.1.0\n",
+		"services:\n  bloodhound:\n    image: ghcr.io/mihhailsokolov/bloodtrail:v9.6.0-bt0.1.0\n",
 		"    environment:\n",
 		"      - BLOODTRAIL_LOG_LEVEL=info\n",
 		"      - bhe_graph_driver=bloodtrail\n",
