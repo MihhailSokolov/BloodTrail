@@ -49,7 +49,7 @@ bench-cypher: ## run the cypher-interpreter benchmark against BLOODTRAIL_TEST_PG
 # all too, which then regenerates at adgen's own default size. Point it only
 # at a disposable test database.
 # -enforce fails the build if apply overhead or during-ingest p95 miss their
-# (PROVISIONAL, see bench/applybench/README.md) bars; every phase is bounded
+# measured, evidence-derived bars (see bench/applybench/README.md); every phase is bounded
 # by applybench's own -cap watchdog (default 10m per operation), which
 # ABORTS THE WHOLE RUN on a trip rather than ever waiting unbounded; never
 # pass -enforce in CI (see bench/applybench).

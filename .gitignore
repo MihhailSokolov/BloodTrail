@@ -3,7 +3,6 @@
 *.test
 *.out
 /bin/
-/dist/
 /pathbench
 /builderbench
 /cypherbench
@@ -26,3 +25,4 @@ dist/
 
 # Agent working files
 .superpowers/
+.claude/

@@ -369,7 +369,7 @@ func TestTryCypherDifferential(t *testing.T) {
 			// Plain-property-MATCH coverage: a bare
 			// MATCH/WHERE/RETURN with no shortestPath/allShortestPaths
 			// pattern at all -- exactly the general-purpose shape the
-			// retired milestone-2 recognizer could never serve, and the
+			// retired shortestPath-only recognizer could never serve, and the
 			// interpreter now can. adminNode's name is unique across this
 			// entire fixture, so the match (and therefore the aggregated
 			// single-node "path" ops.FetchByQuery builds from a plain node
@@ -446,7 +446,7 @@ func TestTryCypherDifferential(t *testing.T) {
 }
 
 // TestTryCypherRejectsNonShortestPath was originally the reject case
-// for the retired milestone-2 recognizer (recognize.FromCypher), which
+// for the retired shortestPath-only recognizer (recognize.FromCypher), which
 // only ever recognized shortestPath/allShortestPaths shapes -- so a plain
 // `MATCH (n) RETURN n` was, at the time, the simplest possible "declined"
 // example. The interpreter-backed TryCypher serves that exact shape

@@ -130,6 +130,23 @@ type Row struct {
 	// markEdgeUsed needs no lazy-allocate-on-first-use dance the way the
 	// map-valued fields above do.
 	usedEdges []uint64
+
+	// trailEdges records the same overlay-aware edge identities as usedEdges
+	// (see candidateIdentity), but for edges consumed by a variable-length
+	// step's own emitted trail rather than by a fixed step. The two sets are
+	// deliberately separate because dawgs' cross-step relationship-uniqueness
+	// constraints are asymmetric (pinned from dawgs@v0.8.0
+	// translate/traversal.go's previousRelationshipUniquenessConstraint /
+	// expansionPreviousRelationshipUniquenessConstraint, and verified against
+	// its generated SQL): a fixed step may reuse neither another fixed step's
+	// edge (`e1.id != e0.id`) nor any edge inside a variable-length step's
+	// trail (`e1.id != all (path)`), and a trail may not reuse a fixed step's
+	// edge (`e0 != all (path)` emitted from the fixed step's side in both
+	// orders) -- but two variable-length steps' trails MAY share an edge (the
+	// constraint builders skip a preceding expansion entirely). So fixed-step
+	// expansion checks BOTH sets, while the trail DFS checks only usedEdges
+	// and records into trailEdges.
+	trailEdges []uint64
 }
 
 // NewRow returns an empty Row ready for SetNode/SetEdge/SetPathVar/
@@ -217,6 +234,27 @@ func (r *Row) markEdgeUsed(fwd uint64) {
 func (r *Row) edgeUsed(fwd uint64) bool {
 	for _, used := range r.usedEdges {
 		if used == fwd {
+			return true
+		}
+	}
+	return false
+}
+
+// markTrailEdge records identity (the same overlay-aware value
+// candidateIdentity produces) as consumed by a variable-length step's trail
+// on this row -- see trailEdges' own doc for why this is a separate set from
+// usedEdges. Like markEdgeUsed, re-marking the same identity is harmless.
+func (r *Row) markTrailEdge(identity uint64) {
+	r.trailEdges = append(r.trailEdges, identity)
+}
+
+// trailEdgeUsed reports whether identity was recorded via markTrailEdge on
+// this row or on whichever row it was cloned/merged from. Same linear-scan
+// reasoning as edgeUsed: a row's trail hop count is bounded by the
+// variable-length depth cap, so the slice stays small.
+func (r *Row) trailEdgeUsed(identity uint64) bool {
+	for _, used := range r.trailEdges {
+		if used == identity {
 			return true
 		}
 	}

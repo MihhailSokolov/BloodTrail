@@ -266,7 +266,7 @@ func TestFileBootRejectsUncoveredGap(t *testing.T) {
 	}
 }
 
-// TestFileBootWaitsForInFlightWriteAndAdopts is milestone 7's headline
+// TestFileBootWaitsForInFlightWriteAndAdopts is the settle-wait's headline
 // case: a write whose eager bump has committed but whose Apply has not yet
 // run when the file attempt starts -- the shape that made a one-instant
 // decision reject under any concurrent writer (a batch's bump lands at its

@@ -364,6 +364,27 @@ func finalizeDerived(s *Snapshot) {
 	s.kindBitmaps = kindBitmaps
 	s.MaxKindID = maxKind
 
+	// selfLoopKinds: which edge kinds have at least one self-loop edge in
+	// this snapshot (start == end). Derived here so every construction path
+	// -- Build, ReadSnapshotFile, and Fold (which goes through Build) --
+	// carries it without a file-format change; a compaction that folds away
+	// the last self-loop of a kind therefore also clears its hazard bit.
+	// Consumed by View.SelfLoopHazard (see its doc for what the interpreter
+	// gates on it and why).
+	var selfLoopKinds map[KindID]struct{}
+	for i := 0; i < n; i++ {
+		lo, hi := s.OutOffsets[i], s.OutOffsets[i+1]
+		for slot := lo; slot < hi; slot++ {
+			if s.OutTargets[slot] == NodeID(i) {
+				if selfLoopKinds == nil {
+					selfLoopKinds = make(map[KindID]struct{})
+				}
+				selfLoopKinds[s.OutKinds[slot]] = struct{}{}
+			}
+		}
+	}
+	s.selfLoopKinds = selfLoopKinds
+
 	finalizePropStore(s.Props, n)
 }
 

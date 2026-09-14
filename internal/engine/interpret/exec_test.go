@@ -852,6 +852,68 @@ func TestExecChainSameEdgeReusedAcrossDifferentVarStepsAllowed(t *testing.T) {
 		[]string{"N:1,2,3,4,2,3,5,|E:200,201,202,203,201,204,"})
 }
 
+// TestExecChainFixedEdgeExcludedFromLaterTrail: a two-node cycle where a
+// fixed step consumes a->x and the following var-length step's only way to
+// produce a second row is to walk back over that very edge (x->a->x). dawgs
+// emits `e0 != all (path)` between a fixed step and a variable-length
+// expansion of the same pattern -- in both orders -- so the trail may take
+// x->a (a fresh edge) but never extend a->x again: exactly one row survives,
+// and the depth-2 trail that reused the fixed edge must not exist. (Two
+// var-length steps of the same chain sharing an edge stays LEGAL -- the
+// companion pin above.)
+func TestExecChainFixedEdgeExcludedFromLaterTrail(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindMid    snapshot.KindID = 2
+		kindTarget snapshot.KindID = 3
+		kindE      snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindRoot: "Root", kindMid: "Mid", kindTarget: "Target", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindRoot, kindTarget}}, // a
+			{id: 2, kinds: []snapshot.KindID{kindMid, kindTarget}},  // x
+		},
+		[]execEdgeSpec{
+			{id: 100, start: 1, end: 2, kind: kindE}, // a->x: the fixed step's edge
+			{id: 101, start: 2, end: 1, kind: kindE}, // x->a: the trail's legal edge
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (a:Root)-[:E]->(m:Mid)-[:E*1..2]->(b:Target) RETURN p`, 0,
+		[]string{"N:1,2,1,|E:100,101,"})
+}
+
+// TestExecChainTrailEdgeExcludedFromLaterFixedStep: the mirrored order of
+// the pin above -- the var-length step's trail walks the whole a->x->a
+// cycle first, and the fixed step that follows could then only bind by
+// reusing the trail's own first edge (a->x). dawgs emits the same
+// `e != all (path)` exclusion from the fixed step's side, so the whole
+// chain must produce no rows at all.
+func TestExecChainTrailEdgeExcludedFromLaterFixedStep(t *testing.T) {
+	const (
+		kindRoot snapshot.KindID = 1
+		kindMid  snapshot.KindID = 2
+		kindE    snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindRoot: "Root", kindMid: "Mid", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindRoot}}, // a
+			{id: 2, kinds: []snapshot.KindID{kindMid}},  // x
+		},
+		[]execEdgeSpec{
+			{id: 100, start: 1, end: 2, kind: kindE}, // a->x: trail edge 1, and the fixed step's only candidate
+			{id: 101, start: 2, end: 1, kind: kindE}, // x->a: trail edge 2
+		},
+	)
+
+	assertPathSigs(t, snap,
+		`MATCH p = (a:Root)-[:E*2..2]->(m:Root)-[:E]->(b:Mid) RETURN p`, 0,
+		nil)
+}
+
 // TestExecChainBudgetExhaustionMidChain: a fixed step (a -F-> m) followed by
 // a variable-length step from m into an 8-node clique, under a work budget
 // far too small for the clique's own fan-out (mirroring

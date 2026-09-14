@@ -50,6 +50,12 @@ type Segment struct {
 	// from one map with no fast/slow-path split.
 	objectIndex map[string][]uint64
 
+	// selfLoopKinds holds every edge kind this segment writes at least one
+	// live self-loop edge for (start == end, not tombstoned); nil when there
+	// are none. The Segment half of the base snapshot's identically-named
+	// derived field -- see segmentSelfLoopKinds and View.SelfLoopHazard.
+	selfLoopKinds map[KindID]struct{}
+
 	// approxBytes memoizes ApproxBytes' result, computed once by
 	// computeSegmentApproxBytes at construction time (SegmentBuilder.Build
 	// or MergeSegments) rather than walked afresh on every call. A Segment
@@ -553,9 +559,29 @@ func (b *SegmentBuilder) Build() *Segment {
 	s.edgeIDs = edgeIDs
 	s.edgeStates = edgeStates
 	s.objectIndex = buildSegmentObjectIndex(nodeIDs, nodeStates)
+	s.selfLoopKinds = segmentSelfLoopKinds(edgeStates)
 	s.approxBytes = computeSegmentApproxBytes(s)
 
 	return s
+}
+
+// segmentSelfLoopKinds derives which edge kinds carry at least one live
+// (non-tombstoned) self-loop edge in edgeStates -- the Segment counterpart
+// of finalizeDerived's base-snapshot derivation, shared by
+// SegmentBuilder.Build and MergeSegments the same way
+// buildSegmentObjectIndex is. nil when there are none (the ordinary case).
+func segmentSelfLoopKinds(edgeStates map[uint64]EdgeSegState) map[KindID]struct{} {
+	var out map[KindID]struct{}
+	for _, st := range edgeStates {
+		if st.Tombstoned || st.StartID != st.EndID {
+			continue
+		}
+		if out == nil {
+			out = make(map[KindID]struct{})
+		}
+		out[st.Kind] = struct{}{}
+	}
+	return out
 }
 
 // copyKindNames returns a copy of pairs, or an empty (non-nil) map if pairs
@@ -633,12 +659,13 @@ func MergeSegments(segs []*Segment) *Segment {
 	edgeIDs := sortedUint64Keys(edgeStates)
 
 	merged := &Segment{
-		nodeIDs:     nodeIDs,
-		nodeStates:  nodeStates,
-		edgeIDs:     edgeIDs,
-		edgeStates:  edgeStates,
-		addedKinds:  addedKinds,
-		objectIndex: buildSegmentObjectIndex(nodeIDs, nodeStates),
+		nodeIDs:       nodeIDs,
+		nodeStates:    nodeStates,
+		edgeIDs:       edgeIDs,
+		edgeStates:    edgeStates,
+		addedKinds:    addedKinds,
+		objectIndex:   buildSegmentObjectIndex(nodeIDs, nodeStates),
+		selfLoopKinds: segmentSelfLoopKinds(edgeStates),
 	}
 	merged.approxBytes = computeSegmentApproxBytes(merged)
 	return merged

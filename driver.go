@@ -241,20 +241,22 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // own doc -- because a batch's earlier chunks are already durable by the
 // time a later one fails.)
 //
-// The error branch instead calls resolveAbandonedWrite (write_observer.go) on
-// whatever scope observer last held: the watermark protocol's own spec
-// amendment (internal/engine/watermark.go's BumpWatermark doc) requires the
-// pg counter to advance even for a write that rolled back, since the
-// observer's first mutating call already bumped it eagerly, before this
-// transaction's own pg effect -- long before its outcome was known. That
-// bump has to resolve (fold into e.appliedWatermark, retire its
-// e.inflightBumps entry) regardless, and a bump that FAILED has to settle its
-// own watermark trust generation, since a rolled-back transaction left
-// nothing uncounted behind it -- both of which resolveAbandonedWrite does
-// directly, without a full Apply: a rolled-back transaction has no committed
-// effect for a read-back to replay. observer can be nil here only if
-// d.Driver.WriteTransaction's own delegate closure never ran at all (never
-// observed in the pinned pg driver, but checked defensively).
+// The error branch splits on WHERE the error arose, because only one of the
+// two sources proves a rollback. A delegate-returned error means the
+// embedded driver rolled the transaction back: resolveAbandonedWrite
+// (write_observer.go) resolves the eager bump without an Apply -- the
+// watermark protocol's own spec amendment (internal/engine/watermark.go's
+// BumpWatermark doc) requires the pg counter to advance even for a write
+// that rolled back, so that bump has to fold into e.appliedWatermark and
+// retire its e.inflightBumps entry regardless, and a bump that FAILED has to
+// settle its own trust generation -- a rolled-back transaction has no
+// committed effect for a read-back to replay. But an error with a
+// SUCCESSFUL delegate arose in the embedded driver's own final Commit, whose
+// outcome is ambiguous (the write may be durable); that branch records a
+// fallback and Applies instead -- see its in-body comment. observer can be
+// nil here only if d.Driver.WriteTransaction's own delegate closure never
+// ran at all (never observed in the pinned pg driver, but checked
+// defensively).
 //
 // observer is declared once, outside the delegate closure below, then
 // reconstructed fresh inside it on every invocation -- matching
@@ -313,18 +315,52 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // bump-failure mark, not just the last attempt's) before either could be
 // trusted.
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
-	var observer *observingTransaction
+	var (
+		observer    *observingTransaction
+		delegateErr error
+	)
 	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		observer = &observingTransaction{Transaction: tx, scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
-		return txDelegate(observer)
+		delegateErr = txDelegate(observer)
+		return delegateErr
 	}, options...); err != nil {
-		if observer != nil {
-			resolveAbandonedWrite(ctx, d.engine, observer.scope)
-		}
+		resolveWriteTransactionFailure(ctx, d.engine, observer, delegateErr, err)
 		return err
 	}
 	d.engine.Apply(ctx, observer.scope)
 	return nil
+}
+
+// resolveWriteTransactionFailure settles the engine's accounting for a
+// Driver.WriteTransaction call whose OUTER call errored, split three ways
+// (see WriteTransaction's doc for the full reasoning):
+//
+//   - observer == nil: the delegate closure never ran (e.g. BEGIN failed) --
+//     no scope exists, nothing was bumped, nothing to resolve.
+//   - delegateErr != nil: the delegate's own error made the embedded driver
+//     roll back -- resolveAbandonedWrite settles the eager bump without an
+//     Apply, since a rolled-back transaction left no committed effect.
+//   - delegateErr == nil: the error arose AFTER the delegate, in the
+//     embedded driver's own final Commit, whose outcome is AMBIGUOUS: the
+//     error can come from PostgreSQL's COMMIT itself, and the write may be
+//     durable. Assuming rollback would leave the replica permanently missing
+//     a committed write while trusting its own watermark accounting. Record
+//     a fallback and Apply instead: the rebuild reloads PostgreSQL's actual
+//     outcome whichever way the commit went, and Apply resolves the bump
+//     through the ordinary path (the same reasoning as
+//     observingTransaction.Commit's own failed-commit branch, which covers a
+//     DELEGATE-issued commit; this covers the embedded driver's final one,
+//     which no wrapper ever sees).
+func resolveWriteTransactionFailure(ctx context.Context, eng *engine.Engine, observer *observingTransaction, delegateErr, outerErr error) {
+	if observer == nil {
+		return
+	}
+	if delegateErr == nil {
+		observer.scope.Changes().RecordFallback(fmt.Sprintf("WriteTransaction: commit outcome ambiguous: %v", outerErr))
+		eng.Apply(ctx, observer.scope)
+		return
+	}
+	resolveAbandonedWrite(ctx, eng, observer.scope)
 }
 
 // BatchOperation runs batchDelegate against the embedded PostgreSQL driver,

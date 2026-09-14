@@ -285,8 +285,10 @@ type Engine struct {
 	// e.kindNamesByID (below) would. Same seam, same motivation, and same
 	// New default (e.kindNamesByID) as mapKind above, just for the opposite
 	// direction -- needed by TryNodeFetchKinds to render its
-	// graph.KindsResult output.
-	mapKindNames func(ids []snapshot.KindID) (graph.Kinds, error)
+	// graph.KindsResult output. Takes the serving request's own ctx so the
+	// PostgreSQL round trip behind a served builder answer honors the
+	// caller's deadline/cancellation.
+	mapKindNames func(ctx context.Context, ids []snapshot.KindID) (graph.Kinds, error)
 }
 
 // New constructs an Engine bound to pgDriver/pool. It does not load a
@@ -306,13 +308,11 @@ func New(pgDriver *pg.Driver, pool *pgxpool.Pool, cfg Config) *Engine {
 }
 
 // kindNamesByID resolves KindIDs back to their graph.Kind names via the
-// driver's KindMapper -- mapKindNames' production default (New, above).
-// context.Background() is used deliberately: this has no ctx of its own to
-// plumb through from mapKindNames' callers, and a kind lookup that outlives
-// whatever request triggered it is fine here, the same way RebuildNow's own
-// background boot-load/recovery goroutines outlive any one caller.
-func (e *Engine) kindNamesByID(ids []snapshot.KindID) (graph.Kinds, error) {
-	return e.pgDriver.KindMapper().MapKindIDs(context.Background(), ids)
+// driver's KindMapper -- mapKindNames' production default (New, above),
+// threading the serving caller's own ctx so the lookup's PostgreSQL round
+// trip respects the request's deadline instead of outliving it.
+func (e *Engine) kindNamesByID(ctx context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
+	return e.pgDriver.KindMapper().MapKindIDs(ctx, ids)
 }
 
 // ApplyCount returns how many times Apply (apply.go) has been called,

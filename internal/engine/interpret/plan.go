@@ -324,6 +324,17 @@ type ProjectionOutput struct {
 	Alias        string
 	Expr         cypher.Expression
 	BareCallKind string
+
+	// OutputName is the column name a CALLER observes (ResultSet.Keys /
+	// Result.Keys()), as PostgreSQL itself would name it: identical to Alias
+	// except for an UNALIASED property lookup, which dawgs projects with no
+	// SQL alias at all, so PostgreSQL names the column `?column?` (pinned
+	// live by TestTryCypherKeysMatchOracle). Alias stays the Cypher-side
+	// name ("n.prop") because planning still needs it -- projectedAliases'
+	// duplicate detection and planOrder's alias resolution both key off the
+	// name ORDER BY can actually reference, and pg's own placeholder is not
+	// referenceable from Cypher.
+	OutputName string
 }
 
 // Projection is the compiled RETURN clause: Distinct is RETURN DISTINCT
@@ -2761,10 +2772,23 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		projectedKinds[name] = itemKind
 		projectedNumeric[name] = isStaticallyNumericScalar(item.Expression, numericScalars)
 
+		outputName := name
+		if item.Alias == nil || item.Alias.Symbol == "" {
+			// An unaliased property lookup reaches PostgreSQL with no SQL
+			// alias, so pg names the column `?column?` -- see
+			// ProjectionOutput.OutputName's doc. A bare variable is the other
+			// unaliased shape Plan accepts, and dawgs DOES alias that one to
+			// the symbol itself.
+			if _, isProp := unwrapParens(item.Expression).(*cypher.PropertyLookup); isProp {
+				outputName = "?column?"
+			}
+		}
+
 		items = append(items, ProjectionOutput{
 			Alias:        name,
 			Expr:         item.Expression,
 			BareCallKind: bareCallKind(item.Expression),
+			OutputName:   outputName,
 		})
 	}
 

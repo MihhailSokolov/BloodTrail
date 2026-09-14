@@ -92,5 +92,7 @@ final heap=99 MB sys=264 MB
 
 The synthetic graph is a stand-in. Real AD graphs have more structure (OU containment
 trees, per-domain clustering, ACL edges concentrated on a few objects), which keeps
-BFS frontiers smaller for longer. The first milestone replaces these numbers with
-measurements on a real topology export.
+BFS frontiers smaller for longer. The realistic-topology benchmarks under
+[bench/](..) (adgen + pathbench, against the real engine on PostgreSQL-loaded
+data) superseded these synthetic numbers; a run against a real topology export
+stays open for whenever an export exists.

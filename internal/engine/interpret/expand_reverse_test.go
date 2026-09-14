@@ -178,7 +178,6 @@ var revKindTable = map[snapshot.KindID]string{
 //     twice), which must stay two distinct trails,
 //   - a directed cycle (5->6->7->5) exercising the relationship-uniqueness
 //     rule in both walk directions,
-//   - a mid-trail self-loop (3->3),
 //   - a node carrying BOTH endpoint kinds (node 5), so `*0..` can bind the two
 //     pattern endpoints to the same node,
 //   - a second edge kind (2->3 via F) that a `[:E...]` pattern must exclude,
@@ -206,7 +205,6 @@ func buildReverseEqualityFixture(t *testing.T) *snapshot.View {
 			{104, 2, 6, revKindE},
 			{105, 2, 6, revKindE},
 			{106, 6, 7, revKindE},
-			{107, 3, 3, revKindE},
 			{108, 7, 5, revKindE},
 			{109, 5, 6, revKindE},
 			{110, 2, 3, revKindF},
@@ -318,16 +316,13 @@ func TestVarLengthReverseMultiplicity(t *testing.T) {
 	})
 }
 
-// buildReverseSelfLoopFixture builds the first-edge-self-loop fixture: node 1
-// carries a self-loop AND is itself a matching Target, node 1 also points at a
-// second matching Target (node 2), and node 3 points into node 1.
-//
-// Forward expansion emits a trail whose FIRST edge is a self-loop at depth 1
-// but never extends it, so `[1 -(self)- 1 -> 2]` must NOT exist. Backward
-// expansion discovers that same first edge LAST, so it cannot prune the branch
-// (a self-loop reached deeper is legal and extendable, e.g. `[3 -> 1 -(self)-
-// 1]`); it has to suppress emission at exactly the moment the most recently
-// walked edge is a self-loop and the trail is already two or more edges long.
+// buildReverseSelfLoopFixture builds a fixture whose node 1 carries a
+// self-loop of the pattern's own edge kind (E) -- since the self-loop hazard
+// gate landed, a graph like this makes EVERY [:E*..] pattern decline, in
+// both walk directions, because pg's seed-side is_cycle guard placement
+// would otherwise be observable (see expand.go's SELF-LOOPS package-doc
+// bullet). Node 3's F-kind edge exists so the kind-scoped half of the gate
+// has something to prove: a pattern admitting only F must still serve.
 func buildReverseSelfLoopFixture(t *testing.T) *snapshot.View {
 	t.Helper()
 	return buildExecSnapshot(t, revKindTable,
@@ -339,38 +334,36 @@ func buildReverseSelfLoopFixture(t *testing.T) *snapshot.View {
 		[]execEdgeSpec{
 			{200, 1, 1, revKindE},
 			{201, 1, 2, revKindE},
-			{202, 3, 1, revKindE},
+			{202, 3, 1, revKindF},
 		},
 	)
 }
 
-// TestVarLengthReverseFirstEdgeSelfLoopRule asserts both halves of the
-// first-edge self-loop rule survive backward discovery, against a hand-derived
-// expected trail set (not one computed by either executor).
-func TestVarLengthReverseFirstEdgeSelfLoopRule(t *testing.T) {
+// TestVarLengthSelfLoopHazardDeclinesBothDirections: a self-loop of an
+// admitted kind anywhere in the view declines the var-length pattern in
+// BOTH enumeration directions (the reverse-eligible spelling included),
+// while a pattern admitting only a kind with no self-loops still serves.
+func TestVarLengthSelfLoopHazardDeclinesBothDirections(t *testing.T) {
 	snap := buildReverseSelfLoopFixture(t)
-	const query = `MATCH p = (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'S-516' RETURN p`
 
-	env := &Env{Snap: snap}
-	part, step := varLengthPartAndStep(t, snap, query)
-	if !varLengthReverseEligible(env, part, step) {
-		t.Fatalf("query %q: want reverse-eligible", query)
+	// Reverse-eligible spelling (unconstrained near side, anchored far side):
+	// the dispatcher would pick the backward route; the gate must decline
+	// before either walker enumerates anything.
+	const reversedQuery = `MATCH p = (s)-[:E*1..3]->(t:Target) WHERE t.objectid = 'S-516' RETURN p`
+	if err := execExpectErr(t, snap, reversedQuery, generousBudget); !errors.Is(err, errUnsupportedStep) {
+		t.Fatalf("query %q: err = %v, want errUnsupportedStep", reversedQuery, err)
 	}
 
-	assertVarLengthDirectionsAgree(t, snap, query)
+	// Forward spelling (constrained near side).
+	const forwardQuery = `MATCH p = (t:Target)-[:E*1..3]->(x) WHERE t.objectid = 'S-516' RETURN p`
+	if err := execExpectErr(t, snap, forwardQuery, generousBudget); !errors.Is(err, errUnsupportedStep) {
+		t.Fatalf("query %q: err = %v, want errUnsupportedStep", forwardQuery, err)
+	}
 
-	// The hand-derived set. Note what is absent: "N:1,1,2,|E:200,201," -- the
-	// trail whose first edge is the self-loop and which is then extended --
-	// which a backward walk would happily enumerate without the suppression
-	// rule, and which forward expansion can never produce.
-	assertPathSigs(t, snap, query, 0, []string{
-		"N:1,1,|E:200,",             // depth-1 self-loop trail: emitted
-		"N:1,2,|E:201,",             // ordinary depth-1 trail
-		"N:3,1,|E:202,",             // ordinary depth-1 trail
-		"N:3,1,1,|E:202,200,",       // self-loop reached mid-trail: legal
-		"N:3,1,2,|E:202,201,",       // ordinary depth-2 trail
-		"N:3,1,1,2,|E:202,200,201,", // self-loop mid-trail, extended further
-	})
+	// Kind-scoped: the only F edge is 3->1 (no F self-loop exists), so a
+	// pattern admitting only F is unaffected by the E self-loop.
+	assertPathSigs(t, snap, `MATCH p = (s)-[:F*1..3]->(t:Target) WHERE t.objectid = 'S-516' RETURN p`, 0,
+		[]string{"N:3,1,|E:202,"})
 }
 
 // TestVarLengthReverseZeroLengthBindsSameNode pins the `*0..` arm under

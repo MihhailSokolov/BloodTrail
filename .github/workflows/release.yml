@@ -10,6 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # The installer a release ships is useless if the patched images cannot
+      # be pulled anonymously (first-release checklist, build/README.md):
+      # refuse to publish a CLI before the GHCR package is public.
+      - name: Verify the GHCR images are anonymously pullable
+        run: |
+          docker logout ghcr.io 2>/dev/null || true
+          docker manifest inspect ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0 > /dev/null
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - uses: goreleaser/goreleaser-action@v6

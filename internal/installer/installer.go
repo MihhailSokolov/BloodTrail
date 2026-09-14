@@ -357,15 +357,37 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		if err != nil {
 			return fmt.Errorf("reading %s logs before the migration: %w; %s", bloodhoundService, err, rollbackHint)
 		}
-		// BloodHound keeps ingesting into Neo4j while the operator confirms
-		// and the backup runs, so the counts taken during inventory can
-		// already be stale by the time the migration starts. Read Neo4j
-		// again right before it, best effort like the inventory read, and
-		// compare the migrated counts against these instead.
-		freshNodes, freshEdges, freshErr := neo4jCounts(ctx, c, inv.Config)
+		// The migrator runs inside the bloodhound server, and its state
+		// machine resets to "idle" if that container restarts -- which
+		// WaitUntilIdle cannot tell apart from completion. Capture the
+		// container's identity (id + start time) before starting, so a
+		// restart anywhere inside the migration window is detected instead
+		// of read as success.
+		epochBefore, err := bloodhoundContainerEpoch(ctx, deps, c)
+		if err != nil {
+			return fmt.Errorf("reading the %s container's identity before the migration: %w; %s", bloodhoundService, err, rollbackHint)
+		}
 		client := toolapi.Client{BaseURL: toolAPIBaseURL, Transport: deps.NewToolAPITransport(inv.Config.DefaultNetworkName())}
 		if err := client.MigrateNeoToPG(ctx, migrationPoll, opts.MigrationTimeout); err != nil {
 			return fmt.Errorf("the migration reported an error: %w; BloodHound's migrator may already have switched the active driver to pg; %s", err, rollbackHint)
+		}
+		epochAfter, err := bloodhoundContainerEpoch(ctx, deps, c)
+		if err != nil {
+			return fmt.Errorf("reading the %s container's identity after the migration: %w; %s", bloodhoundService, err, rollbackHint)
+		}
+		if epochAfter != epochBefore {
+			return fmt.Errorf("the %s container restarted during the migration; its migrator resets to idle on boot, so the reported completion cannot be trusted; %s", bloodhoundService, rollbackHint)
+		}
+		// Count Neo4j AFTER the migration finished, not before: BloodHound
+		// keeps ingesting into Neo4j right up to the driver switch, so only
+		// a post-migration count also covers whatever landed mid-migration
+		// (which the migrator may not have carried over). And the count is
+		// required, not best-effort: without it a partial migration has no
+		// backstop at all -- a failed recount used to fall through with any
+		// nonzero node count and silently bless whatever arrived.
+		freshNodes, freshEdges, freshErr := neo4jCounts(ctx, c, inv.Config)
+		if freshErr != nil {
+			return fmt.Errorf("counting the Neo4j graph after the migration: %w; the migrated graph cannot be verified against its source (cypher-shell and NEO4J_AUTH must be available in the graph-db service); %s", freshErr, rollbackHint)
 		}
 		nodes, edges, err := store.CountGraph(ctx)
 		if err != nil {
@@ -375,12 +397,10 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		// still returns to idle, so a run that imported the nodes but dropped
 		// every edge looks identical to a clean one from the API. Check what
 		// arrived against what Neo4j holds now, then read the log.
-		switch {
-		case freshErr == nil && (nodes < freshNodes || edges < freshEdges):
-			return fmt.Errorf("the migration moved %d nodes and %d edges into PostgreSQL but Neo4j now holds %d nodes and %d edges; "+
+		if nodes < freshNodes || edges < freshEdges {
+			return fmt.Errorf("the migration moved %d nodes and %d edges into PostgreSQL but Neo4j now holds %d nodes and %d edges "+
+				"(data ingested during the migration is not carried over -- pause ingestion for the install window); "+
 				"BloodHound's migrator reports failures to its log only; %s", nodes, edges, freshNodes, freshEdges, rollbackHint)
-		case freshErr != nil && nodes == 0:
-			return fmt.Errorf("the migration finished with zero nodes in PostgreSQL; BloodHound's migrator may already have switched the active driver to pg; %s", rollbackHint)
 		}
 		if line, err := migratorFailureInLogs(ctx, c, len(preLogs)); err != nil {
 			return fmt.Errorf("reading %s logs after the migration: %w; %s", bloodhoundService, err, rollbackHint)
@@ -597,6 +617,38 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 	say("    rolled back; backups kept in %s", m.BackupDir)
 	return nil
+}
+
+// bloodhoundContainerEpoch identifies the current incarnation of the
+// bloodhound service's container: its full container id plus its
+// docker-reported start time. A plain restart keeps the id and changes
+// StartedAt; a recreate changes the id; either one invalidates anything
+// observed across the migration window (the migrator's own state lives in
+// that process and resets to idle on boot).
+func bloodhoundContainerEpoch(ctx context.Context, deps Deps, c dockerx.Compose) (string, error) {
+	out, err := c.PS(ctx, bloodhoundService)
+	if err != nil {
+		return "", fmt.Errorf("docker compose ps %s: %w", bloodhoundService, err)
+	}
+	// Same dual-shape parse as runningImage below: compose v2 prints a JSON
+	// array in recent versions and one object per line in older ones.
+	dec := json.NewDecoder(bytes.NewReader(out))
+	if tok, err := dec.Token(); err != nil {
+		return "", fmt.Errorf("parsing docker compose ps %s output: %w", bloodhoundService, err)
+	} else if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+		dec = json.NewDecoder(bytes.NewReader(out))
+	}
+	var container struct {
+		ID string `json:"ID"`
+	}
+	if err := dec.Decode(&container); err != nil || container.ID == "" {
+		return "", fmt.Errorf("the %s service has no running container", bloodhoundService)
+	}
+	started, err := deps.Runner.Run(ctx, nil, "docker", "inspect", "-f", "{{.Id}} {{.State.StartedAt}}", container.ID)
+	if err != nil {
+		return "", fmt.Errorf("docker inspect %s: %w", container.ID, err)
+	}
+	return strings.TrimSpace(string(started)), nil
 }
 
 // runningImage reports the image of the service's container. The two answers

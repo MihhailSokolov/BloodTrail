@@ -18,7 +18,7 @@ import (
 // or node value and always reaches FetchByQuery's path branch.
 //
 // Originally written for the now-retired pathResult (TryCypher's own
-// milestone-2/3 result type, deleted once TryCypher was rewired to the
+// pre-interpreter result type, deleted once TryCypher was rewired to the
 // Cypher interpreter's cypherRowsResult in serve_cypher.go); this function
 // stayed, since cypherRowsResult.Mapper still needs exactly the same path
 // classification for its own OutPath columns.

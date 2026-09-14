@@ -108,9 +108,9 @@ var (
 // seeded-random pair whose BFS crosses the per-domain hub groups reaches a
 // large fraction of the graph, and ~100ms is simply what that breadth costs
 // single-threaded at this scale -- which is why the original 100ms bar
-// (milestone 2's target, set before any 5M measurement existed, and the
+// (the path engine's original target, set before any 5M measurement existed, and the
 // only bar in the repository never re-derived from measurement) sat exactly
-// on the noise floor: it failed 3/3 at milestone 5's close (101/141/131ms)
+// on the noise floor: it failed 3/3 at write-through's close (101/141/131ms)
 // and straddled PASS/FAIL on every re-run since. 180ms still trips on real
 // regressions of this bar's own history: the discarded-allocation defect
 // fixed at 56bcbb5 measured 215-255ms.

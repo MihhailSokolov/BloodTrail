@@ -116,7 +116,7 @@ const (
 // (see Generate's doc comment): real AD's own timestamp properties are
 // epoch seconds compared against datetime().epochseconds - N*86400 at
 // *query* time (see internal/graphtest/corpusfixture.go's "Time-dependent
-// predicates" section for the same tradeoff made by the milestone-4 corpus
+// predicates" section for the same tradeoff made by the prebuilt-query corpus
 // fixture), so a graph whose timestamps were anchored to a seed-fixed
 // point in time would silently age out of any such window the longer it
 // sits unqueried after generation. Anchoring to generation time instead

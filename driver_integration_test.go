@@ -2,7 +2,7 @@
 
 //go:build integration
 
-package bloodtrail_test
+package bloodtrail
 
 import (
 	"context"
@@ -18,8 +18,6 @@ import (
 	"github.com/specterops/dawgs/graph"
 	"github.com/specterops/dawgs/opengraph"
 	"github.com/specterops/dawgs/util/size"
-
-	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 const testPGEnv = "BLOODTRAIL_TEST_PG"
@@ -141,9 +139,16 @@ func loadDatasets(t *testing.T, ctx context.Context, db graph.Database) opengrap
 	return ids
 }
 
+// pathSignatures runs cypher and renders every returned path through the
+// canonical comparator the differential suites share (canonicalizePath,
+// prebuilt_corpus_integration_test.go): node ids AND properties, edge kinds
+// AND properties, in path order -- not a node-id-only reduction, which would
+// let a wrong edge (a parallel edge of another kind, a dropped property)
+// slip through as "equal". Sorted for order-independent set comparison,
+// duplicates preserved.
 func pathSignatures(t *testing.T, ctx context.Context, db graph.Database, cypher string) []string {
 	t.Helper()
-	var sigs []string
+	var paths graph.PathSet
 	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
 		result := tx.Query(cypher, nil)
 		defer result.Close()
@@ -152,17 +157,14 @@ func pathSignatures(t *testing.T, ctx context.Context, db graph.Database, cypher
 			if err := result.Scan(&p); err != nil {
 				return err
 			}
-			parts := make([]string, 0, len(p.Nodes))
-			for _, n := range p.Nodes {
-				parts = append(parts, n.ID.String())
-			}
-			sigs = append(sigs, strings.Join(parts, ">"))
+			paths = append(paths, p)
 		}
 		return result.Error()
 	})
 	if err != nil {
 		t.Fatalf("query %q: %v", cypher, err)
 	}
+	sigs := renderPathSignatures(paths)
 	sort.Strings(sigs)
 	return sigs
 }
@@ -173,15 +175,22 @@ func TestBloodTrailMatchesPostgresDriver(t *testing.T) {
 		t.Skipf("%s not set", testPGEnv)
 	}
 	ctx := context.Background()
+
+	// Before dawgs.Open: Open reads slog.Default() once to build the
+	// engine's logger, so the capture must already be installed for the
+	// served markers below to be visible at all.
+	buf := installLogCapture(t)
+
 	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: openPool(t, ctx, dsn)}
 
-	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
+	bt, err := dawgs.Open(ctx, DriverName, cfg)
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	if _, ok := bt.(*bloodtrail.Driver); !ok {
+	d, ok := bt.(*Driver)
+	if !ok {
 		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
@@ -190,6 +199,18 @@ func TestBloodTrailMatchesPostgresDriver(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 	ids := loadDatasets(t, ctx, bt)
+
+	// The fixture load's own initial Nodes().Delete() trips the engine into
+	// FALLBACK, and without forcing a rebuild here the whole comparison
+	// below could silently run PostgreSQL-vs-PostgreSQL (delegation) and
+	// prove nothing -- exactly the weakness the 2026-09-13 sweep flagged in
+	// this file. Rebuild deterministically and require SERVING.
+	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+	if _, fresh := d.engine.Fresh(); !fresh {
+		t.Fatal("engine is not serving immediately after RebuildNow")
+	}
 
 	// A plain pg driver on the same pool and data is the oracle.
 	oracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
@@ -204,7 +225,11 @@ func TestBloodTrailMatchesPostgresDriver(t *testing.T) {
 	for _, eq := range equivalenceQueries {
 		cypher := eq.cypher(ids)
 		t.Run(eq.name, func(t *testing.T) {
+			served := markerCount(buf, cypherServedMarker)
 			got := pathSignatures(t, ctx, bt, cypher)
+			if delta := markerCount(buf, cypherServedMarker) - served; delta < 1 {
+				t.Fatalf("the BloodTrail side did not serve from the engine (served-marker delta %d); a delegated run compares PostgreSQL against itself\nquery: %s", delta, cypher)
+			}
 			want := pathSignatures(t, ctx, oracle, cypher)
 			if len(want) == 0 {
 				t.Fatalf("oracle returned no paths; the query or dataset names are wrong")
@@ -216,7 +241,7 @@ func TestBloodTrailMatchesPostgresDriver(t *testing.T) {
 	}
 
 	// Capability methods must be reachable through the embedded driver.
-	if err := bt.(*bloodtrail.Driver).DeleteRelationshipsByKinds(ctx, graph.Kinds{}); err != nil {
+	if err := d.DeleteRelationshipsByKinds(ctx, graph.Kinds{}); err != nil {
 		t.Fatalf("DeleteRelationshipsByKinds: %v", err)
 	}
 }

@@ -434,8 +434,11 @@ func TestProjectionValueKindsPropertyStaysDefault(t *testing.T) {
 }
 
 // TestProjectionValueKindsKeysOrder confirms Keys() preserves RETURN order
-// (interpret.ResultSet.Keys' own contract, passed straight through by
-// cypherRowsResult.Keys()).
+// and mirrors the pg driver's own behavior exactly (pinned live by
+// TestTryCypherKeysMatchOracle): nil before the first Next() call, the
+// pg-named columns afterwards -- an UNALIASED property lookup is pg's
+// `?column?` placeholder (dawgs emits it with no SQL alias), a bare
+// variable keeps its symbol -- and the names persist past exhaustion.
 func TestProjectionValueKindsKeysOrder(t *testing.T) {
 	snap := buildCypherTestSnapshot(t, nil,
 		[]cypherTestNode{{id: 1, props: map[string]any{"age": float64(30), "name": "Alice"}}}, nil,
@@ -443,8 +446,20 @@ func TestProjectionValueKindsKeysOrder(t *testing.T) {
 	q := planAndExec(t, snap, `MATCH (n) RETURN n.name, n.age, n`)
 
 	result := newCypherRowsResult(snapshot.NewView(snap), q.rs, projectionValueKinds(q.query), nil)
-	if got, want := result.Keys(), []string{"n.name", "n.age", "n"}; !reflect.DeepEqual(got, want) {
+	if got := result.Keys(); got != nil {
+		t.Fatalf("Keys() before the first Next() = %v, want nil (pg driver populates keys in Next)", got)
+	}
+	if !result.Next() {
+		t.Fatal("Next() = false, want a row")
+	}
+	want := []string{"?column?", "?column?", "n"}
+	if got := result.Keys(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Keys() = %v, want %v", got, want)
+	}
+	for result.Next() {
+	}
+	if got := result.Keys(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Keys() after exhaustion = %v, want %v (names persist once a row was read)", got, want)
 	}
 }
 

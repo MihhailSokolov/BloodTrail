@@ -57,9 +57,9 @@ func fakeKindMapper(byName map[string]snapshot.KindID) func(context.Context, gra
 // bug, not a case under test, so it fails loudly via t.Fatalf rather than
 // returning an error a caller might confuse with a genuine resolver
 // failure. Shared with overlay_serving_test.go.
-func fakeResolver(t *testing.T, byID map[snapshot.KindID]graph.Kind) func([]snapshot.KindID) (graph.Kinds, error) {
+func fakeResolver(t *testing.T, byID map[snapshot.KindID]graph.Kind) func(context.Context, []snapshot.KindID) (graph.Kinds, error) {
 	t.Helper()
-	return func(ids []snapshot.KindID) (graph.Kinds, error) {
+	return func(_ context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
 		kinds := make(graph.Kinds, len(ids))
 		for i, id := range ids {
 			kind, ok := byID[id]
@@ -203,6 +203,39 @@ func kindConstraint(allOf bool, names ...string) recognize.KindConstraint {
 		kinds[i] = graph.StringKind(name)
 	}
 	return recognize.KindConstraint{Kinds: kinds, AllOf: allOf}
+}
+
+// TestTryNodeFetchKindsThreadsCallerContext pins the mapKindNames seam's ctx
+// plumbing: the resolver must receive the serving caller's own ctx -- not a
+// context.Background() minted along the way -- so the PostgreSQL round trip
+// behind a served builder answer honors the request's deadline and
+// cancellation.
+func TestTryNodeFetchKindsThreadsCallerContext(t *testing.T) {
+	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
+
+	type ctxKey struct{}
+	callerCtx := context.WithValue(context.Background(), ctxKey{}, "sentinel")
+
+	var got context.Context
+	inner := fakeResolver(t, nodeSpecKindNames())
+	e.mapKindNames = func(ctx context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
+		got = ctx
+		return inner(ctx, ids)
+	}
+
+	spec := recognize.NodeSpec{Constraints: []recognize.KindConstraint{kindConstraint(false, "User")}}
+	cursor, ok := e.TryNodeFetchKinds(callerCtx, spec)
+	if !ok {
+		t.Fatalf("TryNodeFetchKinds: ok = false, want true")
+	}
+	cursor.Close()
+
+	if got == nil {
+		t.Fatalf("mapKindNames was never called")
+	}
+	if got.Value(ctxKey{}) != "sentinel" {
+		t.Fatalf("mapKindNames received a ctx that is not the caller's own")
+	}
 }
 
 // TestTryNodeQueriesSingleAnyOf covers a single any-of constraint: TryNodeCount,
@@ -389,7 +422,7 @@ func TestTryNodeQueriesMapKindErrorDeclines(t *testing.T) {
 // cursor is handed back, rather than surfacing mid-stream.
 func TestTryNodeFetchKindsResolveErrorDeclines(t *testing.T) {
 	e := newNodeSpecEngine(t, buildNodeSpecSnapshot(t))
-	e.mapKindNames = func(ids []snapshot.KindID) (graph.Kinds, error) {
+	e.mapKindNames = func(_ context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
 		return nil, errors.New("boom: kind id resolution failed")
 	}
 
@@ -952,7 +985,7 @@ func TestTryRelFetchKindsResolvesKindNames(t *testing.T) {
 // reasonError before any cursor is handed back.
 func TestTryRelFetchKindsResolveErrorDeclines(t *testing.T) {
 	e := newRelSpecEngine(t, buildRelSpecSnapshot(t))
-	e.mapKindNames = func(ids []snapshot.KindID) (graph.Kinds, error) {
+	e.mapKindNames = func(_ context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
 		return nil, errors.New("boom: kind id resolution failed")
 	}
 
