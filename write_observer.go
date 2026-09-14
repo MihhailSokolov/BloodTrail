@@ -354,9 +354,26 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 // always safe, never wrong -- a key whose write never landed (the whole
 // transaction rolled back) simply reads back as it already was, and a key
 // whose write landed via some other path this call cannot see is reconciled
-// exactly as if this call had never run.
+// exactly as if this call had never run. That per-key argument does NOT
+// cover a recognized kind-scoped delete, which replays as an instruction
+// with no read-back key -- so a failed Commit first records a fallback (the
+// in-body comment below), making that Apply a rebuild rather than a replay.
 func (t *observingTransaction) Commit() error {
 	err := t.Transaction.Commit()
+	if err != nil {
+		// A Commit that returned an error has an AMBIGUOUS outcome: the
+		// error can come from PostgreSQL's own COMMIT, whose effect may or
+		// may not be durable. Read-back-keyed changes reconcile either way
+		// (the doc above), but a recognized kind-scoped delete is replayed
+		// as an INSTRUCTION ("tombstone every edge of these kinds"), not a
+		// read-back key -- replaying it after a commit that actually rolled
+		// back would tombstone edges PostgreSQL still holds, permanently
+		// (nothing re-reads them). Recording a fallback makes Apply take the
+		// rebuild path instead: correct for every change shape under either
+		// commit outcome, at the cost of one background rebuild on an error
+		// path that is already exceptional.
+		t.scope.Changes().RecordFallback(fmt.Sprintf("Commit: outcome ambiguous: %v", err))
+	}
 	t.eng.Apply(applyContext(t.ctx), t.scope)
 	t.scope = engine.NewWriteScope()
 	return err

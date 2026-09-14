@@ -3,6 +3,7 @@
 package bloodtrail
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -1097,6 +1098,68 @@ func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T)
 	}
 	if tx.scope == scope || !tx.scope.Empty() {
 		t.Fatalf("Commit did not reset scope after the inner Commit failed")
+	}
+	// The commit's outcome is ambiguous (the error can be pg's own COMMIT
+	// failing after a durable write, or a rollback), and a recognized
+	// kind-scoped delete replays as an instruction with no read-back key --
+	// so the applied scope must carry a fallback record, making that Apply a
+	// rebuild rather than a replay.
+	if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
+		t.Fatalf("a failed Commit must record a fallback on the scope it applies (ambiguous outcome)")
+	}
+}
+
+// TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback pins
+// Driver.WriteTransaction's outer-commit-failure branch: the delegate
+// succeeded, so the error arose in the embedded driver's own final Commit
+// and the outcome is ambiguous -- the scope must be applied (rebuild via its
+// fallback record), never resolved as an abandoned (rolled-back) write.
+func TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback(t *testing.T) {
+	eng := disabledEngine()
+	scope := engine.NewWriteScope()
+	observer := &observingTransaction{Transaction: &fakeTransaction{}, scope: scope, eng: eng}
+
+	applyCountBefore := eng.ApplyCount()
+	resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit boom"))
+
+	if got := eng.ApplyCount(); got != applyCountBefore+1 {
+		t.Fatalf("ambiguous commit outcome did not Apply: ApplyCount = %d, want %d", got, applyCountBefore+1)
+	}
+	if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
+		t.Fatalf("ambiguous commit outcome must record a fallback before applying")
+	}
+}
+
+// TestResolveWriteTransactionFailureDelegateErrorSkipsApply pins the
+// mirrored branch: a delegate-returned error proves the embedded driver
+// rolled back, so the bump resolves without any Apply and no fallback is
+// recorded.
+func TestResolveWriteTransactionFailureDelegateErrorSkipsApply(t *testing.T) {
+	eng := disabledEngine()
+	scope := engine.NewWriteScope()
+	observer := &observingTransaction{Transaction: &fakeTransaction{}, scope: scope, eng: eng}
+
+	delegateErr := errors.New("delegate boom")
+	applyCountBefore := eng.ApplyCount()
+	resolveWriteTransactionFailure(context.Background(), eng, observer, delegateErr, delegateErr)
+
+	if got := eng.ApplyCount(); got != applyCountBefore {
+		t.Fatalf("a rolled-back delegate error must not Apply: ApplyCount = %d, want %d", got, applyCountBefore)
+	}
+	if hasFallback, _ := scope.Changes().HasFallback(); hasFallback {
+		t.Fatalf("a rolled-back delegate error must not record a fallback")
+	}
+}
+
+// TestResolveWriteTransactionFailureNilObserverIsNoop: a BEGIN failure means
+// the delegate closure never ran -- nothing exists to resolve, and the
+// helper must tolerate the nil observer.
+func TestResolveWriteTransactionFailureNilObserverIsNoop(t *testing.T) {
+	eng := disabledEngine()
+	applyCountBefore := eng.ApplyCount()
+	resolveWriteTransactionFailure(context.Background(), eng, nil, nil, errors.New("begin boom"))
+	if got := eng.ApplyCount(); got != applyCountBefore {
+		t.Fatalf("nil observer must be a no-op: ApplyCount = %d, want %d", got, applyCountBefore)
 	}
 }
 
