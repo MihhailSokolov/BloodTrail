@@ -30,7 +30,7 @@
 // answer that came from a rebuilt snapshot would prove nothing about
 // write-through.
 
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -45,6 +45,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // This file's fixture kinds, named distinctly from every other integration
@@ -68,7 +70,7 @@ var (
 // against a stable baseline: boot load runs exactly once, ever, so once it
 // has adopted, nothing else in this file's own control triggers a rebuild
 // unasked.
-func openApplyDriver(t *testing.T) (*Driver, graph.Database, *lockedBuffer, context.Context) {
+func openApplyDriver(t *testing.T) (*bloodtrail.Driver, graph.Database, *lockedBuffer, context.Context) {
 	t.Helper()
 
 	dsn := graphtest.PGAvailable(t)
@@ -80,15 +82,15 @@ func openApplyDriver(t *testing.T) (*Driver, graph.Database, *lockedBuffer, cont
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	t.Cleanup(func() { _ = bt.Close(ctx) })
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -105,12 +107,12 @@ func openApplyDriver(t *testing.T) (*Driver, graph.Database, *lockedBuffer, cont
 // Open) launches that goroutine asynchronously, so without this a test's own
 // "before" RebuildCount baseline could race against boot load's one and only
 // rebuild attempt landing later, inside the test's own measurement window.
-func waitForBootLoad(t *testing.T, d *Driver) {
+func waitForBootLoad(t *testing.T, d *bloodtrail.Driver) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, fresh := d.engine.Fresh(); fresh {
+		if _, fresh := bloodtrail.TestingEngine(d).Fresh(); fresh {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -166,10 +168,10 @@ func TestApplyObjectIDUpsertServesNewNode(t *testing.T) {
 
 	// A rebuild against the (empty) graph, so the replica exists and every
 	// answer below is a delta layered onto it.
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	const objectID = "APPLY-UPSERT-1"
 
@@ -190,7 +192,7 @@ func TestApplyObjectIDUpsertServesNewNode(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "the new node is counted by its kind, served",
 		func() int64 { return nodeCountByKind(t, ctx, bt, applyUpsertNodeKind) }, 1)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- an objectid upsert must be served without any rebuild", got, rebuilds)
 	}
 	assertNoFallback(t, buf)
@@ -218,10 +220,10 @@ func TestApplyPropertyMergeServesMergedBag(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
 		return tx.UpdateNode(&graph.Node{ID: nodeID, Properties: graph.NewProperties().Set("second", "two")})
@@ -238,7 +240,7 @@ func TestApplyPropertyMergeServesMergedBag(t *testing.T) {
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "the pre-existing property survives the merge and still serves",
 		func() string { return cypherStringValue(t, ctx, bt, firstText) }, "one")
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- a property merge must be served without any rebuild", got, rebuilds)
 	}
 	assertNoFallback(t, buf)
@@ -271,10 +273,10 @@ func TestApplyBatchDeleteNodeRemovesNodeAndIncidentEdges(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: both nodes are counted",
 		func() int64 { return nodeCountByKind(t, ctx, bt, applyDeleteNodeKind) }, 2)
@@ -293,12 +295,12 @@ func TestApplyBatchDeleteNodeRemovesNodeAndIncidentEdges(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "its incident edge is gone from the served triple fetch (the cascade)",
 		func() int { return len(applyRelTriples(t, ctx, bt, applyDeleteEdgeKind)) }, 0)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- a node delete must be served without any rebuild", got, rebuilds)
 	}
 
 	// Differential check: a snapshot loaded from scratch must agree.
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-delete): %v", err)
 	}
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "post-rebuild: the node count agrees with the replica's own answer",
@@ -342,10 +344,10 @@ func TestApplyDeleteRelationshipsByKindsRemovesOnlyThatKind(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: both edges of the doomed kind are counted",
 		func() int64 { return relCountByKind(t, ctx, bt, applyRelDroppedKind) }, 2)
@@ -363,11 +365,11 @@ func TestApplyDeleteRelationshipsByKindsRemovesOnlyThatKind(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "no node was removed by a relationship-kind delete",
 		func() int64 { return nodeCountByKind(t, ctx, bt, applyRelNodeKind) }, 3)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- a kind-scoped relationship delete must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-delete): %v", err)
 	}
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "post-rebuild: the deleted kind's count agrees with the replica's own answer",
@@ -405,10 +407,10 @@ func TestApplyMutatingRunFallsBackAndRecovers(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	text := fmt.Sprintf(`MATCH (n:ApplyRunNode) WHERE id(n) = %d RETURN n.name`, nodeID)
 
@@ -441,14 +443,14 @@ func TestApplyMutatingRunFallsBackAndRecovers(t *testing.T) {
 	if delta := markerCount(buf, fallbackExitedMarker) - exitedBefore; delta != 1 {
 		t.Fatalf("%q log count changed by %d, want exactly 1", fallbackExitedMarker, delta)
 	}
-	if got := d.engine.RebuildCount(); got != rebuilds+1 {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds+1 {
 		t.Fatalf("RebuildCount = %d, want %d -- recovering from a fallback must cost exactly one rebuild", got, rebuilds+1)
 	}
 
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after recovery: the property read serves the value the raw statement wrote",
 		func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
 
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("the engine is still not serving after logging %q", fallbackExitedMarker)
 	}
 }

@@ -24,7 +24,7 @@
 //
 // This file needs same-package access to Driver's own unexported `engine`
 // field (see staleness_integration_test.go's identically-reasoned doc) so it
-// can force a deterministic rebuild with d.engine.RebuildNow before running
+// can force a deterministic rebuild with bloodtrail.TestingEngine(d).RebuildNow before running
 // any case, rather than depending on the timing of Start's own asynchronous
 // boot-load goroutine (engine/boot.go) or of the automatic fallback-recovery
 // rebuild described below. That access requires living in package
@@ -50,7 +50,7 @@
 // records a ChangeSet fallback and trips the engine into fallback, starting
 // an automatic background recovery rebuild (apply.go's enterFallback/
 // runFallbackRebuild) before LoadDataset writes a single node. A manual
-// d.engine.RebuildNow call still runs before every read-only case below --
+// bloodtrail.TestingEngine(d).RebuildNow call still runs before every read-only case below --
 // not to be the first thing that makes the engine servable (that automatic
 // recovery already raced to do so), but to make the snapshot every case
 // runs against deterministic rather than however far that race happened to
@@ -70,7 +70,7 @@
 // so: ClearGraph's own fallback trip (above) already starts a recovery
 // rebuild before LoadDataset even begins, and that automatic rebuild reads
 // the same committed PostgreSQL state the later manual RebuildNow does,
-// since nothing writes in between. Polling d.engine.Fresh()/RebuildCount
+// since nothing writes in between. Polling bloodtrail.TestingEngine(d).Fresh()/RebuildCount
 // immediately after LoadDataset returns, and logging each case's served/
 // declined outcome under both the old "delegating" and "engine" labels
 // (repeated runs, every dataset group), showed the automatic recovery had
@@ -90,7 +90,7 @@
 //
 // Fixture cases (a "fixture" field) run inside a rolled-back write
 // transaction (Session.WithRollbackFixture): Driver.WriteTransaction only
-// calls d.engine.Apply on success (driver.go), and the rollback sentinel
+// calls bloodtrail.TestingEngine(d).Apply on success (driver.go), and the rollback sentinel
 // withRollback returns makes the underlying call fail, so a fixture's write
 // never reaches Apply and never disturbs the snapshot every read-only case
 // above runs against. More fundamentally, a write transaction's own Query
@@ -99,7 +99,7 @@
 // by construction, not by snapshot staleness -- so there is nothing a second
 // pass could exercise that a first did not. Each fixture case therefore
 // runs exactly once, under its own "fixture" subtest.
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -121,6 +121,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // caseFile represents one JSON test case file.
@@ -302,7 +304,7 @@ func TestDAWGSCorpus(t *testing.T) {
 
 	// Parse every case file and group by dataset -- verbatim grouping logic
 	// from upstream's TestCypher, save for reading from files (an absolute
-	// path list from filepath.Glob above) instead of a relative "testdata/
+	// path list from filepath.Glob above) instead of a relative "../testdata/
 	// cases/*.json" glob.
 	type group struct {
 		dataset string
@@ -360,19 +362,19 @@ func TestDAWGSCorpus(t *testing.T) {
 	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
 
 	// Hand-construct the driver via dawgs.Open with this package's own
-	// DriverName, exactly as driver_integration_test.go does -- deliberately
+	// bloodtrail.DriverName, exactly as driver_integration_test.go does -- deliberately
 	// not integration.Open/SetupDB, whose connection-string scheme map
 	// (harness.go's DriverFromConnectionString) only knows postgresql/neo4j
 	// schemes and would never resolve to bloodtrail.
-	rawBT, err := dawgs.Open(ctx, DriverName, cfg)
+	rawBT, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = rawBT.Close(ctx) }()
 
-	d, ok := rawBT.(*Driver)
+	d, ok := rawBT.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", rawBT)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", rawBT)
 	}
 	db := graph.Database(d)
 
@@ -434,7 +436,7 @@ func TestDAWGSCorpus(t *testing.T) {
 			// the same committed state either way, and why this call exists
 			// for determinism rather than to be the first thing that makes
 			// the engine servable here).
-			if err := d.engine.RebuildNow(ctx, "manual"); err != nil {
+			if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual"); err != nil {
 				t.Fatalf("RebuildNow (dataset %q): %v", ds, err)
 			}
 

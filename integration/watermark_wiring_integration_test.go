@@ -10,7 +10,7 @@
 // write-shape suite). Neither proves the wiring itself -- write_observer.go's
 // ensureBumped/resolveAbandonedWrite, and driver.go's own call sites -- actually
 // reaches BumpWatermark/Apply/AdvanceWatermark correctly when driven through
-// the real *Driver, nor that a nested Driver.BatchOperation call issued from
+// the real *bloodtrail.Driver, nor that a nested Driver.BatchOperation call issued from
 // inside a WriteTransaction delegate (the shape BloodHound's own
 // queries/graph.go uses, e.g. calling s.Graph.BatchOperation -- the driver,
 // not the transaction -- for a batched node update while already inside a
@@ -22,7 +22,7 @@
 // engine.ReadWatermark and the exported test-observability wrapper
 // engine.WatermarkConverged (watermark.go's own doc on why that one is
 // exported at all).
-package bloodtrail
+package integration
 
 import (
 	"errors"
@@ -30,6 +30,8 @@ import (
 	"testing"
 
 	"github.com/specterops/dawgs/graph"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // This file's fixture kinds, named distinctly from every other integration
@@ -64,12 +66,12 @@ var (
 func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing.T) {
 	d, bt, buf, ctx := openApplyDriver(t)
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
-	counterBefore, err := d.engine.ReadWatermark(ctx)
+	counterBefore, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 	if err != nil {
 		t.Fatalf("ReadWatermark before: %v", err)
 	}
@@ -95,7 +97,7 @@ func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing
 		t.Fatalf("WriteTransaction (nested BatchOperation): %v", err)
 	}
 
-	counterAfter, err := d.engine.ReadWatermark(ctx)
+	counterAfter, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 	if err != nil {
 		t.Fatalf("ReadWatermark after: %v", err)
 	}
@@ -103,10 +105,10 @@ func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing
 		t.Fatalf("watermark counter advanced by %d, want exactly 2 (one bump for the outer transaction's own first mutating call, one for the nested batch's independently-bumped scope)", delta)
 	}
 
-	if _, converged := d.engine.WatermarkConverged(ctx); !converged {
+	if _, converged := bloodtrail.TestingEngine(d).WatermarkConverged(ctx); !converged {
 		t.Fatalf("WatermarkConverged = false after both the outer transaction's and the nested batch's scopes should have resolved, want true")
 	}
-	if !d.engine.WatermarkTrusted(ctx) {
+	if !bloodtrail.TestingEngine(d).WatermarkTrusted(ctx) {
 		t.Fatalf("WatermarkTrusted = false after two ordinary, fully resolved writes through the real wiring, want true")
 	}
 
@@ -117,7 +119,7 @@ func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "the nested batch's own node serves too, from the same replica",
 		func() string { return cypherStringValue(t, ctx, bt, innerText) }, "inner")
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- both the outer and the nested write must be served without any rebuild", got, rebuilds)
 	}
 	assertNoFallback(t, buf)
@@ -125,7 +127,7 @@ func TestNestedBatchOperationInsideWriteTransactionResolvesBothScopes(t *testing
 
 // TestDriverWatermarkWiringAdvancesThroughRealPaths covers I4: three real
 // driver-level write paths, each asserting that the watermark counter
-// (d.engine.ReadWatermark) and convergence (d.engine.WatermarkConverged)
+// (bloodtrail.TestingEngine(d).ReadWatermark) and convergence (bloodtrail.TestingEngine(d).WatermarkConverged)
 // advance through the REAL write_observer.go/driver.go wiring --
 // ensureBumped's eager bump and Apply/resolveAbandonedWrite's resolution -- rather
 // than internal/engine's own white-box simulation of that same sequence
@@ -152,7 +154,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("fixture setup WriteTransaction: %v", err)
 		}
 
-		before, err := d.engine.ReadWatermark(ctx)
+		before, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 		if err != nil {
 			t.Fatalf("ReadWatermark before: %v", err)
 		}
@@ -165,7 +167,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 
-		after, err := d.engine.ReadWatermark(ctx)
+		after, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 		if err != nil {
 			t.Fatalf("ReadWatermark after: %v", err)
 		}
@@ -173,7 +175,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("watermark counter advanced by %d through Driver.Run, want exactly 1 (ensureBumped's own top-of-method bump)", delta)
 		}
 
-		if _, converged := d.engine.WatermarkConverged(ctx); !converged {
+		if _, converged := bloodtrail.TestingEngine(d).WatermarkConverged(ctx); !converged {
 			t.Fatalf("WatermarkConverged = false after Run's own scope resolved, want true")
 		}
 	})
@@ -181,7 +183,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 	t.Run("WriteTransaction success", func(t *testing.T) {
 		d, bt, _, ctx := openApplyDriver(t)
 
-		before, err := d.engine.ReadWatermark(ctx)
+		before, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 		if err != nil {
 			t.Fatalf("ReadWatermark before: %v", err)
 		}
@@ -193,7 +195,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("WriteTransaction: %v", err)
 		}
 
-		after, err := d.engine.ReadWatermark(ctx)
+		after, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 		if err != nil {
 			t.Fatalf("ReadWatermark after: %v", err)
 		}
@@ -201,10 +203,10 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("watermark counter advanced by %d through a successful WriteTransaction, want exactly 1", delta)
 		}
 
-		if _, converged := d.engine.WatermarkConverged(ctx); !converged {
+		if _, converged := bloodtrail.TestingEngine(d).WatermarkConverged(ctx); !converged {
 			t.Fatalf("WatermarkConverged = false after the transaction's own scope resolved via the success path (driver.go's own Apply call), want true")
 		}
-		if !d.engine.WatermarkTrusted(ctx) {
+		if !bloodtrail.TestingEngine(d).WatermarkTrusted(ctx) {
 			t.Fatalf("WatermarkTrusted = false after an ordinary successful write, want true: no watermark failure was ever noted, the counters converged, and the engine is serving")
 		}
 	})
@@ -218,7 +220,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 	t.Run("WriteTransaction error branch", func(t *testing.T) {
 		d, bt, _, ctx := openApplyDriver(t)
 
-		before, err := d.engine.ReadWatermark(ctx)
+		before, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 		if err != nil {
 			t.Fatalf("ReadWatermark before: %v", err)
 		}
@@ -234,7 +236,7 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("WriteTransaction error = %v, want %v", txErr, wantErr)
 		}
 
-		after, err := d.engine.ReadWatermark(ctx)
+		after, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
 		if err != nil {
 			t.Fatalf("ReadWatermark after: %v", err)
 		}
@@ -242,10 +244,10 @@ func TestDriverWatermarkWiringAdvancesThroughRealPaths(t *testing.T) {
 			t.Fatalf("watermark counter advanced by %d through a rolled-back WriteTransaction, want exactly 1 (the eager bump still resolves via resolveAbandonedWrite despite the rollback)", delta)
 		}
 
-		if _, converged := d.engine.WatermarkConverged(ctx); !converged {
+		if _, converged := bloodtrail.TestingEngine(d).WatermarkConverged(ctx); !converged {
 			t.Fatalf("WatermarkConverged = false after the rolled-back transaction's bump resolved via resolveAbandonedWrite, want true")
 		}
-		if !d.engine.WatermarkTrusted(ctx) {
+		if !bloodtrail.TestingEngine(d).WatermarkTrusted(ctx) {
 			t.Fatalf("WatermarkTrusted = false after a rolled-back write whose bump succeeded, want true")
 		}
 

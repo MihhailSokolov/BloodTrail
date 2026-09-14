@@ -40,9 +40,9 @@
 // unexported access to Driver's own `engine *engine.Engine` field, which
 // bloodtrail_test-package tests (engine_serving_integration_test.go) cannot
 // reach directly. That access is used below for three exported-method calls:
-// d.engine.RebuildNow (a deterministic, on-demand rebuild), d.engine.Fresh
+// bloodtrail.TestingEngine(d).RebuildNow (a deterministic, on-demand rebuild), bloodtrail.TestingEngine(d).Fresh
 // (is the engine serving at all, and -- via waitForBootLoad -- has Start's
-// own boot-load rebuild settled yet), and d.engine.RebuildCount (has any
+// own boot-load rebuild settled yet), and bloodtrail.TestingEngine(d).RebuildCount (has any
 // rebuild happened).
 //
 // Everything else stays a black-box proof: every flow issues a real query
@@ -57,7 +57,7 @@
 // from the replica, and the replica was right to serve it"; a delta of 0 plus
 // a correct result means "declined and fell through to PostgreSQL, and
 // PostgreSQL was consulted correctly".
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -74,6 +74,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // servedMarker and builderServedMarker are the exact messages
@@ -309,7 +311,7 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 
 	// Every rebuild observed below is the direct, deterministic result of
-	// this test's own d.engine.RebuildNow calls: waitForBootLoad (below)
+	// this test's own bloodtrail.TestingEngine(d).RebuildNow calls: waitForBootLoad (below)
 	// blocks until Start's own one-shot boot-load rebuild has settled, and
 	// nothing else in this test's own control triggers another.
 	buf := installLogCapture(t)
@@ -317,7 +319,7 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	ctx := context.Background()
 
 	// graphtest.OpenPG both asserts the "bloodtrail_test" default graph this
-	// test's own dawgs.Open(DriverName, ...) call below needs (a physical
+	// test's own dawgs.Open(bloodtrail.DriverName, ...) call below needs (a physical
 	// database fact, not tied to any one driver instance, so asserting it
 	// once via this raw pg.Driver is enough) and hands back the pool the
 	// wrapped driver is opened against. graphtest.WipeGraph then clears
@@ -328,15 +330,15 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	// AssertSchema's default-graph target is tracked per driver instance
@@ -405,13 +407,13 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	// === Flow 1: one rebuild, then kind-A relationship Count and a
 	// shortest-path query both serve. ===
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (flow 1): %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("flow 1: engine is not serving immediately after RebuildNow")
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "flow 1: kind-A relationship count serves",
 		func() int64 { return relCountByKind(t, ctx, bt, stalenessEdgeKindA) }, 1)
@@ -430,7 +432,7 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 		t.Fatalf("WriteTransaction (create kind-B edge, flow 2): %v", err)
 	}
 
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("flow 2: engine stopped serving after a write; write-through must keep it serving")
 	}
 
@@ -499,14 +501,14 @@ func TestWriteThroughEndToEnd(t *testing.T) {
 	// now serves as the differential check: a snapshot loaded from scratch
 	// must agree with every one of those answers. ===
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("flow 5: RebuildCount = %d, want %d -- no rebuild may happen for a written-through write", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (flow 5): %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("flow 5: engine is not serving immediately after RebuildNow")
 	}
 
@@ -567,15 +569,15 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -596,10 +598,10 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (baseline): %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: base-kind node count serves",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertBaseKind) }, 1)
@@ -622,11 +624,11 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "base-kind node count still serves (the node kept its original kind too)",
 		func() int64 { return nodeCountByKind(t, ctx, bt, stalenessUpsertBaseKind) }, 1)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- the upsert must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-upsert): %v", err)
 	}
 
@@ -769,15 +771,15 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -798,10 +800,10 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (baseline): %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	text := fmt.Sprintf(`MATCH (n:CypherStalenessNode) WHERE id(n) = %d RETURN n.name`, nodeID)
 
@@ -818,7 +820,7 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 		t.Fatalf("WriteTransaction (property-only update): %v", err)
 	}
 
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("engine stopped serving after a property-only write; write-through must keep it serving")
 	}
 
@@ -828,11 +830,11 @@ func TestCypherPropertyOnlyWriteServesImmediately(t *testing.T) {
 	requireMarkerDelta(t, buf, builderServedMarker, 1, "after the property-only write: kind-scoped node count still serves",
 		func() int64 { return nodeCountByKind(t, ctx, bt, cypherStalenessNodeKind) }, 1)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- a property-only write must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-write): %v", err)
 	}
 
@@ -882,15 +884,15 @@ func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -922,10 +924,10 @@ func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	text := fmt.Sprintf(`MATCH p = shortestPath((s)-[:CypherHydrationEdge*1..]->(e)) WHERE id(s) = %d AND id(e) = %d RETURN p`, startID, endID)
 
@@ -955,11 +957,11 @@ func TestCypherShortestPathServesEdgeWritesImmediately(t *testing.T) {
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after re-creating the edge: the shortestPath query serves one path again, over a delta-only edge",
 		func() int { return cypherPathCount(t, ctx, bt, text) }, 1)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- edge writes must be served without any rebuild", got, rebuilds)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow (post-write): %v", err)
 	}
 
@@ -999,15 +1001,15 @@ func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -1028,10 +1030,10 @@ func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 		t.Fatalf("fixture setup WriteTransaction: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	rebuilds := d.engine.RebuildCount()
+	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 	text := fmt.Sprintf(`MATCH (n:CypherStaleRecheckNode) WHERE id(n) = %d RETURN n.name`, nodeID)
 
@@ -1082,7 +1084,7 @@ func TestCypherServesConsistentlyDuringConcurrentWrites(t *testing.T) {
 	requireMarkerDelta(t, buf, cypherServedMarker, 1, "after the concurrent writer finished: the next read serves the final value",
 		func() string { return cypherStringValue(t, ctx, bt, text) }, last)
 
-	if got := d.engine.RebuildCount(); got != rebuilds {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds {
 		t.Fatalf("RebuildCount = %d, want %d -- concurrent writes must be served without any rebuild", got, rebuilds)
 	}
 }
@@ -1146,16 +1148,16 @@ func TestCypherMultiGraphGuard(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	t.Cleanup(func() { _ = bt.Close(ctx) })
 	t.Cleanup(func() { graphtest.WipeGraph(t, pgDriver) })
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -1187,10 +1189,10 @@ func TestCypherMultiGraphGuard(t *testing.T) {
 		t.Fatalf("create second graph's node: %v", err)
 	}
 
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("engine reports stale immediately after RebuildNow")
 	}
 
@@ -1254,16 +1256,16 @@ func TestWriteTransactionReadAfterWriteDelegatesToPG(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	t.Cleanup(func() { _ = bt.Close(ctx) })
 	t.Cleanup(func() { graphtest.WipeGraph(t, pgDriver) })
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	if err := bt.AssertSchema(ctx, graph.Schema{DefaultGraph: graph.Graph{Name: graphtest.GraphName}}); err != nil {
@@ -1313,10 +1315,10 @@ func TestWriteTransactionReadAfterWriteDelegatesToPG(t *testing.T) {
 	// transaction has committed and the engine has rebuilt, DOES serve --
 	// proving the marker delta of 0 above was a real decline, not a query
 	// shape TryCypher was never going to recognize in the first place. ===
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("engine reports stale immediately after RebuildNow")
 	}
 
@@ -1371,16 +1373,16 @@ func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	t.Cleanup(func() { _ = bt.Close(ctx) })
 	t.Cleanup(func() { graphtest.WipeGraph(t, pgDriver) })
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	// BatchReadNode is asserted up front, via schema.Graphs (not
@@ -1454,10 +1456,10 @@ func TestBatchReadAfterWriteDelegatesToPG(t *testing.T) {
 
 	// === Sanity check on the premise: the identical structural count,
 	// once the batch has committed and the engine has rebuilt, DOES serve. ===
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatalf("engine reports stale immediately after RebuildNow")
 	}
 

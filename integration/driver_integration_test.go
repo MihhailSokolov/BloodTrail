@@ -2,7 +2,7 @@
 
 //go:build integration
 
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -18,11 +18,13 @@ import (
 	"github.com/specterops/dawgs/graph"
 	"github.com/specterops/dawgs/opengraph"
 	"github.com/specterops/dawgs/util/size"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 const testPGEnv = "BLOODTRAIL_TEST_PG"
 
-var datasets = []string{"testdata/dawgs/traversal_shapes.json", "testdata/dawgs/adcs_fanout.json"}
+var datasets = []string{"../testdata/dawgs/traversal_shapes.json", "../testdata/dawgs/adcs_fanout.json"}
 
 // equivalenceQuery builds one of the queries every driver must answer identically,
 // given the document-ID-to-database-ID mapping produced by loading the datasets.
@@ -183,13 +185,13 @@ func TestBloodTrailMatchesPostgresDriver(t *testing.T) {
 
 	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: openPool(t, ctx, dsn)}
 
-	bt, err := dawgs.Open(ctx, DriverName, cfg)
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
 		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
@@ -205,10 +207,10 @@ func TestBloodTrailMatchesPostgresDriver(t *testing.T) {
 	// below could silently run PostgreSQL-vs-PostgreSQL (delegation) and
 	// prove nothing -- exactly the weakness the 2026-09-13 sweep flagged in
 	// this file. Rebuild deterministically and require SERVING.
-	if err := d.engine.RebuildNow(ctx, "manual_test"); err != nil {
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual_test"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
-	if _, fresh := d.engine.Fresh(); !fresh {
+	if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 		t.Fatal("engine is not serving immediately after RebuildNow")
 	}
 

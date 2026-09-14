@@ -68,7 +68,7 @@
 // call happens to remove it. That is still safe (an extra unique index on
 // an expression no other suite's fixtures rely on causes no conflict by
 // itself), just not bounded to "this run."
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -85,6 +85,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // nodeSignaturesByCypher runs text -- a Cypher query projecting bare nodes,
@@ -180,9 +182,9 @@ func cypherValueOrNil(t *testing.T, ctx context.Context, db graph.Database, text
 // mirroring apply_integration_test.go's inline check: label's write shape
 // must be served entirely from the write-through delta, never by way of a
 // rebuild -- a rebuilt snapshot would prove nothing about write-through.
-func assertRebuildCountUnchanged(t *testing.T, d *Driver, before uint64, label string) {
+func assertRebuildCountUnchanged(t *testing.T, d *bloodtrail.Driver, before uint64, label string) {
 	t.Helper()
-	if got := d.engine.RebuildCount(); got != before {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != before {
 		t.Fatalf("%s: RebuildCount = %d, want %d -- must be served without any rebuild", label, got, before)
 	}
 }
@@ -270,15 +272,15 @@ func TestWriteThroughDifferential(t *testing.T) {
 	oracle, pool := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, oracle)
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	t.Cleanup(func() { _ = bt.Close(ctx) })
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	// Assert the objectid unique expression index UpdateNodeBy's ON
@@ -302,7 +304,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		kind := graph.StringKind("WT1Node")
 		const objectID = "WT1-1"
 
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
@@ -338,7 +340,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		// write under test), so a rebuild the fixture setup itself triggers
 		// is caught too -- this class's exit criterion is that NOTHING in
 		// it needs a rebuild, not only its own headline write.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -396,7 +398,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -473,7 +475,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		const startOID = "WT4-S1"
 		const endOID = "WT4-E1"
 
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.BatchOperation(ctx, func(batch graph.Batch) error {
@@ -524,7 +526,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var nodeID graph.ID
@@ -610,7 +612,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		nodeKind := graph.StringKind("WT6Node")
 		edgeKind := graph.StringKind("WT6Edge")
 
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -648,7 +650,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var relID graph.ID
@@ -711,7 +713,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var startID graph.ID
@@ -778,7 +780,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -873,7 +875,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		var idA, idB, idC graph.ID
@@ -947,7 +949,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		kind := graph.StringKind(fmt.Sprintf("WT11New%d", time.Now().UnixNano()))
 		const objectID = "WT11-1"
 
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -978,7 +980,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		kind := graph.StringKind("WT12Node")
 		const attempted = 5
 
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		injected := fmt.Errorf("wt12: injected batch failure")
@@ -1022,7 +1024,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		// identical comment on why the baseline has to be this early: the
 		// exactly-one-rebuild assertion further down must cover the whole
 		// class, not just the deliberate fallback trigger.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 
 		var nodeID graph.ID
 		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
@@ -1062,7 +1064,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		if delta := markerCount(buf, fallbackExitedMarker) - exitedBefore; delta != 1 {
 			t.Fatalf("%q log count changed by %d, want exactly 1", fallbackExitedMarker, delta)
 		}
-		if got := d.engine.RebuildCount(); got != rebuilds+1 {
+		if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuilds+1 {
 			t.Fatalf("RebuildCount = %d, want %d -- recovering from a fallback must cost exactly one rebuild", got, rebuilds+1)
 		}
 
@@ -1076,7 +1078,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 		requireMarkerDelta(t, buf, cypherServedMarker, 1, "after recovery: the property read serves the raw statement's own write",
 			func() string { return cypherStringValue(t, ctx, bt, text) }, "after")
 
-		if _, fresh := d.engine.Fresh(); !fresh {
+		if _, fresh := bloodtrail.TestingEngine(d).Fresh(); !fresh {
 			t.Fatalf("the engine is still not serving after logging %q", fallbackExitedMarker)
 		}
 	})
@@ -1096,7 +1098,7 @@ func TestWriteThroughDifferential(t *testing.T) {
 
 		// Captured BEFORE the fixture setup write below -- see class 2's
 		// identical comment on why the baseline has to be this early.
-		rebuilds := d.engine.RebuildCount()
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 		fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 		// The delete goroutine's own fixture -- n relationships to delete

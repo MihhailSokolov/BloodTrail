@@ -2,17 +2,14 @@
 
 //go:build integration
 
-package bloodtrail_test
+package integration
 
 import (
-	"bytes"
 	"context"
-	"log/slog"
 	"os"
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,69 +25,10 @@ import (
 	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
-// servedMarker is the exact message engine.TryAllShortestPaths logs (at
-// Info) whenever it serves a query from the in-memory snapshot --
-// duplicated here (rather than exported from internal/engine) since only
-// this test needs to recognize it in captured log output. engine.TryCypher
-// no longer shares this marker: since being rewired to the general-purpose
-// Cypher interpreter (internal/engine/interpret), it logs its own, Debug-
-// level "bloodtrail: cypher engine served" instead (engine.go's
-// cypherServedLogMessage) -- this test never issues a raw Cypher-text
-// query through the wrapped driver, so it has no reason to watch for that
-// marker.
-const servedMarker = "bloodtrail: path engine served"
-
-// builderServedMarker is the exact message engine.TryNodeCount/
-// TryNodeFetchIDs/TryNodeFetchKinds (internal/engine/serve_builder.go's
-// servedOp) log at Debug whenever they serve a structural node query from
-// the in-memory snapshot -- duplicated here for the same reason servedMarker
-// is (only this test needs to recognize it in captured log output). It is
-// deliberately Debug, not Info, unlike servedMarker (servedOp's own doc), so
-// installLogCapture must enable Debug-level capture for this marker to ever
-// appear in buf.
-const builderServedMarker = "bloodtrail: builder engine served"
-
-// lockedBuffer is a bytes.Buffer safe for concurrent writes from the
-// engine's background/serving goroutines and reads from the test goroutine.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// installLogCapture installs a slog default logger that writes into a
-// returned buffer, restoring the previous default via t.Cleanup. It must be
-// called before dawgs.Open constructs the bloodtrail driver: driver.go's
-// Open reads slog.Default() exactly once, at construction time, to build
-// the engine's own Config.Log, so installing the capture afterward would
-// miss every line the engine itself logs.
-//
-// The handler is configured at Debug level (rather than the text handler's
-// own Info default) so builderServedMarker -- logged via DebugContext by the
-// structural node/relationship query path (servedOp's doc) -- is captured
-// alongside servedMarker's Info-level line; every existing caller that only
-// ever greps for servedMarker is unaffected by the extra Debug output.
-func installLogCapture(t *testing.T) *lockedBuffer {
-	t.Helper()
-
-	buf := &lockedBuffer{}
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
-	return buf
-}
+// servedMarker/builderServedMarker/lockedBuffer/installLogCapture: this file
+// used to carry its own copies (it lived in a different test package); the
+// shared definitions in staleness_integration_test.go serve the whole
+// integration package now.
 
 // shortestPathsViaCriteria runs the same graph.Criteria shape BloodHound's
 // API builds for FetchAllShortestPaths -- query.And(query.Equals(StartID),
@@ -181,24 +119,8 @@ func waitForBuilderServe[T any](t *testing.T, buf *lockedBuffer, baseline int, d
 	return zero
 }
 
-// nodeCountByKind runs tx.Nodes().Filter(query.Kind(query.Node(), kind)).
-// Count() -- the exact shape recordingNodeQuery.Count (node_query.go)
-// recognizes and may serve from the engine -- through db, returning the
-// result.
-func nodeCountByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) int64 {
-	t.Helper()
-
-	var count int64
-	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
-		n, err := tx.Nodes().Filter(query.Kind(query.Node(), kind)).Count()
-		count = n
-		return err
-	})
-	if err != nil {
-		t.Fatalf("Nodes().Filter(Kind(%s)).Count(): %v", kind, err)
-	}
-	return count
-}
+// nodeCountByKind lives in staleness_integration_test.go (shared since the
+// two files joined one package).
 
 // nodeIDsByKind runs tx.Nodes().Filter(query.Kind(query.Node(), kind)).
 // FetchIDs() through db, returning the matching ids sorted ascending so two
@@ -224,24 +146,8 @@ func nodeIDsByKind(t *testing.T, ctx context.Context, db graph.Database, kind gr
 	return ids
 }
 
-// relCountByKind runs tx.Relationships().Filter(query.Kind(query.
-// Relationship(), kind)).Count() -- the exact structural shape
-// recordingRelationshipQuery.Count (relationship_query.go) recognizes and may
-// serve from the engine -- through db, returning the result.
-func relCountByKind(t *testing.T, ctx context.Context, db graph.Database, kind graph.Kind) int64 {
-	t.Helper()
-
-	var count int64
-	err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
-		n, err := tx.Relationships().Filter(query.Kind(query.Relationship(), kind)).Count()
-		count = n
-		return err
-	})
-	if err != nil {
-		t.Fatalf("Relationships().Filter(Kind(%s)).Count(): %v", kind, err)
-	}
-	return count
-}
+// relCountByKind lives in staleness_integration_test.go (shared since the
+// two files joined one package).
 
 // relCountByKindOrdered is relCountByKind with an added OrderBy that
 // recognize.OrderIsEdgeIDAscending accepts -- exactly the paging order
