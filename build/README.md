@@ -108,18 +108,21 @@ regardless.
 
 ## First release checklist
 
-The installer derives its image from the running upstream tag, so the images have to be
-published before a CLI release is of any use. In order:
+The installer derives its image tag from the running upstream tag plus its own version
+(`<upstream>-bt<version>`), so the version-suffixed images have to exist before a
+released CLI can install anything. In order (the ordering is load-bearing twice:
+`release.yml` refuses to run until the package is public, and the `image` workflow can
+only be dispatched from a ref that already exists):
 
-1. For each supported upstream tag, dispatch the `image` workflow from the release tag
-   (`gh workflow run image.yml --ref vX.Y.Z -f upstream_tag=v9.6.0`), so the built image
-   carries the same driver version the released CLI derives.
-2. Set the GHCR package `bloodhound-bloodtrail` to public in its package settings.
-   Until then anonymous pulls fail and the installer reports the image as missing.
-3. Confirm an unauthenticated client can see it:
+1. Set the GHCR package `bloodhound-bloodtrail` to public in its package settings.
+2. Confirm an unauthenticated client can see it:
    `docker logout ghcr.io && docker manifest inspect ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0`.
-4. Push the `vX.Y.Z` tag to trigger `release.yml`, which builds the CLI archives,
-   `checksums.txt` and `install.sh`.
+3. Push the `vX.Y.Z` tag to trigger `release.yml`, which verifies that anonymous pull
+   itself and then builds the CLI archives, `checksums.txt` and `install.sh`.
+4. For each supported upstream tag, dispatch the `image` workflow from the release tag
+   (`gh workflow run image.yml --ref vX.Y.Z -f upstream_tag=v9.6.0`): `git describe` on
+   that ref is what stamps the driver version, so this publishes the
+   `v9.6.0-btX.Y.Z`-style image the released CLI derives and pulls.
 5. On a clean host with a BloodHound CE deployment, run the documented one-liner
    (`curl -fsSL …/install.sh | sh -s -- install`) end to end, including
    `bloodtrail rollback`.
