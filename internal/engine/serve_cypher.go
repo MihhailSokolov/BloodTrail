@@ -713,9 +713,16 @@ func (r *cypherRowsResult) materializeValue(v interpret.OutVal, vk valueKind) an
 }
 
 // Keys names each projection column, in RETURN order -- interpret.
-// ResultSet.Keys already carries exactly this (see its own doc comment), so
-// this is a direct pass-through.
+// ResultSet.Keys carries the names (pg's own column naming, see
+// ProjectionOutput.OutputName), and this mirrors the pg driver's LIFECYCLE
+// too (pinned live by TestTryCypherKeysMatchOracle): the pg queryResult only
+// populates its keys inside Next(), so Keys() is nil before the first
+// Next() call and stays nil forever on a zero-row result; once a row has
+// been read, the names persist past exhaustion.
 func (r *cypherRowsResult) Keys() []string {
+	if r.idx < 0 || len(r.materialized) == 0 {
+		return nil
+	}
 	return r.keys
 }
 

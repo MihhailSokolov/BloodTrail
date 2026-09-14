@@ -1558,11 +1558,13 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 
 // --- RETURN projection -----------------------------------------------------
 
-// projectionKeys returns proj's RETURN column names in projection order.
+// projectionKeys returns proj's RETURN column names in projection order --
+// the caller-observable names (ProjectionOutput.OutputName, pg's own
+// naming), not the Cypher-side aliases planning resolves against.
 func projectionKeys(proj Projection) []string {
 	keys := make([]string, len(proj.Items))
 	for i, item := range proj.Items {
-		keys[i] = item.Alias
+		keys[i] = item.OutputName
 	}
 	return keys
 }
