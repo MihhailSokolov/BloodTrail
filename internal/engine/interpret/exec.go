@@ -426,6 +426,9 @@ func mergeRowInto(dst, src *Row) {
 	for _, fwd := range src.usedEdges {
 		dst.markEdgeUsed(fwd)
 	}
+	for _, identity := range src.trailEdges {
+		dst.markTrailEdge(identity)
+	}
 }
 
 // --- one component: anchor scan + BFS expansion + closing-edge checks ----
@@ -761,11 +764,13 @@ func pathStepArcKey(stepIdx int) string {
 // by exactly one step at a time: a fixed step via expandStep, a
 // variable-length step via expandVarLengthTrailsForSeed (expand.go, factored
 // out of expandVarLengthComponent so both dispatch paths share the identical
-// trail-DFS semantics). Trail-edge uniqueness stays scoped to each
-// variable-length step's own call (a fresh DFS per step, per row) --
+// trail-DFS semantics). Trail-edge uniqueness within one trail stays scoped
+// to each variable-length step's own call (a fresh DFS per step, per row) --
 // distinct variable-length steps of the same chain may legally reuse the
 // same physical edge in their own trails, mirroring dawgs' own per-expansion
-// recursive CTE (see expand.go's package doc).
+// recursive CTE -- while a FIXED step's edge and a trail's edges mutually
+// exclude each other across the whole chain, in both orders (see expand.go's
+// package doc's CROSS-STEP bullet and Row.trailEdges' doc).
 func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string) ([]*Row, error) {
 	startSym := part.Chains[stepIdxs[0]].FromSym
 	rows, err := scanAnchor(env, meter, startSym, part.Nodes[startSym])
@@ -1233,6 +1238,18 @@ func candidateIdentity(snap *snapshot.View, c adjCandidate) uint64 {
 	return c.fwd
 }
 
+// edgeRefIdentity returns ref's overlay-aware edge identity, the EdgeRef
+// counterpart of candidateIdentity: the same discriminant (snap.Overlay())
+// that decided which of EdgeRef's two fields edgeRefFor populated decides
+// which one names the physical edge here. Used to record a finished trail's
+// edges into Row.trailEdges (see that field's doc).
+func edgeRefIdentity(snap *snapshot.View, ref EdgeRef) uint64 {
+	if snap.Overlay() {
+		return ref.EdgeID
+	}
+	return ref.Fwd
+}
+
 // adjacency enumerates every edge incident to bound that step's shape
 // admits, spending one work unit per adjacency slot inspected (whether or
 // not it survives any filter -- edge-kind filtering happens in the caller,
@@ -1438,6 +1455,16 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			if r.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
 			}
+			// The other half of the same rule for a mixed fixed/var-length
+			// chain: a fixed step may not resolve to an edge a preceding
+			// variable-length step's trail already consumed either -- dawgs
+			// emits `e1.id != all (path)` for every expansion preceding a
+			// fixed step (see Row.trailEdges' doc for the full asymmetric
+			// contract, incl. why the trail DFS itself does NOT check this
+			// set).
+			if r.trailEdgeUsed(candidateIdentity(env.Snap, c)) {
+				continue
+			}
 			nr := cloneRow(r)
 			nr.SetNode(unboundSym, c.other)
 			if step.EdgeSym != "" {
@@ -1505,6 +1532,14 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 				continue
 			}
 			if r.edgeUsed(candidateIdentity(env.Snap, c)) {
+				continue
+			}
+			// Same trail-edge exclusion expandStep applies (see Row.trailEdges'
+			// doc): unreachable today -- a component containing a
+			// variable-length Step is always a strict linear chain, which
+			// never produces a closing Step -- but checked anyway so the two
+			// fixed-step expanders enforce one rule, not two.
+			if r.trailEdgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			nr := cloneRow(r)

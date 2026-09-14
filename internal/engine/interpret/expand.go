@@ -39,22 +39,43 @@
 //     ever fires for depth >= 1). This file mirrors that structurally: the
 //     zero-length row is produced once per seed, before the trail DFS even
 //     starts, never as a "depth 0" case inside the DFS itself.
-//   - FIRST-EDGE SELF-LOOP: pattern_expansion.sql's seed (depth-1) query and
-//     its recursive member use different join shapes -- the seed's `where
-//     n0.id != n1.id or path.depth > 0`-style guard (self-loop exclusion)
-//     applies only to the *first* edge taken from the root, never to a
-//     self-loop reached deeper in the recursion. A trail whose first edge
-//     is a self-loop is therefore still emitted at depth 1 (the seed row
-//     itself is never suppressed, only its own further recursion is), but
-//     it can never be extended past depth 1 by the recursive member. A
-//     self-loop encountered at depth > 1 (i.e. not the very first edge) has
-//     no such restriction and recurses normally.
+//   - SELF-LOOPS force a decline. pg's recursive CTE carries an `is_cycle`
+//     guard on its SEED-side edge only (the seed arm computes `start = end`
+//     and the recursive member requires `not is_cycle`, resetting it to
+//     false for deeper edges): a trail whose seed-side edge is a self-loop
+//     is emitted at depth 1 but never extended, while a deeper self-loop
+//     recurses normally. Which PATTERN edge that guard lands on depends on
+//     which side dawgs seeds the CTE from -- and that choice is made per
+//     query by version-specific heuristics (optimize/direction.go's
+//     InboundTraversalReversalRule, optimize/lowering_plan.go's
+//     traversalDirectionDecisionForStep -- verified: a kinds-only terminal
+//     with an unconstrained source seeds from the TERMINAL and walks
+//     backward, `e0.end_id = seed.root_id` -- and translate's own baseline
+//     OptimizePatternConstraintBalance). Mirroring those heuristics would
+//     chain this engine's correctness to dawgs internals that can move
+//     under any upstream bump, so it deliberately does not: when the
+//     current view provably holds NO self-loop of an admitted kind
+//     (View.SelfLoopHazard false -- the overwhelmingly common case in AD
+//     graphs), the guard can never fire on either side and the seeding
+//     choice is unobservable; otherwise every var-length route declines
+//     (errUnsupportedStep -> delegate) rather than risk placing the rule on
+//     the wrong edge.
 //   - Multiplicity: no relationship-uniqueness or per-endpoint-pair dedup is
 //     applied anywhere in dawgs' translation for this shape -- every
 //     distinct trail (including two trails that use different parallel
 //     edges of the same kind between the same two nodes) is a separate CTE
 //     row, so this file enumerates all of them rather than collapsing by
 //     (root, terminal) pair.
+//   - CROSS-STEP uniqueness in a mixed fixed/var-length chain is asymmetric
+//     (pinned from translate/traversal.go's
+//     previousRelationshipUniquenessConstraint /
+//     expansionPreviousRelationshipUniquenessConstraint and verified against
+//     generated SQL): a fixed step's edge is excluded from every
+//     variable-length step's trail of the same pattern and vice versa
+//     (`e_fixed != all (path)` is emitted whichever of the two comes first),
+//     while two variable-length steps' trails may legally share an edge (the
+//     constraint builders skip preceding expansions entirely). Implemented
+//     via Row's two separate edge sets -- see Row.trailEdges' doc.
 //   - Undirected var-length cannot occur: plan.go's buildStep already
 //     rejects it at plan time, so Step.Direction is always
 //     graph.DirectionOutbound whenever Step.Range != nil, and FromSym is
@@ -76,9 +97,9 @@
 // seeded from that endpoint, producing the identical rows for a small fraction
 // of the work -- see varLengthReverseEligible for when that swap is taken and
 // expandVarLengthTrailsToSeed for the clause-by-clause argument that it
-// preserves every rule above (including the first-edge self-loop rule, the one
-// place where the two directions need visibly different bookkeeping to reach
-// the same answer).
+// preserves every rule above (the self-loop decline makes the one
+// historically direction-sensitive rule moot: no served graph contains an
+// admissible self-loop at all).
 //
 // Work accounting matches exec.go's documented model exactly: adjacency()
 // already spends one work unit per adjacency slot inspected; this file adds
@@ -138,11 +159,8 @@ var ErrSelfEndpoint = errors.New("interpret: self endpoint")
 
 // trailFrame is one partial (or complete) trail on expandVarLengthComponent's
 // explicit DFS stack: nodes[len(nodes)-1] is the walk's current frontier
-// node, edges[i] is the EdgeRef taken from nodes[i] to nodes[i+1], and
-// firstIsSelfLoop records whether edges[0] (if any) is a self-loop -- the one
-// piece of history the "first-edge self-loop is never extended" rule needs
-// that isn't otherwise recoverable from nodes/edges alone once the DFS has
-// moved past depth 1. Fresh slices are allocated per pushed frame (mirroring
+// node, edges[i] is the EdgeRef taken from nodes[i] to nodes[i+1].
+// Fresh slices are allocated per pushed frame (mirroring
 // traverse/bfs.go's enumerate/pairEnumerate, the existing precedent for this
 // exact iterative-stack-instead-of-recursion shape in this codebase); trails
 // are capped at Range.Max (documented as small -- MaxExpansionDepth is 15
@@ -150,9 +168,8 @@ var ErrSelfEndpoint = errors.New("interpret: self endpoint")
 // implies is a deliberate "small slices, linear containment" tradeoff,
 // not a hidden hot loop.
 type trailFrame struct {
-	nodes           []snapshot.NodeID
-	edges           []EdgeRef
-	firstIsSelfLoop bool
+	nodes []snapshot.NodeID
+	edges []EdgeRef
 }
 
 // containsFwd reports whether any edge in edges already carries c's own
@@ -314,6 +331,15 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // segment -- see assembleChainPathVal's doc. "" skips binding entirely,
 // matching a caller with no path to assemble.
 func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+	// A self-loop of an admitted kind anywhere in the view makes pg's
+	// seed-side is_cycle guard placement observable, and that placement
+	// depends on dawgs heuristics this engine deliberately does not mirror
+	// -- decline and delegate. See the package doc's SELF-LOOPS bullet and
+	// View.SelfLoopHazard.
+	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
+		return nil, errUnsupportedStep
+	}
+
 	root, _ := seed.Node(step.FromSym)
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
@@ -348,6 +374,14 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 		if depth >= 1 && depth >= minDepth && nodeSatisfiesConstraint(env, toNC, curNode) {
 			nr := cloneRow(seed)
 			nr.SetNode(step.ToSym, curNode)
+			// Record the trail's own edges so a later FIXED step of the same
+			// chain cannot resolve to one of them (dawgs emits `e.id != all
+			// (path)` for the expansion preceding a fixed step); a later
+			// var-length step's own trail deliberately does NOT consult this
+			// set -- see Row.trailEdges' doc for the full pinned contract.
+			for _, e := range cur.edges {
+				nr.markTrailEdge(edgeRefIdentity(env.Snap, e))
+			}
 			if pathArcKey != "" {
 				pv := &PathVal{
 					Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
@@ -372,7 +406,7 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			out = append(out, nr)
 		}
 
-		if depth == maxHops || (depth == 1 && cur.firstIsSelfLoop) {
+		if depth == maxHops {
 			continue
 		}
 
@@ -387,6 +421,15 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			if containsFwd(env, cur.edges, c) {
 				continue
 			}
+			// An edge a FIXED step of the same pattern already consumed is
+			// off-limits to this trail (dawgs emits `e_fixed != all (path)`
+			// regardless of which side of the expansion the fixed step sits
+			// on); seed carries exactly those edges in usedEdges. Edges used
+			// by ANOTHER var-length step's trail are deliberately not
+			// excluded -- see Row.trailEdges' doc.
+			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
+				continue
+			}
 
 			nextNodes := make([]snapshot.NodeID, depth+2)
 			copy(nextNodes, cur.nodes)
@@ -397,9 +440,8 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			nextEdges[depth] = edgeRefFor(env.Snap, c)
 
 			stack = append(stack, trailFrame{
-				nodes:           nextNodes,
-				edges:           nextEdges,
-				firstIsSelfLoop: cur.firstIsSelfLoop || (depth == 0 && c.other == curNode),
+				nodes: nextNodes,
+				edges: nextEdges,
 			})
 		}
 	}
@@ -563,19 +605,9 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 // the pattern's NEAR endpoint, and edges[i] is the EdgeRef traversed from
 // nodes[i+1] to nodes[i] -- i.e. both slices run in BACKWARD-DISCOVERY order,
 // the exact reverse of the pattern's own FromSym-to-ToSym order.
-//
-// lastIsSelfLoop records whether edges[len(edges)-1] -- the most recently
-// walked edge, and therefore the trail's FIRST edge in pattern order -- is a
-// self-loop. trailFrame's forward equivalent records the same fact about the
-// same edge; the difference is only when it becomes known. Walking forward,
-// the trail's first edge is chosen first and its self-loop-ness is fixed for
-// the rest of the branch; walking backward it changes at every step, which is
-// why this is recomputed per frame rather than propagated like trailFrame's
-// firstIsSelfLoop.
 type reverseTrailFrame struct {
-	nodes          []snapshot.NodeID
-	edges          []EdgeRef
-	lastIsSelfLoop bool
+	nodes []snapshot.NodeID
+	edges []EdgeRef
 }
 
 // expandVarLengthTrailsToSeed grows exactly one FAR-endpoint seed row backward
@@ -594,11 +626,10 @@ type reverseTrailFrame struct {
 //   - every ei's kind is admitted by the pattern's edge-kind list,
 //   - k is at most the resolved max depth and at least the min depth,
 //   - the near endpoint's own constraint holds at n0 and the far endpoint's at
-//     nk,
-//   - and, unless k is 1, e0 is not a self-loop.
+//     nk.
 //
 // Each clause is checked below on the same trail the forward walk would have
-// checked it on. Three of them need care in this direction:
+// checked it on. Two of them need care in this direction:
 //
 //   - Depth is counted in EDGES, identically either way, so the min/max bounds
 //     transfer unchanged.
@@ -606,24 +637,23 @@ type reverseTrailFrame struct {
 //     endpoint's constraint (plus its pushed predicates, see
 //     expandVarLengthComponentReverse), and the NEAR endpoint's constraint is
 //     what each reached node is tested against.
-//   - The first-edge self-loop rule changes from a PRUNE into a SUPPRESSION,
-//     and this is the one genuine asymmetry. Walking forward, a trail whose
-//     first edge is a self-loop is emitted at depth 1 and its branch is then
-//     abandoned, so no trail of two or more edges can ever begin with one.
-//     Walking backward,
-//     that same first edge is the LAST one discovered, so there is no branch
-//     to abandon at the point the fact becomes known -- and abandoning it
-//     would be wrong anyway, since extending the walk one more edge makes the
-//     self-loop an interior edge, which is perfectly legal and does have to be
-//     emitted. So this loop keeps walking and instead declines to EMIT
-//     whenever the trail is two or more edges long and the edge just walked is
-//     a self-loop. The emitted set is identical; only the shape of the
-//     bookkeeping differs.
+//
+// The historically direction-sensitive clause -- pg's seed-side self-loop
+// dead-end guard -- no longer appears in either walker: both decline
+// outright whenever the view holds any self-loop of an admitted kind (see
+// the package doc's SELF-LOOPS bullet), so every trail either walker is
+// ever allowed to enumerate contains no self-loop at all.
 //
 // pathArcKey behaves exactly as it does for the forward walk: when non-empty,
 // each output row additionally binds its own trail as a *PathVal under that
 // key.
 func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+	// Same self-loop hazard decline as the forward walker -- see its comment
+	// and the package doc's SELF-LOOPS bullet.
+	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
+		return nil, errUnsupportedStep
+	}
+
 	terminal, _ := seed.Node(step.ToSym)
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
@@ -655,10 +685,16 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		depth := len(cur.edges)
 		curNode := cur.nodes[depth]
 
-		firstEdgeSelfLoopSuppressed := depth >= 2 && cur.lastIsSelfLoop
-		if depth >= 1 && depth >= minDepth && !firstEdgeSelfLoopSuppressed && nodeSatisfiesConstraint(env, fromNC, curNode) {
+		if depth >= 1 && depth >= minDepth && nodeSatisfiesConstraint(env, fromNC, curNode) {
 			nr := cloneRow(seed)
 			nr.SetNode(step.FromSym, curNode)
+			// Mirror of the forward walker's trail-edge recording -- see
+			// Row.trailEdges' doc. Unreachable in a mixed chain today (only
+			// standalone single-step components take this route), recorded
+			// anyway so both walkers keep identical bookkeeping.
+			for _, e := range cur.edges {
+				nr.markTrailEdge(edgeRefIdentity(env.Snap, e))
+			}
 			if pathArcKey != "" {
 				pv := &PathVal{
 					Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
@@ -698,6 +734,13 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			if containsFwd(env, cur.edges, c) {
 				continue
 			}
+			// Mirror of the forward walker's fixed-edge exclusion -- see
+			// Row.trailEdges' doc. A reverse seed is always a fresh row today
+			// (standalone components only), so this is a no-op until a caller
+			// ever hands this walker a row carrying fixed-step edges.
+			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
+				continue
+			}
 
 			nextNodes := make([]snapshot.NodeID, depth+2)
 			copy(nextNodes, cur.nodes)
@@ -708,9 +751,8 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			nextEdges[depth] = edgeRefFor(env.Snap, c)
 
 			stack = append(stack, reverseTrailFrame{
-				nodes:          nextNodes,
-				edges:          nextEdges,
-				lastIsSelfLoop: c.other == curNode,
+				nodes: nextNodes,
+				edges: nextEdges,
 			})
 		}
 	}

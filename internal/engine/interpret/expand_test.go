@@ -298,43 +298,23 @@ func TestExpandVarLengthMinDepthPostFilter(t *testing.T) {
 	})
 }
 
-// TestExpandVarLengthFirstEdgeSelfLoopNotExtended: root `a` carries both a
-// self-loop and a normal edge to `b`. The self-loop trail must appear at
-// depth 1 and must NOT be extended into a depth-2 trail through it (a-a-b);
-// the ordinary a-b trail is unaffected.
-func TestExpandVarLengthFirstEdgeSelfLoopNotExtended(t *testing.T) {
-	const kindRoot snapshot.KindID = 1
-	const kindE snapshot.KindID = 10
-	snap := buildExecSnapshot(t,
-		map[snapshot.KindID]string{kindRoot: "Root", kindE: "E"},
-		[]execNodeSpec{
-			{id: 1, kinds: []snapshot.KindID{kindRoot}},
-			{id: 2},
-		},
-		[]execEdgeSpec{
-			{id: 100, start: 1, end: 1, kind: kindE}, // self-loop
-			{id: 101, start: 1, end: 2, kind: kindE},
-		},
-	)
-
-	assertPathSigs(t, snap, `MATCH p = (a:Root)-[:E*1..3]->(x) RETURN p`, 0, []string{
-		"N:1,1,|E:100,",
-		"N:1,2,|E:101,",
-	})
-}
-
-// TestExpandVarLengthMidPathSelfLoopExtendable: `x` (reached via a's normal
-// edge, so the self-loop is not the trail's first edge) carries a self-loop
-// that CAN be extended further -- both the direct a-x-y trail and the
-// longer a-x-x-y trail through the self-loop must be enumerated.
-func TestExpandVarLengthMidPathSelfLoopExtendable(t *testing.T) {
+// TestExpandVarLengthSelfLoopHazardDeclines: any self-loop of an admitted
+// kind in the view -- whether it would sit on the trail's first edge or
+// mid-trail -- declines the whole var-length pattern instead of serving it:
+// pg's recursive CTE applies its self-loop dead-end guard to whichever
+// pattern edge sits on the CTE's own seed side, chosen per query by dawgs
+// heuristics this engine deliberately does not mirror (see expand.go's
+// SELF-LOOPS package-doc bullet). A second pattern over a kind with no
+// self-loops must keep serving from the same snapshot.
+func TestExpandVarLengthSelfLoopHazardDeclines(t *testing.T) {
 	const (
 		kindRoot   snapshot.KindID = 1
 		kindTarget snapshot.KindID = 2
 		kindE      snapshot.KindID = 10
+		kindF      snapshot.KindID = 11
 	)
 	snap := buildExecSnapshot(t,
-		map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"},
+		map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E", kindF: "F"},
 		[]execNodeSpec{
 			{id: 1, kinds: []snapshot.KindID{kindRoot}}, // a
 			{id: 2}, // x
@@ -342,14 +322,22 @@ func TestExpandVarLengthMidPathSelfLoopExtendable(t *testing.T) {
 		},
 		[]execEdgeSpec{
 			{id: 200, start: 1, end: 2, kind: kindE}, // a->x
-			{id: 201, start: 2, end: 2, kind: kindE}, // x self-loop
+			{id: 201, start: 2, end: 2, kind: kindE}, // x self-loop: the hazard
 			{id: 202, start: 2, end: 3, kind: kindE}, // x->y
+			{id: 203, start: 1, end: 3, kind: kindF}, // a->y, self-loop-free kind
 		},
 	)
 
-	assertPathSigs(t, snap, `MATCH p = (a:Root)-[:E*1..3]->(y:Target) RETURN p`, 0, []string{
-		"N:1,2,3,|E:200,202,",
-		"N:1,2,2,3,|E:200,201,202,",
+	if err := execExpectErr(t, snap, `MATCH p = (a:Root)-[:E*1..3]->(y:Target) RETURN p`, generousBudget); !errors.Is(err, errUnsupportedStep) {
+		t.Fatalf("E-kind pattern: err = %v, want errUnsupportedStep", err)
+	}
+	// An empty relationship-type list admits every kind, so the E self-loop
+	// is a hazard for it too.
+	if err := execExpectErr(t, snap, `MATCH p = (a:Root)-[*1..3]->(y:Target) RETURN p`, generousBudget); !errors.Is(err, errUnsupportedStep) {
+		t.Fatalf("any-kind pattern: err = %v, want errUnsupportedStep", err)
+	}
+	assertPathSigs(t, snap, `MATCH p = (a:Root)-[:F*1..3]->(y:Target) RETURN p`, 0, []string{
+		"N:1,3,|E:203,",
 	})
 }
 
