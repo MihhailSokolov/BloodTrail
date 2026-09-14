@@ -132,6 +132,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
+	scriptContainerEpoch(fake, base)
 	var out bytes.Buffer
 	deps := Deps{
 		Runner:  fake,
@@ -208,7 +209,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, preLogs, postLogs string) *dockerx.FakeRunner {
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
 	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
-	return &dockerx.FakeRunner{
+	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
@@ -226,6 +227,17 @@ func migrationFake(dir, composeFile, image, neo4jNodes, neo4jEdges, pg, preLogs,
 			psql + "select (select count(*) from node)": []byte(pg + "\n"),
 		},
 	}
+	scriptContainerEpoch(fake, base)
+	return fake
+}
+
+// scriptContainerEpoch scripts the container-identity probe the installer
+// runs on each side of the migration window: a stable container id and
+// start time, i.e. no restart. A test proving restart detection overrides
+// the inspect key with a Sequences entry instead.
+func scriptContainerEpoch(fake *dockerx.FakeRunner, base string) {
+	fake.Outputs[base+"ps --format json bloodhound"] = []byte(`{"ID":"cafe01","Image":"` + upstreamImage + `"}`)
+	fake.Outputs["docker inspect -f {{.Id}} {{.State.StartedAt}} cafe01"] = []byte("cafe01 2026-09-02T00:00:00Z\n")
 }
 
 // runMigrationInstall drives Install through the migration with fake and
@@ -250,19 +262,47 @@ func runMigrationInstall(t *testing.T, dir, composeFile, image string, fake *doc
 	return Install(context.Background(), deps, opts)
 }
 
-func TestInstallAbortsWhenMigrationYieldsNoNodes(t *testing.T) {
+// TestInstallAbortsWhenNeo4jRecountFails pins the fail-closed verification:
+// without a usable post-migration Neo4j count there is nothing to compare
+// the migrated graph against, and the old behavior -- passing on any
+// nonzero PostgreSQL node count -- silently blessed partial migrations. A
+// failed recount is now itself the abort.
+func TestInstallAbortsWhenNeo4jRecountFails(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
 	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
-	// Without a usable Neo4j count there is nothing to compare against, so an
-	// empty PostgreSQL graph is the only evidence the migration failed.
-	fake := migrationFake(dir, composeFile, image, "10", "20", "0|0", "", "")
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "", "")
 	delete(fake.Outputs, base+neo4jNodeCount)
 	delete(fake.Outputs, base+neo4jEdgeCount)
 
 	err := runMigrationInstall(t, dir, composeFile, image, fake)
-	if err == nil || !strings.Contains(err.Error(), "zero nodes") || !strings.Contains(err.Error(), "rollback") {
-		t.Fatalf("expected a zero-node error mentioning rollback, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cannot be verified against its source") || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected a fail-closed recount error mentioning rollback, got %v", err)
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("manifest should still exist so `bloodtrail rollback` can undo the partial install")
+	}
+}
+
+// TestInstallAbortsWhenBloodhoundRestartsDuringMigration: a bloodhound
+// container restart resets its migrator to "idle", which WaitUntilIdle
+// cannot tell apart from completion -- the installer compares the
+// container's identity (id + start time) across the migration window and
+// must refuse the reported completion when it changed.
+func TestInstallAbortsWhenBloodhoundRestartsDuringMigration(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "", "")
+	// Same container id, different start time: a plain restart.
+	delete(fake.Outputs, "docker inspect -f {{.Id}} {{.State.StartedAt}} cafe01")
+	fake.Sequences["docker inspect -f {{.Id}} {{.State.StartedAt}} cafe01"] = [][]byte{
+		[]byte("cafe01 2026-09-02T00:00:00Z\n"),
+		[]byte("cafe01 2026-09-02T00:05:00Z\n"),
+	}
+
+	err := runMigrationInstall(t, dir, composeFile, image, fake)
+	if err == nil || !strings.Contains(err.Error(), "restarted during the migration") || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected a restart-detection error mentioning rollback, got %v", err)
 	}
 	if !manifest.Exists(dir) {
 		t.Fatal("manifest should still exist so `bloodtrail rollback` can undo the partial install")
@@ -340,6 +380,7 @@ func TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory(
 	}))
 	defer tool.Close()
 
+	scriptContainerEpoch(fake, base)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -455,6 +496,7 @@ func TestInstallIgnoresAPreExistingMigratorFailureLog(t *testing.T) {
 	}))
 	defer tool.Close()
 
+	scriptContainerEpoch(fake, base)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -572,6 +614,7 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 	}))
 	defer tool.Close()
 
+	scriptContainerEpoch(fake, base)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
