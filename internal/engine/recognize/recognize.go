@@ -8,7 +8,7 @@
 // PostgreSQL.
 //
 // This package's own Cypher-text equivalent of FromCriteria (FromCypher)
-// existed only through milestone 3; milestone 4's general-purpose Cypher
+// predated the Cypher interpreter; the general-purpose
 // interpreter (internal/engine/interpret) superseded it entirely, and
 // engine.TryCypher now serves Cypher text directly through that interpreter
 // instead of recognizing a fixed shortestPath/allShortestPaths shape here.

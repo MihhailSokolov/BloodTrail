@@ -186,7 +186,7 @@ call, once for the whole graph), not from `-seed`. This is a deliberate
 departure from Generate's otherwise-total `-seed`/`-users` determinism:
 real AD's own timestamp properties are epoch seconds that Cypher hygiene
 queries compare against `datetime().epochseconds - N*86400` at *query*
-time (the milestone-4 corpus fixture,
+time (the prebuilt-query corpus fixture,
 `internal/graphtest/corpusfixture.go`, makes this same tradeoff, see its
 "Time-dependent predicates" section). A graph whose timestamps were pinned
 to a `-seed`-derived point in time would silently age out of any such

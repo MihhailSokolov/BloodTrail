@@ -743,7 +743,7 @@ func applyRandomCypherMutation(t *testing.T, ctx context.Context, bt, oracleDB g
 
 // randomCypherDifferentialSeeds and randomCypherDifferentialQueriesPerSeed
 // mirror internal/engine/random_differential_integration_test.go's own
-// milestone-2 convention exactly: 20 seeds, 10 queries per seed, each query
+// original sweep convention exactly: 20 seeds, 10 queries per seed, each query
 // its own "seed=N/query=M" subtest so a failure reproduces by rerunning just
 // that one subtest.
 const (

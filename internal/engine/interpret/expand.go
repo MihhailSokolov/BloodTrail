@@ -120,7 +120,7 @@
 // (ids/objectid/predicates present -- reusing scanAnchor's own
 // id/objectid/full-scan anchoring plus each endpoint's pushed, single-symbol
 // WHERE predicates, the in-memory replacement for the live-PG endpoint
-// resolution an earlier milestone used); a kinds-only side is instead handed
+// resolution an earlier design used); a kinds-only side is instead handed
 // to traverse as a lazy kind bitmap it can iterate/probe directly, and a
 // truly unconstrained side as traverse's own "matches every node" sentinel
 // -- neither ever visits a candidate node one at a time the way scanAnchor

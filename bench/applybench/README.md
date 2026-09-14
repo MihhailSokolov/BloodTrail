@@ -232,7 +232,11 @@ Three outcomes are legitimate per boot:
 Any other rejection reason, a writer error mid-boot, or a boot that reaches
 neither marker inside `-cap` aborts the run. Reported only, never enforced
 (the same judgment as (c)/(d): correctness either way, and the cost either
-way is a background rebuild, not a served query's latency).
+way is a background rebuild, not a served query's latency). To be explicit
+about the one gate that IS enforced: a scenario fails only when it adopts
+zero boots; `overflowed` and every other outcome counter are deliberately
+never asserted against -- an adversarial writer legitimately overflowing
+the caps is a result the bench should say, not die on.
 
 Every measurement prints a human-readable line and a machine-greppable
 `APPLYBENCH_*` summary line (`grep '^APPLYBENCH_'`), ending in
@@ -494,7 +498,7 @@ it was built for, at a boot cost indistinguishable from (d)'s quiet boots
 (8.6-11.8s individual observations vs (d)'s 10.4-14.0s p50 range). The
 buffer's caps were never approached: 4 entries against the then-1024 entry
 cap (4096 since the sustained scenario's own measurement moved it -- see
-the milestone-7 results below), ~200 keys
+the mid-ingest adoption results below), ~200 keys
 against 262,144 -- a real BloodHound boot's startup-analysis burst is the
 same order of magnitude as this phase's, far below either cap.
 
@@ -507,7 +511,7 @@ existed, and the phase failed on a race the harness itself manufactured.
 Every phase now waits on the engine's own adoption marker
 (`waitForAdoption`, main.go) instead of predicting boot duration.
 
-**Milestone-7 results (2026-09-13, same graph recipe, ~4.8M nodes):** with
+**Mid-ingest adoption results (2026-09-13, same graph recipe, ~4.8M nodes):** with
 the engine's settle-wait adoption in place and the scenario split into
 burst + sustained, one full run measured:
 

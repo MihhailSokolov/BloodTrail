@@ -51,7 +51,7 @@
 //     loadBuilderMatrixRandomGraph -- a local, size-bounded adaptation of
 //     internal/graphtest's own LoadRandom (see that function's doc for why
 //     it is adapted rather than reused unmodified: LoadRandom's 60-node,
-//     180-edge sizing was tuned for milestone 2's much lighter path-query
+//     180-edge sizing was tuned for the original path-engine's much lighter path-query
 //     differential suite, not for this suite's dense structural matrix,
 //     which multiplies every node/edge kind by several anchor variants and
 //     op families).

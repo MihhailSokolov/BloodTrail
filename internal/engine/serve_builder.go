@@ -154,7 +154,7 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 //  1. serveGate: cfg.Enabled, then a non-nil snapshot.
 //  2. spec.Constraints non-empty (reasonNoKindConstraint otherwise).
 //  3. Every constraint's kinds mapped to a KindID via e.mapKind
-//     (reasonError on the first failure -- consistent with milestone 2's
+//     (reasonError on the first failure -- consistent with the path engine's
 //     MapKind stance in resolveKindsEndpoint/buildKindMask: a mapping
 //     failure is ambiguous between "kind genuinely doesn't exist" and "the
 //     lookup itself failed", so it is never silently treated as "matches

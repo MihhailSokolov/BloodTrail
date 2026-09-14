@@ -51,13 +51,13 @@ Three fresh runs at 5M scale (4,760,000 nodes / 48,886,562 edges,
 `adgen -users 2800000 -domains 4 -seed 1`, moderate background load)
 measured pairs p95 103.7 / 99.0 / 85.1 ms -> 103.7 x 1.75 ~= 181 -> 180ms.
 
-Bar history: the original 100ms came from milestone 2's target, set before
+Bar history: the original 100ms came from the path engine's first target, set before
 any 5M measurement existed, and was the only enforced bar in the repository
 never re-derived from measurement. At this scale it sits exactly on the
 worst pairs' own cost -- a seeded-random pair whose BFS crosses the
 per-domain hub groups reaches a large fraction of the graph, and that
 breadth genuinely costs ~85-110ms single-threaded -- so runs straddled
-PASS/FAIL on ambient load alone (fail 3/3 at milestone 5's close, then
+PASS/FAIL on ambient load alone (fail 3/3 at write-through's close, then
 1/3 fail, on the same graph and machine). Two real defects were found and
 fixed while running it down, which is the tripwire doing its job: a
 discarded per-expansion allocation in backward BFS (p95 255 -> ~124ms,
