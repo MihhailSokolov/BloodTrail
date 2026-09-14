@@ -187,3 +187,39 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 }
+
+// TestEmptyLogLevelIsAbsent pins that a declared-but-unset
+// BLOODTRAIL_LOG_LEVEL leaves LogLevelSet false. The environment hands such
+// a variable over as ("", true), and treating it as an explicit "info" makes
+// Open install the debug override handler, which forces every BloodTrail
+// Info line back on in a deployment that had turned its own logging down to
+// Warn or Error -- the exact widening LogLevelSet exists to prevent.
+func TestEmptyLogLevelIsAbsent(t *testing.T) {
+	for _, value := range []string{"", "   ", "\t"} {
+		settings, err := SettingsFromEnv(func(key string) (string, bool) {
+			if key == EnvLogLevel {
+				return value, true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("%q: %v", value, err)
+		}
+		if settings.LogLevelSet {
+			t.Errorf("%q: LogLevelSet = true, want false", value)
+		}
+	}
+
+	settings, err := SettingsFromEnv(func(key string) (string, bool) {
+		if key == EnvLogLevel {
+			return "warn", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settings.LogLevelSet || settings.LogLevel != slog.LevelWarn {
+		t.Errorf("an explicit level must still be honored: set=%v level=%v", settings.LogLevelSet, settings.LogLevel)
+	}
+}

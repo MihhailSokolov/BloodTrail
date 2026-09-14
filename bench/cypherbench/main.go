@@ -525,13 +525,16 @@ func ratioOf(btP50, pgP50 time.Duration) float64 {
 //
 // When pgCapped is true, the pg baseline was never (fully) measured -- its
 // wall-clock cap tripped, see runPGCypherCapped's doc -- so there is no pg
-// result left to compute a ratio against or to match btSize/pgSize against:
-// both of those checks are skipped entirely (not scored as a failure) and
-// the shape is judged solely on whether btP50 clears th.engineAbsoluteCap.
-// This is deliberate, not a gap: matching against a result that was never
-// obtained is impossible, and penalizing a shape for pg's slowness (rather
-// than the engine's) would defeat the point of capping it in the first
-// place.
+// result left to compute a ratio against, so the ratio check is skipped
+// (not scored as a failure) and the shape is judged on whether btP50 clears
+// th.engineAbsoluteCap. Penalizing a shape for pg's slowness rather than
+// the engine's would defeat the point of capping pg in the first place.
+//
+// The row-count match is NOT skipped along with it when the comparison
+// already happened: measureShape's warmup compares the two sides before any
+// capping is possible, so matchChecked && !match is a measured
+// disagreement, and a capped pg baseline is no reason to forgive it. Only a
+// comparison that never ran at all is passed over.
 //
 // When pgCapped is false, matchChecked is expected true (measureShape's
 // warmup always runs before any capping can happen when uncapped) --
@@ -541,6 +544,16 @@ func ratioOf(btP50, pgP50 time.Duration) float64 {
 // supposed to run.
 func evaluateShape(btP50, pgP50 time.Duration, matchChecked, match, pgCapped bool, th shapeThreshold) (ok bool, reasons []string) {
 	if pgCapped {
+		// A mismatch already MEASURED still counts. matchChecked is set by
+		// measureShape's warmup, which runs before any capping can happen,
+		// so matchChecked && !match means the two sides were compared and
+		// genuinely disagreed -- a correctness failure that pg's later
+		// slowness does not retract. Only a comparison that never ran is
+		// skipped here, which is what "there is no pg result to match
+		// against" actually licenses.
+		if matchChecked && !match {
+			reasons = append(reasons, "bt/pg result row count mismatch (measured at warmup, before the pg baseline was capped)")
+		}
 		if btP50 > th.engineAbsoluteCap {
 			reasons = append(reasons, fmt.Sprintf("pg_capped: engine p50 %s exceeds absolute cap %s", fmtMillis(btP50), fmtMillis(th.engineAbsoluteCap)))
 		}

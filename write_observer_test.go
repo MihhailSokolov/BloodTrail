@@ -2357,3 +2357,43 @@ func TestObservingBatchCommitAppliesEvenWhenInnerCommitFails(t *testing.T) {
 		t.Fatalf("Commit did not reset scope after the inner Commit failed")
 	}
 }
+
+// TestBatchCreateNodeWithZeroIDKeysOnObjectID pins that a batch create whose
+// node carries id 0 is treated as "the database assigns the id", exactly as
+// dawgs' pg batch does (its flushNodeCreateBuffer routes `node.ID == 0 ||
+// node.ID == graph.UnregisteredNodeID` to the generate-an-id path). Keying
+// the read-back on id 0 instead pointed it at a row that cannot exist, so
+// the applier found nothing, tombstoned nothing, and the node PostgreSQL
+// really created stayed absent from the replica with no fallback recorded to
+// correct it.
+func TestBatchCreateNodeWithZeroIDKeysOnObjectID(t *testing.T) {
+	scope := engine.NewWriteScope()
+	recordBatchCreateNodeIdentity(scope, graph.NewNode(0,
+		graph.NewProperties().Set("objectid", "S-1-5-21-0"), graph.StringKind("User")))
+
+	cs := scope.Changes()
+	if ids := cs.NodeIDs(); len(ids) != 0 {
+		t.Errorf("NodeIDs = %v, want none: id 0 is not a real preset id", ids)
+	}
+	if got := cs.NodeObjectIDs(); len(got) != 1 || got[0] != "S-1-5-21-0" {
+		t.Errorf("NodeObjectIDs = %v, want the node's own objectid", got)
+	}
+	if fell, _ := cs.HasFallback(); fell {
+		t.Error("an objectid-keyed create needs no fallback")
+	}
+
+	// With no objectid either, there is nothing to re-read by, so the
+	// create must fall back rather than key on a bogus id.
+	bare := engine.NewWriteScope()
+	recordBatchCreateNodeIdentity(bare, graph.NewNode(0, graph.NewProperties(), graph.StringKind("User")))
+	if fell, _ := bare.Changes().HasFallback(); !fell {
+		t.Error("a create with neither a real id nor an objectid must record a fallback")
+	}
+
+	// A genuine preset id is still recorded as a read-back key.
+	preset := engine.NewWriteScope()
+	recordBatchCreateNodeIdentity(preset, graph.NewNode(graph.ID(42), graph.NewProperties(), graph.StringKind("User")))
+	if got := preset.Changes().NodeIDs(); len(got) != 1 || got[0] != uint64(42) {
+		t.Errorf("NodeIDs = %v, want the preset id 42", got)
+	}
+}

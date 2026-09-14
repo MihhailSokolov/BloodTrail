@@ -185,9 +185,11 @@ func (b *Builder) addPreparedNode(databaseID uint64, kinds []KindID, props prepa
 		ne := propEntry{prop: newID, kind: e.kind, num: e.num}
 		switch e.kind {
 		case propKindString, propKindArray, propKindObject:
-			ne.ref = uint32(len(b.propArena))
-			b.propArena = append(b.propArena, props.arena[e.ref:e.ref+e.len]...)
-			ne.len = e.len
+			ref, length, appendErr := appendPropBytes(&b.propArena, props.arena[e.ref:e.ref+e.len])
+			if appendErr != nil {
+				return appendErr
+			}
+			ne.ref, ne.len = ref, length
 		}
 		entries[i] = ne
 	}

@@ -1489,8 +1489,21 @@ func evalSizeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, b
 	if err != nil {
 		return nil, false, err
 	}
-	if !ok || val == nil {
+	if !ok {
+		// Absent: pg's `->` yields SQL NULL and jsonb_array_length(NULL)
+		// is NULL, so NULL here matches.
 		return nil, false, nil
+	}
+	if val == nil {
+		// Present, and the value is JSON null -- a different thing from
+		// absent, and PropStore keeps them apart. pg's `-> 'k'` yields
+		// 'null'::jsonb rather than SQL NULL for this row, and
+		// jsonb_array_length('null'::jsonb) raises "cannot get array
+		// length of a scalar", which aborts the whole delegated query.
+		// Answering NULL would quietly drop a row (or emit a column)
+		// PostgreSQL never produces at all, so the query delegates and
+		// fails the same way stock BloodHound does.
+		return nil, false, ErrRuntimeCast
 	}
 	list, isList := val.([]any)
 	if !isList {
@@ -1524,6 +1537,22 @@ func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, 
 	sep, sepIsString := sepVal.(string)
 	if !isString || !sepIsString {
 		return nil, false, ErrRuntimeCast
+	}
+
+	// PostgreSQL's string_to_array, which is what dawgs emits for split(),
+	// disagrees with strings.Split on both degenerate inputs, and empty
+	// string properties are ordinary in BloodHound data:
+	//
+	//	string_to_array('', ',')     -> {}        strings.Split -> [""]
+	//	string_to_array('abc', '')   -> {abc}     strings.Split -> [a b c]
+	//
+	// The first one changes rows, not just values: `'' IN split(n.s, ',')`
+	// is true for the Go result and false for PostgreSQL's empty array.
+	switch {
+	case s == "":
+		return []any{}, true, nil
+	case sep == "":
+		return []any{s}, true, nil
 	}
 
 	parts := strings.Split(s, sep)

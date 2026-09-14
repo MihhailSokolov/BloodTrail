@@ -123,6 +123,11 @@ caller has already been told committed.
   - A `NodeQuery`/`RelationshipQuery` `.Update`/`.Delete` call whose criteria aren't one
     of the shapes BloodTrail's recognizer can enumerate (an id-list criterion is;
     an arbitrary predicate isn't).
+  - A `RelationshipQuery.Delete` whose criteria *were* recognized but whose delete then
+    failed in PostgreSQL. The recognized form of that call is replayed as an
+    instruction ("tombstone every edge of these kinds") rather than as a read-back
+    key, so it is only sound for a delete that actually happened; after a failure the
+    replica knows nothing about those edges, and saying so is the honest record.
   - `Batch.CreateNode` for a node with neither a pre-assigned graph id nor a string
     `objectid` property -- a plain `INSERT` with nothing for the read-back to key on, so
     the applier cannot find the row it just created.
@@ -133,7 +138,7 @@ caller has already been told committed.
     endpoint nodes and the relationship in one statement, so the edge triple is only
     sound to record when both endpoints resolve and there is a relationship to key it.
 
-  The first six are rare in an ordinary BloodHound deployment -- admin actions, not
+  The first seven are rare in an ordinary BloodHound deployment -- admin actions, not
   anything ingest or analysis routinely does. **The last three are not.** They are
   ingest-shaped: they sit on the very batch API ingest itself writes through, and what
   keeps them off the hot path is not the call but the *shape* of its identity. The
@@ -284,7 +289,8 @@ are correct regardless of the replica's state.
   - `BLOODTRAIL_LOG_LEVEL` -- `debug`, `info`, `warn`, or `error`. When set, it widens the
     minimum level BloodTrail's own log lines are guaranteed to be visible at, on top of
     whatever already configures the process's logger -- it can only add visibility, never
-    take it away. Left unset, it is a complete no-op. `debug` is what surfaces e.g.
+    take it away. Left unset -- or declared with an empty value, the shape a
+    compose variable with nothing assigned to it produces -- it is a complete no-op. `debug` is what surfaces e.g.
     `bloodtrail: builder engine served` and `bloodtrail: write-through applied`.
 
 - **Log markers**, all under a `bloodtrail:` prefix, grouped by what they cover:
@@ -427,6 +433,24 @@ query BloodHound's UI ships.
   cannot evaluate without PostgreSQL's own numeric casting rules. Exactly as
   elsewhere, every decline falls back to PostgreSQL and always returns a correct
   result -- the only difference is latency.
+
+  Four more shapes delegate because dawgs' SQL for them does not mean what Cypher
+  means, so serving them would answer a question stock BloodHound answers
+  differently or cannot answer at all:
+  - A **chained comparison** (`1 < n.val < 5`, `n.val = 1 = true`). Cypher reads it
+    as a conjunction; dawgs emits left-associative SQL, which PostgreSQL either
+    evaluates differently or rejects outright (`operator does not exist: boolean <
+    integer`).
+  - A **list literal** containing `null`, a boolean, or a mix of strings and
+    numbers. dawgs renders a list as a one-type PostgreSQL array and fails to
+    translate all three, so the delegated query errors rather than answering.
+  - **`/` and `%` whose operands dawgs types as integers** (`n.val / 2`, `1 / 3`).
+    PostgreSQL truncates there; this evaluator has only float arithmetic. Writing
+    one operand as a float (`n.val / 2.0`) is served, because dawgs then casts to
+    `float8` and both sides agree.
+  - **`RETURN DISTINCT` ordered by a carried `COUNT` alias the projection does not
+    output.** PostgreSQL rejects that combination ("for SELECT DISTINCT, ORDER BY
+    expressions must appear in select list").
 - **The translate gate.** Because the interpreter is a reimplementation of a Cypher
   subset rather than a wrapper around dawgs' own PostgreSQL translator, nothing
   inherently guarantees the two agree on which queries are servable. Before executing
@@ -467,7 +491,11 @@ query BloodHound's UI ships.
   work-unit budget (node/adjacency inspections during execution), and an unbounded
   variable-length relationship pattern (a bare `*`, `*1..`, `*..`) is capped at 15 hops
   -- mirroring dawgs' own default traversal depth cap. Exceeding either budget declines
-  the query (falling back to PostgreSQL) rather than serving a truncated result.
+  the query (falling back to PostgreSQL) rather than serving a truncated result. An
+  explicit depth written into the query (`*1..40`) is honored past that default,
+  because PostgreSQL honors it too -- but only up to 127 hops, the deepest the
+  traversal's own distance buffer can represent; beyond that the query delegates
+  rather than being answered from a buffer that cannot hold the answer.
 - **The multi-graph guard.** The interpreter has no notion of which graph a query is
   scoped to -- unlike the path engine's own endpoint-resolution machinery, which only
   ever walks the one snapshot it was given -- so if `LoadSnapshot` detects the database
@@ -511,9 +539,8 @@ the terminal; add `--yes` to run it unattended.
 
 Until the first release is published, build the CLI with `go build ./cmd/bloodtrail`
 instead; the one-liner above describes the intended installation once a release exists.
-On macOS the bootstrap script's checksum step needs `sha256sum`, which stock macOS
-lacks; verify the release checksum by hand with `shasum -a 256` instead, or install the
-CLI from the release archive directly.
+The bootstrap script verifies the download with `sha256sum` where available and falls
+back to `shasum -a 256` (stock macOS) otherwise.
 
 The installer inventories the deployment, backs up the application database and the
 compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
@@ -543,6 +570,13 @@ v9.6.0. Images are built from the upstream Dockerfile with a one-file patch
   `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail` driver setting
   and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or drop the
   explicit `-f` and let `.env` decide.
+- Writing that entry replaces docker compose's own file discovery, so the installer
+  writes out everything discovery would have found: the compose file it was given and,
+  when one sits beside it, the conventional `docker-compose.override.yml`. Deployments
+  that keep their customizations in that override file therefore keep them, both in the
+  installer's own commands and in the operator's afterwards. `bloodtrail rollback`
+  removes the whole entry again when the install was what created it, which puts
+  discovery back the way it was.
 - `bloodtrail rollback` returns the deployment to the graph it had before the install.
   On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible

@@ -145,7 +145,11 @@ The first time a shape's pg baseline exceeds `-pg-cap`, `builderbench`:
 
 With no pg measurement left, `evaluateShape` judges a `pg_capped=true`
 shape on the **bloodtrail driver's own absolute p50** instead of a ratio,
-against `shapeThreshold.engineAbsoluteCap`:
+against `shapeThreshold.engineAbsoluteCap`. A size mismatch the warmup
+already measured still fails the shape, though: the warmup runs before any
+capping is possible, so a recorded `match=false` is a real disagreement
+between the two drivers, and a slow pg baseline is no reason to forgive it.
+Only a comparison that never ran (`match_checked=false`) is passed over.
 
 | Shape                            | Engine abs. cap (pg_capped path) | Why                                                                                 |
 |-----------------------------------|:---------------------------------:|-----------------------------------------------------------------------------------------|
@@ -199,7 +203,7 @@ graph data of its own.
 
 ### Smoke-testing the `-pg-cap` path
 
-The `pg_capped=true` path (skipped pg runs, skipped match check, engine
+The `pg_capped=true` path (skipped pg runs, skipped ratio check, engine
 judged on its absolute p50) is otherwise only exercised by a genuinely slow
 pg baseline, which doesn't happen at small scale. Force it instead:
 

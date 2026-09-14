@@ -82,6 +82,15 @@ type NodeSegState struct {
 	Tombstoned bool
 	KindIDs    []KindID
 	ObjectID   string
+	// HasObjectID says whether ObjectID is a value the node actually
+	// carries, which "" alone cannot: the empty string is a perfectly
+	// ordinary objectid, and PropStore's own index records it. Keying the
+	// segment index off ObjectID != "" instead made a delta-written node
+	// whose objectid really is empty invisible to objectid resolution --
+	// until a compaction happened to fold it into the base, at which point
+	// it appeared. That is an overlay-versus-base divergence in exactly
+	// the lookup apply.go resolves written ids through.
+	HasObjectID bool
 
 	seg     *Segment
 	entries []propEntry // sorted by prop; nil when Tombstoned
@@ -306,10 +315,11 @@ func computeSegmentApproxBytes(s *Segment) uint64 {
 // Build collapses the (possibly repeated) writes for each id down to a
 // single final NodeSegState.
 type segNodeBuild struct {
-	tombstoned bool
-	kindIDs    []KindID
-	objectID   string
-	entries    []propEntry
+	tombstoned  bool
+	kindIDs     []KindID
+	objectID    string
+	hasObjectID bool
+	entries     []propEntry
 }
 
 // segEdgeBuild is segNodeBuild's edge counterpart.
@@ -359,7 +369,7 @@ func (b *SegmentBuilder) AddNodeState(id uint64, kindIDs []KindID, propsJSON []b
 		return fmt.Errorf("snapshot: SegmentBuilder.AddNodeState: id %d: %w", id, err)
 	}
 
-	entries, objectID, err := b.commitProps(parsed.parsed)
+	entries, objectID, hasObjectID, err := b.commitProps(parsed.parsed)
 	if err != nil {
 		return fmt.Errorf("snapshot: SegmentBuilder.AddNodeState: id %d: %w", id, err)
 	}
@@ -368,9 +378,10 @@ func (b *SegmentBuilder) AddNodeState(id uint64, kindIDs []KindID, propsJSON []b
 		b.nodes = make(map[uint64]segNodeBuild)
 	}
 	b.nodes[id] = segNodeBuild{
-		kindIDs:  append([]KindID(nil), kindIDs...),
-		objectID: objectID,
-		entries:  entries,
+		kindIDs:     append([]KindID(nil), kindIDs...),
+		objectID:    objectID,
+		hasObjectID: hasObjectID,
+		entries:     entries,
 	}
 	return nil
 }
@@ -433,28 +444,30 @@ func (b *SegmentBuilder) AddKind(id KindID, name string) {
 // entries built so far are discarded rather than returned, matching
 // Builder.commitNodeProps's own "nothing partially committed on error"
 // contract.
-func (b *SegmentBuilder) commitProps(parsed []parsedProp) (entries []propEntry, objectID string, err error) {
+func (b *SegmentBuilder) commitProps(parsed []parsedProp) (entries []propEntry, objectID string, hasObjectID bool, err error) {
 	entries = make([]propEntry, len(parsed))
 	for i, pp := range parsed {
 		propID, err := b.internPropName(pp.name)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
 		e := propEntry{prop: propID, kind: pp.kind, num: pp.num}
 		switch pp.kind {
 		case propKindString, propKindArray, propKindObject:
-			e.ref = uint32(len(b.propArena))
-			b.propArena = append(b.propArena, pp.bytes...)
-			e.len = uint32(len(pp.bytes))
+			ref, length, appendErr := appendPropBytes(&b.propArena, pp.bytes)
+			if appendErr != nil {
+				return nil, "", false, appendErr
+			}
+			e.ref, e.len = ref, length
 		}
 		entries[i] = e
 
 		if pp.name == "objectid" && pp.kind == propKindString {
-			objectID = string(pp.bytes)
+			objectID, hasObjectID = string(pp.bytes), true
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].prop < entries[j].prop })
-	return entries, objectID, nil
+	return entries, objectID, hasObjectID, nil
 }
 
 // internPropName returns the PropID for name, interning it (assigning the
@@ -509,11 +522,12 @@ func (b *SegmentBuilder) Build() *Segment {
 	for _, id := range nodeIDs {
 		nb := b.nodes[id]
 		nodeStates[id] = NodeSegState{
-			Tombstoned: nb.tombstoned,
-			KindIDs:    nb.kindIDs,
-			ObjectID:   nb.objectID,
-			seg:        s,
-			entries:    nb.entries,
+			Tombstoned:  nb.tombstoned,
+			KindIDs:     nb.kindIDs,
+			ObjectID:    nb.objectID,
+			HasObjectID: nb.hasObjectID,
+			seg:         s,
+			entries:     nb.entries,
 		}
 	}
 
@@ -555,7 +569,9 @@ func copyKindNames(pairs map[KindID]string) map[KindID]string {
 }
 
 // buildSegmentObjectIndex scans nodeIDs (assumed sorted ascending) and
-// indexes every non-tombstoned node carrying a non-empty ObjectID, in the
+// indexes every non-tombstoned node that carries a string objectid at all --
+// HasObjectID, not a non-empty ObjectID, since "" is a value a node can
+// genuinely have and PropStore indexes it too -- in the
 // same ascending order MergeSegments and SegmentBuilder.Build both produce
 // their id lists in -- shared by both, since Build and MergeSegments each
 // need to derive an objectIndex from a final, already-collapsed
@@ -564,7 +580,7 @@ func buildSegmentObjectIndex(nodeIDs []uint64, nodeStates map[uint64]NodeSegStat
 	index := make(map[string][]uint64)
 	for _, id := range nodeIDs {
 		st := nodeStates[id]
-		if st.Tombstoned || st.ObjectID == "" {
+		if st.Tombstoned || !st.HasObjectID {
 			continue
 		}
 		index[st.ObjectID] = append(index[st.ObjectID], id)

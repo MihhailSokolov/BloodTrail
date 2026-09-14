@@ -86,3 +86,4 @@ concurrent load.
 | `-seed`       | `1`     | Seed for deterministic pair selection.                             |
 | `-enforce`    | `false` | Exit nonzero on a threshold miss (never pass this in CI).          |
 | `-cpuprofile` | (none)  | Write a pprof CPU profile to this file.                            |
+| `-cap`        | `30m`   | Wall-clock cap on the whole run. Exceeding it **aborts** with a nonzero exit and no report, rather than waiting: every query this benchmark makes -- the two snapshot loads, the rebuild, each sampled pair, and the property hydration behind a served answer -- hangs off that one deadline, so a wedged PostgreSQL round trip is reported instead of parking the run indefinitely. |

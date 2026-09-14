@@ -958,3 +958,127 @@ func (s rewriteTransport) Do(ctx context.Context, method, url string) (int, []by
 	path := url[strings.Index(url, "2112")+4:]
 	return toolapi.HTTPTransport{Client: s.client}.Do(ctx, method, s.base+path)
 }
+
+// TestInstallKeepsTheComposeFileDiscoveryWouldHaveLoaded covers the project
+// shape that has no COMPOSE_FILE entry but does have the conventional
+// override file beside the base one: docker compose loads that file on its
+// own, and naming any file with -f switches that discovery off. Every compose
+// call the installer makes has to name it, or `up -d` recreates the operator's
+// services without whatever the override holds (published ports, bind mounts).
+// The COMPOSE_FILE entry the install writes has to name it for the same
+// reason: it replaces discovery for the operator's own commands too.
+func TestInstallKeepsTheComposeFileDiscoveryWouldHaveLoaded(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	discovered := filepath.Join(dir, "docker-compose.override.yml")
+	_ = os.WriteFile(discovered, []byte("services: {}\n"), 0o644)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	withOverride := base + "-f " + overridePath + " "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+			psql + "select driver from database_switch limit 1":             []byte("pg\n"),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker image inspect " + image:                                 []byte(""),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+			withOverride + "up -d":                                          nil,
+			withOverride + "logs --no-color bloodhound":                     []byte("BloodTrail driver active version=test\n"),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	for _, call := range fake.Calls {
+		if strings.HasPrefix(call, "docker compose") && !strings.Contains(call, " -f "+discovered+" ") {
+			t.Fatalf("a compose call dropped the file compose would have discovered: %s", call)
+		}
+	}
+	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	want := "COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.bloodtrail.yml"
+	if strings.TrimSpace(string(env)) != want {
+		t.Fatalf(".env = %q, want %q", strings.TrimSpace(string(env)), want)
+	}
+	m, err := manifest.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.EnvComposeFileCreated {
+		t.Error("the manifest must record that this install created the COMPOSE_FILE entry")
+	}
+}
+
+// TestRollbackRemovesAnEnvEntryItCreated pins that rollback restores the
+// absence of the COMPOSE_FILE line, not a line naming the base file: any line
+// at all keeps compose's own file discovery switched off, so leaving one
+// behind would stop the operator's docker-compose.override.yml from being
+// loaded by their own commands, for good, after a rollback that claims to
+// have restored everything.
+func TestRollbackRemovesAnEnvEntryItCreated(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	discovered := filepath.Join(dir, "docker-compose.override.yml")
+	_ = os.WriteFile(discovered, []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"),
+		[]byte("A=b\nCOMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+	row := "pg"
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound",
+		EnvComposeFileCreated: true}.Save(dir)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer api.Close()
+
+	installed := "docker compose --project-directory " + dir + " -f " + composeFile +
+		" -f " + discovered + " -f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	psql := installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('pg')"
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			psql + restoreRow: []byte("INSERT 0 1\n"),
+			// After the entry is gone, discovery is back on, so the restart
+			// addresses the project as base file plus discovered override.
+			"docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " up -d": nil,
+		},
+	}
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
+		Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	if strings.Contains(string(env), "COMPOSE_FILE") {
+		t.Fatalf("rollback left a COMPOSE_FILE entry behind: %q", env)
+	}
+	if strings.TrimSpace(string(env)) != "A=b" {
+		t.Fatalf("rollback changed more than the entry it created: %q", env)
+	}
+}
+
+// TestComposeHandleSkipsAMissingExtraFile covers the state the override
+// file's own header invites: the operator removes the file but leaves its
+// COMPOSE_FILE entry. Passing a missing file to compose fails every command,
+// which would wedge `bloodtrail rollback` behind an error telling the
+// operator to rerun the command that cannot succeed.
+func TestComposeHandleSkipsAMissingExtraFile(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	present := filepath.Join(dir, "extra.yml")
+	_ = os.WriteFile(present, []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"),
+		[]byte("COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+
+	args := strings.Join(composeHandle(&dockerx.FakeRunner{}, composeFile, dir).Args("up", "-d"), " ")
+	if !strings.Contains(args, " -f "+present) {
+		t.Errorf("the file that is there was dropped: %s", args)
+	}
+	if strings.Contains(args, "docker-compose.bloodtrail.yml") {
+		t.Errorf("the file that is gone was passed on anyway: %s", args)
+	}
+}

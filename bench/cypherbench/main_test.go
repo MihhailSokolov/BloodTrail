@@ -118,8 +118,25 @@ func TestEvaluateShape(t *testing.T) {
 			th: fiveX, wantOK: true, wantReasons: 0,
 		},
 		{
-			name:  "capped: passes even if match/ratio inputs look bad -- they must be ignored",
+			// The ratio is ignored under a capped baseline, but a mismatch
+			// that was actually measured is not: the warmup compares the
+			// two sides before any capping can happen, so this shape was
+			// compared and disagreed. Forgiving it let a real correctness
+			// bug pass -enforce whenever pg happened to be slow.
+			name:  "capped: still fails a mismatch measured at warmup, ratio ignored",
 			btP50: 500 * ms, pgP50: 1 * ms, matchChecked: true, match: false, pgCapped: true,
+			th: fiveX, wantOK: false, wantReasons: 1,
+		},
+		{
+			name:  "capped: a matching warmup comparison passes, ratio ignored",
+			btP50: 500 * ms, pgP50: 1 * ms, matchChecked: true, match: true, pgCapped: true,
+			th: fiveX, wantOK: true, wantReasons: 0,
+		},
+		{
+			// A comparison that never ran is the one thing a capped
+			// baseline genuinely licenses skipping.
+			name:  "capped: an unchecked comparison is passed over",
+			btP50: 500 * ms, pgP50: 0, matchChecked: false, match: false, pgCapped: true,
 			th: fiveX, wantOK: true, wantReasons: 0,
 		},
 		{

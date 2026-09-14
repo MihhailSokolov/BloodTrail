@@ -572,24 +572,41 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 
 // Delete marks scope via relationshipDeleteScope (see its doc for exactly
 // which shapes are recognized, and why any conjunct beyond bare relationship
-// KindMatchers falls back rather than being ignored) before delegating to
-// the inner query. The recognized branch's ChangeSet
-// entry is RecordDeleteRelationshipsByKinds(kinds), not an enumerated edge
-// id list: relationshipDeleteScope's own recognized shape is a kind
-// matcher, not an InIDs target list, so "delete every relationship of
-// these kinds" is the operation this delete actually performs, and the
+// KindMatchers falls back rather than being ignored). The recognized
+// branch's ChangeSet entry is RecordDeleteRelationshipsByKinds(kinds), not
+// an enumerated edge id list: relationshipDeleteScope's own recognized shape
+// is a kind matcher, not an InIDs target list, so "delete every relationship
+// of these kinds" is the operation this delete actually performs, and the
 // one the applier should replay -- an id list captured before the delete
 // ran could go stale by the time the applier reads it back. The
 // unrecognized branch falls back, same as every other unrecognized
 // criteria in this file.
+//
+// Unlike every other observer in this file, the recognized entry is recorded
+// only AFTER the delete has actually succeeded. It is the one entry that is
+// an exact instruction to mutate the replica rather than a read-back key: a
+// kind-criteria scope issues no read-back query at all, so nothing later
+// consults PostgreSQL about it and nothing can correct it. Recorded ahead of
+// a delete that then failed (a statement timeout, a deadlock, a reset
+// connection), it would tombstone every edge of those kinds in the replica
+// while PostgreSQL still holds them, with no fallback recorded and the
+// engine still reporting itself healthy -- every memory-served query would
+// silently omit them until some unrelated rebuild. A failed delete records
+// a fallback instead, which is the honest description of what the replica
+// now knows: nothing.
 func (r *observingRelationshipQuery) Delete() error {
 	ensureBumped(r.ctx, r.eng, r.scope)
-	if kinds, touchAll := relationshipDeleteScope(r.criteria); touchAll {
+	kinds, touchAll := relationshipDeleteScope(r.criteria)
+	if touchAll {
 		r.scope.Changes().RecordFallback("RelationshipQuery.Delete: unrecognized criteria")
-	} else {
-		r.scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
+		return r.RelationshipQuery.Delete()
 	}
-	return r.RelationshipQuery.Delete()
+	if err := r.RelationshipQuery.Delete(); err != nil {
+		r.scope.Changes().RecordFallback("RelationshipQuery.Delete: delete failed")
+		return err
+	}
+	r.scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
+	return nil
 }
 
 // Update records either a recognized InIDs target list or a fallback
@@ -877,16 +894,22 @@ func (b *observingBatch) CreateNode(node *graph.Node) error {
 // only) never returns the row's generated id, so this method must instead
 // look at what the caller itself gave node:
 //
-//   - If node.ID is not graph.UnregisteredNodeID -- the sentinel
-//     graph.PrepareNode assigns every node this codebase constructs for a
-//     plain "let the database assign an id" create (see that function's
-//     own doc, and this package's own convention, verified against
-//     hydrate_integration_test.go's PrepareNode usage) -- the caller preset
-//     a real id itself. The one caller known to do this is the neo4j-to-
-//     PostgreSQL migration tool's own path, which carries over each node's
-//     original neo4j id rather than letting a fresh one be assigned; that
-//     preset id is exactly what a later read-back needs, so it is recorded
-//     via RecordNodeID.
+//   - If node.ID is a real preset id -- neither graph.UnregisteredNodeID,
+//     the sentinel graph.PrepareNode assigns every node this codebase
+//     constructs for a plain "let the database assign an id" create (see
+//     that function's own doc, and this package's own convention, verified
+//     against hydrate_integration_test.go's PrepareNode usage), nor 0,
+//     which the pg batch treats identically to that sentinel (its
+//     flushNodeCreateBuffer routes `node.ID == 0 || node.ID ==
+//     graph.UnregisteredNodeID` to the generate-an-id path) -- the caller
+//     preset a real id itself. The one caller known to do this is the
+//     neo4j-to-PostgreSQL migration tool's own path, which carries over
+//     each node's original neo4j id rather than letting a fresh one be
+//     assigned; that preset id is exactly what a later read-back needs, so
+//     it is recorded via RecordNodeID. Recording id 0 instead would key the
+//     read-back on a row that cannot exist, so the applier would find
+//     nothing, tombstone nothing, and leave the node PostgreSQL really
+//     created absent from the replica with no fallback to correct it.
 //   - Otherwise, if node's own Properties carry a string "objectid" value
 //     (objectIDFromProperties -- the same low-level read
 //     nodeUpsertObjectIDFor's declared-identity check uses, called directly
@@ -898,7 +921,7 @@ func (b *observingBatch) CreateNode(node *graph.Node) error {
 //   - Otherwise, this create gave the applier no key to re-read the new row
 //     by at all, so it records a fallback.
 func recordBatchCreateNodeIdentity(scope *engine.WriteScope, node *graph.Node) {
-	if node.ID != graph.UnregisteredNodeID {
+	if node.ID != graph.UnregisteredNodeID && node.ID != 0 {
 		scope.Changes().RecordNodeID(node.ID)
 		return
 	}

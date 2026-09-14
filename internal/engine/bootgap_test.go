@@ -247,10 +247,6 @@ func TestBootGapBufferOverflowPoisons(t *testing.T) {
 	})
 }
 
-// TestChangeSetKeyCount pins keyCount against every key-bearing Record*
-// method, and against what it deliberately excludes: fallback reasons are
-// not keys (they poison the buffer through HasFallback long before any
-// size cap matters).
 // TestMeasuredBootGapCaps pins the buffer's evidence-based size caps to
 // their documented values (the constants' own doc carries the derivation;
 // bench/applybench's sustained boot scenario is the measurement), the same
@@ -260,7 +256,7 @@ func TestBootGapBufferOverflowPoisons(t *testing.T) {
 // alongside the change -- a silent edit fails here.
 func TestMeasuredBootGapCaps(t *testing.T) {
 	if maxBootGapEntries != 4096 {
-		t.Errorf("maxBootGapEntries = %d, want 4096 (~3x the adversarial ~90 entries/s measured across a worst-case 5M boot window; re-derive with fresh evidence before moving it)", maxBootGapEntries)
+		t.Errorf("maxBootGapEntries = %d, want 4096 (~2.3x the 1765 writes the adversarial sustained writer buffered across its worst measured 5M boot window; re-derive with fresh evidence before moving it)", maxBootGapEntries)
 	}
 	if maxBootGapKeys != 1<<18 {
 		t.Errorf("maxBootGapKeys = %d, want 262144 (the actual memory bound; sized for the boot window, not an ingest backlog)", maxBootGapKeys)
@@ -299,6 +295,10 @@ func TestBootGapBufferPeekDoesNotConsume(t *testing.T) {
 	}
 }
 
+// TestChangeSetKeyCount pins keyCount against every key-bearing Record*
+// method, and against what it deliberately excludes: fallback reasons are
+// not keys (they poison the buffer through HasFallback long before any
+// size cap matters).
 func TestChangeSetKeyCount(t *testing.T) {
 	var c ChangeSet
 	if got := c.keyCount(); got != 0 {

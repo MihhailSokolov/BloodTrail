@@ -22,14 +22,19 @@ import (
 // deliberately adversarial, tiny 25-unit batches issued flat out, ~90
 // ChangeSets/s, a shape that maximizes entries per second the way no real
 // ingest's large flushes do -- filled ~1000 entries across a ~11s 5M boot
-// window (8-9s file load plus part of the settle wait), landing exactly at
-// the previous cap of 1024 (repeats measured 914 and 997 buffered writes
-// replayed; the third overflowed). 4096 covers that measured worst rate
-// across the whole worst window (~9s load + the full 5s settle ≈ 14s x
-// 90/s ≈ 1260) with ~3x headroom, for ~48KiB more slice at the cap.
-// Real ingest shapes exhaust the key cap long before the entry cap; an
-// ingest backlog beyond EITHER cap is exactly the case the overflow poison
-// exists to hand to the rebuild path honestly.
+// window, landing exactly at the previous cap of 1024 (repeats measured
+// 914 and 997 buffered writes replayed; the third overflowed). The window
+// is not the quiet-boot load time alone: it runs from the driver open
+// through the file load and adoption's settle wait (bootGapSettleTimeout,
+// boot.go), and under that write stream the worst repeat measured at this
+// cap took 19.2s and buffered 1765 writes -- essentially every write the
+// scenario issued meanwhile. 4096 is ~2.3x that measured worst case, for
+// ~48KiB more slice at the cap; a longer window (a larger graph's load, a
+// longer settle timeout) eats the headroom in proportion and is the first
+// thing to re-measure if this cap ever overflows again. Real ingest shapes
+// exhaust the key cap long before the entry cap; an ingest backlog beyond
+// EITHER cap is exactly the case the overflow poison exists to hand to the
+// rebuild path honestly.
 const (
 	maxBootGapEntries = 4096
 	maxBootGapKeys    = 1 << 18

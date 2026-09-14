@@ -1591,7 +1591,7 @@ func (pb *partBuilder) checkExpr(expr cypher.Expression, predicatePosition bool)
 		// A list's own elements are always value operands (`[a, b, c]` has
 		// no predicate position inside it), regardless of predicatePosition
 		// at the ListLiteral itself.
-		return e != nil && pb.checkExprList(*e, false)
+		return e != nil && checkListLiteralElements(*e) && pb.checkExprList(*e, false)
 
 	case *cypher.FunctionInvocation:
 		return pb.checkFunction(e)
@@ -1615,6 +1615,44 @@ func (pb *partBuilder) checkExprList(exprs []cypher.Expression, predicatePositio
 		}
 	}
 	return true
+}
+
+// checkListLiteralElements rejects the list literals dawgs cannot turn into
+// SQL at all. Its translator renders a list as a PostgreSQL array literal,
+// which has one element type, so it fails outright on a NULL element ("data
+// type has no direct array representation"), on a boolean element, and on a
+// mix of string and numeric elements ("expected array literal value type
+// text[] at index 0 but found type int8[]").
+//
+// Every one of those is a query the delegated form answers with an error and
+// no rows, while this evaluator would happily answer it -- value.go's In has
+// a mixed-list branch, so `NOT n.x IN [1, null]` returns rows here and an
+// error from stock BloodHound. Rejecting the shape keeps the two in step.
+//
+// Only elements that are literals can be judged statically; a list of
+// property lookups or arithmetic is left to the element checks that follow.
+// An empty list is fine: dawgs renders it as an empty array.
+func checkListLiteralElements(elems []cypher.Expression) bool {
+	sawString, sawNumber := false, false
+	for _, elem := range elems {
+		lit, isLiteral := elem.(*cypher.Literal)
+		if !isLiteral || lit == nil {
+			continue
+		}
+		if lit.Null {
+			return false
+		}
+		switch lit.Value.(type) {
+		case string:
+			sawString = true
+		case int64, uint64, float64:
+			sawNumber = true
+		default:
+			// bool, and anything a future dawgs literal kind adds.
+			return false
+		}
+	}
+	return !sawString || !sawNumber
 }
 
 func checkLiteralShape(lit *cypher.Literal) bool {
@@ -1738,14 +1776,30 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 	if cmp == nil || len(cmp.Partials) == 0 {
 		return false
 	}
-	// singlePartial, together with predicatePosition, gates checkInOperands'
-	// CollectMembership bypass: that bypass is only sound for a comparison
-	// consisting of exactly this one IN partial (Plan's own IR truly is
-	// `<nodeVar> IN <alias>` and nothing else), never for a chained
-	// comparison (`a op1 b op2 c`, Cypher sugar for `(a op1 b) AND (b op2
-	// c)`) that merely has the membership shape as one of several partials
-	// -- see checkInOperands' own doc comment.
-	singlePartial := len(cmp.Partials) == 1
+	// A chained comparison (`a op1 b op2 c`) never gets served, whatever it
+	// is made of. Cypher reads it as `(a op1 b) AND (b op2 c)` and that is
+	// what eval.go evaluates, but dawgs lowers the very same AST to
+	// left-associative SQL, `(a op1 b) op2 c`, so the two disagree on every
+	// chain there is:
+	//
+	//	n.x = 1 = true   Cypher: (n.x = 1) AND (1 = true) -> false
+	//	                 pg:     (n.x = 1) = true         -> true
+	//	1 < n.x < 5      pg:     (1 < n.x) < 5            -> error:
+	//	                         operator does not exist: boolean < integer
+	//
+	// Translation succeeds for both, so the engine's translate gate lets
+	// them through; serving them would answer a query stock BloodHound
+	// either answers differently or cannot run at all. Delegating is the
+	// only honest option.
+	//
+	// This also makes checkInOperands' CollectMembership bypass
+	// unconditional on shape below: that bypass is sound only for a
+	// comparison consisting of exactly one IN partial (Plan's own IR truly
+	// is `<nodeVar> IN <alias>` and nothing else), which is now the only
+	// kind of comparison that reaches it at all.
+	if len(cmp.Partials) != 1 {
+		return false
+	}
 	left := cmp.Left
 	for _, partial := range cmp.Partials {
 		if partial == nil {
@@ -1753,7 +1807,7 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 		}
 		switch partial.Operator {
 		case cypher.OperatorIn:
-			if !pb.checkInOperands(left, partial.Right, predicatePosition && singlePartial) {
+			if !pb.checkInOperands(left, partial.Right, predicatePosition) {
 				return false
 			}
 		case cypher.OperatorRegexMatch:
@@ -2417,6 +2471,10 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		return false
 	}
 	curKind := classifyAddOperand(ae.Left)
+	// Tracks whether the value accumulated on the left is statically a
+	// float, which is what decides whether PostgreSQL divides in integers
+	// -- see staticallyFloatOperand and the Divide case below.
+	leftIsFloat := staticallyFloatOperand(ae.Left)
 	for i, p := range ae.Partials {
 		if p == nil {
 			return false
@@ -2430,6 +2488,23 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 			return false
 		}
 		rKind := classifyAddOperand(p.Right)
+		rightIsFloat := staticallyFloatOperand(p.Right)
+
+		// `/` and `%` are the two operators whose result depends on whether
+		// PostgreSQL is working in integers or floats, and dawgs decides
+		// that statically: it casts a property lookup to int8 unless some
+		// operand is a float, so `n.val / 2` becomes `(...)::int8 / 2` --
+		// truncating division. This evaluator has only float64 arithmetic,
+		// so it answers 3.5 where PostgreSQL answers 3, and `WHERE n.val /
+		// 2 = 1` then drops a row PostgreSQL returns. Unless some operand
+		// is statically a float (`n.val / 2.0`, where dawgs casts to
+		// float8 and both sides agree), the shape delegates.
+		if p.Operator == cypher.OperatorDivide || p.Operator == cypher.OperatorModulo {
+			if !leftIsFloat && !rightIsFloat {
+				return false
+			}
+		}
+		leftIsFloat = leftIsFloat || rightIsFloat
 
 		if p.Operator == cypher.OperatorAdd {
 			if i == 0 && curKind == addPropertyLookup && rKind == addPropertyLookup {
@@ -2444,6 +2519,44 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		curKind = nextAddKind(p.Operator, curKind, rKind)
 	}
 	return true
+}
+
+// staticallyFloatOperand reports whether expr is, on its AST alone, a
+// floating-point value -- the thing that decides whether dawgs' translation
+// of a `/` or `%` lands on PostgreSQL's integer or floating-point operator.
+// A float literal anywhere in an operand makes the whole operand float, so
+// parentheses, signs and nested arithmetic are followed through.
+//
+// Everything whose type is not statically knowable here -- a property
+// lookup, a variable, a function result -- answers false, which is the
+// conservative direction: it makes the caller decline rather than assume
+// PostgreSQL will agree with float64 arithmetic.
+func staticallyFloatOperand(expr cypher.Expression) bool {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.Literal:
+		if e == nil || e.Null {
+			return false
+		}
+		_, isFloat := e.Value.(float64)
+		return isFloat
+	case *cypher.UnaryAddOrSubtractExpression:
+		return e != nil && staticallyFloatOperand(e.Right)
+	case *cypher.ArithmeticExpression:
+		if e == nil {
+			return false
+		}
+		if staticallyFloatOperand(e.Left) {
+			return true
+		}
+		for _, p := range e.Partials {
+			if p != nil && staticallyFloatOperand(p.Right) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // --- WITH ------------------------------------------------------------------
@@ -2655,7 +2768,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		})
 	}
 
-	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, countAliases)
+	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, countAliases, proj.Distinct)
 	if !ok {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -2904,7 +3017,7 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 // exactly the shape the probe found unsafe. Every other alias shape
 // (property lookups, arbitrary function calls, node/edge/path values)
 // rejects outright, delegating the whole query to PostgreSQL.
-func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric map[string]bool, countAliases map[string]bool) ([]OrderKey, bool) {
+func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric map[string]bool, countAliases map[string]bool, distinct bool) ([]OrderKey, bool) {
 	if order == nil {
 		return nil, true
 	}
@@ -2916,6 +3029,20 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 		v, ok := unwrapParens(item.Expression).(*cypher.Variable)
 		if !ok || v == nil {
 			return nil, false
+		}
+		// The carried-COUNT exception below orders by a value the
+		// projection does not output. PostgreSQL allows that for a plain
+		// projection, but rejects it outright under DISTINCT -- "for
+		// SELECT DISTINCT, ORDER BY expressions must appear in select
+		// list" -- so the delegated query errors while this evaluator
+		// would happily dedup the projection and then sort the survivors
+		// by each row's own carried count, an order PostgreSQL cannot even
+		// observe. Under DISTINCT every order key has to be a projected
+		// alias.
+		if distinct && countAliases[v.Symbol] {
+			if _, isProjected := projectedKinds[v.Symbol]; !isProjected {
+				return nil, false
+			}
 		}
 		if countAliases[v.Symbol] {
 			keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})

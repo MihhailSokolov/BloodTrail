@@ -15,6 +15,16 @@ case "$ARCH" in
 esac
 case "$OS" in linux|darwin) ;; *) echo "unsupported OS: $OS" >&2; exit 1 ;; esac
 
+# GNU coreutils' sha256sum is the norm on Linux; stock macOS ships shasum
+# instead, which accepts the same checksums.txt format with -a 256.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256="shasum -a 256"
+else
+  echo "neither sha256sum nor shasum is available to verify the download" >&2; exit 1
+fi
+
 if [ "$VERSION" = "latest" ]; then
   BASE="https://github.com/$REPO/releases/latest/download"
 else
@@ -27,7 +37,7 @@ trap 'rm -rf "$TMP"' EXIT
 echo "Downloading $ASSET from $BASE" >&2
 curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET"
 curl -fsSL "$BASE/checksums.txt" -o "$TMP/checksums.txt"
-(cd "$TMP" && grep -F " $ASSET" checksums.txt | sha256sum -c - >/dev/null) || { echo "checksum verification failed" >&2; exit 1; }
+(cd "$TMP" && grep -F " $ASSET" checksums.txt | $SHA256 -c - >/dev/null) || { echo "checksum verification failed" >&2; exit 1; }
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 set +e
 "$TMP/bloodtrail" "$@"

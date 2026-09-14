@@ -5,6 +5,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -487,4 +490,45 @@ func TestEnsureWatermarkTableIsNoOpWithNoPool(t *testing.T) {
 	e.ensureWatermarkTable(context.Background())
 
 	wantGens(t, e, 0, 0, 0)
+}
+
+// TestNoteWatermarkBumpFailureInvalidatesTheSnapshotFile pins that a failed
+// eager bump also takes the saved snapshot file out of play. The write it
+// guarded reaches PostgreSQL without advancing the counter, so the file's
+// stamp still matches what PostgreSQL reads: a boot after a hard stop would
+// see a zero-sized gap, call the file fully covered, and adopt a replica
+// permanently missing that write. The in-memory generation the failure opens
+// is invisible to that next process, so the file itself has to go.
+//
+// A path that cannot be resolved (no default graph yet) must not panic and
+// must still open the generation; the removal is best effort.
+func TestNoteWatermarkBumpFailureInvalidatesTheSnapshotFile(t *testing.T) {
+	dir := t.TempDir()
+	e := New(nil, nil, Config{Enabled: true, SnapshotDir: dir})
+
+	if opened := e.NoteWatermarkBumpFailure(context.Background(), NewWriteScope(), errors.New("boom")); !opened {
+		t.Fatal("a bump failure must open a watermark generation")
+	}
+	wantGens(t, e, 1, 0, 0)
+}
+
+// TestInvalidateSnapshotFileRemovesTheFile covers the removal itself against
+// a resolvable path, and that a missing file is not an error: the contract is
+// that no adoptable file is left behind, not that one was found.
+func TestInvalidateSnapshotFileRemovesTheFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph-1.btsnap")
+	if err := os.WriteFile(path, []byte("snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(nil, nil, Config{Enabled: true, SnapshotDir: dir})
+
+	e.removeSnapshotFile(context.Background(), path)
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stat after invalidation = %v, want fs.ErrNotExist", err)
+	}
+
+	// Idempotent: nothing left to remove is a success, not a failure.
+	e.removeSnapshotFile(context.Background(), path)
 }

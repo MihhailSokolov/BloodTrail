@@ -4,8 +4,10 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -408,4 +410,46 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 // this one, not a reason to weaken this one.
 func saveSnapshotPreconditionsFor(state int32, dirtyGen, resolvedGen uint64, converged bool) bool {
 	return state == stateServing && dirtyGen == resolvedGen && converged
+}
+
+// invalidateSnapshotFile removes the saved snapshot file for this graph, so
+// no later boot can adopt it. Called when something has made the file
+// unprovable rather than merely out of date -- today, a failed eager
+// watermark bump (NoteWatermarkBumpFailure, watermark.go), whose write
+// reaches PostgreSQL without advancing the counter the boot's gap check
+// compares against.
+//
+// Best effort by design, and quiet about a file that was never there: the
+// point is that no adoptable file is left behind, not that one was found. A
+// removal that genuinely fails is logged at Warn, since the next boot may
+// then adopt a file it should not -- there is nothing else this process can
+// do about it from here.
+func (e *Engine) invalidateSnapshotFile(ctx context.Context) {
+	path, ok := e.snapshotFilePath()
+	if !ok {
+		if e.cfg.SnapshotDir != "" {
+			e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not invalidated",
+				slog.String("reason", "no snapshot file path resolved yet"))
+		}
+		return
+	}
+	e.removeSnapshotFile(ctx, path)
+}
+
+// removeSnapshotFile is invalidateSnapshotFile's second half, split out so it
+// can be exercised against a path of the caller's choosing rather than only
+// the one a resolved default graph produces.
+func (e *Engine) removeSnapshotFile(ctx context.Context, path string) {
+	switch err := os.Remove(path); {
+	case err == nil:
+		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file invalidated",
+			slog.String("path", path),
+			slog.String("reason", "a write reached PostgreSQL without advancing the watermark"))
+	case errors.Is(err, os.ErrNotExist):
+		// Nothing saved yet, or already gone. Either way there is no file
+		// a later boot could adopt.
+	default:
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file invalidation failed",
+			slog.String("path", path), slog.Any("error", err))
+	}
 }

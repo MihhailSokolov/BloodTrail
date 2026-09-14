@@ -356,12 +356,12 @@ func CheckViewsEquivalent(a, b *View) error {
 	// objectid resolution, for every objectid value observed on either side.
 	objectIDs := make(map[string]struct{})
 	for _, info := range aliveA {
-		if v, ok := info.props["objectid"].(string); ok && v != "" {
+		if v, ok := info.props["objectid"].(string); ok {
 			objectIDs[v] = struct{}{}
 		}
 	}
 	for _, info := range aliveB {
-		if v, ok := info.props["objectid"].(string); ok && v != "" {
+		if v, ok := info.props["objectid"].(string); ok {
 			objectIDs[v] = struct{}{}
 		}
 	}

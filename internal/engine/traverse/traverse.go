@@ -22,6 +22,18 @@ import (
 // driver's translateDefaultMaxTraversalDepth.
 const MaxDepth = 15
 
+// MaxRepresentableDepth is the deepest traversal this package can answer at
+// all. scratch.dist holds one int8 per node, and bfsFrom writes d+1 into it,
+// so 127 is the largest hop count that survives the store; past it the value
+// wraps negative and BFS distances stop meaning anything.
+//
+// Only a bound written into the query text can reach that far -- MaxDepth is
+// 15, and interpret's planner deliberately passes a larger explicit `*1..N`
+// through unclamped because the pg driver honors it as well -- so
+// AllShortestPaths declines such a query (ErrTooLarge) rather than answering
+// it from a buffer that cannot hold the answer.
+const MaxRepresentableDepth = 127
+
 // Path is one enumerated path. Nodes always has at least two entries (zero-
 // length paths are never produced); Kinds holds the edge kind chosen for
 // each hop, so len(Kinds) == len(Nodes)-1.
@@ -396,6 +408,16 @@ func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
 	maxDepth := q.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = MaxDepth
+	}
+	// Past what an int8 distance can hold, every answer this package could
+	// give is wrong rather than merely incomplete: the wrapped distances
+	// make strategy A prune at the first hop (a 128-hop chain yielded zero
+	// paths where one exists) and make strategy B read a wrapped 0 as the
+	// seed's own distance, emitting paths that start at some unrelated node
+	// instead of the query's root. Declining hands the query to PostgreSQL,
+	// which honors the explicit bound.
+	if maxDepth > MaxRepresentableDepth {
+		return nil, ErrTooLarge
 	}
 
 	// q.Kinds nil means "every kind allowed" (the field's own doc); bfs.go's

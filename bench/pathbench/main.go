@@ -44,6 +44,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -135,6 +136,7 @@ func run(args []string) int {
 		runs       = fs.Int("runs", 20, "number of seeded-random User->Computer pairs to sample for section (a)")
 		seed       = fs.Int64("seed", 1, "seed for deterministic pair selection (same -runs/-seed reproduces the same pairs)")
 		enforce    = fs.Bool("enforce", false, "exit nonzero if pairs p95 > 180ms or the Domain Admins query > 5s (never pass this in CI)")
+		runCap     = fs.Duration("cap", defaultRunCap, "wall-clock cap on the whole run; exceeding it ABORTS the run (nonzero exit, no report) rather than waiting -- see README")
 		cpuprofile = fs.String("cpuprofile", "", "write a pprof CPU profile to this file")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -168,8 +170,32 @@ func run(args []string) int {
 		defer pprof.StopCPUProfile()
 	}
 
-	result, err := execute(context.Background(), config{dsn: *dsn, runs: *runs, seed: *seed})
+	if *runCap <= 0 {
+		fmt.Fprintln(os.Stderr, "pathbench: -cap must be positive")
+		return 2
+	}
+
+	// Everything this benchmark does hangs off this one context: the two
+	// snapshot loads, the rebuild, every pair query (engine and pg alike)
+	// and the property hydration each engine answer performs. Bounding it
+	// here bounds all of them.
+	//
+	// Without a cap, a single slow or wedged PostgreSQL round trip -- the
+	// hydration fetch behind a served path, a pool acquire against a
+	// saturated pool, an OFFSET scan under lock contention -- parks the run
+	// with no deadline, no further output and nothing to notice it by. That
+	// is exactly how a bench once sat for 17 hours, and why builderbench
+	// and cypherbench grew their own -bt-cap. An abort with a message is
+	// always better than a wait with none.
+	ctx, cancel := context.WithTimeout(context.Background(), *runCap)
+	defer cancel()
+
+	result, err := execute(ctx, config{dsn: *dsn, runs: *runs, seed: *seed})
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			fmt.Fprintf(os.Stderr, "pathbench: ABORTED: the run exceeded -cap=%s and was cut off (last error: %v)\n", *runCap, err)
+			return 1
+		}
 		fmt.Fprintf(os.Stderr, "pathbench: %v\n", err)
 		return 1
 	}
@@ -187,6 +213,12 @@ type config struct {
 	runs int
 	seed int64
 }
+
+// defaultRunCap bounds the whole run. Generous enough for a 5M-node graph's
+// two full snapshot loads plus every sampled pair (the recorded worst run is
+// minutes, not tens of minutes), and still short enough that a wedged round
+// trip is reported the same day it happens.
+const defaultRunCap = 30 * time.Minute
 
 // snapshotStats is engine.LoadSnapshot's result, timed.
 type snapshotStats struct {

@@ -475,11 +475,11 @@ type benchResult struct {
 	// (e)'s outcomes, one set per writer scenario: how many boots adopted
 	// the file (with how many buffered writes replayed onto it, and how
 	// long the open->loaded path took) versus how many were superseded by a
-	// gap-rejection, plus how many ingest units the concurrent writer
-	// landed per repeat. replay* is the burst scenario (BloodHound's
-	// ordinary startup-analysis shape); sustainedReplay* is the flat-out
-	// writer (a restart landing mid-ingest), the case the adoption path's
-	// settle-wait exists for.
+	// gap-rejection or by a buffer-cap overflow, plus how many ingest
+	// units the concurrent writer landed per repeat. replay* is the burst
+	// scenario (BloodHound's ordinary startup-analysis shape);
+	// sustainedReplay* is the flat-out writer (a restart landing
+	// mid-ingest), the case the adoption path's settle-wait exists for.
 	replayAdopted     int
 	replayGapRejected int
 	replayOverflowed  int
@@ -1751,9 +1751,9 @@ func runSnapshotBoot(ctx context.Context, cfg config, dir string, repeat int) (t
 //     frozen-target wait, internal/engine/boot.go) exists precisely to win
 //     it, and this scenario is its regression proof at scale.
 //
-// Two outcomes are legitimate per boot, and both are reported rather than
-// barred (like (c) and (d), this phase measures; only an outcome neither
-// explains fails the run):
+// Three outcomes are legitimate per boot, and all are reported rather than
+// barred (like (c) and (d), this phase measures; only an outcome none of
+// them explains fails the run):
 //
 //   - ADOPTED: "snapshot file loaded", with the marker's replayed_writes
 //     attr counting the buffered writes folded in. The expected outcome in
@@ -1772,10 +1772,12 @@ func runSnapshotBoot(ctx context.Context, cfg config, dir string, repeat int) (t
 //     outproduced the boot gap buffer's caps across the whole boot window
 //     -- the bounded-memory design handing the boot to the rebuild path
 //     honestly, exactly as documented. Counted and reported so a run at a
-//     scale beyond the caps' envelope says so instead of aborting; the
-//     caps themselves are sized from this scenario's own measurement
-//     (maxBootGapEntries' doc, internal/engine/bootgap.go), so at current
-//     caps and scale the expected count is zero.
+//     scale beyond the caps' envelope says so per boot instead of dying on
+//     the first one (a scenario that overflows EVERY boot still fails,
+//     having measured no adoption at all); the caps themselves are sized
+//     from this scenario's own measurement (maxBootGapEntries' doc,
+//     internal/engine/bootgap.go), so at current caps and scale the
+//     expected count is zero.
 //
 // Any other rejection reason, or a boot that never reaches either marker
 // inside -cap, is a real defect and aborts the run.
@@ -1824,10 +1826,15 @@ func measureBootReplay(ctx context.Context, cfg config, base *baseGraph, result 
 			case bootReplayOverflowRejected:
 				*sc.overflowed++
 				fmt.Printf("applybench: %s repeat %d: boot OVERFLOW-REJECTED the file (the writer outproduced the boot gap buffer's caps across the whole window; writer landed %d units)\n", sc.name, i+1, written)
+			default:
+				return fmt.Errorf("%s repeat %d: unknown boot outcome %d -- bootReplayOutcome grew without this switch following", sc.name, i+1, outcome)
 			}
 		}
 
 		if *sc.adopted == 0 {
+			if *sc.overflowed == cfg.repeats {
+				return fmt.Errorf("no %s-writer repeat ever adopted the snapshot file: all %d boots overflowed the boot gap buffer's caps, so this scale is beyond the caps' envelope and the phase measured no adoption at all -- re-derive the caps from this run's evidence (maxBootGapEntries' doc, internal/engine/bootgap.go) before trusting this build's restart path at this scale", sc.name, cfg.repeats)
+			}
 			return fmt.Errorf("no %s-writer repeat ever adopted the snapshot file (%d/%d gap-rejected, %d/%d overflowed): losing every time is indistinguishable from the replay (or its settle-wait) never working -- investigate before trusting this build's restart path", sc.name, *sc.rejected, cfg.repeats, *sc.overflowed, cfg.repeats)
 		}
 	}
@@ -1836,24 +1843,34 @@ func measureBootReplay(ctx context.Context, cfg config, base *baseGraph, result 
 
 // bootReplayGapReason is adoptSnapshotFileView's uncovered-gap rejection
 // reason (internal/engine/boot.go): a write outlived the settle window.
-// bootReplayOverflowPrefix matches the buffer-poisoned rejection for a cap
-// overflow ("boot write buffer poisoned: " from the adoption path,
-// "overflow: ..." from the buffer's own poison reasons) -- the bounded-
+// bootReplayPoisonPrefix is what the adoption path puts in front of every
+// buffer-poisoned rejection's own reason (boot.go's reject("boot write
+// buffer poisoned: " + poisoned)), and both of the buffer's cap-overflow
+// reasons start with "overflow: " (bootgap.go's append) -- so
+// bootReplayOverflowPrefix matches exactly a cap overflow, the bounded-
 // memory design working as documented when a writer outproduces the caps
-// across the whole boot window. These are the two rejections (e)'s own
-// writers can legitimately drive the boot into; both pieces are pinned
-// against the engine source by TestLogMessagesMatchEngineSource alongside
-// the message literals.
+// across the whole boot window. These are the two rejection shapes (e)'s
+// own writers can legitimately drive the boot into. The literals are
+// pinned against the engine source by TestLogMessagesMatchEngineSource
+// alongside the message literals, and the assembly -- that the prefix
+// matches what the engine actually logs for each overflow reason -- by
+// TestBootReplayOverflowPrefixMatchesEngineReasons.
 const (
 	bootReplayGapReason      = "boot gap not covered by buffered writes"
-	bootReplayOverflowPrefix = "boot write buffer poisoned: overflow: too many buffered"
+	bootReplayPoisonPrefix   = "boot write buffer poisoned: "
+	bootReplayOverflowPrefix = bootReplayPoisonPrefix + "overflow: "
 )
 
-// bootReplayOutcome is one (e) boot's result.
+// bootReplayOutcome is one (e) boot's result. The zero value is
+// bootReplayUndecided, deliberately not a real outcome: a return that never
+// reached the decision (an open failure, a timeout) always carries an
+// error, and this keeps it from reading as an adoption -- or anything
+// else -- should that error ever go unchecked.
 type bootReplayOutcome int
 
 const (
-	bootReplayAdopted bootReplayOutcome = iota
+	bootReplayUndecided bootReplayOutcome = iota
+	bootReplayAdopted
 	bootReplayGapRejected
 	bootReplayOverflowRejected
 )
@@ -1891,7 +1908,7 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 	t0 := time.Now()
 	db, cleanup, err := openPhaseDriver(capCtx, cfg.dsn, phaseEnv{engineOn: true, compactEntries: 1 << 30, snapshotDir: dir})
 	if err != nil {
-		return bootReplayGapRejected, 0, 0, 0, fmt.Errorf("open boot-replay driver (repeat %d): %w", repeat, err)
+		return bootReplayUndecided, 0, 0, 0, fmt.Errorf("open boot-replay driver (repeat %d): %w", repeat, err)
 	}
 	defer cleanup()
 
@@ -1933,11 +1950,18 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 			if capture.count(msgSnapshotFileLoaded) > 0 {
 				return bootReplayAdopted, nil
 			}
-			if capture.count(msgSnapshotFileRejected) > 0 {
+			if rejected := capture.count(msgSnapshotFileRejected); rejected > 0 {
 				reasons := capture.reasons(msgSnapshotFileRejected)
+				if len(reasons) < rejected {
+					// tryLoadSnapshotFile's read-error path logs the
+					// rejection with an error and no reason at all: an
+					// unreadable or corrupt file, which nothing this
+					// phase's writers do can cause.
+					return bootReplayUndecided, fmt.Errorf("repeat %d: boot rejected the file without a reason attribute (an unreadable or corrupt snapshot file?) -- not an outcome this phase's own writers can produce", repeat)
+				}
 				for _, r := range reasons {
 					if r != bootReplayGapReason && !strings.HasPrefix(r, bootReplayOverflowPrefix) {
-						return bootReplayGapRejected, fmt.Errorf("repeat %d: boot rejected the file for %q -- only %q or a %q cap overflow is a legitimate outcome of this phase's own writers", repeat, r, bootReplayGapReason, bootReplayOverflowPrefix)
+						return bootReplayUndecided, fmt.Errorf("repeat %d: boot rejected the file for %q -- only %q or a %q cap overflow is a legitimate outcome of this phase's own writers", repeat, r, bootReplayGapReason, bootReplayOverflowPrefix)
 					}
 				}
 				for _, r := range reasons {
@@ -1948,7 +1972,7 @@ func runBootWithConcurrentWrites(ctx context.Context, cfg config, base *baseGrap
 				return bootReplayGapRejected, nil
 			}
 			if capCtx.Err() != nil {
-				return bootReplayGapRejected, fmt.Errorf("repeat %d: timed out waiting for the boot's file attempt to conclude (-cap=%s)", repeat, cfg.cap)
+				return bootReplayUndecided, fmt.Errorf("repeat %d: timed out waiting for the boot's file attempt to conclude (-cap=%s)", repeat, cfg.cap)
 			}
 			if time.Since(lastProgress) >= 2*time.Second {
 				fmt.Printf("applybench: ... boot-replay repeat %d waiting for the file attempt (%s elapsed, writer at %d units)\n", repeat+1, fmtSeconds(time.Since(t0)), writerUnits.Load())
@@ -2125,8 +2149,11 @@ func (c *logCapture) replayedCounts(message string) []int64 {
 
 // reasons returns the "reason" attribute of every captured record matching
 // message that carried one, in capture order -- how (e) discriminates the
-// one legitimate rejection its own writer can race the boot into from every
-// rejection that would be a real defect.
+// rejections its own writers can legitimately drive the boot into
+// (bootReplayGapReason, bootReplayOverflowPrefix) from every rejection
+// that would be a real defect. A record with no reason attribute is left
+// out, so a caller comparing this against count sees one that carried
+// none.
 func (c *logCapture) reasons(message string) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2229,10 +2256,13 @@ func (r *benchResult) report(enforce bool) bool {
 	replayBootP50 := percentile(r.replayBootDurs, 0.50)
 	sustainedBootP50 := percentile(r.sustainedReplayBootDurs, 0.50)
 	fmt.Printf("\n=== (e) boot adoption under concurrent writes (reported only, not enforced) ===\n")
+	// Every boot appends to its written list exactly once whatever its
+	// outcome, so that length is the boot count -- no sum to keep in step
+	// with the outcome set.
 	fmt.Printf("applybench: burst:     adopted=%d gap_rejected=%d overflowed=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
-		r.replayAdopted, r.replayGapRejected, r.replayOverflowed, r.replayAdopted+r.replayGapRejected+r.replayOverflowed, r.replayCounts, r.replayWritten)
+		r.replayAdopted, r.replayGapRejected, r.replayOverflowed, len(r.replayWritten), r.replayCounts, r.replayWritten)
 	fmt.Printf("applybench: sustained: adopted=%d gap_rejected=%d overflowed=%d of %d boots; replayed_writes per adoption: %v; writer units per boot: %v\n",
-		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, r.sustainedReplayOverflowed, r.sustainedReplayAdopted+r.sustainedReplayGapRejected+r.sustainedReplayOverflowed, r.sustainedReplayCounts, r.sustainedReplayWritten)
+		r.sustainedReplayAdopted, r.sustainedReplayGapRejected, r.sustainedReplayOverflowed, len(r.sustainedReplayWritten), r.sustainedReplayCounts, r.sustainedReplayWritten)
 	fmt.Printf("applybench: boot under burst writes,     open -> file loaded  p50=%s: %s\n", fmtMillis(replayBootP50), fmtDurationsMs(r.replayBootDurs))
 	fmt.Printf("applybench: boot under sustained writes, open -> file loaded  p50=%s: %s\n", fmtMillis(sustainedBootP50), fmtDurationsMs(r.sustainedReplayBootDurs))
 	fmt.Printf("APPLYBENCH_BOOT_REPLAY adopted=%d gap_rejected=%d overflowed=%d boot_p50_ms=%.3f max_replayed=%d\n",

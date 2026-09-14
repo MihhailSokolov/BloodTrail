@@ -178,6 +178,32 @@ func (m *workMeter) spend(units int64) error {
 	return m.check()
 }
 
+// spendProduct charges the whole size of a row product up front, so a join
+// too large to build is refused before anything is allocated for it. The
+// multiplication is done in float64 first: left*right as int64 can itself
+// overflow at these sizes (a 3-billion-row product squared does not fit),
+// and an overflowed product could wrap to something small enough to look
+// affordable.
+//
+// A product beyond either budget is ErrBudget, exactly as reaching the same
+// total one row at a time would be, so the caller delegates to PostgreSQL
+// instead of trying to hold the result.
+func (m *workMeter) spendProduct(left, right int) error {
+	if left == 0 || right == 0 {
+		return nil
+	}
+	product := float64(left) * float64(right)
+	if m.budget.MaxWork > 0 && product > float64(m.budget.MaxWork) {
+		return ErrBudget
+	}
+	if m.budget.MaxRows > 0 && product > float64(m.budget.MaxRows) {
+		return ErrBudget
+	}
+	// Within budget, so the exact total is representable and is charged
+	// through the ordinary counter.
+	return m.spend(int64(left) * int64(right))
+}
+
 // check compares the accumulated work total against budget.MaxWork
 // unconditionally, regardless of the 1024-unit batching spend applies.
 // Execute calls this once, unconditionally, right before returning a
@@ -343,8 +369,21 @@ func groupComponents(part *Part) []component {
 // from two different components (see groupComponents), which by
 // construction never bind the same symbol, so this is a plain merge with no
 // equality check to perform.
+//
+// The product is charged to the meter BEFORE any of it is built, and the
+// output slice is grown by append rather than reserved up front. Both
+// matter: a reserved len(left)*len(right) is one allocation that no budget
+// has approved yet, and on a multi-component pattern over a real graph it
+// is enormous -- two disjoint `(a:User), (b:User)` components over 300k
+// users reserve 300k x 300k x 8 bytes, 720 GB. That is under the size at
+// which Go panics on a slice length, so it arrives as `fatal error:
+// runtime: out of memory`, which no recover() can catch: the API process
+// dies where declining would have handed the query to PostgreSQL.
 func cartesianJoin(meter *workMeter, left, right []*Row) ([]*Row, error) {
-	out := make([]*Row, 0, len(left)*len(right))
+	if err := meter.spendProduct(len(left), len(right)); err != nil {
+		return nil, err
+	}
+	var out []*Row
 	for _, l := range left {
 		for _, r := range right {
 			nr := cloneRow(l)
@@ -1382,6 +1421,21 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 				continue
 			}
 			if !nodeSatisfiesConstraint(env, unboundNC, c.other) {
+				continue
+			}
+			// Cypher's relationship-uniqueness rule, the same one
+			// verifyClosingStep applies: no two Steps of one pattern may
+			// resolve to the identical relationship. This step marks its
+			// edge used just below, but used to consume one already taken
+			// by an earlier step of the same pattern without objecting --
+			// so a two-step chain over a single edge matched it twice.
+			// dawgs emits `e1.id != e0.id` for every step past the first,
+			// so `MATCH (a)-[:E]->(b)<-[:E]-(c)` over one edge returns no
+			// rows from PostgreSQL and returned one here, and the
+			// co-membership shape
+			// `(u1:User)-[:MemberOf]->(g)<-[:MemberOf]-(u2:User)` paired
+			// every user with themselves through a single membership edge.
+			if r.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			nr := cloneRow(r)

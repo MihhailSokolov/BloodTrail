@@ -186,6 +186,23 @@ func (e *Engine) NoteWatermarkBumpFailure(ctx context.Context, scope *WriteScope
 
 	if scope == nil || scope.markWatermarkBumpFailed() {
 		e.dirtyGen.Add(1)
+		// The write this bump was guarding is about to reach PostgreSQL
+		// uncounted, which makes any saved snapshot file a trap. Its
+		// watermark stamp equals what PostgreSQL's counter still reads, so
+		// a boot after a hard stop -- before the recovery rebuild that
+		// would have healed this ever ran -- finds a zero-sized gap,
+		// declares the file fully covered, and adopts it as trusted,
+		// permanently missing this write's committed rows. The in-memory
+		// generation advanced just above says nothing to that next
+		// process, and nothing in the file's header does either.
+		//
+		// Removing the file is the one durable statement available without
+		// a format change, and it is purely local: it still works when the
+		// database is exactly what has become unreachable. The cost is one
+		// slow boot (a full PostgreSQL rebuild), which is the correct
+		// trade against serving a graph that silently lacks a committed
+		// write.
+		e.invalidateSnapshotFile(ctx)
 		return true
 	}
 	return false

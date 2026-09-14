@@ -414,6 +414,34 @@ func (b *Builder) internProp(name string) (PropID, error) {
 	return id, nil
 }
 
+// maxPropArena is the largest property arena a snapshot can address.
+// propEntry.ref is a uint32, and so is the wire format's field for it, so an
+// arena grown past 4 GiB would give every value staged after the boundary a
+// wrapped offset pointing at unrelated bytes near the arena's start -- and
+// then serve those bytes as the property's value, with no error anywhere.
+//
+// Refusing to grow past it turns an unaddressable arena into a build
+// failure, which the engine answers the way it answers any failed build: by
+// leaving the query to PostgreSQL rather than serving something wrong. The
+// bound is reachable in principle on a very large graph, since nothing else
+// caps the arena (MemoryLimit is checked only after a build, and defaults to
+// unlimited).
+const maxPropArena = uint64(math.MaxUint32)
+
+// appendPropBytes appends one value's payload to a property arena and
+// returns the (ref, len) pair that addresses it, refusing to append at all
+// once the result would not fit a uint32 ref. Every arena-backed property
+// kind goes through here -- Builder's own staging, Fold's re-staging, and
+// SegmentBuilder's -- so the bound is enforced in one place.
+func appendPropBytes(arena *[]byte, payload []byte) (ref, length uint32, err error) {
+	start := uint64(len(*arena))
+	if start+uint64(len(payload)) > maxPropArena {
+		return 0, 0, fmt.Errorf("snapshot: property arena would exceed %d bytes (propEntry.ref, a uint32, would wrap)", maxPropArena)
+	}
+	*arena = append(*arena, payload...)
+	return uint32(start), uint32(len(payload)), nil
+}
+
 // commitNodeProps interns each parsed property's name, appends its payload
 // (if any) to the Builder's shared arena, sorts the node's entries by
 // PropID, and appends them to the Builder's flat entries/offsets arrays.
@@ -435,9 +463,11 @@ func (b *Builder) commitNodeProps(parsed []parsedProp) error {
 		e := propEntry{prop: propID, kind: pp.kind, num: pp.num}
 		switch pp.kind {
 		case propKindString, propKindArray, propKindObject:
-			e.ref = uint32(len(b.propArena))
-			b.propArena = append(b.propArena, pp.bytes...)
-			e.len = uint32(len(pp.bytes))
+			ref, length, appendErr := appendPropBytes(&b.propArena, pp.bytes)
+			if appendErr != nil {
+				return appendErr
+			}
+			e.ref, e.len = ref, length
 		}
 		entries[i] = e
 	}

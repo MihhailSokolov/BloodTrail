@@ -2,7 +2,10 @@
 
 package compose
 
-import "strings"
+import (
+	"path"
+	"strings"
+)
 
 const composeFileKey = "COMPOSE_FILE="
 
@@ -28,8 +31,17 @@ func ComposeFiles(env string) []string {
 }
 
 // AddComposeFile ensures the .env contents make docker compose load the
-// override after the base file, so a plain `docker compose up -d` keeps it.
-func AddComposeFile(env, baseFile, overrideFile string) string {
+// override after the files the project is already made of, so a plain
+// `docker compose up -d` keeps it.
+//
+// baseFiles is that existing project, in merge order, and is used only when
+// there is no COMPOSE_FILE entry yet: writing one turns off compose's own
+// file discovery for every later command, so the line has to name everything
+// discovery would have found -- the base file AND the conventional override
+// beside it (AutoOverrideCandidates). Naming only the base file would
+// silently drop the operator's docker-compose.override.yml from their own
+// commands, permanently and invisibly.
+func AddComposeFile(env string, baseFiles []string, overrideFile string) string {
 	lines, lineEnding := splitLines(env)
 	for i, line := range lines {
 		if strings.HasPrefix(line, composeFileKey) {
@@ -43,12 +55,15 @@ func AddComposeFile(env, baseFile, overrideFile string) string {
 			return joinLines(lines, lineEnding)
 		}
 	}
-	lines = append(lines, composeFileKey+baseFile+":"+overrideFile)
+	lines = append(lines, composeFileKey+strings.Join(append(append([]string(nil), baseFiles...), overrideFile), ":"))
 	return joinLines(lines, lineEnding)
 }
 
 // RemoveComposeFile drops the override from COMPOSE_FILE, removing the whole
-// line only if the override was the sole entry.
+// line only if the override was the sole entry. Use RemoveComposeFileLine
+// instead when the install created the entry itself: what has to be restored
+// then is the absence of the line, not a line naming the base file (see
+// AddComposeFile for why a present line is not equivalent to no line).
 func RemoveComposeFile(env, overrideFile string) string {
 	lines, lineEnding := splitLines(env)
 	out := lines[:0]
@@ -96,4 +111,45 @@ func joinLines(lines []string, lineEnding string) string {
 
 func stripCR(s string) string {
 	return strings.TrimRight(s, "\r")
+}
+
+// RemoveComposeFileLine drops the COMPOSE_FILE entry entirely, whatever it
+// lists. This is what restores a project that had no COMPOSE_FILE before the
+// install wrote one: leaving a line behind would keep compose's own file
+// discovery switched off for good, so the conventional override beside the
+// base file would stop being loaded by the operator's own commands.
+func RemoveComposeFileLine(env string) string {
+	lines, lineEnding := splitLines(env)
+	out := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, composeFileKey) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return joinLines(out, lineEnding)
+}
+
+// AutoOverrideCandidates names the override files docker compose would load
+// on its own beside baseFile, most preferred first. Compose pairs a base file
+// with an "<name>.override.<ext>" sibling and loads it after the base without
+// being told to; naming any file with -f (or through COMPOSE_FILE) switches
+// that discovery off, so both composeHandle and AddComposeFile have to put
+// the sibling back explicitly or the installer and the operator end up
+// running two different projects.
+//
+// The same-extension spelling comes first, then the other one, matching
+// compose's own preference. Callers resolve these against the base file's
+// directory and keep the ones that exist.
+func AutoOverrideCandidates(baseFile string) []string {
+	ext := path.Ext(baseFile)
+	if ext != ".yml" && ext != ".yaml" {
+		return nil
+	}
+	stem := strings.TrimSuffix(baseFile, ext)
+	other := ".yaml"
+	if ext == ".yaml" {
+		other = ".yml"
+	}
+	return []string{stem + ".override" + ext, stem + ".override" + other}
 }
