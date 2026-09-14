@@ -398,7 +398,7 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 		return nil, false
 	}
 
-	kindNames, err := resolveMatchingKindNames(snap, matches, e.mapKindNames)
+	kindNames, err := resolveMatchingKindNames(ctx, snap, matches, e.mapKindNames)
 	if err != nil {
 		e.declineOp(ctx, opNodeKinds, reasonError, err)
 		return nil, false
@@ -432,7 +432,7 @@ func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec)
 // one regardless of how many nodes match, and is what lets
 // TryNodeFetchKinds decline reasonError before starting to emit instead of
 // discovering a resolution failure mid-stream.
-func resolveMatchingKindNames(snap *snapshot.View, matches *snapshot.Bitset, resolve func([]snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
+func resolveMatchingKindNames(ctx context.Context, snap *snapshot.View, matches *snapshot.Bitset, resolve func(context.Context, []snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
 	seen := make(map[snapshot.KindID]struct{})
 	var ids []snapshot.KindID
 
@@ -446,7 +446,7 @@ func resolveMatchingKindNames(snap *snapshot.View, matches *snapshot.Bitset, res
 		return true
 	})
 
-	return resolveKindNameMap(ids, resolve)
+	return resolveKindNameMap(ctx, ids, resolve)
 }
 
 // resolveKindNameMap is resolveMatchingKindNames'/TryRelFetchKinds'/
@@ -461,12 +461,12 @@ func resolveMatchingKindNames(snap *snapshot.View, matches *snapshot.Bitset, res
 // A nil or empty ids returns an empty, non-nil map without calling resolve
 // at all -- there is nothing to look up, and a production KindMapper is
 // under no obligation to handle an empty batch gracefully.
-func resolveKindNameMap(ids []snapshot.KindID, resolve func([]snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
+func resolveKindNameMap(ctx context.Context, ids []snapshot.KindID, resolve func(context.Context, []snapshot.KindID) (graph.Kinds, error)) (map[snapshot.KindID]graph.Kind, error) {
 	if len(ids) == 0 {
 		return map[snapshot.KindID]graph.Kind{}, nil
 	}
 
-	kinds, err := resolve(ids)
+	kinds, err := resolve(ctx, ids)
 	if err != nil {
 		return nil, fmt.Errorf("engine: resolveKindNameMap: %w", err)
 	}
@@ -1097,7 +1097,7 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 		return nil, false
 	}
 
-	kindNames, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID(), plan.kindMask.Has), e.mapKindNames)
+	kindNames, err := resolveKindNameMap(ctx, selectKindIDs(plan.snap.MaxKindID(), plan.kindMask.Has), e.mapKindNames)
 	if err != nil {
 		e.declineOp(ctx, opRelKinds, reasonError, err)
 		return nil, false
@@ -1206,7 +1206,7 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 
 	var kindNames map[snapshot.KindID]graph.Kind
 	if proj != recognize.ProjectionStartEnd {
-		resolved, err := resolveKindNameMap(selectKindIDs(plan.snap.MaxKindID(), func(snapshot.KindID) bool { return true }), e.mapKindNames)
+		resolved, err := resolveKindNameMap(ctx, selectKindIDs(plan.snap.MaxKindID(), func(snapshot.KindID) bool { return true }), e.mapKindNames)
 		if err != nil {
 			e.declineOp(ctx, opRelRows, reasonError, err)
 			return nil, false
