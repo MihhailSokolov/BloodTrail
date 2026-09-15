@@ -1,0 +1,72 @@
+[
+  {
+    "name": "ADV: var-length with a selective property predicate on the near side",
+    "query": "MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE a.objectid ENDS WITH '-10007' AND t.objectid ENDS WITH '-512' RETURN p LIMIT 1000",
+    "why": "A property predicate on the near side still counts as narrowing, so this keeps the FORWARD route by design. If the far side is tiny and the near side huge, forward is the wrong choice and this is the shape that still pays for it."
+  },
+  {
+    "name": "ADV: unbounded var-length from an unconstrained source",
+    "query": "MATCH p = (a:User)-[:MemberOf*1..]->(g:Group) RETURN p LIMIT 1000",
+    "why": "Neither endpoint narrows, so no reverse route applies and every user expands. Tests whether LIMIT early termination actually saves the engine here."
+  },
+  {
+    "name": "ADV: full node scan with no kind constraint",
+    "query": "MATCH (n) WHERE n.objectid ENDS WITH '-512' RETURN n LIMIT 1000",
+    "why": "No kind bitmap to start from; the engine must walk every node while PostgreSQL has a GIN index on properties."
+  },
+  {
+    "name": "ADV: property scan over the largest kind",
+    "query": "MATCH (u:User) WHERE u.enabled = true RETURN u LIMIT 1000",
+    "why": "A low-selectivity property filter over 500k nodes -- pg answers from an index and stops at LIMIT; the engine evaluates the predicate per node."
+  },
+  {
+    "name": "ADV: count over the largest kind",
+    "query": "MATCH (u:User) RETURN count(u)",
+    "why": "Aggregation with no LIMIT to stop early. The engine counts its bitmap; pg counts an index."
+  },
+  {
+    "name": "ADV: large result set, 5000 rows",
+    "query": "MATCH (u:User) RETURN u LIMIT 5000",
+    "why": "The engine materializes every row eagerly before returning; pg streams. Large result sets are where eager materialization should hurt."
+  },
+  {
+    "name": "ADV: ORDER BY over a large scan",
+    "query": "MATCH (u:User) RETURN u.objectid ORDER BY u.objectid LIMIT 1000",
+    "why": "An in-memory sort over the whole matching set versus pg's indexed ordering."
+  },
+  {
+    "name": "ADV: DISTINCT over a large scan",
+    "query": "MATCH (u:User) RETURN DISTINCT u.enabled LIMIT 1000",
+    "why": "Dedup over 500k rows in memory."
+  },
+  {
+    "name": "ADV: two-hop fixed pattern with a wide middle",
+    "query": "MATCH p = (a:User)-[:MemberOf]->(g:Group)<-[:MemberOf]-(b:User) WHERE g.objectid ENDS WITH '-513' RETURN p LIMIT 1000",
+    "why": "The Domain Users hub has 500k members, so the middle of this pattern fans out enormously before the LIMIT can cut it."
+  },
+  {
+    "name": "ADV: path query returning many edges (hydration cost)",
+    "query": "MATCH p = (a:User)-[:MemberOf]->(g:Group) RETURN p LIMIT 2000",
+    "why": "Edge properties live only in PostgreSQL, so every served path pays a hydration round trip the pg driver never makes."
+  },
+  {
+    "name": "ADV: shortestPath between two unconstrained kinds",
+    "query": "MATCH p = shortestPath((a:User)-[*1..]->(c:Computer)) RETURN p LIMIT 25",
+    "why": "Both endpoint sets are enormous; traverse's pair/side budgets should decline, and a decline that happens AFTER work is wasted effort pg never spent."
+  },
+  {
+    "name": "ADV: negated property filter over the largest kind",
+    "query": "MATCH (u:User) WHERE NOT u.enabled = false RETURN u LIMIT 1000",
+    "why": "A negation the planner may not push, forcing a full evaluation per node."
+  },
+  {
+    "name": "ADV: regex over the largest kind",
+    "query": "MATCH (u:User) WHERE u.name =~ '(?i).*SMITH.*' RETURN u LIMIT 1000",
+    "why": "Regex per node in the engine versus pg's own regex over an indexed column."
+  },
+  {
+    "name": "ADV: collect anti-join over a large set",
+    "query": "MATCH (g:Group) WHERE g.objectid ENDS WITH '-512' WITH COLLECT(g) AS das MATCH (u:User) WHERE NOT u IN das RETURN u LIMIT 1000",
+    "why": "The anti-join shape whose per-anchor-row binding clones were previously measured as the dominant serve cost."
+  }
+]

@@ -56,6 +56,13 @@ type Segment struct {
 	// derived field -- see segmentSelfLoopKinds and View.SelfLoopHazard.
 	selfLoopKinds map[KindID]struct{}
 
+	// edgeKinds holds every edge kind this segment writes at least one live
+	// (non-tombstoned) edge for; nil when it writes none. The Segment half of
+	// the base snapshot's edgeKindSeen -- a map here rather than a dense
+	// slice because a segment carries one commit's worth of writes, not a
+	// whole graph's. See segmentEdgeKinds and View.EdgeKindPresent.
+	edgeKinds map[KindID]struct{}
+
 	// approxBytes memoizes ApproxBytes' result, computed once by
 	// computeSegmentApproxBytes at construction time (SegmentBuilder.Build
 	// or MergeSegments) rather than walked afresh on every call. A Segment
@@ -560,6 +567,7 @@ func (b *SegmentBuilder) Build() *Segment {
 	s.edgeStates = edgeStates
 	s.objectIndex = buildSegmentObjectIndex(nodeIDs, nodeStates)
 	s.selfLoopKinds = segmentSelfLoopKinds(edgeStates)
+	s.edgeKinds = segmentEdgeKinds(edgeStates)
 	s.approxBytes = computeSegmentApproxBytes(s)
 
 	return s
@@ -574,6 +582,25 @@ func segmentSelfLoopKinds(edgeStates map[uint64]EdgeSegState) map[KindID]struct{
 	var out map[KindID]struct{}
 	for _, st := range edgeStates {
 		if st.Tombstoned || st.StartID != st.EndID {
+			continue
+		}
+		if out == nil {
+			out = make(map[KindID]struct{})
+		}
+		out[st.Kind] = struct{}{}
+	}
+	return out
+}
+
+// segmentEdgeKinds returns every edge kind edgeStates writes a live edge
+// for, or nil if it writes none. A tombstoned edge contributes nothing: if
+// its kind still exists in the base snapshot, the base's own edgeKindSeen
+// keeps the kind present for View.EdgeKindPresent, and if it does not, the
+// tombstone cannot be the thing that makes it appear.
+func segmentEdgeKinds(edgeStates map[uint64]EdgeSegState) map[KindID]struct{} {
+	var out map[KindID]struct{}
+	for _, st := range edgeStates {
+		if st.Tombstoned {
 			continue
 		}
 		if out == nil {
@@ -666,6 +693,7 @@ func MergeSegments(segs []*Segment) *Segment {
 		addedKinds:    addedKinds,
 		objectIndex:   buildSegmentObjectIndex(nodeIDs, nodeStates),
 		selfLoopKinds: segmentSelfLoopKinds(edgeStates),
+		edgeKinds:     segmentEdgeKinds(edgeStates),
 	}
 	merged.approxBytes = computeSegmentApproxBytes(merged)
 	return merged

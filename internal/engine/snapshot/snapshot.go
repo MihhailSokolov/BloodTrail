@@ -68,6 +68,15 @@ type Snapshot struct {
 	// doc -- and read through View.SelfLoopHazard.
 	selfLoopKinds map[KindID]struct{}
 
+	// edgeKindSeen[k] reports whether kind k labels at least one edge in this
+	// snapshot's forward CSR; a kind at or past its length labels none.
+	// Derived by finalizeDerived on every construction path, like
+	// selfLoopKinds above, but held as a dense slice rather than a map
+	// because EVERY edge contributes to it -- a map would cost one write per
+	// edge on a multi-million-edge build, where self-loops are rare enough
+	// that theirs stays tiny. Read through View.EdgeKindPresent.
+	edgeKindSeen []bool
+
 	// edgeIDPerm holds forward-CSR indices 0..EdgeCount()-1 permuted into
 	// ascending OutEdgeIDs order, letting EdgeByID binary-search by database
 	// edge id without a separate id->index map.
@@ -95,6 +104,14 @@ func (s *Snapshot) Dense(databaseID uint64) (NodeID, bool) {
 func (s *Snapshot) Out(n NodeID) ([]NodeID, []KindID) {
 	lo, hi := s.OutOffsets[n], s.OutOffsets[n+1]
 	return s.OutTargets[lo:hi], s.OutKinds[lo:hi]
+}
+
+// hasEdgeKind reports whether k labels at least one edge in s. False is a
+// proof of absence for this snapshot alone; callers that must account for
+// later writes go through View.EdgeKindPresent, which also consults the
+// segment stack.
+func (s *Snapshot) hasEdgeKind(k KindID) bool {
+	return k >= 0 && int(k) < len(s.edgeKindSeen) && s.edgeKindSeen[k]
 }
 
 // In returns slice views over n's incoming edges: aligned source and kind

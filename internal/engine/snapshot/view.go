@@ -161,6 +161,44 @@ func (v *View) SelfLoopHazard(kinds []KindID) bool {
 	return false
 }
 
+// EdgeKindPresent reports whether this View may contain at least one edge
+// whose kind is admitted by kinds -- an empty kinds list, the "any
+// relationship type" pattern, admits every kind and so is always true (any
+// edge at all satisfies it).
+//
+// Like SelfLoopHazard it is an over-approximation, and in the same direction:
+// a true return means "an edge of an admitted kind may exist", while a FALSE
+// return is a proof that none does. A delta tombstone never clears a base
+// kind's bit (only a compaction, which re-derives from what survives, does),
+// so emptying a kind out leaves this reporting true until the next
+// compaction -- the safe way round, since a true return only ever costs the
+// caller the ordinary full walk it would have done anyway.
+//
+// The interpreter uses a false return to answer a pattern that requires at
+// least one edge of such a kind with no rows and no walking at all. Without
+// it, BloodHound's shipped prebuilts for features a deployment does not use
+// (the ADCS, Entra and NTLM-relay queries on AD-only data) each scan the
+// whole graph to discover an emptiness the kind table already knew about:
+// measured at 224ms per query against PostgreSQL's ~18ms index probe on a
+// 1M-node graph, where an absent NODE kind already cost only 7ms because a
+// kind bitmap answers that question directly.
+func (v *View) EdgeKindPresent(kinds []KindID) bool {
+	if len(kinds) == 0 {
+		return true
+	}
+	for _, k := range kinds {
+		if v.base.hasEdgeKind(k) {
+			return true
+		}
+		for _, seg := range v.segments {
+			if _, ok := seg.edgeKinds[k]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // setAdmitsSelfLoop reports whether set (a self-loop kind set, possibly nil)
 // contains any kind admitted by kinds (empty = every kind).
 func setAdmitsSelfLoop(set map[KindID]struct{}, kinds []KindID) bool {

@@ -973,3 +973,172 @@ func TestLimitedQueryStillReverseSeeds(t *testing.T) {
 		t.Fatalf("adding a LIMIT cost %d work units against the unlimited form's %d -- the chunked driver is still refusing the constrained-side route", limWork, unlWork)
 	}
 }
+
+// --- graph-covering kind on the near side -----------------------------------
+
+// buildBaseLabelledFixture mirrors how BloodHound actually labels an AD
+// graph: every node carries the universal `Base` kind IN ADDITION to its
+// specific one, and the shipped prebuilts write their near endpoint as
+// `(:Base)` rather than leaving it bare. Group is a small minority of nodes,
+// User and Computer are large minorities, and Base covers everything -- so
+// one fixture exercises all three sides of scanEquivalentNearSide's rule.
+func buildBaseLabelledFixture(t *testing.T, users, computers int) *snapshot.View {
+	t.Helper()
+	const (
+		blBase     snapshot.KindID = 1
+		blUser     snapshot.KindID = 2
+		blComputer snapshot.KindID = 3
+		blGroup    snapshot.KindID = 4
+		blMemberOf snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{
+		blBase: "Base", blUser: "User", blComputer: "Computer",
+		blGroup: "Group", blMemberOf: "MemberOf",
+	}
+
+	group := func(id uint64, rid string) execNodeSpec {
+		return execNodeSpec{id, []snapshot.KindID{blBase, blGroup}, map[string]any{
+			"objectid": "S-1-5-21-1-1-1-" + rid,
+		}}
+	}
+	nodes := []execNodeSpec{
+		group(1, "512"),  // Domain Admins
+		group(2, "1001"), // Server Admins
+		group(3, "1002"), // IT Admins
+		group(4, "1003"), // Helpdesk
+		group(5, "513"),  // Domain Users hub
+	}
+	edges := []execEdgeSpec{
+		{100, 2, 1, blMemberOf},
+		{101, 3, 2, blMemberOf},
+		{102, 4, 3, blMemberOf},
+	}
+
+	edgeID := uint64(1000)
+	nodeID := uint64(1000)
+	add := func(n int, kind snapshot.KindID) {
+		for i := 0; i < n; i++ {
+			id := nodeID
+			nodeID++
+			nodes = append(nodes, execNodeSpec{id, []snapshot.KindID{blBase, kind}, map[string]any{
+				"objectid": fmt.Sprintf("S-1-5-21-1-1-1-%d", id),
+			}})
+			edges = append(edges, execEdgeSpec{edgeID, id, 5, blMemberOf}) // -> Domain Users
+			edgeID++
+		}
+	}
+	add(users, blUser)
+	add(computers, blComputer)
+
+	// Exactly one principal actually reaches Domain Admins, through the
+	// nested chain -- so the answer is a handful of rows however it is found.
+	edges = append(edges, execEdgeSpec{edgeID, 1000, 4, blMemberOf})
+
+	return buildExecSnapshot(t, kinds, nodes, edges)
+}
+
+// TestVarLengthReverseEligibleWithGraphCoveringKindNearSide pins
+// scanEquivalentNearSide: a kind label that covers essentially the whole
+// graph narrows nothing, so it must not disqualify the constrained-side
+// route, while a kind that genuinely is a minority of nodes still must.
+//
+// This is the pattern-label half of the same bug
+// TestVarLengthReverseEligibleIgnoresKindOnlyPredicates fixed for WHERE-written
+// kind tests. `(:Base)` never reached endpointNarrows at all -- it reached the
+// cost test through rankOf, which ranks any kind as tierKind and so outranked
+// a full scan of the same node count.
+func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
+	snap := buildBaseLabelledFixture(t, 100, 100)
+	env := &Env{Snap: snap}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{
+			name:  "a graph-covering kind on the near side is scan-equivalent",
+			query: `MATCH p = (:Base)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
+			want:  true,
+		},
+		{
+			name:  "a bare near side stays eligible, as before",
+			query: `MATCH p = (a)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
+			want:  true,
+		},
+		{
+			// 100 of 205 nodes: a real narrowing, and the hazard the rule
+			// exists for (an unlucky seed's in-degree) is live again.
+			name:  "a large-minority kind on the near side still blocks it",
+			query: `MATCH p = (:User)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
+			want:  false,
+		},
+		{
+			name:  "a small kind on the near side still blocks it",
+			query: `MATCH p = (:Group)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
+			want:  false,
+		},
+		{
+			// The far side must still genuinely narrow: a kinds-only far side
+			// buys nothing, whatever the near side is.
+			name:  "a kinds-only far side is still ineligible",
+			query: `MATCH p = (:Base)-[:MemberOf*1..]->(g:Group) RETURN p`,
+			want:  false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			part, step := varLengthPartAndStep(t, snap, tc.query)
+			if got := varLengthReverseEligible(env, part, step); got != tc.want {
+				t.Fatalf("varLengthReverseEligible = %v, want %v\nquery: %s", got, tc.want, tc.query)
+			}
+		})
+	}
+}
+
+// TestBaseLabelledPrebuiltDoesNotScan is the end-to-end half: the shipped
+// prebuilt spelling (`(:Base)` near side, a suffix predicate on the far side,
+// a LIMIT) must now cost what the bare-source spelling costs and return
+// exactly the same rows -- not a full scan of the graph.
+//
+// Measured against the bare spelling rather than an absolute bar, because the
+// two queries differ ONLY in how the near endpoint is written and are
+// therefore required to be the same query: on the 500k benchmark graph this
+// difference was 2551ms versus 50ms for an identical 108-node answer.
+func TestBaseLabelledPrebuiltDoesNotScan(t *testing.T) {
+	snap := buildBaseLabelledFixture(t, 2000, 2000)
+	nodeCount := snap.NodeCount()
+
+	const (
+		baseLabelled = `MATCH p = (:Base)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p LIMIT 1000`
+		bareSource   = `MATCH p = (a)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p LIMIT 1000`
+	)
+
+	run := func(query string) (int64, int) {
+		t.Helper()
+		plan := planQuery(t, snap, query)
+		meter := &workMeter{budget: Budgets{MaxRows: 100000, MaxWork: 1 << 34}}
+		rs, err := runQuery(&Env{Snap: snap}, plan, meter)
+		if err != nil {
+			t.Fatalf("runQuery(%q): %v", query, err)
+		}
+		return meter.work, len(rs.Rows)
+	}
+
+	baseWork, baseRows := run(baseLabelled)
+	bareWork, bareRows := run(bareSource)
+	t.Logf("nodes=%d  (:Base): work=%d rows=%d   (a): work=%d rows=%d",
+		nodeCount, baseWork, baseRows, bareWork, bareRows)
+
+	if baseRows != bareRows {
+		t.Fatalf("the two spellings answered differently: (:Base) gave %d rows, (a) gave %d", baseRows, bareRows)
+	}
+	if baseRows == 0 {
+		t.Fatal("fixture invariant broken: one principal reaches Domain Admins, so the answer must be non-empty")
+	}
+	if baseWork > bareWork*2+100 {
+		t.Fatalf("(:Base) spent %d work against the bare spelling's %d -- the graph-covering kind is still refusing the constrained-side route", baseWork, bareWork)
+	}
+	if int(baseWork) >= nodeCount {
+		t.Fatalf("(:Base) spent %d work on a %d-node graph -- that is still a full scan", baseWork, nodeCount)
+	}
+}

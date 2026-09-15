@@ -1,0 +1,82 @@
+[
+  {
+    "name": "ADV2: objectid ENDS WITH suffix anchor on a Group",
+    "query": "match (s:Group) where s.objectid ends with '-513' return s limit 10"
+  },
+  {
+    "name": "ADV2: ENDS WITH anchor expanded one hop to a wide target",
+    "query": "match p = (s:Group)-[:AdminTo]->(c:Computer) where s.objectid ends with '-513' return p limit 1000"
+  },
+  {
+    "name": "ADV2: name STARTS WITH prefix anchor over the largest kind",
+    "query": "match (u:User) where u.name starts with 'SVC' return u limit 1000"
+  },
+  {
+    "name": "ADV2: name CONTAINS substring over the largest kind",
+    "query": "match (u:User) where u.name contains 'ADMIN' return u limit 1000"
+  },
+  {
+    "name": "ADV2: IN list membership over the largest kind",
+    "query": "match (u:User) where u.domain in ['CORP.LOCAL','EU.CORP.LOCAL','APAC.CORP.LOCAL','DEV.CORP.LOCAL','LAB.CORP.LOCAL'] return u limit 1000"
+  },
+  {
+    "name": "ADV2: top-k, ORDER BY property with a small LIMIT",
+    "query": "match (u:User) where u.lastlogontimestamp is not null return u order by u.lastlogontimestamp desc limit 10"
+  },
+  {
+    "name": "ADV2: range predicate on a numeric property",
+    "query": "match (u:User) where u.pwdlastset < 1600000000 return u limit 1000"
+  },
+  {
+    "name": "ADV2: property existence check over the largest kind",
+    "query": "match (u:User) where u.serviceprincipalnames is not null return u limit 1000"
+  },
+  {
+    "name": "ADV2: two var-length segments in one pattern",
+    "query": "match p = (u:User)-[:MemberOf*1..2]->(g:Group)-[:MemberOf*1..2]->(t:Group) where t.objectid ends with '-512' return p limit 100"
+  },
+  {
+    "name": "ADV2: deep fixed-length chain, five hops",
+    "query": "match p = (a:User)-[:MemberOf]->(b:Group)-[:MemberOf]->(c:Group)-[:AdminTo]->(d:Computer)-[:HasSession]->(e:User)-[:MemberOf]->(f:Group) return p limit 100"
+  },
+  {
+    "name": "ADV2: join predicate comparing two nodes' properties",
+    "query": "match (u:User)-[:MemberOf]->(g:Group) where u.domain = g.domain return u limit 1000"
+  },
+  {
+    "name": "ADV2: negated pattern predicate over a large set",
+    "query": "match (u:User) where not (u)-[:MemberOf]->(:Group) return u limit 1000"
+  },
+  {
+    "name": "ADV2: allShortestPaths between kind-only endpoints",
+    "query": "match p = allShortestPaths((u:User)-[*1..4]->(c:Computer)) where u.admincount = true return p limit 100"
+  },
+  {
+    "name": "ADV2: var-length with a narrow target but unconstrained source",
+    "query": "match p = (a)-[:MemberOf|AdminTo*1..3]->(t:Group) where t.objectid ends with '-519' return p limit 1000"
+  },
+  {
+    "name": "ADV2: multi-kind relationship union over a wide source",
+    "query": "match p = (u:User)-[:AdminTo|CanRDP|ExecuteDCOM|CanPSRemote]->(c:Computer) return p limit 2000"
+  },
+  {
+    "name": "ADV2: aggregation grouped by a property",
+    "query": "match (u:User) return u.domain, count(u) order by count(u) desc limit 25"
+  },
+  {
+    "name": "ADV2: OPTIONAL MATCH against a large left side",
+    "query": "match (u:User) where u.admincount = true optional match (u)-[:MemberOf]->(g:Group) return u, g limit 1000"
+  },
+  {
+    "name": "ADV2: bounded var-length between two kind-only endpoints",
+    "query": "match p = (u:User)-[:MemberOf*1..3]->(g:Group) return p limit 2000"
+  },
+  {
+    "name": "ADV2: boolean property scan returning a large slice",
+    "query": "match (u:User) where u.enabled = true return u limit 5000"
+  },
+  {
+    "name": "ADV2: reverse traversal from a narrow computer set",
+    "query": "match p = (u:User)-[:HasSession*1..1]-(c:Computer) where c.operatingsystem contains 'Server' return p limit 1000"
+  }
+]
