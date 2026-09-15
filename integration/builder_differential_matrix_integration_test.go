@@ -98,7 +98,7 @@
 // catching a recognizer regression that silently starts delegating just one
 // family, which a single graph's aggregate graphServed > 0 check alone could
 // never distinguish from "every other family compensated."
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -118,6 +118,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // --- Op-family tally (see this file's top doc, "Anti-vacuity"). ---
@@ -149,8 +151,8 @@ var allOpFamilies = []string{
 // the same way loadDatasets does (via graphtest.LoadDataset, called once
 // per path against the same driver).
 var builderMatrixFixturePaths = []string{
-	"testdata/dawgs/traversal_shapes.json",
-	"testdata/dawgs/adcs_fanout.json",
+	"../testdata/dawgs/traversal_shapes.json",
+	"../testdata/dawgs/adcs_fanout.json",
 }
 
 // builderMatrixFixtureKinds parses both fixture files (without loading them
@@ -973,7 +975,7 @@ func runBuilderQueryDifferentialMatrix(t *testing.T, ctx context.Context, bt, or
 }
 
 // TestBuilderQueryDifferentialMatrix drives the whole matrix: it opens a
-// real *Driver (bt) alongside a raw pg driver oracle on the same PostgreSQL
+// real *bloodtrail.Driver (bt) alongside a raw pg driver oracle on the same PostgreSQL
 // database, then runs runBuilderQueryDifferentialMatrix once for the hand
 // fixtures and once per random-graph seed (1..builderMatrixRandomSeeds),
 // wiping and reloading the graph and forcing a deterministic RebuildNow
@@ -1008,15 +1010,15 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
 
-	bt, err := dawgs.Open(ctx, DriverName, cfg)
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = bt.Close(ctx) }()
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 	// AssertSchema's default-graph target is tracked per driver instance
 	// (not auto-discovered from the database by a freshly opened one), so
@@ -1045,7 +1047,7 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		for _, path := range builderMatrixFixturePaths {
 			graphtest.LoadDataset(t, pgDriver, path)
 		}
-		if err := d.engine.RebuildNow(ctx, "matrix_test"); err != nil {
+		if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "matrix_test"); err != nil {
 			t.Fatalf("RebuildNow: %v", err)
 		}
 
@@ -1064,7 +1066,7 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		t.Run("fixtures_writethrough", func(t *testing.T) {
 			nodeKinds, edgeKinds := builderMatrixFixtureKinds(t)
 
-			rebuilds := d.engine.RebuildCount()
+			rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 			fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 			runBuilderMatrixWriteThroughPreamble(t, ctx, bt, oracle, pool, nodeKinds, edgeKinds)
@@ -1081,7 +1083,7 @@ func TestBuilderQueryDifferentialMatrix(t *testing.T) {
 		t.Run(fmt.Sprintf("random/seed=%d", seed), func(t *testing.T) {
 			graphtest.WipeGraph(t, pgDriver)
 			loadBuilderMatrixRandomGraph(t, pgDriver, seed)
-			if err := d.engine.RebuildNow(ctx, "matrix_test"); err != nil {
+			if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "matrix_test"); err != nil {
 				t.Fatalf("RebuildNow (seed=%d): %v", seed, err)
 			}
 

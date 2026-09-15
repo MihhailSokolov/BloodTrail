@@ -8,7 +8,7 @@ TAG="${1:-v9.6.0}"
 # "latest" currently resolves to the same manifest digest as the bare-number
 # tag for the current stable release, confirming the convention.
 DOCKERHUB_TAG="${TAG#v}"
-IMAGE="${IMAGE:-ghcr.io/mihhailsokolov/bloodhound-bloodtrail:$TAG-bte2e}"
+IMAGE="${IMAGE:-ghcr.io/mihhailsokolov/bloodtrail:$TAG-bte2e}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$ROOT/.build/e2e"
 rm -rf "$WORK" && mkdir -p "$WORK"

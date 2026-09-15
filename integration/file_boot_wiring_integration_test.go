@@ -46,7 +46,7 @@
 // Open path, and only an in-package test can read Driver's unexported engine
 // field for RebuildCount.
 
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -63,6 +63,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // The engine's own snapshot-file log markers, as an outside observer (an
@@ -109,17 +111,17 @@ func newFileBootPool(t *testing.T, dsn string) *pgxpool.Pool {
 // production does -- dawgs.Open FIRST, AssertSchema AFTER -- and returns it
 // without waiting for boot load, so a caller can observe boot load's own
 // behavior across that ordering.
-func openProductionOrdered(t *testing.T, ctx context.Context, dsn string, pool *pgxpool.Pool) (*Driver, graph.Database) {
+func openProductionOrdered(t *testing.T, ctx context.Context, dsn string, pool *pgxpool.Pool) (*bloodtrail.Driver, graph.Database) {
 	t.Helper()
 
-	bt, err := dawgs.Open(ctx, DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
+	bt, err := dawgs.Open(ctx, bloodtrail.DriverName, dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool})
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 
-	d, ok := bt.(*Driver)
+	d, ok := bt.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", bt)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", bt)
 	}
 
 	// Only now -- Open has returned, which is the earliest instant any
@@ -230,7 +232,7 @@ func TestOpenLoadsSnapshotFileWithProductionAssertSchemaOrdering(t *testing.T) {
 	ctx := context.Background()
 
 	dir := t.TempDir()
-	t.Setenv(EnvSnapshotDir, dir)
+	t.Setenv(bloodtrail.EnvSnapshotDir, dir)
 
 	buf := installLogCapture(t)
 
@@ -254,11 +256,11 @@ func TestOpenLoadsSnapshotFileWithProductionAssertSchemaOrdering(t *testing.T) {
 	if got := markerCount(buf, snapshotFileRejectedMarker) - rejectedBefore; got != 0 {
 		t.Fatalf("%q fired %d time(s) for a valid matching-watermark file, want 0\ncaptured log:\n%s", snapshotFileRejectedMarker, got, buf.String())
 	}
-	if got := d.engine.RebuildCount(); got != 0 {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != 0 {
 		t.Fatalf("RebuildCount = %d after booting from a valid matching-watermark snapshot file, want 0 -- a full PostgreSQL rebuild was spent while the file sat unread", got)
 	}
 
-	view, serving := d.engine.Fresh()
+	view, serving := bloodtrail.TestingEngine(d).Fresh()
 	if !serving {
 		t.Fatalf("engine not serving after a file boot")
 	}
@@ -279,7 +281,7 @@ func TestOpenWithNoSnapshotFileStillRebuildsThroughProductionOrdering(t *testing
 	ctx := context.Background()
 
 	dir := t.TempDir() // real directory, deliberately left empty
-	t.Setenv(EnvSnapshotDir, dir)
+	t.Setenv(bloodtrail.EnvSnapshotDir, dir)
 
 	buf := installLogCapture(t)
 
@@ -305,7 +307,7 @@ func TestOpenWithNoSnapshotFileStillRebuildsThroughProductionOrdering(t *testing
 	if got := markerCount(buf, snapshotFileLoadedMarker); got != 0 {
 		t.Fatalf("%q fired with no file ever present\ncaptured log:\n%s", snapshotFileLoadedMarker, buf.String())
 	}
-	if got := d.engine.RebuildCount(); got == 0 {
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got == 0 {
 		t.Fatalf("RebuildCount = 0 with no snapshot file to load, want at least one PostgreSQL rebuild")
 	}
 	if strings.Contains(buf.String(), "bloodtrail: boot load failed") {
@@ -362,7 +364,7 @@ func TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext(t *testing.
 	ctx := context.Background()
 
 	dir := t.TempDir()
-	t.Setenv(EnvSnapshotDir, dir)
+	t.Setenv(bloodtrail.EnvSnapshotDir, dir)
 
 	buf := installLogCapture(t)
 
@@ -439,7 +441,7 @@ func TestCloseSavesSnapshotFileWithAnAlreadyCancelledShutdownContext(t *testing.
 	if got := markerCount(buf, snapshotFileRejectedMarker) - rejectedBefore; got != 0 {
 		t.Fatalf("%q fired %d time(s) for the file the shutdown save wrote, want 0\ncaptured log:\n%s", snapshotFileRejectedMarker, got, buf.String())
 	}
-	if got := d2.engine.RebuildCount(); got != 0 {
+	if got := bloodtrail.TestingEngine(d2).RebuildCount(); got != 0 {
 		t.Fatalf("RebuildCount = %d booting from the shutdown-written file, want 0", got)
 	}
 }

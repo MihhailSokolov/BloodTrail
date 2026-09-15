@@ -23,7 +23,7 @@
 // bloodtrail_test, since the differential suite forces a deterministic
 // snapshot rebuild through Driver's own unexported engine field, the same
 // way those two files do.
-package bloodtrail
+package integration
 
 import (
 	"context"
@@ -44,6 +44,8 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
+
+	bloodtrail "github.com/MihhailSokolov/BloodTrail"
 )
 
 // commonSearchEntry mirrors one entry of testdata/prebuilt/agt.json or
@@ -153,9 +155,9 @@ func assertFailsToParse(t *testing.T, label, query string) {
 // every non-disabled query parses as valid Cypher via frontend.ParseCypher
 // except the probe, which must fail to parse.
 func TestPrebuiltCorpusCounts(t *testing.T) {
-	agt := loadCommonSearches(t, "testdata/prebuilt/agt.json")
-	agi := loadCommonSearches(t, "testdata/prebuilt/agi.json")
-	selectors := loadSelectors(t, "testdata/prebuilt/selectors.json")
+	agt := loadCommonSearches(t, "../testdata/prebuilt/agt.json")
+	agi := loadCommonSearches(t, "../testdata/prebuilt/agi.json")
+	selectors := loadSelectors(t, "../testdata/prebuilt/selectors.json")
 
 	t.Run("agt", func(t *testing.T) {
 		const wantTotal = 92 // 91 CommonSearches (1 disabled) + 1 probe
@@ -266,7 +268,7 @@ func TestPrebuiltCorpusCounts(t *testing.T) {
 //
 // The reason is the same one that pins its siblings here:
 // this suite needs a deterministic, on-demand snapshot rebuild
-// (d.engine.RebuildNow) after seeding the fixture, the same unexported
+// (bloodtrail.TestingEngine(d).RebuildNow) after seeding the fixture, the same unexported
 // access dawgs_corpus_integration_test.go, builder_differential_matrix_
 // integration_test.go, and staleness_integration_test.go already rely on --
 // which requires living in package bloodtrail, where Driver's own
@@ -409,9 +411,9 @@ func corpusQueryKey(q corpusQuery) string {
 func activeCorpusQueries(t *testing.T) (queries []corpusQuery, probe commonSearchEntry) {
 	t.Helper()
 
-	agt := loadCommonSearches(t, "testdata/prebuilt/agt.json")
-	agi := loadCommonSearches(t, "testdata/prebuilt/agi.json")
-	selectors := loadSelectors(t, "testdata/prebuilt/selectors.json")
+	agt := loadCommonSearches(t, "../testdata/prebuilt/agt.json")
+	agi := loadCommonSearches(t, "../testdata/prebuilt/agi.json")
+	selectors := loadSelectors(t, "../testdata/prebuilt/selectors.json")
 
 	// nameCounts tracks, per "<source>/<name>", how many corpusQuery entries
 	// have already been assigned that pair -- corpusQuery.index below.
@@ -1077,15 +1079,15 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 	_, pool := graphtest.OpenPG(t, dsn)
 	cfg := dawgs.Config{ConnectionString: dsn, GraphQueryMemoryLimit: size.Gibibyte, Pool: pool}
 
-	rawBT, err := dawgs.Open(ctx, DriverName, cfg)
+	rawBT, err := dawgs.Open(ctx, bloodtrail.DriverName, cfg)
 	if err != nil {
 		t.Fatalf("open bloodtrail: %v", err)
 	}
 	defer func() { _ = rawBT.Close(ctx) }()
 
-	d, ok := rawBT.(*Driver)
+	d, ok := rawBT.(*bloodtrail.Driver)
 	if !ok {
-		t.Fatalf("expected *Driver, got %T", rawBT)
+		t.Fatalf("expected *bloodtrail.Driver, got %T", rawBT)
 	}
 
 	rawOracle, err := dawgs.Open(ctx, pg.DriverName, cfg)
@@ -1129,8 +1131,8 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 	// A deterministic, on-demand rebuild, independent of Start's own
 	// one-shot boot-load goroutine (engine/boot.go) -- matching
 	// dawgs_corpus_integration_test.go/builder_differential_matrix_
-	// integration_test.go's identical use of d.engine.RebuildNow.
-	if err := d.engine.RebuildNow(ctx, "manual"); err != nil {
+	// integration_test.go's identical use of bloodtrail.TestingEngine(d).RebuildNow.
+	if err := bloodtrail.TestingEngine(d).RebuildNow(ctx, "manual"); err != nil {
 		t.Fatalf("RebuildNow: %v", err)
 	}
 
@@ -1219,7 +1221,7 @@ func TestPrebuiltCorpusDifferential(t *testing.T) {
 	// safe against this specific fixture.
 	if writeThroughPreambleEnabled() {
 		t.Run("writethrough", func(t *testing.T) {
-			rebuilds := d.engine.RebuildCount()
+			rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 			fallbacks := markerCount(buf, fallbackEnteredMarker)
 
 			runCorpusWriteThroughPreamble(t, ctx, bt, oracleDB, pool)
@@ -1320,7 +1322,7 @@ func runOneCorpusQueryComparison(t *testing.T, ctx context.Context, buf *lockedB
 //
 // The comparison above (TestPrebuiltCorpusDifferential's main body) proves
 // the corpus's 222 active queries agree between bt and oracleDB against
-// REBUILD-derived replica state: d.engine.RebuildNow, called once, right
+// REBUILD-derived replica state: bloodtrail.TestingEngine(d).RebuildNow, called once, right
 // after graphtest.LoadCorpusFixture, loads the whole fixture from
 // PostgreSQL in one shot. That never exercises the write-through path at
 // all -- every one of write_observer.go's recognized write shapes could be

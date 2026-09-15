@@ -16,7 +16,7 @@ jobs:
       - name: Verify the GHCR images are anonymously pullable
         run: |
           docker logout ghcr.io 2>/dev/null || true
-          docker manifest inspect ghcr.io/mihhailsokolov/bloodhound-bloodtrail:v9.6.0 > /dev/null
+          docker manifest inspect ghcr.io/mihhailsokolov/bloodtrail:v9.6.0 > /dev/null
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - uses: goreleaser/goreleaser-action@v6

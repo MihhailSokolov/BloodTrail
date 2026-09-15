@@ -572,7 +572,7 @@ To undo everything:
     bloodtrail rollback
 
 Supported upstream releases are the tags published at
-`ghcr.io/mihhailsokolov/bloodhound-bloodtrail`. Images are built from the upstream
+`ghcr.io/mihhailsokolov/bloodtrail`. Images are built from the upstream
 Dockerfile with a one-file patch (`patches/bloodhound-driver.patch`); see
 [Upstream versions](#upstream-versions) for which tags exist and how they are
 validated.
@@ -667,6 +667,8 @@ cmd/bloodtrail/        CLI: installs/verifies/reports on/rolls back the driver i
                        existing BloodHound CE compose deployment
 bench/csrbench/        CSR traversal micro-benchmark (self-contained Go module)
 bench/adgen/           Generates a synthetic AD-shaped graph and loads it into PostgreSQL
+bench/shgen/           Generates a fictitious AD forest as SharpHound v6 JSON, for
+                       benchmarking a whole deployment through BloodHound's own ingest
 bench/pathbench/       Benchmarks the in-memory path engine against a loaded graph
 bench/builderbench/    Benchmarks query-builder serving against a loaded graph
 bench/cypherbench/     Benchmarks Cypher-interpreter serving against a loaded graph
