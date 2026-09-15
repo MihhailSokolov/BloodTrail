@@ -810,12 +810,59 @@ func pathStepArcKey(stepIdx int) string {
 // exclude each other across the whole chain, in both orders (see expand.go's
 // package doc's CROSS-STEP bullet and Row.trailEdges' doc).
 func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string) ([]*Row, error) {
-	startSym := part.Chains[stepIdxs[0]].FromSym
+	startSym := chainAnchorSym(env, part, stepIdxs)
 	rows, err := scanAnchor(env, meter, startSym, part.Nodes[startSym])
 	if err != nil {
 		return nil, err
 	}
 	return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, rows)
+}
+
+// chainWalkReversed reports whether a strict chain should be walked from its
+// RIGHTMOST symbol leftward instead of the default left-to-right order:
+// every step is fixed-length (a variable-length step can only ever expand
+// forward from its own FromSym -- expandChainComponent's doc), and the
+// rightmost endpoint's candidate source ranks strictly better than the
+// leftmost's.
+//
+// Why this exists: BloodHound writes many prebuilts as named-path chains
+// whose SELECTIVE end is on the right -- `MATCH p = (:User)-
+// [:SyncedToEntraUser]->(:AZUser)-[:AZRoleEligible]->(:AZRole) RETURN p` --
+// and arrow normalization (buildStep's inbound swap) means even a query
+// WRITTEN right-to-left still puts the wide symbol in stepIdxs[0].FromSym.
+// Anchoring left walked 450k Users to reach 20 roles: 284ms measured on the
+// hybrid benchmark graph, against 8.6ms for the identical pattern executed
+// through the general BFS (which already anchors cost-optimally, but only
+// serves unnamed patterns). A fixed step expands equally well in either
+// direction (expandStep's boundIsFrom, the same primitive runComponent's
+// BFS uses), and path assembly reads each row's BINDINGS in written order
+// (assembleChainPathVal), not the walk order, so the reversed walk changes
+// which rows exist at each intermediate stage and nothing about the rows
+// that come out.
+//
+// Both the direct executor and the chunked LIMIT driver derive the walk
+// direction from this one deterministic function (componentAnchorSym scans
+// the same end this walks from), so a chunk of anchor rows always meets the
+// loop that expects them.
+func chainWalkReversed(env *Env, part *Part, stepIdxs []int) bool {
+	for _, idx := range stepIdxs {
+		if part.Chains[idx].Range != nil {
+			return false
+		}
+	}
+	first := part.Chains[stepIdxs[0]].FromSym
+	last := part.Chains[stepIdxs[len(stepIdxs)-1]].ToSym
+	return rankOf(env, part.Nodes[last]).better(rankOf(env, part.Nodes[first]))
+}
+
+// chainAnchorSym is the symbol expandChainComponent scans as the chain's
+// sole anchor: the rightmost endpoint when chainWalkReversed says to walk
+// backward, the leftmost otherwise.
+func chainAnchorSym(env *Env, part *Part, stepIdxs []int) string {
+	if chainWalkReversed(env, part, stepIdxs) {
+		return part.Chains[stepIdxs[len(stepIdxs)-1]].ToSym
+	}
+	return part.Chains[stepIdxs[0]].FromSym
 }
 
 // expandChainComponentFrom is expandChainComponent's own step-by-step
@@ -827,6 +874,39 @@ func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int
 // in chain order, and pathSym's PathVal assembly (assembleChainPathVal)
 // still runs last, over the fully-grown rows -- unchanged by this split.
 func expandChainComponentFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string, anchorRows []*Row) ([]*Row, error) {
+	// A pure-fixed chain whose rightmost end ranks better is walked from
+	// that end leftward (chainWalkReversed); anchorRows are then rows of the
+	// RIGHTMOST symbol (chainAnchorSym scans the same end). Each step still
+	// expands through expandStep -- just bound on its ToSym -- and the
+	// bindings that come out are identical to a forward walk's, so the
+	// pathSym assembly below is untouched.
+	if chainWalkReversed(env, part, stepIdxs) {
+		rows := anchorRows
+		var err error
+		for i := len(stepIdxs) - 1; i >= 0; i-- {
+			idx := stepIdxs[i]
+			step := &part.Chains[idx]
+			arcKey := ""
+			if pathSym != "" {
+				arcKey = pathStepArcKey(idx)
+			}
+			rows, err = expandStep(env, meter, rows, step, step.ToSym, step.FromSym, false, part.Nodes[step.FromSym], arcKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if pathSym != "" {
+			for _, r := range rows {
+				pv, err := assembleChainPathVal(r, part, stepIdxs)
+				if err != nil {
+					return nil, err
+				}
+				r.SetPathVar(pathSym, pv)
+			}
+		}
+		return rows, nil
+	}
+
 	rows := anchorRows
 	var err error
 

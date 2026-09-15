@@ -296,14 +296,11 @@ const (
 func (c config) azTenantID() string         { return c.guid(azgTenant, 0, 0) }
 func (c config) azUserID(i int) string      { return c.guid(azgUser, 0, i) }
 func (c config) azGroupID(i int) string     { return c.guid(azgGroup, 0, i) }
-func (c config) azAppObjectID(i int) string { return c.guid(azgApp, 0, i) }
 func (c config) azAppClientID(i int) string { return c.guid(azgAppID, 0, i) }
 func (c config) azSPID(i int) string        { return c.guid(azgSP, 0, i) }
 func (c config) azDeviceID(i int) string    { return c.guid(azgDevice, 0, i) }
 func (c config) azSubID(i int) string       { return c.guid(azgSub, 0, i) }
-func (c config) azRGID(i int) string        { return c.guid(azgRG, 0, i) }
 func (c config) azVMID(i int) string        { return c.guid(azgVM, 0, i) }
-func (c config) azVaultID(i int) string     { return c.guid(azgVault, 0, i) }
 func (c config) azGraphSPID() string        { return c.guid(azgGraphSP, 0, 0) }
 
 // azSyncedUsers is how many AZUsers carry an on-prem identity; azure user i

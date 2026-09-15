@@ -941,69 +941,98 @@ func TestLimitEarlyTerminationVarLength(t *testing.T) {
 	}
 }
 
-// TestLimitEarlyTerminationNamedPathChain exercises the chunked driver's
-// named-path/chain dispatch end to end: componentAnchorSym's pathSym != ""
-// branch picks the chain's own leftmost symbol as anchor (rather than
-// chooseAnchor's cost-ranked pick), and runComponentFrom's own pathSym != ""
-// branch (guarded by isStrictLinearChain) routes through
-// expandChainComponentFrom -- the same anchor/dispatch pairing
-// TestRunComponentFromDispatchMatchesRunComponent's "named-path chain"
-// subtest exercises directly, here driven through the full runQuery/LIMIT
-// path instead. A large :User anchor pool, each with a one-hop MemberOf
-// edge to a single shared Group, all under one named path `p`: a LIMIT 3
-// run must stop after roughly one anchor-scan batch instead of assembling
-// every user's own path, while every returned path must still be one that
-// the unlimited run itself produces.
-func TestLimitEarlyTerminationNamedPathChain(t *testing.T) {
+// TestLimitedNamedPathChainDirections pins how the chunked LIMIT driver and
+// the chain walker choose their shared anchor end after chains learned to
+// walk from their cheaper side (chainWalkReversed):
+//
+//  1. HUB SHAPE (2000 users -> one group): the rightmost end ranks better
+//     (a single-node Group bitmap), so both the unlimited walk and the
+//     chunked driver anchor there and walk leftward. A one-row anchor gives
+//     LIMIT chunking nothing to terminate early -- the single anchor row's
+//     own fan-out IS the whole answer -- so the pinned bound is "no more
+//     work than the unlimited run", not "strictly less". This is the same
+//     resolution the var-length driver reached
+//     (TestVarLengthReverseUsedEvenWithALimit): the reverse route wins
+//     enormously when the selective end is genuinely selective (the shipped
+//     Synced-Entra chains: 20-node role anchor against a 450k-user scan,
+//     measured 284ms -> ~10ms), and costs at most the unlimited figure when
+//     it is a hub; forcing forward chunking instead would re-slow every
+//     LIMIT-carrying prebuilt of that family, which is all of them.
+//  2. NO-PREFERENCE SHAPE (2000 users -> 2000 groups, one each): equal
+//     ranks keep the forward walk, and there LIMIT chunking must still
+//     terminate early -- strictly less work than the unlimited run.
+//
+// In both shapes every limited path must be one the unlimited run produces.
+func TestLimitedNamedPathChainDirections(t *testing.T) {
 	const (
 		kindUser     snapshot.KindID = 1
 		kindGroup    snapshot.KindID = 2
 		kindMemberOf snapshot.KindID = 10
 	)
+	kinds := map[snapshot.KindID]string{kindUser: "User", kindGroup: "Group", kindMemberOf: "MemberOf"}
 	const n = 2000
-	const groupID = uint64(1)
-
-	nodes := []execNodeSpec{{groupID, []snapshot.KindID{kindGroup}, nil}}
-	var edges []execEdgeSpec
-	for i := 0; i < n; i++ {
-		userID := uint64(1000 + i)
-		nodes = append(nodes, execNodeSpec{userID, []snapshot.KindID{kindUser}, nil})
-		edges = append(edges, execEdgeSpec{uint64(9_000_000 + i), userID, groupID, kindMemberOf})
-	}
-	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User", kindGroup: "Group", kindMemberOf: "MemberOf"}, nodes, edges)
-
 	const query = `MATCH p = (a:User)-[:MemberOf]->(b:Group) RETURN p`
 
-	baseline := &workMeter{budget: generousBudget}
-	baseRS, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query), baseline)
-	if err != nil {
-		t.Fatalf("baseline runQuery: %v", err)
+	run := func(t *testing.T, snap *snapshot.View, q string) (*ResultSet, int64) {
+		t.Helper()
+		meter := &workMeter{budget: generousBudget}
+		rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, q), meter)
+		if err != nil {
+			t.Fatalf("runQuery(%q): %v", q, err)
+		}
+		return rs, meter.work
 	}
-	if len(baseRS.Rows) != n {
-		t.Fatalf("baseline row count = %d, want %d (sanity: every user has exactly one qualifying MemberOf edge)", len(baseRS.Rows), n)
-	}
-	wantSigs := make(map[string]bool, n)
-	for _, sig := range pathSigsAtColumn(t, snap, baseRS, 0) {
-		wantSigs[sig] = true
-	}
-
-	limited := &workMeter{budget: generousBudget}
-	rs, err := runQuery(&Env{Snap: snap}, planQuery(t, snap, query+" LIMIT 3"), limited)
-	if err != nil {
-		t.Fatalf("runQuery: %v", err)
-	}
-
-	if len(rs.Rows) != 3 {
-		t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
-	}
-	for _, sig := range pathSigsAtColumn(t, snap, rs, 0) {
-		if !wantSigs[sig] {
-			t.Fatalf("limited path %q is not among the unlimited run's own %d paths", sig, n)
+	verify := func(t *testing.T, snap *snapshot.View, limitBound func(limited, baseline int64) bool, boundDesc string) {
+		t.Helper()
+		baseRS, baseWork := run(t, snap, query)
+		if len(baseRS.Rows) != n {
+			t.Fatalf("baseline row count = %d, want %d", len(baseRS.Rows), n)
+		}
+		wantSigs := make(map[string]bool, n)
+		for _, sig := range pathSigsAtColumn(t, snap, baseRS, 0) {
+			wantSigs[sig] = true
+		}
+		rs, limWork := run(t, snap, query+" LIMIT 3")
+		if len(rs.Rows) != 3 {
+			t.Fatalf("got %d rows, want 3 (LIMIT 3)", len(rs.Rows))
+		}
+		for _, sig := range pathSigsAtColumn(t, snap, rs, 0) {
+			if !wantSigs[sig] {
+				t.Fatalf("limited path %q is not among the unlimited run's own %d paths", sig, n)
+			}
+		}
+		if !limitBound(limWork, baseWork) {
+			t.Fatalf("limited work = %d vs baseline %d, want %s", limWork, baseWork, boundDesc)
 		}
 	}
-	if limited.work >= baseline.work {
-		t.Fatalf("meter.work = %d, want strictly below the full-scan figure %d", limited.work, baseline.work)
-	}
+
+	t.Run("hub: reverse anchor, bounded by the unlimited figure", func(t *testing.T) {
+		const groupID = uint64(1)
+		nodes := []execNodeSpec{{groupID, []snapshot.KindID{kindGroup}, nil}}
+		var edges []execEdgeSpec
+		for i := 0; i < n; i++ {
+			userID := uint64(1000 + i)
+			nodes = append(nodes, execNodeSpec{userID, []snapshot.KindID{kindUser}, nil})
+			edges = append(edges, execEdgeSpec{uint64(9_000_000 + i), userID, groupID, kindMemberOf})
+		}
+		snap := buildExecSnapshot(t, kinds, nodes, edges)
+		verify(t, snap, func(lim, base int64) bool { return lim <= base }, "no more than the unlimited figure")
+	})
+
+	t.Run("no preference: forward chunking still terminates early", func(t *testing.T) {
+		var nodes []execNodeSpec
+		var edges []execEdgeSpec
+		for i := 0; i < n; i++ {
+			nodes = append(nodes, execNodeSpec{uint64(1000 + i), []snapshot.KindID{kindUser}, nil})
+		}
+		for i := 0; i < n; i++ {
+			gid := uint64(100000 + i)
+			nodes = append(nodes, execNodeSpec{gid, []snapshot.KindID{kindGroup}, nil})
+			edges = append(edges, execEdgeSpec{uint64(9_000_000 + i), uint64(1000 + i), gid, kindMemberOf})
+		}
+		snap := buildExecSnapshot(t, kinds, nodes, edges)
+		verify(t, snap, func(lim, base int64) bool { return lim < base }, "strictly below the unlimited figure")
+	})
 }
 
 // --- shortestPath LIMIT pushdown scoped to single-part queries (C1) --------
