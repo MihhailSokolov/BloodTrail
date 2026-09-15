@@ -62,26 +62,35 @@ by `/api/v2/graphs/shortest-path`):
 
 ## Measuring BloodTrail's effect
 
-1. Deploy BloodHound CE (the upstream quickstart compose), pin the image tag,
-   and note the initial admin password from the `bloodhound` container's
-   first-boot logs.
-2. Generate a forest at your target scale and upload it: UI (drag the `-zip`
-   archive into Administration -> File Ingest) or API (the flow in
-   `internal/verify/smoke.go`: `POST /api/v2/file-upload/start`, POST each
-   JSON with `X-File-Upload-Name`, `POST .../end`, then poll `/api/v2/file-upload`
-   and `/api/v2/datapipe/status`).
-3. Time what you care about on stock BloodHound: ingest wall time (upload ->
-   job Complete), analysis (datapipe back to idle), and the queries the UI
-   leans on -- pathfinding between two principals, the pre-built searches
-   under Cypher, group membership listings.
-4. `bloodtrail install` (see the top-level [README](../../README.md)), then
-   repeat step 3 on the same data. For ingest-side numbers, wipe and re-upload
-   the same files so both runs ingest identical input; expect writes to cost
-   roughly a quarter more wall time (write-through's documented price) and
-   the read side -- pathfinding and Cypher -- to be where the improvement
-   shows.
-5. `bloodtrail rollback` returns the deployment to stock whenever you want to
-   re-measure the baseline.
+[`bench.py`](bench.py) automates one side of the comparison: it uploads a
+generated forest, waits for ingest and analysis, then times the three read
+paths BloodTrail serves (pathfinding, Cypher, entity-panel reads), writing a
+JSON report. Every phase is bounded by `--deadline`; nothing waits forever.
+
+    python3 bench.py --port 8181 --data DIR --password PW --label stock
+
+Run it against two deployments that each start **empty** and ingest the same
+files, so the ingest-side numbers are comparable and the query-side ones are
+measured on identical data:
+
+1. Deploy BloodHound CE (upstream quickstart compose) with the image tag
+   pinned in `.env` (`BLOODHOUND_TAG=9.7.0` -- the installer refuses a moving
+   `:latest`), and read the initial admin password from the `bloodhound`
+   container's first-boot logs.
+2. `bench.py ... --label stock` against it.
+3. Tear that stack down, bring up an identical empty one, `bloodtrail
+   install` it *before* any ingest, then `bench.py ... --label bloodtrail`.
+   Running the two sequentially rather than side by side keeps them from
+   competing for the same CPU and disk.
+4. Compare the reports. Expect write-side wall time to cost roughly a quarter
+   more (write-through's documented price) and the read side -- pathfinding
+   and Cypher especially -- to be where the improvement shows.
+
+Uploading by hand instead: drag the `-zip` archive into the UI's File Ingest
+page, or drive the API flow in `internal/verify/smoke.go`.
+
+`bloodtrail rollback` returns a deployment to stock whenever you want to
+re-measure a baseline on the same box.
 
 For engine-only microbenchmarks (no ingest, no API), use
 [`bench/pathbench`](../pathbench) / [`bench/cypherbench`](../cypherbench) on
