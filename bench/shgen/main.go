@@ -30,10 +30,22 @@ func main() {
 		chunk     = flag.Int("chunk", 50000, "maximum objects per output file (BloodHound accepts any number of files per upload)")
 		zipPath   = flag.String("zip", "", "also bundle every generated file into this zip (handy for UI drag-and-drop upload)")
 		domain    = flag.String("domain", "MEGACORP.LOCAL", "forest root domain name (children become DIVNN.<root>)")
+
+		azUsers    = flag.Int("az-users", 0, "AZUser principals in the Entra tenant; 0 disables the whole azure side")
+		azGroups   = flag.Int("az-groups", -1, "AZGroup security groups; -1 means az-users/20")
+		azApps     = flag.Int("az-apps", -1, "AZApp registrations, each with a service principal; -1 means az-users/100 (minimum covers the seeded paths)")
+		azDevices  = flag.Int("az-devices", -1, "AZDevice entries; -1 means az-users/3")
+		azVMs      = flag.Int("az-vms", -1, "AZVM virtual machines; -1 means 200")
+		azKeyVault = flag.Int("az-keyvaults", -1, "AZKeyVault vaults; -1 means 50")
+		azSubs     = flag.Int("az-subs", -1, "AZSubscription subscriptions; -1 means 2")
+		azSyncPct  = flag.Int("az-sync-pct", 60, "percent of AZUsers hybrid-synced to an AD user")
 	)
 	flag.Parse()
 
-	cfg := config{Domain: *domain, Users: *users, Computers: *computers, Groups: *groups, Domains: *domains, Seed: *seed}
+	cfg := config{Domain: *domain, Users: *users, Computers: *computers, Groups: *groups, Domains: *domains, Seed: *seed,
+		AZUsers: *azUsers, AZGroups: *azGroups, AZApps: *azApps, AZDevices: *azDevices,
+		AZVMs: *azVMs, AZKeyVault: *azKeyVault, AZSubs: *azSubs, AZSyncPct: *azSyncPct}
+	cfg.applyAzureDefaults()
 	if cfg.Computers == 0 {
 		cfg.Computers = cfg.Users / 2
 	}
@@ -63,6 +75,12 @@ func main() {
 	fmt.Printf("generated %s in %s (%d files in %s)\n", cfg.Domain, time.Since(start).Round(time.Millisecond), len(sum.Files), *out)
 	fmt.Printf("  domains: %d   users: %d   computers: %d   groups: %d   ous: %d   gpos: %d   containers: %d\n",
 		sum.Domains, sum.Users, sum.Computers, sum.Groups, sum.OUs, sum.GPOs, sum.Containers)
+	if sum.AZObjects > 0 {
+		fmt.Printf("  azure: %d items (tenant, %d users, %d groups, %d apps+SPs, %d devices, %d VMs, %d vaults, %d subscriptions)\n",
+			sum.AZObjects, cfg.AZUsers, cfg.AZGroups, cfg.AZApps, cfg.AZDevices, cfg.AZVMs, cfg.AZKeyVault, cfg.AZSubs)
+		fmt.Printf("  seeded azure paths: hybrid sync into a Global Admin; PIM eligibility; app owner -> MS Graph role grant;\n")
+		fmt.Printf("  role-assignable group -> Privileged Role Admin; key-vault reader; VM admin login; Intune -> devices\n")
+	}
 	fmt.Printf("  seeded attack paths per domain: nested-membership chain to DOMAIN ADMINS; GenericAll ACL chain via APP OWNERS;\n")
 	fmt.Printf("  kerberoastable SVC-SQL* with AdminTo over a host holding a DA session; AS-REP roastables; unconstrained delegation\n")
 

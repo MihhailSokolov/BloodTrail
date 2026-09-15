@@ -19,6 +19,11 @@ type chunkWriter struct {
 	prefix, typ, meta string
 	chunk             int
 
+	// methods/version fill the meta trailer. SharpHound files carry the
+	// fixture's proven collection bitmask and format version; AzureHound
+	// files carry their own (see newAzureChunkWriter).
+	methods, version int
+
 	file    *os.File
 	buf     *bufio.Writer
 	enc     *json.Encoder
@@ -31,7 +36,17 @@ func newChunkWriter(prefix, typ, meta string, chunk int) (*chunkWriter, error) {
 	if chunk < 1 {
 		chunk = 1
 	}
-	return &chunkWriter{prefix: prefix, typ: typ, meta: meta, chunk: chunk}, nil
+	return &chunkWriter{prefix: prefix, typ: typ, meta: meta, chunk: chunk, methods: metaMethods, version: metaVersion}, nil
+}
+
+// newAzureChunkWriter is the AzureHound-format variant: meta.type "azure",
+// AzureHound's own format version, no collection-methods bitmask (its files
+// carry methods 0; BloodHound's azure decode path never reads it).
+func newAzureChunkWriter(prefix string, chunk int) (*chunkWriter, error) {
+	if chunk < 1 {
+		chunk = 1
+	}
+	return &chunkWriter{prefix: prefix, typ: "azure", meta: "azure", chunk: chunk, methods: 0, version: azureMetaVersion}, nil
 }
 
 func (w *chunkWriter) path() string {
@@ -70,7 +85,7 @@ func (w *chunkWriter) write(obj any) error {
 }
 
 func (w *chunkWriter) finishFile() error {
-	trailer := Meta{Methods: metaMethods, Type: w.meta, Count: w.inFile, Version: metaVersion}
+	trailer := Meta{Methods: w.methods, Type: w.meta, Count: w.inFile, Version: w.version}
 	tb, err := json.Marshal(trailer)
 	if err != nil {
 		return err
