@@ -1262,25 +1262,13 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 		return nil, err
 	}
 
+	// scanAnchorVisit's admit already evaluated nc.Predicates per candidate
+	// (predicatesAdmit) -- the per-row re-check this function used to carry
+	// moved there so every anchor consumer narrows early, not just this one.
 	ids := make([]snapshot.NodeID, 0, len(rows))
 	for _, r := range rows {
 		id, _ := r.Node(sym)
-		ok := true
-		if nc != nil {
-			for _, pred := range nc.Predicates {
-				t, err := EvalPredicate(env, r, pred)
-				if err != nil {
-					return nil, err
-				}
-				if t != TriTrue {
-					ok = false
-					break
-				}
-			}
-		}
-		if ok {
-			ids = append(ids, id)
-		}
+		ids = append(ids, id)
 	}
 	return ids, nil
 }

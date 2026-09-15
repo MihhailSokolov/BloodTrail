@@ -496,13 +496,17 @@ RETURN c`
 //
 // The snapshot has 3 User nodes; scanAnchor's own two-tier accounting
 // (Budgets' doc comment: "+1 per node visited ... +1 per row produced
-// anywhere") charges 2 work units per node visited by the kind-bitmap anchor
-// (1 visit + 1 for the row it produces, all 3 satisfy the trivial :User
-// constraint) = 6, regardless of this fix. Of those 3 rows, exactly 2 survive
-// `WHERE n.enabled = true` and are admitted as final rows, each charged
-// exactly once by addFinalRow = 2. Total: 6 + 2 = 8. Before this fix,
-// filterRows' own per-survivor spend(1) added a second charge for each of
-// those same 2 survivors, making the (wrong) pre-fix total 10.
+// anywhere") charges every visited node 1, and only candidates that BECOME
+// rows a second 1. `WHERE n.enabled = true` is a pushed single-symbol
+// predicate, evaluated at admit time (scanAnchorVisit's predicatesAdmit):
+// nodes 1 and 2 pass and produce rows (2 each = 4), node 3 fails and costs
+// only its visit (1) -- it never becomes a row, so under the documented
+// model it earns no row charge. Anchor total: 5. The 2 surviving rows are
+// admitted as final rows, charged exactly once each by addFinalRow = 2.
+// Total: 5 + 2 = 7. (Historical totals for this query: 10 when filterRows
+// double-charged survivors, 8 when the double charge was removed but
+// predicates still ran only in filterRows so the failing node was charged
+// as a row it never needed to be.)
 func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 	const kindUser snapshot.KindID = 1
 
@@ -526,8 +530,8 @@ func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 	if len(rs.Rows) != 2 {
 		t.Fatalf("got %d rows, want 2", len(rs.Rows))
 	}
-	if meter.work != 8 {
-		t.Fatalf("meter.work = %d, want 8 (6 scanAnchor + 2 addFinalRow, no filterRows double charge)", meter.work)
+	if meter.work != 7 {
+		t.Fatalf("meter.work = %d, want 7 (5 scanAnchor with admit-time predicate filtering + 2 addFinalRow)", meter.work)
 	}
 	if meter.finalRows != 2 {
 		t.Fatalf("meter.finalRows = %d, want 2", meter.finalRows)
@@ -542,17 +546,18 @@ func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 //
 // The snapshot has 3 User nodes: node 1 is Part[0]'s sole match (its
 // objectid anchor -- see TestExecObjectIDAnchor -- visits exactly that one
-// node: 1 visit + 1 produced = 2). `WITH n` passes that single row through
-// unchanged (runWithPassThrough's own, unrelated per-row charge: 1). Part[1]
-// (`MATCH (m:User)`) re-scans all 3 User nodes for that one carried row (kind
-// -bitmap anchor: 2 work units per node x 3 = 6), merges each of those 3 rows
-// with the carried row (runCarriedPart's merge step -- charges nothing of
-// its own, per this fix), and `WHERE m.flag = true` keeps exactly 1 of the 3
-// merged rows, admitted once as a final row (addFinalRow: 1). Total:
-// 2 + 1 + 6 + 1 = 10. Before this fix, runCarriedPart's own per-merged-row
-// spend(1) added 3 (one per merged row, regardless of WHERE), and filterRows'
-// per-survivor spend(1) added 1 more for the single WHERE survivor, making
-// the (wrong) pre-fix total 15.
+// node, which also passes its own pushed predicate: 1 visit + 1 produced =
+// 2). `WITH n` passes that single row through unchanged
+// (runWithPassThrough's own, unrelated per-row charge: 1). Part[1]
+// (`MATCH (m:User)`) re-scans all 3 User nodes for that one carried row;
+// `WHERE m.flag = true` is a pushed single-symbol predicate evaluated at
+// admit time, so node 2 passes and produces a row (2) while nodes 1 and 3
+// fail and cost only their visits (1 each) -- anchor total 4. The merge
+// step charges nothing of its own, and the single surviving merged row is
+// admitted once as a final row (addFinalRow: 1). Total: 2 + 1 + 4 + 1 = 8.
+// (Historical totals for this query: 15 with the filterRows/runCarriedPart
+// double charges, 10 with those removed but predicates still evaluated
+// only in filterRows, so the two failing nodes were charged as rows.)
 func TestPipelineWorkAccountingCarriedPartNoDoubleCharge(t *testing.T) {
 	const kindUser snapshot.KindID = 1
 
@@ -576,8 +581,8 @@ func TestPipelineWorkAccountingCarriedPartNoDoubleCharge(t *testing.T) {
 	if len(rs.Rows) != 1 {
 		t.Fatalf("got %d rows, want 1", len(rs.Rows))
 	}
-	if meter.work != 10 {
-		t.Fatalf("meter.work = %d, want 10 (2 anchor + 1 WITH pass-through + 6 Part[1] scan + 1 addFinalRow, no filterRows/runCarriedPart double charge)", meter.work)
+	if meter.work != 8 {
+		t.Fatalf("meter.work = %d, want 8 (2 anchor + 1 WITH pass-through + 4 Part[1] scan with admit-time predicate filtering + 1 addFinalRow)", meter.work)
 	}
 	if meter.finalRows != 1 {
 		t.Fatalf("meter.finalRows = %d, want 1", meter.finalRows)

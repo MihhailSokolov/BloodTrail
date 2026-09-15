@@ -1114,6 +1114,27 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 		}
 		r := NewRow()
 		r.SetNode(sym, id)
+		// Pushed single-symbol predicates are applied HERE, not only in the
+		// eventual Part.Where pass (where they remain and run again,
+		// redundantly but harmlessly, over what survives). Filtering at the
+		// anchor is what keeps a selective predicate from amplifying:
+		// `(s:Group)-[:AdminTo]->(c) WHERE s.objectid ENDS WITH '-513'`
+		// anchors on the 25k-strong Group bitmap, and without this check
+		// every one of those groups became a row and was EXPANDED, with the
+		// WHERE only mopping up afterwards -- the row set was 25,000x larger
+		// than the answer for the whole middle of the pipeline. Semantics
+		// are unchanged by construction: a single-symbol conjunct references
+		// nothing but sym, its evaluation on this one-binding row is exactly
+		// its evaluation on any later superset row, and only TriTrue admits
+		// -- the same bar filterRows applies. An evaluation error declines
+		// the query, exactly as it would have in filterRows.
+		ok, err := predicatesAdmit(env, r, nc)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
 		if err := meter.spend(1); err != nil {
 			return err
 		}
@@ -1179,6 +1200,28 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 		return nil, err
 	}
 	return rows, nil
+}
+
+// predicatesAdmit evaluates nc's pushed single-symbol predicates against r,
+// admitting only a row every predicate holds TriTrue for -- the same bar
+// filterRows applies to Part.Where, where these conjuncts also still live
+// and run again over the survivors. An evaluation error is returned as-is
+// (the caller declines the query, exactly as filterRows would have); an
+// unknown (TriNull) result drops the candidate, Cypher's WHERE semantics.
+func predicatesAdmit(env *Env, r *Row, nc *NodeConstraint) (bool, error) {
+	if nc == nil {
+		return true, nil
+	}
+	for _, pred := range nc.Predicates {
+		t, err := EvalPredicate(env, r, pred)
+		if err != nil {
+			return false, err
+		}
+		if t != TriTrue {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // nodeSatisfiesConstraint reports whether id carries every one of nc's kind
@@ -1505,6 +1548,18 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			}
 			nr := cloneRow(r)
 			nr.SetNode(unboundSym, c.other)
+			// The far endpoint's own pushed predicates gate expansion the
+			// same way they gate the anchor scan (scanAnchorVisit's admit):
+			// a candidate whose target fails its single-symbol WHERE
+			// conjuncts would only ever be deleted by filterRows later, and
+			// in the meantime each one is a row the rest of the component
+			// pays to carry. Same bar, same error semantics, evaluated on
+			// the row the candidate would otherwise become.
+			if ok, err := predicatesAdmit(env, nr, unboundNC); err != nil {
+				return nil, err
+			} else if !ok {
+				continue
+			}
 			if step.EdgeSym != "" {
 				nr.SetEdge(step.EdgeSym, edgeRefFor(env.Snap, c))
 			}
