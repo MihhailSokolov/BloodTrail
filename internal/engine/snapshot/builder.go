@@ -364,6 +364,21 @@ func finalizeDerived(s *Snapshot) {
 	s.kindBitmaps = kindBitmaps
 	s.MaxKindID = maxKind
 
+	// edgeKindSeen: which kinds label at least one edge at all. Sized from
+	// maxKind, which the loop above already raised to cover every edge kind.
+	// Derived here for the same reason selfLoopKinds below is -- so Build,
+	// ReadSnapshotFile and Fold all carry it without a file-format change,
+	// and so a compaction that folds away a kind's last edge also clears it.
+	// Consumed by View.EdgeKindPresent, which the interpreter uses to answer
+	// a pattern naming an absent relationship kind without walking anything.
+	edgeKindSeen := make([]bool, maxKind+1)
+	for _, k := range s.OutKinds {
+		if k >= 0 {
+			edgeKindSeen[k] = true
+		}
+	}
+	s.edgeKindSeen = edgeKindSeen
+
 	// selfLoopKinds: which edge kinds have at least one self-loop edge in
 	// this snapshot (start == end). Derived here so every construction path
 	// -- Build, ReadSnapshotFile, and Fold (which goes through Build) --

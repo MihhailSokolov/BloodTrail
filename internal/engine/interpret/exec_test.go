@@ -1108,6 +1108,11 @@ func TestExecChainNamedVarLengthStepDeclines(t *testing.T) {
 		[]execEdgeSpec{
 			{100, 1, 2, kindY},
 			{101, 2, 3, kindY},
+			// The var-length step below names kind X, so at least one X edge
+			// has to exist: with none, partCannotMatch answers the query with
+			// zero rows before the chain-shape decline this test is about is
+			// ever reached.
+			{102, 1, 2, kindX},
 		},
 	)
 

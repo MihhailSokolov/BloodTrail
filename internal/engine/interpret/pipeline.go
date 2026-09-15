@@ -196,6 +196,17 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		}
 		collectAliases := collectAliasNames(part0.With.Aggregates)
 
+		// Part[1] requiring an edge kind the snapshot does not have means no
+		// seed can produce a row. Dropping the carried rows here makes both
+		// driver loops below iterate zero seeds, instead of running the whole
+		// cross-join to discover the same emptiness one seed at a time --
+		// this is the two-part path's copy of matchPart's own short-circuit,
+		// placed after the structural declines above so that what this
+		// executor refuses to serve is unchanged. See partCannotMatch.
+		if partCannotMatch(env, part1) {
+			rows = nil
+		}
+
 		var comp1 component
 		var anchor1 string
 		var limited bool
@@ -458,6 +469,13 @@ func matchPartPlain(env *Env, meter *workMeter, part *Part) ([]*Row, error) {
 // unchanged. Callers only reach this at all when limitTarget(q) >= 0 and
 // len(q.Parts) == 1 -- see runQuery.
 func matchPartLimited(env *Env, meter *workMeter, part *Part, target int64) ([]*Row, error) {
+	// The chunked driver is the one pattern-match path that does not run
+	// through matchPart, so it needs its own copy of matchPart's absent-kind
+	// short-circuit -- without it a LIMIT would send exactly the queries that
+	// benefit most (`(n)-[:AbsentKind]->(m) ... LIMIT 1000`) down a full scan.
+	if partCannotMatch(env, part) {
+		return nil, nil
+	}
 	if comp, anchor, ok := limitEligibleComponent(env, meter, part); ok {
 		return runComponentLimited(env, meter, part, comp, anchor, nil, nil, target)
 	}

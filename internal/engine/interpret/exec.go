@@ -275,6 +275,9 @@ func matchPart(env *Env, part *Part, meter *workMeter) ([]*Row, error) {
 	if len(part.Nodes) == 0 {
 		return []*Row{NewRow()}, nil
 	}
+	if partCannotMatch(env, part) {
+		return nil, nil
+	}
 
 	var merged []*Row
 	first := true
@@ -293,6 +296,41 @@ func matchPart(env *Env, part *Part, meter *workMeter) ([]*Row, error) {
 		}
 	}
 	return merged, nil
+}
+
+// partCannotMatch reports whether part contains a Step that requires at least
+// one edge whose kind the snapshot provably does not contain -- in which case
+// the pattern match has no solutions at all and every executor below can skip
+// straight to zero rows without walking anything.
+//
+// Only a step that MANDATES a hop counts. A `*0..` range is satisfied by a
+// zero-length match (start == end) that traverses no edge, so an absent kind
+// says nothing about whether it matches; those steps are skipped here.
+//
+// Safety comes from this returning exactly what the full walk would have
+// returned -- zero rows -- not from anything about the caller, because it
+// replaces the WALK and not the pipeline stage above it. That is also why it
+// lives here rather than at the top of Execute: a stage above a zero-row
+// match does not necessarily produce zero rows itself (an aggregate over no
+// matches still has one row to emit), so only the match may short-circuit.
+// This package declines aggregates today, so that distinction costs nothing
+// to honor and stops the placement from becoming wrong if it ever serves one.
+//
+// This is what keeps a deployment's unused-feature prebuilts cheap: on
+// AD-only data every shipped ADCS, Entra and NTLM-relay query names a
+// relationship kind with no edges, and each one previously scanned the whole
+// graph to find that out. See View.EdgeKindPresent for the measurement.
+func partCannotMatch(env *Env, part *Part) bool {
+	for i := range part.Chains {
+		step := &part.Chains[i]
+		if step.Range != nil && step.Range.Min == 0 {
+			continue
+		}
+		if !env.Snap.EdgeKindPresent(step.EdgeKinds) {
+			return true
+		}
+	}
+	return false
 }
 
 // component is one connected piece of a Part's pattern graph: every node
