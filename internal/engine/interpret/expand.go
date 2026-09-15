@@ -556,8 +556,66 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 // objectid anchor, or pushed single-symbol WHERE predicates. Kind labels alone
 // do not count -- the kind bitmap IS the candidate source for a kinds-only
 // constraint, so re-checking it filters nothing.
+//
+// That last rule applies to a kind test WHEREVER IT IS WRITTEN. BloodHound's
+// shipped prebuilt queries spell their near-endpoint type filter as a WHERE
+// label disjunction (`WHERE (a:User or a:Computer)`) rather than as a pattern
+// label, and partBuilder.pushdown copies every single-symbol conjunct into
+// Predicates regardless of its shape -- so without kindOnlyPredicate below,
+// such a query counted as "narrowing" purely because of a type test, which
+// disqualified the constrained-side route in varLengthReverseEligible and
+// sent the whole query down a full scan of every node in the graph. That is
+// what made the shipped "all Domain Admins" query 84x slower than PostgreSQL
+// on a 1M-node graph (bench/shgen's 500k measurement); the kind test does not
+// change which candidate SOURCE the symbol is enumerated from, which is the
+// only thing this predicate is meant to be about.
 func endpointNarrows(nc *NodeConstraint) bool {
-	return nc != nil && (len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || len(nc.Predicates) > 0)
+	if nc == nil {
+		return false
+	}
+	if len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil {
+		return true
+	}
+	for _, p := range nc.Predicates {
+		if !kindOnlyPredicate(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// kindOnlyPredicate reports whether expr tests nothing but kind membership --
+// a KindMatcher, or any and/or/not/parenthesised combination of them. Such a
+// predicate filters exactly what a pattern label would, so endpointNarrows
+// treats it the same way it treats pattern labels: as part of the candidate
+// source rather than as a narrowing of it. Anything else (a property
+// comparison, a function call, a bare truthiness test) returns false, so a
+// genuinely selective predicate keeps its narrowing status.
+func kindOnlyPredicate(expr cypher.Expression) bool {
+	switch typed := unwrapParens(expr).(type) {
+	case *cypher.KindMatcher:
+		return typed != nil
+	case *cypher.Negation:
+		return typed != nil && kindOnlyPredicate(typed.Expression)
+	case *cypher.Conjunction:
+		return typed != nil && allKindOnly(typed.GetAll())
+	case *cypher.Disjunction:
+		return typed != nil && allKindOnly(typed.GetAll())
+	default:
+		return false
+	}
+}
+
+func allKindOnly(exprs []cypher.Expression) bool {
+	if len(exprs) == 0 {
+		return false
+	}
+	for _, e := range exprs {
+		if !kindOnlyPredicate(e) {
+			return false
+		}
+	}
+	return true
 }
 
 // expandVarLengthComponentReverse enumerates step's trails backward: it

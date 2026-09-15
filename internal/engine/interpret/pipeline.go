@@ -513,10 +513,47 @@ func limitEligibleComponent(env *Env, meter *workMeter, part *Part) (comp compon
 	if hasShortestStep(part, comp.stepIdxs) {
 		return component{}, "", false
 	}
+	if componentPrefersReverseSeeding(env, part, comp) {
+		return component{}, "", false
+	}
 	if _, err := runComponentFrom(env, meter, part, comp, nil); err != nil {
 		return component{}, "", false
 	}
 	return comp, componentAnchorSym(env, part, comp), true
+}
+
+// componentPrefersReverseSeeding reports whether comp is a standalone
+// variable-length step whose far endpoint is so much cheaper to resolve that
+// the unlimited executor would seed from it and walk backward
+// (varLengthReverseEligible, expand.go).
+//
+// Such a component is deliberately kept AWAY from the chunked early-
+// termination driver, even when the query carries a LIMIT the driver could
+// otherwise exploit. The driver's whole mechanism is "scan a bounded chunk of
+// the NEAR endpoint, expand it, stop once enough rows survive", so it can only
+// ever walk forward -- and for this shape forward means scanning every node in
+// the graph. Measured on a 1M-node graph, BloodHound's shipped "all Domain
+// Admins" prebuilt cost 20,031 work units through the chunked driver against
+// 19 for the identical query without its LIMIT: the early termination the
+// LIMIT was supposed to buy is worth far less than the seeding choice it was
+// costing. Declining here sends the component back to matchPartPlain, which
+// runs the ordinary executor (and therefore the constrained-side route); the
+// LIMIT still applies, one stage later, at the pipeline's own SKIP/LIMIT pass.
+//
+// This is deliberately narrow: it only fires for the exact shape whose
+// reverse route is already proven cheaper, so every other LIMIT-eligible
+// query keeps the early termination it has today. Costs nothing to evaluate
+// -- varLengthReverseEligible reads constraint metadata and kind-bitmap
+// populations only, spending no metered work (see its own doc).
+func componentPrefersReverseSeeding(env *Env, part *Part, comp component) bool {
+	if len(comp.stepIdxs) != 1 {
+		return false
+	}
+	step := &part.Chains[comp.stepIdxs[0]]
+	if step.Range == nil {
+		return false
+	}
+	return varLengthReverseEligible(env, part, step)
 }
 
 // componentAnchorSym reports the symbol runComponentFrom's own dispatch
