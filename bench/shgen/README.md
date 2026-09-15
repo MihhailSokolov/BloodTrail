@@ -69,7 +69,26 @@ JSON report. Every phase is bounded by `--deadline`; nothing waits forever.
 
     python3 bench.py --port 8181 --data DIR --password PW --label stock
 
-Run it against two deployments that each start **empty** and ingest the same
+**Mind which baseline you are measuring against.** The upstream quickstart
+compose defaults to `bhe_graph_driver=neo4j`, so a stock deployment out of
+the box stores its graph in Neo4j while BloodTrail always runs on
+PostgreSQL. Comparing those two directly answers the operator's question
+("what do I gain by installing this?") but conflates two changes -- the
+storage swap and the engine. To isolate the engine, set `GRAPH_DRIVER=pg` in
+the baseline's `.env` so both sides use PostgreSQL and only the driver
+differs. Running all three arms (neo4j, pg, pg+bloodtrail) answers both
+questions and costs one extra ingest.
+
+> **Don't mistake the datapipe's tick for a stall.** After the last file is
+> uploaded the job sits at `status 6` / `total_files: 0` with every container
+> idle for twenty or thirty seconds before the daemon picks it up
+> (`Ingest run starting`, `task_count: N` in the `bloodhound` logs). That is
+> normal. A fresh `GRAPH_DRIVER=pg` boot also logs `Unable to find expected
+> data type: nodecomposite. This database connection will not be pooled.`
+> because the server creates its graph schema after caching the schema's
+> absence; it is a pooling warning, not a failure, and ingest proceeds.
+
+Run each arm against a deployment that starts **empty** and ingests the same
 files, so the ingest-side numbers are comparable and the query-side ones are
 measured on identical data:
 
@@ -77,11 +96,12 @@ measured on identical data:
    pinned in `.env` (`BLOODHOUND_TAG=9.7.0` -- the installer refuses a moving
    `:latest`), and read the initial admin password from the `bloodhound`
    container's first-boot logs.
-2. `bench.py ... --label stock` against it.
+2. `bench.py ... --label stock-pg` against it.
 3. Tear that stack down, bring up an identical empty one, `bloodtrail
    install` it *before* any ingest, then `bench.py ... --label bloodtrail`.
-   Running the two sequentially rather than side by side keeps them from
-   competing for the same CPU and disk.
+   Running the arms sequentially rather than side by side keeps them from
+   competing for the same CPU and disk -- which matters: at 500k scale one
+   arm alone saturates several cores.
 4. Compare the reports. Expect write-side wall time to cost roughly a quarter
    more (write-through's documented price) and the read side -- pathfinding
    and Cypher especially -- to be where the improvement shows.
