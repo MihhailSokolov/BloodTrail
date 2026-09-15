@@ -27,3 +27,6 @@ dist/
 # Agent working files
 .superpowers/
 .claude/
+
+# Python scratch
+__pycache__/
