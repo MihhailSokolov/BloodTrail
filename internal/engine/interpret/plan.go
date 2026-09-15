@@ -1416,7 +1416,82 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 		return false
 	}
 	pb.extractObjectIDAnchor(sym, conjunct)
+	pb.extractKindConjunct(sym, conjunct)
 	return true
+}
+
+// extractKindConjunct folds a WHERE conjunct that is a bare (possibly
+// parenthesised) exclusive kind matcher over sym -- `WHERE n:Tag_Tier_Zero`
+// -- into sym's NodeConstraint.Kinds, exactly as if the kind had been
+// written as a pattern label. The kind test itself stays in Predicates too
+// (pushdown appended it above), which is redundant but harmless, matching
+// how a desugared inline-map equality coexists with its extracted anchor.
+//
+// Why this matters: BloodHound's Tier Zero prebuilts are written as
+// `MATCH (n:Base) WHERE (n:Tag_Tier_Zero) AND <property tests>`. Without
+// extraction the anchor is the `Base` bitmap -- the whole graph -- and the
+// kind test runs per node; with it, smallestKindBitmap anchors on the tag
+// kind's own bitmap, which is tiny (or empty) on most deployments. Measured
+// on the 500k benchmark graph, that class sat at 250-2600ms against
+// PostgreSQL's ~20ms index probe.
+//
+// Two deliberate refusals:
+//
+//   - Only an EXCLUSIVE matcher qualifies (`n:A:B` = has ALL, the shape the
+//     frontend always builds for source-level matchers): Kinds is an AND
+//     list, so a non-exclusive (ANY) matcher cannot be folded into it. A
+//     disjunction of matchers (`n:A OR n:B`) arrives as a Disjunction, not a
+//     KindMatcher, and is likewise left alone.
+//   - A symbol that is an endpoint of a variable-length or shortestPath
+//     step keeps its NodeConstraint.Kinds as WRITTEN in the pattern. Those
+//     routes choose their seeding side by comparing the two endpoints'
+//     candidate-source ranks (varLengthReverseEligible), and that contract
+//     was calibrated -- twice, measurably -- around kind tests written in
+//     WHERE not counting as anchors (see endpointNarrows/kindOnlyPredicate
+//     and scanEquivalentNearSide). Folding a WHERE kind into such a
+//     symbol's Kinds would silently re-route those queries; the anchor win
+//     this extraction exists for is the pure node-scan shape, which has no
+//     such step.
+//
+// checkExpr ran before pushdown, so every kind name here already resolved
+// against the snapshot (checkKindMatcher rejects unknowns); the second
+// lookup is belt-and-braces, never a behavior change.
+func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expression) {
+	if pb.symbolInTraversalStep(sym) {
+		return
+	}
+	km, ok := unwrapParens(conjunct).(*cypher.KindMatcher)
+	if !ok || km == nil || !km.IsExclusive {
+		return
+	}
+	v, ok := unwrapParens(km.Reference).(*cypher.Variable)
+	if !ok || v == nil || v.Symbol != sym {
+		return
+	}
+	nc := pb.nodeConstraint(sym)
+	for _, kind := range km.Kinds {
+		if id, ok := pb.snap.Kinds().ID(kind.String()); ok {
+			nc.Kinds = append(nc.Kinds, id)
+		}
+	}
+}
+
+// symbolInTraversalStep reports whether sym is an endpoint of any
+// variable-length or shortestPath step -- the steps whose seeding-side
+// choice reads endpoint ranks, and which extractKindConjunct therefore
+// leaves untouched. Chains are complete before the WHERE loop runs
+// (planPart processes every pattern first), so this sees every step.
+func (pb *partBuilder) symbolInTraversalStep(sym string) bool {
+	for i := range pb.chains {
+		step := &pb.chains[i]
+		if step.Range == nil && step.Shortest == ShortestNone {
+			continue
+		}
+		if step.FromSym == sym || step.ToSym == sym {
+			return true
+		}
+	}
+	return false
 }
 
 // extractIDAnchor recognizes `id(sym) = <literal>` (either operand order)
