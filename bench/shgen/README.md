@@ -27,6 +27,15 @@ Everything is synthetic: names cycle fixed lists with numeric suffixes, SIDs
 derive from the seed, and no real organization, person or credential appears
 anywhere.
 
+**No object ever references itself.** A self-referencing ACL or membership
+edge is a self-loop, and a self-loop of an admitted relationship kind makes
+BloodTrail's variable-length executor decline the whole pattern and delegate
+to PostgreSQL (see the top-level README's "What always delegates"). One stray
+self-ACE would therefore push every `[*1..]` query in a benchmark onto the
+delegating path and understate the engine for a reason that has nothing to do
+with the engine. `TestNoSelfLoopEdges` pins this across several seeds and
+shapes.
+
 ## Seeded attack paths
 
 Beyond realistic noise (group nesting, ACL fan-out, sessions, stale

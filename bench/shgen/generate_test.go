@@ -347,6 +347,53 @@ func TestSeededAttackPaths(t *testing.T) {
 	}
 }
 
+// TestNoSelfLoopEdges pins a property the generated forest must hold at
+// every scale and seed: no object references ITSELF. Such an edge is a
+// self-loop, and a self-loop of an admitted kind makes BloodTrail's
+// variable-length executor decline the whole pattern and delegate
+// (internal/engine/interpret/expand.go's SELF-LOOPS rule) -- so one stray
+// self-ACE would push every `[*1..]` query in a benchmark onto PostgreSQL
+// and understate the engine for a generator-side reason. It is also not
+// realistic AD data. Several seeds and shapes are probed because the noise
+// draw that used to produce these hit only at some (groups, seed)
+// combinations: a single-config test would have passed while the bug was
+// live.
+func TestNoSelfLoopEdges(t *testing.T) {
+	for _, cfg := range []config{
+		{Domain: "MEGACORP.LOCAL", Users: 500, Computers: 100, Groups: 10, Domains: 1, Seed: 1},
+		{Domain: "MEGACORP.LOCAL", Users: 5000, Computers: 500, Groups: 40, Domains: 1, Seed: 7},
+		{Domain: "MEGACORP.LOCAL", Users: 20000, Computers: 2000, Groups: 1000, Domains: 2, Seed: 3},
+		{Domain: "MEGACORP.LOCAL", Users: 800, Computers: 300, Groups: 60, Domains: 2, Seed: 11},
+	} {
+		g := &generator{cfg: cfg}
+		for d := 0; d < cfg.domainCount(); d++ {
+			for gi := 0; gi < cfg.groupsInDomain(d); gi++ {
+				sid := cfg.groupSID(d, gi)
+				for _, a := range g.groupAces(d, gi) {
+					if a.PrincipalSID == sid {
+						t.Fatalf("seed %d, domain %d, group %d: ACL edge references itself (%s)", cfg.Seed, d, gi, sid)
+					}
+				}
+				for _, m := range g.groupMembers(d, gi) {
+					if m.ObjectIdentifier == sid {
+						t.Fatalf("seed %d, domain %d, group %d: membership edge references itself (%s)", cfg.Seed, d, gi, sid)
+					}
+				}
+			}
+			for ci := 0; ci < cfg.computersInDomain(d) && ci < 500; ci++ {
+				cmp := g.computer(d, ci, cfg.domainSID(d), cfg.domainName(d))
+				for _, lg := range cmp.LocalGroups {
+					for _, r := range lg.Results {
+						if r.ObjectIdentifier == cmp.ObjectIdentifier {
+							t.Fatalf("seed %d, domain %d, computer %d: local-group edge references itself", cfg.Seed, d, ci)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestChunkingRollsFiles pins that a small -chunk splits a type across
 // several files, each independently valid with its own correct meta.count
 // (parseDir already validates each file), and that the union carries every

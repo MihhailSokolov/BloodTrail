@@ -389,7 +389,21 @@ func (g *generator) groupAces(d, gi int) []ACE {
 		if c.intn(2, 37, int64(d), int64(gi), int64(k)) == 0 && ud > 0 {
 			aces = append(aces, ACE{PrincipalSID: c.userSID(d, c.intn(ud, 38, int64(d), int64(gi), int64(k))), PrincipalType: "User", RightName: right})
 		} else if gd > 0 {
-			aces = append(aces, ACE{PrincipalSID: c.groupSID(d, c.intn(gd, 39, int64(d), int64(gi), int64(k))), PrincipalType: "Group", RightName: right})
+			other := c.intn(gd, 39, int64(d), int64(gi), int64(k))
+			// Never let a group hold an ACL over ITSELF. Such an edge is a
+			// self-loop, and a self-loop of an admitted kind makes the
+			// engine's variable-length executor decline the whole pattern
+			// (internal/engine/interpret/expand.go's SELF-LOOPS rule, which
+			// exists because PostgreSQL's own recursive CTE places its
+			// self-loop guard on whichever side it seeds from). One stray
+			// self-ACE would therefore push every `[*1..]` query in a
+			// benchmark onto the delegating path and understate the engine
+			// for a reason that has nothing to do with the engine -- and it
+			// is not realistic AD data either. Skipped rather than remapped
+			// so the remaining draws keep their own indices.
+			if other != gi {
+				aces = append(aces, ACE{PrincipalSID: c.groupSID(d, other), PrincipalType: "Group", RightName: right})
+			}
 		}
 	}
 	return aces
