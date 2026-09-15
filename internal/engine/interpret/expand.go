@@ -484,11 +484,12 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     while giving up the near side's structure.
 //   - The near endpoint must NOT narrow. If it does, it is already the cheap
 //     side and the ordinary forward route is the right one.
-//   - The near endpoint's own candidate source must be a full scan
-//     (rankOf(...).tier == tierScan) -- not merely "not narrowing". A kind
+//   - The near endpoint's own candidate source must COST what a full scan
+//     costs (scanEquivalentNearSide) -- not merely be "not narrowing". A kind
 //     bitmap is "not narrowing" in endpointNarrows' sense (the bitmap IS its
-//     candidate source, so re-checking it filters nothing further), but it is
-//     still a BOUNDED seed set, and this whole comparison is silent about
+//     candidate source, so re-checking it filters nothing further), but a
+//     SMALL one is still a bounded seed set, and this whole comparison is
+//     silent about
 //     what happens AFTER seeding: the reverse walk's cost is driven by each
 //     far-side seed's IN-DEGREE, which has no relationship to how cheap that
 //     seed was to find, and which this package has no way to estimate before
@@ -499,11 +500,19 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     ranges over a small Computer kind bitmap rather than a full scan --
 //     would pass every OTHER condition here (far side narrows, near side does
 //     not, far side's tier beats near side's) while costing far more to
-//     reverse than to walk forward. Requiring a full scan specifically is the
-//     cheapest available way to rule this out: a full scan's cost is fixed at
-//     env.Snap.NodeCount() regardless of graph structure, so there is no
-//     structural surprise (like an unlucky seed's in-degree) left to be wrong
-//     about on the near side.
+//     reverse than to walk forward. Requiring scan-equivalent cost is the
+//     cheapest available way to rule this out: at that population the near
+//     side's cost is env.Snap.NodeCount() regardless of graph structure, so
+//     there is no structural surprise (like an unlucky seed's in-degree) left
+//     to be wrong about on the near side.
+//
+//     What "scan-equivalent" buys over the exact `tier == tierScan` test this
+//     condition used to spell itself as: a kind bitmap holding essentially
+//     every node in the graph narrows nothing and costs a full scan to
+//     enumerate, so refusing the route for it was a distinction with no
+//     difference -- and an expensive one, because BloodHound labels every AD
+//     node `Base` and writes its shipped prebuilts against it. See
+//     scanEquivalentNearSide for the measurement.
 //
 // What that leaves bounded, and what it does not:
 //
@@ -545,10 +554,58 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 		return false
 	}
 	fromRank := rankOf(env, fromNC)
-	if fromRank.tier != tierScan {
+	if !scanEquivalentNearSide(env, fromRank) {
 		return false
 	}
 	return rankOf(env, toNC).better(fromRank)
+}
+
+// scanEquivalentSlack sets how much of the graph a kind bitmap may be missing
+// and still count as a full scan: at 100, a kind must cover 99% of nodes.
+const scanEquivalentSlack = 100
+
+// scanEquivalentNearSide reports whether r -- a variable-length step's NEAR
+// endpoint rank -- costs what a full scan costs, which is what
+// varLengthReverseEligible's third condition is actually about (see its doc).
+//
+// A bare tierScan qualifies by definition. So does a kind bitmap that holds
+// essentially every node in the snapshot: such a "kind" narrows nothing, so
+// enumerating it IS the full scan the condition means to require, and the
+// structural hazard the condition guards against -- a SMALL kind bitmap whose
+// few seeds turn out to be high in-degree hubs -- cannot arise at that
+// population.
+//
+// This is the second half of the same bug the kindOnlyPredicate rule below
+// fixed. That one taught endpointNarrows to ignore a kind test written in
+// WHERE; a kind written in the PATTERN never reached endpointNarrows at all,
+// it reached this cost test through rankOf -- which returns tierKind for any
+// non-empty Kinds list, and anchorRank.better compares tier before size. So
+// `(:Base)`, 1,025,105 nodes out of 1,025,106 in bench/shgen's 500k graph,
+// outranked a full scan of 1,025,106 and disqualified the constrained-side
+// route. On the shipped "all members of Protected Users" prebuilt
+// (`(:Base)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-525'`)
+// that cost 2551ms where seeding from the far side costs 50ms -- 51x, for the
+// identical answer, with the whole difference in which end got seeded.
+//
+// The threshold is a FRACTION rather than an exact equality deliberately, and
+// it is load-bearing in both directions:
+//
+//   - Exact equality would never fire. BloodHound's datapipe leaves at least
+//     one node (its Meta node) unlabelled by `Base`, so the bitmap is always
+//     at least one short of the node count.
+//   - A fraction is also the semantically right answer on a hybrid graph,
+//     where `Base` covers only the AD half of an AD+Entra deployment. There
+//     `(:Base)` genuinely IS a narrowing, its population falls far below the
+//     threshold, and this declines -- correctly, not as a missed win.
+func scanEquivalentNearSide(env *Env, r anchorRank) bool {
+	if r.tier == tierScan {
+		return true
+	}
+	if r.tier != tierKind {
+		return false
+	}
+	total := env.Snap.NodeCount()
+	return total > 0 && r.size >= total-total/scanEquivalentSlack
 }
 
 // endpointNarrows reports whether nc actually cuts its symbol's candidate set
