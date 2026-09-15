@@ -132,7 +132,7 @@ engine-isolating baseline, speedups are relative to it.
 |---|---|---|---|
 | shortest path, kerberoast pivot | 6.7 ms | 20.0 ms | **3.1 ms** (6.5x) |
 | shortest path, membership chain | 6.9 ms | 116.4 ms | **7.9 ms** (14.7x) |
-| cypher, all Domain Admins (`MemberOf*1..`) | 10.8 ms | 31.7 ms | **2650 ms (84x slower)** |
+| cypher, all Domain Admins (`MemberOf*1..`) | 10.8 ms | 31.7 ms | **16.5 ms** (1.9x) |
 | cypher, kerberoastable scan | 20.2 ms | 21.8 ms | 16.6 ms (1.3x) |
 | cypher, objectid point lookup | 4.4 ms | 2.9 ms | 2.7 ms (1.1x) |
 | members of Domain Admins | 9.8 ms | 5.3 ms | 4.5 ms (1.2x) |
@@ -145,22 +145,36 @@ engine-isolating baseline, speedups are relative to it.
 - **Write-through's cost is confirmed**: the ingest phase runs 185.4 s vs
   150.3 s, **+23%**, inside the 19-34% band the top-level README documents.
   Analysis is unaffected (75.1 vs 75.2 s).
-- **There is a serious regression on the variable-length Cypher prebuilt**
-  -- BloodHound's most-recognizable shipped query -- at this scale: 2650 ms
-  against PostgreSQL's 32 ms. The engine *serves* it (`bloodtrail: cypher
-  engine served`), so this is not a decline-and-delegate cost. Removing the
-  `LIMIT` does not change it (2598 ms), so it is **not** the documented
-  "LIMIT-eligible var-length queries never reverse-seed" gap. One request
-  fans out into several engine serves (durations escalating 0.2 -> 342 ms),
-  and the engine's own serve time sums well below the 2650 ms request, so a
-  meaningful part of the cost sits in path materialization around the
-  engine rather than in traversal itself. **Root cause is not yet
-  established** -- treat this table's Cypher row as an open defect, not a
-  characterization.
+- **The variable-length Cypher prebuilt was 84x SLOWER (2650 ms) when this
+  table was first measured, and is 16.5 ms after the fix that measurement
+  prompted.** Two independent blockers each forced BloodHound's most
+  recognizable shipped query onto a full scan of every node, and because
+  either one alone was sufficient, removing them one at a time each looked
+  like a disproof:
+  1. The prebuilts write their near-endpoint type filter as a WHERE label
+     disjunction, `(a:User or a:Computer)`. Every single-symbol conjunct is
+     pushed into `NodeConstraint.Predicates`, and any predicate counted as
+     "this endpoint narrows" -- which disqualified the constrained-side
+     (reverse) route, even though a kind test is exactly what that rule
+     already said must not count.
+  2. Every shipped prebuilt carries `LIMIT 1000`, which handed the component
+     to the chunked early-termination driver; that driver grows a chunk of
+     NEAR-endpoint rows and structurally cannot seed from the far endpoint.
+     Measured: 20,031 work units with the LIMIT against 19 without, for the
+     same answer.
+
+  Both are fixed in `internal/engine/interpret` (`kindOnlyPredicate`,
+  `componentPrefersReverseSeeding`). The second deliberately overturns a
+  previously pinned design decision -- early termination had been judged
+  worth more than the seeding choice, and measurement said otherwise by
+  three orders of magnitude.
 - **Large membership listings are unaffected** (1.6 s either way): that
   entity-panel path is not one the engine accelerates today.
 - Neo4j and PostgreSQL ingest at the same end-to-end speed here (241 s
   both); they differ in where the time goes, not how much.
+
+The `bloodtrail` column reflects the fixed engine; the pre-fix run is kept
+above in prose because the gap it exposed is the reason the fix exists.
 
 Single run, laptop, one graph shape -- directional, not a lab result.
 
