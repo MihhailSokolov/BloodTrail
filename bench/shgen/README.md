@@ -144,6 +144,29 @@ page, or drive the API flow in `internal/verify/smoke.go`.
 `bloodtrail rollback` returns a deployment to stock whenever you want to
 re-measure a baseline on the same box.
 
+## Measured on the hybrid graph (2026-09-15, 450k AD users + 60k Entra users)
+
+One tenant alongside a 4-domain forest: 692k AD objects + 88k azure items,
+~1.0M nodes after ingest. Both arms measured on identical data, one stack
+resident at a time, canary-checked. Full corpus = BloodHound's 165 shipped
+prebuilt/selector queries + 34 adversarial shapes:
+
+| | stock (pg driver) | BloodTrail |
+|---|---|---|
+| whole-corpus p50 total | 90.5 s | **35.0 s** (0.39x) |
+| azure-touching queries | 55.7 s | **9.0 s** |
+| worst single query | 49.5 s (Shortest paths to Azure Subscriptions) | 1.1 s |
+| queries >5x slower than the other arm | 7 | 7 |
+| ingest (upload -> datapipe idle) | 262 s | 341 s (+30%, write-through) |
+| peak RSS over the sweep | 3.2 GiB | 5.7 GiB |
+
+All 22 azure derived-edge checks (AZGlobalAdmin, SyncedToEntraUser/
+SyncedToADUser, the AZMG* family, AZResetPassword, AZRoleEligible/Approver,
+AZExecuteCommand, key-vault and VM access) return identical results on both
+arms, and result sizes agree on 43 of 47 azure prebuilts -- the remainder are
+the documented LIMIT/shortest-path witness-choice nondeterminism, verified
+node-subset-level.
+
 ## Measured at 500k (2026-09-15)
 
 One run of all three arms on an M3 Pro laptop (Docker Desktop, 7.65 GiB VM),
