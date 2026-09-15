@@ -30,6 +30,7 @@ func generate(cfg config, dir string, chunkSize int) (*summary, error) {
 		{"ous", g.emitOUs},
 		{"containers", g.emitContainers},
 		{"domains", g.emitDomains},
+		{"azure", g.emitAzure},
 	} {
 		if err := step.fn(sum); err != nil {
 			return nil, fmt.Errorf("emit %s: %w", step.typ, err)
@@ -48,6 +49,7 @@ type generator struct {
 
 type summary struct {
 	Users, Computers, Groups, GPOs, OUs, Containers, Domains int
+	AZObjects                                                int
 	Files                                                    []string
 }
 

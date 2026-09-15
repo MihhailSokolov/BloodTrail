@@ -71,6 +71,10 @@ func parseDir(t *testing.T, dir string) *parsedForest {
 		}
 		n := 0
 		switch envelope.Meta.Type {
+		case "azure":
+			// The azure item stream has its own parser and assertions
+			// (azure_test.go); this walker only indexes the AD side.
+			continue
 		case "users":
 			var xs []User
 			mustParse(t, e.Name(), envelope.Data, &xs)

@@ -60,6 +60,38 @@ by `/api/v2/graphs/shortest-path`):
 7. **Cross-domain**: with `-domains > 1`, bidirectional parent-child trusts
    connect the forest, and the root's ENTERPRISE ADMINS reaches everywhere.
 
+## The Entra/Azure tenant (hybrid data)
+
+Passing `-az-users N` (0 disables the whole azure side) adds one Entra
+tenant in AzureHound v2 format, ingested through the same upload as the AD
+files: AZUsers (a configurable share hybrid-synced to AD users by on-prem
+SID), AZGroups, the built-in directory AZRoles with their real template
+GUIDs, AZApps with service principals (including the tenant's Microsoft
+Graph SP), AZDevices, and an Azure resource tree (subscriptions, resource
+groups, AZVMs, AZKeyVaults). Sizing flags mirror the AD side:
+`-az-groups`, `-az-apps`, `-az-devices`, `-az-vms`, `-az-keyvaults`,
+`-az-subs`, `-az-sync-pct`.
+
+Seeded azure attack paths (reserved AZUser indices 0-10, each verified
+live against a stock deployment -- ingest, analysis, and the derived edges
+the prebuilt queries traverse):
+
+- hybrid: AD user (0,0) -> `SyncedToEntraUser` -> the tenant's Global
+  Administrator -> `AZGlobalAdmin` -> tenant (and `SyncedToADUser` back);
+- PIM: user 1 -> `AZRoleEligible` -> Privileged Role Administrator;
+- app owner: user 2 -> `AZOwns` -> app 0 -> `AZRunsAs` -> its SP, which
+  holds RoleManagement.ReadWrite.Directory on Microsoft Graph -- analysis
+  fans that out into `AZMGGrantRole`/`AZMGGrantAppRoles`/`AZMGAddSecret`;
+- role-assignable group: user 3 -> `AZMemberOf` -> TIER ZERO ADMINS ->
+  `AZHasRole` -> Privileged Role Administrator;
+- key vault: user 4 -> `AZGetSecrets`/`AZGetKeys`/`AZGetCertificates` ->
+  vault 0;  VM: user 5 -> `AZVMAdminLogin` -> VM 0;
+- Intune: user 6 -> role -> `AZExecuteCommand` -> every Windows AZDevice;
+- scoped app admin: user 7 -> `AZAppAdmin` -> app 1; approver: user 8 ->
+  `AZRoleApprover` -> the Global Administrator role;
+- and the role matrix itself: `AZResetPassword`, `AZAddSecret`,
+  `AZAddOwner`, `AZAddMembers` all derive from the seeded role holders.
+
 ## Measuring BloodTrail's effect
 
 [`bench.py`](bench.py) automates one side of the comparison: it uploads a
