@@ -747,28 +747,31 @@ func TestVarLengthReverseDeclinesOnBudget(t *testing.T) {
 
 // --- isolation from the chunked LIMIT driver --------------------------------
 
-// TestVarLengthReverseNotUsedByChunkedLimitDriver pins that the chunked LIMIT
-// early-termination driver keeps taking the forward route, byte for byte, over
-// a pattern the full executor WOULD reverse. The chunked driver grows a
-// caller-supplied chunk of FromSym anchor rows, so it structurally cannot host
-// a ToSym-seeded walk; the reversal decision therefore lives only inside the
-// full (non-chunked) executor, and this test is what keeps it there.
+// TestVarLengthReverseUsedEvenWithALimit pins the SECOND half of the "all
+// Domain Admins" regression fix, and deliberately REVERSES what this test
+// asserted before.
 //
-// The assertion is exact, not approximate: the whole query's work must equal
-// the forward decomposition it is built from -- one full FromSym anchor scan,
-// one forward trail walk per anchor row, and one final-row charge per surviving
-// row -- which is the identical figure the chunked driver produced before the
-// reverse route existed. A reverse-seeded chunk would come in far below it.
+// It used to pin the opposite rule: that a LIMIT handed the component to the
+// chunked early-termination driver, which grows a caller-supplied chunk of
+// FromSym anchor rows and therefore structurally cannot host a ToSym-seeded
+// walk, so a LIMIT-ed query kept the forward route even where the unlimited
+// executor would reverse. That was a deliberate, documented choice -- and
+// measurement overturned it: on a 1M-node graph BloodHound's shipped "all
+// Domain Admins" prebuilt (every shipped prebuilt carries LIMIT 1000) spent
+// 20,031 work units through the chunked driver against 19 for the identical
+// query without its LIMIT, for the same answer. The early termination a LIMIT
+// buys is worth far less than the seeding choice it was costing, so
+// limitEligibleComponent now declines exactly the shapes
+// componentPrefersReverseSeeding identifies and lets the ordinary executor
+// (and its reverse route) run instead; the LIMIT still applies at the
+// pipeline's own SKIP/LIMIT pass.
 //
-// That baseline is deliberately assembled from the FORWARD TRAIL PRIMITIVE
-// (expandVarLengthTrailsForSeed) rather than from the per-chunk component tail
-// the driver itself calls: a baseline built out of the very function under
-// test would move in lockstep with any mistake in it, and a comparison whose
-// two sides share a bug can never fail. The fixture is likewise sized past the
-// driver's own chunk size, so a per-chunk tail that ignored its anchor rows and
-// re-ran the whole component would show up as duplicated result rows here, not
-// merely as a different work total.
-func TestVarLengthReverseNotUsedByChunkedLimitDriver(t *testing.T) {
+// The assertion is the reverse decomposition's own figure, built from the
+// BACKWARD trail primitive rather than from the component tail under test, so
+// a baseline and a bug cannot move in lockstep. The fixture is sized past the
+// driver's chunk size so a tail that ignored its anchor rows would show up as
+// duplicated rows rather than merely a different work total.
+func TestVarLengthReverseUsedEvenWithALimit(t *testing.T) {
 	const wide = 2*limitChunk + 1
 	snap := buildReverseAsymmetricFixture(t, wide)
 	env := &Env{Snap: snap}
@@ -779,17 +782,19 @@ func TestVarLengthReverseNotUsedByChunkedLimitDriver(t *testing.T) {
 		t.Fatalf("query %q: want reverse-eligible (otherwise this test proves nothing)", base)
 	}
 
-	// Reconstruct the forward figure from its own pieces.
-	fwd := &workMeter{budget: generousBudget}
-	anchorRows, err := scanAnchor(env, fwd, step.FromSym, part.Nodes[step.FromSym])
+	// Reconstruct the REVERSE figure from its own pieces.
+	rev := &workMeter{budget: generousBudget}
+	seedIDs, err := resolveEndpointSet(env, rev, step.ToSym, part.Nodes[step.ToSym])
 	if err != nil {
-		t.Fatalf("scanAnchor: %v", err)
+		t.Fatalf("resolveEndpointSet: %v", err)
 	}
 	var rows []*Row
-	for _, seed := range anchorRows {
-		grown, err := expandVarLengthTrailsForSeed(env, fwd, step, part.Nodes[step.ToSym], seed, step.PathSym)
+	for _, id := range seedIDs {
+		seed := NewRow()
+		seed.SetNode(step.ToSym, id)
+		grown, err := expandVarLengthTrailsToSeed(env, rev, step, part.Nodes[step.FromSym], seed, step.PathSym)
 		if err != nil {
-			t.Fatalf("expandVarLengthTrailsForSeed: %v", err)
+			t.Fatalf("expandVarLengthTrailsToSeed: %v", err)
 		}
 		rows = append(rows, grown...)
 	}
@@ -797,10 +802,7 @@ func TestVarLengthReverseNotUsedByChunkedLimitDriver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filterRows: %v", err)
 	}
-	wantWork := fwd.work + int64(len(rows)) // one addFinalRow charge per surviving row
-	if wantWork < 2*int64(wide) {
-		t.Fatalf("forward baseline = %d, want at least the %d-unit near-side anchor scan", wantWork, 2*wide)
-	}
+	wantWork := rev.work + int64(len(rows)) // one addFinalRow charge per surviving row
 
 	q := planQuery(t, snap, base+` LIMIT 5`)
 	meter := &workMeter{budget: generousBudget}
@@ -812,6 +814,162 @@ func TestVarLengthReverseNotUsedByChunkedLimitDriver(t *testing.T) {
 		t.Fatalf("got %d rows, want %d", len(rs.Rows), len(rows))
 	}
 	if meter.work != wantWork {
-		t.Fatalf("meter.work = %d, want %d (the chunked LIMIT driver must still run the forward route unchanged)", meter.work, wantWork)
+		t.Fatalf("meter.work = %d, want %d (a LIMIT must no longer force the forward route for a reverse-eligible component)", meter.work, wantWork)
+	}
+	// And the whole point: this must be far below a near-side full scan.
+	if meter.work >= 2*int64(wide) {
+		t.Fatalf("meter.work = %d, which is at or above the %d-unit near-side full scan the reverse route exists to avoid", meter.work, 2*wide)
+	}
+}
+
+// buildDomainAdminsFixture mirrors a real BloodHound forest's shape at small
+// scale, for the two regression tests below: many ordinary users all holding
+// a Domain Users membership (the wide NEAR side), and a short nested-admin
+// chain into a Domain Admins group whose objectid ends '-512' (the narrow FAR
+// side). That asymmetry -- a handful of groups reachable backward against
+// every user forward -- is exactly what the constrained-side route exists to
+// exploit, and what BloodHound's shipped "all Domain Admins" prebuilt walks.
+func buildDomainAdminsFixture(t *testing.T, users int) *snapshot.View {
+	t.Helper()
+	const (
+		daUser     snapshot.KindID = 1
+		daComputer snapshot.KindID = 2
+		daGroup    snapshot.KindID = 3
+		daMemberOf snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{
+		daUser: "User", daComputer: "Computer", daGroup: "Group", daMemberOf: "MemberOf",
+	}
+
+	nodes := []execNodeSpec{
+		{1, []snapshot.KindID{daGroup}, map[string]any{"objectid": "S-1-5-21-1-1-1-512"}},  // Domain Admins
+		{2, []snapshot.KindID{daGroup}, map[string]any{"objectid": "S-1-5-21-1-1-1-1001"}}, // Server Admins
+		{3, []snapshot.KindID{daGroup}, map[string]any{"objectid": "S-1-5-21-1-1-1-1002"}}, // IT Admins
+		{4, []snapshot.KindID{daGroup}, map[string]any{"objectid": "S-1-5-21-1-1-1-1003"}}, // Helpdesk
+		{5, []snapshot.KindID{daGroup}, map[string]any{"objectid": "S-1-5-21-1-1-1-513"}},  // Domain Users hub
+	}
+	edges := []execEdgeSpec{
+		{100, 2, 1, daMemberOf},
+		{101, 3, 2, daMemberOf},
+		{102, 4, 3, daMemberOf},
+	}
+	edgeID := uint64(1000)
+	for i := 0; i < users; i++ {
+		id := uint64(1000 + i)
+		nodes = append(nodes, execNodeSpec{id, []snapshot.KindID{daUser}, map[string]any{
+			"objectid": fmt.Sprintf("S-1-5-21-1-1-1-%d", 10000+i),
+		}})
+		edges = append(edges, execEdgeSpec{edgeID, id, 5, daMemberOf})
+		edgeID++
+	}
+	// One user actually reaches Domain Admins, through the nested chain.
+	edges = append(edges, execEdgeSpec{edgeID, 1000, 4, daMemberOf})
+
+	return buildExecSnapshot(t, kinds, nodes, edges)
+}
+
+// TestVarLengthReverseEligibleIgnoresKindOnlyPredicates pins the fix for the
+// 84x "all Domain Admins" regression the 500k benchmark found.
+//
+// BloodHound's shipped prebuilt writes its near-endpoint type filter as a
+// WHERE label disjunction -- `(a:User or a:Computer)` -- rather than as a
+// pattern label. pushdown copies every single-symbol conjunct into
+// NodeConstraint.Predicates, so that disjunction made endpointNarrows(fromNC)
+// true and disqualified the constrained-side route, sending a query whose far
+// endpoint resolves to a handful of groups down a full scan of every node in
+// the graph instead. A kind test is exactly what endpointNarrows' own doc
+// says must NOT count ("the kind bitmap IS the candidate source"), whether it
+// is written in the pattern or in WHERE.
+func TestVarLengthReverseEligibleIgnoresKindOnlyPredicates(t *testing.T) {
+	snap := buildDomainAdminsFixture(t, 200)
+	env := &Env{Snap: snap}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{
+			name:  "kind disjunction in WHERE does not block the reverse route",
+			query: `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE (a:User or a:Computer) AND t.objectid ENDS WITH '-512' RETURN p`,
+			want:  true,
+		},
+		{
+			name:  "single kind test in WHERE does not block it either",
+			query: `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE a:User AND t.objectid ENDS WITH '-512' RETURN p`,
+			want:  true,
+		},
+		{
+			name:  "no near-side predicate at all stays eligible",
+			query: `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE t.objectid ENDS WITH '-512' RETURN p`,
+			want:  true,
+		},
+		{
+			// A genuine PROPERTY predicate on the near side still blocks it:
+			// that side really can be cut down before expanding, which is the
+			// case the rule was written for.
+			name:  "a property predicate on the near side still blocks it",
+			query: `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE a.objectid ENDS WITH '-1234' AND t.objectid ENDS WITH '-512' RETURN p`,
+			want:  false,
+		},
+		{
+			// Mixed: a kind test AND a property predicate -- the property one
+			// still counts, so the near side is still treated as narrowing.
+			name:  "kind test mixed with a property predicate still blocks it",
+			query: `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE a:User AND a.objectid ENDS WITH '-1234' AND t.objectid ENDS WITH '-512' RETURN p`,
+			want:  false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			part, step := varLengthPartAndStep(t, snap, tc.query)
+			if got := varLengthReverseEligible(env, part, step); got != tc.want {
+				t.Fatalf("varLengthReverseEligible = %v, want %v\nquery: %s", got, tc.want, tc.query)
+			}
+		})
+	}
+}
+
+// TestLimitedQueryStillReverseSeeds is the second half of the "all Domain
+// Admins" regression fix. Every BloodHound prebuilt carries `LIMIT 1000`, and
+// a LIMIT used to hand the whole component to the chunked early-termination
+// driver, which only ever scans the pattern's near endpoint forward and never
+// takes the constrained-side route -- so the shipped query stayed on the full
+// scan even once its kind test stopped disqualifying the reverse route.
+//
+// Measured rather than asserted structurally: the same query with and without
+// its LIMIT must both produce the same rows, and the LIMIT-ed one must not
+// cost dramatically more work than the unlimited one (it used to cost the
+// whole graph).
+func TestLimitedQueryStillReverseSeeds(t *testing.T) {
+	snap := buildDomainAdminsFixture(t, 5000)
+
+	const (
+		limited   = `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE (a:User or a:Computer) AND t.objectid ENDS WITH '-512' RETURN p LIMIT 1000`
+		unlimited = `MATCH p = (t:Group)<-[:MemberOf*1..]-(a) WHERE (a:User or a:Computer) AND t.objectid ENDS WITH '-512' RETURN p`
+	)
+
+	run := func(query string) (int64, int) {
+		t.Helper()
+		plan := planQuery(t, snap, query)
+		meter := &workMeter{budget: Budgets{MaxRows: 100000, MaxWork: 1 << 34}}
+		rs, err := runQuery(&Env{Snap: snap}, plan, meter)
+		if err != nil {
+			t.Fatalf("runQuery(%q): %v", query, err)
+		}
+		return meter.work, len(rs.Rows)
+	}
+
+	limWork, limRows := run(limited)
+	unlWork, unlRows := run(unlimited)
+	t.Logf("limited: work=%d rows=%d   unlimited: work=%d rows=%d", limWork, limRows, unlWork, unlRows)
+
+	if limRows != unlRows {
+		t.Fatalf("LIMIT changed the answer: %d rows vs %d unlimited", limRows, unlRows)
+	}
+	// The unlimited form reverse-seeds and touches a handful of nodes. Adding
+	// a LIMIT larger than the result set must not turn that into a full scan;
+	// allow generous headroom, but a whole-graph walk is ~4x the node count.
+	if limWork > unlWork*4+1000 {
+		t.Fatalf("adding a LIMIT cost %d work units against the unlimited form's %d -- the chunked driver is still refusing the constrained-side route", limWork, unlWork)
 	}
 }
