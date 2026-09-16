@@ -135,6 +135,7 @@ package interpret
 import (
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/graph"
@@ -340,6 +341,10 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // segment -- see assembleChainPathVal's doc. "" skips binding entirely,
 // matching a caller with no path to assemble.
 func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+	// The forward walk follows edges outward, so a node extends the trail
+	// when it has an admissible OUTGOING edge.
+	contIDs := trailContinuationSet(env, step, true)
+
 	// A self-loop of an admitted kind anywhere in the view makes pg's
 	// seed-side is_cycle guard placement observable, and that placement
 	// depends on dawgs heuristics this engine deliberately does not mirror
@@ -444,6 +449,16 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			// excluded -- see Row.trailEdges' doc.
 			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
+			}
+
+			// Same pruning the reverse walker applies, for the same reason:
+			// a neighbour that can neither carry the trail further nor be
+			// the pattern's endpoint never becomes a frame. See
+			// trailCanContinue.
+			if depth+1 == maxHops || !trailCanContinue(contIDs, c.other) {
+				if depth+1 < minDepth || !nodeSatisfiesConstraint(env, toNC, c.other) {
+					continue
+				}
 			}
 
 			nextNodes := make([]snapshot.NodeID, depth+2)
@@ -772,6 +787,9 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 	// trail materialized before the pipeline's own SKIP/LIMIT threw nearly
 	// all of them away.
 	cap := reverseTrailRowCap(meter, part, step)
+	// The reverse walk follows edges backward, so a node extends the trail
+	// when it has an admissible INCOMING edge.
+	contIDs := trailContinuationSet(env, step, false)
 
 	var out []*Row
 	for _, id := range seedIDs {
@@ -784,7 +802,7 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 		}
 		seed := NewRow()
 		seed.SetNode(step.ToSym, id)
-		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym, remaining)
+		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym, remaining, contIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -818,6 +836,41 @@ func reverseTrailRowCap(meter *workMeter, part *Part, step *Step) int {
 		return 0
 	}
 	return int(meter.limitTarget)
+}
+
+// trailCanContinue reports whether n can extend a trail one more hop, by
+// membership in the endpoint set for the walk's own direction. ids must be
+// the sorted set EdgeKindEndpoints returns; a nil set means "unknown", which
+// admits everything.
+//
+// This is what stops a trail walk from paying for nodes that cannot matter.
+// Walking BACKWARD over MemberOf from a Tier Zero group reaches every member
+// -- hundreds of thousands of users on a real graph -- and a user can neither
+// continue the trail (nothing is a member OF a user, so it has no admissible
+// incoming edge) nor be the pattern's endpoint (which is labelled Group). The
+// shipped "Nested groups within Tier Zero / High Value" prebuilt answers with
+// twelve paths and was allocating a stack frame, a node slice and an edge
+// slice for each of those users on the way.
+func trailCanContinue(ids []snapshot.NodeID, n snapshot.NodeID) bool {
+	if ids == nil {
+		return true
+	}
+	i := sort.Search(len(ids), func(i int) bool { return ids[i] >= n })
+	return i < len(ids) && ids[i] == n
+}
+
+// trailContinuationSet resolves the endpoint set a trail walk can continue
+// from, or nil when the step declares no relationship kinds (every edge
+// qualifies, so the set narrows nothing).
+func trailContinuationSet(env *Env, step *Step, outgoing bool) []snapshot.NodeID {
+	if len(step.EdgeKinds) == 0 {
+		return nil
+	}
+	ids, ok := env.Snap.EdgeKindEndpoints(step.EdgeKinds, outgoing)
+	if !ok {
+		return nil
+	}
+	return ids
 }
 
 // reverseTrailFrame is one partial (or complete) trail on
@@ -871,7 +924,7 @@ type reverseTrailFrame struct {
 // key.
 // rowCap, when positive, stops the walk once it has produced that many rows;
 // see reverseTrailRowCap for why truncating is sound and when it is offered.
-func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string, rowCap int) ([]*Row, error) {
+func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string, rowCap int, contIDs []snapshot.NodeID) ([]*Row, error) {
 	// Same self-loop hazard decline as the forward walker -- see its comment
 	// and the package doc's SELF-LOOPS bullet.
 	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
@@ -977,6 +1030,17 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			// ever hands this walker a row carrying fixed-step edges.
 			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
+			}
+
+			// A neighbour that can neither carry the trail further nor be
+			// the pattern's own endpoint cannot contribute anything, so it
+			// never becomes a frame. The cheap index test comes first: a
+			// node that CAN continue needs no constraint evaluation here,
+			// and one that cannot is usually a leaf the constraint rejects.
+			if depth+1 == maxHops || !trailCanContinue(contIDs, c.other) {
+				if depth+1 < minDepth || !nodeSatisfiesConstraint(env, fromNC, c.other) {
+					continue
+				}
 			}
 
 			nextNodes := make([]snapshot.NodeID, depth+2)

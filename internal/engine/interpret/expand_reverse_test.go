@@ -846,7 +846,7 @@ func TestVarLengthReverseUsedEvenWithALimit(t *testing.T) {
 	for _, id := range seedIDs {
 		seed := NewRow()
 		seed.SetNode(step.ToSym, id)
-		grown, err := expandVarLengthTrailsToSeed(env, rev, step, part.Nodes[step.FromSym], seed, step.PathSym, 0)
+		grown, err := expandVarLengthTrailsToSeed(env, rev, step, part.Nodes[step.FromSym], seed, step.PathSym, 0, nil)
 		if err != nil {
 			t.Fatalf("expandVarLengthTrailsToSeed: %v", err)
 		}
@@ -1348,5 +1348,68 @@ func TestVarLengthReverseHonoursTheLimit(t *testing.T) {
 		Budgets{MaxRows: 100000, MaxWork: 10000000, MaxLiveRows: 100000})
 	if len(full.Rows) <= 5 {
 		t.Fatalf("unlimited query returned %d rows; the fixture is not exercising truncation", len(full.Rows))
+	}
+}
+
+// TestTrailWalkSkipsDeadEndNeighbours pins the pruning that keeps a trail
+// walk from paying for nodes that cannot contribute.
+//
+// The fixture is the shipped "Nested groups within Tier Zero / High Value"
+// shape: a handful of groups nested into a tagged one, each carrying many
+// members that are NOT groups. Walking backward reaches every member, and a
+// member can neither continue the trail (nothing is a member of it, so it has
+// no admissible incoming edge) nor be the pattern's endpoint (which is
+// labelled Group). Under a budget far too small to have framed them all, the
+// answer must still come out.
+func TestTrailWalkSkipsDeadEndNeighbours(t *testing.T) {
+	const (
+		kiGroup snapshot.KindID = 1
+		kiUser  snapshot.KindID = 2
+		keMem   snapshot.KindID = 3
+	)
+	kinds := map[snapshot.KindID]string{kiGroup: "Group", kiUser: "User", keMem: "MemberOf"}
+
+	const groups, membersPer = 6, 500
+	var nodes []execNodeSpec
+	var edges []execEdgeSpec
+	var id, eid uint64
+	nextID := func() uint64 { id++; return id }
+	nextE := func() uint64 { eid++; return eid }
+
+	var groupIDs []uint64
+	for i := 0; i < groups; i++ {
+		g := nextID()
+		props := map[string]any{"objectid": fmt.Sprintf("S-1-5-21-1-1-9-%d", 3000+i)}
+		if i == 0 {
+			props["system_tags"] = "admin_tier_0"
+		}
+		nodes = append(nodes, execNodeSpec{g, []snapshot.KindID{kiGroup}, props})
+		groupIDs = append(groupIDs, g)
+	}
+	// Each group is a member of the one before it, so the tagged group is
+	// reachable backward through the chain.
+	for i := 1; i < groups; i++ {
+		edges = append(edges, execEdgeSpec{nextE(), groupIDs[i], groupIDs[i-1], keMem})
+	}
+	// Many plain users in each group: reachable backward, useful to nobody.
+	for _, g := range groupIDs {
+		for j := 0; j < membersPer; j++ {
+			u := nextID()
+			nodes = append(nodes, execNodeSpec{u, []snapshot.KindID{kiUser},
+				map[string]any{"objectid": fmt.Sprintf("S-1-5-21-1-1-1-%d", u)}})
+			edges = append(edges, execEdgeSpec{nextE(), u, g, keMem})
+		}
+	}
+	snap := buildExecSnapshot(t, kinds, nodes, edges)
+
+	const query = `MATCH p=(t:Group)<-[:MemberOf*1..]-(s:Group) ` +
+		`WHERE COALESCE(t.system_tags, '') CONTAINS 'admin_tier_0' RETURN p`
+
+	// groups*membersPer = 3000 dead-end members; a budget of 200 cannot have
+	// framed them, and the five nested groups must still come back.
+	rs := mustExec(t, snap, query, Budgets{MaxRows: 1000, MaxWork: 200, MaxLiveRows: 10000})
+	if len(rs.Rows) != groups-1 {
+		t.Fatalf("got %d rows, want %d (each nested group reaching the tagged one)",
+			len(rs.Rows), groups-1)
 	}
 }
