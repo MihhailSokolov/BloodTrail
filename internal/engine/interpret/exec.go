@@ -312,23 +312,161 @@ func matchPart(env *Env, part *Part, meter *workMeter) ([]*Row, error) {
 		return nil, nil
 	}
 
+	comps := groupComponents(part)
 	var merged []*Row
+	var mergedSyms []string
 	first := true
-	for _, comp := range groupComponents(part) {
+	for _, comp := range comps {
 		rows, err := runComponent(env, meter, part, comp.syms, comp.stepIdxs)
 		if err != nil {
 			return nil, err
 		}
 		if first {
-			merged, first = rows, false
+			merged, mergedSyms, first = rows, append([]string(nil), comp.syms...), false
 			continue
 		}
-		merged, err = cartesianJoin(meter, merged, rows)
+		// A WHERE equality linking the two sides turns what would be a
+		// cartesian product into an equi-join. Cypher writes cross-cloud
+		// correlations exactly this way -- `MATCH (E:AZBase) MATCH (A:Base)
+		// WHERE E.onpremid = A.objectid` -- and the product of those two
+		// components on a real graph is ~60k x 920k rows, which no budget
+		// can afford and which spendProduct correctly refuses. Hashing one
+		// side on the join value answers the same query in one pass.
+		if left, right, ok := equiJoinKeys(part.Where, mergedSyms, comp.syms); ok {
+			merged, err = hashJoin(env, meter, merged, rows, left, right)
+		} else {
+			merged, err = cartesianJoin(meter, merged, rows)
+		}
 		if err != nil {
 			return nil, err
 		}
+		mergedSyms = append(mergedSyms, comp.syms...)
 	}
 	return merged, nil
+}
+
+// equiJoinKeys finds a top-level WHERE conjunct of the form
+// `<leftExpr> = <rightExpr>` whose two sides reference symbols from
+// DIFFERENT components -- the join condition hiding in a cartesian product.
+// The returned expressions are oriented to match the caller's (left, right)
+// row sets.
+//
+// Only a property lookup per side qualifies, and only `=`: this exists to
+// replace a product that cannot be afforded, not to build a general join
+// planner, and any conjunct it does not recognize simply leaves the product
+// in place -- still correct, and still refused by the budget when it is too
+// large.
+//
+// Recognizing a conjunct that does NOT hold for every result row is the one
+// way this can be wrong, which is why the search is restricted to top-level
+// conjuncts: matchPart does not apply WHERE (Execute does, over the complete
+// row set), so the join only has to avoid DROPPING a row that WHERE would
+// keep. Every such row satisfies every top-level conjunct, this one
+// included, so hashing on it drops nothing. A conjunct under an OR or a NOT
+// carries no such guarantee, and flattenTopLevelConjuncts hands those back
+// whole rather than descending into them.
+func equiJoinKeys(where cypher.Expression, leftSyms, rightSyms []string) (left, right cypher.Expression, ok bool) {
+	if where == nil {
+		return nil, nil, false
+	}
+	inSet := func(syms []string, sym string) bool {
+		for _, s := range syms {
+			if s == sym {
+				return true
+			}
+		}
+		return false
+	}
+	for _, conjunct := range flattenTopLevelConjuncts(where) {
+		op, a, b, isCmp := asSingleComparison(conjunct)
+		if !isCmp || op != cypher.OperatorEquals {
+			continue
+		}
+		aSym, aOK := propertyLookupSymbol(a)
+		bSym, bOK := propertyLookupSymbol(b)
+		if !aOK || !bOK || aSym == bSym {
+			continue
+		}
+		switch {
+		case inSet(leftSyms, aSym) && inSet(rightSyms, bSym):
+			return a, b, true
+		case inSet(leftSyms, bSym) && inSet(rightSyms, aSym):
+			return b, a, true
+		}
+	}
+	return nil, nil, false
+}
+
+// propertyLookupSymbol returns the variable a property lookup reads, or
+// false for any other expression shape.
+func propertyLookupSymbol(expr cypher.Expression) (string, bool) {
+	pl, isProp := unwrapParens(expr).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol == "" {
+		return "", false
+	}
+	return v.Symbol, true
+}
+
+// hashJoin joins left and right on leftExpr == rightExpr, hashing the RIGHT
+// side and probing with the left. Row cost is charged per emitted row, the
+// same accounting cartesianJoin uses, so a join whose output is genuinely
+// enormous is still refused -- what changes is that a SELECTIVE join no
+// longer has to pay for the product it would have built.
+//
+// Only an ABSENT property is skipped, because absence is the sole source of
+// NULL in PropEq -- the predicate this join has to agree with. A PRESENT
+// JSON null is a value like any other here and joins with another present
+// JSON null, because pg's jsonb `=` says `'null'::jsonb = 'null'::jsonb` is
+// true and PropEq (via jsonbEqual) reproduces that. appendScalarKey already
+// encodes present null as its own key, so this needs no special case -- but
+// it does need the skip to test presence, NOT nil-ness: skipping nil would
+// drop rows the WHERE that follows would have kept.
+func hashJoin(env *Env, meter *workMeter, left, right []*Row, leftExpr, rightExpr cypher.Expression) ([]*Row, error) {
+	buckets := make(map[string][]*Row, len(right))
+	for _, r := range right {
+		v, present, err := EvalValue(env, r, rightExpr)
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			continue
+		}
+		key := string(appendScalarKey(nil, v))
+		buckets[key] = append(buckets[key], r)
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+	}
+
+	var out []*Row
+	for _, l := range left {
+		v, present, err := EvalValue(env, l, leftExpr)
+		if err != nil {
+			return nil, err
+		}
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+		if !present {
+			continue
+		}
+		for _, r := range buckets[string(appendScalarKey(nil, v))] {
+			nr := cloneRow(l)
+			mergeRowInto(nr, r)
+			if err := meter.spend(1); err != nil {
+				return nil, err
+			}
+			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
 }
 
 // partCannotMatch reports whether part contains a Step that requires at least
