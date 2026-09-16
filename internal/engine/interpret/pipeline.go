@@ -604,6 +604,14 @@ func componentAnchorSym(env *Env, part *Part, comp component) string {
 	stepIdxs := comp.stepIdxs
 	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
 	if pathUniform && (hasSpecialStep(part, stepIdxs) || pathSym != "") {
+		if !hasSpecialStep(part, stepIdxs) {
+			// A pure-fixed named-path chain may be walked from either end;
+			// scan whichever one expandChainComponentFrom will actually
+			// walk from (the same deterministic chainWalkReversed decision,
+			// so a chunk of these anchor rows always meets the loop that
+			// expects them).
+			return chainAnchorSym(env, part, stepIdxs)
+		}
 		return part.Chains[stepIdxs[0]].FromSym
 	}
 	return chooseAnchor(env, part.Nodes, comp.syms)

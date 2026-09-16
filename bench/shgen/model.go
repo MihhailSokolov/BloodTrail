@@ -18,6 +18,11 @@ const metaMethods = 46067
 // metaVersion is the SharpHound JSON format version this generator emits.
 const metaVersion = 6
 
+// azureMetaVersion is the AzureHound format version stamped on azure files;
+// BloodHound's azure decode path dispatches purely on meta.type, so this is
+// informational, matching what AzureHound v2.x itself writes.
+const azureMetaVersion = 5
+
 // Meta is the per-file trailer.
 type Meta struct {
 	Methods int    `json:"methods"`

@@ -982,18 +982,20 @@ func TestLimitedQueryStillReverseSeeds(t *testing.T) {
 // `(:Base)` rather than leaving it bare. Group is a small minority of nodes,
 // User and Computer are large minorities, and Base covers everything -- so
 // one fixture exercises all three sides of scanEquivalentNearSide's rule.
-func buildBaseLabelledFixture(t *testing.T, users, computers int) *snapshot.View {
+func buildBaseLabelledFixture(t *testing.T, users, computers, entraUsers int) *snapshot.View {
 	t.Helper()
 	const (
 		blBase     snapshot.KindID = 1
 		blUser     snapshot.KindID = 2
 		blComputer snapshot.KindID = 3
 		blGroup    snapshot.KindID = 4
+		blAZBase   snapshot.KindID = 5
+		blAZUser   snapshot.KindID = 6
 		blMemberOf snapshot.KindID = 10
 	)
 	kinds := map[snapshot.KindID]string{
 		blBase: "Base", blUser: "User", blComputer: "Computer",
-		blGroup: "Group", blMemberOf: "MemberOf",
+		blGroup: "Group", blAZBase: "AZBase", blAZUser: "AZUser", blMemberOf: "MemberOf",
 	}
 
 	group := func(id uint64, rid string) execNodeSpec {
@@ -1030,6 +1032,16 @@ func buildBaseLabelledFixture(t *testing.T, users, computers int) *snapshot.View
 	add(users, blUser)
 	add(computers, blComputer)
 
+	// entraUsers carry AZBase/AZUser and NOT Base -- the hybrid shape, where
+	// `Base` is a large majority of the graph rather than the whole of it.
+	for i := 0; i < entraUsers; i++ {
+		id := nodeID
+		nodeID++
+		nodes = append(nodes, execNodeSpec{id, []snapshot.KindID{blAZBase, blAZUser}, map[string]any{
+			"objectid": fmt.Sprintf("%08X-0000-0000-0000-%012X", i, i),
+		}})
+	}
+
 	// Exactly one principal actually reaches Domain Admins, through the
 	// nested chain -- so the answer is a handful of rows however it is found.
 	edges = append(edges, execEdgeSpec{edgeID, 1000, 4, blMemberOf})
@@ -1048,7 +1060,7 @@ func buildBaseLabelledFixture(t *testing.T, users, computers int) *snapshot.View
 // cost test through rankOf, which ranks any kind as tierKind and so outranked
 // a full scan of the same node count.
 func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
-	snap := buildBaseLabelledFixture(t, 100, 100)
+	snap := buildBaseLabelledFixture(t, 60, 60, 0)
 	env := &Env{Snap: snap}
 
 	for _, tc := range []struct {
@@ -1067,9 +1079,10 @@ func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
 			want:  true,
 		},
 		{
-			// 100 of 205 nodes: a real narrowing, and the hazard the rule
-			// exists for (an unlucky seed's in-degree) is live again.
-			name:  "a large-minority kind on the near side still blocks it",
+			// 60 of 125 nodes -- just under a majority: a real narrowing,
+			// and the hazard the rule exists for (an unlucky seed's
+			// in-degree) is live.
+			name:  "a minority kind on the near side still blocks it",
 			query: `MATCH p = (:User)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
 			want:  false,
 		},
@@ -1093,6 +1106,23 @@ func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
 			}
 		})
 	}
+
+	// The HYBRID shape is the rule's hardest case and the reason the
+	// threshold is a majority rather than near-totality: with an Entra side
+	// present, `Base` labels only the AD nodes -- a large majority, not the
+	// whole graph -- and a first version of this rule (>=99% coverage)
+	// refused the reverse route for it, which walked the shipped
+	// Protected-Users prebuilt forward for ~3.0s on the hybrid benchmark
+	// graph against ~20ms of far-side seeding.
+	t.Run("a large-majority kind on a hybrid graph is scan-equivalent", func(t *testing.T) {
+		hybrid := buildBaseLabelledFixture(t, 60, 60, 20) // Base = 125/145 ~ 86%
+		env := &Env{Snap: hybrid}
+		part, step := varLengthPartAndStep(t, hybrid,
+			`MATCH p = (:Base)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`)
+		if !varLengthReverseEligible(env, part, step) {
+			t.Fatal("a Base kind covering ~86% of a hybrid graph must be scan-equivalent")
+		}
+	})
 }
 
 // TestBaseLabelledPrebuiltDoesNotScan is the end-to-end half: the shipped
@@ -1105,7 +1135,7 @@ func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
 // therefore required to be the same query: on the 500k benchmark graph this
 // difference was 2551ms versus 50ms for an identical 108-node answer.
 func TestBaseLabelledPrebuiltDoesNotScan(t *testing.T) {
-	snap := buildBaseLabelledFixture(t, 2000, 2000)
+	snap := buildBaseLabelledFixture(t, 2000, 2000, 600)
 	nodeCount := snap.NodeCount()
 
 	const (

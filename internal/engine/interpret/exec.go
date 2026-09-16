@@ -810,12 +810,59 @@ func pathStepArcKey(stepIdx int) string {
 // exclude each other across the whole chain, in both orders (see expand.go's
 // package doc's CROSS-STEP bullet and Row.trailEdges' doc).
 func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string) ([]*Row, error) {
-	startSym := part.Chains[stepIdxs[0]].FromSym
+	startSym := chainAnchorSym(env, part, stepIdxs)
 	rows, err := scanAnchor(env, meter, startSym, part.Nodes[startSym])
 	if err != nil {
 		return nil, err
 	}
 	return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, rows)
+}
+
+// chainWalkReversed reports whether a strict chain should be walked from its
+// RIGHTMOST symbol leftward instead of the default left-to-right order:
+// every step is fixed-length (a variable-length step can only ever expand
+// forward from its own FromSym -- expandChainComponent's doc), and the
+// rightmost endpoint's candidate source ranks strictly better than the
+// leftmost's.
+//
+// Why this exists: BloodHound writes many prebuilts as named-path chains
+// whose SELECTIVE end is on the right -- `MATCH p = (:User)-
+// [:SyncedToEntraUser]->(:AZUser)-[:AZRoleEligible]->(:AZRole) RETURN p` --
+// and arrow normalization (buildStep's inbound swap) means even a query
+// WRITTEN right-to-left still puts the wide symbol in stepIdxs[0].FromSym.
+// Anchoring left walked 450k Users to reach 20 roles: 284ms measured on the
+// hybrid benchmark graph, against 8.6ms for the identical pattern executed
+// through the general BFS (which already anchors cost-optimally, but only
+// serves unnamed patterns). A fixed step expands equally well in either
+// direction (expandStep's boundIsFrom, the same primitive runComponent's
+// BFS uses), and path assembly reads each row's BINDINGS in written order
+// (assembleChainPathVal), not the walk order, so the reversed walk changes
+// which rows exist at each intermediate stage and nothing about the rows
+// that come out.
+//
+// Both the direct executor and the chunked LIMIT driver derive the walk
+// direction from this one deterministic function (componentAnchorSym scans
+// the same end this walks from), so a chunk of anchor rows always meets the
+// loop that expects them.
+func chainWalkReversed(env *Env, part *Part, stepIdxs []int) bool {
+	for _, idx := range stepIdxs {
+		if part.Chains[idx].Range != nil {
+			return false
+		}
+	}
+	first := part.Chains[stepIdxs[0]].FromSym
+	last := part.Chains[stepIdxs[len(stepIdxs)-1]].ToSym
+	return rankOf(env, part.Nodes[last]).better(rankOf(env, part.Nodes[first]))
+}
+
+// chainAnchorSym is the symbol expandChainComponent scans as the chain's
+// sole anchor: the rightmost endpoint when chainWalkReversed says to walk
+// backward, the leftmost otherwise.
+func chainAnchorSym(env *Env, part *Part, stepIdxs []int) string {
+	if chainWalkReversed(env, part, stepIdxs) {
+		return part.Chains[stepIdxs[len(stepIdxs)-1]].ToSym
+	}
+	return part.Chains[stepIdxs[0]].FromSym
 }
 
 // expandChainComponentFrom is expandChainComponent's own step-by-step
@@ -827,6 +874,39 @@ func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int
 // in chain order, and pathSym's PathVal assembly (assembleChainPathVal)
 // still runs last, over the fully-grown rows -- unchanged by this split.
 func expandChainComponentFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string, anchorRows []*Row) ([]*Row, error) {
+	// A pure-fixed chain whose rightmost end ranks better is walked from
+	// that end leftward (chainWalkReversed); anchorRows are then rows of the
+	// RIGHTMOST symbol (chainAnchorSym scans the same end). Each step still
+	// expands through expandStep -- just bound on its ToSym -- and the
+	// bindings that come out are identical to a forward walk's, so the
+	// pathSym assembly below is untouched.
+	if chainWalkReversed(env, part, stepIdxs) {
+		rows := anchorRows
+		var err error
+		for i := len(stepIdxs) - 1; i >= 0; i-- {
+			idx := stepIdxs[i]
+			step := &part.Chains[idx]
+			arcKey := ""
+			if pathSym != "" {
+				arcKey = pathStepArcKey(idx)
+			}
+			rows, err = expandStep(env, meter, rows, step, step.ToSym, step.FromSym, false, part.Nodes[step.FromSym], arcKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if pathSym != "" {
+			for _, r := range rows {
+				pv, err := assembleChainPathVal(r, part, stepIdxs)
+				if err != nil {
+					return nil, err
+				}
+				r.SetPathVar(pathSym, pv)
+			}
+		}
+		return rows, nil
+	}
+
 	rows := anchorRows
 	var err error
 
@@ -1114,6 +1194,27 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 		}
 		r := NewRow()
 		r.SetNode(sym, id)
+		// Pushed single-symbol predicates are applied HERE, not only in the
+		// eventual Part.Where pass (where they remain and run again,
+		// redundantly but harmlessly, over what survives). Filtering at the
+		// anchor is what keeps a selective predicate from amplifying:
+		// `(s:Group)-[:AdminTo]->(c) WHERE s.objectid ENDS WITH '-513'`
+		// anchors on the 25k-strong Group bitmap, and without this check
+		// every one of those groups became a row and was EXPANDED, with the
+		// WHERE only mopping up afterwards -- the row set was 25,000x larger
+		// than the answer for the whole middle of the pipeline. Semantics
+		// are unchanged by construction: a single-symbol conjunct references
+		// nothing but sym, its evaluation on this one-binding row is exactly
+		// its evaluation on any later superset row, and only TriTrue admits
+		// -- the same bar filterRows applies. An evaluation error declines
+		// the query, exactly as it would have in filterRows.
+		ok, err := predicatesAdmit(env, r, nc)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
 		if err := meter.spend(1); err != nil {
 			return err
 		}
@@ -1179,6 +1280,28 @@ func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*
 		return nil, err
 	}
 	return rows, nil
+}
+
+// predicatesAdmit evaluates nc's pushed single-symbol predicates against r,
+// admitting only a row every predicate holds TriTrue for -- the same bar
+// filterRows applies to Part.Where, where these conjuncts also still live
+// and run again over the survivors. An evaluation error is returned as-is
+// (the caller declines the query, exactly as filterRows would have); an
+// unknown (TriNull) result drops the candidate, Cypher's WHERE semantics.
+func predicatesAdmit(env *Env, r *Row, nc *NodeConstraint) (bool, error) {
+	if nc == nil {
+		return true, nil
+	}
+	for _, pred := range nc.Predicates {
+		t, err := EvalPredicate(env, r, pred)
+		if err != nil {
+			return false, err
+		}
+		if t != TriTrue {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // nodeSatisfiesConstraint reports whether id carries every one of nc's kind
@@ -1505,6 +1628,18 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			}
 			nr := cloneRow(r)
 			nr.SetNode(unboundSym, c.other)
+			// The far endpoint's own pushed predicates gate expansion the
+			// same way they gate the anchor scan (scanAnchorVisit's admit):
+			// a candidate whose target fails its single-symbol WHERE
+			// conjuncts would only ever be deleted by filterRows later, and
+			// in the meantime each one is a row the rest of the component
+			// pays to carry. Same bar, same error semantics, evaluated on
+			// the row the candidate would otherwise become.
+			if ok, err := predicatesAdmit(env, nr, unboundNC); err != nil {
+				return nil, err
+			} else if !ok {
+				continue
+			}
 			if step.EdgeSym != "" {
 				nr.SetEdge(step.EdgeSym, edgeRefFor(env.Snap, c))
 			}

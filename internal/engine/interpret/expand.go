@@ -507,12 +507,12 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     to be wrong about on the near side.
 //
 //     What "scan-equivalent" buys over the exact `tier == tierScan` test this
-//     condition used to spell itself as: a kind bitmap holding essentially
-//     every node in the graph narrows nothing and costs a full scan to
-//     enumerate, so refusing the route for it was a distinction with no
-//     difference -- and an expensive one, because BloodHound labels every AD
-//     node `Base` and writes its shipped prebuilts against it. See
-//     scanEquivalentNearSide for the measurement.
+//     condition used to spell itself as: a kind bitmap holding a majority of
+//     the graph's nodes costs scan-order work to walk forward, so refusing
+//     the route for it kept the expensive path -- and BloodHound labels
+//     every AD node `Base` and writes its shipped prebuilts against it,
+//     which on a hybrid AD+Entra graph is a large-majority kind rather than
+//     a universal one. See scanEquivalentNearSide for the measurements.
 //
 // What that leaves bounded, and what it does not:
 //
@@ -560,9 +560,6 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 	return rankOf(env, toNC).better(fromRank)
 }
 
-// scanEquivalentSlack sets how much of the graph a kind bitmap may be missing
-// and still count as a full scan: at 100, a kind must cover 99% of nodes.
-const scanEquivalentSlack = 100
 
 // scanEquivalentNearSide reports whether r -- a variable-length step's NEAR
 // endpoint rank -- costs what a full scan costs, which is what
@@ -587,16 +584,28 @@ const scanEquivalentSlack = 100
 // that cost 2551ms where seeding from the far side costs 50ms -- 51x, for the
 // identical answer, with the whole difference in which end got seeded.
 //
-// The threshold is a FRACTION rather than an exact equality deliberately, and
-// it is load-bearing in both directions:
+// The threshold is "a majority of the graph", not near-equality, and the
+// distinction was MEASURED, not chosen aesthetically. A first version of this
+// rule required >=99% coverage, reasoning that a hybrid AD+Entra graph --
+// where `Base` labels only the AD side -- should keep declining. That was
+// backwards: on the hybrid benchmark graph `Base` covers ~91% of 1.01M
+// nodes, the 99% rule refused the reverse route, and the shipped
+// Protected-Users prebuilt walked forward for ~3.0 seconds against ~20ms of
+// far-side seeding -- on exactly the deployment shape (hybrid) real
+// installations run. What the condition is protecting is the HAZARD CASE: a
+// small kind bitmap whose few seeds hide an unbounded in-degree surprise
+// (see the third-condition bullet above). A kind covering at least half the
+// graph cannot be that case -- walking it forward already costs scan-order
+// work, which is precisely when giving up the near side's structure for the
+// far side's selectivity is worth the in-degree risk the work meter
+// backstops. Below a majority the near side keeps the forward route: its
+// bitmap is genuinely bounded, and the hub hazard is live
+// (TestVarLengthReverseRejectsHighInDegreeHub pins the extreme).
 //
-//   - Exact equality would never fire. BloodHound's datapipe leaves at least
-//     one node (its Meta node) unlabelled by `Base`, so the bitmap is always
-//     at least one short of the node count.
-//   - A fraction is also the semantically right answer on a hybrid graph,
-//     where `Base` covers only the AD half of an AD+Entra deployment. There
-//     `(:Base)` genuinely IS a narrowing, its population falls far below the
-//     threshold, and this declines -- correctly, not as a missed win.
+// A fraction rather than exact equality also matters at the top end:
+// BloodHound's datapipe leaves at least one node (its Meta node) unlabelled
+// by `Base`, so even an AD-only deployment's bitmap is always at least one
+// short of the node count.
 func scanEquivalentNearSide(env *Env, r anchorRank) bool {
 	if r.tier == tierScan {
 		return true
@@ -605,7 +614,7 @@ func scanEquivalentNearSide(env *Env, r anchorRank) bool {
 		return false
 	}
 	total := env.Snap.NodeCount()
-	return total > 0 && r.size >= total-total/scanEquivalentSlack
+	return total > 0 && r.size*2 >= total
 }
 
 // endpointNarrows reports whether nc actually cuts its symbol's candidate set
@@ -1262,25 +1271,13 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 		return nil, err
 	}
 
+	// scanAnchorVisit's admit already evaluated nc.Predicates per candidate
+	// (predicatesAdmit) -- the per-row re-check this function used to carry
+	// moved there so every anchor consumer narrows early, not just this one.
 	ids := make([]snapshot.NodeID, 0, len(rows))
 	for _, r := range rows {
 		id, _ := r.Node(sym)
-		ok := true
-		if nc != nil {
-			for _, pred := range nc.Predicates {
-				t, err := EvalPredicate(env, r, pred)
-				if err != nil {
-					return nil, err
-				}
-				if t != TriTrue {
-					ok = false
-					break
-				}
-			}
-		}
-		if ok {
-			ids = append(ids, id)
-		}
+		ids = append(ids, id)
 	}
 	return ids, nil
 }

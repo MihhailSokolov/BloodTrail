@@ -28,6 +28,50 @@ type config struct {
 	Groups    int    // total non-well-known Group principals across all domains
 	Domains   int    // number of domains (>= 1); domain 0 is the forest root
 	Seed      int64
+
+	// Azure/Entra tenant (see emit_azure.go). AZUsers == 0 disables the
+	// whole azure side, keeping pre-hybrid invocations byte-identical.
+	AZUsers    int // AZUser principals in the tenant
+	AZGroups   int // AZGroup security groups
+	AZApps     int // AZApp registrations (each with a matching AZServicePrincipal)
+	AZDevices  int // AZDevice entries
+	AZVMs      int // AZVM virtual machines, spread over the resource groups
+	AZKeyVault int // AZKeyVault vaults, spread over the resource groups
+	AZSubs     int // AZSubscription subscriptions under the tenant
+	AZSyncPct  int // percent of AZUsers hybrid-synced to an AD user (onprem SID)
+}
+
+// applyAzureDefaults resolves the -1 "derive from az-users" azure sizing
+// flags. With AZUsers == 0 everything azure stays zero and no azure file is
+// emitted at all.
+func (c *config) applyAzureDefaults() {
+	if c.AZUsers <= 0 {
+		c.AZUsers, c.AZGroups, c.AZApps, c.AZDevices, c.AZVMs, c.AZKeyVault, c.AZSubs = 0, 0, 0, 0, 0, 0, 0
+		return
+	}
+	if c.AZUsers < azAttackUserReserve {
+		c.AZUsers = azAttackUserReserve
+	}
+	def := func(v *int, fallback, floor int) {
+		if *v < 0 {
+			*v = fallback
+		}
+		if *v < floor {
+			*v = floor
+		}
+	}
+	def(&c.AZGroups, c.AZUsers/20, azAttackGroupReserve)
+	def(&c.AZApps, c.AZUsers/100, azAttackAppReserve)
+	def(&c.AZDevices, c.AZUsers/3, 1)
+	def(&c.AZVMs, 200, 1)
+	def(&c.AZKeyVault, 50, 1)
+	def(&c.AZSubs, 2, 1)
+	if c.AZSyncPct < 0 {
+		c.AZSyncPct = 0
+	}
+	if c.AZSyncPct > 100 {
+		c.AZSyncPct = 100
+	}
 }
 
 // splitmix64 hashes an arbitrary tuple of ints (mixed with the seed) into a
@@ -224,3 +268,87 @@ const (
 // need the missing computers (the tests scale their expectations to the
 // counts, and main.go warns).
 const attackComputerReserve = 2
+
+// --- azure id layout ---------------------------------------------------------
+//
+// Azure object identifiers are GUIDs, derived exactly like the AD side's
+// guid(): pure functions of (seed, kind tag, index), so any emitter can
+// reference any object without shared state. Distinct kind tags keep the
+// classes collision-free. Emitted uppercase throughout: BloodHound joins
+// azure edges to nodes by exact objectid string, so one consistent case is
+// the whole requirement, and uppercase matches how ingest builds composite
+// ids (e.g. an AZRole's ROLEDEFINITIONID@TENANTID).
+const (
+	azgTenant  = 100
+	azgUser    = 101
+	azgGroup   = 102
+	azgApp     = 103 // the app REGISTRATION's directory object id
+	azgAppID   = 104 // the app's appId (client id) -- a distinct GUID in AAD
+	azgSP      = 105
+	azgDevice  = 106
+	azgSub     = 107
+	azgRG      = 108
+	azgVM      = 109
+	azgVault   = 110
+	azgGraphSP = 111 // the tenant's own "Microsoft Graph" service principal
+)
+
+func (c config) azTenantID() string         { return c.guid(azgTenant, 0, 0) }
+func (c config) azUserID(i int) string      { return c.guid(azgUser, 0, i) }
+func (c config) azGroupID(i int) string     { return c.guid(azgGroup, 0, i) }
+func (c config) azAppClientID(i int) string { return c.guid(azgAppID, 0, i) }
+func (c config) azSPID(i int) string        { return c.guid(azgSP, 0, i) }
+func (c config) azDeviceID(i int) string    { return c.guid(azgDevice, 0, i) }
+func (c config) azSubID(i int) string       { return c.guid(azgSub, 0, i) }
+func (c config) azVMID(i int) string        { return c.guid(azgVM, 0, i) }
+func (c config) azGraphSPID() string        { return c.guid(azgGraphSP, 0, 0) }
+
+// azSyncedUsers is how many AZUsers carry an on-prem identity; azure user i
+// (for i < that count) syncs to AD user index i in domain i%domains, so the
+// on-prem SID always resolves to an emitted AD user.
+func (c config) azSyncedUsers() int {
+	return c.AZUsers * c.AZSyncPct / 100
+}
+
+// Reserved azure indices, mirroring the AD side's reserved-attack-path
+// convention: noise never disturbs these, tests assert them by exact id.
+const (
+	// AZUsers:
+	//   0 = Global Administrator (also the hybrid target: AD user 0 of
+	//       domain 0 syncs INTO it when AZSyncPct > 0)
+	//   1 = eligible (PIM) for Privileged Role Administrator
+	//   2 = owner of app 0 (whose SP holds RoleManagement.ReadWrite.Directory
+	//       on MS Graph -- the AZMGGrantRole escalation)
+	//   3 = member of group 0 (the role-assignable tier-zero group)
+	//   4 = GetSecrets/GetKeys/GetCertificates on key vault 0
+	//   5 = AZVMAdminLogin on VM 0
+	azuGlobalAdmin = 0
+	azuPIMEligible = 1
+	azuAppOwner    = 2
+	azuGroupMember = 3
+	azuVaultReader = 4
+	azuVMAdmin     = 5
+	//   6 = Intune Administrator (post-processing: AZExecuteCommand to devices)
+	//   7 = Application Administrator scoped to app 1 (AZAppAdmin at ingest)
+	//   8 = approver for the Global Administrator role (AZRoleApprover)
+	//   9 = Privileged Authentication Administrator holder
+	//  10 = Application Administrator at tenant scope (AZHasRole; the role
+	//       node then fans AZAddSecret out to every app/SP in analysis)
+	azuIntuneAdmin      = 6
+	azuScopedAppAdmin   = 7
+	azuRoleApprover     = 8
+	azuPAAHolder        = 9
+	azuUnscopedAppAdmin = 10
+
+	// azAttackUserReserve is the AZUsers floor when the azure side is
+	// enabled at all -- indices 0-10 above carry the seeded paths.
+	azAttackUserReserve = 11
+
+	// AZGroups: 0 = role-assignable group holding Privileged Role Admin.
+	azgTierZeroGroup = 0
+
+	azAttackGroupReserve = 1
+	// AZApps: 0 = the escalation app (owner: user 2; SP 0 has the MS Graph
+	// role grant).
+	azAttackAppReserve = 1
+)
