@@ -81,6 +81,11 @@ func TestTryCypherKeysMatchOracle(t *testing.T) {
 		`MATCH (n:KeysNode) RETURN count(*)`,
 		`MATCH (n:KeysNode) RETURN n.name, count(n)`,
 		`MATCH (n:KeysNode) RETURN n.name, count(n) ORDER BY count(n) DESC`,
+		// OPTIONAL MATCH: the unmatched column has to come back as a null
+		// with the SAME key and column count as a matched one, or the
+		// result shape diverges from pg on exactly the rows the feature
+		// exists to produce.
+		`MATCH (n:KeysNode) OPTIONAL MATCH (n)-[:KeysEdge]->(m:KeysNode) RETURN n, m`,
 		// Zero rows: the oracle never populates Keys at all for these.
 		`MATCH (n:KeysNode) WHERE n.name = 'nobody' RETURN n.name`,
 		`MATCH (n:KeysNode) WHERE n.name = 'nobody' RETURN n AS renamed`,

@@ -584,6 +584,27 @@ var randomCypherTemplates = []randomCypherTemplate{
 			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))])
 	},
 
+	// OPTIONAL MATCH: a LEFT join, so the row count is the point -- an
+	// unmatched left row must SURVIVE with a null column rather than being
+	// dropped, and a left row with several matches must fan out. Both
+	// failure modes (inner-join semantics, and null-padding a row that
+	// should have matched) change the row count, which is what the
+	// differential compares.
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (a:%s) OPTIONAL MATCH (a)-[:%s]->(b:%s) RETURN a, b`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (a:%s) WHERE a.val > %s OPTIONAL MATCH (a)-[:%s]->(b:%s) RETURN a, b`,
+			randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)),
+			randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (a:%s) OPTIONAL MATCH (a)-[:%s]->(b:%s) WHERE b.str STARTS WITH %s RETURN a, b`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))],
+			randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
+	},
+
 	// Single-Part (still a bare SinglePartQuery, per planStages): two MATCH
 	// clauses chaining a *0..2/*1..3 var-length relationship, exercising the
 	// fixture's self-loops and parallel multi-kind edges.

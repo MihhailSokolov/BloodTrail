@@ -168,9 +168,25 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	}
 
 	part0 := &q.Parts[0]
+
+	// Only Part[0] runs through matchPartPlain, which is where the OPTIONAL
+	// MATCH left join lives. A Part after a WITH boundary is matched per
+	// carried seed by a different driver entirely, so an Optional hanging off
+	// one would be silently ignored -- a wrong answer, not a slow one.
+	// Decline instead; PostgreSQL serves it.
+	for i := 1; i < len(q.Parts); i++ {
+		if q.Parts[i].Optional != nil {
+			return nil, errUnsupportedStep
+		}
+	}
+
 	var rows []*Row
 	var err error
-	if len(q.Parts) == 1 && target >= 0 {
+	// An OPTIONAL MATCH opts out of LIMIT early termination: the chunked
+	// driver bypasses matchPartPlain (and therefore the left join) entirely,
+	// and truncating the mandatory side before the join would decide the
+	// answer from a prefix of rows rather than from the rows themselves.
+	if len(q.Parts) == 1 && target >= 0 && part0.Optional == nil {
 		rows, err = matchPartLimited(env, meter, part0, target)
 	} else {
 		rows, err = matchPartPlain(env, meter, part0)
@@ -468,7 +484,97 @@ func matchPartPlain(env *Env, meter *workMeter, part *Part) ([]*Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	return filterRows(env, rows, part.Where, nil)
+	rows, err = filterRows(env, rows, part.Where, nil)
+	if err != nil {
+		return nil, err
+	}
+	return leftJoinOptional(env, meter, part, rows)
+}
+
+// leftJoinOptional extends each surviving row with part's OPTIONAL MATCH.
+// A row that the optional pattern matches is emitted once per match; a row it
+// does not match is emitted unchanged, with the optional pattern's own
+// symbols left UNBOUND, which is how a null column is represented here.
+//
+// The optional side is matched ONCE over the whole graph and hashed on the
+// shared symbols, rather than re-run per row: the pattern is the same for
+// every row, and the mandatory Part's constraints were copied into it at plan
+// time (see planOptionalPart), so the set it produces is already narrowed to
+// roughly what the rows can join against.
+//
+// It runs AFTER Part.Where, which is what Cypher requires: the WHERE belongs
+// to the mandatory MATCH, and filtering afterwards would drop rows the
+// optional clause is supposed to preserve.
+func leftJoinOptional(env *Env, meter *workMeter, part *Part, rows []*Row) ([]*Row, error) {
+	if part.Optional == nil || len(rows) == 0 {
+		return rows, nil
+	}
+
+	optRows, err := matchPart(env, part.Optional, meter)
+	if err != nil {
+		return nil, err
+	}
+	optRows, err = filterRows(env, optRows, part.Optional.Where, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	buckets := make(map[string][]*Row, len(optRows))
+	for _, r := range optRows {
+		key, ok := optionalJoinKey(r, part.OptionalShared)
+		if !ok {
+			continue
+		}
+		buckets[key] = append(buckets[key], r)
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]*Row, 0, len(rows))
+	for _, l := range rows {
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+		key, ok := optionalJoinKey(l, part.OptionalShared)
+		matches := buckets[key]
+		if !ok || len(matches) == 0 {
+			// No match: the row survives with the optional symbols unbound.
+			out = append(out, l)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		for _, r := range matches {
+			nr := cloneRow(l)
+			mergeRowInto(nr, r)
+			if err := meter.spend(1); err != nil {
+				return nil, err
+			}
+			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// optionalJoinKey encodes a row's bindings for the shared symbols into one
+// self-delimiting key. ok is false when the row does not bind them all, which
+// cannot happen for a row either side actually produced but is handled rather
+// than assumed.
+func optionalJoinKey(r *Row, shared []string) (string, bool) {
+	var buf []byte
+	for _, sym := range shared {
+		id, bound := r.Node(sym)
+		if !bound {
+			return "", false
+		}
+		buf = appendUint32(buf, uint32(id))
+	}
+	return string(buf), true
 }
 
 // matchPartLimited is runQuery's single-part (no WITH boundary) entry point

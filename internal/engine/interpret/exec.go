@@ -2021,6 +2021,17 @@ func projectItem(env *Env, r *Row, item ProjectionOutput) (OutVal, error) {
 			// predates that task, per its own doc comment.
 			return OutVal{Kind: OutPath, Path: pv.(*PathVal)}, nil
 		}
+		if item.Optional {
+			// An OPTIONAL MATCH symbol this row did not match: a null
+			// column. Falling through would reach EvalValue, which reports
+			// an unbound variable as an unsupported expression and would
+			// decline the whole query on the first null-padded row.
+			//
+			// ScalarAbsent, not a present JSON null: the column has no
+			// value at all, which is what PostgreSQL returns here (verified
+			// against the live oracle -- a plain nil).
+			return OutVal{Kind: OutScalar, Scalar: nil, ScalarAbsent: true}, nil
+		}
 	}
 
 	val, ok, err := EvalValue(env, r, item.Expr)

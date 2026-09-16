@@ -337,6 +337,20 @@ type Part struct {
 	Nodes  map[string]*NodeConstraint
 	Where  cypher.Expression
 	With   *WithClause
+
+	// Optional is this Part's trailing OPTIONAL MATCH, planned as a Part in
+	// its own right, and OptionalShared names the symbols it has in common
+	// with this one -- the join key. Both are nil/empty unless the query
+	// wrote an OPTIONAL MATCH.
+	//
+	// It is a LEFT join: every row this Part produces survives, extended by
+	// the optional pattern's matches when there are any and carrying the
+	// optional symbols UNBOUND when there are none. An unbound symbol
+	// projects as a null column, which is exactly what PostgreSQL returns
+	// for the same query (verified against the live oracle: the unmatched
+	// column comes back as a plain nil, not a node-shaped placeholder).
+	Optional       *Part
+	OptionalShared []string
 }
 
 // ProjectionOutput is one RETURN item's compiled plan: the column name
@@ -357,6 +371,11 @@ type Part struct {
 // projectionTypingOK) -- BareCallKind being non-empty is therefore always a
 // true statement about the item's entire expression, not merely its root.
 type ProjectionOutput struct {
+	// Optional marks a bare variable that an OPTIONAL MATCH introduced and
+	// that a given row may therefore leave UNBOUND. projectItem emits a null
+	// column for those instead of failing, which is what PostgreSQL returns.
+	Optional bool
+
 	Alias        string
 	Expr         cypher.Expression
 	BareCallKind string
@@ -557,6 +576,9 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 			}
 			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, ret)
 			if !ok {
+				return nil, false
+			}
+			if !admitOptionalProjection(parts, &proj, order) {
 				return nil, false
 			}
 			return &Query{
@@ -791,14 +813,21 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried ma
 
 	var whereConjuncts []cypher.Expression
 
-	for _, rc := range reading {
+	// An OPTIONAL MATCH is split out and planned as its own Part. Only a
+	// single one, only as the LAST reading clause, and only with at least
+	// one mandatory MATCH before it to join against: an OPTIONAL MATCH with
+	// nothing to its left has no left side, and a mandatory clause AFTER one
+	// would have to filter rows the optional clause was supposed to preserve.
+	mandatory, optionalClause, ok := splitOptionalMatch(reading)
+	if !ok {
+		return Part{}, nil, false
+	}
+
+	for _, rc := range mandatory {
 		if rc == nil || rc.Unwind != nil || rc.Match == nil {
 			return Part{}, nil, false
 		}
 		m := rc.Match
-		if m.Optional {
-			return Part{}, nil, false
-		}
 		if len(m.Pattern) == 0 {
 			return Part{}, nil, false
 		}
@@ -833,11 +862,210 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried ma
 		return Part{}, nil, false
 	}
 
+	part := Part{
+		Chains: pb.chains,
+		Nodes:  pb.nodes,
+		Where:  rebuildConjunction(whereConjuncts),
+	}
+	if optionalClause == nil {
+		return part, pb.known, true
+	}
+
+	optPart, optKnown, ok := planOptionalPart(snap, regexes, numericScalars, pb, optionalClause)
+	if !ok {
+		return Part{}, nil, false
+	}
+	shared := sharedNodeSymbols(part.Nodes, optPart.Nodes)
+	if len(shared) == 0 {
+		// Nothing in common means the optional pattern is a product against
+		// every mandatory row rather than a lookup, and a null-padded product
+		// is a shape nothing in the corpus writes. Decline rather than build
+		// it.
+		return Part{}, nil, false
+	}
+	part.Optional, part.OptionalShared = &optPart, shared
+	return part, optKnown, true
+}
+
+// splitOptionalMatch separates a stage's reading clauses into the mandatory
+// ones and its single trailing OPTIONAL MATCH, if any. See Part.Optional for
+// why the shape is restricted this narrowly.
+func splitOptionalMatch(reading []*cypher.ReadingClause) (mandatory []*cypher.ReadingClause, optional *cypher.ReadingClause, ok bool) {
+	for i, rc := range reading {
+		if rc == nil || rc.Match == nil {
+			// Left for the mandatory loop's own validation to reject, so
+			// every non-Match reading clause keeps failing in one place.
+			mandatory = append(mandatory, rc)
+			continue
+		}
+		if !rc.Match.Optional {
+			if optional != nil {
+				return nil, nil, false
+			}
+			mandatory = append(mandatory, rc)
+			continue
+		}
+		if optional != nil || i != len(reading)-1 || i == 0 {
+			return nil, nil, false
+		}
+		optional = rc
+	}
+	return mandatory, optional, true
+}
+
+// planOptionalPart plans an OPTIONAL MATCH clause as a Part of its own,
+// seeded from the mandatory Part's builder so a symbol the mandatory pattern
+// already bound resolves to the same variable rather than being introduced
+// afresh.
+//
+// Every shared symbol carries the mandatory Part's OWN NodeConstraint into
+// the optional Part. That is a narrowing the left join cannot observe --
+// every row the join can match already satisfies those constraints, because
+// it came from the mandatory side -- and without it the optional pattern's
+// bare `(u)` would anchor on a full scan where the mandatory one anchored on
+// a kind bitmap.
+func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, numericScalars map[string]bool, outer *partBuilder, rc *cypher.ReadingClause) (Part, map[string]symKind, bool) {
+	if rc.Unwind != nil || rc.Match == nil || len(rc.Match.Pattern) == 0 {
+		return Part{}, nil, false
+	}
+
+	pb := &partBuilder{
+		snap:           snap,
+		known:          cloneKnown(outer.known),
+		nodes:          map[string]*NodeConstraint{},
+		regexes:        regexes,
+		numericScalars: numericScalars,
+	}
+
+	// nodes starts EMPTY, deliberately: it must end up holding exactly the
+	// symbols this optional pattern mentions, because that set is what
+	// sharedNodeSymbols intersects to find the join key. Pre-seeding it with
+	// the mandatory Part's symbols made every one of them look shared, so a
+	// genuinely disjoint OPTIONAL MATCH (nothing in common, hence a
+	// null-padded product) was accepted and served instead of declined.
+	for _, pp := range rc.Match.Pattern {
+		if !pb.addPatternPart(pp) {
+			return Part{}, nil, false
+		}
+	}
+
+	// Now that the pattern's own symbols are known, narrow the shared ones
+	// with what the mandatory Part already requires of them. The join can
+	// never observe this -- every row it can match came from the mandatory
+	// side and so already satisfies them -- but without it the optional
+	// pattern's bare `(u)` anchors on a full scan where the mandatory one
+	// anchored on a kind bitmap.
+	for sym, inner := range pb.nodes {
+		outerNC, shared := outer.nodes[sym]
+		if !shared || outerNC == nil || inner == nil {
+			continue
+		}
+		inner.Kinds = append(inner.Kinds, outerNC.Kinds...)
+		inner.Predicates = append(inner.Predicates, outerNC.Predicates...)
+		if inner.ObjectIDAnchor == nil {
+			inner.ObjectIDAnchor = outerNC.ObjectIDAnchor
+		}
+		inner.IDs = append(inner.IDs, outerNC.IDs...)
+	}
+
+	var whereConjuncts []cypher.Expression
+	if rc.Match.Where != nil {
+		for _, top := range rc.Match.Where.GetAll() {
+			whereConjuncts = append(whereConjuncts, flattenTopLevelConjuncts(top)...)
+		}
+	}
+	whereConjuncts = append(whereConjuncts, pb.desugaredEqualities...)
+	for _, conjunct := range whereConjuncts {
+		pb.touched = map[string]bool{}
+		if !pb.checkExpr(conjunct, true) {
+			return Part{}, nil, false
+		}
+		if !pb.pushdown(conjunct) {
+			return Part{}, nil, false
+		}
+	}
+	if !pb.finalizeShortestPaths(whereConjuncts) {
+		return Part{}, nil, false
+	}
+
 	return Part{
 		Chains: pb.chains,
 		Nodes:  pb.nodes,
 		Where:  rebuildConjunction(whereConjuncts),
 	}, pb.known, true
+}
+
+// admitOptionalProjection validates a RETURN against the OPTIONAL MATCH
+// symbols a query carries, and marks the items that can come back unbound.
+//
+// The rule is deliberately blunt: once any Part has an OPTIONAL MATCH, every
+// RETURN item must be a BARE VARIABLE and the query must have no ORDER BY.
+// The reason is null propagation. `RETURN g.name` where g went unmatched is
+// null in PostgreSQL, and so is every expression built on it, but this
+// package's evaluator has no notion of "this symbol is absent, so everything
+// reading it is too" -- it reports an unbound variable as an unsupported
+// expression. Serving those shapes would mean inventing that propagation and
+// getting it to agree with pg's everywhere, which is exactly the kind of
+// half-understood representation that produces a SERVED WRONG ANSWER rather
+// than a decline. A bare variable needs none of it: bound projects as the
+// node, unbound projects as null, and there is nothing in between.
+//
+// Everything this refuses is delegated and answered correctly by PostgreSQL.
+func admitOptionalProjection(parts []Part, proj *Projection, order []OrderKey) bool {
+	optional := optionalOnlySymbols(parts)
+	if len(optional) == 0 {
+		return true
+	}
+	if len(order) > 0 {
+		return false
+	}
+	for i := range proj.Items {
+		v, isVar := unwrapParens(proj.Items[i].Expr).(*cypher.Variable)
+		if !isVar || v == nil {
+			return false
+		}
+		if optional[v.Symbol] {
+			proj.Items[i].Optional = true
+		}
+	}
+	return true
+}
+
+// optionalOnlySymbols returns the node symbols that exist ONLY because an
+// OPTIONAL MATCH introduced them -- the ones a row can leave unbound. A
+// symbol the mandatory pattern also binds (the join key) is always bound and
+// is deliberately not included.
+func optionalOnlySymbols(parts []Part) map[string]bool {
+	out := map[string]bool{}
+	for i := range parts {
+		opt := parts[i].Optional
+		if opt == nil {
+			continue
+		}
+		shared := map[string]bool{}
+		for _, sym := range parts[i].OptionalShared {
+			shared[sym] = true
+		}
+		for sym := range opt.Nodes {
+			if !shared[sym] {
+				out[sym] = true
+			}
+		}
+	}
+	return out
+}
+
+// sharedNodeSymbols returns the node symbols both Parts constrain, sorted so
+// the join key is built in a stable order on both sides.
+func sharedNodeSymbols(outer, inner map[string]*NodeConstraint) []string {
+	var out []string
+	for sym := range inner {
+		if _, both := outer[sym]; both {
+			out = append(out, sym)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // rebuildConjunction ANDs conjuncts back together for storage on Part.Where:
