@@ -495,19 +495,28 @@ RETURN c`
 // charged exactly once for that (via workMeter.addFinalRow), not once more
 // by filterRows itself for surviving the predicate.
 //
-// The snapshot has 3 User nodes. `WHERE n.enabled = true` now ANCHORS on the
-// value index's exact-match postings rather than on the User kind bitmap, so
-// the failing node is never visited at all: the candidate source is the two
-// nodes carrying enabled=true. scanAnchor's two-tier accounting (Budgets'
-// doc: "+1 per node visited ... +1 per row produced anywhere") charges each
-// of them a visit and a row = 4. The 2 surviving rows are admitted as final
-// rows, charged once each by addFinalRow = 2. Total: 4 + 2 = 6.
+// The snapshot has 3 User nodes; scanAnchor's own two-tier accounting
+// (Budgets' doc comment: "+1 per node visited ... +1 per row produced
+// anywhere") charges every visited node 1, and only candidates that BECOME
+// rows a second 1. `WHERE n.enabled = true` is a pushed single-symbol
+// predicate, evaluated at admit time (scanAnchorVisit's predicatesAdmit):
+// nodes 1 and 2 pass and produce rows (2 each = 4), node 3 fails and costs
+// only its visit (1) -- it never becomes a row, so under the documented
+// model it earns no row charge. Anchor total: 5. The 2 surviving rows are
+// admitted as final rows, charged exactly once each by addFinalRow = 2.
+// Total: 5 + 2 = 7.
+//
+// The value index deliberately does NOT anchor this: two postings against a
+// three-node kind bitmap does not clear valueAnchorMargin, and an index is
+// worth preferring only when it is decisively better (see that constant for
+// what adopting a marginal one cost). On a graph where the predicate is
+// actually selective it does anchor, and TestValueAnchorReplacesTheKindScan
+// pins that under a budget this scan could not afford.
 //
 // (Historical totals for this query: 10 when filterRows double-charged
 // survivors, 8 when the double charge was removed but predicates still ran
-// only in filterRows, 7 once predicates ran at admit time over the kind
-// bitmap, and 6 now that the predicate selects the candidate source instead
-// of filtering it.)
+// only in filterRows so the failing node was charged as a row it never
+// needed to be.)
 func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 	const kindUser snapshot.KindID = 1
 
@@ -531,8 +540,8 @@ func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 	if len(rs.Rows) != 2 {
 		t.Fatalf("got %d rows, want 2", len(rs.Rows))
 	}
-	if meter.work != 6 {
-		t.Fatalf("meter.work = %d, want 6 (4 scanAnchor over the value index's 2 postings + 2 addFinalRow)", meter.work)
+	if meter.work != 7 {
+		t.Fatalf("meter.work = %d, want 7 (5 scanAnchor with admit-time predicate filtering + 2 addFinalRow)", meter.work)
 	}
 	if meter.finalRows != 2 {
 		t.Fatalf("meter.finalRows = %d, want 2", meter.finalRows)
@@ -550,16 +559,19 @@ func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 // node, which also passes its own pushed predicate: 1 visit + 1 produced =
 // 2). `WITH n` passes that single row through unchanged
 // (runWithPassThrough's own, unrelated per-row charge: 1). Part[1]
-// (`MATCH (m:User)`) anchors on the value index for `WHERE m.flag = true`
-// rather than re-scanning all 3 User nodes: the sole node carrying flag=true
-// is the whole candidate source, costing a visit and a row (2). The merge
+// (`MATCH (m:User)`) re-scans all 3 User nodes for that one carried row;
+// `WHERE m.flag = true` is a pushed single-symbol predicate evaluated at
+// admit time, so node 2 passes and produces a row (2) while nodes 1 and 3
+// fail and cost only their visits (1 each) -- anchor total 4. The merge
 // step charges nothing of its own, and the single surviving merged row is
-// admitted once as a final row (addFinalRow: 1). Total: 2 + 1 + 2 + 1 = 6.
+// admitted once as a final row (addFinalRow: 1). Total: 2 + 1 + 4 + 1 = 8.
+// (One posting against a three-node bitmap does not clear valueAnchorMargin,
+// so the value index does not anchor this either -- see the note on the
+// single-part test above.)
 //
-// (Historical totals: 15 with the filterRows/runCarriedPart double charges,
-// 10 with those removed but predicates still evaluated only in filterRows,
-// 8 once predicates ran at admit time over the kind bitmap, and 6 now that
-// the predicate selects the candidate source instead of filtering it.)
+// (Historical totals for this query: 15 with the filterRows/runCarriedPart
+// double charges, 10 with those removed but predicates still evaluated
+// only in filterRows, so the two failing nodes were charged as rows.)
 func TestPipelineWorkAccountingCarriedPartNoDoubleCharge(t *testing.T) {
 	const kindUser snapshot.KindID = 1
 
@@ -583,8 +595,8 @@ func TestPipelineWorkAccountingCarriedPartNoDoubleCharge(t *testing.T) {
 	if len(rs.Rows) != 1 {
 		t.Fatalf("got %d rows, want 1", len(rs.Rows))
 	}
-	if meter.work != 6 {
-		t.Fatalf("meter.work = %d, want 6 (2 anchor + 1 WITH pass-through + 2 Part[1] value-index scan + 1 addFinalRow)", meter.work)
+	if meter.work != 8 {
+		t.Fatalf("meter.work = %d, want 8 (2 anchor + 1 WITH pass-through + 4 Part[1] scan with admit-time predicate filtering + 1 addFinalRow)", meter.work)
 	}
 	if meter.finalRows != 1 {
 		t.Fatalf("meter.finalRows = %d, want 1", meter.finalRows)

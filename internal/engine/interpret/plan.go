@@ -1982,10 +1982,20 @@ func (pb *partBuilder) extractValueAnchor(sym string, conjunct cypher.Expression
 			return
 		}
 		total += n
-		if total >= budget {
-			// Already no cheaper than what the symbol would scan anyway.
+		if total*valueAnchorMargin > budget {
 			return
 		}
+	}
+
+	if len(terms) == 1 {
+		// One term's postings are already a set, so there is nothing to
+		// merge and nothing to copy.
+		ids, ok := pb.resolveValueTerm(terms[0])
+		if !ok {
+			return
+		}
+		nc.PropCandidates, nc.PropIndexed = ids, true
+		return
 	}
 
 	seen := make(map[snapshot.NodeID]bool, total)
@@ -2004,6 +2014,18 @@ func (pb *partBuilder) extractValueAnchor(sym string, conjunct cypher.Expression
 	}
 	nc.PropCandidates, nc.PropIndexed = union, true
 }
+
+// valueAnchorMargin is how many times smaller an exact-match candidate set
+// must be than the source it would replace before it is adopted.
+//
+// A bare "smaller than" test is not enough, and the difference is not
+// academic. `t.enabled = true` matches ~900,000 of the ~920,000 Base nodes on
+// the benchmark graph: strictly smaller, so it was adopted, and the engine
+// then paid to materialize and delta-union a 900,000-id posting list per
+// query to avoid visiting 20,000 candidates. Two shipped prebuilts went from
+// 0.85x of PostgreSQL to 2.8x on exactly that. An index is worth preferring
+// when it is decisively better, not marginally.
+const valueAnchorMargin = 4
 
 // valueAnchorBudget is the size an exact-match candidate set has to beat:
 // whatever the symbol would otherwise enumerate, which is its smallest kind

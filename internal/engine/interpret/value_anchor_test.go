@@ -156,3 +156,34 @@ func TestValueAnchorKeepsTheSameAnswer(t *testing.T) {
 		})
 	}
 }
+
+// TestValueAnchorRefusesMarginalPostings pins valueAnchorMargin, which is the
+// difference between an index that pays and one that costs.
+//
+// `enabled = true` matches almost every node. Adopting it is strictly
+// "smaller" than the kind bitmap and almost entirely useless: the engine
+// materializes and delta-unions a posting list nearly the size of the bitmap
+// to avoid visiting the handful of nodes it excludes. On the benchmark graph
+// that is a 900,000-id list to skip 20,000 candidates, and it took two
+// shipped prebuilts from 0.85x of PostgreSQL to 2.8x.
+func TestValueAnchorRefusesMarginalPostings(t *testing.T) {
+	const n = 400
+	snap := buildValueAnchorFixture(t, n)
+
+	marginal := planQuery(t, snap, `MATCH (u:Base) WHERE u.enabled = true RETURN u`)
+	if nc := marginal.Parts[0].Nodes["u"]; nc.PropIndexed {
+		t.Fatalf("a predicate matching %d of %d nodes must not become the candidate source "+
+			"(resolved %d)", n, n, len(nc.PropCandidates))
+	}
+
+	// The same property shape, but genuinely selective, still anchors.
+	selective := planQuery(t, snap, `MATCH (u:Base) WHERE u.usedeskeyonly = true RETURN u`)
+	nc := selective.Parts[0].Nodes["u"]
+	if !nc.PropIndexed {
+		t.Fatal("a selective equality must still anchor")
+	}
+	if len(nc.PropCandidates)*valueAnchorMargin > n {
+		t.Fatalf("anchored on %d candidates against %d nodes, which does not clear the margin",
+			len(nc.PropCandidates), n)
+	}
+}
