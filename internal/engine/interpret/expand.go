@@ -512,8 +512,10 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     kinds-only far endpoint contributes no filtering beyond what its own
 //     candidate source already enumerates, so seeding from it buys nothing
 //     while giving up the near side's structure.
+//
 //   - The near endpoint must NOT narrow. If it does, it is already the cheap
 //     side and the ordinary forward route is the right one.
+//
 //   - The near endpoint's own candidate source must COST what a full scan
 //     costs (scanEquivalentNearSide) -- not merely be "not narrowing". A kind
 //     bitmap is "not narrowing" in endpointNarrows' sense (the bitmap IS its
@@ -653,8 +655,6 @@ const (
 	// estimates.
 	reverseSeedMargin = 4
 )
-
-
 
 // endpointNarrows reports whether nc actually cuts its symbol's candidate set
 // below whatever its candidate source already enumerates: explicit ids, an

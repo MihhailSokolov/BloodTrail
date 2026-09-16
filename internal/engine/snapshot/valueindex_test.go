@@ -3,6 +3,7 @@
 package snapshot
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 )
@@ -189,5 +190,108 @@ func TestValueIndexOverlayIsASuperset(t *testing.T) {
 	if !found {
 		t.Fatalf("got %v, missing the delta-updated node %d: a SHORT candidate source "+
 			"makes the executor serve a wrong answer", got, want)
+	}
+}
+
+// TestFlatArrayScannerAgreesWithEncodingJSON is the safety argument for
+// reading list properties straight out of the arena instead of decoding
+// them: for every array text, the fast scanner must produce exactly the keys
+// encoding/json would, or report that it is not certain and fall back.
+//
+// A disagreement here is not a slow answer, it is a wrong candidate set --
+// `'x' IN n.prop` would look at the wrong nodes.
+func TestFlatArrayScannerAgreesWithEncodingJSON(t *testing.T) {
+	for _, raw := range []string{
+		`[]`,
+		`["a"]`,
+		`["a","b","c"]`,
+		`[ "a" , "b" ]`,
+		`["RC4-HMAC-MD5","AES256"]`,
+		`[1,2,3]`,
+		`[1.5,-2.25,0,-0]`,
+		`[true,false,null]`,
+		`["a",1,true,null]`,
+		`["with space","with-dash","with.dot"]`,
+		// Shapes the scanner must REFUSE rather than guess at.
+		`["with\"escape"]`,
+		`["back\\slash"]`,
+		`["tab\there"]`,
+		`[["nested"]]`,
+		`[{"k":"v"}]`,
+		`["unicode é"]`,
+		// Genuinely non-ASCII content with no escape is still flat.
+		`["café","日本語"]`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			fast, ok := scanFlatArrayKeys(nil, []byte(raw), nil)
+
+			var v []any
+			if err := json.Unmarshal([]byte(raw), &v); err != nil {
+				t.Skipf("not valid JSON: %v", err)
+			}
+			var want []string
+			for _, el := range v {
+				if key, keyable := valueKey(el); keyable {
+					want = append(want, key)
+				}
+			}
+
+			if !ok {
+				// Refusing is always allowed; the caller falls back. But it
+				// must not refuse everything, which the cases above check by
+				// having plenty that do succeed.
+				return
+			}
+			if len(fast) != len(want) {
+				t.Fatalf("scanner produced %d keys, encoding/json %d: %q vs %q", len(fast), len(want), fast, want)
+			}
+			for i := range want {
+				if fast[i] != want[i] {
+					t.Fatalf("key %d = %q, want %q", i, fast[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestFlatArrayScannerRefusesTheHardCases pins that the shapes it cannot
+// decode correctly are actually refused, so the agreement above is not
+// achieved by never running.
+func TestFlatArrayScannerRefusesTheHardCases(t *testing.T) {
+	for _, raw := range []string{`["a\"b"]`, `["a\\b"]`, `[["x"]]`, `[{"k":1}]`, `["a"`, `not an array`} {
+		if _, ok := scanFlatArrayKeys(nil, []byte(raw), nil); ok {
+			t.Fatalf("%q was accepted; it must fall back to encoding/json", raw)
+		}
+	}
+	for _, raw := range []string{`["a","b"]`, `[1,2]`, `[true]`, `[]`} {
+		if _, ok := scanFlatArrayKeys(nil, []byte(raw), nil); !ok {
+			t.Fatalf("%q was refused; the fast path would never run", raw)
+		}
+	}
+}
+
+func BenchmarkValueIndexBuild(b *testing.B) {
+	const n = 50000
+	kiBase := KindID(1)
+	bld := NewBuilder(1)
+	bld.SetKinds(map[KindID]string{kiBase: "Base"})
+	for i := 0; i < n; i++ {
+		props := `{"etypes":["RC4-HMAC-MD5","AES256","AES128"],"enabled":true}`
+		if err := bld.AddNode(uint64(i+1), []KindID{kiBase}, []byte(props)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	snap, err := bld.Build()
+	if err != nil {
+		b.Fatal(err)
+	}
+	prop, _ := NewView(snap).PropIDByName("etypes")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		snap.valueIdx = nil
+		b.StartTimer()
+		snap.valueIndexFor(prop)
 	}
 }

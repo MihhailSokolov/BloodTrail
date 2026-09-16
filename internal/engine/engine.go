@@ -541,6 +541,9 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 	if e.applyEpoch.Load() != epoch {
 		return false
 	}
+	// Build the derived read indexes now, on the write path, rather than
+	// leaving them for whichever query arrives first -- see Snapshot.Warm.
+	view.Base().Warm()
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 

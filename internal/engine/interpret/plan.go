@@ -2156,7 +2156,7 @@ func literalValue(expr cypher.Expression) (any, bool) {
 // coalescePropOpLiteral recognizes `COALESCE(sym.<prop>, <default>) <op>
 // <literal>` as an anchorable property predicate, which is how BloodHound
 // actually writes them: twenty-one of the 185 corpus queries wrap a property
-// in COALESCE, seventeen of those as `COALESCE(x, '') CONTAINS ...`. Without
+// in COALESCE, seventeen of those as `COALESCE(x, ”) CONTAINS ...`. Without
 // this the wrapper hides the property from the index completely -- the
 // predicate is a function call, not a property lookup -- so the symbol is
 // priced and enumerated as its bare kind bitmap. On the shipped "Nested

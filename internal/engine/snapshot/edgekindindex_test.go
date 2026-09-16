@@ -10,8 +10,8 @@ import "testing"
 func buildEdgeKindEndpointFixture(t *testing.T) *View {
 	t.Helper()
 	const (
-		kiA   KindID = 1
-		kiB   KindID = 2
+		kiA    KindID = 1
+		kiB    KindID = 2
 		keRare KindID = 3
 		keMany KindID = 4
 		keNone KindID = 5

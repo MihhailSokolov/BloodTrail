@@ -284,3 +284,22 @@ func (v *View) ensureDeltaEdgeKindIndex() *edgeKindIndex {
 	})
 	return v.deltaEdgeIdx
 }
+
+// Warm builds the derived read indexes this snapshot can construct without
+// knowing which queries will arrive, so no query pays to construct them.
+//
+// Writes to a BloodHound database are rare and reads are not, which makes the
+// write path the right place to absorb this. Without it the cost lands on
+// whichever query happens to touch a structure first -- measured at over
+// 200ms for one query on the benchmark graph, and paid again after every
+// snapshot rebuild and every compaction, because both produce a new base.
+//
+// Only the edge-kind index is warmed. It is bounded (one id per node per
+// relationship kind it carries an edge of), it is useful to every pattern
+// query rather than to the ones naming a particular property, and it is what
+// the anchor cost model consults for EVERY step. Property indexes stay lazy:
+// BloodHound collects dozens of properties, a deployment queries a handful,
+// and warming all of them would spend memory on the rest.
+func (s *Snapshot) Warm() {
+	s.ensureEdgeKindIndex()
+}

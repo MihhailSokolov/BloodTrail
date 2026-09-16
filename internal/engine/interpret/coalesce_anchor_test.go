@@ -11,7 +11,7 @@ import (
 
 // buildCoalesceFixture: many Groups, a handful carrying system_tags -- the
 // shape of the shipped "Nested groups within Tier Zero / High Value"
-// prebuilt, which asks for `COALESCE(t.system_tags, '') CONTAINS
+// prebuilt, which asks for `COALESCE(t.system_tags, ”) CONTAINS
 // 'admin_tier_0'`.
 func buildCoalesceFixture(t *testing.T, groups, tagged int) *snapshot.View {
 	t.Helper()
@@ -29,7 +29,7 @@ func buildCoalesceFixture(t *testing.T, groups, tagged int) *snapshot.View {
 
 // TestCoalesceAnchorsThroughTheWrapper pins the idiom BloodHound actually
 // writes. Twenty-one of the 185 corpus queries wrap a property in COALESCE,
-// seventeen of them as `COALESCE(x, '') CONTAINS ...`, and the wrapper hid
+// seventeen of them as `COALESCE(x, ”) CONTAINS ...`, and the wrapper hid
 // the property from the index completely -- the predicate is a function call,
 // not a property lookup, so the symbol was priced and enumerated as its bare
 // kind bitmap.

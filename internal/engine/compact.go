@@ -201,6 +201,9 @@ func (e *Engine) collapseSegmentStackIfNeeded(ctx context.Context, view *snapsho
 	}
 
 	merged := snapshot.NewView(view.Base()).WithSegment(snapshot.MergeSegments(segs))
+	// A fold produces a NEW base snapshot, so its indexes are built here
+	// rather than by the next query -- see Snapshot.Warm.
+	merged.Base().Warm()
 	e.snap.Store(merged)
 
 	e.cfg.Log.DebugContext(ctx, "bloodtrail: segment stack merged",
@@ -423,6 +426,9 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 	if len(tail) > 0 {
 		newView = newView.WithSegment(snapshot.MergeSegments(tail))
 	}
+	// A fold produces a NEW base snapshot, so its indexes are built here
+	// rather than by the next query -- see Snapshot.Warm.
+	newView.Base().Warm()
 	e.snap.Store(newView)
 	e.compactionCount.Add(1)
 	return true

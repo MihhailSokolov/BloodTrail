@@ -764,6 +764,9 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 		}
 	}
 
+	// Build the derived read indexes now, on the write path, rather than
+	// leaving them for whichever query arrives first -- see Snapshot.Warm.
+	view.Base().Warm()
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 	e.maintainAfterPublish(ctx, view)
