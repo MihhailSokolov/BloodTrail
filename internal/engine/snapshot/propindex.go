@@ -203,7 +203,35 @@ func (v *View) NodesWithString(prop PropID, match StringMatch, operand string) (
 	if !v.Overlay() {
 		return out, true
 	}
-	return append(out, v.deltaTouchedNodes()...), true
+	return unionDeltaTouched(out, v.deltaTouchedNodes()), true
+}
+
+// unionDeltaTouched appends the segment-touched nodes to an indexed result
+// WITHOUT repeating any the index already returned. A candidate source must
+// never yield the same node twice: scanAnchorVisit admits each element it
+// is handed, so a duplicate becomes a duplicate result row -- which is
+// exactly what happened before this existed, on a write-through query whose
+// modified node also matched the base index (`MATCH (n:User) WHERE
+// n.objectid ENDS WITH '-500' RETURN n` returned the Administrator twice).
+//
+// The delta side is one commit's worth of writes, so it is the side that
+// becomes the set; the indexed side is filtered through it and the delta
+// ids are appended whole.
+func unionDeltaTouched(indexed, touched []NodeID) []NodeID {
+	if len(touched) == 0 {
+		return indexed
+	}
+	inDelta := make(map[NodeID]struct{}, len(touched))
+	for _, id := range touched {
+		inDelta[id] = struct{}{}
+	}
+	out := make([]NodeID, 0, len(indexed)+len(touched))
+	for _, id := range indexed {
+		if _, dup := inDelta[id]; !dup {
+			out = append(out, id)
+		}
+	}
+	return append(out, touched...)
 }
 
 // deltaTouchedNodes returns every dense node id any segment in the stack

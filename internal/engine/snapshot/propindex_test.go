@@ -197,3 +197,38 @@ func TestNodesWithStringOverlaySuperset(t *testing.T) {
 		t.Fatalf("segment-touched node 5 missing from candidates %v", got)
 	}
 }
+
+// TestNodesWithStringOverlayNoDuplicates pins that the overlay union never
+// yields the same node twice. A candidate source that repeats a node makes
+// the interpreter admit it twice and emit a duplicate result row -- which
+// is exactly what a write-through query hit before unionDeltaTouched
+// existed: a modified node that ALSO matched the base index was returned
+// twice where PostgreSQL returned it once.
+func TestNodesWithStringOverlayNoDuplicates(t *testing.T) {
+	base := buildPropIndexFixture(t, 10)
+	v := NewView(base)
+	objID := mustProp(t, v, "objectid")
+
+	// Touch node 4 without changing the property the index is keyed on --
+	// the write-through shape: it stays a base-index match AND becomes
+	// segment-touched.
+	sb := &SegmentBuilder{}
+	if err := sb.AddNodeState(4, []KindID{1}, []byte(`{"objectid":"S-1-5-21-1-1-1-1003","touched":"yes"}`)); err != nil {
+		t.Fatalf("AddNodeState: %v", err)
+	}
+	ov := v.WithSegment(sb.Build())
+
+	ids, ok := ov.NodesWithString(objID, StringSuffix, "-1003")
+	if !ok {
+		t.Fatal("index unavailable on the overlay view")
+	}
+	seen := map[NodeID]int{}
+	for _, id := range ids {
+		seen[id]++
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("node %d appears %d times in the candidate set; a candidate source must never repeat a node", id, n)
+		}
+	}
+}
