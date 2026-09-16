@@ -19,7 +19,6 @@ package interpret
 import (
 	"errors"
 	"math"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -347,7 +346,7 @@ type Env struct {
 	Now  time.Time
 
 	regexMu    sync.Mutex
-	regexCache map[string]*regexp.Regexp
+	regexCache map[string]*RegexMatcher
 }
 
 // compiledRegex returns a compiled, cached *regexp.Regexp for pattern,
@@ -355,19 +354,19 @@ type Env struct {
 // cache exists instead of compiling on every call the way value.go's own
 // matchString (used for the STARTS WITH/ENDS WITH/CONTAINS operators, which
 // have no compilation cost to amortize) deliberately still does.
-func (e *Env) compiledRegex(pattern string) (*regexp.Regexp, error) {
+func (e *Env) compiledRegex(pattern string) (*RegexMatcher, error) {
 	e.regexMu.Lock()
 	defer e.regexMu.Unlock()
 
 	if re, ok := e.regexCache[pattern]; ok {
 		return re, nil
 	}
-	re, err := regexp.Compile(pattern)
+	re, err := NewRegexMatcher(pattern)
 	if err != nil {
 		return nil, err
 	}
 	if e.regexCache == nil {
-		e.regexCache = make(map[string]*regexp.Regexp)
+		e.regexCache = make(map[string]*RegexMatcher)
 	}
 	e.regexCache[pattern] = re
 	return re, nil
@@ -917,7 +916,7 @@ func evalRegexPredicate(env *Env, val any, ok bool, pattern string, negated bool
 	if compileErr != nil {
 		re = nil
 	}
-	return RegexPredicate(re, val, ok, negated)
+	return RegexMatcherPredicate(re, val, ok, negated)
 }
 
 // literalStringValue evaluates expr and requires the result to be a present
