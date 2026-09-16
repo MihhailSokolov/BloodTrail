@@ -87,6 +87,11 @@ type Snapshot struct {
 	stringIdxMu sync.Mutex
 	stringIdx   map[PropID]*stringIndex
 
+	// valueIdx memoizes per-property EXACT-match postings (valueindex.go),
+	// built lazily like stringIdx and guarded for the same reason.
+	valueIdxMu sync.Mutex
+	valueIdx   map[PropID]*valueIndex
+
 	// edgeKindIdx memoizes the per-edge-kind endpoint index
 	// (edgekindindex.go), built lazily in one pass on first use. Guarded for
 	// the same reason stringIdx is: a Snapshot is otherwise immutable and

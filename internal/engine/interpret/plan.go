@@ -1719,6 +1719,7 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 	pb.extractObjectIDAnchor(sym, conjunct)
 	pb.extractKindConjunct(sym, conjunct)
 	pb.extractStringAnchor(sym, conjunct)
+	pb.extractValueAnchor(sym, conjunct)
 	return true
 }
 
@@ -1938,6 +1939,196 @@ func propOpLiteral(propSide, litSide cypher.Expression, sym string) (name, opera
 		return "", "", false
 	}
 	return pl.Symbol, decoded, true
+}
+
+// extractValueAnchor resolves a conjunct into an EXACT-match candidate set
+// through the value index: `sym.prop = <literal>`, `<literal> IN sym.prop`,
+// or a disjunction of those over the same symbol.
+//
+// These are the predicates PostgreSQL itself has no index for -- BloodHound's
+// schema carries none on `properties` at all -- so they were a scan on both
+// sides, and this engine lost them on per-row throughput alone. The shipped
+// "Principals with weak supported Kerberos encryption types" is the case:
+//
+//	MATCH (u:Base) WHERE 'DES-CBC-CRC' IN u.supportedencryptiontypes
+//	   OR 'DES-CBC-MD5' IN u.supportedencryptiontypes
+//	   OR 'RC4-HMAC-MD5' IN u.supportedencryptiontypes RETURN u
+//
+// which walked every Base node in the graph to find a few hundred.
+//
+// A DISJUNCTION resolves only when EVERY arm does: the union of the arms'
+// candidate sets bounds the OR exactly when nothing else can satisfy it, and
+// one unrecognized arm means some node outside the union may match, which
+// would make the source SHORT rather than merely loose.
+//
+// The set is costed before it is built (ValuePostingCount) and adopted only
+// when it beats what the symbol would otherwise enumerate, because the common
+// case is the opposite of selective -- `n.enabled = true` matches most of the
+// graph, and materializing a million-id posting list per query to then not
+// use it costs more than the scan it replaces.
+func (pb *partBuilder) extractValueAnchor(sym string, conjunct cypher.Expression) {
+	nc := pb.nodeConstraint(sym)
+
+	terms, ok := pb.valueAnchorTerms(sym, conjunct)
+	if !ok || len(terms) == 0 {
+		return
+	}
+
+	budget := pb.valueAnchorBudget(sym, nc)
+	total := 0
+	for _, t := range terms {
+		n, ok := pb.snap.ValuePostingCount(t.name, t.value, t.element)
+		if !ok {
+			return
+		}
+		total += n
+		if total >= budget {
+			// Already no cheaper than what the symbol would scan anyway.
+			return
+		}
+	}
+
+	seen := make(map[snapshot.NodeID]bool, total)
+	var union []snapshot.NodeID
+	for _, t := range terms {
+		ids, ok := pb.resolveValueTerm(t)
+		if !ok {
+			return
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				union = append(union, id)
+			}
+		}
+	}
+	nc.PropCandidates, nc.PropIndexed = union, true
+}
+
+// valueAnchorBudget is the size an exact-match candidate set has to beat:
+// whatever the symbol would otherwise enumerate, which is its smallest kind
+// bitmap, or the whole graph when it carries no label. An anchor already
+// resolved (by extractStringAnchor, say) is the bar instead when it is
+// smaller, so the cheapest source wins rather than the first one found.
+func (pb *partBuilder) valueAnchorBudget(sym string, nc *NodeConstraint) int {
+	budget := pb.snap.NodeCount()
+	if n, ok := pb.smallestKindCount(sym); ok && n < budget {
+		budget = n
+	}
+	if nc.PropIndexed && len(nc.PropCandidates) < budget {
+		budget = len(nc.PropCandidates)
+	}
+	return budget
+}
+
+// valueAnchorTerm is one exact-match lookup: a property name, the value, and
+// whether the property is a LIST the value must be a member of.
+type valueAnchorTerm struct {
+	name    string
+	value   any
+	element bool
+}
+
+func (pb *partBuilder) resolveValueTerm(t valueAnchorTerm) ([]snapshot.NodeID, bool) {
+	if t.element {
+		return pb.snap.NodesWithArrayElementByName(t.name, t.value)
+	}
+	return pb.snap.NodesWithValueByName(t.name, t.value)
+}
+
+// valueAnchorTerms flattens conjunct into the exact-match lookups whose union
+// bounds it, or reports that it cannot be bounded.
+func (pb *partBuilder) valueAnchorTerms(sym string, conjunct cypher.Expression) ([]valueAnchorTerm, bool) {
+	switch typed := unwrapParens(conjunct).(type) {
+	case *cypher.Disjunction:
+		if typed == nil {
+			return nil, false
+		}
+		var all []valueAnchorTerm
+		for _, arm := range typed.GetAll() {
+			terms, ok := pb.valueAnchorTerms(sym, arm)
+			if !ok || len(terms) == 0 {
+				return nil, false
+			}
+			all = append(all, terms...)
+		}
+		return all, true
+	default:
+		t, ok := pb.valueAnchorTerm(sym, conjunct)
+		if !ok {
+			return nil, false
+		}
+		return []valueAnchorTerm{t}, true
+	}
+}
+
+// valueAnchorTerm recognizes one `sym.prop = <literal>` or `<literal> IN
+// sym.prop`.
+func (pb *partBuilder) valueAnchorTerm(sym string, expr cypher.Expression) (valueAnchorTerm, bool) {
+	op, left, right, ok := asSingleComparison(expr)
+	if !ok {
+		return valueAnchorTerm{}, false
+	}
+	switch op {
+	case cypher.OperatorEquals:
+		if name, val, ok := propEqLiteral(left, right, sym); ok {
+			return valueAnchorTerm{name: name, value: val}, true
+		}
+		if name, val, ok := propEqLiteral(right, left, sym); ok {
+			return valueAnchorTerm{name: name, value: val}, true
+		}
+	case cypher.OperatorIn:
+		// `<literal> IN sym.prop` -- the LIST is on the right. The mirrored
+		// `sym.prop IN [...]` is a different shape entirely and belongs to
+		// extractStringInAnchor.
+		pl, isProp := unwrapParens(right).(*cypher.PropertyLookup)
+		if !isProp || pl == nil || pl.Symbol == "" {
+			return valueAnchorTerm{}, false
+		}
+		v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+		if !isVar || v == nil || v.Symbol != sym {
+			return valueAnchorTerm{}, false
+		}
+		val, ok := literalValue(left)
+		if !ok {
+			return valueAnchorTerm{}, false
+		}
+		return valueAnchorTerm{name: pl.Symbol, value: val, element: true}, true
+	}
+	return valueAnchorTerm{}, false
+}
+
+// propEqLiteral recognizes `sym.<name>` against any literal, returning the
+// property name and the literal's value in this package's value model.
+func propEqLiteral(propSide, litSide cypher.Expression, sym string) (name string, val any, ok bool) {
+	pl, isProp := unwrapParens(propSide).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", nil, false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return "", nil, false
+	}
+	value, ok := literalValue(litSide)
+	if !ok {
+		return "", nil, false
+	}
+	return pl.Symbol, value, true
+}
+
+// literalValue converts a literal expression to this package's value model,
+// or reports that it is not a usable literal. A NULL literal is refused: the
+// index holds present values, and `x = null` is never true anyway.
+func literalValue(expr cypher.Expression) (any, bool) {
+	lit, isLit := asLiteral(expr)
+	if !isLit || lit == nil || lit.Null {
+		return nil, false
+	}
+	val, ok, err := evalLiteralValue(lit)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return val, true
 }
 
 // coalescePropOpLiteral recognizes `COALESCE(sym.<prop>, <default>) <op>
