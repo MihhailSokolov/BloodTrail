@@ -94,30 +94,54 @@ func TestStringAnchorReplacesTheKindScan(t *testing.T) {
 	}
 }
 
-// TestStringAnchorNeverLosesToItsOwnKindBitmap: an UNSELECTIVE string
-// predicate must not hijack the anchor away from a smaller kind bitmap.
-// `name CONTAINS 'USER'` resolves to nearly the whole User population, so
-// ranking the index as its own better tier would have made this query walk
-// 5000 candidates where the Group bitmap offers 1 -- the mis-ranking
-// rankOf's same-tier, size-compared treatment exists to prevent.
-func TestStringAnchorNeverLosesToItsOwnKindBitmap(t *testing.T) {
+// TestStringAnchorContainsOnlyWhenCheaper pins the cost guard around
+// CONTAINS, which -- unlike equality/prefix/suffix -- has no ordering that
+// answers it and therefore scans the property's whole population every
+// time. Resolving it anyway is a LOSS whenever that population is larger
+// than the candidate source it would replace.
+//
+// This is not hypothetical: the shipped "Tier Zero / High Value external
+// Entra ID users" prebuilt pairs `(n:Tag_Tier_Zero)` (145 nodes on the
+// benchmark graph) with `n.name CONTAINS '#EXT#@'` (~1M nodes carry
+// `name`), and resolving the CONTAINS turned a 17.7ms query into 1504.8ms.
+func TestStringAnchorContainsOnlyWhenCheaper(t *testing.T) {
 	const users = 5000
 	snap := buildPropAnchorFixture(t, users)
 
-	env := &Env{Snap: snap}
-	q := planQuery(t, snap, `MATCH (u:User) WHERE u.name CONTAINS 'USER' RETURN u LIMIT 5`)
-	nc := q.Parts[0].Nodes["u"]
-	if !nc.PropIndexed {
-		t.Fatal("expected the CONTAINS predicate to resolve through the index")
-	}
-	if len(nc.PropCandidates) < users-10 {
-		t.Fatalf("fixture invariant: CONTAINS 'USER' should match nearly every user, got %d", len(nc.PropCandidates))
-	}
-	// Same tier as a kind bitmap, and the bitmap here is no larger, so the
-	// index must not be preferred on size.
-	if propIndexPreferred(env, nc) && len(nc.PropCandidates) > smallestKindBitmap(env, nc.Kinds).Count() {
-		t.Fatal("an unselective index result was preferred over a smaller kind bitmap")
-	}
+	t.Run("unselective CONTAINS against a kind bitmap is not resolved", func(t *testing.T) {
+		// `name` is carried by every user; the User bitmap is no larger, so
+		// scanning the property population cannot pay for itself.
+		q := planQuery(t, snap, `MATCH (u:User) WHERE u.name CONTAINS 'USER' RETURN u LIMIT 5`)
+		if q.Parts[0].Nodes["u"].PropIndexed {
+			t.Fatal("an unselective CONTAINS must not resolve through the index")
+		}
+	})
+
+	t.Run("sparse CONTAINS against a kind bitmap is resolved", func(t *testing.T) {
+		// system_tags is carried by 3 of 5000 nodes: far cheaper to scan
+		// than the User bitmap, which is the whole point of the index.
+		q := planQuery(t, snap, `MATCH (u:User) WHERE u.system_tags CONTAINS 'admin_tier_0' RETURN u LIMIT 5`)
+		nc := q.Parts[0].Nodes["u"]
+		if !nc.PropIndexed {
+			t.Fatal("a sparse CONTAINS should resolve through the index")
+		}
+		if len(nc.PropCandidates) != 2 {
+			t.Fatalf("resolved %d candidates, want the 2 tagged nodes", len(nc.PropCandidates))
+		}
+	})
+
+	t.Run("ordered lookups resolve regardless of population", func(t *testing.T) {
+		// A suffix search returns its matches in log time however many
+		// nodes carry the property, so the population is irrelevant.
+		q := planQuery(t, snap, `MATCH (u:User) WHERE u.objectid ENDS WITH '-513' RETURN u LIMIT 5`)
+		nc := q.Parts[0].Nodes["u"]
+		if !nc.PropIndexed {
+			t.Fatal("an ENDS WITH over a fully-populated property should still resolve")
+		}
+		if len(nc.PropCandidates) != 1 {
+			t.Fatalf("resolved %d candidates, want 1", len(nc.PropCandidates))
+		}
+	})
 }
 
 // TestStringAnchorAnswersMatchTheScan is the correctness pin: for each

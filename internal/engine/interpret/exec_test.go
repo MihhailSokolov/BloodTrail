@@ -1286,3 +1286,14 @@ func rowsToOutVals(t *testing.T, rows []*Row) [][]OutVal {
 	}
 	return out
 }
+
+// planNoFail plans query and reports whether it was served, without failing
+// the test when it is declined -- for assertions ABOUT declines.
+func planNoFail(t *testing.T, snap *snapshot.View, query string) (*Query, bool) {
+	t.Helper()
+	rq, err := frontend.ParseCypher(frontend.NewContext(), query)
+	if err != nil {
+		return nil, false
+	}
+	return Plan(rq, snap)
+}

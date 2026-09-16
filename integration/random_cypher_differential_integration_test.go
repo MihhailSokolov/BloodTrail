@@ -587,6 +587,28 @@ var randomCypherTemplates = []randomCypherTemplate{
 		return fmt.Sprintf(`MATCH (n:%s) WHERE n.str CONTAINS %s WITH count(n) AS cnt RETURN cnt`,
 			randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
 	},
+
+	// RETURN-position aggregation (desugarReturnAggregates), which pg
+	// answers with its own GROUP BY: the single-row forms pin the fold and
+	// the empty-match "one row of zero" rule, and the grouped form pins
+	// that the engine's first-occurrence group order and pg's hash-agg
+	// order agree as SETS -- the comparison below sorts, which is the only
+	// sense in which either engine promises an order here.
+	func(rng *rand.Rand) string {
+		op := []string{"=", "<>", "<", ">"}[rng.Intn(4)]
+		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val %s %s RETURN count(n)`,
+			randomCypherPickKind(rng), op, cypherNumberLiteral(randomCypherPickNumber(rng)))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) RETURN count(*)`, randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE n.str CONTAINS %s RETURN count(n) AS cnt`,
+			randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n.flag, count(n)`, randomCypherPickKind(rng))
+	},
 }
 
 // randomCypherQuery picks a uniformly random template and renders it.

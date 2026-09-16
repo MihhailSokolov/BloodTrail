@@ -74,6 +74,13 @@ func TestTryCypherKeysMatchOracle(t *testing.T) {
 		`MATCH (n:KeysNode) RETURN n.name, n.objectid`,
 		`MATCH (n:KeysNode) RETURN toLower(n.name) AS lowered, n`,
 		`MATCH (n:KeysNode) RETURN count(n) AS c`,
+		// RETURN-position aggregation: pg names an unaliased aggregate
+		// after its function and an unaliased property lookup `?column?`,
+		// which is where those rules in desugarReturnAggregates come from.
+		`MATCH (n:KeysNode) RETURN count(n)`,
+		`MATCH (n:KeysNode) RETURN count(*)`,
+		`MATCH (n:KeysNode) RETURN n.name, count(n)`,
+		`MATCH (n:KeysNode) RETURN n.name, count(n) ORDER BY count(n) DESC`,
 		// Zero rows: the oracle never populates Keys at all for these.
 		`MATCH (n:KeysNode) WHERE n.name = 'nobody' RETURN n.name`,
 		`MATCH (n:KeysNode) WHERE n.name = 'nobody' RETURN n AS renamed`,

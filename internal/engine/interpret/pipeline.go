@@ -249,6 +249,16 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		return nil, errUnsupportedStep
 	}
 
+	// A RETURN carrying aggregates groups here, immediately before
+	// projection, through the very same stage an explicit WITH boundary
+	// uses -- see Query.ReturnGroup and desugarReturnAggregates.
+	if q.ReturnGroup != nil {
+		rows, err = runWithStage(env, meter, q.ReturnGroup, rows)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Admit every surviving row into the query's row budget -- this is the
 	// "final result" MaxRows' own doc comment describes: a 2-part query's
 	// Part[0]-filtered-but-pre-WITH rows are an intermediate quantity already
@@ -724,6 +734,28 @@ func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component,
 // producing the carried row set for whatever comes next -- see this file's
 // package doc comment for the grouping-vs-pass-through dispatch rule.
 func runWithStage(env *Env, meter *workMeter, wc *WithClause, rows []*Row) ([]*Row, error) {
+	// Computed items bind first, on the INPUT rows, because a grouping key
+	// may BE one of them (`WITH u.domain AS d, COUNT(u) AS n` groups by the
+	// evaluated property, not by the expression's text). Binding them as
+	// ordinary scalars under their alias is what lets every stage below --
+	// group-key encoding, projection, ORDER BY -- treat a computed key
+	// exactly like any other carried symbol, with no special case.
+	//
+	// Writing to the input rows is safe: they belong to this query alone,
+	// and the alias namespace ("$ret..." for a desugared RETURN, an explicit
+	// user alias otherwise) cannot collide with a pattern binding.
+	for _, c := range wc.Computed {
+		for _, r := range rows {
+			v, ok, err := EvalValue(env, r, c.Expr)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				v = nil
+			}
+			r.SetScalar(c.Alias, v)
+		}
+	}
 	if len(wc.Aggregates) == 0 {
 		return runWithPassThrough(env, meter, wc, rows)
 	}
@@ -890,6 +922,11 @@ func applyAggregate(env *Env, out *Row, agg WithAggregate, groupRows []*Row) {
 // distinct composites, which equals distinct ids" -- CountAgg's own doc
 // comment) or by the same ScalarEq-consistent encoding grouping uses.
 func countAggregate(env *Env, agg *CountAgg, rows []*Row) int64 {
+	if agg.Star {
+		// COUNT(*) counts ROWS, with no value to test for null and no
+		// DISTINCT to apply -- pg's own semantics.
+		return int64(len(rows))
+	}
 	if !agg.Distinct {
 		if len(rows) == 0 {
 			return 0

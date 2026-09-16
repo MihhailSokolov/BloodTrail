@@ -206,6 +206,10 @@ type NodeConstraint struct {
 type CountAgg struct {
 	Distinct bool
 	Sym      string
+
+	// Star is `COUNT(*)`: the group's own row count, with no argument to
+	// test for null and no DISTINCT to apply. Sym is empty when it is set.
+	Star bool
 }
 
 // CollectMembershipAgg is a WITH `COLLECT(sym)` aggregate, servable *only*
@@ -270,6 +274,21 @@ type WithClause struct {
 	GroupKeys  []string
 	Aggregates []WithAggregate
 	Constants  []WithConstant
+
+	// Computed is every `<expression> AS alias` item: an expression
+	// evaluated once per INPUT row and bound as a scalar under Alias before
+	// grouping happens, so a grouping key may be a property lookup
+	// (`WITH u.domain AS d, COUNT(u) AS n`) rather than only a bare
+	// variable. Each alias also appears in GroupKeys, which is what makes
+	// the rest of the pipeline -- key encoding, projection, ORDER BY --
+	// treat it exactly like any other carried symbol.
+	Computed []WithComputed
+}
+
+// WithComputed is one `<expression> AS alias` projection item.
+type WithComputed struct {
+	Alias string
+	Expr  cypher.Expression
 }
 
 // Part is one query "part" in the multi-part-query sense: a pattern
@@ -427,6 +446,15 @@ type Query struct {
 	Skip      int64
 	Limit     int64
 	Regexes   map[string]*regexp.Regexp
+
+	// ReturnGroup is the implicit grouping a RETURN clause containing
+	// aggregates desugars to (desugarReturnAggregates): `RETURN u.domain,
+	// COUNT(u)` is `WITH u.domain AS k, COUNT(u) AS a RETURN k, a` with the
+	// original column names preserved. nil when RETURN has no aggregate.
+	// Applied by runQuery immediately before projection, through the same
+	// runWithStage the explicit WITH boundary uses -- one grouping
+	// implementation, not two.
+	ReturnGroup *WithClause
 }
 
 // --- Plan entry point ---------------------------------------------------
@@ -500,17 +528,31 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 				// smuggle a second shortestPath past a per-Part-only check.
 				return nil, false
 			}
-			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, st.ret)
+			ret, returnGroup, groupKnown, ok := desugarReturnAggregates(known, st.ret)
+			if !ok {
+				return nil, false
+			}
+			if returnGroup != nil {
+				// After grouping, only the synthesized aliases survive --
+				// the same scoping an explicit WITH imposes. countAliases /
+				// numericScalars carry the COUNT aliases so planOrder's
+				// numeric-alias rule admits `ORDER BY count(u)`.
+				known = groupKnown
+				countAliases = countAliasSet(*returnGroup)
+				numericScalars = numericScalarSet(*returnGroup)
+			}
+			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, ret)
 			if !ok {
 				return nil, false
 			}
 			return &Query{
-				Parts:     parts,
-				Returning: proj,
-				Order:     order,
-				Skip:      skip,
-				Limit:     limit,
-				Regexes:   regexes,
+				Parts:       parts,
+				Returning:   proj,
+				Order:       order,
+				Skip:        skip,
+				Limit:       limit,
+				Regexes:     regexes,
+				ReturnGroup: returnGroup,
 			}, true
 		}
 	}
@@ -1501,11 +1543,69 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 		nc.PropCandidates, nc.PropIndexed = nil, true
 		return
 	}
+	if !pb.stringAnchorWorthIt(sym, propID, match) {
+		return
+	}
 	ids, ok := pb.snap.NodesWithString(propID, match, operand)
 	if !ok {
 		return
 	}
 	nc.PropCandidates, nc.PropIndexed = ids, true
+}
+
+// stringAnchorWorthIt decides whether resolving an indexable predicate can
+// actually pay for itself, BEFORE the resolution runs -- because resolving
+// is not free and happens here, at plan time.
+//
+// The distinction is the match shape. An ordered lookup (equality, prefix,
+// suffix) costs a binary search plus the matches, however many nodes carry
+// the property, so it is worth taking whenever it is available; the sort
+// that makes it possible is built once per property and memoized across
+// every later query against the same snapshot.
+//
+// CONTAINS has no such ordering: it scans the property's whole population
+// every time. That is a win exactly when the population is smaller than the
+// candidate source it replaces -- a hygiene property on 125 nodes against a
+// 920k-node `Base` bitmap -- and a LOSS when it is larger. Measured: the
+// shipped "Tier Zero / High Value external Entra ID users" prebuilt pairs
+// `(n:Tag_Tier_Zero)` (145 nodes) with `n.name CONTAINS '#EXT#@'` (~1M
+// nodes carry `name`), and resolving the CONTAINS anyway turned a 17.7ms
+// query into 1504.8ms.
+func (pb *partBuilder) stringAnchorWorthIt(sym string, prop snapshot.PropID, match snapshot.StringMatch) bool {
+	if match != snapshot.StringContains {
+		return true
+	}
+	population, ok := pb.snap.PropCount(prop)
+	if !ok {
+		return false
+	}
+	alt, ok := pb.smallestKindCount(sym)
+	if !ok {
+		// No kind labels: the alternative is a full scan of every node, so
+		// scanning only the nodes carrying this property is never worse.
+		return true
+	}
+	return population < alt
+}
+
+// smallestKindCount returns the population of the smallest kind bitmap
+// among sym's kind labels -- the candidate source scanAnchorVisit would use
+// if no property index were available -- and false when sym carries none.
+func (pb *partBuilder) smallestKindCount(sym string) (int, bool) {
+	nc, ok := pb.nodes[sym]
+	if !ok || len(nc.Kinds) == 0 {
+		return 0, false
+	}
+	best := -1
+	for _, k := range nc.Kinds {
+		if n := pb.snap.NodesOfKind(k).Count(); best < 0 || n < best {
+			best = n
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
 }
 
 // extractStringInAnchor handles `sym.prop IN ['a','b',...]`: a disjunction
@@ -2915,6 +3015,13 @@ func planWith(inputKnown map[string]symKind, w *cypher.With) (WithClause, map[st
 func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) (WithAggregate, bool) {
 	switch strings.ToLower(fi.Name) {
 	case cypher.CountFunction:
+		// COUNT(*) reaches here as a single *cypher.RangeQuantifier
+		// argument holding "*", not as an empty argument list -- the
+		// grammar reuses that node for the star. It is the group's own row
+		// count; pg names the column `count`, as it does for COUNT(<expr>).
+		if isStarArgument(fi) {
+			return WithAggregate{Count: &CountAgg{Star: true}}, true
+		}
 		if len(fi.Arguments) != 1 {
 			return WithAggregate{}, false
 		}
@@ -2943,6 +3050,289 @@ func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) 
 
 	default:
 		return WithAggregate{}, false
+	}
+}
+
+// aggregateAliasPrefix names the synthetic symbols desugarReturnAggregates
+// introduces. "$" can never begin a real Cypher identifier (the same
+// reasoning symbolFor and pathStepArcKey rely on), so these can never
+// collide with a user's own variable.
+const aggregateAliasPrefix = "$ret"
+
+// pgPlaceholderColumn is the column name PostgreSQL gives a projection it
+// was handed with no SQL alias -- an unaliased property lookup, as dawgs
+// translates it. Pinned live by TestTryCypherKeysMatchOracle.
+const pgPlaceholderColumn = "?column?"
+
+// containsAggregateCall reports whether expr contains a call to an
+// aggregate function anywhere inside it. Only a TOP-LEVEL aggregate is
+// servable (see desugarReturnAggregates), so a nested one -- `count(n) + 1`
+// -- is detected here purely so the whole query can decline rather than be
+// silently mis-grouped.
+func containsAggregateCall(expr cypher.Expression) bool {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return false
+		}
+		if isAggregateName(e.Name) {
+			return true
+		}
+		for _, arg := range e.Arguments {
+			if containsAggregateCall(arg) {
+				return true
+			}
+		}
+		return false
+	case *cypher.ArithmeticExpression:
+		if e == nil {
+			return false
+		}
+		if containsAggregateCall(e.Left) {
+			return true
+		}
+		for _, p := range e.Partials {
+			if p != nil && containsAggregateCall(p.Right) {
+				return true
+			}
+		}
+		return false
+	case *cypher.UnaryAddOrSubtractExpression:
+		return e != nil && containsAggregateCall(e.Right)
+	case *cypher.ListLiteral:
+		if e == nil {
+			return false
+		}
+		for _, el := range *e {
+			if containsAggregateCall(el) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// isStarArgument recognizes the `(*)` argument list of COUNT(*).
+func isStarArgument(fi *cypher.FunctionInvocation) bool {
+	if len(fi.Arguments) != 1 {
+		return false
+	}
+	rq, ok := unwrapParens(fi.Arguments[0]).(*cypher.RangeQuantifier)
+	return ok && rq != nil && rq.Value == "*"
+}
+
+// projectionKeyOf canonicalizes a projectable expression into a comparable
+// string, so an ORDER BY item can be matched against the RETURN item that
+// computed it (`RETURN u.name, count(u) ORDER BY count(u) DESC`). Only the
+// shapes desugarReturnAggregates itself projects are canonicalized; ok is
+// false for anything else, which simply means no rewrite is attempted.
+func projectionKeyOf(expr cypher.Expression) (string, bool) {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.Variable:
+		if e == nil || e.Symbol == "" {
+			return "", false
+		}
+		return "v:" + e.Symbol, true
+	case *cypher.PropertyLookup:
+		if e == nil {
+			return "", false
+		}
+		v, ok := unwrapParens(e.Atom).(*cypher.Variable)
+		if !ok || v == nil {
+			return "", false
+		}
+		return "p:" + v.Symbol + "." + e.Symbol, true
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return "", false
+		}
+		key := "f:" + strings.ToLower(e.Name)
+		if e.Distinct {
+			key += ":distinct"
+		}
+		if isStarArgument(e) {
+			return key + "|*", true
+		}
+		for _, arg := range e.Arguments {
+			k, ok := projectionKeyOf(arg)
+			if !ok {
+				return "", false
+			}
+			key += "|" + k
+		}
+		return key, true
+	default:
+		return "", false
+	}
+}
+
+func isAggregateName(name string) bool {
+	switch strings.ToLower(name) {
+	case cypher.CountFunction, cypher.CollectFunction:
+		return true
+	}
+	return false
+}
+
+// desugarReturnAggregates rewrites a RETURN clause containing aggregates
+// into an implicit grouping plus a RETURN over its results: `RETURN
+// u.domain, COUNT(u)` becomes, in effect, `WITH u.domain AS $ret0,
+// COUNT(u) AS $ret1 RETURN $ret0, $ret1` -- with each output column keeping
+// the name PostgreSQL itself would give it.
+//
+// Cypher's own rule decides the grouping: every RETURN item that is NOT an
+// aggregate is a grouping key, and the aggregates fold over each group.
+// Routing this through the SAME WithClause the explicit WITH boundary uses
+// means there is one grouping implementation rather than two, and every
+// property the WITH path already has -- deterministic first-occurrence
+// group order, the "aggregate with no GROUP BY produces exactly one row
+// even over zero input rows" rule -- applies here unchanged.
+//
+// Column naming was taken from a live PostgreSQL oracle rather than
+// assumed: an unaliased aggregate is named after its FUNCTION
+// (`RETURN count(n)` -> "count", `RETURN sum(1)` -> "sum"), an unaliased
+// property lookup is pg's own `?column?` placeholder, and an explicit
+// `AS x` is x. planReturn's projectionName/OutputName machinery already
+// implements the last two; this function only has to preserve the item's
+// original naming inputs while swapping the expression underneath, which
+// it does by aliasing every rewritten item explicitly and letting
+// ProjectionOutput.OutputName carry pg's name.
+//
+// Returns (ret, nil, nil, true) unchanged when RETURN has no aggregate.
+func desugarReturnAggregates(known map[string]symKind, ret *cypher.Return) (*cypher.Return, *WithClause, map[string]symKind, bool) {
+	if ret == nil || ret.Projection == nil || ret.Projection.All {
+		return ret, nil, nil, true
+	}
+	any := false
+	for _, raw := range ret.Projection.Items {
+		item, ok := raw.(*cypher.ProjectionItem)
+		if !ok || item == nil {
+			return ret, nil, nil, true // planReturn rejects it on its own terms
+		}
+		if containsAggregateCall(item.Expression) {
+			any = true
+		}
+	}
+	if !any {
+		return ret, nil, nil, true
+	}
+
+	wc := &WithClause{}
+	groupKnown := map[string]symKind{}
+	newItems := make([]cypher.Expression, 0, len(ret.Projection.Items))
+	aliasByKey := map[string]string{}
+
+	for i, raw := range ret.Projection.Items {
+		item := raw.(*cypher.ProjectionItem)
+		alias := aggregateAliasPrefix + itoa(i)
+
+		// pg's own column name for this item, computed from the ORIGINAL
+		// expression before it is swapped out.
+		outName, ok := aggregateOutputName(item)
+		if !ok {
+			return nil, nil, nil, false
+		}
+
+		bare := unwrapParens(item.Expression)
+		if fi, isCall := bare.(*cypher.FunctionInvocation); isCall && fi != nil && isAggregateName(fi.Name) {
+			agg, ok := classifyAggregate(known, fi)
+			if !ok {
+				return nil, nil, nil, false
+			}
+			if agg.Count == nil {
+				// COLLECT is servable only as WITH's id-set membership
+				// aggregate (CollectMembershipAgg's own doc): its value is
+				// a set of node ids for a later IN test, NOT the list of
+				// node composites PostgreSQL would project. Projecting it
+				// would return a different value than pg for the same
+				// query, so RETURN-position COLLECT stays delegated.
+				return nil, nil, nil, false
+			}
+			agg.Alias = alias
+			wc.Aggregates = append(wc.Aggregates, agg)
+		} else {
+			if containsAggregateCall(item.Expression) {
+				// An aggregate nested inside a larger expression
+				// (`count(n) + 1`): grouping it correctly means evaluating
+				// the surrounding arithmetic AFTER the fold, which this
+				// projection layer does not do. Decline rather than group
+				// by an expression containing its own aggregate.
+				return nil, nil, nil, false
+			}
+			wc.Computed = append(wc.Computed, WithComputed{Alias: alias, Expr: item.Expression})
+			wc.GroupKeys = append(wc.GroupKeys, alias)
+		}
+		groupKnown[alias] = symScalar
+		if key, ok := projectionKeyOf(item.Expression); ok {
+			aliasByKey[key] = alias
+		}
+
+		newItems = append(newItems, &cypher.ProjectionItem{
+			Expression: &cypher.Variable{Symbol: alias},
+			Alias:      &cypher.Variable{Symbol: outName},
+		})
+	}
+
+	// ORDER BY may name one of the RETURN expressions rather than an alias
+	// -- `RETURN u.name, count(u) ORDER BY count(u) DESC` is the corpus's
+	// own shape. Since the expression has just been replaced by a synthetic
+	// alias, the sort key has to follow it; planOrder only ever accepts a
+	// bare variable, and after this rewrite that is exactly what it sees.
+	order := ret.Projection.Order
+	if order != nil && len(aliasByKey) > 0 {
+		items := make([]*cypher.SortItem, 0, len(order.Items))
+		for _, si := range order.Items {
+			if si == nil {
+				return nil, nil, nil, false
+			}
+			ns := &cypher.SortItem{Ascending: si.Ascending, Expression: si.Expression}
+			if key, ok := projectionKeyOf(si.Expression); ok {
+				if alias, found := aliasByKey[key]; found {
+					ns.Expression = &cypher.Variable{Symbol: alias}
+				}
+			}
+			items = append(items, ns)
+		}
+		order = &cypher.Order{Items: items}
+	}
+
+	rewritten := &cypher.Return{Projection: &cypher.Projection{
+		Distinct: ret.Projection.Distinct,
+		Items:    newItems,
+		Order:    order,
+		Skip:     ret.Projection.Skip,
+		Limit:    ret.Projection.Limit,
+	}}
+	return rewritten, wc, groupKnown, true
+}
+
+// aggregateOutputName returns the column name PostgreSQL gives one RETURN
+// item, verified against a live pg oracle: an explicit alias wins; an
+// unaliased aggregate call is named after the function; an unaliased
+// property lookup is pg's `?column?` placeholder; an unaliased bare
+// variable is the variable. Anything else this layer does not name is
+// refused rather than guessed at.
+func aggregateOutputName(item *cypher.ProjectionItem) (string, bool) {
+	if item.Alias != nil && item.Alias.Symbol != "" {
+		return item.Alias.Symbol, true
+	}
+	switch e := unwrapParens(item.Expression).(type) {
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return "", false
+		}
+		return strings.ToLower(e.Name), true
+	case *cypher.Variable:
+		if e == nil || e.Symbol == "" {
+			return "", false
+		}
+		return e.Symbol, true
+	case *cypher.PropertyLookup:
+		return pgPlaceholderColumn, true
+	default:
+		return "", false
 	}
 }
 
@@ -3029,7 +3419,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 			// unaliased shape Plan accepts, and dawgs DOES alias that one to
 			// the symbol itself.
 			if _, isProp := unwrapParens(item.Expression).(*cypher.PropertyLookup); isProp {
-				outputName = "?column?"
+				outputName = pgPlaceholderColumn
 			}
 		}
 
