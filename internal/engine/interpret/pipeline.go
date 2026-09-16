@@ -169,6 +169,18 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 
 	part0 := &q.Parts[0]
 
+	// A query that must materialize every row before it can answer, over a
+	// candidate source already larger than the row budget, cannot finish --
+	// so it declines here rather than after scanning its way to the same
+	// conclusion. `MATCH (u:User) RETURN DISTINCT u.enabled LIMIT 1000` and
+	// `... RETURN u.objectid ORDER BY u.objectid LIMIT 1000` each spent tens
+	// of milliseconds discovering that, on top of the PostgreSQL time they
+	// then cost anyway, which is the whole of why they measured slower than
+	// the database they delegate to.
+	if declinesOnRowBudget(env, q, meter) {
+		return nil, ErrBudget
+	}
+
 	// Only Part[0] runs through matchPartPlain, which is where the OPTIONAL
 	// MATCH left join lives. A Part after a WITH boundary is matched per
 	// carried seed by a different driver entirely, so an Optional hanging off
@@ -479,6 +491,44 @@ const limitChunk = 1024
 // function, so every ineligible query -- and every eligible-looking one that
 // still isn't actually servable by the chunked driver -- gets exactly the
 // same treatment it always got.
+// declinesOnRowBudget reports whether q provably cannot finish within
+// Budgets.MaxRows, cheaply enough to be worth asking before any scanning.
+//
+// Deliberately narrow, because the cost of being wrong is declining a query
+// that would have succeeded. It fires only for a single Part with no pattern
+// steps and one symbol -- a bare kind scan -- whose candidate source carries
+// no predicate that could reduce it, in a query that must see every row
+// before it can emit any (DISTINCT, or ORDER BY). For that shape the final
+// row count IS the candidate count, exactly, and a LIMIT cannot stop the scan
+// early because the rows have to be deduplicated or sorted first.
+func declinesOnRowBudget(env *Env, q *Query, meter *workMeter) bool {
+	if meter.budget.MaxRows <= 0 || len(q.Parts) != 1 {
+		return false
+	}
+	if !q.Returning.Distinct && len(q.Order) == 0 {
+		return false
+	}
+	if q.ReturnGroup != nil {
+		// An aggregate collapses rows, so the candidate count says nothing
+		// about how many come out.
+		return false
+	}
+	part := &q.Parts[0]
+	if len(part.Chains) != 0 || len(part.Nodes) != 1 || part.Where != nil || part.Optional != nil {
+		return false
+	}
+	for _, nc := range part.Nodes {
+		if nc == nil || len(nc.Predicates) > 0 || len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil {
+			return false
+		}
+		if len(nc.Kinds) == 0 {
+			return false
+		}
+		return smallestKindBitmap(env, nc.Kinds).Count() > meter.budget.MaxRows
+	}
+	return false
+}
+
 func matchPartPlain(env *Env, meter *workMeter, part *Part) ([]*Row, error) {
 	rows, err := matchPart(env, part, meter)
 	if err != nil {

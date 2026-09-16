@@ -846,7 +846,7 @@ func TestVarLengthReverseUsedEvenWithALimit(t *testing.T) {
 	for _, id := range seedIDs {
 		seed := NewRow()
 		seed.SetNode(step.ToSym, id)
-		grown, err := expandVarLengthTrailsToSeed(env, rev, step, part.Nodes[step.FromSym], seed, step.PathSym)
+		grown, err := expandVarLengthTrailsToSeed(env, rev, step, part.Nodes[step.FromSym], seed, step.PathSym, 0)
 		if err != nil {
 			t.Fatalf("expandVarLengthTrailsToSeed: %v", err)
 		}
@@ -1285,5 +1285,68 @@ func TestVarLengthReverseIgnoresNegatedNearPredicates(t *testing.T) {
 				assertVarLengthDirectionsAgree(t, snap, tc.query)
 			}
 		})
+	}
+}
+
+// TestVarLengthReverseHonoursTheLimit pins that the reverse walk stops at the
+// query's LIMIT instead of enumerating every trail and letting the pipeline
+// throw the rest away.
+//
+// It matters because this route is deliberately kept away from the chunked
+// LIMIT driver (componentPrefersReverseSeeding), so if the walk does not
+// honour the limit itself, nothing does until every trail exists. The fixture
+// is a chain deep enough that the full enumeration is far larger than the
+// limit, under a work budget that only the truncated walk can afford.
+func TestVarLengthReverseHonoursTheLimit(t *testing.T) {
+	// A caterpillar: a spine of Src nodes, each also pointed at by several
+	// leaves, all reaching the single Target. Trails through it are many
+	// times the limit below.
+	const spine, leaves = 40, 6
+	// Node ids must be staged ascending, so the Target comes first.
+	const targetID = uint64(1)
+	nodes := []execNodeSpec{{targetID, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "L-516"}}}
+	var edges []execEdgeSpec
+	var eid uint64
+	next := func() uint64 { eid++; return eid }
+	prev := targetID
+	id := uint64(2)
+	for i := 0; i < spine; i++ {
+		s := id
+		id++
+		nodes = append(nodes, execNodeSpec{s, nil, nil})
+		for j := 0; j < leaves; j++ {
+			l := id
+			id++
+			nodes = append(nodes, execNodeSpec{l, nil, nil})
+			edges = append(edges, execEdgeSpec{next(), l, s, revKindE})
+		}
+		edges = append(edges, execEdgeSpec{next(), s, prev, revKindE})
+		prev = s
+	}
+	snap := buildExecSnapshot(t, revKindTable, nodes, edges)
+	env := &Env{Snap: snap}
+
+	const query = `MATCH (s)-[:E*1..15]->(t:Target) WHERE t.objectid = 'L-516' RETURN s, t LIMIT 5`
+	part, step := varLengthPartAndStep(t, snap, query)
+	if !varLengthReverseEligible(env, part, step) {
+		t.Fatal("fixture must exercise the reverse route")
+	}
+
+	// Enumerating everything costs far more than this; only a walk that stops
+	// at the limit fits.
+	rs, err := Execute(env, planQuery(t, snap, query), Budgets{MaxRows: 1000, MaxWork: 200, MaxLiveRows: 10000})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(rs.Rows) != 5 {
+		t.Fatalf("got %d rows, want 5", len(rs.Rows))
+	}
+
+	// Without a LIMIT the same query must still produce everything it always
+	// did -- the cap is an optimization, not a new bound on the answer.
+	full := mustExec(t, snap, `MATCH (s)-[:E*1..15]->(t:Target) WHERE t.objectid = 'L-516' RETURN s, t`,
+		Budgets{MaxRows: 100000, MaxWork: 10000000, MaxLiveRows: 100000})
+	if len(full.Rows) <= 5 {
+		t.Fatalf("unlimited query returned %d rows; the fixture is not exercising truncation", len(full.Rows))
 	}
 }

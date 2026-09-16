@@ -32,14 +32,19 @@ type RegexMatcher struct {
 	// ASCII-lowercased when fold is set.
 	literals []string
 
-	// prefilter, when non-empty, is a set of which at least one MUST appear
-	// for the pattern to match -- necessary, not sufficient. Subjects that
-	// carry none are rejected without running the engine; the rest are
-	// matched normally. `(10.0.19044|10.0.22000|6.1.7601)` is the shape:
-	// the dots are wildcards so no arm is a plain substring, but every arm
-	// still requires one, and a version string carrying none of them cannot
-	// match whatever the wildcards do.
-	prefilter []string
+	// prefilter is a conjunction of requirements: each entry is a set of
+	// which at least one member MUST appear for the pattern to match. It is
+	// necessary, not sufficient -- subjects failing any entry are rejected
+	// without running the engine, and the rest are matched normally.
+	//
+	// `(10.0.19044|10.0.22000|6.1.7601)` yields one entry: the dots are
+	// wildcards so no arm is a plain substring, but every arm requires a
+	// literal, and a version carrying none of them cannot match whatever the
+	// wildcards do. `(?i).*Windows.* (2000|2003|xp).*` yields three -- the
+	// two literals and the version alternation -- and it is that last one
+	// that does the filtering, which a single "longest required literal"
+	// would have missed by picking "windows".
+	prefilter [][]string
 
 	fold bool
 }
@@ -55,8 +60,8 @@ func NewRegexMatcher(pattern string) (*RegexMatcher, error) {
 		simplified := parsed.Simplify()
 		if lits, fold, ok := searchEquivalentLiterals(simplified); ok {
 			m.literals, m.fold = lits, fold
-		} else if lits, fold, ok := prefilterLiterals(simplified); ok {
-			m.prefilter, m.fold = lits, fold
+		} else if sets, fold, ok := prefilterSets(simplified); ok {
+			m.prefilter, m.fold = sets, fold
 		}
 	}
 	return m, nil
@@ -69,9 +74,12 @@ func (m *RegexMatcher) MatchString(s string) bool {
 		return false
 	}
 	if len(m.literals) == 0 {
-		if len(m.prefilter) > 0 && !m.carriesAny(s, m.prefilter) {
-			// No required literal present, so no arm can match.
-			return false
+		for _, required := range m.prefilter {
+			if !m.carriesAny(s, required) {
+				// A requirement the subject cannot satisfy, so no match is
+				// possible however the rest of the pattern behaves.
+				return false
+			}
 		}
 		return m.re.MatchString(s)
 	}
@@ -198,42 +206,96 @@ func (m *RegexMatcher) carriesAny(s string, lits []string) bool {
 	return containsAnyLiteralFoldASCII(s, lits)
 }
 
-// prefilterLiterals returns a set of which at least one must appear for re to
-// match. Unlike searchEquivalentLiterals this is a NECESSARY condition only,
-// so the caller still runs the real engine on whatever survives.
+// prefilterSets returns requirements re cannot match without: a conjunction
+// of alternatives, each of which must have at least one member present.
+// Unlike searchEquivalentLiterals these are NECESSARY conditions only, so the
+// caller still runs the real engine on whatever survives.
 //
-// Derived from a top-level alternation: every arm must yield a literal it
-// requires, and a match means some arm matched, so it means that arm's
-// literal is present. One arm without a required literal (`.*`, a character
-// class) and there is nothing to filter on.
-func prefilterLiterals(re *syntax.Regexp) (lits []string, fold bool, ok bool) {
-	switch re.Op {
-	case syntax.OpCapture:
-		if len(re.Sub) != 1 {
-			return nil, false, false
-		}
-		return prefilterLiterals(re.Sub[0])
-	case syntax.OpAlternate:
-		first := true
-		for _, sub := range re.Sub {
-			lit, subFold, subOK := requiredLiteral(sub)
-			if !subOK {
-				return nil, false, false
+// A concatenation contributes every requirement of its parts, because all of
+// them must be traversed. An alternation contributes ONE requirement -- the
+// union of what each arm needs -- and only when every arm needs something,
+// since an arm with no requirement can match anything. A repetition or an
+// optional group contributes nothing: the pattern matches without it.
+func prefilterSets(re *syntax.Regexp) (sets [][]string, fold bool, ok bool) {
+	foldSet := false
+	seenFold := false
+
+	var walk func(*syntax.Regexp) bool
+	walk = func(node *syntax.Regexp) bool {
+		switch node.Op {
+		case syntax.OpCapture:
+			if len(node.Sub) != 1 {
+				return true
 			}
-			if first {
-				fold, first = subFold, false
-			} else if subFold != fold {
-				return nil, false, false
+			return walk(node.Sub[0])
+
+		case syntax.OpConcat:
+			for _, sub := range node.Sub {
+				if !walk(sub) {
+					return false
+				}
 			}
-			lits = append(lits, lit)
+			return true
+
+		case syntax.OpLiteral:
+			lit, f, litOK := literalText(node)
+			if !litOK {
+				return true // contributes no requirement, which is safe
+			}
+			if seenFold && f != foldSet {
+				return false
+			}
+			foldSet, seenFold = f, true
+			sets = append(sets, []string{lit})
+			return true
+
+		case syntax.OpAlternate:
+			var union []string
+			for _, arm := range node.Sub {
+				lit, f, armOK := requiredLiteral(arm)
+				if !armOK {
+					// One arm requires nothing, so the alternation as a whole
+					// requires nothing.
+					return true
+				}
+				if seenFold && f != foldSet {
+					return false
+				}
+				foldSet, seenFold = f, true
+				union = append(union, lit)
+			}
+			if len(union) > 0 {
+				sets = append(sets, union)
+			}
+			return true
+
+		default:
+			return true
 		}
-		if len(lits) == 0 {
-			return nil, false, false
-		}
-		return lits, fold, true
-	default:
+	}
+
+	if !walk(re) || len(sets) == 0 {
 		return nil, false, false
 	}
+	return sets, foldSet, true
+}
+
+// literalText renders an OpLiteral, ASCII-lowercased when it folds case, or
+// reports that it cannot be used (a non-ASCII folding literal, or an empty
+// one).
+func literalText(node *syntax.Regexp) (string, bool, bool) {
+	f := node.Flags&syntax.FoldCase != 0
+	s := string(node.Rune)
+	if s == "" {
+		return "", false, false
+	}
+	if f {
+		if !isASCII(s) {
+			return "", false, false
+		}
+		s = strings.ToLower(s)
+	}
+	return s, f, true
 }
 
 // requiredLiteral returns the longest literal re cannot match without, or

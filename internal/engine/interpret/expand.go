@@ -762,11 +762,29 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 		return nil, err
 	}
 
+	// This route is deliberately kept away from the chunked LIMIT driver
+	// (componentPrefersReverseSeeding), because that driver can only walk
+	// forward and forward is the expensive direction here. So the LIMIT has
+	// to be honoured by the walk itself, or it is not honoured until after
+	// every trail in the graph has been enumerated -- which is what the
+	// shipped "Nested groups within Tier Zero / High Value" prebuilt was
+	// paying: eight seeds, a LIMIT of 1000, and every nested-membership
+	// trail materialized before the pipeline's own SKIP/LIMIT threw nearly
+	// all of them away.
+	cap := reverseTrailRowCap(meter, part, step)
+
 	var out []*Row
 	for _, id := range seedIDs {
+		if cap > 0 && len(out) >= cap {
+			break
+		}
+		remaining := 0
+		if cap > 0 {
+			remaining = cap - len(out)
+		}
 		seed := NewRow()
 		seed.SetNode(step.ToSym, id)
-		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym)
+		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym, remaining)
 		if err != nil {
 			return nil, err
 		}
@@ -777,6 +795,29 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 	}
 
 	return out, nil
+}
+
+// reverseTrailRowCap is how many rows the reverse walk may stop after, or 0
+// for no cap.
+//
+// It is the whole query's own SKIP+LIMIT (limitTarget, which already refuses
+// to produce a target for an ORDER BY or DISTINCT query -- both of which have
+// to see every row before they can emit any). Truncating is sound only when
+// nothing downstream can reject a row this walk produced, which is exactly
+// what noResidualWhere establishes: every WHERE conjunct is either already
+// pushed into one of the two endpoints' own constraints, and therefore
+// already checked per row here, or is the endpoint inequality this route
+// handles itself. With no residual filter, the first N rows are as good an
+// answer as any other N -- the same latitude an unordered LIMIT already gives
+// every other path in this package.
+func reverseTrailRowCap(meter *workMeter, part *Part, step *Step) int {
+	if !meter.limitTargetSet || meter.limitTarget <= 0 {
+		return 0
+	}
+	if !noResidualWhere(part, step) {
+		return 0
+	}
+	return int(meter.limitTarget)
 }
 
 // reverseTrailFrame is one partial (or complete) trail on
@@ -828,7 +869,9 @@ type reverseTrailFrame struct {
 // pathArcKey behaves exactly as it does for the forward walk: when non-empty,
 // each output row additionally binds its own trail as a *PathVal under that
 // key.
-func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+// rowCap, when positive, stops the walk once it has produced that many rows;
+// see reverseTrailRowCap for why truncating is sound and when it is offered.
+func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string, rowCap int) ([]*Row, error) {
 	// Same self-loop hazard decline as the forward walker -- see its comment
 	// and the package doc's SELF-LOOPS bullet.
 	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
@@ -861,8 +904,15 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		return out, nil
 	}
 
+	if rowCap > 0 && len(out) >= rowCap {
+		return out, nil
+	}
+
 	stack := []reverseTrailFrame{{nodes: []snapshot.NodeID{terminal}}}
 	for len(stack) > 0 {
+		if rowCap > 0 && len(out) >= rowCap {
+			break
+		}
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 

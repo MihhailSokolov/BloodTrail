@@ -135,11 +135,15 @@ func TestRegexMatcherTakesTheFastPathWhereExpected(t *testing.T) {
 		// The dots are WILDCARDS, so no arm is a plain substring -- but every
 		// arm still requires one, which is a sound prefilter.
 		{`(10.0.19044|10.0.22000|6.1.7601)`, prefilter},
-		{`^abc`, none},
-		{`abc$`, none},
-		{`a.c`, none},
-		{`(?i).*Windows.* (2000|2003).*`, none},
+		// Anchored or wildcard-bearing patterns are not equivalent to a
+		// substring test, but their required pieces still filter.
+		{`^abc`, prefilter},
+		{`abc$`, prefilter},
+		{`a.c`, prefilter},
+		{`(?i).*Windows.* (2000|2003).*`, prefilter},
+		// A repetition requires nothing: the pattern matches without it.
 		{`[abc]+`, none},
+		{`.*`, none},
 	} {
 		t.Run(tc.pattern, func(t *testing.T) {
 			m, err := NewRegexMatcher(tc.pattern)

@@ -1229,3 +1229,74 @@ func TestRowBindingsKeepMapSemantics(t *testing.T) {
 		}
 	})
 }
+
+// TestDeclinesOnRowBudgetBeforeScanning pins the early decline: a query that
+// must materialize every row, over a kind bitmap already larger than the row
+// budget, gives up before scanning rather than after.
+//
+// It is not about serving more queries -- PostgreSQL answers these either way
+// -- but about not paying twice. `MATCH (u:User) RETURN DISTINCT u.enabled
+// LIMIT 1000` spent tens of milliseconds scanning to the row cap and then
+// delegated, which is the whole of why it measured slower than the database
+// it delegates to.
+func TestDeclinesOnRowBudgetBeforeScanning(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+	var nodes []execNodeSpec
+	for i := 0; i < 200; i++ {
+		nodes = append(nodes, execNodeSpec{uint64(i + 1), []snapshot.KindID{kindUser},
+			map[string]any{"enabled": i%2 == 0}})
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+
+	for _, tc := range []struct {
+		name    string
+		query   string
+		maxRows int
+		decline bool
+	}{
+		{"DISTINCT over more nodes than the budget", `MATCH (u:User) RETURN DISTINCT u.enabled`, 50, true},
+		{"ORDER BY over more nodes than the budget", `MATCH (u:User) RETURN u.enabled ORDER BY u.enabled`, 50, true},
+		{"the same query within budget still runs", `MATCH (u:User) RETURN DISTINCT u.enabled`, 1000, false},
+		{"no DISTINCT or ORDER BY: the row cap decides as before", `MATCH (u:User) RETURN u`, 50, true},
+		{
+			// A predicate could reduce the row count below the budget, so the
+			// candidate count proves nothing and the query must actually run.
+			name: "a predicate blocks the early decline", maxRows: 50, decline: true,
+			query: `MATCH (u:User) WHERE u.enabled = true RETURN DISTINCT u.enabled`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := planQuery(t, snap, tc.query)
+			meter := &workMeter{budget: Budgets{MaxRows: tc.maxRows, MaxWork: 1_000_000, MaxLiveRows: 1_000_000}}
+			_, err := runQuery(&Env{Snap: snap}, q, meter)
+			if tc.decline && err == nil {
+				t.Fatal("want a decline")
+			}
+			if !tc.decline && err != nil {
+				t.Fatalf("want success, got %v", err)
+			}
+		})
+	}
+}
+
+// TestEarlyDeclineSpendsNothing is the point of the change: the decline must
+// cost no scanning at all, or it has only moved the waste.
+func TestEarlyDeclineSpendsNothing(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+	var nodes []execNodeSpec
+	for i := 0; i < 500; i++ {
+		nodes = append(nodes, execNodeSpec{uint64(i + 1), []snapshot.KindID{kindUser},
+			map[string]any{"enabled": i%2 == 0}})
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+
+	q := planQuery(t, snap, `MATCH (u:User) RETURN DISTINCT u.enabled`)
+	meter := &workMeter{budget: Budgets{MaxRows: 10, MaxWork: 1_000_000, MaxLiveRows: 1_000_000}}
+	if _, err := runQuery(&Env{Snap: snap}, q, meter); err == nil {
+		t.Fatal("want a decline")
+	}
+	if meter.work != 0 {
+		t.Fatalf("meter.work = %d, want 0: the decline is only worth making if it "+
+			"happens before the scan it is avoiding", meter.work)
+	}
+}
