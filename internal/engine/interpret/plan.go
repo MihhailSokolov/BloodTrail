@@ -181,6 +181,23 @@ type NodeConstraint struct {
 	IDs            []uint64
 	ObjectIDAnchor *string
 	Predicates     []cypher.Expression
+
+	// PropCandidates is the node set an indexable string predicate on this
+	// symbol resolved to at PLAN time (see extractStringAnchor), and
+	// PropIndexed says whether one was resolved at all -- nil-vs-empty
+	// matters, an empty slice being a perfectly good "nothing matches".
+	//
+	// Resolved during planning rather than on demand during execution for
+	// two reasons: Plan already holds the snapshot, and a NodeConstraint is
+	// read by the executor from several goroutine-free but structurally
+	// unrelated places, so leaving it immutable after Plan keeps the
+	// executor's "constraints are read-only" property intact.
+	//
+	// It is a candidate SUPERSET, exactly like a kind bitmap: every
+	// consumer re-verifies with nodeSatisfiesConstraint + predicatesAdmit,
+	// and the predicate that produced it also stays in Predicates.
+	PropCandidates []snapshot.NodeID
+	PropIndexed    bool
 }
 
 // CountAgg is a WITH/RETURN `COUNT(sym)` or `COUNT(DISTINCT sym)` aggregate.
@@ -1417,7 +1434,101 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 	}
 	pb.extractObjectIDAnchor(sym, conjunct)
 	pb.extractKindConjunct(sym, conjunct)
+	pb.extractStringAnchor(sym, conjunct)
 	return true
+}
+
+// extractStringAnchor recognizes a pushed conjunct of the form
+// `sym.prop <op> '<literal>'` for an op the snapshot's per-property string
+// index can answer -- `=`, STARTS WITH, ENDS WITH, CONTAINS -- and resolves
+// it, right here at plan time, into the candidate node set the executor
+// should enumerate instead of a kind bitmap or a full scan.
+//
+// This is what closes the gap PostgreSQL's btree/trigram indexes opened.
+// BloodHound anchors whole prebuilt families on a well-known RID suffix
+// (`WHERE s.objectid ENDS WITH '-513'`), on a name prefix, or on a hygiene
+// property's substring; each of those used to enumerate the pattern's kind
+// bitmap -- often every User in the graph -- and test the predicate per
+// node, against PostgreSQL's single index probe.
+//
+// Only the FIRST resolvable anchor on a symbol is kept. A second one would
+// have to be intersected to stay a correct superset, and conjoined string
+// predicates on one symbol are not a shape BloodHound's corpus writes; the
+// unkept predicates all remain in Predicates and still filter every
+// candidate, so keeping one is a narrowing choice, never a correctness one.
+func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expression) {
+	nc := pb.nodeConstraint(sym)
+	if nc.PropIndexed {
+		return
+	}
+	op, left, right, ok := asSingleComparison(conjunct)
+	if !ok {
+		return
+	}
+	var match snapshot.StringMatch
+	switch op {
+	case cypher.OperatorEquals:
+		match = snapshot.StringEquals
+	case cypher.OperatorStartsWith:
+		match = snapshot.StringPrefix
+	case cypher.OperatorEndsWith:
+		match = snapshot.StringSuffix
+	case cypher.OperatorContains:
+		match = snapshot.StringContains
+	default:
+		return
+	}
+	// Only `property <op> literal` -- the mirrored spelling is not valid
+	// Cypher for the string operators, and for `=` the literal-on-the-left
+	// form is already covered by whichever side carries the PropertyLookup.
+	name, operand, ok := propOpLiteral(left, right, sym)
+	if !ok {
+		if name, operand, ok = propOpLiteral(right, left, sym); !ok {
+			return
+		}
+		if op != cypher.OperatorEquals {
+			return
+		}
+	}
+	propID, ok := pb.snap.PropIDByName(name)
+	if !ok {
+		// The property is not interned in this snapshot at all, so nothing
+		// carries it: an empty candidate set is the correct answer, and a
+		// far better one than scanning to discover it.
+		nc.PropCandidates, nc.PropIndexed = nil, true
+		return
+	}
+	ids, ok := pb.snap.NodesWithString(propID, match, operand)
+	if !ok {
+		return
+	}
+	nc.PropCandidates, nc.PropIndexed = ids, true
+}
+
+// propOpLiteral recognizes `sym.<name>` on propSide and a string literal on
+// litSide, returning the property name and the decoded literal.
+func propOpLiteral(propSide, litSide cypher.Expression, sym string) (name, operand string, ok bool) {
+	pl, isProp := unwrapParens(propSide).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", "", false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return "", "", false
+	}
+	lit, isLit := asLiteral(litSide)
+	if !isLit || lit == nil || lit.Null {
+		return "", "", false
+	}
+	raw, isStr := lit.Value.(string)
+	if !isStr {
+		return "", "", false
+	}
+	decoded, err := decodeCypherStringLiteral(raw)
+	if err != nil {
+		return "", "", false
+	}
+	return pl.Symbol, decoded, true
 }
 
 // extractKindConjunct folds a WHERE conjunct that is a bare (possibly

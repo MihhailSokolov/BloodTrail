@@ -1106,10 +1106,40 @@ func rankOf(env *Env, nc *NodeConstraint) anchorRank {
 	if nc != nil && nc.ObjectIDAnchor != nil {
 		return anchorRank{tier: tierObjectID}
 	}
+	// A plan-time-resolved string-index candidate set (NodeConstraint's
+	// PropCandidates) is a bounded enumerable candidate source exactly like
+	// a kind bitmap, so it competes at the SAME tier and wins or loses on
+	// size alone. Ranking it as its own better tier would be wrong: an
+	// unselective `name CONTAINS 'A'` can resolve to most of the graph and
+	// must not outrank a five-node kind bitmap.
+	if nc != nil && nc.PropIndexed {
+		size := len(nc.PropCandidates)
+		if len(nc.Kinds) > 0 {
+			if kindSize := smallestKindBitmap(env, nc.Kinds).Count(); kindSize < size {
+				size = kindSize
+			}
+		}
+		return anchorRank{tier: tierKind, size: size}
+	}
 	if nc != nil && len(nc.Kinds) > 0 {
 		return anchorRank{tier: tierKind, size: smallestKindBitmap(env, nc.Kinds).Count()}
 	}
 	return anchorRank{tier: tierScan, size: env.Snap.NodeCount()}
+}
+
+// propIndexPreferred reports whether nc's resolved string-index candidate
+// set is the cheapest enumerable source for the symbol -- i.e. it exists and
+// no kind bitmap it also carries is smaller. scanAnchorVisit and rankOf
+// agree by both asking this, so the cost the planner priced is the one the
+// executor pays.
+func propIndexPreferred(env *Env, nc *NodeConstraint) bool {
+	if nc == nil || !nc.PropIndexed {
+		return false
+	}
+	if len(nc.Kinds) == 0 {
+		return true
+	}
+	return len(nc.PropCandidates) <= smallestKindBitmap(env, nc.Kinds).Count()
 }
 
 // chooseAnchor picks the best (chooseAnchor.better) ranked symbol among
@@ -1238,6 +1268,17 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 				if err := admit(id); err != nil {
 					return err
 				}
+			}
+		}
+
+	case propIndexPreferred(env, nc):
+		// Resolved at plan time from the snapshot's per-property string
+		// index (extractStringAnchor). A superset by contract -- admit
+		// re-verifies kinds and every pushed predicate, including the one
+		// that produced this set.
+		for _, id := range nc.PropCandidates {
+			if err := admit(id); err != nil {
+				return err
 			}
 		}
 
