@@ -807,7 +807,11 @@ func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component,
 		return nil
 	}
 
-	scanErr := scanAnchorVisit(env, meter, anchor, part.Nodes[anchor], func(r *Row) error {
+	// Same hint every other seeding path uses, so the chunked driver
+	// enumerates the same candidates and charges the same work as the
+	// unchunked one it stands in for.
+	hint := hintForAnchor(env, part, comp.stepIdxs, anchor)
+	scanErr := scanAnchorVisitHinted(env, meter, anchor, part.Nodes[anchor], hint, func(r *Row) error {
 		chunk = append(chunk, r)
 		if len(chunk) < limitChunk {
 			return nil

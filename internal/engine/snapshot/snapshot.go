@@ -87,6 +87,13 @@ type Snapshot struct {
 	stringIdxMu sync.Mutex
 	stringIdx   map[PropID]*stringIndex
 
+	// edgeKindIdx memoizes the per-edge-kind endpoint index
+	// (edgekindindex.go), built lazily in one pass on first use. Guarded for
+	// the same reason stringIdx is: a Snapshot is otherwise immutable and
+	// shared across concurrently-served queries.
+	edgeKindIdxMu sync.Mutex
+	edgeKindIdx   *edgeKindIndex
+
 	// edgeIDPerm holds forward-CSR indices 0..EdgeCount()-1 permuted into
 	// ascending OutEdgeIDs order, letting EdgeByID binary-search by database
 	// edge id without a separate id->index map.

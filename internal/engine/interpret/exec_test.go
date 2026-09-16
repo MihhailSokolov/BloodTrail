@@ -1188,8 +1188,14 @@ func TestRunComponentFromDispatchMatchesRunComponent(t *testing.T) {
 			t.Fatalf("%s: runComponent: %v", query, err)
 		}
 
+		// Seeded exactly as every production caller of runComponentFrom
+		// seeds -- through hintForAnchor. A caller that scanned WITHOUT the
+		// hint would enumerate more candidates than runComponent does and
+		// spend more work for the identical rows, which is the divergence
+		// this test exists to catch.
 		split := &workMeter{budget: generousBudget}
-		anchorRows, err := scanAnchor(env, split, anchorSym, part.Nodes[anchorSym])
+		anchorRows, err := scanAnchorHinted(env, split, anchorSym, part.Nodes[anchorSym],
+			hintForAnchor(env, part, comp.stepIdxs, anchorSym))
 		if err != nil {
 			t.Fatalf("%s: scanAnchor(%q): %v", query, anchorSym, err)
 		}

@@ -268,7 +268,13 @@ func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step
 // the EdgeSym/FromSym==ToSym decline above happens BEFORE any anchor scan is
 // charged for.
 func expandVarLengthComponentForward(env *Env, meter *workMeter, part *Part, step *Step) ([]*Row, error) {
-	seeds, err := scanAnchor(env, meter, step.FromSym, part.Nodes[step.FromSym])
+	// The step's own relationship kinds narrow the seed set: a node with no
+	// admissible outgoing edge cannot start a trail of minimum length one, so
+	// enumerating it is pure waste. This is what keeps
+	// `(:AZBase)-[:AZGlobalAdmin*1..]->(:AZTenant)` from seeding all 84,481
+	// AZBase nodes to reach the graph's single AZGlobalAdmin edge.
+	seeds, err := scanAnchorHinted(env, meter, step.FromSym, part.Nodes[step.FromSym],
+		newEdgeHint(env, step, step.FromSym))
 	if err != nil {
 		return nil, err
 	}
@@ -562,11 +568,16 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 	if !endpointNarrows(toNC) || endpointNarrows(fromNC) {
 		return false
 	}
-	fromRank := rankOf(env, fromNC)
+	// Both ends priced WITH the step's own relationship-kind narrowing, so
+	// the comparison is on the cost each side will actually pay. This matters
+	// in both directions: a near side the edge-kind index narrows to a
+	// handful is no longer "scan-equivalent", and reversing away from it
+	// would be the more expensive route, not the cheaper one.
+	fromRank := rankOfHinted(env, fromNC, newEdgeHint(env, step, step.FromSym))
 	if !scanEquivalentNearSide(env, fromRank) {
 		return false
 	}
-	return rankOf(env, toNC).better(fromRank)
+	return rankOfHinted(env, toNC, newEdgeHint(env, step, step.ToSym)).better(fromRank)
 }
 
 

@@ -675,8 +675,20 @@ func TestVarLengthReverseRejectsHighInDegreeHub(t *testing.T) {
 // buildReverseAsymmetricFixture builds the asymmetric shape this whole route
 // exists for: many unconstrained nodes, exactly one of which reaches the
 // single objectid-anchored Target. Forward expansion has to visit every one of
-// them (a full-snapshot anchor scan plus one expansion per node); backward
-// expansion starts from the one Target and walks a single edge.
+// them (an anchor scan plus one expansion per node); backward expansion starts
+// from the one Target and walks a single edge.
+//
+// EVERY wide node carries an outgoing E edge, which matters: the edge-kind
+// endpoint index (edgeHint) narrows a forward seed scan to the nodes that can
+// actually start an admissible edge, and it would collapse this fixture to a
+// single seed if only node 1 had one -- making the forward route optimal and
+// leaving the test proving nothing. The chain 1->2->...->wide->2 gives them
+// all one while keeping node 1 UNREACHABLE, so it stays the only node that
+// reaches the Target and the answer stays a single row.
+//
+// What remains asymmetric, and what the reverse route is for, is the shape
+// the hint cannot help with: a relationship kind that nearly every node
+// carries, paired with a far side of exactly one node.
 func buildReverseAsymmetricFixture(t *testing.T, wide int) *snapshot.View {
 	t.Helper()
 	nodes := make([]execNodeSpec, 0, wide+1)
@@ -684,9 +696,18 @@ func buildReverseAsymmetricFixture(t *testing.T, wide int) *snapshot.View {
 		nodes = append(nodes, execNodeSpec{uint64(i), nil, nil})
 	}
 	nodes = append(nodes, execNodeSpec{9000, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "W-516"}})
-	return buildExecSnapshot(t, revKindTable, nodes,
-		[]execEdgeSpec{{5000, 1, 9000, revKindE}},
-	)
+
+	edges := []execEdgeSpec{{5000, 1, 9000, revKindE}}
+	var eid uint64 = 6000
+	for i := 1; i < wide; i++ {
+		eid++
+		edges = append(edges, execEdgeSpec{eid, uint64(i), uint64(i + 1), revKindE})
+	}
+	if wide > 1 {
+		eid++
+		edges = append(edges, execEdgeSpec{eid, uint64(wide), 2, revKindE})
+	}
+	return buildExecSnapshot(t, revKindTable, nodes, edges)
 }
 
 // TestVarLengthReverseSpendsFarLessWork calibrates the two directions against

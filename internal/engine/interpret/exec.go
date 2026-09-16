@@ -32,6 +32,7 @@ package interpret
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
@@ -737,8 +738,9 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 		return expandChainComponent(env, meter, part, stepIdxs, pathSym)
 	}
 
-	anchor := chooseAnchor(env, part.Nodes, syms)
-	rows, err := scanAnchor(env, meter, anchor, part.Nodes[anchor])
+	hintFor := func(sym string) *edgeHint { return hintForAnchor(env, part, stepIdxs, sym) }
+	anchor := chooseAnchorHinted(env, part.Nodes, syms, hintFor)
+	rows, err := scanAnchorHinted(env, meter, anchor, part.Nodes[anchor], hintFor(anchor))
 	if err != nil {
 		return nil, err
 	}
@@ -1008,7 +1010,8 @@ func pathStepArcKey(stepIdx int) string {
 // package doc's CROSS-STEP bullet and Row.trailEdges' doc).
 func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string) ([]*Row, error) {
 	startSym := chainAnchorSym(env, part, stepIdxs)
-	rows, err := scanAnchor(env, meter, startSym, part.Nodes[startSym])
+	rows, err := scanAnchorHinted(env, meter, startSym, part.Nodes[startSym],
+		hintForAnchor(env, part, stepIdxs, startSym))
 	if err != nil {
 		return nil, err
 	}
@@ -1299,6 +1302,23 @@ func (r anchorRank) better(o anchorRank) bool {
 // NodeConstraint's doc) beats an objectid anchor beats the smallest single
 // kind bitmap among every AND-ed kind label beats an unconstrained full
 // scan.
+// rankOfHinted is rankOf with a step's edge-kind endpoint set available as an
+// additional candidate source -- see edgeHint. rankOf itself is this with no
+// hint, so every existing caller keeps its exact previous behavior.
+func rankOfHinted(env *Env, nc *NodeConstraint, h *edgeHint) anchorRank {
+	base := rankOf(env, nc)
+	if !edgeHintPreferred(env, nc, h) {
+		return base
+	}
+	// Same tier as a kind bitmap, for the same reason PropCandidates is: it
+	// is a bounded enumerable set that competes on size, not a lookup that
+	// outranks one.
+	if r := (anchorRank{tier: tierKind, size: h.size()}); r.better(base) {
+		return r
+	}
+	return base
+}
+
 func rankOf(env *Env, nc *NodeConstraint) anchorRank {
 	if nc != nil && len(nc.IDs) > 0 {
 		return anchorRank{tier: tierID}
@@ -1327,6 +1347,141 @@ func rankOf(env *Env, nc *NodeConstraint) anchorRank {
 	return anchorRank{tier: tierScan, size: env.Snap.NodeCount()}
 }
 
+// edgeHint is a resolved "this symbol must have an admissible edge" candidate
+// source: the endpoint set of a step's declared relationship kinds, on the
+// side the symbol sits.
+//
+// It exists because PostgreSQL has an access path this engine did not.
+// BloodHound's schema indexes `edge` by kind_id alone, so pg answers a
+// pattern anchored on a rare relationship with one btree probe, while this
+// engine's candidate sources knew only about node kinds, ids, objectids and
+// property values. The shipped "All Global Administrators" prebuilt is the
+// extreme case: `(:AZBase)-[:AZGlobalAdmin*1..]->(:AZTenant)` seeded from all
+// 84,481 AZBase nodes to find the ONE AZGlobalAdmin edge in the graph.
+//
+// Resolved ONCE by the caller rather than per rank/scan call, because a
+// kind alternation (the shipped shortest-path prebuilts name upwards of sixty
+// relationship kinds) costs a union to materialize.
+type edgeHint struct {
+	ids []snapshot.NodeID
+	ok  bool
+}
+
+// newEdgeHint resolves the endpoint set sym must belong to in order to take
+// part in step.
+//
+// Unusable, rather than wrong, for every shape where that set is not a
+// superset of the matches:
+//
+//   - a step that does NOT mandate a hop (`*0..`), which a zero-length match
+//     satisfies without traversing any edge, so a node with no admissible
+//     edge still matches and must not be skipped;
+//   - an undirected step, where an edge on either side qualifies and the
+//     endpoint set would have to be the union of both directions;
+//   - a step with no declared relationship kinds, which every edge satisfies.
+func newEdgeHint(env *Env, step *Step, sym string) *edgeHint {
+	if step == nil || len(step.EdgeKinds) == 0 || sym == "" {
+		return &edgeHint{}
+	}
+	if step.Range != nil && step.Range.Min == 0 {
+		return &edgeHint{}
+	}
+
+	var outgoing bool
+	switch {
+	case step.Direction == graph.DirectionOutbound && sym == step.FromSym:
+		outgoing = true
+	case step.Direction == graph.DirectionOutbound && sym == step.ToSym:
+		outgoing = false
+	case step.Direction == graph.DirectionInbound && sym == step.FromSym:
+		outgoing = false
+	case step.Direction == graph.DirectionInbound && sym == step.ToSym:
+		outgoing = true
+	default:
+		// Undirected, or a symbol this step does not touch.
+		return &edgeHint{}
+	}
+
+	ids, ok := env.Snap.EdgeKindEndpoints(step.EdgeKinds, outgoing)
+	if !ok {
+		return &edgeHint{}
+	}
+	return &edgeHint{ids: ids, ok: true}
+}
+
+// hintForAnchor picks the most selective edge hint anchor can take from any
+// step of the component it seeds. Every step the anchor is an endpoint of
+// must be satisfied by a matching row, so any one of their endpoint sets is a
+// valid superset; the smallest is the cheapest to enumerate.
+//
+// Shared by every path that seeds a component -- the ordinary scan, the chain
+// walk, the variable-length route and the chunked LIMIT driver -- so all of
+// them enumerate the same candidates and charge the same work. A path that
+// seeded without it would silently spend more than the one beside it, which
+// is exactly the inconsistency TestRunComponentFromDispatchMatchesRunComponent
+// exists to catch.
+func hintForAnchor(env *Env, part *Part, stepIdxs []int, anchor string) *edgeHint {
+	best := &edgeHint{}
+	for _, idx := range stepIdxs {
+		if idx < 0 || idx >= len(part.Chains) {
+			continue
+		}
+		h := newEdgeHint(env, &part.Chains[idx], anchor)
+		if h.usable() && h.size() < best.size() {
+			best = h
+		}
+	}
+	return best
+}
+
+// usable reports whether h resolved to a real candidate set.
+func (h *edgeHint) usable() bool { return h != nil && h.ok }
+
+// size is h's candidate count, or a value no source can beat when unusable.
+func (h *edgeHint) size() int {
+	if !h.usable() {
+		return math.MaxInt
+	}
+	return len(h.ids)
+}
+
+// edgeHintPreferred reports whether h is the cheapest enumerable source for
+// nc -- strictly smaller than whatever nc would otherwise enumerate. rankOf
+// and scanAnchorVisit agree by both asking this, so the cost the planner
+// priced is the one the executor pays.
+//
+// It deliberately does NOT compete with an id or objectid anchor: those
+// resolve to at most a handful of nodes already, and preferring a hint over
+// them could only ever cost more.
+func edgeHintPreferred(env *Env, nc *NodeConstraint, h *edgeHint) bool {
+	if !h.usable() {
+		return false
+	}
+	if nc != nil && (len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil) {
+		return false
+	}
+	return h.size() < otherwiseEnumerated(env, nc)
+}
+
+// otherwiseEnumerated is the size of the candidate source nc would use with
+// no hint at all -- its property-index candidates, its smallest kind bitmap,
+// or the whole graph.
+func otherwiseEnumerated(env *Env, nc *NodeConstraint) int {
+	best := env.Snap.NodeCount()
+	if nc == nil {
+		return best
+	}
+	if len(nc.Kinds) > 0 {
+		if n := smallestKindBitmap(env, nc.Kinds).Count(); n < best {
+			best = n
+		}
+	}
+	if nc.PropIndexed && len(nc.PropCandidates) < best {
+		best = len(nc.PropCandidates)
+	}
+	return best
+}
+
 // propIndexPreferred reports whether nc's resolved string-index candidate
 // set is the cheapest enumerable source for the symbol -- i.e. it exists and
 // no kind bitmap it also carries is smaller. scanAnchorVisit and rankOf
@@ -1347,10 +1502,29 @@ func propIndexPreferred(env *Env, nc *NodeConstraint) bool {
 // that a tie breaks toward the lexicographically first symbol name
 // deterministically.
 func chooseAnchor(env *Env, nodes map[string]*NodeConstraint, syms []string) string {
+	return chooseAnchorHinted(env, nodes, syms, nil)
+}
+
+// chooseAnchorHinted is chooseAnchor with each candidate symbol priced
+// against the edge-kind endpoint set it could seed from (see edgeHint), so
+// the symbol the executor scans is chosen on the same cost basis the scan
+// will actually pay.
+//
+// Without this the choice ignores relationship selectivity entirely: for
+// `(a:Wide)-[:Rare]->(b:Narrow)` it compares two kind bitmaps and never sees
+// that the step's own relationship kind narrows either end to a handful.
+// hint may be nil, which reproduces chooseAnchor exactly.
+func chooseAnchorHinted(env *Env, nodes map[string]*NodeConstraint, syms []string, hint func(string) *edgeHint) string {
+	rank := func(sym string) anchorRank {
+		if hint == nil {
+			return rankOf(env, nodes[sym])
+		}
+		return rankOfHinted(env, nodes[sym], hint(sym))
+	}
 	best := syms[0]
-	bestRank := rankOf(env, nodes[best])
+	bestRank := rank(best)
 	for _, s := range syms[1:] {
-		if r := rankOf(env, nodes[s]); r.better(bestRank) {
+		if r := rank(s); r.better(bestRank) {
 			best, bestRank = s, r
 		}
 	}
@@ -1400,6 +1574,16 @@ var errStopScan = errors.New("interpret: stop anchor scan")
 // error (any other non-nil return from visit aborts the scan the same way
 // and is likewise returned unchanged).
 func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint, visit func(*Row) error) error {
+	return scanAnchorVisitHinted(env, meter, sym, nc, nil, visit)
+}
+
+// scanAnchorVisitHinted is scanAnchorVisit with a step's edge-kind endpoint
+// set offered as an additional candidate source (see edgeHint). The hint is
+// used only when it is strictly cheaper than what nc would otherwise
+// enumerate, and admit re-verifies every candidate against the COMPLETE nc
+// either way -- so a hint can only change how many candidates are inspected,
+// never which rows come out.
+func scanAnchorVisitHinted(env *Env, meter *workMeter, sym string, nc *NodeConstraint, hint *edgeHint, visit func(*Row) error) error {
 	overlay := env.Snap.Overlay()
 	admit := func(id snapshot.NodeID) error {
 		// A tombstoned base node's dense id still resolves through Dense
@@ -1471,6 +1655,18 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 			}
 		}
 
+	case edgeHintPreferred(env, nc, hint):
+		// Nodes carrying an admissible edge for the step this symbol
+		// anchors. A superset by contract, like every source here: admit
+		// re-verifies kinds and every pushed predicate. Valid only because
+		// the caller resolved the hint from a step that MANDATES a hop --
+		// see newEdgeHint.
+		for _, id := range hint.ids {
+			if err := admit(id); err != nil {
+				return err
+			}
+		}
+
 	case propIndexPreferred(env, nc):
 		// Resolved at plan time from the snapshot's per-property string
 		// index (extractStringAnchor). A superset by contract -- admit
@@ -1512,6 +1708,17 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 // append-collecting wrapper over scanAnchorVisit: its own visit callback
 // never returns errStopScan, so scanAnchorVisit's return value here is
 // always either nil or a genuine evaluator error, never the sentinel.
+func scanAnchorHinted(env *Env, meter *workMeter, sym string, nc *NodeConstraint, hint *edgeHint) ([]*Row, error) {
+	var rows []*Row
+	if err := scanAnchorVisitHinted(env, meter, sym, nc, hint, func(r *Row) error {
+		rows = append(rows, r)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*Row, error) {
 	var rows []*Row
 	if err := scanAnchorVisit(env, meter, sym, nc, func(r *Row) error {
