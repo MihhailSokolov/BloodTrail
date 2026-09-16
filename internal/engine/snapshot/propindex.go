@@ -260,6 +260,41 @@ func (v *View) deltaTouchedNodes() []NodeID {
 	return out
 }
 
+// HasStringValue reports whether prop is string-valued on ANY node in this
+// view, and whether that question could be answered at all (false when the
+// property is not interned in the base snapshot, where an overlay could
+// still have introduced it).
+//
+// This is deliberately NOT PropCount(prop) > 0. PropCount adds every
+// segment-touched node to its total -- correct for sizing a scan, since
+// those nodes must be re-checked -- but it answers "how many candidates",
+// not "is this column ever a string". Conflating the two made ORDER BY on a
+// numeric property decline the instant ANY write was pending, which is most
+// of the time on a live deployment.
+//
+// The delta is checked exactly rather than approximated: a segment can give
+// a numeric column a string value, and ordering a string column would mean
+// reproducing PostgreSQL's collation, which this package cannot.
+func (v *View) HasStringValue(prop PropID) (bool, bool) {
+	idx := v.base.stringIndexFor(prop)
+	if idx == nil {
+		return false, false
+	}
+	if len(idx.present) > 0 {
+		return true, true
+	}
+	if v.Overlay() {
+		for _, id := range v.deltaTouchedNodes() {
+			if val, ok := v.PropValue(id, prop); ok {
+				if _, isString := val.(string); isString {
+					return true, true
+				}
+			}
+		}
+	}
+	return false, true
+}
+
 // PropCount reports how many nodes carry prop with a string value, and
 // whether the property is interned at all. Callers use it to decide whether
 // an indexed candidate source is worth preferring over a kind bitmap.

@@ -1195,6 +1195,70 @@ func resolveOrderValue(aliasIndex map[string]int, row *Row, outRow []OutVal, sym
 	return v
 }
 
+// resolveOrderAbsent reports whether sym's value for this row is an ABSENT
+// property rather than a present null. PostgreSQL ranks the two
+// differently in ORDER BY -- an absent property is SQL NULL (last ascending),
+// a stored JSON null is a jsonb value (first ascending) -- so
+// compareRuntimeNumericOrder needs to tell them apart. Only a projected
+// alias can be absent; a WITH-stage scalar is always a present value.
+func resolveOrderAbsent(aliasIndex map[string]int, outRow []OutVal, sym string) bool {
+	if idx, ok := aliasIndex[sym]; ok {
+		return outRow[idx].ScalarAbsent
+	}
+	return false
+}
+
+// runtimeNumericRank ranks one ORDER BY value under PostgreSQL's own
+// ordering for a jsonb column, measured against a live database rather than
+// assumed:
+//
+//	ORDER BY n.val        -> [stored null] [1] [3] [absent]
+//	ORDER BY n.val DESC   -> [absent] [3] [1] [stored null]
+//
+// so a stored JSON null sorts BELOW every number, an absent property sorts
+// ABOVE every number, and DESC is the exact reverse of ASC -- which is why
+// sortRows can keep implementing DESC as a plain negation.
+//
+// ok is false for anything else (a string, bool, array, object): pg orders
+// strings by a database collation this package cannot know (value.go's
+// Compare refuses them outright), and the remaining type ranks were never
+// verified, so those decline instead of guessing.
+func runtimeNumericRank(v any, absent bool) (rank int, num float64, ok bool) {
+	switch {
+	case absent:
+		return 2, 0, true
+	case v == nil:
+		return 0, 0, true
+	}
+	f, isNum := v.(float64)
+	if !isNum {
+		return 0, 0, false
+	}
+	return 1, f, true
+}
+
+// compareRuntimeNumericOrder compares two ORDER BY values for a
+// RuntimeNumeric key, returning ErrUnsupported (which declines the query to
+// PostgreSQL) the moment it sees a value whose ordering this package cannot
+// reproduce.
+func compareRuntimeNumericOrder(av any, aAbsent bool, bv any, bAbsent bool) (int, error) {
+	ar, an, aok := runtimeNumericRank(av, aAbsent)
+	br, bn, bok := runtimeNumericRank(bv, bAbsent)
+	if !aok || !bok {
+		return 0, ErrUnsupported
+	}
+	if ar != br {
+		if ar < br {
+			return -1, nil
+		}
+		return 1, nil
+	}
+	if ar != 1 {
+		return 0, nil
+	}
+	return compareFloat(an, bn), nil
+}
+
 // sortRows stably sorts rows and outRows in lockstep (both index i always
 // describes the same logical row) by order, resolving each key via
 // resolveOrderValue and comparing via value.go's Compare. Compare's
@@ -1231,7 +1295,17 @@ func sortRows(rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[
 		for _, ok := range order {
 			av := resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol)
 			bv := resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol)
-			c, err := Compare(av, bv)
+			var (
+				c   int
+				err error
+			)
+			if ok.RuntimeNumeric {
+				c, err = compareRuntimeNumericOrder(
+					av, resolveOrderAbsent(aliasIndex, outRows[a], ok.Symbol),
+					bv, resolveOrderAbsent(aliasIndex, outRows[b], ok.Symbol))
+			} else {
+				c, err = Compare(av, bv)
+			}
 			if err != nil {
 				sortErr = err
 				return false

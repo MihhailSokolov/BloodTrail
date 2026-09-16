@@ -609,6 +609,20 @@ var randomCypherTemplates = []randomCypherTemplate{
 	func(rng *rand.Rand) string {
 		return fmt.Sprintf(`MATCH (n:%s) RETURN n.flag, count(n)`, randomCypherPickKind(rng))
 	},
+
+	// ORDER BY a NUMERIC property -- served only after the property index
+	// confirms the column is never string-valued, because pg orders strings
+	// by a collation this package cannot know. The ordering itself (stored
+	// null < numbers < absent, DESC its exact reverse) was measured against
+	// a live database; these templates keep it measured.
+	func(rng *rand.Rand) string {
+		dir := []string{"", " DESC"}[rng.Intn(2)]
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n.val ORDER BY n.val%s`, randomCypherPickKind(rng), dir)
+	},
+	func(rng *rand.Rand) string {
+		dir := []string{"", " DESC"}[rng.Intn(2)]
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n.val AS v ORDER BY v%s LIMIT 5`, randomCypherPickKind(rng), dir)
+	},
 }
 
 // randomCypherQuery picks a uniformly random template and renders it.

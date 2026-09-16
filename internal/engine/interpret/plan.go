@@ -394,6 +394,13 @@ type Projection struct {
 type OrderKey struct {
 	Symbol     string
 	Descending bool
+
+	// RuntimeNumeric marks a key whose alias is a bare PROPERTY lookup --
+	// a shape no static analysis can prove numeric, because what a property
+	// holds is a per-node fact. sortRows serves it only after checking every
+	// value it actually sees, and declines the whole query otherwise. See
+	// compareRuntimeNumericOrder for the ordering that check licenses.
+	RuntimeNumeric bool
 }
 
 // Query is Plan's complete output: an executable, plain-data compilation of
@@ -3371,6 +3378,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 	// isStaticallyNumericScalar accepts its own top-level expression --
 	// planOrder's second (beyond bare count aliases) admission criterion.
 	projectedNumeric := map[string]bool{}
+	projectedProperty := map[string]bool{}
 
 	for _, raw := range proj.Items {
 		item, ok := raw.(*cypher.ProjectionItem)
@@ -3410,6 +3418,21 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		projectedAliases[name] = true
 		projectedKinds[name] = itemKind
 		projectedNumeric[name] = isStaticallyNumericScalar(item.Expression, numericScalars)
+		// A bare property lookup is eligible for planOrder's runtime-numeric
+		// ORDER BY admission -- but only when the snapshot says this
+		// property is never string-valued anywhere. PostgreSQL orders
+		// strings by a database collation this package cannot know
+		// (value.go's Compare refuses them outright), so a column that
+		// holds even one string must delegate. Asking the property index
+		// makes that a PLAN-time answer: the alternative, discovering it
+		// mid-sort, would materialize the whole result before declining.
+		if pl, isProp := unwrapParens(item.Expression).(*cypher.PropertyLookup); isProp && pl != nil {
+			if propID, known := snap.PropIDByName(pl.Symbol); known {
+				if hasString, answered := snap.HasStringValue(propID); answered && !hasString {
+					projectedProperty[name] = true
+				}
+			}
+		}
 
 		outputName := name
 		if item.Alias == nil || item.Alias.Symbol == "" {
@@ -3431,7 +3454,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		})
 	}
 
-	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, countAliases, proj.Distinct)
+	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, projectedProperty, countAliases, proj.Distinct)
 	if !ok {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -3647,6 +3670,21 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 	}
 }
 
+// orderPropertyName renders an ORDER BY item that is a bare property
+// lookup as the same "sym.prop" handle projectionName gives the identical
+// RETURN item, so the two resolve to one another.
+func orderPropertyName(expr cypher.Expression) (string, bool) {
+	pl, ok := unwrapParens(expr).(*cypher.PropertyLookup)
+	if !ok || pl == nil || pl.Symbol == "" {
+		return "", false
+	}
+	v, ok := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !ok || v == nil || v.Symbol == "" {
+		return "", false
+	}
+	return v.Symbol + "." + pl.Symbol, true
+}
+
 // planOrder validates ORDER BY: every item must be a bare Variable (after
 // unwrapping parens) naming either a RETURN-projected alias or -- the
 // controller's "bare count alias" exception -- a COUNT aggregate alias from
@@ -3680,7 +3718,7 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 // exactly the shape the probe found unsafe. Every other alias shape
 // (property lookups, arbitrary function calls, node/edge/path values)
 // rejects outright, delegating the whole query to PostgreSQL.
-func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric map[string]bool, countAliases map[string]bool, distinct bool) ([]OrderKey, bool) {
+func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric, projectedProperty map[string]bool, countAliases map[string]bool, distinct bool) ([]OrderKey, bool) {
 	if order == nil {
 		return nil, true
 	}
@@ -3691,7 +3729,19 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 		}
 		v, ok := unwrapParens(item.Expression).(*cypher.Variable)
 		if !ok || v == nil {
-			return nil, false
+			// `ORDER BY n.score` names the same thing `RETURN n.score`
+			// projects, and projectionName gives both the identical
+			// "n.score" handle -- so resolve the property lookup to that
+			// projected alias instead of refusing every non-variable item.
+			// Anything that is not a projected alias still refuses.
+			name, named := orderPropertyName(item.Expression)
+			if !named {
+				return nil, false
+			}
+			if _, isProjected := projectedKinds[name]; !isProjected {
+				return nil, false
+			}
+			v = &cypher.Variable{Symbol: name}
 		}
 		// The carried-COUNT exception below orders by a value the
 		// projection does not output. PostgreSQL allows that for a plain
@@ -3716,7 +3766,20 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 			return nil, false
 		}
 		if !projectedNumeric[v.Symbol] {
-			return nil, false
+			// A bare PROPERTY lookup cannot be proven numeric statically --
+			// what a property holds is a per-node fact -- but it is the
+			// single most common thing anyone sorts by (`ORDER BY
+			// n.lastlogontimestamp DESC LIMIT 10`). Admit it as a
+			// RUNTIME-checked key: sortRows serves it only if every value
+			// it actually sees is a number or a null, and declines the
+			// whole query otherwise, so a string column still delegates
+			// rather than risk PostgreSQL's collation (value.go's Compare
+			// refuses strings outright, ErrCollation).
+			if !projectedProperty[v.Symbol] {
+				return nil, false
+			}
+			keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending, RuntimeNumeric: true})
+			continue
 		}
 		keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})
 	}
