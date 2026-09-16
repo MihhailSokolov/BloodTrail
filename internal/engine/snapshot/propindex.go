@@ -260,6 +260,36 @@ func (v *View) deltaTouchedNodes() []NodeID {
 	return out
 }
 
+// NodesWithStringByName is NodesWithString keyed by the property NAME a
+// query actually writes, and is the entry point every caller holding a name
+// must use.
+//
+// Resolving the name to a PropID first and reading a miss as "nothing
+// carries this property" is WRONG on a View, and was: PropIDByName reads the
+// BASE snapshot's intern table, while each delta segment interns its own
+// property names. An engine that boots against an empty database and
+// receives its entire graph through write-through -- every fresh install,
+// and the deployment build/e2e.sh exercises -- has a base that interned
+// nothing at all, so `objectid` missed, and the empty candidate set that
+// followed made `MATCH (t:Group) WHERE t.objectid ENDS WITH '-512'` answer
+// zero rows against a graph that plainly contained that group.
+//
+// A candidate source is allowed to be loose and is never allowed to be
+// short, so a miss resolves to every delta-touched node when there IS a
+// delta -- the same superset NodesWithString unions in for a property the
+// base does know -- and to the empty set only when there is no delta for a
+// node to be hiding in, which is the one case where the base's silence
+// really does settle the question.
+func (v *View) NodesWithStringByName(name string, match StringMatch, operand string) ([]NodeID, bool) {
+	if prop, ok := v.PropIDByName(name); ok {
+		return v.NodesWithString(prop, match, operand)
+	}
+	if !v.Overlay() {
+		return nil, true
+	}
+	return v.deltaTouchedNodes(), true
+}
+
 // HasStringValue reports whether prop is string-valued on ANY node in this
 // view, and whether that question could be answered at all (false when the
 // property is not interned in the base snapshot, where an overlay could

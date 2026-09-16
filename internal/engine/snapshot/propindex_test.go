@@ -232,3 +232,85 @@ func TestNodesWithStringOverlayNoDuplicates(t *testing.T) {
 		}
 	}
 }
+
+// TestNodesWithStringByNameSeesPastAnUninterestedBase pins the rule that a
+// base snapshot's silence about a property name is not evidence about the
+// delta. A PropID resolves against the base's intern table only, so on a
+// View whose base predates the property entirely -- the state every fresh
+// install boots into, where PostgreSQL holds nothing and the whole graph
+// arrives by write-through -- a name lookup misses while the delta is full
+// of nodes carrying it.
+//
+// Treating that miss as "nothing carries this property" returned an empty
+// candidate set, and an empty candidate set is a wrong answer rather than a
+// slow one: it made the engine SERVE zero rows for a query whose match was
+// sitting in the delta.
+func TestNodesWithStringByNameSeesPastAnUninterestedBase(t *testing.T) {
+	// A base that interns "other" and nothing else -- in particular, never
+	// the name the queries below look up.
+	base := NewBuilder(1)
+	base.SetKinds(map[KindID]string{1: "Thing"})
+	if err := base.AddNode(1, []KindID{1}, []byte(`{"other":"irrelevant"}`)); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	snap, err := base.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if _, interned := NewView(snap).PropIDByName("objectid"); interned {
+		t.Fatal("fixture invalid: the base must not intern objectid")
+	}
+
+	t.Run("no delta means the base really does settle it", func(t *testing.T) {
+		ids, ok := NewView(snap).NodesWithStringByName("objectid", StringSuffix, "-512")
+		if !ok {
+			t.Fatal("a flat snapshot can always answer")
+		}
+		if len(ids) != 0 {
+			t.Fatalf("got %d candidates, want 0: with no delta, a property the base "+
+				"never interned is carried by nothing", len(ids))
+		}
+	})
+
+	t.Run("a delta carrying the property must not be missed", func(t *testing.T) {
+		var sb SegmentBuilder
+		sb.AddKind(1, "Thing")
+		for _, n := range []struct {
+			id   uint64
+			json string
+		}{
+			{100, `{"objectid":"S-1-5-21-1-1-1-512"}`},
+			{101, `{"objectid":"S-1-5-21-1-1-1-1105"}`},
+		} {
+			if err := sb.AddNodeState(n.id, []KindID{1}, []byte(n.json)); err != nil {
+				t.Fatalf("AddNodeState(%d): %v", n.id, err)
+			}
+		}
+		view := NewView(snap).WithSegment(sb.Build())
+
+		ids, ok := view.NodesWithStringByName("objectid", StringSuffix, "-512")
+		if !ok {
+			t.Fatal("an overlay can always answer")
+		}
+		// The set is allowed to be loose -- it is the whole delta, and the
+		// caller re-verifies -- but it must contain the real match.
+		if len(ids) == 0 {
+			t.Fatal("empty candidate set: the match lives in the delta, so this is a wrong " +
+				"answer the caller cannot recover from, not a missed optimization")
+		}
+		want, ok := view.Dense(100)
+		if !ok {
+			t.Fatal("delta node 100 has no dense id")
+		}
+		found := false
+		for _, id := range ids {
+			if id == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("candidate set %v omits the one node that matches", ids)
+		}
+	})
+}

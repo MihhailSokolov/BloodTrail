@@ -1549,18 +1549,21 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 			return
 		}
 	}
-	propID, ok := pb.snap.PropIDByName(name)
-	if !ok {
-		// The property is not interned in this snapshot at all, so nothing
-		// carries it: an empty candidate set is the correct answer, and a
-		// far better one than scanning to discover it.
-		nc.PropCandidates, nc.PropIndexed = nil, true
+	// Resolution goes through the NAME, never through a PropID this function
+	// resolved itself: a PropID miss means only that the BASE snapshot never
+	// interned the property, which on an overlay says nothing about what the
+	// delta carries. NodesWithStringByName owns that distinction, and its
+	// doc records what reading a miss as "nothing carries it" cost.
+	//
+	// The cost guard still needs a PropID, so it applies only when the base
+	// knows the property. When it does not, the candidate set that comes
+	// back is the whole delta, which propIndexPreferred and rankOf already
+	// price against the kind bitmap and decline to use when it is the
+	// larger of the two -- the same protection stringAnchorWorthIt gives.
+	if propID, known := pb.snap.PropIDByName(name); known && !pb.stringAnchorWorthIt(sym, propID, match) {
 		return
 	}
-	if !pb.stringAnchorWorthIt(sym, propID, match) {
-		return
-	}
-	ids, ok := pb.snap.NodesWithString(propID, match, operand)
+	ids, ok := pb.snap.NodesWithStringByName(name, match, operand)
 	if !ok {
 		return
 	}
@@ -1660,15 +1663,13 @@ func (pb *partBuilder) extractStringInAnchor(sym string, nc *NodeConstraint, lef
 		}
 		operands = append(operands, decoded)
 	}
-	propID, ok := pb.snap.PropIDByName(pl.Symbol)
-	if !ok {
-		nc.PropCandidates, nc.PropIndexed = nil, true
-		return
-	}
+	// By NAME, for the reason NodesWithStringByName's doc gives: a PropID
+	// miss means the base never interned the property, which decides nothing
+	// about an overlay's delta.
 	seen := map[snapshot.NodeID]bool{}
 	var union []snapshot.NodeID
 	for _, operand := range operands {
-		ids, ok := pb.snap.NodesWithString(propID, snapshot.StringEquals, operand)
+		ids, ok := pb.snap.NodesWithStringByName(pl.Symbol, snapshot.StringEquals, operand)
 		if !ok {
 			return
 		}
