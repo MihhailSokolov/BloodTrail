@@ -667,11 +667,41 @@ func endpointNarrows(nc *NodeConstraint) bool {
 		return true
 	}
 	for _, p := range nc.Predicates {
-		if !kindOnlyPredicate(p) {
-			return true
+		if kindOnlyPredicate(p) || negatedPredicate(p) {
+			continue
 		}
+		return true
 	}
 	return false
+}
+
+// negatedPredicate reports whether expr is a negation, which endpointNarrows
+// treats as not narrowing at all.
+//
+// The reasoning is that a negation is the COMPLEMENT of whatever it wraps, so
+// its selectivity is the complement's: the more selective `x ENDS WITH '-512'`
+// is, the LESS selective `NOT x ENDS WITH '-512'` is. Counting one as a
+// narrowing is backwards, and it is what kept the shipped "Nested groups
+// within Tier Zero / High Value" prebuilt on the forward route -- its near
+// side carries `NOT s.objectid ENDS WITH '-512' AND NOT s.objectid ENDS WITH
+// '-519'`, which between them exclude two groups out of thousands, while its
+// far side is the handful tagged admin_tier_0.
+//
+// Like kindOnlyPredicate, this only affects which end the route SEEDS from.
+// The predicate itself stays in Part.Where and filters every row either way.
+func negatedPredicate(expr cypher.Expression) bool {
+	switch typed := unwrapParens(expr).(type) {
+	case *cypher.Negation:
+		return typed != nil
+	case *cypher.Comparison:
+		// `a <> b` is a negation written as an operator.
+		if typed == nil || len(typed.Partials) != 1 || typed.Partials[0] == nil {
+			return false
+		}
+		return typed.Partials[0].Operator == cypher.OperatorNotEquals
+	default:
+		return false
+	}
 }
 
 // kindOnlyPredicate reports whether expr tests nothing but kind membership --

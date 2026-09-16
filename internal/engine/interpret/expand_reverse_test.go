@@ -1236,3 +1236,54 @@ func TestBaseLabelledPrebuiltDoesNotScan(t *testing.T) {
 		t.Fatalf("(:Base) spent %d work on a %d-node graph -- that is still a full scan", baseWork, nodeCount)
 	}
 }
+
+// TestVarLengthReverseIgnoresNegatedNearPredicates pins that a NEGATED
+// predicate on the near side does not count as narrowing.
+//
+// A negation is the complement of what it wraps, so its selectivity is the
+// complement's: the more selective `x ENDS WITH '-512'` is, the less
+// selective `NOT x ENDS WITH '-512'` is. Counting it as a narrowing kept the
+// shipped "Nested groups within Tier Zero / High Value" prebuilt seeding from
+// every Group in the graph -- its near side excludes two groups out of
+// thousands while its far side is the handful tagged admin_tier_0 -- and it
+// measured 3.9x slower than the database this engine replaces.
+func TestVarLengthReverseIgnoresNegatedNearPredicates(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+	env := &Env{Snap: snap}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{
+			name:  "NOT ... ENDS WITH on the near side does not block it",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) WHERE NOT s.objectid ENDS WITH '-999' AND t.objectid = 'T-516' RETURN s, t`,
+			want:  true,
+		},
+		{
+			name:  "<> on the near side does not block it",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) WHERE s.objectid <> 'X' AND t.objectid = 'T-516' RETURN s, t`,
+			want:  true,
+		},
+		{
+			// A POSITIVE predicate still blocks it: that one really can be
+			// selective, and rankOf cannot see by how much.
+			name:  "a positive near-side predicate still blocks it",
+			query: `MATCH (s)-[:E*1..3]->(t:Target) WHERE s.objectid ENDS WITH '-1' AND t.objectid = 'T-516' RETURN s, t`,
+			want:  false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			part, step := varLengthPartAndStep(t, snap, tc.query)
+			if got := varLengthReverseEligible(env, part, step); got != tc.want {
+				t.Fatalf("varLengthReverseEligible = %v, want %v\nquery: %s", got, tc.want, tc.query)
+			}
+			// Where the route IS taken, it must produce the forward answer.
+			// (The helper only compares shapes the dispatcher reverses.)
+			if tc.want {
+				assertVarLengthDirectionsAgree(t, snap, tc.query)
+			}
+		})
+	}
+}
