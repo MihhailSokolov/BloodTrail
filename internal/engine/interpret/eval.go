@@ -108,10 +108,30 @@ func (e EdgeRef) Kind(snap *snapshot.View) snapshot.KindID {
 // namespace a symbol lives in is a property of the query's pattern, not
 // something this package needs to infer from the stored value's shape.
 type Row struct {
-	nodes   map[string]snapshot.NodeID
-	edges   map[string]EdgeRef
-	paths   map[string]any
-	scalars map[string]any
+	// The four binding namespaces are association SLICES, not maps, for the
+	// reason usedEdges below already gives for itself: a row binds the
+	// symbols of one pattern, which is a handful, and at that size a linear
+	// scan over contiguous memory beats hashing. The difference that made
+	// this worth changing is allocation, not lookup -- a lazily-created map
+	// costs a header plus its first bucket, so a freshly bound one-symbol
+	// row cost three allocations where it now costs one.
+	//
+	// That cost is paid per CANDIDATE, not per result: scanAnchorVisit binds
+	// a row for every node a candidate source yields, and a wide anchor
+	// feeding a selective step discards nearly all of them. Measured on the
+	// benchmark graph's "All Global Administrators" shape -- 84k AZBase
+	// nodes seeding a step whose edge kind has exactly ONE edge in the whole
+	// graph -- Row construction was 76% of the query's allocations.
+	//
+	// Set overwrites in place when the symbol is already bound, so these
+	// carry the same one-value-per-symbol semantics a map did. Iteration
+	// order is now insertion order rather than random; nothing depends on
+	// it (cloneRow and mergeRowInto are this package's only iterators, and
+	// both build a complete copy).
+	nodes   []nodeBinding
+	edges   []edgeBinding
+	paths   []anyBinding
+	scalars []anyBinding
 
 	// usedEdges records the forward-CSR index of every edge any Step has
 	// bound while constructing this row, regardless of whether that Step
@@ -149,75 +169,122 @@ type Row struct {
 	trailEdges []uint64
 }
 
+// nodeBinding, edgeBinding and anyBinding are one symbol's entry in a Row's
+// corresponding namespace -- see Row's own doc for why these are slices.
+type nodeBinding struct {
+	sym string
+	id  snapshot.NodeID
+}
+
+type edgeBinding struct {
+	sym string
+	ref EdgeRef
+}
+
+type anyBinding struct {
+	sym string
+	val any
+}
+
 // NewRow returns an empty Row ready for SetNode/SetEdge/SetPathVar/
 // SetScalar.
 func NewRow() *Row {
 	return &Row{}
 }
 
-// SetNode binds sym to a node's dense NodeID.
+// SetNode binds sym to a node's dense NodeID, replacing any previous
+// binding for sym.
 func (r *Row) SetNode(sym string, id snapshot.NodeID) {
-	if r.nodes == nil {
-		r.nodes = make(map[string]snapshot.NodeID)
+	for i := range r.nodes {
+		if r.nodes[i].sym == sym {
+			r.nodes[i].id = id
+			return
+		}
 	}
-	r.nodes[sym] = id
+	r.nodes = append(r.nodes, nodeBinding{sym: sym, id: id})
 }
 
 // Node returns the dense NodeID bound to sym, and whether sym is bound as a
 // node variable at all.
 func (r *Row) Node(sym string) (snapshot.NodeID, bool) {
-	id, ok := r.nodes[sym]
-	return id, ok
+	for i := range r.nodes {
+		if r.nodes[i].sym == sym {
+			return r.nodes[i].id, true
+		}
+	}
+	return 0, false
 }
 
-// SetEdge binds sym to an edge reference.
+// SetEdge binds sym to an edge reference, replacing any previous binding
+// for sym.
 func (r *Row) SetEdge(sym string, ref EdgeRef) {
-	if r.edges == nil {
-		r.edges = make(map[string]EdgeRef)
+	for i := range r.edges {
+		if r.edges[i].sym == sym {
+			r.edges[i].ref = ref
+			return
+		}
 	}
-	r.edges[sym] = ref
+	r.edges = append(r.edges, edgeBinding{sym: sym, ref: ref})
 }
 
 // Edge returns the EdgeRef bound to sym, and whether sym is bound as an edge
 // variable at all.
 func (r *Row) Edge(sym string) (EdgeRef, bool) {
-	ref, ok := r.edges[sym]
-	return ref, ok
+	for i := range r.edges {
+		if r.edges[i].sym == sym {
+			return r.edges[i].ref, true
+		}
+	}
+	return EdgeRef{}, false
 }
 
-// SetPathVar binds sym to a path value. Nothing produced a path value when
-// this was written, so v's shape is not defined by anything other than the
-// caller; this exists purely so Row's namespace shape already carries the
-// path slot, ahead of the code that populates it.
+// SetPathVar binds sym to a path value, replacing any previous binding for
+// sym. Nothing produced a path value when this was written, so v's shape is
+// not defined by anything other than the caller; this exists purely so
+// Row's namespace shape already carries the path slot, ahead of the code
+// that populates it.
 func (r *Row) SetPathVar(sym string, v any) {
-	if r.paths == nil {
-		r.paths = make(map[string]any)
-	}
-	r.paths[sym] = v
+	r.paths = setAnyBinding(r.paths, sym, v)
 }
 
 // PathVar returns the path value bound to sym, and whether sym is bound as a
 // path variable at all.
 func (r *Row) PathVar(sym string) (any, bool) {
-	v, ok := r.paths[sym]
-	return v, ok
+	return getAnyBinding(r.paths, sym)
 }
 
 // SetScalar binds sym to a plain computed/bound value (e.g. an UNWIND
 // element), in the same post-JSON value model as everything else in this
-// package.
+// package, replacing any previous binding for sym.
 func (r *Row) SetScalar(sym string, v any) {
-	if r.scalars == nil {
-		r.scalars = make(map[string]any)
-	}
-	r.scalars[sym] = v
+	r.scalars = setAnyBinding(r.scalars, sym, v)
 }
 
 // Scalar returns the scalar value bound to sym, and whether sym is bound as
 // a scalar variable at all.
 func (r *Row) Scalar(sym string) (any, bool) {
-	v, ok := r.scalars[sym]
-	return v, ok
+	return getAnyBinding(r.scalars, sym)
+}
+
+// setAnyBinding and getAnyBinding are the paths/scalars namespaces' shared
+// bodies -- both are []anyBinding, so the scan is written once.
+func setAnyBinding(bs []anyBinding, sym string, v any) []anyBinding {
+	for i := range bs {
+		if bs[i].sym == sym {
+			bs[i].val = v
+			return bs
+		}
+	}
+	return append(bs, anyBinding{sym: sym, val: v})
+}
+
+func getAnyBinding(bs []anyBinding, sym string) (any, bool) {
+	for i := range bs {
+		if bs[i].sym == sym {
+			return bs[i].val, true
+		}
+	}
+	return nil, false
 }
 
 // markEdgeUsed records fwd (a forward-CSR index) as consumed by some Step

@@ -610,11 +610,34 @@ func cartesianJoin(meter *workMeter, left, right []*Row) ([]*Row, error) {
 }
 
 // cloneRow returns a shallow copy of r's bindings on a fresh Row. Reaches
-// into Row's unexported maps directly (same package) rather than adding a
-// new exported Row method purely for this internal need.
+// into Row's unexported binding slices directly (same package) rather than
+// adding a new exported Row method purely for this internal need.
+//
+// The destination is empty by construction, so every binding is new and the
+// slices copy wholesale -- no per-binding "is this symbol already bound"
+// scan, which is what mergeRowInto has to do and what this used to pay for
+// by routing through it. cloneRow runs once per emitted row on the hot
+// expansion paths, so the difference is worth the duplication.
 func cloneRow(r *Row) *Row {
 	nr := NewRow()
-	mergeRowInto(nr, r)
+	if len(r.nodes) > 0 {
+		nr.nodes = append(make([]nodeBinding, 0, len(r.nodes)), r.nodes...)
+	}
+	if len(r.edges) > 0 {
+		nr.edges = append(make([]edgeBinding, 0, len(r.edges)), r.edges...)
+	}
+	if len(r.scalars) > 0 {
+		nr.scalars = append(make([]anyBinding, 0, len(r.scalars)), r.scalars...)
+	}
+	if len(r.paths) > 0 {
+		nr.paths = append(make([]anyBinding, 0, len(r.paths)), r.paths...)
+	}
+	if len(r.usedEdges) > 0 {
+		nr.usedEdges = append(make([]uint64, 0, len(r.usedEdges)), r.usedEdges...)
+	}
+	if len(r.trailEdges) > 0 {
+		nr.trailEdges = append(make([]uint64, 0, len(r.trailEdges)), r.trailEdges...)
+	}
 	return nr
 }
 
@@ -623,17 +646,17 @@ func cloneRow(r *Row) *Row {
 // sets union together, so a closing Step evaluated after the merge still
 // sees every edge either side already consumed.
 func mergeRowInto(dst, src *Row) {
-	for k, v := range src.nodes {
-		dst.SetNode(k, v)
+	for _, b := range src.nodes {
+		dst.SetNode(b.sym, b.id)
 	}
-	for k, v := range src.edges {
-		dst.SetEdge(k, v)
+	for _, b := range src.edges {
+		dst.SetEdge(b.sym, b.ref)
 	}
-	for k, v := range src.scalars {
-		dst.SetScalar(k, v)
+	for _, b := range src.scalars {
+		dst.SetScalar(b.sym, b.val)
 	}
-	for k, v := range src.paths {
-		dst.SetPathVar(k, v)
+	for _, b := range src.paths {
+		dst.SetPathVar(b.sym, b.val)
 	}
 	for _, fwd := range src.usedEdges {
 		dst.markEdgeUsed(fwd)

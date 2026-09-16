@@ -1129,3 +1129,90 @@ func TestShortestPathLimitPushdownNotAppliedAcrossWithBoundary_UnderServe(t *tes
 		t.Fatalf("got %d rows, want 3 (s3/s4/s5's matches, not truncated to s1/s2/s3 by the leaked final LIMIT)", len(rs.Rows))
 	}
 }
+
+// TestRowBindingsKeepMapSemantics pins the behaviour Row's association
+// slices replaced a map to provide. A slice makes "bind this symbol again"
+// an explicit overwrite rather than something the data structure does for
+// free, so the cases where that matters are pinned here directly: rebinding
+// must replace rather than append a second entry, each namespace must be
+// independent, and a merge must let the source win on a conflict, exactly
+// as assigning into a map did.
+func TestRowBindingsKeepMapSemantics(t *testing.T) {
+	t.Run("rebinding replaces", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("n", 1)
+		r.SetNode("n", 2)
+		if got, ok := r.Node("n"); !ok || got != 2 {
+			t.Fatalf("Node(n) = %v, %v; want 2, true", got, ok)
+		}
+		if len(r.nodes) != 1 {
+			t.Fatalf("rebinding appended a second entry: %d bindings", len(r.nodes))
+		}
+	})
+
+	t.Run("namespaces are independent", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("x", 7)
+		r.SetScalar("x", "scalar")
+		r.SetPathVar("x", "path")
+		if got, _ := r.Node("x"); got != 7 {
+			t.Fatalf("node binding disturbed: %v", got)
+		}
+		if got, _ := r.Scalar("x"); got != "scalar" {
+			t.Fatalf("scalar binding disturbed: %v", got)
+		}
+		if got, _ := r.PathVar("x"); got != "path" {
+			t.Fatalf("path binding disturbed: %v", got)
+		}
+	})
+
+	t.Run("an unbound symbol reports unbound", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("a", 1)
+		if _, ok := r.Node("b"); ok {
+			t.Fatal("Node(b) reported bound")
+		}
+		if _, ok := r.Scalar("a"); ok {
+			t.Fatal("a is a node, not a scalar")
+		}
+	})
+
+	t.Run("merge lets the source win", func(t *testing.T) {
+		dst, src := NewRow(), NewRow()
+		dst.SetNode("shared", 1)
+		dst.SetNode("dstonly", 10)
+		src.SetNode("shared", 2)
+		src.SetNode("srconly", 20)
+		mergeRowInto(dst, src)
+		for _, tc := range []struct {
+			sym  string
+			want snapshot.NodeID
+		}{{"shared", 2}, {"dstonly", 10}, {"srconly", 20}} {
+			if got, ok := dst.Node(tc.sym); !ok || got != tc.want {
+				t.Fatalf("Node(%s) = %v, %v; want %v, true", tc.sym, got, ok, tc.want)
+			}
+		}
+		if len(dst.nodes) != 3 {
+			t.Fatalf("merge produced %d bindings, want 3 distinct symbols", len(dst.nodes))
+		}
+	})
+
+	t.Run("a clone is independent of its source", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("n", 1)
+		r.SetScalar("s", "v")
+		r.markEdgeUsed(42)
+		c := cloneRow(r)
+		c.SetNode("n", 99)
+		c.SetNode("extra", 5)
+		if got, _ := r.Node("n"); got != 1 {
+			t.Fatalf("writing to the clone changed the original: %v", got)
+		}
+		if _, ok := r.Node("extra"); ok {
+			t.Fatal("the clone's new binding leaked into the original")
+		}
+		if !c.edgeUsed(42) {
+			t.Fatal("clone lost usedEdges")
+		}
+	})
+}
