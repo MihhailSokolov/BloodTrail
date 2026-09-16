@@ -1289,6 +1289,28 @@ type anchorRank struct {
 	size int
 }
 
+// candidateEstimate is how many candidates this rank expects to enumerate,
+// on one scale across every tier -- what a cost COMPARISON needs, as opposed
+// to better()'s tier-first ordering, which deliberately prefers an id lookup
+// over any bitmap regardless of size.
+//
+// An id or objectid anchor resolves to a handful; both are reported as one,
+// since the distinction between one and three candidates never decides
+// anything a caller of this asks.
+func (r anchorRank) candidateEstimate(env *Env) int {
+	switch r.tier {
+	case tierID, tierObjectID:
+		return 1
+	case tierScan:
+		if r.size > 0 {
+			return r.size
+		}
+		return env.Snap.NodeCount()
+	default:
+		return r.size
+	}
+}
+
 // better reports whether r is a strictly cheaper anchor than o.
 func (r anchorRank) better(o anchorRank) bool {
 	if r.tier != o.tier {

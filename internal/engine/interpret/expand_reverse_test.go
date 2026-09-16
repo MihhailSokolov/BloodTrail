@@ -186,8 +186,9 @@ var revKindTable = map[snapshot.KindID]string{
 //   - an isolated node (8) reachable from nothing.
 func buildReverseEqualityFixture(t *testing.T) *snapshot.View {
 	t.Helper()
+	padNodes, padEdges := reverseEqualityPadding()
 	return buildExecSnapshot(t, revKindTable,
-		[]execNodeSpec{
+		append([]execNodeSpec{
 			{1, []snapshot.KindID{revKindSrc}, nil},
 			{2, []snapshot.KindID{revKindSrc}, nil},
 			{3, nil, nil},
@@ -196,8 +197,8 @@ func buildReverseEqualityFixture(t *testing.T) *snapshot.View {
 			{6, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "T-516"}},
 			{7, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "T-999"}},
 			{8, nil, nil},
-		},
-		[]execEdgeSpec{
+		}, padNodes...),
+		append([]execEdgeSpec{
 			{100, 1, 3, revKindE},
 			{101, 3, 6, revKindE},
 			{102, 1, 4, revKindE},
@@ -208,8 +209,33 @@ func buildReverseEqualityFixture(t *testing.T) *snapshot.View {
 			{108, 7, 5, revKindE},
 			{109, 5, 6, revKindE},
 			{110, 2, 3, revKindF},
-		},
+		}, padEdges...),
 	)
+}
+
+// reverseEqualityPadding returns a chain of nodes joined by E edges that
+// reaches no Target, so it contributes no rows to any query in this file
+// while making the NEAR side genuinely wide.
+//
+// It exists because the reverse route's eligibility rule is a COST
+// comparison: it reverses when the near side is large and the far side is
+// several times cheaper. On a seven-node fixture every side is small and the
+// comparison cannot express anything, so a case named "wide near side" would
+// be asserting about a near side of five nodes. Padding with isolated nodes
+// would not work either -- the edge-kind hint prices the near side as the
+// nodes carrying an admissible OUT edge, which isolated nodes do not.
+func reverseEqualityPadding() ([]execNodeSpec, []execEdgeSpec) {
+	const padding = 60
+	var nodes []execNodeSpec
+	var edges []execEdgeSpec
+	for i := 0; i < padding; i++ {
+		id := uint64(1000 + i)
+		nodes = append(nodes, execNodeSpec{id, nil, nil})
+		if i > 0 {
+			edges = append(edges, execEdgeSpec{uint64(2000 + i), id - 1, id, revKindE})
+		}
+	}
+	return nodes, edges
 }
 
 // TestVarLengthReverseEqualsForwardAcrossShapes is this change's central
@@ -420,16 +446,17 @@ func TestVarLengthReverseZeroLengthBindsSameNode(t *testing.T) {
 // pattern's own first-written endpoint first, in both cases regardless of the
 // direction the executor actually walked.
 func TestVarLengthReversePatternOrderPath(t *testing.T) {
+	padNodes, padEdges := reverseEqualityPadding()
 	snap := buildExecSnapshot(t, revKindTable,
-		[]execNodeSpec{
+		append([]execNodeSpec{
 			{1, []snapshot.KindID{revKindSrc}, nil},
 			{2, nil, nil},
 			{3, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "P-516"}},
-		},
-		[]execEdgeSpec{
+		}, padNodes...),
+		append([]execEdgeSpec{
 			{300, 1, 2, revKindE},
 			{301, 2, 3, revKindE},
-		},
+		}, padEdges...),
 	)
 
 	t.Run("forward arrow", func(t *testing.T) {
@@ -456,20 +483,21 @@ func TestVarLengthReversePatternOrderPath(t *testing.T) {
 // identical, mutually unreachable clusters each carry their own matching
 // Target.
 func TestVarLengthReverseMultiSeedDisjointComponents(t *testing.T) {
+	padNodes, padEdges := reverseEqualityPadding()
 	snap := buildExecSnapshot(t, revKindTable,
-		[]execNodeSpec{
+		append([]execNodeSpec{
 			{1, nil, nil},
 			{2, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "D1-516"}},
 			{11, nil, nil},
 			{12, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "D2-516"}},
 			{21, nil, nil},
 			{22, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "D3-999"}},
-		},
-		[]execEdgeSpec{
+		}, padNodes...),
+		append([]execEdgeSpec{
 			{400, 1, 2, revKindE},
 			{401, 11, 12, revKindE},
 			{402, 21, 22, revKindE},
-		},
+		}, padEdges...),
 	)
 
 	const query = `MATCH (s)-[:E*1..2]->(t:Target) WHERE t.objectid ENDS WITH '-516' RETURN s, t`
@@ -736,14 +764,19 @@ func TestVarLengthReverseSpendsFarLessWork(t *testing.T) {
 // 8-node clique whose one objectid-anchored Target is reachable backward from
 // everywhere, searched `*1..4` under a tiny work budget.
 func TestVarLengthReverseDeclinesOnBudget(t *testing.T) {
+	// Sized past the eligibility rule's near-side floor: below a couple of
+	// dozen seeds the forward walk is cheap whatever its shape, so the route
+	// would stay forward and this test would prove nothing about the reverse
+	// walk's budget behaviour.
+	const clique = 20
 	nodes := []execNodeSpec{{1, []snapshot.KindID{revKindTarget}, map[string]any{"objectid": "C-516"}}}
-	for i := uint64(2); i <= 8; i++ {
+	for i := uint64(2); i <= clique; i++ {
 		nodes = append(nodes, execNodeSpec{i, nil, nil})
 	}
 	var edges []execEdgeSpec
 	nextEdgeID := uint64(1)
-	for u := uint64(1); u <= 8; u++ {
-		for v := uint64(1); v <= 8; v++ {
+	for u := uint64(1); u <= clique; u++ {
+		for v := uint64(1); v <= clique; v++ {
 			if u == v {
 				continue
 			}
@@ -1070,16 +1103,16 @@ func buildBaseLabelledFixture(t *testing.T, users, computers, entraUsers int) *s
 	return buildExecSnapshot(t, kinds, nodes, edges)
 }
 
-// TestVarLengthReverseEligibleWithGraphCoveringKindNearSide pins
-// scanEquivalentNearSide: a kind label that covers essentially the whole
-// graph narrows nothing, so it must not disqualify the constrained-side
-// route, while a kind that genuinely is a minority of nodes still must.
+// TestVarLengthReverseEligibleWithGraphCoveringKindNearSide pins how a kind
+// label on the NEAR side is priced: by how many nodes it actually covers,
+// against what the far side costs, rather than by whether it happens to cover
+// a majority of the graph.
 //
-// This is the pattern-label half of the same bug
-// TestVarLengthReverseEligibleIgnoresKindOnlyPredicates fixed for WHERE-written
-// kind tests. `(:Base)` never reached endpointNarrows at all -- it reached the
-// cost test through rankOf, which ranks any kind as tierKind and so outranked
-// a full scan of the same node count.
+// The majority rule this replaced refused the route for every near side that
+// was merely large, which is where three shipped prebuilts lost to
+// PostgreSQL. What survives it is the floor: a near side of a handful stays
+// on the forward route, because the ratio between two small numbers decides
+// nothing and forward is cheap there regardless.
 func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
 	snap := buildBaseLabelledFixture(t, 60, 60, 0)
 	env := &Env{Snap: snap}
@@ -1100,14 +1133,24 @@ func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
 			want:  true,
 		},
 		{
-			// 60 of 125 nodes -- just under a majority: a real narrowing,
-			// and the hazard the rule exists for (an unlucky seed's
-			// in-degree) is live.
-			name:  "a minority kind on the near side still blocks it",
+			// 60 of 125 nodes, against a far side of one or two. This used to
+			// be REFUSED, on the rule that a near side had to cover a
+			// majority of the graph before the route would switch -- and
+			// that is the defect this case now guards the fix for. Measured
+			// on the benchmark graph, shipped prebuilts lost to PostgreSQL
+			// because 84,481 near-side nodes against twenty on the far side
+			// is not a majority of a million. A near side that is large in
+			// absolute terms and several times more expensive than the far
+			// side is exactly when reversing pays.
+			name:  "a large minority kind on the near side now reverses",
 			query: `MATCH p = (:User)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
-			want:  false,
+			want:  true,
 		},
 		{
+			// Still refused, and for a reason that survives the rule change:
+			// a handful of near-side seeds is cheap to walk forward whatever
+			// their shape, so the ratio between two small numbers is not
+			// worth acting on.
 			name:  "a small kind on the near side still blocks it",
 			query: `MATCH p = (:Group)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-512' RETURN p`,
 			want:  false,

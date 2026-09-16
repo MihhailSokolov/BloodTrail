@@ -565,77 +565,81 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 		return false
 	}
 	fromNC, toNC := part.Nodes[step.FromSym], part.Nodes[step.ToSym]
+
+	// The far side has to be materializable into a concrete seed set --
+	// resolveEndpointSet is what this route seeds from, and a side that
+	// narrows nothing would make that a full scan. The near side must NOT
+	// narrow: a pushed predicate there makes it the already-cheap side, and
+	// rankOf cannot see how much it narrows by, so reversing away from it
+	// would be a guess.
 	if !endpointNarrows(toNC) || endpointNarrows(fromNC) {
 		return false
 	}
-	// Both ends priced WITH the step's own relationship-kind narrowing, so
-	// the comparison is on the cost each side will actually pay. This matters
-	// in both directions: a near side the edge-kind index narrows to a
-	// handful is no longer "scan-equivalent", and reversing away from it
-	// would be the more expensive route, not the cheaper one.
-	fromRank := rankOfHinted(env, fromNC, newEdgeHint(env, step, step.FromSym))
-	if !scanEquivalentNearSide(env, fromRank) {
+
+	// Both ends priced on the same basis, INCLUDING the step's own
+	// relationship-kind narrowing, and the route reverses only when the near
+	// side is EXPENSIVE IN ABSOLUTE TERMS and the far side is cheaper by a
+	// wide margin.
+	//
+	// The absolute part is what keeps this safe, and it is not a formality.
+	// Seed count alone does not decide which route is cheaper, because a walk
+	// fans out by the degree of what it seeds from: a one-node near side with
+	// no admissible out-edges answers in zero work, while a one-node far side
+	// that is a hub walks its way back through hundreds of predecessors. The
+	// two look identical on seed count and could not be more different in
+	// cost, which is exactly the shape TestVarLengthReverseRejectsHighInDegree
+	// Hub pins. Requiring the near side to be genuinely large means the route
+	// only ever switches away from work that is definitely being spent.
+	//
+	// What this REPLACED was a pair of structural preconditions -- the near
+	// side had to narrow nothing, and had to be "scan-equivalent" (a full
+	// scan, or a kind holding a MAJORITY of the graph). Those encoded
+	// "reverse only when the near side is hopeless" rather than "reverse when
+	// the far side is much cheaper", and they refused the route wherever the
+	// near side was merely large. Measured against PostgreSQL on the
+	// benchmark graph, shipped prebuilts lost to that: 84,481 near-side nodes
+	// against twenty on the far side was refused because 84,481 is not a
+	// majority of a million.
+	//
+	// Fan-out past the first hop is still not estimated here, by either
+	// route. The work meter is the backstop, as it is forward: a walk that
+	// fans out too far spends past its budget and declines to PostgreSQL,
+	// never returning a truncated answer.
+	near := rankOfHinted(env, fromNC, newEdgeHint(env, step, step.FromSym))
+	far := rankOfHinted(env, toNC, newEdgeHint(env, step, step.ToSym))
+
+	nearN, farN := near.candidateEstimate(env), far.candidateEstimate(env)
+	if nearN < reverseMinNearSeeds {
 		return false
 	}
-	return rankOfHinted(env, toNC, newEdgeHint(env, step, step.ToSym)).better(fromRank)
+	if farN < 1 {
+		farN = 1
+	}
+	return nearN/farN >= reverseSeedMargin
 }
 
+const (
+	// reverseMinNearSeeds is how large the near side must be before switching
+	// routes is worth considering at all. Below it the forward walk is cheap
+	// whatever its shape, and reversing can only add risk. Small, because the
+	// margin below is what actually does the work -- this suppresses the case
+	// where BOTH sides are a handful, where the ratio between two small
+	// numbers says nothing and the forward walk is cheap in absolute terms
+	// whatever its shape.
+	reverseMinNearSeeds = 16
 
-// scanEquivalentNearSide reports whether r -- a variable-length step's NEAR
-// endpoint rank -- costs what a full scan costs, which is what
-// varLengthReverseEligible's third condition is actually about (see its doc).
-//
-// A bare tierScan qualifies by definition. So does a kind bitmap that holds
-// essentially every node in the snapshot: such a "kind" narrows nothing, so
-// enumerating it IS the full scan the condition means to require, and the
-// structural hazard the condition guards against -- a SMALL kind bitmap whose
-// few seeds turn out to be high in-degree hubs -- cannot arise at that
-// population.
-//
-// This is the second half of the same bug the kindOnlyPredicate rule below
-// fixed. That one taught endpointNarrows to ignore a kind test written in
-// WHERE; a kind written in the PATTERN never reached endpointNarrows at all,
-// it reached this cost test through rankOf -- which returns tierKind for any
-// non-empty Kinds list, and anchorRank.better compares tier before size. So
-// `(:Base)`, 1,025,105 nodes out of 1,025,106 in bench/shgen's 500k graph,
-// outranked a full scan of 1,025,106 and disqualified the constrained-side
-// route. On the shipped "all members of Protected Users" prebuilt
-// (`(:Base)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-525'`)
-// that cost 2551ms where seeding from the far side costs 50ms -- 51x, for the
-// identical answer, with the whole difference in which end got seeded.
-//
-// The threshold is "a majority of the graph", not near-equality, and the
-// distinction was MEASURED, not chosen aesthetically. A first version of this
-// rule required >=99% coverage, reasoning that a hybrid AD+Entra graph --
-// where `Base` labels only the AD side -- should keep declining. That was
-// backwards: on the hybrid benchmark graph `Base` covers ~91% of 1.01M
-// nodes, the 99% rule refused the reverse route, and the shipped
-// Protected-Users prebuilt walked forward for ~3.0 seconds against ~20ms of
-// far-side seeding -- on exactly the deployment shape (hybrid) real
-// installations run. What the condition is protecting is the HAZARD CASE: a
-// small kind bitmap whose few seeds hide an unbounded in-degree surprise
-// (see the third-condition bullet above). A kind covering at least half the
-// graph cannot be that case -- walking it forward already costs scan-order
-// work, which is precisely when giving up the near side's structure for the
-// far side's selectivity is worth the in-degree risk the work meter
-// backstops. Below a majority the near side keeps the forward route: its
-// bitmap is genuinely bounded, and the hub hazard is live
-// (TestVarLengthReverseRejectsHighInDegreeHub pins the extreme).
-//
-// A fraction rather than exact equality also matters at the top end:
-// BloodHound's datapipe leaves at least one node (its Meta node) unlabelled
-// by `Base`, so even an AD-only deployment's bitmap is always at least one
-// short of the node count.
-func scanEquivalentNearSide(env *Env, r anchorRank) bool {
-	if r.tier == tierScan {
-		return true
-	}
-	if r.tier != tierKind {
-		return false
-	}
-	total := env.Snap.NodeCount()
-	return total > 0 && r.size*2 >= total
-}
+	// reverseSeedMargin is how many times cheaper the far side must be.
+	//
+	// The near estimate is EXACT here rather than an upper bound, because the
+	// precondition above already refused any near side carrying a pushed
+	// predicate -- what is left is a kind bitmap or a full scan, both of
+	// which rankOf counts exactly. So the margin is covering one unknown
+	// rather than two: fan-out past the first hop, which neither route
+	// estimates.
+	reverseSeedMargin = 4
+)
+
+
 
 // endpointNarrows reports whether nc actually cuts its symbol's candidate set
 // below whatever its candidate source already enumerates: explicit ids, an
