@@ -843,7 +843,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork, MaxLiveRows: maxCypherLiveRows})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
 		return nil, false

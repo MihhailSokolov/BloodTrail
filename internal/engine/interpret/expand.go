@@ -305,6 +305,9 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 			return nil, err
 		}
 		out = append(out, rows...)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	return out, nil
@@ -357,6 +360,9 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			return nil, err
 		}
 		out = append(out, nr)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	if maxHops <= 0 {
@@ -404,6 +410,9 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 
 		if depth == maxHops {
@@ -717,6 +726,9 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 			return nil, err
 		}
 		out = append(out, rows...)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	return out, nil
@@ -795,6 +807,9 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			return nil, err
 		}
 		out = append(out, nr)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	if maxHops <= 0 {
@@ -841,6 +856,9 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 
 		if depth == maxHops {
@@ -1004,6 +1022,9 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 			return nil, err
 		}
 		out = append(out, nr)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

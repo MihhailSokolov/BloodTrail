@@ -65,6 +65,20 @@ var errUnsupportedStep = errors.New("interpret: unsupported step")
 type Budgets struct {
 	MaxRows int
 	MaxWork int64
+
+	// MaxLiveRows caps the size of any single MATERIALIZED intermediate row
+	// set, which is what actually bounds this executor's memory. MaxWork
+	// cannot: it is a CUMULATIVE counter over the whole query, charged +1
+	// per row produced among much cheaper events (adjacency slots, node
+	// visits), so a budget loose enough to let a legitimate deep traversal
+	// inspect a hundred million adjacency slots also lets a pathological
+	// one accumulate a hundred million live rows -- tens of gigabytes, and
+	// an OOM-killed container rather than a decline. Exceeding this is
+	// ErrBudget like any other overrun, so the query delegates to
+	// PostgreSQL, which spills to disk instead of dying.
+	//
+	// Zero or negative means "unlimited", matching the other two fields.
+	MaxLiveRows int
 }
 
 // OutKind discriminates OutVal's payload.
@@ -163,6 +177,25 @@ type workMeter struct {
 	limitTarget    int64
 	limitTargetSet bool
 	finalRows      int
+	peakRows       int
+}
+
+// observeRows reports the current size of a materialized intermediate row
+// set. Called as such a set grows -- not after it is finished -- so a
+// runaway expansion is refused while it is still small enough to refuse,
+// rather than after the allocation that would have killed the process.
+//
+// Checked exactly rather than sampled: unlike work units, where an
+// outstanding balance below the 1024 threshold is immaterial, a single
+// oversized row set IS the failure being prevented.
+func (m *workMeter) observeRows(n int) error {
+	if n > m.peakRows {
+		m.peakRows = n
+	}
+	if m.budget.MaxLiveRows > 0 && n > m.budget.MaxLiveRows {
+		return ErrBudget
+	}
+	return nil
 }
 
 // spend adds units to the work counter, checking it against
@@ -430,6 +463,9 @@ func cartesianJoin(meter *workMeter, left, right []*Row) ([]*Row, error) {
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return out, nil
@@ -937,6 +973,9 @@ func expandChainComponentFrom(env *Env, meter *workMeter, part *Part, stepIdxs [
 				return nil, err
 			}
 			next = append(next, grown...)
+			if err := meter.observeRows(len(next)); err != nil {
+				return nil, err
+			}
 		}
 		rows = next
 	}
@@ -1697,6 +1736,9 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return out, nil
