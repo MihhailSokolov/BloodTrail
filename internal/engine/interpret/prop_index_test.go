@@ -175,3 +175,36 @@ func TestStringAnchorAnswersMatchTheScan(t *testing.T) {
 		}
 	}
 }
+
+// TestStringAnchorInList pins `prop IN [...]` -- a disjunction of
+// equalities, indexed as the union of their lookups. BloodHound writes
+// domain and tenant filters this way. The indexed answer is cross-checked
+// against the same predicate written so it cannot be pushed, so a union
+// that dropped an operand would fail here rather than silently lose rows.
+func TestStringAnchorInList(t *testing.T) {
+	snap := buildPropAnchorFixture(t, 5000)
+
+	const inList = `MATCH (u:User) WHERE u.name IN ['USER000007@CORP.LOCAL','USER000009@CORP.LOCAL','SVC-SQL@CORP.LOCAL'] RETURN u`
+	rs := mustExec(t, snap, inList+" LIMIT 10", Budgets{MaxRows: 100, MaxWork: 60})
+	if len(rs.Rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rs.Rows))
+	}
+
+	q := planQuery(t, snap, inList)
+	if !q.Parts[0].Nodes["u"].PropIndexed {
+		t.Fatal("an all-string IN list should resolve through the index")
+	}
+	if got := len(q.Parts[0].Nodes["u"].PropCandidates); got != 3 {
+		t.Fatalf("index resolved %d candidates, want exactly the 3 named", got)
+	}
+
+	// Cross-check against the unpushable spelling (the OR keeps the
+	// conjunct in Part.Where only, so every node is evaluated).
+	const list = `['USER000007@CORP.LOCAL','USER000009@CORP.LOCAL','SVC-SQL@CORP.LOCAL']`
+	scanned := mustExec(t, snap,
+		`MATCH (u:User) WHERE u.name IN `+list+` OR u.name IN `+list+` RETURN u`,
+		generousBudget)
+	if len(scanned.Rows) != 3 {
+		t.Fatalf("scanned route returned %d rows, want 3", len(scanned.Rows))
+	}
+}

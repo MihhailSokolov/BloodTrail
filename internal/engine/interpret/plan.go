@@ -1475,6 +1475,9 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 		match = snapshot.StringSuffix
 	case cypher.OperatorContains:
 		match = snapshot.StringContains
+	case cypher.OperatorIn:
+		pb.extractStringInAnchor(sym, nc, left, right)
+		return
 	default:
 		return
 	}
@@ -1503,6 +1506,66 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 		return
 	}
 	nc.PropCandidates, nc.PropIndexed = ids, true
+}
+
+// extractStringInAnchor handles `sym.prop IN ['a','b',...]`: a disjunction
+// of equalities, and therefore the UNION of each operand's equality lookup.
+// BloodHound writes domain and tenant filters this way, and the union stays
+// a superset for the same reason a single equality does.
+//
+// An all-literal, all-string list is required. A list holding anything else
+// (a parameter, a number, a nested expression) is left to the ordinary
+// per-node evaluation rather than partially indexed, which would risk
+// dropping candidates a non-string element could still match.
+func (pb *partBuilder) extractStringInAnchor(sym string, nc *NodeConstraint, left, right cypher.Expression) {
+	pl, isProp := unwrapParens(left).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return
+	}
+	list, isList := unwrapParens(right).(*cypher.ListLiteral)
+	if !isList || list == nil || len(*list) == 0 {
+		return
+	}
+	operands := make([]string, 0, len(*list))
+	for _, e := range *list {
+		lit, ok := asLiteral(e)
+		if !ok || lit == nil || lit.Null {
+			return
+		}
+		raw, isStr := lit.Value.(string)
+		if !isStr {
+			return
+		}
+		decoded, err := decodeCypherStringLiteral(raw)
+		if err != nil {
+			return
+		}
+		operands = append(operands, decoded)
+	}
+	propID, ok := pb.snap.PropIDByName(pl.Symbol)
+	if !ok {
+		nc.PropCandidates, nc.PropIndexed = nil, true
+		return
+	}
+	seen := map[snapshot.NodeID]bool{}
+	var union []snapshot.NodeID
+	for _, operand := range operands {
+		ids, ok := pb.snap.NodesWithString(propID, snapshot.StringEquals, operand)
+		if !ok {
+			return
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				union = append(union, id)
+			}
+		}
+	}
+	nc.PropCandidates, nc.PropIndexed = union, true
 }
 
 // propOpLiteral recognizes `sym.<name>` on propSide and a string literal on
