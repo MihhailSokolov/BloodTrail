@@ -556,6 +556,34 @@ var randomCypherTemplates = []randomCypherTemplate{
 		return fmt.Sprintf(`MATCH (n:%s) WHERE %s IN n.tags RETURN n`, randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickTagCandidate(rng)))
 	},
 
+	// Pattern predicates with an ANONYMOUS endpoint -- the existential shape
+	// BloodHound writes for "principals with no group membership". The label
+	// on that endpoint is the whole point: it has to filter by the NEIGHBOUR's
+	// kind, not just by the edge kind, and it binds nothing, so both engines
+	// must agree it is a pure EXISTS. Negated and undirected forms included
+	// because those are where a wrong answer hides -- a semi-join that
+	// silently ignored the label would still look plausible positively.
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (n)-[:%s]->(:%s) RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE NOT (n)-[:%s]->(:%s) RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (n)-[:%s]-(:%s) RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (:%s)-[:%s]->(n) RETURN n`,
+			randomCypherPickKind(rng), randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))])
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (n)-[:%s]->() RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))])
+	},
+
 	// Single-Part (still a bare SinglePartQuery, per planStages): two MATCH
 	// clauses chaining a *0..2/*1..3 var-length relationship, exercising the
 	// fixture's self-loops and parallel multi-kind edges.

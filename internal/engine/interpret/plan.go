@@ -2604,16 +2604,25 @@ func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 		return false
 	}
 
-	from, ok := pb.checkPatternPredicateEndpoint(pp.PatternElements[0])
-	if !ok {
-		return false
-	}
 	rel, isRel := pp.PatternElements[1].Element.(*cypher.RelationshipPattern)
 	if !isRel || rel == nil || rel.Range != nil || rel.Variable != nil || rel.Properties != nil {
 		return false
 	}
-	to, ok := pb.checkPatternPredicateEndpoint(pp.PatternElements[2])
-	if !ok {
+
+	// Each endpoint is either a bound variable or an ANONYMOUS node carrying
+	// kind labels, and at least one must be bound -- that is the side whose
+	// adjacency the evaluator walks. Two anonymous endpoints would be an
+	// existential over the whole graph with nothing to anchor it, and a
+	// NAMED fresh variable would have to BIND, which a predicate does not do;
+	// both stay rejected.
+	from, fromBound := pb.checkPatternPredicateEndpoint(pp.PatternElements[0])
+	to, toBound := pb.checkPatternPredicateEndpoint(pp.PatternElements[2])
+	fromAnon := !fromBound && pb.checkPatternPredicateAnonEndpoint(pp.PatternElements[0])
+	toAnon := !toBound && pb.checkPatternPredicateAnonEndpoint(pp.PatternElements[2])
+	fromOK := fromBound || fromAnon
+	toOK := toBound || toAnon
+	anchored := fromBound || toBound
+	if !fromOK || !toOK || !anchored {
 		return false
 	}
 
@@ -2638,8 +2647,43 @@ func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 	// since resolveEndpointSet's per-candidate EvalPredicate call handles a
 	// self-referencing predicate the same way any other single-symbol one
 	// works.
-	pb.touched[from] = true
-	pb.touched[to] = true
+	// Only a bound endpoint marks a symbol touched; an anonymous one names
+	// no symbol at all. A predicate that touches exactly one symbol pushes
+	// into that symbol's own Predicates, which is what makes the anonymous
+	// shape cheap: `WHERE NOT (u)-[:MemberOf]->(:Group)` is tested per
+	// candidate during the anchor scan rather than after a full row is
+	// assembled.
+	if fromBound {
+		pb.touched[from] = true
+	}
+	if toBound {
+		pb.touched[to] = true
+	}
+	return true
+}
+
+// checkPatternPredicateAnonEndpoint validates one endpoint as a fully
+// ANONYMOUS node pattern -- no variable, no inline properties -- optionally
+// carrying kind labels, every one of which must resolve against this
+// snapshot. This is the `(:Group)` of `WHERE NOT (u)-[:MemberOf]->(:Group)`:
+// it binds nothing, so the predicate stays the pure existence check
+// evalPatternPredicate implements and pg lowers to.
+func (pb *partBuilder) checkPatternPredicateAnonEndpoint(el *cypher.PatternElement) bool {
+	if el == nil {
+		return false
+	}
+	np, isNode := el.Element.(*cypher.NodePattern)
+	if !isNode || np == nil || np.Variable != nil || np.Properties != nil {
+		return false
+	}
+	for _, k := range np.Kinds {
+		if _, ok := pb.snap.Kinds().ID(k.String()); !ok {
+			// An unknown label cannot match anything, which the evaluator
+			// represents faithfully; but declining keeps plan-time kind
+			// resolution uniform with every other checker here.
+			return false
+		}
+	}
 	return true
 }
 

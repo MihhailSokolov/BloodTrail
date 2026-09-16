@@ -1053,19 +1053,6 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 	if !isNode || !isRel || !isNode2 || fromNode == nil || rel == nil || toNode == nil {
 		return TriNull, ErrUnsupported
 	}
-	if fromNode.Variable == nil || toNode.Variable == nil {
-		return TriNull, ErrUnsupported
-	}
-
-	fromID, ok := row.Node(fromNode.Variable.Symbol)
-	if !ok {
-		return TriNull, ErrUnsupported
-	}
-	toID, ok := row.Node(toNode.Variable.Symbol)
-	if !ok {
-		return TriNull, ErrUnsupported
-	}
-
 	kinds := make([]snapshot.KindID, 0, len(rel.Kinds))
 	for _, k := range rel.Kinds {
 		id, found := env.Snap.Kinds().ID(k.String())
@@ -1075,16 +1062,135 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 		kinds = append(kinds, id)
 	}
 
-	switch rel.Direction {
-	case graph.DirectionOutbound:
-		return boolToTri(hasAdjacentEdge(env, fromID, toID, kinds)), nil
-	case graph.DirectionInbound:
-		return boolToTri(hasAdjacentEdge(env, toID, fromID, kinds)), nil
-	case graph.DirectionBoth:
-		return boolToTri(hasAdjacentEdge(env, fromID, toID, kinds) || hasAdjacentEdge(env, toID, fromID, kinds)), nil
+	// One endpoint may be an ANONYMOUS node carrying kind labels -- the
+	// `(:Group)` in `WHERE NOT (u)-[:MemberOf]->(:Group)`. It binds nothing,
+	// so the predicate is the existential pg lowers it to ("is there an edge
+	// from u to SOME node labelled Group"), reached by walking the bound
+	// side's adjacency and testing each neighbour's labels instead of
+	// probing one already-known pair. A NAMED fresh variable is still
+	// rejected at plan time, because that one really would have to bind.
+	fromBound, fromOK := patternEndpointNode(row, fromNode)
+	toBound, toOK := patternEndpointNode(row, toNode)
+
+	switch {
+	case fromOK && toOK:
+		return boolToTri(adjacentInDirection(env, rel.Direction, fromBound, toBound, kinds)), nil
+	case fromOK:
+		return boolToTri(hasKindedNeighbor(env, fromBound, rel.Direction, nodeKindIDs(env, toNode), kinds)), nil
+	case toOK:
+		return boolToTri(hasKindedNeighbor(env, toBound, reverseDirection(rel.Direction), nodeKindIDs(env, fromNode), kinds)), nil
 	default:
 		return TriNull, ErrUnsupported
 	}
+}
+
+// patternEndpointNode resolves a pattern-predicate endpoint to the node the
+// row already bound it to, or reports that it is not a bound variable.
+func patternEndpointNode(row *Row, np *cypher.NodePattern) (snapshot.NodeID, bool) {
+	if np.Variable == nil || np.Variable.Symbol == "" {
+		return 0, false
+	}
+	return row.Node(np.Variable.Symbol)
+}
+
+// nodeKindIDs resolves a pattern node's kind labels to snapshot ids. A label
+// this snapshot has never interned yields the sentinel "no node can match"
+// value, which is correct rather than an error: nothing carries a kind that
+// does not exist. nil (no labels at all) means "any node".
+func nodeKindIDs(env *Env, np *cypher.NodePattern) []snapshot.KindID {
+	if len(np.Kinds) == 0 {
+		return nil
+	}
+	out := make([]snapshot.KindID, 0, len(np.Kinds))
+	for _, k := range np.Kinds {
+		id, found := env.Snap.Kinds().ID(k.String())
+		if !found {
+			return []snapshot.KindID{kindIDNoMatch}
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// kindIDNoMatch is a kind id no node can carry, used to represent a pattern
+// label this snapshot never interned. Kind ids are assigned densely upward
+// from zero, so a negative one is unreachable by construction.
+const kindIDNoMatch = snapshot.KindID(-1)
+
+// reverseDirection flips a relationship direction so a predicate anchored on
+// its OTHER endpoint walks the correct adjacency. DirectionBoth is its own
+// reverse.
+func reverseDirection(d graph.Direction) graph.Direction {
+	switch d {
+	case graph.DirectionOutbound:
+		return graph.DirectionInbound
+	case graph.DirectionInbound:
+		return graph.DirectionOutbound
+	default:
+		return d
+	}
+}
+
+// adjacentInDirection is the both-endpoints-bound probe, unchanged: does an
+// admissible edge connect these two specific nodes the declared way round?
+func adjacentInDirection(env *Env, dir graph.Direction, from, to snapshot.NodeID, kinds []snapshot.KindID) bool {
+	switch dir {
+	case graph.DirectionOutbound:
+		return hasAdjacentEdge(env, from, to, kinds)
+	case graph.DirectionInbound:
+		return hasAdjacentEdge(env, to, from, kinds)
+	case graph.DirectionBoth:
+		return hasAdjacentEdge(env, from, to, kinds) || hasAdjacentEdge(env, to, from, kinds)
+	default:
+		return false
+	}
+}
+
+// hasKindedNeighbor reports whether src has at least one edge, in dir and of
+// an admissible edge kind, to a node carrying every label in nodeKinds (nil
+// nodeKinds admitting any node). It stops at the first hit, so the common
+// answer on a dense graph costs one edge.
+func hasKindedNeighbor(env *Env, src snapshot.NodeID, dir graph.Direction, nodeKinds, edgeKinds []snapshot.KindID) bool {
+	match := func(n snapshot.NodeID, k snapshot.KindID) bool {
+		return edgeKindOK(edgeKinds, k) && nodeHasAllKinds(env, n, nodeKinds)
+	}
+	found := false
+	visit := func(n snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+		if match(n, k) {
+			found = true
+			return false
+		}
+		return true
+	}
+	if dir == graph.DirectionOutbound || dir == graph.DirectionBoth {
+		env.Snap.OutEdges(src, visit)
+	}
+	if !found && (dir == graph.DirectionInbound || dir == graph.DirectionBoth) {
+		env.Snap.InEdges(src, visit)
+	}
+	return found
+}
+
+// nodeHasAllKinds reports whether n carries every kind in kinds -- Cypher's
+// `(n:A:B)` AND semantics. An empty list admits every node.
+func nodeHasAllKinds(env *Env, n snapshot.NodeID, kinds []snapshot.KindID) bool {
+	if len(kinds) == 0 {
+		return true
+	}
+	have := env.Snap.KindIDsOf(n)
+	for _, want := range kinds {
+		ok := false
+		for _, h := range have {
+			if h == want {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // hasAdjacentEdge reports whether src has at least one outgoing edge to dst
