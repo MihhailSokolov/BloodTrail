@@ -169,7 +169,7 @@ func (v *View) EdgeKindEndpoints(kinds []KindID, outgoing bool) ([]NodeID, bool)
 	if !v.Overlay() {
 		return merged, true
 	}
-	return unionDeltaTouched(merged, v.deltaEdgeEndpoints(kinds, outgoing)), true
+	return unionDeltaTouched(merged, v.deltaEdgeEndpointsFor(kinds, outgoing)), true
 }
 
 // unionFor returns the memoized endpoint union for a kind alternation,
@@ -211,39 +211,76 @@ func (v *View) EdgeKindEndpointCount(kinds []KindID, outgoing bool) (int, bool) 
 	return len(ids), true
 }
 
-// deltaEdgeEndpoints returns the endpoints, on the requested side, of every
-// edge any segment in the stack wrote -- the overlay half of
-// EdgeKindEndpoints' superset contract.
-func (v *View) deltaEdgeEndpoints(kinds []KindID, outgoing bool) []NodeID {
-	v.ensureDelta()
-	if v.merged == nil {
+// deltaEdgeEndpointsFor returns the endpoints, on the requested side, of every
+// delta edge of an admissible kind -- the overlay half of EdgeKindEndpoints'
+// superset contract.
+//
+// Served from a per-View index built once, NOT by walking the merged delta
+// per call. The walk is O(every edge any segment wrote), and this is asked
+// several times per query by the planner and the router; on a live instance
+// carrying a few hundred thousand segment entries that turned a query the
+// base index answers from one seed into tens of milliseconds of set-building.
+// A View is immutable once published, so one pass serves every query against
+// it -- the same bargain ensureEdgeKindIndex makes for the base snapshot.
+func (v *View) deltaEdgeEndpointsFor(kinds []KindID, outgoing bool) []NodeID {
+	idx := v.ensureDeltaEdgeKindIndex()
+	if idx == nil {
 		return nil
 	}
-	admits := func(k KindID) bool {
-		for _, want := range kinds {
-			if want == k {
-				return true
+	side := idx.out
+	if !outgoing {
+		side = idx.in
+	}
+	if len(kinds) == 1 {
+		return side[kinds[0]]
+	}
+	var merged []NodeID
+	seen := make(map[NodeID]struct{})
+	for _, k := range kinds {
+		for _, id := range side[k] {
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				merged = append(merged, id)
 			}
 		}
-		return false
 	}
-	var out []NodeID
-	v.merged.IterEdges(func(_ uint64, st EdgeSegState) bool {
-		if !admits(st.Kind) {
+	return merged
+}
+
+// ensureDeltaEdgeKindIndex builds this View's delta-side edge-kind endpoint
+// index once and memoizes it. nil when there is no delta at all.
+func (v *View) ensureDeltaEdgeKindIndex() *edgeKindIndex {
+	v.deltaEdgeIdxOnce.Do(func() {
+		v.ensureDelta()
+		if v.merged == nil {
+			return
+		}
+		idx := &edgeKindIndex{out: make(map[KindID][]NodeID), in: make(map[KindID][]NodeID)}
+		dense := func(dbID uint64) (NodeID, bool) {
+			if id, ok := v.base.Dense(dbID); ok {
+				return id, true
+			}
+			id, ok := v.pgToVirtual[dbID]
+			return id, ok
+		}
+		v.merged.IterEdges(func(_ uint64, st EdgeSegState) bool {
+			if id, ok := dense(st.StartID); ok {
+				idx.out[st.Kind] = append(idx.out[st.Kind], id)
+			}
+			if id, ok := dense(st.EndID); ok {
+				idx.in[st.Kind] = append(idx.in[st.Kind], id)
+			}
 			return true
+		})
+		for k, ids := range idx.out {
+			sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+			idx.out[k] = dedupeSorted(ids)
 		}
-		dbID := st.StartID
-		if !outgoing {
-			dbID = st.EndID
+		for k, ids := range idx.in {
+			sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+			idx.in[k] = dedupeSorted(ids)
 		}
-		if dense, ok := v.base.Dense(dbID); ok {
-			out = append(out, dense)
-			return true
-		}
-		if virtual, ok := v.pgToVirtual[dbID]; ok {
-			out = append(out, virtual)
-		}
-		return true
+		v.deltaEdgeIdx = idx
 	})
-	return out
+	return v.deltaEdgeIdx
 }

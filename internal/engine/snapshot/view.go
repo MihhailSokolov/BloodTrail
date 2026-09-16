@@ -64,6 +64,11 @@ type View struct {
 	maxKindOnce sync.Once
 	maxKindCeil KindID
 
+	// deltaEdgeIdxOnce guards deltaEdgeIdx, this View's delta-side
+	// edge-kind endpoint index -- see ensureDeltaEdgeKindIndex.
+	deltaEdgeIdxOnce sync.Once
+	deltaEdgeIdx     *edgeKindIndex
+
 	// deltaAdjOnce guards deltaOut/deltaIn, the per-dense-node index of
 	// delta-added/-upserted edges -- see ensureDeltaAdjacency.
 	deltaAdjOnce sync.Once
