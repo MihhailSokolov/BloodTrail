@@ -2,7 +2,12 @@
 
 package snapshot
 
-import "sort"
+import (
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
 
 // edgeKindIndex answers "which nodes have at least one edge of kind k, in
 // this direction" -- the access path PostgreSQL has and this engine did not.
@@ -29,6 +34,35 @@ import "sort"
 type edgeKindIndex struct {
 	out map[KindID][]NodeID
 	in  map[KindID][]NodeID
+
+	// unions memoizes the endpoint set of a kind ALTERNATION, which is what
+	// the corpus actually asks for: `[:MemberOf|AdminTo*1..3]` names two
+	// kinds and the shipped shortest-path prebuilts name upwards of sixty.
+	// Recomputing that union per call meant a map insert and a sort over
+	// every endpoint of every named kind, on a hot path the planner and the
+	// router both hit several times per query -- hundreds of thousands of
+	// nodes' worth of work to answer a question whose answer never changes
+	// for an immutable snapshot.
+	unionMu sync.Mutex
+	unions  map[string][]NodeID
+}
+
+// unionKey identifies one alternation-and-direction for the union memo. Kind
+// ids are sorted so two spellings of the same alternation share an entry.
+func unionKey(kinds []KindID, outgoing bool) string {
+	sorted := append([]KindID(nil), kinds...)
+	sort.Slice(sorted, func(a, b int) bool { return sorted[a] < sorted[b] })
+	var b strings.Builder
+	if outgoing {
+		b.WriteByte('o')
+	} else {
+		b.WriteByte('i')
+	}
+	for _, k := range sorted {
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(int(k)))
+	}
+	return b.String()
 }
 
 // ensureEdgeKindIndex builds the whole index on first use and memoizes it.
@@ -126,27 +160,45 @@ func (v *View) EdgeKindEndpoints(kinds []KindID, outgoing bool) ([]NodeID, bool)
 	}
 
 	var merged []NodeID
-	switch len(kinds) {
-	case 1:
+	if len(kinds) == 1 {
 		merged = side[kinds[0]]
-	default:
-		// A kind alternation is the union of its kinds' endpoint sets.
-		seen := make(map[NodeID]struct{})
-		for _, k := range kinds {
-			for _, id := range side[k] {
-				if _, dup := seen[id]; !dup {
-					seen[id] = struct{}{}
-					merged = append(merged, id)
-				}
-			}
-		}
-		sort.Slice(merged, func(a, b int) bool { return merged[a] < merged[b] })
+	} else {
+		merged = idx.unionFor(side, kinds, outgoing)
 	}
 
 	if !v.Overlay() {
 		return merged, true
 	}
 	return unionDeltaTouched(merged, v.deltaEdgeEndpoints(kinds, outgoing)), true
+}
+
+// unionFor returns the memoized endpoint union for a kind alternation,
+// computing it at most once per alternation per direction.
+func (idx *edgeKindIndex) unionFor(side map[KindID][]NodeID, kinds []KindID, outgoing bool) []NodeID {
+	key := unionKey(kinds, outgoing)
+
+	idx.unionMu.Lock()
+	defer idx.unionMu.Unlock()
+	if idx.unions == nil {
+		idx.unions = make(map[string][]NodeID)
+	}
+	if got, ok := idx.unions[key]; ok {
+		return got
+	}
+
+	seen := make(map[NodeID]struct{})
+	var merged []NodeID
+	for _, k := range kinds {
+		for _, id := range side[k] {
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				merged = append(merged, id)
+			}
+		}
+	}
+	sort.Slice(merged, func(a, b int) bool { return merged[a] < merged[b] })
+	idx.unions[key] = merged
+	return merged
 }
 
 // EdgeKindEndpointCount is EdgeKindEndpoints' size without materializing the

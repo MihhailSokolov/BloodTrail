@@ -1770,6 +1770,9 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 	// form is already covered by whichever side carries the PropertyLookup.
 	name, operand, ok := propOpLiteral(left, right, sym)
 	if !ok {
+		name, operand, ok = coalescePropOpLiteral(left, right, sym, match)
+	}
+	if !ok {
 		if name, operand, ok = propOpLiteral(right, left, sym); !ok {
 			return
 		}
@@ -1935,6 +1938,92 @@ func propOpLiteral(propSide, litSide cypher.Expression, sym string) (name, opera
 		return "", "", false
 	}
 	return pl.Symbol, decoded, true
+}
+
+// coalescePropOpLiteral recognizes `COALESCE(sym.<prop>, <default>) <op>
+// <literal>` as an anchorable property predicate, which is how BloodHound
+// actually writes them: twenty-one of the 185 corpus queries wrap a property
+// in COALESCE, seventeen of those as `COALESCE(x, '') CONTAINS ...`. Without
+// this the wrapper hides the property from the index completely -- the
+// predicate is a function call, not a property lookup -- so the symbol is
+// priced and enumerated as its bare kind bitmap. On the shipped "Nested
+// groups within Tier Zero / High Value" prebuilt that is every Group in the
+// graph standing in for the handful actually tagged.
+//
+// The rewrite is only valid when the DEFAULT cannot satisfy the predicate.
+// COALESCE yields the default exactly when the property is absent, so if
+// `<default> <op> <literal>` is false then no absent-property node can match
+// and the index population (which holds only nodes carrying the property) is
+// a superset of the matches -- which is the contract every candidate source
+// here owes. If the default DID satisfy it, absent nodes would match and the
+// population would be SHORT, which is a wrong answer rather than a slow one.
+func coalescePropOpLiteral(propSide, litSide cypher.Expression, sym string, match snapshot.StringMatch) (name, operand string, ok bool) {
+	fi, isFunc := unwrapParens(propSide).(*cypher.FunctionInvocation)
+	if !isFunc || fi == nil || strings.ToLower(fi.Name) != "coalesce" || len(fi.Arguments) != 2 {
+		return "", "", false
+	}
+	pl, isProp := unwrapParens(fi.Arguments[0]).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", "", false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return "", "", false
+	}
+	defLit, isLit := asLiteral(fi.Arguments[1])
+	if !isLit || defLit == nil {
+		return "", "", false
+	}
+
+	operandLit, isLit := asLiteral(litSide)
+	if !isLit || operandLit == nil || operandLit.Null {
+		return "", "", false
+	}
+	rawOperand, isStr := operandLit.Value.(string)
+	if !isStr {
+		return "", "", false
+	}
+	decoded, err := decodeCypherStringLiteral(rawOperand)
+	if err != nil {
+		return "", "", false
+	}
+	if !coalesceDefaultRejects(defLit, match, decoded) {
+		return "", "", false
+	}
+	return pl.Symbol, decoded, true
+}
+
+// coalesceDefaultRejects reports whether def, the value COALESCE yields for a
+// node that does not carry the property at all, fails the predicate -- the
+// condition that makes the property index a superset of the matches.
+func coalesceDefaultRejects(def *cypher.Literal, match snapshot.StringMatch, operand string) bool {
+	if def.Null {
+		// COALESCE(x, null) is null for an absent property, and null
+		// satisfies no string predicate.
+		return true
+	}
+	raw, isStr := def.Value.(string)
+	if !isStr {
+		// A number or boolean default: pg's jsonb comparison makes a type
+		// mismatch a definite false, so it satisfies no string predicate.
+		return true
+	}
+	s, err := decodeCypherStringLiteral(raw)
+	if err != nil {
+		return false
+	}
+	switch match {
+	case snapshot.StringEquals:
+		return s != operand
+	case snapshot.StringPrefix:
+		return !strings.HasPrefix(s, operand)
+	case snapshot.StringSuffix:
+		return !strings.HasSuffix(s, operand)
+	case snapshot.StringContains:
+		return !strings.Contains(s, operand)
+	default:
+		return false
+	}
 }
 
 // extractKindConjunct folds a WHERE conjunct that is a bare (possibly
