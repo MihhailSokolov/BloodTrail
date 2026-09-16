@@ -395,6 +395,13 @@ type OrderKey struct {
 	Symbol     string
 	Descending bool
 
+	// Expr, when set, is evaluated against each ROW instead of being
+	// resolved to a projected column: `RETURN u ORDER BY u.lastlogontimestamp`
+	// sorts by a property the projection never outputs, which PostgreSQL
+	// allows and an analyst sorting a result table does constantly. Always
+	// accompanied by RuntimeNumeric.
+	Expr cypher.Expression
+
 	// RuntimeNumeric marks a key whose alias is a bare PROPERTY lookup --
 	// a shape no static analysis can prove numeric, because what a property
 	// holds is a per-node fact. sortRows serves it only after checking every
@@ -3454,7 +3461,26 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		})
 	}
 
-	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, projectedProperty, countAliases, proj.Distinct)
+	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, projectedProperty, countAliases, proj.Distinct,
+		func(expr cypher.Expression) bool {
+			// An unprojected ORDER BY key is orderable off the row when the
+			// symbol is a node this Part bound and the property is never
+			// string-valued anywhere in the snapshot (pg's collation).
+			pl, isProp := unwrapParens(expr).(*cypher.PropertyLookup)
+			if !isProp || pl == nil {
+				return false
+			}
+			v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+			if !isVar || v == nil || known[v.Symbol] != symNode {
+				return false
+			}
+			propID, interned := snap.PropIDByName(pl.Symbol)
+			if !interned {
+				return false
+			}
+			hasString, answered := snap.HasStringValue(propID)
+			return answered && !hasString
+		})
 	if !ok {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -3718,7 +3744,7 @@ func orderPropertyName(expr cypher.Expression) (string, bool) {
 // exactly the shape the probe found unsafe. Every other alias shape
 // (property lookups, arbitrary function calls, node/edge/path values)
 // rejects outright, delegating the whole query to PostgreSQL.
-func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric, projectedProperty map[string]bool, countAliases map[string]bool, distinct bool) ([]OrderKey, bool) {
+func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric, projectedProperty map[string]bool, countAliases map[string]bool, distinct bool, orderableRowProperty func(cypher.Expression) bool) ([]OrderKey, bool) {
 	if order == nil {
 		return nil, true
 	}
@@ -3739,7 +3765,23 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 				return nil, false
 			}
 			if _, isProjected := projectedKinds[name]; !isProjected {
-				return nil, false
+				// Not projected. PostgreSQL still sorts by it -- `RETURN u
+				// ORDER BY u.lastlogontimestamp DESC LIMIT 10` is the top-k
+				// shape -- so evaluate the property off each row, under the
+				// same never-string gate the projected case uses. Under
+				// DISTINCT pg rejects an unprojected sort key outright
+				// ("for SELECT DISTINCT, ORDER BY expressions must appear in
+				// select list"), so that combination keeps declining.
+				if distinct || !orderableRowProperty(item.Expression) {
+					return nil, false
+				}
+				keys = append(keys, OrderKey{
+					Symbol:         name,
+					Descending:     !item.Ascending,
+					RuntimeNumeric: true,
+					Expr:           item.Expression,
+				})
+				continue
 			}
 			v = &cypher.Variable{Symbol: name}
 		}

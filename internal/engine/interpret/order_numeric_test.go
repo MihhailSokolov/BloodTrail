@@ -78,3 +78,32 @@ func TestOrderByStringPropertyStaysDelegated(t *testing.T) {
 		t.Fatal("aliasing the string property must not change that")
 	}
 }
+
+// TestOrderByUnprojectedProperty pins the top-k shape an analyst actually
+// writes: the RESULT is the node, the SORT is by one of its properties, and
+// the projection never outputs that property. PostgreSQL sorts by it
+// happily; the key is read off each row instead of resolved to a column.
+func TestOrderByUnprojectedProperty(t *testing.T) {
+	snap := buildOrderFixture(t)
+
+	rs := mustExec(t, snap, `MATCH (n:N) WHERE n.score IS NOT NULL RETURN n ORDER BY n.score DESC LIMIT 1`, generousBudget)
+	if len(rs.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rs.Rows))
+	}
+	if got := snap.GraphID(rs.Rows[0][0].Node); got != 1 {
+		t.Fatalf("top-1 node = %d, want node 1 (score 3)", got)
+	}
+
+	// Same never-string gate as the projected case.
+	if _, ok := planNoFail(t, snap, `MATCH (n:N) RETURN n ORDER BY n.label`); ok {
+		t.Fatal("ORDER BY an unprojected STRING property must stay delegated")
+	}
+
+	// PostgreSQL rejects an unprojected sort key under DISTINCT ("for
+	// SELECT DISTINCT, ORDER BY expressions must appear in select list"),
+	// so that combination must keep declining rather than be served with an
+	// order pg could not produce.
+	if _, ok := planNoFail(t, snap, `MATCH (n:N) RETURN DISTINCT n ORDER BY n.score`); ok {
+		t.Fatal("ORDER BY an unprojected property under DISTINCT must stay delegated")
+	}
+}

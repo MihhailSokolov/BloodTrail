@@ -623,6 +623,21 @@ var randomCypherTemplates = []randomCypherTemplate{
 		dir := []string{"", " DESC"}[rng.Intn(2)]
 		return fmt.Sprintf(`MATCH (n:%s) RETURN n.val AS v ORDER BY v%s LIMIT 5`, randomCypherPickKind(rng), dir)
 	},
+	// The top-k shape: the result is the NODE, the sort key is a property
+	// the projection never outputs.
+	//
+	// Deliberately WITHOUT a LIMIT. `ORDER BY n.val LIMIT 5` over this
+	// fixture is not a differential test at all: many nodes share a val (and
+	// many share "absent"), PostgreSQL guarantees no tie-break, and a LIMIT
+	// then keeps an arbitrary 5 of the tied rows -- so the two engines
+	// legitimately return DIFFERENT rows for the same query. Projecting the
+	// sort key hides that (tied rows project equal values); projecting the
+	// node exposes it. The ordering itself is pinned against PostgreSQL's
+	// measured behavior in interpret's own order tests.
+	func(rng *rand.Rand) string {
+		dir := []string{"", " DESC"}[rng.Intn(2)]
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n ORDER BY n.val%s`, randomCypherPickKind(rng), dir)
+	},
 }
 
 // randomCypherQuery picks a uniformly random template and renders it.

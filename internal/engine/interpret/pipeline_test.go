@@ -179,6 +179,7 @@ func TestPipelineSortRowsStringErrCollation(t *testing.T) {
 	outB := []OutVal{{Kind: OutScalar, Scalar: "Bob"}}
 
 	err := sortRows(
+		nil,
 		[]*Row{rowA, rowB},
 		[][]OutVal{outA, outB},
 		[]OrderKey{{Symbol: "name"}},

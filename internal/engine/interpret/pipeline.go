@@ -285,7 +285,7 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	}
 
 	if len(q.Order) > 0 {
-		if err := sortRows(rows, outRows, q.Order, aliasIndexFor(q.Returning)); err != nil {
+		if err := sortRows(env, rows, outRows, q.Order, aliasIndexFor(q.Returning)); err != nil {
 			return nil, err
 		}
 	}
@@ -1268,6 +1268,14 @@ func compareRuntimeNumericOrder(av any, aAbsent bool, bv any, bAbsent bool) (int
 // return, so the first Compare error encountered is latched via sortErr and
 // checked once the sort call returns.
 //
+// TIES: sort.SliceStable keeps equal-keyed rows in input order, but
+// PostgreSQL guarantees no tie-break of its own, so a query combining
+// ORDER BY with LIMIT over a key with duplicates can legitimately return a
+// DIFFERENT set of rows here than pg returns -- the same latitude
+// `RETURN n LIMIT 5` without any ORDER BY already has, and which this
+// package already serves. What is NOT latitude is the ordering of
+// DISTINCT keys, which compareRuntimeNumericOrder reproduces exactly.
+//
 // DESC is implemented as a plain negation of Compare's numeric result, never
 // as "compare normally, but always keep NULL last regardless of direction".
 // This is deliberate, not an oversight: value.go's Compare already places a
@@ -1280,7 +1288,7 @@ func compareRuntimeNumericOrder(av any, aAbsent bool, bv any, bAbsent bool) (int
 // no matter what". A naive DESC that special-cased null to stay last
 // independent of direction would silently disagree with pg here -- exactly
 // the corner this comparator is written to get right.
-func sortRows(rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[string]int) error {
+func sortRows(env *Env, rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[string]int) error {
 	idx := make([]int, len(rows))
 	for i := range idx {
 		idx[i] = i
@@ -1293,18 +1301,28 @@ func sortRows(rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[
 		}
 		a, b := idx[i], idx[j]
 		for _, ok := range order {
-			av := resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol)
-			bv := resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol)
 			var (
 				c   int
 				err error
 			)
-			if ok.RuntimeNumeric {
+			switch {
+			case ok.Expr != nil:
+				// Sort key the projection never outputs: read it off the row.
+				av, aPresent, aerr := EvalValue(env, rows[a], ok.Expr)
+				bv, bPresent, berr := EvalValue(env, rows[b], ok.Expr)
+				if aerr != nil || berr != nil {
+					sortErr = ErrUnsupported
+					return false
+				}
+				c, err = compareRuntimeNumericOrder(av, !aPresent, bv, !bPresent)
+			case ok.RuntimeNumeric:
 				c, err = compareRuntimeNumericOrder(
-					av, resolveOrderAbsent(aliasIndex, outRows[a], ok.Symbol),
-					bv, resolveOrderAbsent(aliasIndex, outRows[b], ok.Symbol))
-			} else {
-				c, err = Compare(av, bv)
+					resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol), resolveOrderAbsent(aliasIndex, outRows[a], ok.Symbol),
+					resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol), resolveOrderAbsent(aliasIndex, outRows[b], ok.Symbol))
+			default:
+				c, err = Compare(
+					resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol),
+					resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol))
 			}
 			if err != nil {
 				sortErr = err
