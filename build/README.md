@@ -29,9 +29,16 @@ it, so delete that package only once no such install matters anymore.)
 
 Requires Go 1.26+, Docker with Buildx, and network access to GitHub.
 
-Local example on Apple Silicon:
+A local build targets the Docker daemon's own platform unless `--platform` says otherwise,
+so on Apple Silicon it produces a native `linux/arm64` image:
 
-    ./build/build-image.sh v9.6.0 0.1.0-dev --platform linux/arm64
+    ./build/build-image.sh v9.6.0 0.1.0-dev
+
+Do not benchmark an image built for another architecture. Docker runs it under emulation
+without complaint, and the engine is CPU-bound enough that emulation distorts it far more
+than it distorts BloodHound's HTTP layer: an `amd64` image on an M3 measured a full scan at
+775ms against 122ms native. `docker image inspect <image> --format '{{.Architecture}}'`
+says what you actually built. A `--push` without `--platform` still publishes `linux/amd64`.
 
 ## End-to-end test
 

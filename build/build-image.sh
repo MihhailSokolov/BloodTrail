@@ -5,6 +5,9 @@
 #
 #   build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform linux/amd64,linux/arm64]
 #
+# --platform defaults to the Docker daemon's own platform for a local build, and
+# to linux/amd64 for a --push.
+#
 # Steps: shallow-clone upstream at the tag, apply patches/bloodhound-driver.patch,
 # vendor the driver source under packages/go/bloodtrail (the upstream Dockerfile
 # copies packages/go into the builder stage), point go.mod at it with a replace
@@ -23,7 +26,7 @@ if [[ -n "$DRIVER_VERSION" && "$DRIVER_VERSION" != --* ]]; then shift; else DRIV
 # The image tag and the version stamped into the driver are the same string,
 # without the "v" a git tag carries.
 DRIVER_VERSION="${DRIVER_VERSION#v}"
-PUSH=""; PLATFORM="linux/amd64"
+PUSH=""; PLATFORM=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --push) PUSH="--push"; shift ;;
@@ -31,6 +34,26 @@ while [[ $# -gt 0 ]]; do
     *) usage ;;
   esac
 done
+
+# With no --platform, a LOCAL build targets the Docker daemon's own platform.
+# It used to default to linux/amd64 unconditionally, which on an Apple Silicon
+# host produces an image Docker runs under x86 emulation -- quietly, since it
+# still works. The engine is CPU-bound in a way BloodHound's HTTP layer is not,
+# so emulation hit it far harder than the stock image it gets compared with:
+# benchmarked that way, a full scan measured 775ms against 122ms native and
+# shortest-path queries 5x slower, and every BloodTrail number in a whole
+# benchmark report had to be thrown away.
+#
+# A push keeps the old default: what gets published should not depend on
+# which machine happened to run the script. CI passes --platform explicitly.
+if [[ -z "$PLATFORM" ]]; then
+  if [[ -n "$PUSH" ]]; then
+    PLATFORM="linux/amd64"
+  else
+    PLATFORM="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null || echo linux/amd64)"
+  fi
+fi
+echo "==> Target platform $PLATFORM"
 
 WORK="$REPO_ROOT/.build/upstream-$TAG"
 IMAGE_REPO="${IMAGE_REPO:-ghcr.io/mihhailsokolov/bloodtrail}"
