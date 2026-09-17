@@ -555,7 +555,10 @@ The bootstrap script downloads the latest released CLI for your platform, verifi
 checksum (`sha256sum` where available, `shasum -a 256` on stock macOS), and runs it. To
 pin the exact release you audited instead of `latest`, set `BLOODTRAIL_VERSION`:
 
-    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | BLOODTRAIL_VERSION=v0.1.0 sh -s -- install
+    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | BLOODTRAIL_VERSION=v0.1.1 sh -s -- install
+
+Pin v0.1.1 or newer. A v0.1.0 binary resolves its images under the package's original
+name, which is no longer published, so it cannot complete an install.
 
 Building from source (`go build ./cmd/bloodtrail`) also works, with one behavioral
 difference worth knowing: a source-built binary reports version `dev`, so instead of

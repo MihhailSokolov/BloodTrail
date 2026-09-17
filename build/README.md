@@ -23,9 +23,13 @@ upstream release; the installer falls back to it when the tag for its own versio
 not been published. A leading `v` is stripped from the driver version, so the same
 string is stamped into `Version` and used in the image tag.
 
-(Releases up to and including v0.1.0 were built against the package's original name,
-`ghcr.io/mihhailsokolov/bloodhound-bloodtrail`; those CLI binaries keep pulling from
-it, so delete that package only once no such install matters anymore.)
+(Releases up to and including v0.1.0 resolve images under the package's original name,
+`ghcr.io/mihhailsokolov/bloodhound-bloodtrail`, which is no longer anonymously pullable
+-- so a v0.1.0 CLI cannot complete an install and v0.1.1 is the oldest usable release.
+The repo name is compiled into each CLI, so a rename breaks every already-released
+binary while leaving no trace in the source tree: after one, publish a release built
+against the new name and verify an anonymous pull of the exact `<tag>-bt<version>` the
+new CLI will ask for.)
 
 Requires Go 1.26+, Docker with Buildx, and network access to GitHub.
 
