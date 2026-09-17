@@ -141,13 +141,18 @@ func hasReversedPrefix(v, operand string) bool { return strings.HasSuffix(v, ope
 // all (false means the caller must fall back to its ordinary candidate
 // source).
 //
-// The returned set is a SUPERSET of the true matches, never a subset, and
-// callers are expected to re-verify -- which every caller in this repository
-// already does, because a node also has to satisfy its kind labels and the
-// query's remaining predicates. Being a superset is what makes the overlay
-// case cheap: a delta segment can add a node, or change an indexed node's
-// property out from under the base index, so every node any segment touched
-// is added to the candidate set unconditionally rather than reasoned about.
+// BASE-ONLY, and therefore NOT usable on its own against an overlay View: a
+// delta segment can give a node the property, change the value the base index
+// recorded, or add the node outright, and none of that is reflected here.
+// NodesWithStringByName is the entry point that adds the delta's own matches,
+// and it is the only caller for exactly that reason. Calling this directly on
+// an overlay yields a candidate set missing every node the delta introduced,
+// which reaches the user as a served SHORT answer rather than an error -- the
+// same trap PropIDByName's doc records.
+//
+// Within the base the returned set is a SUPERSET of the true matches, never a
+// subset, and callers re-verify anyway because a node also has to satisfy its
+// kind labels and the query's remaining predicates.
 //
 // Ordering of the result is unspecified.
 func (v *View) NodesWithString(prop PropID, match StringMatch, operand string) ([]NodeID, bool) {
@@ -200,10 +205,7 @@ func (v *View) NodesWithString(prop PropID, match StringMatch, operand string) (
 		}
 	}
 
-	if !v.Overlay() {
-		return out, true
-	}
-	return unionDeltaTouched(out, v.deltaTouchedNodes()), true
+	return out, true
 }
 
 // unionDeltaTouched appends the segment-touched nodes to an indexed result
@@ -234,32 +236,6 @@ func unionDeltaTouched(indexed, touched []NodeID) []NodeID {
 	return append(out, touched...)
 }
 
-// deltaTouchedNodes returns every dense node id any segment in the stack
-// wrote a record for -- upsert or tombstone, base-resident or delta-added.
-// NodesWithString appends these to an indexed result wholesale: a segment
-// may have given a node the property, changed its value, or removed it, and
-// the base index cannot know. They are re-verified by the caller like every
-// other candidate, and a segment is one commit's worth of writes, so the
-// unconditional union stays cheap.
-func (v *View) deltaTouchedNodes() []NodeID {
-	v.ensureDelta()
-	if v.merged == nil {
-		return nil
-	}
-	var out []NodeID
-	v.merged.IterNodes(func(id uint64, _ NodeSegState) bool {
-		if dense, ok := v.base.Dense(id); ok {
-			out = append(out, dense)
-			return true
-		}
-		if virtual, ok := v.pgToVirtual[id]; ok {
-			out = append(out, virtual)
-		}
-		return true
-	})
-	return out
-}
-
 // NodesWithStringByName is NodesWithString keyed by the property NAME a
 // query actually writes, and is the entry point every caller holding a name
 // must use.
@@ -281,13 +257,30 @@ func (v *View) deltaTouchedNodes() []NodeID {
 // node to be hiding in, which is the one case where the base's silence
 // really does settle the question.
 func (v *View) NodesWithStringByName(name string, match StringMatch, operand string) ([]NodeID, bool) {
-	if prop, ok := v.PropIDByName(name); ok {
-		return v.NodesWithString(prop, match, operand)
-	}
-	if !v.Overlay() {
+	prop, interned := v.PropIDByName(name)
+	if !interned && !v.Overlay() {
+		// The base never saw the property and there is no delta for a node
+		// to be hiding in, which is the one case where the base's silence
+		// really does settle the question.
 		return nil, true
 	}
-	return v.deltaTouchedNodes(), true
+
+	var base []NodeID
+	if interned {
+		got, ok := v.NodesWithString(prop, match, operand)
+		if !ok {
+			return nil, false
+		}
+		base = got
+	}
+	if !v.Overlay() {
+		return base, true
+	}
+	// The delta contributes the nodes whose written value actually matches,
+	// not every node any segment wrote. Base postings are still returned
+	// whole -- a segment may have changed or removed the value behind one, so
+	// they stay candidates and the caller re-verifies them, exactly as before.
+	return unionDeltaTouched(base, v.deltaPropFor(name).matchingStrings(match, operand)), true
 }
 
 // HasStringValue reports whether prop is string-valued on ANY node in this
@@ -314,12 +307,8 @@ func (v *View) HasStringValue(prop PropID) (bool, bool) {
 		return true, true
 	}
 	if v.Overlay() {
-		for _, id := range v.deltaTouchedNodes() {
-			if val, ok := v.PropValue(id, prop); ok {
-				if _, isString := val.(string); isString {
-					return true, true
-				}
-			}
+		if d := v.deltaPropFor(v.base.Props.Name(prop)); d != nil && len(d.strings) > 0 {
+			return true, true
 		}
 	}
 	return false, true
@@ -335,7 +324,7 @@ func (v *View) PropCount(prop PropID) (int, bool) {
 	}
 	n := len(idx.present)
 	if v.Overlay() {
-		n += len(v.deltaTouchedNodes())
+		n += v.deltaPropFor(v.base.Props.Name(prop)).count()
 	}
 	return n, true
 }

@@ -165,28 +165,29 @@ func (v *View) valuePostings(name string, val any, element bool) ([]NodeID, bool
 	}
 
 	prop, interned := v.PropIDByName(name)
-	if !interned {
-		// The base never saw this property. With no delta there is nothing
-		// carrying it; with one, every delta-touched node is a candidate.
-		if !v.Overlay() {
-			return nil, true
+	var base []NodeID
+	if interned {
+		idx := v.base.valueIndexFor(prop)
+		if idx == nil {
+			return nil, false
 		}
-		return v.deltaTouchedNodes(), true
-	}
-
-	idx := v.base.valueIndexFor(prop)
-	if idx == nil {
-		return nil, false
-	}
-	postings := idx.scalar
-	if element {
-		postings = idx.element
+		postings := idx.scalar
+		if element {
+			postings = idx.element
+		}
+		base = postings[key]
+	} else if !v.Overlay() {
+		// The base never saw this property and there is no delta for a node
+		// to be hiding in.
+		return nil, true
 	}
 
 	if !v.Overlay() {
-		return postings[key], true
+		return base, true
 	}
-	return unionDeltaTouched(postings[key], v.deltaTouchedNodes()), true
+	// Only the delta nodes whose written value IS the one being asked for --
+	// see deltaPropPostings for what unioning every touched node cost.
+	return unionDeltaTouched(base, v.deltaPropFor(name).exact(key, element)), true
 }
 
 // ValuePostingCount is valuePostings' SIZE without materializing it -- what
@@ -203,23 +204,22 @@ func (v *View) ValuePostingCount(name string, val any, element bool) (int, bool)
 		return 0, false
 	}
 	prop, interned := v.PropIDByName(name)
-	if !interned {
-		if !v.Overlay() {
-			return 0, true
+	n := 0
+	if interned {
+		idx := v.base.valueIndexFor(prop)
+		if idx == nil {
+			return 0, false
 		}
-		return len(v.deltaTouchedNodes()), true
+		postings := idx.scalar
+		if element {
+			postings = idx.element
+		}
+		n = len(postings[key])
+	} else if !v.Overlay() {
+		return 0, true
 	}
-	idx := v.base.valueIndexFor(prop)
-	if idx == nil {
-		return 0, false
-	}
-	postings := idx.scalar
-	if element {
-		postings = idx.element
-	}
-	n := len(postings[key])
 	if v.Overlay() {
-		n += len(v.deltaTouchedNodes())
+		n += len(v.deltaPropFor(name).exact(key, element))
 	}
 	return n, true
 }
@@ -244,7 +244,7 @@ func (v *View) ValuePopulation(name string) (int, bool) {
 		total += len(ids)
 	}
 	if v.Overlay() {
-		total += len(v.deltaTouchedNodes())
+		total += v.deltaPropFor(name).count()
 	}
 	return total, true
 }
@@ -384,4 +384,158 @@ func scanFlatArrayKeys(dst []string, raw []byte, interned map[string]string) ([]
 		}
 		return dst, false
 	}
+}
+
+// StringDistinctAtMost reports how many DISTINCT string values property
+// `name` takes, GIVING UP as soon as the answer exceeds cap: exact is false
+// then, and distinct is meaningless.
+//
+// It exists so a caller holding an expensive per-row predicate -- a regex,
+// which neither this engine nor PostgreSQL has an index for -- can find out
+// whether the property is low-cardinality enough to evaluate the predicate
+// once per distinct VALUE instead of once per node. BloodHound's
+// `operatingsystem` takes a few dozen values across hundreds of thousands of
+// computers; its `name` takes one per node and is worth no such treatment.
+//
+// The cap is what makes it safe to ASK. The obvious implementation reads the
+// distinct count off the property's value index -- but building that index
+// over a property with a million distinct values, purely to discover it has a
+// million distinct values and walk away, cost more than the scan the question
+// was meant to avoid: it turned two prebuilt regex queries 2-3x SLOWER at
+// plan time. Counting with an early abort walks `name` only as far as cap+1
+// distinct values and stops.
+//
+// ok is false when the base snapshot never interned the property.
+func (v *View) StringDistinctAtMost(name string, cap int) (distinct int, exact, ok bool) {
+	prop, interned := v.PropIDByName(name)
+	if !interned {
+		return 0, false, false
+	}
+	d, e := v.base.stringDistinctAtMost(prop, cap)
+	return d, e, true
+}
+
+// stringDistinctAtMost counts prop's distinct string values up to cap.
+//
+// BOTH outcomes are memoized, which matters as much as the early abort. An
+// exact count is reusable directly; a giving-up answer is recorded as a LOWER
+// BOUND, so a later question with a cap at or below it is answered from the
+// bound instead of walking the property again. Without that, every regex
+// query against a high-cardinality property re-walked it to re-discover the
+// same refusal -- measured at ~14ms per query on `name` over the benchmark
+// graph's users, which is most of what the abort was introduced to save.
+func (s *Snapshot) stringDistinctAtMost(prop PropID, cap int) (int, bool) {
+	if cap < 0 {
+		return 0, false
+	}
+	s.distinctMu.Lock()
+	if got, ok := s.distinctCount[prop]; ok {
+		s.distinctMu.Unlock()
+		return got, true
+	}
+	if lower, ok := s.distinctAtLeast[prop]; ok && lower > cap {
+		// Already known to hold more distinct values than this cap allows.
+		s.distinctMu.Unlock()
+		return 0, false
+	}
+	s.distinctMu.Unlock()
+
+	idx := s.stringIndexFor(prop)
+	if idx == nil {
+		return 0, false
+	}
+	seen := make(map[string]struct{})
+	for _, id := range idx.present {
+		str, ok := s.Props.stringValue(id, prop)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[str]; dup {
+			continue
+		}
+		seen[str] = struct{}{}
+		if len(seen) > cap {
+			s.distinctMu.Lock()
+			if s.distinctAtLeast == nil {
+				s.distinctAtLeast = make(map[PropID]int)
+			}
+			if len(seen) > s.distinctAtLeast[prop] {
+				s.distinctAtLeast[prop] = len(seen)
+			}
+			s.distinctMu.Unlock()
+			return 0, false
+		}
+	}
+
+	s.distinctMu.Lock()
+	if s.distinctCount == nil {
+		s.distinctCount = make(map[PropID]int)
+	}
+	s.distinctCount[prop] = len(seen)
+	s.distinctMu.Unlock()
+	return len(seen), true
+}
+
+// NodesMatchingString returns every node whose string value for `name`
+// satisfies match, by evaluating match ONCE PER DISTINCT VALUE and unioning
+// the postings of those that pass.
+//
+// This is the index PostgreSQL does not have, applied to the predicate it
+// most needs one for. `MATCH (c:Computer) WHERE c.operatingsystem =~
+// '(?i).*Windows.* (2000|2003|...)'` is a sequential scan for pg over every
+// Computer in the graph, running its regex engine once per row; the same
+// question asked of the distinct values is a few dozen evaluations plus a
+// union of posting lists, whatever the graph's size.
+//
+// The result is a SUPERSET on an overlay and callers re-verify every
+// candidate, exactly as for every other candidate source here: base postings
+// are returned whole because a segment may have changed the value behind one,
+// and the delta's own string entries are evaluated individually and added.
+func (v *View) NodesMatchingString(name string, match func(string) bool) ([]NodeID, bool) {
+	prop, interned := v.PropIDByName(name)
+	var out []NodeID
+	if interned {
+		idx := v.base.valueIndexFor(prop)
+		if idx == nil {
+			return nil, false
+		}
+		for key, ids := range idx.scalar {
+			if len(key) == 0 || key[0] != 's' {
+				// A non-string value for this property. `match` decides a
+				// STRING, and interpret's own evaluation of a string
+				// predicate against a non-string is a runtime cast error
+				// that declines the whole query to PostgreSQL. Serving from
+				// an index that quietly skipped these nodes would replace
+				// that decline with an answer that may be SHORT, so the
+				// question is refused entirely and the caller scans.
+				return nil, false
+			}
+			if match(key[1:]) {
+				out = append(out, ids...)
+			}
+		}
+		sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+		out = dedupeSorted(out)
+	} else if !v.Overlay() {
+		return nil, true
+	}
+	if !v.Overlay() {
+		return out, true
+	}
+
+	d := v.deltaPropFor(name)
+	var delta []NodeID
+	if d != nil {
+		if d.hasNonString() {
+			// Same refusal as the base side above: a delta-written non-string
+			// value must reach the per-row evaluation that rejects it.
+			return nil, false
+		}
+		for _, e := range d.strings {
+			if match(e.s) {
+				delta = append(delta, e.id)
+			}
+		}
+	}
+	return unionDeltaTouched(out, delta), true
 }

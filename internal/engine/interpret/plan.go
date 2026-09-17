@@ -1720,7 +1720,110 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 	pb.extractKindConjunct(sym, conjunct)
 	pb.extractStringAnchor(sym, conjunct)
 	pb.extractValueAnchor(sym, conjunct)
+	pb.extractRegexAnchor(sym, conjunct)
 	return true
+}
+
+// regexAnchorMargin is how many times smaller a property's DISTINCT-value
+// count must be than the candidate source it would replace before the regex
+// is evaluated per value instead of per node.
+//
+// The two routes do the same number of regex evaluations when the property
+// takes one value per node, and the per-value route additionally has to
+// union posting lists -- so at parity it is a small loss, not a wash. A
+// factor keeps it to the cases where it is decisively right: BloodHound's
+// `operatingsystem` takes a few dozen values across hundreds of thousands of
+// computers, while its `name` takes one per node and must stay on the scan.
+const regexAnchorMargin = 8
+
+// extractRegexAnchor recognizes `sym.prop =~ '<literal pattern>'` and, when
+// the property is low-cardinality, resolves it at plan time by evaluating the
+// pattern ONCE PER DISTINCT VALUE rather than once per candidate node.
+//
+// This is the one predicate shape where neither engine has an index --
+// BloodHound's schema carries none on `properties` -- so both sides scan and
+// the query reduces to raw per-row matching speed, which is a contest Go's
+// regexp engine loses to PostgreSQL's C one. The way out is not to match
+// faster but to match FEWER times: the shipped "Computers with unsupported
+// operating systems" prebuilt runs its pattern against every Computer in the
+// graph, and there are only a few dozen distinct operating-system strings
+// among them.
+//
+// The predicate itself stays in Predicates, as every extracted anchor's does,
+// so each candidate is re-verified and the resolution can only ever narrow
+// what is enumerated.
+func (pb *partBuilder) extractRegexAnchor(sym string, conjunct cypher.Expression) {
+	nc := pb.nodeConstraint(sym)
+	if nc.PropIndexed {
+		return
+	}
+	op, left, right, ok := asSingleComparison(conjunct)
+	if !ok || op != cypher.OperatorRegexMatch {
+		return
+	}
+	name, pattern, ok := propOpLiteral(left, right, sym)
+	coalesced := false
+	if !ok {
+		// BloodHound writes a good many predicates through COALESCE; the
+		// string anchor already understands that spelling, so this one does
+		// too rather than silently missing the same queries.
+		//
+		// StringEquals is passed only to satisfy the shared helper's
+		// signature; its default-value test is written for the string
+		// operators and cannot decide a regex. The real check is below, once
+		// the pattern is compiled, and `coalesced` is what forces it.
+		name, pattern, ok = coalescePropOpLiteral(left, right, sym, snapshot.StringEquals)
+		coalesced = ok
+	}
+	if !ok {
+		return
+	}
+
+	// The alternative is enumerating the symbol's smallest kind bitmap, or
+	// every node when it carries no label at all. Asking the cardinality
+	// question with that as a CAP is what keeps this affordable: a property
+	// with a million distinct values is abandoned after a few thousand,
+	// rather than indexed in full only to be rejected.
+	alt, ok := pb.smallestKindCount(sym)
+	if !ok {
+		alt = pb.snap.NodeCount()
+	}
+	cap := alt / regexAnchorMargin
+	if cap < 1 {
+		return
+	}
+	distinct, exact, ok := pb.snap.StringDistinctAtMost(name, cap)
+	if !ok || !exact || distinct == 0 {
+		return
+	}
+
+	// Compiled through the same matcher eval.go uses, so the substring
+	// rewrite applies here too and the per-value test is the identical
+	// question the per-row test would have asked.
+	m, err := NewRegexMatcher(pattern)
+	if err != nil {
+		return
+	}
+	// Under COALESCE, a node that does not carry the property is tested
+	// against the DEFAULT, not skipped. The candidate set here holds only
+	// nodes that do carry it, so it is a superset of the matches just in
+	// case the pattern rejects that default -- and a pattern like `.*` or
+	// `^$` accepts it, making every node without the property a match the
+	// anchor would hide. Ask the compiled pattern directly; the string
+	// operators' own default test cannot answer for a regex.
+	if coalesced && m.MatchString(coalesceDefaultOf(left, right, sym)) {
+		return
+	}
+	ids, ok := pb.snap.NodesMatchingString(name, m.MatchString)
+	if !ok {
+		return
+	}
+	// A pattern that matches nearly every value resolves to nearly the whole
+	// population, which is not an anchor worth having over the kind bitmap.
+	if len(ids) >= alt {
+		return
+	}
+	nc.PropCandidates, nc.PropIndexed = ids, true
 }
 
 // extractStringAnchor recognizes a pushed conjunct of the form
@@ -2254,31 +2357,33 @@ func coalesceDefaultRejects(def *cypher.Literal, match snapshot.StringMatch, ope
 // on the 500k benchmark graph, that class sat at 250-2600ms against
 // PostgreSQL's ~20ms index probe.
 //
-// Two deliberate refusals:
+// One deliberate refusal: only an EXCLUSIVE matcher qualifies (`n:A:B` = has
+// ALL, the shape the frontend always builds for source-level matchers), since
+// Kinds is an AND list and a non-exclusive (ANY) matcher cannot be folded into
+// it. A disjunction of matchers (`n:A OR n:B`) arrives as a Disjunction, not a
+// KindMatcher, and is likewise left alone.
 //
-//   - Only an EXCLUSIVE matcher qualifies (`n:A:B` = has ALL, the shape the
-//     frontend always builds for source-level matchers): Kinds is an AND
-//     list, so a non-exclusive (ANY) matcher cannot be folded into it. A
-//     disjunction of matchers (`n:A OR n:B`) arrives as a Disjunction, not a
-//     KindMatcher, and is likewise left alone.
-//   - A symbol that is an endpoint of a variable-length or shortestPath
-//     step keeps its NodeConstraint.Kinds as WRITTEN in the pattern. Those
-//     routes choose their seeding side by comparing the two endpoints'
-//     candidate-source ranks (varLengthReverseEligible), and that contract
-//     was calibrated -- twice, measurably -- around kind tests written in
-//     WHERE not counting as anchors (see endpointNarrows/kindOnlyPredicate
-//     and scanEquivalentNearSide). Folding a WHERE kind into such a
-//     symbol's Kinds would silently re-route those queries; the anchor win
-//     this extraction exists for is the pure node-scan shape, which has no
-//     such step.
+// Endpoints of a variable-length step used to be refused as well, and that
+// refusal is gone. It existed because the reverse-routing decision was once a
+// pair of structural preconditions ("the near side narrows nothing and is
+// scan-equivalent") rather than a cost comparison, so any change to a
+// traversal endpoint's Kinds re-routed queries unpredictably and the safe
+// move was to keep WHERE kinds invisible there. varLengthReverseEligible now
+// prices both endpoints on the same basis and reverses only on a wide margin,
+// which means the opposite is true: hiding a kind from it makes it decide on
+// WRONG numbers. `MATCH p=(t:Group)<-[:MemberOf*..]-(s:Group) WHERE
+// (t:Tag_Tier_Zero)` is the case that proves it -- with the tag hidden both
+// ends price as "every Group", the route cannot tell them apart, and the walk
+// seeds from every group in the graph to find the handful that are tagged.
+//
+// The fold is a pure narrowing either way: an exclusive matcher means "has
+// all of these kinds", which is exactly what an added entry in the AND list
+// asks, so no row can be admitted that the predicate would have rejected.
 //
 // checkExpr ran before pushdown, so every kind name here already resolved
 // against the snapshot (checkKindMatcher rejects unknowns); the second
 // lookup is belt-and-braces, never a behavior change.
 func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expression) {
-	if pb.symbolInTraversalStep(sym) {
-		return
-	}
 	km, ok := unwrapParens(conjunct).(*cypher.KindMatcher)
 	if !ok || km == nil || !km.IsExclusive {
 		return
@@ -2293,24 +2398,6 @@ func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expressio
 			nc.Kinds = append(nc.Kinds, id)
 		}
 	}
-}
-
-// symbolInTraversalStep reports whether sym is an endpoint of any
-// variable-length or shortestPath step -- the steps whose seeding-side
-// choice reads endpoint ranks, and which extractKindConjunct therefore
-// leaves untouched. Chains are complete before the WHERE loop runs
-// (planPart processes every pattern first), so this sees every step.
-func (pb *partBuilder) symbolInTraversalStep(sym string) bool {
-	for i := range pb.chains {
-		step := &pb.chains[i]
-		if step.Range == nil && step.Shortest == ShortestNone {
-			continue
-		}
-		if step.FromSym == sym || step.ToSym == sym {
-			return true
-		}
-	}
-	return false
 }
 
 // extractIDAnchor recognizes `id(sym) = <literal>` (either operand order)
@@ -4463,4 +4550,39 @@ func isStaticallyNumericScalar(expr cypher.Expression, numericScalars map[string
 	default:
 		return false
 	}
+}
+
+// coalesceDefaultOf returns the string COALESCE(sym.prop, <default>) yields
+// for a node that does not carry the property, for the operand shape
+// coalescePropOpLiteral has already accepted. "" for a default that is not a
+// string literal -- a number or boolean default satisfies no string
+// predicate, and the empty string is the most permissive stand-in, so
+// treating it as the default can only make a caller MORE cautious.
+func coalesceDefaultOf(left, right cypher.Expression, sym string) string {
+	for _, side := range []cypher.Expression{left, right} {
+		fi, isFunc := unwrapParens(side).(*cypher.FunctionInvocation)
+		if !isFunc || fi == nil || strings.ToLower(fi.Name) != "coalesce" || len(fi.Arguments) != 2 {
+			continue
+		}
+		pl, isProp := unwrapParens(fi.Arguments[0]).(*cypher.PropertyLookup)
+		if !isProp || pl == nil {
+			continue
+		}
+		v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+		if !isVar || v == nil || v.Symbol != sym {
+			continue
+		}
+		defLit, isLit := asLiteral(fi.Arguments[1])
+		if !isLit || defLit == nil || defLit.Null {
+			continue
+		}
+		raw, isStr := defLit.Value.(string)
+		if !isStr {
+			continue
+		}
+		if decoded, err := decodeCypherStringLiteral(raw); err == nil {
+			return decoded
+		}
+	}
+	return ""
 }

@@ -826,8 +826,14 @@ func TestLimitWithDistinctTakesFullPath(t *testing.T) {
 	if len(rs.Rows) != 1 {
 		t.Fatalf("got %d rows, want 1 (RETURN DISTINCT ... LIMIT 1 over 3 rows all sharing one group)", len(rs.Rows))
 	}
-	if limited.work != baseline.work {
-		t.Fatalf("meter.work = %d, want %d (RETURN DISTINCT must take the unlimited path unchanged)", limited.work, baseline.work)
+	// DISTINCT now streams: it projects and deduplicates as rows arrive, so
+	// it can stop as soon as SKIP+LIMIT distinct tuples exist. Once one
+	// distinct group is in hand under LIMIT 1, no later row can change the
+	// answer -- so spending LESS than the unlimited path is the point, not a
+	// regression. What must not change is which rows come out.
+	if limited.work > baseline.work {
+		t.Fatalf("meter.work = %d, want no more than the unlimited path's %d",
+			limited.work, baseline.work)
 	}
 }
 
@@ -1249,31 +1255,54 @@ func TestDeclinesOnRowBudgetBeforeScanning(t *testing.T) {
 	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
 
 	for _, tc := range []struct {
-		name    string
-		query   string
-		maxRows int
-		decline bool
+		name     string
+		query    string
+		maxRows  int
+		decline  bool
+		wantRows int
 	}{
-		{"DISTINCT over more nodes than the budget", `MATCH (u:User) RETURN DISTINCT u.enabled`, 50, true},
-		{"ORDER BY over more nodes than the budget", `MATCH (u:User) RETURN u.enabled ORDER BY u.enabled`, 50, true},
-		{"the same query within budget still runs", `MATCH (u:User) RETURN DISTINCT u.enabled`, 1000, false},
-		{"no DISTINCT or ORDER BY: the row cap decides as before", `MATCH (u:User) RETURN u`, 50, true},
 		{
-			// A predicate could reduce the row count below the budget, so the
-			// candidate count proves nothing and the query must actually run.
-			name: "a predicate blocks the early decline", maxRows: 50, decline: true,
-			query: `MATCH (u:User) WHERE u.enabled = true RETURN DISTINCT u.enabled`,
+			// DISTINCT is STREAMED, not declined: the row budget bounds the
+			// answer, and two hundred users take two distinct values between
+			// them. See runDistinctStreaming.
+			name:  "DISTINCT over more nodes than the budget is streamed",
+			query: `MATCH (u:User) RETURN DISTINCT u.enabled`, maxRows: 50, wantRows: 2,
+		},
+		{
+			// ORDER BY still declines: sorting decides which rows a LIMIT
+			// keeps, so the rows have to exist before the answer does.
+			name: "ORDER BY over more nodes than the budget", decline: true,
+			query: `MATCH (u:User) RETURN u.enabled ORDER BY u.enabled`, maxRows: 50,
+		},
+		{
+			name:  "the same query within budget still runs",
+			query: `MATCH (u:User) RETURN DISTINCT u.enabled`, maxRows: 1000, wantRows: 2,
+		},
+		{
+			name: "no DISTINCT or ORDER BY: the row cap decides as before", decline: true,
+			query: `MATCH (u:User) RETURN u`, maxRows: 50,
+		},
+		{
+			name:    "a predicate narrows it to a single distinct value",
+			query:   `MATCH (u:User) WHERE u.enabled = true RETURN DISTINCT u.enabled`,
+			maxRows: 50, wantRows: 1,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := planQuery(t, snap, tc.query)
 			meter := &workMeter{budget: Budgets{MaxRows: tc.maxRows, MaxWork: 1_000_000, MaxLiveRows: 1_000_000}}
-			_, err := runQuery(&Env{Snap: snap}, q, meter)
-			if tc.decline && err == nil {
-				t.Fatal("want a decline")
+			rs, err := runQuery(&Env{Snap: snap}, q, meter)
+			if tc.decline {
+				if err == nil {
+					t.Fatal("want a decline")
+				}
+				return
 			}
-			if !tc.decline && err != nil {
+			if err != nil {
 				t.Fatalf("want success, got %v", err)
+			}
+			if len(rs.Rows) != tc.wantRows {
+				t.Fatalf("got %d rows, want %d", len(rs.Rows), tc.wantRows)
 			}
 		})
 	}
@@ -1290,7 +1319,10 @@ func TestEarlyDeclineSpendsNothing(t *testing.T) {
 	}
 	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
 
-	q := planQuery(t, snap, `MATCH (u:User) RETURN DISTINCT u.enabled`)
+	// ORDER BY, not DISTINCT: DISTINCT is streamed now (runDistinctStreaming),
+	// so the shape that still cannot finish within the row budget -- and must
+	// therefore say so before spending anything -- is the sorted one.
+	q := planQuery(t, snap, `MATCH (u:User) RETURN u.enabled ORDER BY u.enabled`)
 	meter := &workMeter{budget: Budgets{MaxRows: 10, MaxWork: 1_000_000, MaxLiveRows: 1_000_000}}
 	if _, err := runQuery(&Env{Snap: snap}, q, meter); err == nil {
 		t.Fatal("want a decline")

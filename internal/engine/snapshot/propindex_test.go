@@ -157,44 +157,70 @@ func TestNodesWithStringAbsentProperty(t *testing.T) {
 	}
 }
 
-// TestNodesWithStringOverlaySuperset pins the delta contract: a segment can
-// give a node the property, change its value, or remove it, and the base
-// index cannot know -- so every segment-touched node joins the candidate
-// set unconditionally. The result must remain a SUPERSET, which is what
-// lets callers re-verify instead of the index having to be exact.
-func TestNodesWithStringOverlaySuperset(t *testing.T) {
+// TestNodesWithStringOverlayCandidates pins the delta contract, which is a
+// SUPERSET one -- never short, allowed to be loose -- and pins where the
+// looseness is allowed to be.
+//
+// The delta half used to be "every node any segment wrote a record for",
+// whatever it wrote. That is a superset, but a needlessly enormous one: a
+// view carrying 260,000 written nodes made 260,000 candidates out of a
+// question whose answer is one row, and the caller verified every one. The
+// delta now contributes only nodes whose WRITTEN value actually matches.
+//
+// Base postings are still returned whole, and that is the remaining
+// looseness: a segment may have moved a node's value out of the match, and
+// the base index cannot know, so it stays a candidate and is re-verified.
+func TestNodesWithStringOverlayCandidates(t *testing.T) {
 	base := buildPropIndexFixture(t, 10)
 	v := NewView(base)
-	name := mustProp(t, v, "name")
 
-	// Node 5 is renamed by a segment to something the base index would
-	// never return for this prefix, and a brand-new node 99 is added.
+	// Database ids are i+1, so graph id 4 is the node named USER0003.
 	sb := &SegmentBuilder{}
-	if err := sb.AddNodeState(5, []KindID{1}, []byte(`{"name":"RENAMED@CORP.LOCAL"}`)); err != nil {
-		t.Fatalf("AddNodeState(5): %v", err)
-	}
-	if err := sb.AddNodeState(99, []KindID{1}, []byte(`{"name":"USER0003@CORP.LOCAL"}`)); err != nil {
-		t.Fatalf("AddNodeState(99): %v", err)
+	for _, n := range []struct {
+		id    uint64
+		name  string
+		props string
+	}{
+		{4, "leaves the prefix", `{"name":"RENAMED@CORP.LOCAL"}`},
+		{6, "enters the prefix", `{"name":"USER0003-COPY@CORP.LOCAL"}`},
+		{8, "touched, matches neither", `{"name":"UNRELATED@CORP.LOCAL"}`},
+		{99, "delta-added, matches", `{"name":"USER0003@CORP.LOCAL"}`},
+	} {
+		if err := sb.AddNodeState(n.id, []KindID{1}, []byte(n.props)); err != nil {
+			t.Fatalf("AddNodeState(%d, %s): %v", n.id, n.name, err)
+		}
 	}
 	ov := v.WithSegment(sb.Build())
 
-	ids, ok := ov.NodesWithString(name, StringPrefix, "USER0003")
+	ids, ok := ov.NodesWithStringByName("name", StringPrefix, "USER0003")
 	if !ok {
 		t.Fatal("index unavailable on the overlay view")
 	}
 	got := map[uint64]bool{}
 	for _, id := range ids {
+		if got[ov.GraphID(id)] {
+			t.Fatalf("node %d yielded twice; a candidate source must be a set", ov.GraphID(id))
+		}
 		got[ov.GraphID(id)] = true
 	}
-	// The delta-added node carrying the matching name must be a candidate.
+
+	// Never short: both real matches must be here.
 	if !got[99] {
-		t.Fatalf("delta-added node 99 missing from candidates %v", got)
+		t.Fatalf("delta-ADDED node matching the prefix missing from %v", got)
 	}
-	// The renamed node must also be a candidate even though its NEW value
-	// does not match this prefix -- the superset contract is what keeps the
-	// opposite case (a rename INTO the prefix) correct too.
-	if !got[5] {
-		t.Fatalf("segment-touched node 5 missing from candidates %v", got)
+	if !got[6] {
+		t.Fatalf("node the delta renamed INTO the prefix missing from %v", got)
+	}
+	// Allowed looseness: renamed out, but the base index said it matched.
+	if !got[4] {
+		t.Fatalf("node the delta renamed OUT of the prefix missing from %v -- base"+
+			" postings must still be offered for re-verification", got)
+	}
+	// The tightening: a node the delta touched whose value matches neither
+	// the base nor the delta side is not a candidate at all.
+	if got[8] {
+		t.Fatalf("node %d was written by a segment but matches nothing; it must not"+
+			" be a candidate just for having been touched (%v)", 8, got)
 	}
 }
 

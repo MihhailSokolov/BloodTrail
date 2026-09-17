@@ -230,6 +230,10 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 
 	newView := current.WithSegment(seg)
 
+	// The overlay's derived projections are built HERE rather than by
+	// whichever query arrives first after this commit -- see View.Warm.
+	newView.Warm()
+
 	// Guarded on the limit being configured at all, deliberately: ApproxBytes
 	// is not free on an overlay View (it force-computes the memoized overlay
 	// projections so the estimate does not depend on which accessors happen

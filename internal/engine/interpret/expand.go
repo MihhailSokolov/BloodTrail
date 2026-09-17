@@ -304,10 +304,19 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 	}
 
 	toNC := part.Nodes[step.ToSym]
+	if len(anchorRows) == 0 {
+		return nil, nil
+	}
+	// The forward walk follows edges outward, so a node extends the trail
+	// when it has an admissible OUTGOING edge.
+	contIDs, err := varLengthWalkSetup(env, step, true)
+	if err != nil {
+		return nil, err
+	}
 
 	var out []*Row
 	for _, seed := range anchorRows {
-		rows, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, seed, step.PathSym)
+		rows, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, seed, step.PathSym, contIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -340,20 +349,9 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // chain is named) belongs to the WHOLE chain, not just this one step's
 // segment -- see assembleChainPathVal's doc. "" skips binding entirely,
 // matching a caller with no path to assemble.
-func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
-	// The forward walk follows edges outward, so a node extends the trail
-	// when it has an admissible OUTGOING edge.
-	contIDs := trailContinuationSet(env, step, true)
-
-	// A self-loop of an admitted kind anywhere in the view makes pg's
-	// seed-side is_cycle guard placement observable, and that placement
-	// depends on dawgs heuristics this engine deliberately does not mirror
-	// -- decline and delegate. See the package doc's SELF-LOOPS bullet and
-	// View.SelfLoopHazard.
-	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
-		return nil, errUnsupportedStep
-	}
-
+// contIDs is the step's continuation set, resolved ONCE by the caller via
+// varLengthWalkSetup rather than here -- see that function for why.
+func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string, contIDs []snapshot.NodeID) ([]*Row, error) {
 	root, _ := seed.Node(step.FromSym)
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
@@ -583,13 +581,25 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 	}
 	fromNC, toNC := part.Nodes[step.FromSym], part.Nodes[step.ToSym]
 
-	// The far side has to be materializable into a concrete seed set --
-	// resolveEndpointSet is what this route seeds from, and a side that
-	// narrows nothing would make that a full scan. The near side must NOT
-	// narrow: a pushed predicate there makes it the already-cheap side, and
-	// rankOf cannot see how much it narrows by, so reversing away from it
-	// would be a guess.
-	if !endpointNarrows(toNC) || endpointNarrows(fromNC) {
+	// The near side must NOT narrow: a pushed predicate there makes it the
+	// already-cheap side, and rankOf cannot see how much it narrows by, so
+	// the near estimate would be an OVER-estimate and reversing away from it
+	// would be a guess in the unsafe direction.
+	//
+	// There is deliberately no matching precondition on the far side. One
+	// used to be here -- the far side had to narrow, on the reasoning that
+	// seeding from a side that narrows nothing is a full scan -- and it was
+	// both redundant and harmful. Redundant because the margin below already
+	// refuses that case arithmetically: a far side that narrows nothing has
+	// farN = |V|, and nearN can never exceed |V|, so the ratio cannot reach
+	// reverseSeedMargin. Harmful because endpointNarrows deliberately
+	// discounts kind tests, so a far side that is narrow purely BY KIND --
+	// `WHERE (t:Tag_Tier_Zero)`, a handful of nodes out of a million -- read
+	// as "narrows nothing" and had the route refused, which is the exact
+	// shape this rule exists to catch. An over-estimated far side (one whose
+	// pushed predicate cuts further than rankOf can see) only shrinks the
+	// ratio, so it errs toward the forward walk, which is the safe direction.
+	if endpointNarrows(fromNC) {
 		return false
 	}
 
@@ -857,6 +867,32 @@ func trailCanContinue(ids []snapshot.NodeID, n snapshot.NodeID) bool {
 	}
 	i := sort.Search(len(ids), func(i int) bool { return ids[i] >= n })
 	return i < len(ids) && ids[i] == n
+}
+
+// varLengthWalkSetup resolves everything a trail walk needs that depends on
+// the STEP rather than on the seed: whether the step is servable at all, and
+// the endpoint set its walk can continue from.
+//
+// Both used to be resolved inside expandVarLengthTrailsForSeed, which the
+// callers invoke once per seed row. On an overlay the continuation set is a
+// merge of the base and delta endpoint sets, so a walk seeded from n nodes
+// rebuilt the same set n times -- tens of thousands of times for one query on
+// the benchmark graph, to compute the same answer. The reverse walker already
+// hoisted it; this is the forward walker catching up.
+//
+// The callers invoke this only when they have at least one seed, so a step
+// that would decline but never runs still does not decline -- exactly the
+// behaviour of the per-seed check it replaces.
+func varLengthWalkSetup(env *Env, step *Step, outgoing bool) ([]snapshot.NodeID, error) {
+	// A self-loop of an admitted kind anywhere in the view makes pg's
+	// seed-side is_cycle guard placement observable, and that placement
+	// depends on dawgs heuristics this engine deliberately does not mirror
+	// -- decline and delegate. See the package doc's SELF-LOOPS bullet and
+	// View.SelfLoopHazard.
+	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
+		return nil, errUnsupportedStep
+	}
+	return trailContinuationSet(env, step, outgoing), nil
 }
 
 // trailContinuationSet resolves the endpoint set a trail walk can continue

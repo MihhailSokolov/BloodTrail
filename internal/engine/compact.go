@@ -427,8 +427,11 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 		newView = newView.WithSegment(snapshot.MergeSegments(tail))
 	}
 	// A fold produces a NEW base snapshot, so its indexes are built here
-	// rather than by the next query -- see Snapshot.Warm.
+	// rather than by the next query -- see Snapshot.Warm. When a tail was
+	// appended during the fold the published View is an overlay again, and
+	// its own projections are built here for the same reason (View.Warm).
 	newView.Base().Warm()
+	newView.Warm()
 	e.snap.Store(newView)
 	e.compactionCount.Add(1)
 	return true

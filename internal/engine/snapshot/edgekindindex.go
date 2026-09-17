@@ -135,9 +135,21 @@ func dedupeSorted(ids []NodeID) []NodeID {
 // edge whose kind is among kinds, in the direction outgoing selects, and
 // whether the question could be answered at all.
 //
-// The returned slice is READ-ONLY: for a single kind it aliases the memoized
-// index rather than copying it, because every caller is a candidate source
-// that only iterates.
+// The returned slice is READ-ONLY and ASCENDING, and the ordering is part of
+// the contract, not a coincidence of how it is built: interpret's
+// trailCanContinue decides whether a walk may extend past a node by binary
+// searching this slice, so an unsorted one does not merely read oddly, it
+// answers "absent" for ids that are present.
+//
+// That is exactly what a plain concatenation did. The overlay result used to
+// be "the base's ids minus the delta's, followed by the delta's" -- each half
+// ascending, the join not -- and sort.Search over [5 6 7 2] looking for 2
+// lands on index 0 and reports it missing. A node whose only admissible edge
+// arrived in a delta segment, with a dense id below the base's endpoints, was
+// then judged unable to continue; if it also could not be the pattern's own
+// endpoint it was dropped outright, and every path through it disappeared
+// from a SERVED answer. Live ingest produces precisely that shape, since it
+// keeps adding edges to nodes the base snapshot already holds.
 //
 // ok is false for an EMPTY kinds list -- the "any relationship type" pattern,
 // which every node with any edge satisfies and which therefore narrows
@@ -149,6 +161,11 @@ func dedupeSorted(ids []NodeID) []NodeID {
 // had it. A tombstoned edge is deliberately NOT removed -- a candidate source
 // is allowed to be loose and is never allowed to be short, and the caller
 // re-verifies every candidate anyway.
+//
+// The merged result is memoized per View. A variable-length walk asks for it
+// once per SEED, and on a graph with an overlay that meant rebuilding a map
+// of the delta and a fresh slice of the whole base set tens of thousands of
+// times for one query.
 func (v *View) EdgeKindEndpoints(kinds []KindID, outgoing bool) ([]NodeID, bool) {
 	if len(kinds) == 0 {
 		return nil, false
@@ -169,7 +186,50 @@ func (v *View) EdgeKindEndpoints(kinds []KindID, outgoing bool) ([]NodeID, bool)
 	if !v.Overlay() {
 		return merged, true
 	}
-	return unionDeltaTouched(merged, v.deltaEdgeEndpointsFor(kinds, outgoing)), true
+
+	key := unionKey(kinds, outgoing)
+	v.edgeEndpointMu.Lock()
+	defer v.edgeEndpointMu.Unlock()
+	if got, ok := v.edgeEndpoints[key]; ok {
+		return got, true
+	}
+	out := mergeSortedIDs(merged, v.deltaEdgeEndpointsFor(kinds, outgoing))
+	if v.edgeEndpoints == nil {
+		v.edgeEndpoints = make(map[string][]NodeID)
+	}
+	v.edgeEndpoints[key] = out
+	return out, true
+}
+
+// mergeSortedIDs unions two ASCENDING id slices into one, dropping
+// duplicates. Both inputs come from index structures that sort and dedupe
+// their own postings, so the union is a linear merge rather than a
+// concatenate-and-sort.
+func mergeSortedIDs(a, b []NodeID) []NodeID {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return b
+	}
+	out := make([]NodeID, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] < b[j]:
+			out = append(out, a[i])
+			i++
+		case b[j] < a[i]:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	return append(out, b[j:]...)
 }
 
 // unionFor returns the memoized endpoint union for a kind alternation,
@@ -234,15 +294,11 @@ func (v *View) deltaEdgeEndpointsFor(kinds []KindID, outgoing bool) []NodeID {
 	if len(kinds) == 1 {
 		return side[kinds[0]]
 	}
+	// Ascending, like the single-kind case: EdgeKindEndpoints merges this
+	// against the base set linearly, and its callers binary-search the result.
 	var merged []NodeID
-	seen := make(map[NodeID]struct{})
 	for _, k := range kinds {
-		for _, id := range side[k] {
-			if _, dup := seen[id]; !dup {
-				seen[id] = struct{}{}
-				merged = append(merged, id)
-			}
-		}
+		merged = mergeSortedIDs(merged, side[k])
 	}
 	return merged
 }

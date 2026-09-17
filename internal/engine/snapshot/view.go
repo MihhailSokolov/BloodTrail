@@ -53,11 +53,21 @@ type View struct {
 	kindsOnce sync.Once
 	kindTable *KindTable
 
-	// edgeTombOnce guards edgeTomb, the set of edge ids the merged delta
-	// carries a record for at all (tombstoned or upserted) -- see
+	// edgeTombOnce guards edgeTombSlots and edgeTombCount -- see
 	// ensureEdgeTomb.
 	edgeTombOnce sync.Once
-	edgeTomb     map[uint64]struct{}
+
+	// edgeTombSlots marks the BASE forward-CSR slots the merged delta carries
+	// a record for, tombstone or upsert. OutEdges/InEdges consult it once per
+	// edge they walk past, so it is a bitset rather than the set of edge IDS
+	// it was built from: that set answered the same question with a hash
+	// probe per edge, and once the bitset existed nothing probed it again.
+	// nil when the delta touches no base-resident edge at all.
+	edgeTombSlots *Bitset
+
+	// edgeTombCount is how many edge records the merged delta carries, kept
+	// only so ApproxBytes can account for this projection.
+	edgeTombCount int
 
 	// maxKindOnce guards maxKindCeil, the merged kind-id ceiling MaxKindID
 	// returns -- see its doc.
@@ -69,11 +79,56 @@ type View struct {
 	deltaEdgeIdxOnce sync.Once
 	deltaEdgeIdx     *edgeKindIndex
 
+	// edgeEndpointMu guards edgeEndpoints, the merged base+delta endpoint set
+	// per alternation-and-direction -- see EdgeKindEndpoints. Memoized because
+	// the merge is asked for once per SEED of a variable-length walk, and a
+	// View is immutable once published so the answer never changes.
+	edgeEndpointMu sync.Mutex
+	edgeEndpoints  map[string][]NodeID
+
+	// deltaPropMu guards deltaProp, this View's per-property-NAME delta
+	// postings -- see deltaPropFor, which documents what asking a property
+	// question without them used to cost.
+	deltaPropMu sync.Mutex
+	deltaProp   map[string]*deltaPropPostings
+
+	// deadOnce guards deadBits, the set of dense node ids the merged delta
+	// has tombstoned -- see ensureDead and Alive.
+	deadOnce sync.Once
+	deadBits *Bitset
+
+	// overOnce guards overBits, the set of BASE dense node ids the merged
+	// delta carries any record for -- see ensureOverridden and override.
+	overOnce sync.Once
+	overBits *Bitset
+
+	// dirtyOnce guards dirtyOut/dirtyIn, the base nodes whose outgoing or
+	// incoming adjacency differs from the base CSR -- see CleanOut.
+	dirtyOnce sync.Once
+	dirtyOut  *Bitset
+	dirtyIn   *Bitset
+
+	// mergedOnce guards the materialized adjacency of every node CleanOut
+	// cannot answer for -- see OutSlices.
+	mergedOnce sync.Once
+	mergedOut  mergedAdjacency
+	mergedIn   mergedAdjacency
+
 	// deltaAdjOnce guards deltaOut/deltaIn, the per-dense-node index of
 	// delta-added/-upserted edges -- see ensureDeltaAdjacency.
 	deltaAdjOnce sync.Once
 	deltaOut     map[NodeID][]deltaEdge
 	deltaIn      map[NodeID][]deltaEdge
+
+	// deltaOutBits/deltaInBits mark which dense nodes appear in deltaOut/
+	// deltaIn at all. OutEdges/InEdges consult the maps once per node they
+	// visit, and on a graph where a delta touches tens of thousands of edges
+	// out of millions, almost every one of those lookups is a hash probe that
+	// finds nothing. A bit test answers the same question first, so only the
+	// nodes that really do carry a delta edge pay for the map. nil when the
+	// delta carries no edges.
+	deltaOutBits *Bitset
+	deltaInBits  *Bitset
 }
 
 // NewView wraps base in a View with no segments layered on top (Overlay()
@@ -281,7 +336,45 @@ func (v *View) override(n NodeID) (NodeSegState, bool) {
 		}
 		return v.merged.NodeState(v.virtualPgIDs[idx])
 	}
+
+	// A bit test before the map. override is consulted for every property
+	// read of every node a scan touches -- `MATCH (u:User) WHERE u.name
+	// CONTAINS 'ADMIN'` asks it a million times -- and on a view whose delta
+	// wrote a few thousand nodes, essentially all of those are hash probes
+	// that find nothing. Measured in-container, that query spent 790ms of
+	// engine time against 75ms for the same query and graph with an
+	// edges-only delta; the difference was this lookup.
+	v.ensureOverridden()
+	if v.overBits == nil || !v.overBits.Has(n) {
+		return NodeSegState{}, false
+	}
 	return v.merged.NodeState(v.base.GraphIDs[n])
+}
+
+// ensureOverridden builds, once per View, the set of BASE dense node ids the
+// merged delta carries a record for -- upsert or tombstone alike, matching
+// exactly what override answers ok=true for. nil when the delta writes no
+// base-resident node at all.
+func (v *View) ensureOverridden() {
+	v.overOnce.Do(func() {
+		v.ensureDelta()
+		if v.merged == nil {
+			return
+		}
+		var bits *Bitset
+		v.merged.IterNodes(func(pgID uint64, _ NodeSegState) bool {
+			id, ok := v.base.Dense(pgID)
+			if !ok {
+				return true // delta-added, handled by the virtual path above
+			}
+			if bits == nil {
+				bits = NewBitset(v.base.NodeCount())
+			}
+			bits.Set(id)
+			return true
+		})
+		v.overBits = bits
+	})
 }
 
 // deltaOverridden reports whether the merged delta carries a record --
@@ -327,8 +420,62 @@ func (v *View) Alive(n NodeID) bool {
 	if int(n) < 0 || int(n) >= v.NodeCount() {
 		return false
 	}
-	st, ok := v.override(n)
-	return !ok || !st.Tombstoned
+	if !v.Overlay() {
+		return true
+	}
+	// A bit test, not the merged delta's map. Alive is called once per edge
+	// ENDPOINT of every expansion, and answering it through override meant a
+	// dense-to-database id translation and a hash probe each time: profiled
+	// against an overlay, Alive and the map machinery under it accounted for
+	// 42% of the shipped "All Global Administrators" prebuilt. Tombstones are
+	// rare and the question is a pure predicate, so the whole answer fits in
+	// one bit per node, built once per View.
+	v.ensureDead()
+	return v.deadBits == nil || !v.deadBits.Has(n)
+}
+
+// deadNodes returns the tombstoned-node set for a caller about to test many
+// nodes in a loop, resolved once rather than per test. nil means nothing is
+// tombstoned.
+//
+// It exists because Alive is correct but not cheap to ask in bulk: it bounds
+// checks against NodeCount, and NodeCount goes through ensureDelta's
+// sync.Once. Asked once per edge by OutEdges on an overlay, that chain was 40%
+// of a shortestPath query -- the shipped "Shortest paths from Entra Users to
+// Tier Zero" prebuilt went from 36ms to 157ms the moment a delta of 90k
+// UNRELATED edges existed, purely from being asked whether each edge's
+// endpoint was alive.
+func (v *View) deadNodes() *Bitset {
+	v.ensureDead()
+	return v.deadBits
+}
+
+// ensureDead builds, once per View, the set of dense node ids the merged
+// delta has tombstoned. nil when nothing is tombstoned at all, which is the
+// common case and lets Alive skip even the bit test.
+func (v *View) ensureDead() {
+	v.deadOnce.Do(func() {
+		v.ensureDelta()
+		if v.merged == nil {
+			return
+		}
+		var bits *Bitset
+		v.merged.IterNodes(func(pgID uint64, st NodeSegState) bool {
+			if !st.Tombstoned {
+				return true
+			}
+			id, ok := v.denseOf(pgID)
+			if !ok {
+				return true
+			}
+			if bits == nil {
+				bits = NewBitset(v.NodeCount())
+			}
+			bits.Set(id)
+			return true
+		})
+		v.deadBits = bits
+	})
 }
 
 // Dense returns the dense NodeID for a database id, and whether it exists.
@@ -430,7 +577,7 @@ type deltaEdge struct {
 	edgeID uint64
 }
 
-// ensureEdgeTomb lazily computes edgeTomb: the set of every edge id the
+// ensureEdgeTomb lazily computes edgeTombSlots: the base slots of every edge the
 // merged delta carries a record for at all, tombstoned or upserted. Any base
 // forward-CSR slot naming one of these ids must be skipped by
 // OutEdges/InEdges: a tombstoned edge is gone, and an upserted one is
@@ -451,12 +598,23 @@ func (v *View) ensureEdgeTomb() {
 		if v.merged == nil {
 			return
 		}
-		m := make(map[uint64]struct{}, v.merged.EdgeCount())
+		var bits *Bitset
+		n := 0
 		v.merged.IterEdges(func(id uint64, _ EdgeSegState) bool {
-			m[id] = struct{}{}
+			n++
+			// Projected onto the base slot the edge occupies, when it occupies
+			// one, so the per-edge check in OutEdges/InEdges is a bit test
+			// against the index it is already iterating.
+			if slot, ok := v.base.EdgeByID(id); ok {
+				if bits == nil {
+					bits = NewBitset(int(v.base.EdgeCount()))
+				}
+				bits.Set(NodeID(slot))
+			}
 			return true
 		})
-		v.edgeTomb = m
+		v.edgeTombSlots = bits
+		v.edgeTombCount = n
 	})
 }
 
@@ -478,6 +636,8 @@ func (v *View) ensureDeltaAdjacency() {
 		}
 		out := make(map[NodeID][]deltaEdge)
 		in := make(map[NodeID][]deltaEdge)
+		var outBits, inBits *Bitset
+		n := v.NodeCount()
 		v.merged.IterEdges(func(id uint64, st EdgeSegState) bool {
 			if st.Tombstoned {
 				return true
@@ -489,10 +649,17 @@ func (v *View) ensureDeltaAdjacency() {
 			}
 			out[s] = append(out[s], deltaEdge{other: e, kind: st.Kind, edgeID: id})
 			in[e] = append(in[e], deltaEdge{other: s, kind: st.Kind, edgeID: id})
+			if outBits == nil {
+				outBits, inBits = NewBitset(n), NewBitset(n)
+			}
+			outBits.Set(s)
+			inBits.Set(e)
 			return true
 		})
 		v.deltaOut = out
 		v.deltaIn = in
+		v.deltaOutBits = outBits
+		v.deltaInBits = inBits
 	})
 }
 
@@ -510,22 +677,31 @@ func (v *View) OutEdges(n NodeID, yield func(target NodeID, kind KindID, edgeID 
 	}
 	if int(n) < v.base.NodeCount() {
 		v.ensureEdgeTomb()
+		dead := v.deadNodes()
+		tomb := v.edgeTombSlots
 		lo, hi := v.base.OutOffsets[n], v.base.OutOffsets[n+1]
 		for i := lo; i < hi; i++ {
-			edgeID := v.base.OutEdgeIDs[i]
-			if _, skip := v.edgeTomb[edgeID]; skip {
+			if tomb != nil && tomb.Has(NodeID(i)) {
 				continue
 			}
 			target := v.base.OutTargets[i]
-			if !v.Alive(target) {
+			// A base CSR slot's target is a base node, always inside
+			// [0, NodeCount()), so the liveness question reduces to "was it
+			// tombstoned" -- a bit test against a set resolved once above,
+			// not a call to Alive. See deadNodes for what asking Alive per
+			// edge cost.
+			if dead != nil && dead.Has(target) {
 				continue
 			}
-			if !yield(target, v.base.OutKinds[i], edgeID) {
+			if !yield(target, v.base.OutKinds[i], v.base.OutEdgeIDs[i]) {
 				return
 			}
 		}
 	}
 	v.ensureDeltaAdjacency()
+	if v.deltaOutBits == nil || !v.deltaOutBits.Has(n) {
+		return
+	}
 	for _, de := range v.deltaOut[n] {
 		if !yield(de.other, de.kind, de.edgeID) {
 			return
@@ -541,23 +717,28 @@ func (v *View) InEdges(n NodeID, yield func(source NodeID, kind KindID, edgeID u
 	}
 	if int(n) < v.base.NodeCount() {
 		v.ensureEdgeTomb()
+		dead := v.deadNodes()
+		tomb := v.edgeTombSlots
 		lo, hi := v.base.InOffsets[n], v.base.InOffsets[n+1]
 		for i := lo; i < hi; i++ {
 			fwdIdx := v.base.InEdgeIdx[i]
-			edgeID := v.base.OutEdgeIDs[fwdIdx]
-			if _, skip := v.edgeTomb[edgeID]; skip {
+			if tomb != nil && tomb.Has(NodeID(fwdIdx)) {
 				continue
 			}
 			source := v.base.InTargets[i]
-			if !v.Alive(source) {
+			// Same reduction as OutEdges: a base slot's source is a base node.
+			if dead != nil && dead.Has(source) {
 				continue
 			}
-			if !yield(source, v.base.InKinds[i], edgeID) {
+			if !yield(source, v.base.InKinds[i], v.base.OutEdgeIDs[fwdIdx]) {
 				return
 			}
 		}
 	}
 	v.ensureDeltaAdjacency()
+	if v.deltaInBits == nil || !v.deltaInBits.Has(n) {
+		return
+	}
 	for _, de := range v.deltaIn[n] {
 		if !yield(de.other, de.kind, de.edgeID) {
 			return
@@ -853,7 +1034,7 @@ func (v *View) ApproxBytes() uint64 {
 	}
 	v.kindBitmapMu.Unlock()
 
-	total += uint64(len(v.edgeTomb)) * bytesPerUint64 // map[uint64]struct{}, key bytes only
+	total += uint64(v.edgeTombCount) * bytesPerUint64 // one bit per base edge slot, plus what it was built from
 	for _, edges := range v.deltaOut {
 		total += uint64(len(edges)) * bytesPerDeltaEdge
 	}
@@ -986,4 +1167,308 @@ func (v *View) NodesByObjectID(objectID string) ([]NodeID, bool) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, true
+}
+
+// DegreeHint estimates how many edges n carries on the given side: its BASE
+// CSR degree, which is exact with no overlay and a starting point with one
+// (a delta adds edges far more often than it removes them).
+//
+// It exists so a caller collecting a node's neighbours can size its slice
+// once instead of growing it from nil. On an overlay the neighbour walk goes
+// through OutEdges/InEdges, which yield through a callback and so give the
+// caller nothing to size by; profiling the shipped "All Global
+// Administrators" prebuilt against an overlay put 42% of the whole query in
+// runtime.growslice, repeatedly zeroing and copying a slice that could have
+// been allocated once.
+//
+// 0 for a virtual (delta-added) node, which the base CSR knows nothing about.
+func (v *View) DegreeHint(n NodeID, outgoing bool) int {
+	if int(n) >= v.base.NodeCount() {
+		return 0
+	}
+	offsets := v.base.OutOffsets
+	if !outgoing {
+		offsets = v.base.InOffsets
+	}
+	return int(offsets[n+1] - offsets[n])
+}
+
+// CleanOut returns n's outgoing adjacency as slices aliasing the BASE CSR,
+// and ok=true, exactly when those slices are what OutEdges would yield for n
+// on this View -- same edges, same order, no edge added, hidden or retargeted
+// by the delta. ok=false means the delta touches n's outgoing adjacency and
+// the caller must walk OutEdges instead.
+//
+// This is the overlay counterpart of Out, which panics on an overlay View
+// because a raw CSR read there can be stale. It is not stale for most nodes.
+// A delta written by ingest or post-processing touches the edges of some tens
+// of thousands of nodes out of a million, and the rest have base adjacency
+// that is still exactly right. Sending every one of them through OutEdges'
+// callback -- which is what "Overlay() is true, so use OutEdges" did -- costs
+// an indirect call and a set of membership tests per edge: the shipped
+// "Shortest paths from Entra Users to Tier Zero" prebuilt took 36ms with no
+// overlay and 118ms beside 90k deltas edges it never traversed.
+//
+// Edge identity is NOT part of this contract: CleanOut returns no edge ids,
+// and a caller that keys results on them (interpret's EdgeRef, which uses a
+// CSR slot without an overlay and a database id with one) must not mix this
+// with OutEdges within one query.
+func (v *View) CleanOut(n NodeID) (targets []NodeID, kinds []KindID, ok bool) {
+	if int(n) >= v.base.NodeCount() {
+		return nil, nil, false
+	}
+	if v.Overlay() {
+		v.ensureDirtyAdjacency()
+		if v.dirtyOut != nil && v.dirtyOut.Has(n) {
+			return nil, nil, false
+		}
+	}
+	lo, hi := v.base.OutOffsets[n], v.base.OutOffsets[n+1]
+	return v.base.OutTargets[lo:hi], v.base.OutKinds[lo:hi], true
+}
+
+// CleanIn is CleanOut for incoming adjacency, mirroring In.
+func (v *View) CleanIn(n NodeID) (sources []NodeID, kinds []KindID, ok bool) {
+	if int(n) >= v.base.NodeCount() {
+		return nil, nil, false
+	}
+	if v.Overlay() {
+		v.ensureDirtyAdjacency()
+		if v.dirtyIn != nil && v.dirtyIn.Has(n) {
+			return nil, nil, false
+		}
+	}
+	lo, hi := v.base.InOffsets[n], v.base.InOffsets[n+1]
+	return v.base.InTargets[lo:hi], v.base.InKinds[lo:hi], true
+}
+
+// ensureDirtyAdjacency builds, once per View, the base nodes whose adjacency
+// the merged delta changes on each side. A base node's OUTGOING list differs
+// from the base CSR when:
+//
+//   - the node itself is tombstoned (OutEdges yields nothing for it);
+//   - a node it points at is tombstoned (OutEdges hides that edge);
+//   - one of its own base edge slots carries a delta record, tombstone or
+//     upsert (OutEdges skips the slot, and re-yields an upsert from the delta);
+//   - the delta adds an edge leaving it.
+//
+// and symmetrically for INCOMING. Everything else reads identically through
+// the base CSR, which is the whole premise of CleanOut.
+func (v *View) ensureDirtyAdjacency() {
+	v.dirtyOnce.Do(func() {
+		v.ensureDelta()
+		if v.merged == nil {
+			return
+		}
+		n := v.base.NodeCount()
+		out, in := NewBitset(n), NewBitset(n)
+
+		if dead := v.deadNodes(); dead != nil {
+			dead.Iterate(func(d NodeID) bool {
+				if int(d) >= n {
+					return true
+				}
+				out.Set(d)
+				in.Set(d)
+				// Everything with an edge INTO d has d in its outgoing list,
+				// and everything d points at has d in its incoming list.
+				for _, src := range v.base.InTargets[v.base.InOffsets[d]:v.base.InOffsets[d+1]] {
+					out.Set(src)
+				}
+				for _, tgt := range v.base.OutTargets[v.base.OutOffsets[d]:v.base.OutOffsets[d+1]] {
+					in.Set(tgt)
+				}
+				return true
+			})
+		}
+
+		v.ensureEdgeTomb()
+		if v.edgeTombSlots != nil {
+			v.edgeTombSlots.Iterate(func(slot NodeID) bool {
+				out.Set(sourceOfSlot(v.base, uint64(slot)))
+				in.Set(v.base.OutTargets[slot])
+				return true
+			})
+		}
+
+		v.ensureDeltaAdjacency()
+		if v.deltaOutBits != nil {
+			v.deltaOutBits.Iterate(func(x NodeID) bool { out.Set(x); return true })
+		}
+		if v.deltaInBits != nil {
+			v.deltaInBits.Iterate(func(x NodeID) bool { in.Set(x); return true })
+		}
+		v.dirtyOut, v.dirtyIn = out, in
+	})
+}
+
+// mergedAdjacency is one side's overlay-aware adjacency for the nodes the
+// delta touches, laid out as a compact CSR of its own: row[n] is the index
+// into offsets for node n, or -1 when n is clean and the base CSR is exact.
+type mergedAdjacency struct {
+	row     []int32
+	offsets []int
+	nodes   []NodeID
+	kinds   []KindID
+}
+
+func (m *mergedAdjacency) get(n NodeID) ([]NodeID, []KindID, bool) {
+	if int(n) >= len(m.row) {
+		return nil, nil, false
+	}
+	r := m.row[n]
+	if r < 0 {
+		return nil, nil, false
+	}
+	lo, hi := m.offsets[r], m.offsets[r+1]
+	return m.nodes[lo:hi], m.kinds[lo:hi], true
+}
+
+// OutSlices returns n's outgoing adjacency exactly as OutEdges would yield it
+// -- same neighbours, same kinds, same order -- as slices, for EVERY node on
+// the View: the base CSR for a node the delta leaves alone, and a merged copy
+// built once per View for one it touches, virtual nodes included. ok is false
+// only for an id outside the View.
+//
+// CleanOut alone left a traversal half-fixed: clean nodes read the CSR, but
+// every node a delta touched still went through OutEdges' callback, an
+// indirect call and a set of membership tests per edge. On a delta that
+// touches much of the subgraph being searched that is most of the work, and
+// the shipped "Shortest paths from Entra Users to Tier Zero" prebuilt still
+// cost 2.3x its no-overlay time. Materializing the touched nodes' adjacency
+// once is work on the WRITE side of the ledger -- a View is published per
+// commit and read many times -- which is where this engine puts cost wherever
+// it has the choice.
+//
+// Like CleanOut it carries no edge ids, so a caller that keys results on edge
+// identity must not mix it with OutEdges within one query.
+func (v *View) OutSlices(n NodeID) ([]NodeID, []KindID, bool) {
+	if ns, ks, ok := v.CleanOut(n); ok {
+		return ns, ks, true
+	}
+	if int(n) >= v.NodeCount() {
+		return nil, nil, false
+	}
+	v.ensureMergedAdjacency()
+	return v.mergedOut.get(n)
+}
+
+// InSlices is OutSlices for incoming adjacency.
+func (v *View) InSlices(n NodeID) ([]NodeID, []KindID, bool) {
+	if ns, ks, ok := v.CleanIn(n); ok {
+		return ns, ks, true
+	}
+	if int(n) >= v.NodeCount() {
+		return nil, nil, false
+	}
+	v.ensureMergedAdjacency()
+	return v.mergedIn.get(n)
+}
+
+// ensureMergedAdjacency materializes, once per View, the adjacency of every
+// node CleanOut/CleanIn decline: the dirty base nodes and every virtual one.
+// The walk itself goes through OutEdges/InEdges, so the materialized copy is
+// correct by construction rather than by a second implementation of the
+// overlay rules.
+func (v *View) ensureMergedAdjacency() {
+	v.mergedOnce.Do(func() {
+		v.ensureDirtyAdjacency()
+		total := v.NodeCount()
+		baseN := v.base.NodeCount()
+		build := func(dirty *Bitset, walk func(NodeID, func(NodeID, KindID, uint64) bool)) mergedAdjacency {
+			m := mergedAdjacency{row: make([]int32, total), offsets: []int{0}}
+			for i := range m.row {
+				m.row[i] = -1
+			}
+			add := func(n NodeID) {
+				m.row[n] = int32(len(m.offsets) - 1)
+				walk(n, func(w NodeID, k KindID, _ uint64) bool {
+					m.nodes = append(m.nodes, w)
+					m.kinds = append(m.kinds, k)
+					return true
+				})
+				m.offsets = append(m.offsets, len(m.nodes))
+			}
+			if dirty != nil {
+				dirty.Iterate(func(n NodeID) bool {
+					if int(n) < baseN {
+						add(n)
+					}
+					return true
+				})
+			}
+			for n := baseN; n < total; n++ {
+				add(NodeID(n))
+			}
+			return m
+		}
+		v.mergedOut = build(v.dirtyOut, v.OutEdges)
+		v.mergedIn = build(v.dirtyIn, v.InEdges)
+	})
+}
+
+// CleanOutSlots returns the half-open base forward-CSR slot range holding n's
+// outgoing edges, and ok=true, exactly when OutEdges would yield precisely
+// those slots for n on this View -- see CleanOut, which answers the same
+// question and hands back slices instead.
+//
+// Slots rather than slices, because a caller that needs each edge's own
+// IDENTITY needs the index: OutTargets, OutKinds and OutEdgeIDs are all
+// aligned to it. interpret's adjacency is that caller -- it keys a trail's
+// edge-uniqueness on the edge id under an overlay -- and CleanOut's
+// no-edge-ids contract cannot serve it.
+func (v *View) CleanOutSlots(n NodeID) (lo, hi uint64, ok bool) {
+	if int(n) >= v.base.NodeCount() {
+		return 0, 0, false
+	}
+	if v.Overlay() {
+		v.ensureDirtyAdjacency()
+		if v.dirtyOut != nil && v.dirtyOut.Has(n) {
+			return 0, 0, false
+		}
+	}
+	return v.base.OutOffsets[n], v.base.OutOffsets[n+1], true
+}
+
+// CleanInSlots is CleanOutSlots for the reverse CSR: the returned range
+// indexes InTargets, InKinds and InEdgeIdx.
+func (v *View) CleanInSlots(n NodeID) (lo, hi uint64, ok bool) {
+	if int(n) >= v.base.NodeCount() {
+		return 0, 0, false
+	}
+	if v.Overlay() {
+		v.ensureDirtyAdjacency()
+		if v.dirtyIn != nil && v.dirtyIn.Has(n) {
+			return 0, 0, false
+		}
+	}
+	return v.base.InOffsets[n], v.base.InOffsets[n+1], true
+}
+
+// Warm builds the derived overlay projections a reader would otherwise build
+// on its first query against this View, so no query pays for them.
+//
+// Writes to a BloodHound database are rare and reads are not, which makes the
+// write path the right place to absorb this -- the same bargain
+// Snapshot.Warm makes for the base snapshot's own indexes. Without it the
+// cost lands on whichever request arrives first after a commit: merging the
+// segment stack, then materializing the adjacency of every node that stack
+// touched. On a segment carrying a few hundred thousand records that is
+// hundreds of milliseconds on one unlucky user request, repeatedly, while the
+// CPU that was idle immediately after the write went unused.
+//
+// Safe to call on a View that is not published yet and cheap on one with no
+// overlay at all: every projection is memoized, so a later reader finds the
+// work already done rather than repeating it.
+func (v *View) Warm() {
+	if !v.Overlay() {
+		return
+	}
+	v.ensureDelta()
+	v.ensureDead()
+	v.ensureOverridden()
+	v.ensureEdgeTomb()
+	v.ensureDeltaAdjacency()
+	v.ensureDirtyAdjacency()
+	v.ensureMergedAdjacency()
 }

@@ -89,6 +89,15 @@ type Snapshot struct {
 
 	// valueIdx memoizes per-property EXACT-match postings (valueindex.go),
 	// built lazily like stringIdx and guarded for the same reason.
+	// distinctCount memoizes a property's EXACT distinct-string-value count
+	// once one has been computed -- see stringDistinctAtMost, which abandons
+	// the count for a high-cardinality property rather than finishing it.
+	distinctMu    sync.Mutex
+	distinctCount map[PropID]int
+	// distinctAtLeast records a LOWER bound for a property whose count was
+	// abandoned, so the walk is not repeated for every later query.
+	distinctAtLeast map[PropID]int
+
 	valueIdxMu sync.Mutex
 	valueIdx   map[PropID]*valueIndex
 

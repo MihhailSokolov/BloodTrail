@@ -554,9 +554,16 @@ func TestVarLengthReverseEligible(t *testing.T) {
 			want:  false,
 		},
 		{
-			name:  "far side carries kinds only: nothing narrows it",
+			// A kinds-only far side used to be refused outright, on the rule
+			// that a side which does not "narrow" in endpointNarrows' sense
+			// would make the seeding scan a full one. That reasoning confused
+			// two different things: endpointNarrows deliberately discounts
+			// kind tests, but a kind bitmap is still a far cheaper seed source
+			// than a scan. Here it is 3 Target nodes against a 66-node near
+			// side, and seeding from 3 is plainly the better route.
+			name:  "a kinds-only far side is seeded from when it is much cheaper",
 			query: `MATCH (s)-[:E*1..3]->(t:Target) RETURN s, t`,
-			want:  false,
+			want:  true,
 		},
 		{
 			name:  "far side wholly unconstrained",
@@ -1156,11 +1163,14 @@ func TestVarLengthReverseEligibleWithGraphCoveringKindNearSide(t *testing.T) {
 			want:  false,
 		},
 		{
-			// The far side must still genuinely narrow: a kinds-only far side
-			// buys nothing, whatever the near side is.
-			name:  "a kinds-only far side is still ineligible",
+			// The far side does not have to carry a PREDICATE to be worth
+			// seeding from. Here it carries only a kind, and the edge-kind
+			// hint narrows it further to the 5 groups that actually have an
+			// incoming MemberOf edge -- against 123 on the near side. The
+			// margin, not a structural precondition, is what decides.
+			name:  "a kinds-only far side is seeded from when the margin holds",
 			query: `MATCH p = (:Base)-[:MemberOf*1..]->(g:Group) RETURN p`,
-			want:  false,
+			want:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

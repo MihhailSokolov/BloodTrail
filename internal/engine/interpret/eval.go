@@ -347,6 +347,47 @@ type Env struct {
 
 	regexMu    sync.Mutex
 	regexCache map[string]*RegexMatcher
+
+	// litMu guards litCache, the decoded form of each string literal the
+	// query mentions -- see literalValue.
+	litMu    sync.Mutex
+	litCache map[*cypher.Literal]any
+}
+
+// literalValue is evalLiteralValue memoized per Env, which is per query.
+//
+// The frontend hands string literals over in SOURCE form -- quotes intact,
+// escapes un-decoded -- so reading one means decoding it, and decoding it
+// means allocating a string. Predicates are evaluated once per ROW, and the
+// literal on the right-hand side never changes between them: `MATCH (u:User)
+// WHERE u.name CONTAINS 'ADMIN'` decoded 'ADMIN' once per user in the graph,
+// which profiling put at a tenth of that query's whole cost.
+//
+// Keyed by the literal node's identity rather than its text, so two different
+// literals that happen to share a spelling stay separate and no hashing of
+// the token is needed.
+func (e *Env) literalValue(lit *cypher.Literal) (any, bool, error) {
+	if lit == nil {
+		return nil, false, ErrUnsupported
+	}
+	e.litMu.Lock()
+	if v, ok := e.litCache[lit]; ok {
+		e.litMu.Unlock()
+		return v, true, nil
+	}
+	e.litMu.Unlock()
+
+	v, ok, err := evalLiteralValue(lit)
+	if err != nil || !ok {
+		return v, ok, err
+	}
+	e.litMu.Lock()
+	if e.litCache == nil {
+		e.litCache = make(map[*cypher.Literal]any)
+	}
+	e.litCache[lit] = v
+	e.litMu.Unlock()
+	return v, true, nil
 }
 
 // compiledRegex returns a compiled, cached *regexp.Regexp for pattern,
@@ -773,7 +814,7 @@ func evalLiteralComparison(env *Env, row *Row, otherExpr cypher.Expression, op c
 	if err != nil {
 		return TriNull, err
 	}
-	litVal, _, err := evalLiteralValue(lit)
+	litVal, _, err := env.literalValue(lit)
 	if err != nil {
 		return TriNull, err
 	}
@@ -1241,7 +1282,7 @@ func EvalValue(env *Env, row *Row, expr cypher.Expression) (val any, ok bool, er
 		if typed == nil {
 			return nil, false, ErrUnsupported
 		}
-		return evalLiteralValue(typed)
+		return env.literalValue(typed)
 
 	case *cypher.Parenthetical:
 		if typed == nil {
