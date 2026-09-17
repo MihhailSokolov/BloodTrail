@@ -179,6 +179,7 @@ func TestPipelineSortRowsStringErrCollation(t *testing.T) {
 	outB := []OutVal{{Kind: OutScalar, Scalar: "Bob"}}
 
 	err := sortRows(
+		nil,
 		[]*Row{rowA, rowB},
 		[][]OutVal{outA, outB},
 		[]OrderKey{{Symbol: "name"}},
@@ -503,10 +504,19 @@ RETURN c`
 // only its visit (1) -- it never becomes a row, so under the documented
 // model it earns no row charge. Anchor total: 5. The 2 surviving rows are
 // admitted as final rows, charged exactly once each by addFinalRow = 2.
-// Total: 5 + 2 = 7. (Historical totals for this query: 10 when filterRows
-// double-charged survivors, 8 when the double charge was removed but
-// predicates still ran only in filterRows so the failing node was charged
-// as a row it never needed to be.)
+// Total: 5 + 2 = 7.
+//
+// The value index deliberately does NOT anchor this: two postings against a
+// three-node kind bitmap does not clear valueAnchorMargin, and an index is
+// worth preferring only when it is decisively better (see that constant for
+// what adopting a marginal one cost). On a graph where the predicate is
+// actually selective it does anchor, and TestValueAnchorReplacesTheKindScan
+// pins that under a budget this scan could not afford.
+//
+// (Historical totals for this query: 10 when filterRows double-charged
+// survivors, 8 when the double charge was removed but predicates still ran
+// only in filterRows so the failing node was charged as a row it never
+// needed to be.)
 func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 	const kindUser snapshot.KindID = 1
 
@@ -555,6 +565,10 @@ func TestPipelineWorkAccountingSinglePartNoDoubleCharge(t *testing.T) {
 // fail and cost only their visits (1 each) -- anchor total 4. The merge
 // step charges nothing of its own, and the single surviving merged row is
 // admitted once as a final row (addFinalRow: 1). Total: 2 + 1 + 4 + 1 = 8.
+// (One posting against a three-node bitmap does not clear valueAnchorMargin,
+// so the value index does not anchor this either -- see the note on the
+// single-part test above.)
+//
 // (Historical totals for this query: 15 with the filterRows/runCarriedPart
 // double charges, 10 with those removed but predicates still evaluated
 // only in filterRows, so the two failing nodes were charged as rows.)
@@ -812,8 +826,14 @@ func TestLimitWithDistinctTakesFullPath(t *testing.T) {
 	if len(rs.Rows) != 1 {
 		t.Fatalf("got %d rows, want 1 (RETURN DISTINCT ... LIMIT 1 over 3 rows all sharing one group)", len(rs.Rows))
 	}
-	if limited.work != baseline.work {
-		t.Fatalf("meter.work = %d, want %d (RETURN DISTINCT must take the unlimited path unchanged)", limited.work, baseline.work)
+	// DISTINCT now streams: it projects and deduplicates as rows arrive, so
+	// it can stop as soon as SKIP+LIMIT distinct tuples exist. Once one
+	// distinct group is in hand under LIMIT 1, no later row can change the
+	// answer -- so spending LESS than the unlimited path is the point, not a
+	// regression. What must not change is which rows come out.
+	if limited.work > baseline.work {
+		t.Fatalf("meter.work = %d, want no more than the unlimited path's %d",
+			limited.work, baseline.work)
 	}
 }
 
@@ -1126,5 +1146,189 @@ func TestShortestPathLimitPushdownNotAppliedAcrossWithBoundary_UnderServe(t *tes
 
 	if len(rs.Rows) != 3 {
 		t.Fatalf("got %d rows, want 3 (s3/s4/s5's matches, not truncated to s1/s2/s3 by the leaked final LIMIT)", len(rs.Rows))
+	}
+}
+
+// TestRowBindingsKeepMapSemantics pins the behaviour Row's association
+// slices replaced a map to provide. A slice makes "bind this symbol again"
+// an explicit overwrite rather than something the data structure does for
+// free, so the cases where that matters are pinned here directly: rebinding
+// must replace rather than append a second entry, each namespace must be
+// independent, and a merge must let the source win on a conflict, exactly
+// as assigning into a map did.
+func TestRowBindingsKeepMapSemantics(t *testing.T) {
+	t.Run("rebinding replaces", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("n", 1)
+		r.SetNode("n", 2)
+		if got, ok := r.Node("n"); !ok || got != 2 {
+			t.Fatalf("Node(n) = %v, %v; want 2, true", got, ok)
+		}
+		if len(r.nodes) != 1 {
+			t.Fatalf("rebinding appended a second entry: %d bindings", len(r.nodes))
+		}
+	})
+
+	t.Run("namespaces are independent", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("x", 7)
+		r.SetScalar("x", "scalar")
+		r.SetPathVar("x", "path")
+		if got, _ := r.Node("x"); got != 7 {
+			t.Fatalf("node binding disturbed: %v", got)
+		}
+		if got, _ := r.Scalar("x"); got != "scalar" {
+			t.Fatalf("scalar binding disturbed: %v", got)
+		}
+		if got, _ := r.PathVar("x"); got != "path" {
+			t.Fatalf("path binding disturbed: %v", got)
+		}
+	})
+
+	t.Run("an unbound symbol reports unbound", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("a", 1)
+		if _, ok := r.Node("b"); ok {
+			t.Fatal("Node(b) reported bound")
+		}
+		if _, ok := r.Scalar("a"); ok {
+			t.Fatal("a is a node, not a scalar")
+		}
+	})
+
+	t.Run("merge lets the source win", func(t *testing.T) {
+		dst, src := NewRow(), NewRow()
+		dst.SetNode("shared", 1)
+		dst.SetNode("dstonly", 10)
+		src.SetNode("shared", 2)
+		src.SetNode("srconly", 20)
+		mergeRowInto(dst, src)
+		for _, tc := range []struct {
+			sym  string
+			want snapshot.NodeID
+		}{{"shared", 2}, {"dstonly", 10}, {"srconly", 20}} {
+			if got, ok := dst.Node(tc.sym); !ok || got != tc.want {
+				t.Fatalf("Node(%s) = %v, %v; want %v, true", tc.sym, got, ok, tc.want)
+			}
+		}
+		if len(dst.nodes) != 3 {
+			t.Fatalf("merge produced %d bindings, want 3 distinct symbols", len(dst.nodes))
+		}
+	})
+
+	t.Run("a clone is independent of its source", func(t *testing.T) {
+		r := NewRow()
+		r.SetNode("n", 1)
+		r.SetScalar("s", "v")
+		r.markEdgeUsed(42)
+		c := cloneRow(r)
+		c.SetNode("n", 99)
+		c.SetNode("extra", 5)
+		if got, _ := r.Node("n"); got != 1 {
+			t.Fatalf("writing to the clone changed the original: %v", got)
+		}
+		if _, ok := r.Node("extra"); ok {
+			t.Fatal("the clone's new binding leaked into the original")
+		}
+		if !c.edgeUsed(42) {
+			t.Fatal("clone lost usedEdges")
+		}
+	})
+}
+
+// TestDeclinesOnRowBudgetBeforeScanning pins the early decline: a query that
+// must materialize every row, over a kind bitmap already larger than the row
+// budget, gives up before scanning rather than after.
+//
+// It is not about serving more queries -- PostgreSQL answers these either way
+// -- but about not paying twice. `MATCH (u:User) RETURN DISTINCT u.enabled
+// LIMIT 1000` spent tens of milliseconds scanning to the row cap and then
+// delegated, which is the whole of why it measured slower than the database
+// it delegates to.
+func TestDeclinesOnRowBudgetBeforeScanning(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+	var nodes []execNodeSpec
+	for i := 0; i < 200; i++ {
+		nodes = append(nodes, execNodeSpec{uint64(i + 1), []snapshot.KindID{kindUser},
+			map[string]any{"enabled": i%2 == 0}})
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+
+	for _, tc := range []struct {
+		name     string
+		query    string
+		maxRows  int
+		decline  bool
+		wantRows int
+	}{
+		{
+			// DISTINCT is STREAMED, not declined: the row budget bounds the
+			// answer, and two hundred users take two distinct values between
+			// them. See runDistinctStreaming.
+			name:  "DISTINCT over more nodes than the budget is streamed",
+			query: `MATCH (u:User) RETURN DISTINCT u.enabled`, maxRows: 50, wantRows: 2,
+		},
+		{
+			// ORDER BY still declines: sorting decides which rows a LIMIT
+			// keeps, so the rows have to exist before the answer does.
+			name: "ORDER BY over more nodes than the budget", decline: true,
+			query: `MATCH (u:User) RETURN u.enabled ORDER BY u.enabled`, maxRows: 50,
+		},
+		{
+			name:  "the same query within budget still runs",
+			query: `MATCH (u:User) RETURN DISTINCT u.enabled`, maxRows: 1000, wantRows: 2,
+		},
+		{
+			name: "no DISTINCT or ORDER BY: the row cap decides as before", decline: true,
+			query: `MATCH (u:User) RETURN u`, maxRows: 50,
+		},
+		{
+			name:    "a predicate narrows it to a single distinct value",
+			query:   `MATCH (u:User) WHERE u.enabled = true RETURN DISTINCT u.enabled`,
+			maxRows: 50, wantRows: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := planQuery(t, snap, tc.query)
+			meter := &workMeter{budget: Budgets{MaxRows: tc.maxRows, MaxWork: 1_000_000, MaxLiveRows: 1_000_000}}
+			rs, err := runQuery(&Env{Snap: snap}, q, meter)
+			if tc.decline {
+				if err == nil {
+					t.Fatal("want a decline")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("want success, got %v", err)
+			}
+			if len(rs.Rows) != tc.wantRows {
+				t.Fatalf("got %d rows, want %d", len(rs.Rows), tc.wantRows)
+			}
+		})
+	}
+}
+
+// TestEarlyDeclineSpendsNothing is the point of the change: the decline must
+// cost no scanning at all, or it has only moved the waste.
+func TestEarlyDeclineSpendsNothing(t *testing.T) {
+	const kindUser snapshot.KindID = 1
+	var nodes []execNodeSpec
+	for i := 0; i < 500; i++ {
+		nodes = append(nodes, execNodeSpec{uint64(i + 1), []snapshot.KindID{kindUser},
+			map[string]any{"enabled": i%2 == 0}})
+	}
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindUser: "User"}, nodes, nil)
+
+	// ORDER BY, not DISTINCT: DISTINCT is streamed now (runDistinctStreaming),
+	// so the shape that still cannot finish within the row budget -- and must
+	// therefore say so before spending anything -- is the sorted one.
+	q := planQuery(t, snap, `MATCH (u:User) RETURN u.enabled ORDER BY u.enabled`)
+	meter := &workMeter{budget: Budgets{MaxRows: 10, MaxWork: 1_000_000, MaxLiveRows: 1_000_000}}
+	if _, err := runQuery(&Env{Snap: snap}, q, meter); err == nil {
+		t.Fatal("want a decline")
+	}
+	if meter.work != 0 {
+		t.Fatalf("meter.work = %d, want 0: the decline is only worth making if it "+
+			"happens before the scan it is avoiding", meter.work)
 	}
 }

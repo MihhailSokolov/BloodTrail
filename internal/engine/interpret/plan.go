@@ -181,6 +181,23 @@ type NodeConstraint struct {
 	IDs            []uint64
 	ObjectIDAnchor *string
 	Predicates     []cypher.Expression
+
+	// PropCandidates is the node set an indexable string predicate on this
+	// symbol resolved to at PLAN time (see extractStringAnchor), and
+	// PropIndexed says whether one was resolved at all -- nil-vs-empty
+	// matters, an empty slice being a perfectly good "nothing matches".
+	//
+	// Resolved during planning rather than on demand during execution for
+	// two reasons: Plan already holds the snapshot, and a NodeConstraint is
+	// read by the executor from several goroutine-free but structurally
+	// unrelated places, so leaving it immutable after Plan keeps the
+	// executor's "constraints are read-only" property intact.
+	//
+	// It is a candidate SUPERSET, exactly like a kind bitmap: every
+	// consumer re-verifies with nodeSatisfiesConstraint + predicatesAdmit,
+	// and the predicate that produced it also stays in Predicates.
+	PropCandidates []snapshot.NodeID
+	PropIndexed    bool
 }
 
 // CountAgg is a WITH/RETURN `COUNT(sym)` or `COUNT(DISTINCT sym)` aggregate.
@@ -189,6 +206,10 @@ type NodeConstraint struct {
 type CountAgg struct {
 	Distinct bool
 	Sym      string
+
+	// Star is `COUNT(*)`: the group's own row count, with no argument to
+	// test for null and no DISTINCT to apply. Sym is empty when it is set.
+	Star bool
 }
 
 // CollectMembershipAgg is a WITH `COLLECT(sym)` aggregate, servable *only*
@@ -253,6 +274,21 @@ type WithClause struct {
 	GroupKeys  []string
 	Aggregates []WithAggregate
 	Constants  []WithConstant
+
+	// Computed is every `<expression> AS alias` item: an expression
+	// evaluated once per INPUT row and bound as a scalar under Alias before
+	// grouping happens, so a grouping key may be a property lookup
+	// (`WITH u.domain AS d, COUNT(u) AS n`) rather than only a bare
+	// variable. Each alias also appears in GroupKeys, which is what makes
+	// the rest of the pipeline -- key encoding, projection, ORDER BY --
+	// treat it exactly like any other carried symbol.
+	Computed []WithComputed
+}
+
+// WithComputed is one `<expression> AS alias` projection item.
+type WithComputed struct {
+	Alias string
+	Expr  cypher.Expression
 }
 
 // Part is one query "part" in the multi-part-query sense: a pattern
@@ -301,6 +337,20 @@ type Part struct {
 	Nodes  map[string]*NodeConstraint
 	Where  cypher.Expression
 	With   *WithClause
+
+	// Optional is this Part's trailing OPTIONAL MATCH, planned as a Part in
+	// its own right, and OptionalShared names the symbols it has in common
+	// with this one -- the join key. Both are nil/empty unless the query
+	// wrote an OPTIONAL MATCH.
+	//
+	// It is a LEFT join: every row this Part produces survives, extended by
+	// the optional pattern's matches when there are any and carrying the
+	// optional symbols UNBOUND when there are none. An unbound symbol
+	// projects as a null column, which is exactly what PostgreSQL returns
+	// for the same query (verified against the live oracle: the unmatched
+	// column comes back as a plain nil, not a node-shaped placeholder).
+	Optional       *Part
+	OptionalShared []string
 }
 
 // ProjectionOutput is one RETURN item's compiled plan: the column name
@@ -321,6 +371,11 @@ type Part struct {
 // projectionTypingOK) -- BareCallKind being non-empty is therefore always a
 // true statement about the item's entire expression, not merely its root.
 type ProjectionOutput struct {
+	// Optional marks a bare variable that an OPTIONAL MATCH introduced and
+	// that a given row may therefore leave UNBOUND. projectItem emits a null
+	// column for those instead of failing, which is what PostgreSQL returns.
+	Optional bool
+
 	Alias        string
 	Expr         cypher.Expression
 	BareCallKind string
@@ -358,6 +413,20 @@ type Projection struct {
 type OrderKey struct {
 	Symbol     string
 	Descending bool
+
+	// Expr, when set, is evaluated against each ROW instead of being
+	// resolved to a projected column: `RETURN u ORDER BY u.lastlogontimestamp`
+	// sorts by a property the projection never outputs, which PostgreSQL
+	// allows and an analyst sorting a result table does constantly. Always
+	// accompanied by RuntimeNumeric.
+	Expr cypher.Expression
+
+	// RuntimeNumeric marks a key whose alias is a bare PROPERTY lookup --
+	// a shape no static analysis can prove numeric, because what a property
+	// holds is a per-node fact. sortRows serves it only after checking every
+	// value it actually sees, and declines the whole query otherwise. See
+	// compareRuntimeNumericOrder for the ordering that check licenses.
+	RuntimeNumeric bool
 }
 
 // Query is Plan's complete output: an executable, plain-data compilation of
@@ -410,6 +479,15 @@ type Query struct {
 	Skip      int64
 	Limit     int64
 	Regexes   map[string]*regexp.Regexp
+
+	// ReturnGroup is the implicit grouping a RETURN clause containing
+	// aggregates desugars to (desugarReturnAggregates): `RETURN u.domain,
+	// COUNT(u)` is `WITH u.domain AS k, COUNT(u) AS a RETURN k, a` with the
+	// original column names preserved. nil when RETURN has no aggregate.
+	// Applied by runQuery immediately before projection, through the same
+	// runWithStage the explicit WITH boundary uses -- one grouping
+	// implementation, not two.
+	ReturnGroup *WithClause
 }
 
 // --- Plan entry point ---------------------------------------------------
@@ -483,17 +561,34 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 				// smuggle a second shortestPath past a per-Part-only check.
 				return nil, false
 			}
-			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, st.ret)
+			ret, returnGroup, groupKnown, ok := desugarReturnAggregates(known, st.ret)
 			if !ok {
 				return nil, false
 			}
+			if returnGroup != nil {
+				// After grouping, only the synthesized aliases survive --
+				// the same scoping an explicit WITH imposes. countAliases /
+				// numericScalars carry the COUNT aliases so planOrder's
+				// numeric-alias rule admits `ORDER BY count(u)`.
+				known = groupKnown
+				countAliases = countAliasSet(*returnGroup)
+				numericScalars = numericScalarSet(*returnGroup)
+			}
+			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, ret)
+			if !ok {
+				return nil, false
+			}
+			if !admitOptionalProjection(parts, &proj, order) {
+				return nil, false
+			}
 			return &Query{
-				Parts:     parts,
-				Returning: proj,
-				Order:     order,
-				Skip:      skip,
-				Limit:     limit,
-				Regexes:   regexes,
+				Parts:       parts,
+				Returning:   proj,
+				Order:       order,
+				Skip:        skip,
+				Limit:       limit,
+				Regexes:     regexes,
+				ReturnGroup: returnGroup,
 			}, true
 		}
 	}
@@ -718,14 +813,21 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried ma
 
 	var whereConjuncts []cypher.Expression
 
-	for _, rc := range reading {
+	// An OPTIONAL MATCH is split out and planned as its own Part. Only a
+	// single one, only as the LAST reading clause, and only with at least
+	// one mandatory MATCH before it to join against: an OPTIONAL MATCH with
+	// nothing to its left has no left side, and a mandatory clause AFTER one
+	// would have to filter rows the optional clause was supposed to preserve.
+	mandatory, optionalClause, ok := splitOptionalMatch(reading)
+	if !ok {
+		return Part{}, nil, false
+	}
+
+	for _, rc := range mandatory {
 		if rc == nil || rc.Unwind != nil || rc.Match == nil {
 			return Part{}, nil, false
 		}
 		m := rc.Match
-		if m.Optional {
-			return Part{}, nil, false
-		}
 		if len(m.Pattern) == 0 {
 			return Part{}, nil, false
 		}
@@ -760,11 +862,210 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried ma
 		return Part{}, nil, false
 	}
 
+	part := Part{
+		Chains: pb.chains,
+		Nodes:  pb.nodes,
+		Where:  rebuildConjunction(whereConjuncts),
+	}
+	if optionalClause == nil {
+		return part, pb.known, true
+	}
+
+	optPart, optKnown, ok := planOptionalPart(snap, regexes, numericScalars, pb, optionalClause)
+	if !ok {
+		return Part{}, nil, false
+	}
+	shared := sharedNodeSymbols(part.Nodes, optPart.Nodes)
+	if len(shared) == 0 {
+		// Nothing in common means the optional pattern is a product against
+		// every mandatory row rather than a lookup, and a null-padded product
+		// is a shape nothing in the corpus writes. Decline rather than build
+		// it.
+		return Part{}, nil, false
+	}
+	part.Optional, part.OptionalShared = &optPart, shared
+	return part, optKnown, true
+}
+
+// splitOptionalMatch separates a stage's reading clauses into the mandatory
+// ones and its single trailing OPTIONAL MATCH, if any. See Part.Optional for
+// why the shape is restricted this narrowly.
+func splitOptionalMatch(reading []*cypher.ReadingClause) (mandatory []*cypher.ReadingClause, optional *cypher.ReadingClause, ok bool) {
+	for i, rc := range reading {
+		if rc == nil || rc.Match == nil {
+			// Left for the mandatory loop's own validation to reject, so
+			// every non-Match reading clause keeps failing in one place.
+			mandatory = append(mandatory, rc)
+			continue
+		}
+		if !rc.Match.Optional {
+			if optional != nil {
+				return nil, nil, false
+			}
+			mandatory = append(mandatory, rc)
+			continue
+		}
+		if optional != nil || i != len(reading)-1 || i == 0 {
+			return nil, nil, false
+		}
+		optional = rc
+	}
+	return mandatory, optional, true
+}
+
+// planOptionalPart plans an OPTIONAL MATCH clause as a Part of its own,
+// seeded from the mandatory Part's builder so a symbol the mandatory pattern
+// already bound resolves to the same variable rather than being introduced
+// afresh.
+//
+// Every shared symbol carries the mandatory Part's OWN NodeConstraint into
+// the optional Part. That is a narrowing the left join cannot observe --
+// every row the join can match already satisfies those constraints, because
+// it came from the mandatory side -- and without it the optional pattern's
+// bare `(u)` would anchor on a full scan where the mandatory one anchored on
+// a kind bitmap.
+func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, numericScalars map[string]bool, outer *partBuilder, rc *cypher.ReadingClause) (Part, map[string]symKind, bool) {
+	if rc.Unwind != nil || rc.Match == nil || len(rc.Match.Pattern) == 0 {
+		return Part{}, nil, false
+	}
+
+	pb := &partBuilder{
+		snap:           snap,
+		known:          cloneKnown(outer.known),
+		nodes:          map[string]*NodeConstraint{},
+		regexes:        regexes,
+		numericScalars: numericScalars,
+	}
+
+	// nodes starts EMPTY, deliberately: it must end up holding exactly the
+	// symbols this optional pattern mentions, because that set is what
+	// sharedNodeSymbols intersects to find the join key. Pre-seeding it with
+	// the mandatory Part's symbols made every one of them look shared, so a
+	// genuinely disjoint OPTIONAL MATCH (nothing in common, hence a
+	// null-padded product) was accepted and served instead of declined.
+	for _, pp := range rc.Match.Pattern {
+		if !pb.addPatternPart(pp) {
+			return Part{}, nil, false
+		}
+	}
+
+	// Now that the pattern's own symbols are known, narrow the shared ones
+	// with what the mandatory Part already requires of them. The join can
+	// never observe this -- every row it can match came from the mandatory
+	// side and so already satisfies them -- but without it the optional
+	// pattern's bare `(u)` anchors on a full scan where the mandatory one
+	// anchored on a kind bitmap.
+	for sym, inner := range pb.nodes {
+		outerNC, shared := outer.nodes[sym]
+		if !shared || outerNC == nil || inner == nil {
+			continue
+		}
+		inner.Kinds = append(inner.Kinds, outerNC.Kinds...)
+		inner.Predicates = append(inner.Predicates, outerNC.Predicates...)
+		if inner.ObjectIDAnchor == nil {
+			inner.ObjectIDAnchor = outerNC.ObjectIDAnchor
+		}
+		inner.IDs = append(inner.IDs, outerNC.IDs...)
+	}
+
+	var whereConjuncts []cypher.Expression
+	if rc.Match.Where != nil {
+		for _, top := range rc.Match.Where.GetAll() {
+			whereConjuncts = append(whereConjuncts, flattenTopLevelConjuncts(top)...)
+		}
+	}
+	whereConjuncts = append(whereConjuncts, pb.desugaredEqualities...)
+	for _, conjunct := range whereConjuncts {
+		pb.touched = map[string]bool{}
+		if !pb.checkExpr(conjunct, true) {
+			return Part{}, nil, false
+		}
+		if !pb.pushdown(conjunct) {
+			return Part{}, nil, false
+		}
+	}
+	if !pb.finalizeShortestPaths(whereConjuncts) {
+		return Part{}, nil, false
+	}
+
 	return Part{
 		Chains: pb.chains,
 		Nodes:  pb.nodes,
 		Where:  rebuildConjunction(whereConjuncts),
 	}, pb.known, true
+}
+
+// admitOptionalProjection validates a RETURN against the OPTIONAL MATCH
+// symbols a query carries, and marks the items that can come back unbound.
+//
+// The rule is deliberately blunt: once any Part has an OPTIONAL MATCH, every
+// RETURN item must be a BARE VARIABLE and the query must have no ORDER BY.
+// The reason is null propagation. `RETURN g.name` where g went unmatched is
+// null in PostgreSQL, and so is every expression built on it, but this
+// package's evaluator has no notion of "this symbol is absent, so everything
+// reading it is too" -- it reports an unbound variable as an unsupported
+// expression. Serving those shapes would mean inventing that propagation and
+// getting it to agree with pg's everywhere, which is exactly the kind of
+// half-understood representation that produces a SERVED WRONG ANSWER rather
+// than a decline. A bare variable needs none of it: bound projects as the
+// node, unbound projects as null, and there is nothing in between.
+//
+// Everything this refuses is delegated and answered correctly by PostgreSQL.
+func admitOptionalProjection(parts []Part, proj *Projection, order []OrderKey) bool {
+	optional := optionalOnlySymbols(parts)
+	if len(optional) == 0 {
+		return true
+	}
+	if len(order) > 0 {
+		return false
+	}
+	for i := range proj.Items {
+		v, isVar := unwrapParens(proj.Items[i].Expr).(*cypher.Variable)
+		if !isVar || v == nil {
+			return false
+		}
+		if optional[v.Symbol] {
+			proj.Items[i].Optional = true
+		}
+	}
+	return true
+}
+
+// optionalOnlySymbols returns the node symbols that exist ONLY because an
+// OPTIONAL MATCH introduced them -- the ones a row can leave unbound. A
+// symbol the mandatory pattern also binds (the join key) is always bound and
+// is deliberately not included.
+func optionalOnlySymbols(parts []Part) map[string]bool {
+	out := map[string]bool{}
+	for i := range parts {
+		opt := parts[i].Optional
+		if opt == nil {
+			continue
+		}
+		shared := map[string]bool{}
+		for _, sym := range parts[i].OptionalShared {
+			shared[sym] = true
+		}
+		for sym := range opt.Nodes {
+			if !shared[sym] {
+				out[sym] = true
+			}
+		}
+	}
+	return out
+}
+
+// sharedNodeSymbols returns the node symbols both Parts constrain, sorted so
+// the join key is built in a stable order on both sides.
+func sharedNodeSymbols(outer, inner map[string]*NodeConstraint) []string {
+	var out []string
+	for sym := range inner {
+		if _, both := outer[sym]; both {
+			out = append(out, sym)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // rebuildConjunction ANDs conjuncts back together for storage on Part.Where:
@@ -1417,7 +1718,628 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 	}
 	pb.extractObjectIDAnchor(sym, conjunct)
 	pb.extractKindConjunct(sym, conjunct)
+	pb.extractStringAnchor(sym, conjunct)
+	pb.extractValueAnchor(sym, conjunct)
+	pb.extractRegexAnchor(sym, conjunct)
 	return true
+}
+
+// regexAnchorMargin is how many times smaller a property's DISTINCT-value
+// count must be than the candidate source it would replace before the regex
+// is evaluated per value instead of per node.
+//
+// The two routes do the same number of regex evaluations when the property
+// takes one value per node, and the per-value route additionally has to
+// union posting lists -- so at parity it is a small loss, not a wash. A
+// factor keeps it to the cases where it is decisively right: BloodHound's
+// `operatingsystem` takes a few dozen values across hundreds of thousands of
+// computers, while its `name` takes one per node and must stay on the scan.
+const regexAnchorMargin = 8
+
+// extractRegexAnchor recognizes `sym.prop =~ '<literal pattern>'` and, when
+// the property is low-cardinality, resolves it at plan time by evaluating the
+// pattern ONCE PER DISTINCT VALUE rather than once per candidate node.
+//
+// This is the one predicate shape where neither engine has an index --
+// BloodHound's schema carries none on `properties` -- so both sides scan and
+// the query reduces to raw per-row matching speed, which is a contest Go's
+// regexp engine loses to PostgreSQL's C one. The way out is not to match
+// faster but to match FEWER times: the shipped "Computers with unsupported
+// operating systems" prebuilt runs its pattern against every Computer in the
+// graph, and there are only a few dozen distinct operating-system strings
+// among them.
+//
+// The predicate itself stays in Predicates, as every extracted anchor's does,
+// so each candidate is re-verified and the resolution can only ever narrow
+// what is enumerated.
+func (pb *partBuilder) extractRegexAnchor(sym string, conjunct cypher.Expression) {
+	nc := pb.nodeConstraint(sym)
+	if nc.PropIndexed {
+		return
+	}
+	op, left, right, ok := asSingleComparison(conjunct)
+	if !ok || op != cypher.OperatorRegexMatch {
+		return
+	}
+	name, pattern, ok := propOpLiteral(left, right, sym)
+	coalesced := false
+	if !ok {
+		// BloodHound writes a good many predicates through COALESCE; the
+		// string anchor already understands that spelling, so this one does
+		// too rather than silently missing the same queries.
+		//
+		// StringEquals is passed only to satisfy the shared helper's
+		// signature; its default-value test is written for the string
+		// operators and cannot decide a regex. The real check is below, once
+		// the pattern is compiled, and `coalesced` is what forces it.
+		name, pattern, ok = coalescePropOpLiteral(left, right, sym, snapshot.StringEquals)
+		coalesced = ok
+	}
+	if !ok {
+		return
+	}
+
+	// The alternative is enumerating the symbol's smallest kind bitmap, or
+	// every node when it carries no label at all. Asking the cardinality
+	// question with that as a CAP is what keeps this affordable: a property
+	// with a million distinct values is abandoned after a few thousand,
+	// rather than indexed in full only to be rejected.
+	alt, ok := pb.smallestKindCount(sym)
+	if !ok {
+		alt = pb.snap.NodeCount()
+	}
+	cap := alt / regexAnchorMargin
+	if cap < 1 {
+		return
+	}
+	distinct, exact, ok := pb.snap.StringDistinctAtMost(name, cap)
+	if !ok || !exact || distinct == 0 {
+		return
+	}
+
+	// Compiled through the same matcher eval.go uses, so the substring
+	// rewrite applies here too and the per-value test is the identical
+	// question the per-row test would have asked.
+	m, err := NewRegexMatcher(pattern)
+	if err != nil {
+		return
+	}
+	// Under COALESCE, a node that does not carry the property is tested
+	// against the DEFAULT, not skipped. The candidate set here holds only
+	// nodes that do carry it, so it is a superset of the matches just in
+	// case the pattern rejects that default -- and a pattern like `.*` or
+	// `^$` accepts it, making every node without the property a match the
+	// anchor would hide. Ask the compiled pattern directly; the string
+	// operators' own default test cannot answer for a regex.
+	if coalesced && m.MatchString(coalesceDefaultOf(left, right, sym)) {
+		return
+	}
+	ids, ok := pb.snap.NodesMatchingString(name, m.MatchString)
+	if !ok {
+		return
+	}
+	// A pattern that matches nearly every value resolves to nearly the whole
+	// population, which is not an anchor worth having over the kind bitmap.
+	if len(ids) >= alt {
+		return
+	}
+	nc.PropCandidates, nc.PropIndexed = ids, true
+}
+
+// extractStringAnchor recognizes a pushed conjunct of the form
+// `sym.prop <op> '<literal>'` for an op the snapshot's per-property string
+// index can answer -- `=`, STARTS WITH, ENDS WITH, CONTAINS -- and resolves
+// it, right here at plan time, into the candidate node set the executor
+// should enumerate instead of a kind bitmap or a full scan.
+//
+// This is what closes the gap PostgreSQL's btree/trigram indexes opened.
+// BloodHound anchors whole prebuilt families on a well-known RID suffix
+// (`WHERE s.objectid ENDS WITH '-513'`), on a name prefix, or on a hygiene
+// property's substring; each of those used to enumerate the pattern's kind
+// bitmap -- often every User in the graph -- and test the predicate per
+// node, against PostgreSQL's single index probe.
+//
+// Only the FIRST resolvable anchor on a symbol is kept. A second one would
+// have to be intersected to stay a correct superset, and conjoined string
+// predicates on one symbol are not a shape BloodHound's corpus writes; the
+// unkept predicates all remain in Predicates and still filter every
+// candidate, so keeping one is a narrowing choice, never a correctness one.
+func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expression) {
+	nc := pb.nodeConstraint(sym)
+	if nc.PropIndexed {
+		return
+	}
+	op, left, right, ok := asSingleComparison(conjunct)
+	if !ok {
+		return
+	}
+	var match snapshot.StringMatch
+	switch op {
+	case cypher.OperatorEquals:
+		match = snapshot.StringEquals
+	case cypher.OperatorStartsWith:
+		match = snapshot.StringPrefix
+	case cypher.OperatorEndsWith:
+		match = snapshot.StringSuffix
+	case cypher.OperatorContains:
+		match = snapshot.StringContains
+	case cypher.OperatorIn:
+		pb.extractStringInAnchor(sym, nc, left, right)
+		return
+	default:
+		return
+	}
+	// Only `property <op> literal` -- the mirrored spelling is not valid
+	// Cypher for the string operators, and for `=` the literal-on-the-left
+	// form is already covered by whichever side carries the PropertyLookup.
+	name, operand, ok := propOpLiteral(left, right, sym)
+	if !ok {
+		name, operand, ok = coalescePropOpLiteral(left, right, sym, match)
+	}
+	if !ok {
+		if name, operand, ok = propOpLiteral(right, left, sym); !ok {
+			return
+		}
+		if op != cypher.OperatorEquals {
+			return
+		}
+	}
+	// Resolution goes through the NAME, never through a PropID this function
+	// resolved itself: a PropID miss means only that the BASE snapshot never
+	// interned the property, which on an overlay says nothing about what the
+	// delta carries. NodesWithStringByName owns that distinction, and its
+	// doc records what reading a miss as "nothing carries it" cost.
+	//
+	// The cost guard still needs a PropID, so it applies only when the base
+	// knows the property. When it does not, the candidate set that comes
+	// back is the whole delta, which propIndexPreferred and rankOf already
+	// price against the kind bitmap and decline to use when it is the
+	// larger of the two -- the same protection stringAnchorWorthIt gives.
+	if propID, known := pb.snap.PropIDByName(name); known && !pb.stringAnchorWorthIt(sym, propID, match) {
+		return
+	}
+	ids, ok := pb.snap.NodesWithStringByName(name, match, operand)
+	if !ok {
+		return
+	}
+	nc.PropCandidates, nc.PropIndexed = ids, true
+}
+
+// stringAnchorWorthIt decides whether resolving an indexable predicate can
+// actually pay for itself, BEFORE the resolution runs -- because resolving
+// is not free and happens here, at plan time.
+//
+// The distinction is the match shape. An ordered lookup (equality, prefix,
+// suffix) costs a binary search plus the matches, however many nodes carry
+// the property, so it is worth taking whenever it is available; the sort
+// that makes it possible is built once per property and memoized across
+// every later query against the same snapshot.
+//
+// CONTAINS has no such ordering: it scans the property's whole population
+// every time. That is a win exactly when the population is smaller than the
+// candidate source it replaces -- a hygiene property on 125 nodes against a
+// 920k-node `Base` bitmap -- and a LOSS when it is larger. Measured: the
+// shipped "Tier Zero / High Value external Entra ID users" prebuilt pairs
+// `(n:Tag_Tier_Zero)` (145 nodes) with `n.name CONTAINS '#EXT#@'` (~1M
+// nodes carry `name`), and resolving the CONTAINS anyway turned a 17.7ms
+// query into 1504.8ms.
+func (pb *partBuilder) stringAnchorWorthIt(sym string, prop snapshot.PropID, match snapshot.StringMatch) bool {
+	if match != snapshot.StringContains {
+		return true
+	}
+	population, ok := pb.snap.PropCount(prop)
+	if !ok {
+		return false
+	}
+	alt, ok := pb.smallestKindCount(sym)
+	if !ok {
+		// No kind labels: the alternative is a full scan of every node, so
+		// scanning only the nodes carrying this property is never worse.
+		return true
+	}
+	return population < alt
+}
+
+// smallestKindCount returns the population of the smallest kind bitmap
+// among sym's kind labels -- the candidate source scanAnchorVisit would use
+// if no property index were available -- and false when sym carries none.
+func (pb *partBuilder) smallestKindCount(sym string) (int, bool) {
+	nc, ok := pb.nodes[sym]
+	if !ok || len(nc.Kinds) == 0 {
+		return 0, false
+	}
+	best := -1
+	for _, k := range nc.Kinds {
+		if n := pb.snap.NodesOfKind(k).Count(); best < 0 || n < best {
+			best = n
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
+}
+
+// extractStringInAnchor handles `sym.prop IN ['a','b',...]`: a disjunction
+// of equalities, and therefore the UNION of each operand's equality lookup.
+// BloodHound writes domain and tenant filters this way, and the union stays
+// a superset for the same reason a single equality does.
+//
+// An all-literal, all-string list is required. A list holding anything else
+// (a parameter, a number, a nested expression) is left to the ordinary
+// per-node evaluation rather than partially indexed, which would risk
+// dropping candidates a non-string element could still match.
+func (pb *partBuilder) extractStringInAnchor(sym string, nc *NodeConstraint, left, right cypher.Expression) {
+	pl, isProp := unwrapParens(left).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return
+	}
+	list, isList := unwrapParens(right).(*cypher.ListLiteral)
+	if !isList || list == nil || len(*list) == 0 {
+		return
+	}
+	operands := make([]string, 0, len(*list))
+	for _, e := range *list {
+		lit, ok := asLiteral(e)
+		if !ok || lit == nil || lit.Null {
+			return
+		}
+		raw, isStr := lit.Value.(string)
+		if !isStr {
+			return
+		}
+		decoded, err := decodeCypherStringLiteral(raw)
+		if err != nil {
+			return
+		}
+		operands = append(operands, decoded)
+	}
+	// By NAME, for the reason NodesWithStringByName's doc gives: a PropID
+	// miss means the base never interned the property, which decides nothing
+	// about an overlay's delta.
+	seen := map[snapshot.NodeID]bool{}
+	var union []snapshot.NodeID
+	for _, operand := range operands {
+		ids, ok := pb.snap.NodesWithStringByName(pl.Symbol, snapshot.StringEquals, operand)
+		if !ok {
+			return
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				union = append(union, id)
+			}
+		}
+	}
+	nc.PropCandidates, nc.PropIndexed = union, true
+}
+
+// propOpLiteral recognizes `sym.<name>` on propSide and a string literal on
+// litSide, returning the property name and the decoded literal.
+func propOpLiteral(propSide, litSide cypher.Expression, sym string) (name, operand string, ok bool) {
+	pl, isProp := unwrapParens(propSide).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", "", false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return "", "", false
+	}
+	lit, isLit := asLiteral(litSide)
+	if !isLit || lit == nil || lit.Null {
+		return "", "", false
+	}
+	raw, isStr := lit.Value.(string)
+	if !isStr {
+		return "", "", false
+	}
+	decoded, err := decodeCypherStringLiteral(raw)
+	if err != nil {
+		return "", "", false
+	}
+	return pl.Symbol, decoded, true
+}
+
+// extractValueAnchor resolves a conjunct into an EXACT-match candidate set
+// through the value index: `sym.prop = <literal>`, `<literal> IN sym.prop`,
+// or a disjunction of those over the same symbol.
+//
+// These are the predicates PostgreSQL itself has no index for -- BloodHound's
+// schema carries none on `properties` at all -- so they were a scan on both
+// sides, and this engine lost them on per-row throughput alone. The shipped
+// "Principals with weak supported Kerberos encryption types" is the case:
+//
+//	MATCH (u:Base) WHERE 'DES-CBC-CRC' IN u.supportedencryptiontypes
+//	   OR 'DES-CBC-MD5' IN u.supportedencryptiontypes
+//	   OR 'RC4-HMAC-MD5' IN u.supportedencryptiontypes RETURN u
+//
+// which walked every Base node in the graph to find a few hundred.
+//
+// A DISJUNCTION resolves only when EVERY arm does: the union of the arms'
+// candidate sets bounds the OR exactly when nothing else can satisfy it, and
+// one unrecognized arm means some node outside the union may match, which
+// would make the source SHORT rather than merely loose.
+//
+// The set is costed before it is built (ValuePostingCount) and adopted only
+// when it beats what the symbol would otherwise enumerate, because the common
+// case is the opposite of selective -- `n.enabled = true` matches most of the
+// graph, and materializing a million-id posting list per query to then not
+// use it costs more than the scan it replaces.
+func (pb *partBuilder) extractValueAnchor(sym string, conjunct cypher.Expression) {
+	nc := pb.nodeConstraint(sym)
+
+	terms, ok := pb.valueAnchorTerms(sym, conjunct)
+	if !ok || len(terms) == 0 {
+		return
+	}
+
+	budget := pb.valueAnchorBudget(sym, nc)
+	total := 0
+	for _, t := range terms {
+		n, ok := pb.snap.ValuePostingCount(t.name, t.value, t.element)
+		if !ok {
+			return
+		}
+		total += n
+		if total*valueAnchorMargin > budget {
+			return
+		}
+	}
+
+	if len(terms) == 1 {
+		// One term's postings are already a set, so there is nothing to
+		// merge and nothing to copy.
+		ids, ok := pb.resolveValueTerm(terms[0])
+		if !ok {
+			return
+		}
+		nc.PropCandidates, nc.PropIndexed = ids, true
+		return
+	}
+
+	seen := make(map[snapshot.NodeID]bool, total)
+	var union []snapshot.NodeID
+	for _, t := range terms {
+		ids, ok := pb.resolveValueTerm(t)
+		if !ok {
+			return
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				union = append(union, id)
+			}
+		}
+	}
+	nc.PropCandidates, nc.PropIndexed = union, true
+}
+
+// valueAnchorMargin is how many times smaller an exact-match candidate set
+// must be than the source it would replace before it is adopted.
+//
+// A bare "smaller than" test is not enough, and the difference is not
+// academic. `t.enabled = true` matches ~900,000 of the ~920,000 Base nodes on
+// the benchmark graph: strictly smaller, so it was adopted, and the engine
+// then paid to materialize and delta-union a 900,000-id posting list per
+// query to avoid visiting 20,000 candidates. Two shipped prebuilts went from
+// 0.85x of PostgreSQL to 2.8x on exactly that. An index is worth preferring
+// when it is decisively better, not marginally.
+const valueAnchorMargin = 4
+
+// valueAnchorBudget is the size an exact-match candidate set has to beat:
+// whatever the symbol would otherwise enumerate, which is its smallest kind
+// bitmap, or the whole graph when it carries no label. An anchor already
+// resolved (by extractStringAnchor, say) is the bar instead when it is
+// smaller, so the cheapest source wins rather than the first one found.
+func (pb *partBuilder) valueAnchorBudget(sym string, nc *NodeConstraint) int {
+	budget := pb.snap.NodeCount()
+	if n, ok := pb.smallestKindCount(sym); ok && n < budget {
+		budget = n
+	}
+	if nc.PropIndexed && len(nc.PropCandidates) < budget {
+		budget = len(nc.PropCandidates)
+	}
+	return budget
+}
+
+// valueAnchorTerm is one exact-match lookup: a property name, the value, and
+// whether the property is a LIST the value must be a member of.
+type valueAnchorTerm struct {
+	name    string
+	value   any
+	element bool
+}
+
+func (pb *partBuilder) resolveValueTerm(t valueAnchorTerm) ([]snapshot.NodeID, bool) {
+	if t.element {
+		return pb.snap.NodesWithArrayElementByName(t.name, t.value)
+	}
+	return pb.snap.NodesWithValueByName(t.name, t.value)
+}
+
+// valueAnchorTerms flattens conjunct into the exact-match lookups whose union
+// bounds it, or reports that it cannot be bounded.
+func (pb *partBuilder) valueAnchorTerms(sym string, conjunct cypher.Expression) ([]valueAnchorTerm, bool) {
+	switch typed := unwrapParens(conjunct).(type) {
+	case *cypher.Disjunction:
+		if typed == nil {
+			return nil, false
+		}
+		var all []valueAnchorTerm
+		for _, arm := range typed.GetAll() {
+			terms, ok := pb.valueAnchorTerms(sym, arm)
+			if !ok || len(terms) == 0 {
+				return nil, false
+			}
+			all = append(all, terms...)
+		}
+		return all, true
+	default:
+		t, ok := pb.valueAnchorTerm(sym, conjunct)
+		if !ok {
+			return nil, false
+		}
+		return []valueAnchorTerm{t}, true
+	}
+}
+
+// valueAnchorTerm recognizes one `sym.prop = <literal>` or `<literal> IN
+// sym.prop`.
+func (pb *partBuilder) valueAnchorTerm(sym string, expr cypher.Expression) (valueAnchorTerm, bool) {
+	op, left, right, ok := asSingleComparison(expr)
+	if !ok {
+		return valueAnchorTerm{}, false
+	}
+	switch op {
+	case cypher.OperatorEquals:
+		if name, val, ok := propEqLiteral(left, right, sym); ok {
+			return valueAnchorTerm{name: name, value: val}, true
+		}
+		if name, val, ok := propEqLiteral(right, left, sym); ok {
+			return valueAnchorTerm{name: name, value: val}, true
+		}
+	case cypher.OperatorIn:
+		// `<literal> IN sym.prop` -- the LIST is on the right. The mirrored
+		// `sym.prop IN [...]` is a different shape entirely and belongs to
+		// extractStringInAnchor.
+		pl, isProp := unwrapParens(right).(*cypher.PropertyLookup)
+		if !isProp || pl == nil || pl.Symbol == "" {
+			return valueAnchorTerm{}, false
+		}
+		v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+		if !isVar || v == nil || v.Symbol != sym {
+			return valueAnchorTerm{}, false
+		}
+		val, ok := literalValue(left)
+		if !ok {
+			return valueAnchorTerm{}, false
+		}
+		return valueAnchorTerm{name: pl.Symbol, value: val, element: true}, true
+	}
+	return valueAnchorTerm{}, false
+}
+
+// propEqLiteral recognizes `sym.<name>` against any literal, returning the
+// property name and the literal's value in this package's value model.
+func propEqLiteral(propSide, litSide cypher.Expression, sym string) (name string, val any, ok bool) {
+	pl, isProp := unwrapParens(propSide).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", nil, false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return "", nil, false
+	}
+	value, ok := literalValue(litSide)
+	if !ok {
+		return "", nil, false
+	}
+	return pl.Symbol, value, true
+}
+
+// literalValue converts a literal expression to this package's value model,
+// or reports that it is not a usable literal. A NULL literal is refused: the
+// index holds present values, and `x = null` is never true anyway.
+func literalValue(expr cypher.Expression) (any, bool) {
+	lit, isLit := asLiteral(expr)
+	if !isLit || lit == nil || lit.Null {
+		return nil, false
+	}
+	val, ok, err := evalLiteralValue(lit)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return val, true
+}
+
+// coalescePropOpLiteral recognizes `COALESCE(sym.<prop>, <default>) <op>
+// <literal>` as an anchorable property predicate, which is how BloodHound
+// actually writes them: twenty-one of the 185 corpus queries wrap a property
+// in COALESCE, seventeen of those as `COALESCE(x, ”) CONTAINS ...`. Without
+// this the wrapper hides the property from the index completely -- the
+// predicate is a function call, not a property lookup -- so the symbol is
+// priced and enumerated as its bare kind bitmap. On the shipped "Nested
+// groups within Tier Zero / High Value" prebuilt that is every Group in the
+// graph standing in for the handful actually tagged.
+//
+// The rewrite is only valid when the DEFAULT cannot satisfy the predicate.
+// COALESCE yields the default exactly when the property is absent, so if
+// `<default> <op> <literal>` is false then no absent-property node can match
+// and the index population (which holds only nodes carrying the property) is
+// a superset of the matches -- which is the contract every candidate source
+// here owes. If the default DID satisfy it, absent nodes would match and the
+// population would be SHORT, which is a wrong answer rather than a slow one.
+func coalescePropOpLiteral(propSide, litSide cypher.Expression, sym string, match snapshot.StringMatch) (name, operand string, ok bool) {
+	fi, isFunc := unwrapParens(propSide).(*cypher.FunctionInvocation)
+	if !isFunc || fi == nil || strings.ToLower(fi.Name) != "coalesce" || len(fi.Arguments) != 2 {
+		return "", "", false
+	}
+	pl, isProp := unwrapParens(fi.Arguments[0]).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", "", false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol != sym {
+		return "", "", false
+	}
+	defLit, isLit := asLiteral(fi.Arguments[1])
+	if !isLit || defLit == nil {
+		return "", "", false
+	}
+
+	operandLit, isLit := asLiteral(litSide)
+	if !isLit || operandLit == nil || operandLit.Null {
+		return "", "", false
+	}
+	rawOperand, isStr := operandLit.Value.(string)
+	if !isStr {
+		return "", "", false
+	}
+	decoded, err := decodeCypherStringLiteral(rawOperand)
+	if err != nil {
+		return "", "", false
+	}
+	if !coalesceDefaultRejects(defLit, match, decoded) {
+		return "", "", false
+	}
+	return pl.Symbol, decoded, true
+}
+
+// coalesceDefaultRejects reports whether def, the value COALESCE yields for a
+// node that does not carry the property at all, fails the predicate -- the
+// condition that makes the property index a superset of the matches.
+func coalesceDefaultRejects(def *cypher.Literal, match snapshot.StringMatch, operand string) bool {
+	if def.Null {
+		// COALESCE(x, null) is null for an absent property, and null
+		// satisfies no string predicate.
+		return true
+	}
+	raw, isStr := def.Value.(string)
+	if !isStr {
+		// A number or boolean default: pg's jsonb comparison makes a type
+		// mismatch a definite false, so it satisfies no string predicate.
+		return true
+	}
+	s, err := decodeCypherStringLiteral(raw)
+	if err != nil {
+		return false
+	}
+	switch match {
+	case snapshot.StringEquals:
+		return s != operand
+	case snapshot.StringPrefix:
+		return !strings.HasPrefix(s, operand)
+	case snapshot.StringSuffix:
+		return !strings.HasSuffix(s, operand)
+	case snapshot.StringContains:
+		return !strings.Contains(s, operand)
+	default:
+		return false
+	}
 }
 
 // extractKindConjunct folds a WHERE conjunct that is a bare (possibly
@@ -1435,31 +2357,33 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 // on the 500k benchmark graph, that class sat at 250-2600ms against
 // PostgreSQL's ~20ms index probe.
 //
-// Two deliberate refusals:
+// One deliberate refusal: only an EXCLUSIVE matcher qualifies (`n:A:B` = has
+// ALL, the shape the frontend always builds for source-level matchers), since
+// Kinds is an AND list and a non-exclusive (ANY) matcher cannot be folded into
+// it. A disjunction of matchers (`n:A OR n:B`) arrives as a Disjunction, not a
+// KindMatcher, and is likewise left alone.
 //
-//   - Only an EXCLUSIVE matcher qualifies (`n:A:B` = has ALL, the shape the
-//     frontend always builds for source-level matchers): Kinds is an AND
-//     list, so a non-exclusive (ANY) matcher cannot be folded into it. A
-//     disjunction of matchers (`n:A OR n:B`) arrives as a Disjunction, not a
-//     KindMatcher, and is likewise left alone.
-//   - A symbol that is an endpoint of a variable-length or shortestPath
-//     step keeps its NodeConstraint.Kinds as WRITTEN in the pattern. Those
-//     routes choose their seeding side by comparing the two endpoints'
-//     candidate-source ranks (varLengthReverseEligible), and that contract
-//     was calibrated -- twice, measurably -- around kind tests written in
-//     WHERE not counting as anchors (see endpointNarrows/kindOnlyPredicate
-//     and scanEquivalentNearSide). Folding a WHERE kind into such a
-//     symbol's Kinds would silently re-route those queries; the anchor win
-//     this extraction exists for is the pure node-scan shape, which has no
-//     such step.
+// Endpoints of a variable-length step used to be refused as well, and that
+// refusal is gone. It existed because the reverse-routing decision was once a
+// pair of structural preconditions ("the near side narrows nothing and is
+// scan-equivalent") rather than a cost comparison, so any change to a
+// traversal endpoint's Kinds re-routed queries unpredictably and the safe
+// move was to keep WHERE kinds invisible there. varLengthReverseEligible now
+// prices both endpoints on the same basis and reverses only on a wide margin,
+// which means the opposite is true: hiding a kind from it makes it decide on
+// WRONG numbers. `MATCH p=(t:Group)<-[:MemberOf*..]-(s:Group) WHERE
+// (t:Tag_Tier_Zero)` is the case that proves it -- with the tag hidden both
+// ends price as "every Group", the route cannot tell them apart, and the walk
+// seeds from every group in the graph to find the handful that are tagged.
+//
+// The fold is a pure narrowing either way: an exclusive matcher means "has
+// all of these kinds", which is exactly what an added entry in the AND list
+// asks, so no row can be admitted that the predicate would have rejected.
 //
 // checkExpr ran before pushdown, so every kind name here already resolved
 // against the snapshot (checkKindMatcher rejects unknowns); the second
 // lookup is belt-and-braces, never a behavior change.
 func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expression) {
-	if pb.symbolInTraversalStep(sym) {
-		return
-	}
 	km, ok := unwrapParens(conjunct).(*cypher.KindMatcher)
 	if !ok || km == nil || !km.IsExclusive {
 		return
@@ -1474,24 +2398,6 @@ func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expressio
 			nc.Kinds = append(nc.Kinds, id)
 		}
 	}
-}
-
-// symbolInTraversalStep reports whether sym is an endpoint of any
-// variable-length or shortestPath step -- the steps whose seeding-side
-// choice reads endpoint ranks, and which extractKindConjunct therefore
-// leaves untouched. Chains are complete before the WHERE loop runs
-// (planPart processes every pattern first), so this sees every step.
-func (pb *partBuilder) symbolInTraversalStep(sym string) bool {
-	for i := range pb.chains {
-		step := &pb.chains[i]
-		if step.Range == nil && step.Shortest == ShortestNone {
-			continue
-		}
-		if step.FromSym == sym || step.ToSym == sym {
-			return true
-		}
-	}
-	return false
 }
 
 // extractIDAnchor recognizes `id(sym) = <literal>` (either operand order)
@@ -2315,16 +3221,25 @@ func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 		return false
 	}
 
-	from, ok := pb.checkPatternPredicateEndpoint(pp.PatternElements[0])
-	if !ok {
-		return false
-	}
 	rel, isRel := pp.PatternElements[1].Element.(*cypher.RelationshipPattern)
 	if !isRel || rel == nil || rel.Range != nil || rel.Variable != nil || rel.Properties != nil {
 		return false
 	}
-	to, ok := pb.checkPatternPredicateEndpoint(pp.PatternElements[2])
-	if !ok {
+
+	// Each endpoint is either a bound variable or an ANONYMOUS node carrying
+	// kind labels, and at least one must be bound -- that is the side whose
+	// adjacency the evaluator walks. Two anonymous endpoints would be an
+	// existential over the whole graph with nothing to anchor it, and a
+	// NAMED fresh variable would have to BIND, which a predicate does not do;
+	// both stay rejected.
+	from, fromBound := pb.checkPatternPredicateEndpoint(pp.PatternElements[0])
+	to, toBound := pb.checkPatternPredicateEndpoint(pp.PatternElements[2])
+	fromAnon := !fromBound && pb.checkPatternPredicateAnonEndpoint(pp.PatternElements[0])
+	toAnon := !toBound && pb.checkPatternPredicateAnonEndpoint(pp.PatternElements[2])
+	fromOK := fromBound || fromAnon
+	toOK := toBound || toAnon
+	anchored := fromBound || toBound
+	if !fromOK || !toOK || !anchored {
 		return false
 	}
 
@@ -2349,8 +3264,43 @@ func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 	// since resolveEndpointSet's per-candidate EvalPredicate call handles a
 	// self-referencing predicate the same way any other single-symbol one
 	// works.
-	pb.touched[from] = true
-	pb.touched[to] = true
+	// Only a bound endpoint marks a symbol touched; an anonymous one names
+	// no symbol at all. A predicate that touches exactly one symbol pushes
+	// into that symbol's own Predicates, which is what makes the anonymous
+	// shape cheap: `WHERE NOT (u)-[:MemberOf]->(:Group)` is tested per
+	// candidate during the anchor scan rather than after a full row is
+	// assembled.
+	if fromBound {
+		pb.touched[from] = true
+	}
+	if toBound {
+		pb.touched[to] = true
+	}
+	return true
+}
+
+// checkPatternPredicateAnonEndpoint validates one endpoint as a fully
+// ANONYMOUS node pattern -- no variable, no inline properties -- optionally
+// carrying kind labels, every one of which must resolve against this
+// snapshot. This is the `(:Group)` of `WHERE NOT (u)-[:MemberOf]->(:Group)`:
+// it binds nothing, so the predicate stays the pure existence check
+// evalPatternPredicate implements and pg lowers to.
+func (pb *partBuilder) checkPatternPredicateAnonEndpoint(el *cypher.PatternElement) bool {
+	if el == nil {
+		return false
+	}
+	np, isNode := el.Element.(*cypher.NodePattern)
+	if !isNode || np == nil || np.Variable != nil || np.Properties != nil {
+		return false
+	}
+	for _, k := range np.Kinds {
+		if _, ok := pb.snap.Kinds().ID(k.String()); !ok {
+			// An unknown label cannot match anything, which the evaluator
+			// represents faithfully; but declining keeps plan-time kind
+			// resolution uniform with every other checker here.
+			return false
+		}
+	}
 	return true
 }
 
@@ -2741,6 +3691,13 @@ func planWith(inputKnown map[string]symKind, w *cypher.With) (WithClause, map[st
 func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) (WithAggregate, bool) {
 	switch strings.ToLower(fi.Name) {
 	case cypher.CountFunction:
+		// COUNT(*) reaches here as a single *cypher.RangeQuantifier
+		// argument holding "*", not as an empty argument list -- the
+		// grammar reuses that node for the star. It is the group's own row
+		// count; pg names the column `count`, as it does for COUNT(<expr>).
+		if isStarArgument(fi) {
+			return WithAggregate{Count: &CountAgg{Star: true}}, true
+		}
 		if len(fi.Arguments) != 1 {
 			return WithAggregate{}, false
 		}
@@ -2769,6 +3726,289 @@ func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) 
 
 	default:
 		return WithAggregate{}, false
+	}
+}
+
+// aggregateAliasPrefix names the synthetic symbols desugarReturnAggregates
+// introduces. "$" can never begin a real Cypher identifier (the same
+// reasoning symbolFor and pathStepArcKey rely on), so these can never
+// collide with a user's own variable.
+const aggregateAliasPrefix = "$ret"
+
+// pgPlaceholderColumn is the column name PostgreSQL gives a projection it
+// was handed with no SQL alias -- an unaliased property lookup, as dawgs
+// translates it. Pinned live by TestTryCypherKeysMatchOracle.
+const pgPlaceholderColumn = "?column?"
+
+// containsAggregateCall reports whether expr contains a call to an
+// aggregate function anywhere inside it. Only a TOP-LEVEL aggregate is
+// servable (see desugarReturnAggregates), so a nested one -- `count(n) + 1`
+// -- is detected here purely so the whole query can decline rather than be
+// silently mis-grouped.
+func containsAggregateCall(expr cypher.Expression) bool {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return false
+		}
+		if isAggregateName(e.Name) {
+			return true
+		}
+		for _, arg := range e.Arguments {
+			if containsAggregateCall(arg) {
+				return true
+			}
+		}
+		return false
+	case *cypher.ArithmeticExpression:
+		if e == nil {
+			return false
+		}
+		if containsAggregateCall(e.Left) {
+			return true
+		}
+		for _, p := range e.Partials {
+			if p != nil && containsAggregateCall(p.Right) {
+				return true
+			}
+		}
+		return false
+	case *cypher.UnaryAddOrSubtractExpression:
+		return e != nil && containsAggregateCall(e.Right)
+	case *cypher.ListLiteral:
+		if e == nil {
+			return false
+		}
+		for _, el := range *e {
+			if containsAggregateCall(el) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// isStarArgument recognizes the `(*)` argument list of COUNT(*).
+func isStarArgument(fi *cypher.FunctionInvocation) bool {
+	if len(fi.Arguments) != 1 {
+		return false
+	}
+	rq, ok := unwrapParens(fi.Arguments[0]).(*cypher.RangeQuantifier)
+	return ok && rq != nil && rq.Value == "*"
+}
+
+// projectionKeyOf canonicalizes a projectable expression into a comparable
+// string, so an ORDER BY item can be matched against the RETURN item that
+// computed it (`RETURN u.name, count(u) ORDER BY count(u) DESC`). Only the
+// shapes desugarReturnAggregates itself projects are canonicalized; ok is
+// false for anything else, which simply means no rewrite is attempted.
+func projectionKeyOf(expr cypher.Expression) (string, bool) {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.Variable:
+		if e == nil || e.Symbol == "" {
+			return "", false
+		}
+		return "v:" + e.Symbol, true
+	case *cypher.PropertyLookup:
+		if e == nil {
+			return "", false
+		}
+		v, ok := unwrapParens(e.Atom).(*cypher.Variable)
+		if !ok || v == nil {
+			return "", false
+		}
+		return "p:" + v.Symbol + "." + e.Symbol, true
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return "", false
+		}
+		key := "f:" + strings.ToLower(e.Name)
+		if e.Distinct {
+			key += ":distinct"
+		}
+		if isStarArgument(e) {
+			return key + "|*", true
+		}
+		for _, arg := range e.Arguments {
+			k, ok := projectionKeyOf(arg)
+			if !ok {
+				return "", false
+			}
+			key += "|" + k
+		}
+		return key, true
+	default:
+		return "", false
+	}
+}
+
+func isAggregateName(name string) bool {
+	switch strings.ToLower(name) {
+	case cypher.CountFunction, cypher.CollectFunction:
+		return true
+	}
+	return false
+}
+
+// desugarReturnAggregates rewrites a RETURN clause containing aggregates
+// into an implicit grouping plus a RETURN over its results: `RETURN
+// u.domain, COUNT(u)` becomes, in effect, `WITH u.domain AS $ret0,
+// COUNT(u) AS $ret1 RETURN $ret0, $ret1` -- with each output column keeping
+// the name PostgreSQL itself would give it.
+//
+// Cypher's own rule decides the grouping: every RETURN item that is NOT an
+// aggregate is a grouping key, and the aggregates fold over each group.
+// Routing this through the SAME WithClause the explicit WITH boundary uses
+// means there is one grouping implementation rather than two, and every
+// property the WITH path already has -- deterministic first-occurrence
+// group order, the "aggregate with no GROUP BY produces exactly one row
+// even over zero input rows" rule -- applies here unchanged.
+//
+// Column naming was taken from a live PostgreSQL oracle rather than
+// assumed: an unaliased aggregate is named after its FUNCTION
+// (`RETURN count(n)` -> "count", `RETURN sum(1)` -> "sum"), an unaliased
+// property lookup is pg's own `?column?` placeholder, and an explicit
+// `AS x` is x. planReturn's projectionName/OutputName machinery already
+// implements the last two; this function only has to preserve the item's
+// original naming inputs while swapping the expression underneath, which
+// it does by aliasing every rewritten item explicitly and letting
+// ProjectionOutput.OutputName carry pg's name.
+//
+// Returns (ret, nil, nil, true) unchanged when RETURN has no aggregate.
+func desugarReturnAggregates(known map[string]symKind, ret *cypher.Return) (*cypher.Return, *WithClause, map[string]symKind, bool) {
+	if ret == nil || ret.Projection == nil || ret.Projection.All {
+		return ret, nil, nil, true
+	}
+	any := false
+	for _, raw := range ret.Projection.Items {
+		item, ok := raw.(*cypher.ProjectionItem)
+		if !ok || item == nil {
+			return ret, nil, nil, true // planReturn rejects it on its own terms
+		}
+		if containsAggregateCall(item.Expression) {
+			any = true
+		}
+	}
+	if !any {
+		return ret, nil, nil, true
+	}
+
+	wc := &WithClause{}
+	groupKnown := map[string]symKind{}
+	newItems := make([]cypher.Expression, 0, len(ret.Projection.Items))
+	aliasByKey := map[string]string{}
+
+	for i, raw := range ret.Projection.Items {
+		item := raw.(*cypher.ProjectionItem)
+		alias := aggregateAliasPrefix + itoa(i)
+
+		// pg's own column name for this item, computed from the ORIGINAL
+		// expression before it is swapped out.
+		outName, ok := aggregateOutputName(item)
+		if !ok {
+			return nil, nil, nil, false
+		}
+
+		bare := unwrapParens(item.Expression)
+		if fi, isCall := bare.(*cypher.FunctionInvocation); isCall && fi != nil && isAggregateName(fi.Name) {
+			agg, ok := classifyAggregate(known, fi)
+			if !ok {
+				return nil, nil, nil, false
+			}
+			if agg.Count == nil {
+				// COLLECT is servable only as WITH's id-set membership
+				// aggregate (CollectMembershipAgg's own doc): its value is
+				// a set of node ids for a later IN test, NOT the list of
+				// node composites PostgreSQL would project. Projecting it
+				// would return a different value than pg for the same
+				// query, so RETURN-position COLLECT stays delegated.
+				return nil, nil, nil, false
+			}
+			agg.Alias = alias
+			wc.Aggregates = append(wc.Aggregates, agg)
+		} else {
+			if containsAggregateCall(item.Expression) {
+				// An aggregate nested inside a larger expression
+				// (`count(n) + 1`): grouping it correctly means evaluating
+				// the surrounding arithmetic AFTER the fold, which this
+				// projection layer does not do. Decline rather than group
+				// by an expression containing its own aggregate.
+				return nil, nil, nil, false
+			}
+			wc.Computed = append(wc.Computed, WithComputed{Alias: alias, Expr: item.Expression})
+			wc.GroupKeys = append(wc.GroupKeys, alias)
+		}
+		groupKnown[alias] = symScalar
+		if key, ok := projectionKeyOf(item.Expression); ok {
+			aliasByKey[key] = alias
+		}
+
+		newItems = append(newItems, &cypher.ProjectionItem{
+			Expression: &cypher.Variable{Symbol: alias},
+			Alias:      &cypher.Variable{Symbol: outName},
+		})
+	}
+
+	// ORDER BY may name one of the RETURN expressions rather than an alias
+	// -- `RETURN u.name, count(u) ORDER BY count(u) DESC` is the corpus's
+	// own shape. Since the expression has just been replaced by a synthetic
+	// alias, the sort key has to follow it; planOrder only ever accepts a
+	// bare variable, and after this rewrite that is exactly what it sees.
+	order := ret.Projection.Order
+	if order != nil && len(aliasByKey) > 0 {
+		items := make([]*cypher.SortItem, 0, len(order.Items))
+		for _, si := range order.Items {
+			if si == nil {
+				return nil, nil, nil, false
+			}
+			ns := &cypher.SortItem{Ascending: si.Ascending, Expression: si.Expression}
+			if key, ok := projectionKeyOf(si.Expression); ok {
+				if alias, found := aliasByKey[key]; found {
+					ns.Expression = &cypher.Variable{Symbol: alias}
+				}
+			}
+			items = append(items, ns)
+		}
+		order = &cypher.Order{Items: items}
+	}
+
+	rewritten := &cypher.Return{Projection: &cypher.Projection{
+		Distinct: ret.Projection.Distinct,
+		Items:    newItems,
+		Order:    order,
+		Skip:     ret.Projection.Skip,
+		Limit:    ret.Projection.Limit,
+	}}
+	return rewritten, wc, groupKnown, true
+}
+
+// aggregateOutputName returns the column name PostgreSQL gives one RETURN
+// item, verified against a live pg oracle: an explicit alias wins; an
+// unaliased aggregate call is named after the function; an unaliased
+// property lookup is pg's `?column?` placeholder; an unaliased bare
+// variable is the variable. Anything else this layer does not name is
+// refused rather than guessed at.
+func aggregateOutputName(item *cypher.ProjectionItem) (string, bool) {
+	if item.Alias != nil && item.Alias.Symbol != "" {
+		return item.Alias.Symbol, true
+	}
+	switch e := unwrapParens(item.Expression).(type) {
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return "", false
+		}
+		return strings.ToLower(e.Name), true
+	case *cypher.Variable:
+		if e == nil || e.Symbol == "" {
+			return "", false
+		}
+		return e.Symbol, true
+	case *cypher.PropertyLookup:
+		return pgPlaceholderColumn, true
+	default:
+		return "", false
 	}
 }
 
@@ -2807,6 +4047,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 	// isStaticallyNumericScalar accepts its own top-level expression --
 	// planOrder's second (beyond bare count aliases) admission criterion.
 	projectedNumeric := map[string]bool{}
+	projectedProperty := map[string]bool{}
 
 	for _, raw := range proj.Items {
 		item, ok := raw.(*cypher.ProjectionItem)
@@ -2846,6 +4087,21 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		projectedAliases[name] = true
 		projectedKinds[name] = itemKind
 		projectedNumeric[name] = isStaticallyNumericScalar(item.Expression, numericScalars)
+		// A bare property lookup is eligible for planOrder's runtime-numeric
+		// ORDER BY admission -- but only when the snapshot says this
+		// property is never string-valued anywhere. PostgreSQL orders
+		// strings by a database collation this package cannot know
+		// (value.go's Compare refuses them outright), so a column that
+		// holds even one string must delegate. Asking the property index
+		// makes that a PLAN-time answer: the alternative, discovering it
+		// mid-sort, would materialize the whole result before declining.
+		if pl, isProp := unwrapParens(item.Expression).(*cypher.PropertyLookup); isProp && pl != nil {
+			if propID, known := snap.PropIDByName(pl.Symbol); known {
+				if hasString, answered := snap.HasStringValue(propID); answered && !hasString {
+					projectedProperty[name] = true
+				}
+			}
+		}
 
 		outputName := name
 		if item.Alias == nil || item.Alias.Symbol == "" {
@@ -2855,7 +4111,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 			// unaliased shape Plan accepts, and dawgs DOES alias that one to
 			// the symbol itself.
 			if _, isProp := unwrapParens(item.Expression).(*cypher.PropertyLookup); isProp {
-				outputName = "?column?"
+				outputName = pgPlaceholderColumn
 			}
 		}
 
@@ -2867,7 +4123,26 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		})
 	}
 
-	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, countAliases, proj.Distinct)
+	orderKeys, ok := planOrder(proj.Order, projectedKinds, projectedNumeric, projectedProperty, countAliases, proj.Distinct,
+		func(expr cypher.Expression) bool {
+			// An unprojected ORDER BY key is orderable off the row when the
+			// symbol is a node this Part bound and the property is never
+			// string-valued anywhere in the snapshot (pg's collation).
+			pl, isProp := unwrapParens(expr).(*cypher.PropertyLookup)
+			if !isProp || pl == nil {
+				return false
+			}
+			v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+			if !isVar || v == nil || known[v.Symbol] != symNode {
+				return false
+			}
+			propID, interned := snap.PropIDByName(pl.Symbol)
+			if !interned {
+				return false
+			}
+			hasString, answered := snap.HasStringValue(propID)
+			return answered && !hasString
+		})
 	if !ok {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -3083,6 +4358,21 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 	}
 }
 
+// orderPropertyName renders an ORDER BY item that is a bare property
+// lookup as the same "sym.prop" handle projectionName gives the identical
+// RETURN item, so the two resolve to one another.
+func orderPropertyName(expr cypher.Expression) (string, bool) {
+	pl, ok := unwrapParens(expr).(*cypher.PropertyLookup)
+	if !ok || pl == nil || pl.Symbol == "" {
+		return "", false
+	}
+	v, ok := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !ok || v == nil || v.Symbol == "" {
+		return "", false
+	}
+	return v.Symbol + "." + pl.Symbol, true
+}
+
 // planOrder validates ORDER BY: every item must be a bare Variable (after
 // unwrapping parens) naming either a RETURN-projected alias or -- the
 // controller's "bare count alias" exception -- a COUNT aggregate alias from
@@ -3116,7 +4406,7 @@ func containsFlaggedCallNested(expr cypher.Expression) bool {
 // exactly the shape the probe found unsafe. Every other alias shape
 // (property lookups, arbitrary function calls, node/edge/path values)
 // rejects outright, delegating the whole query to PostgreSQL.
-func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric map[string]bool, countAliases map[string]bool, distinct bool) ([]OrderKey, bool) {
+func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projectedNumeric, projectedProperty map[string]bool, countAliases map[string]bool, distinct bool, orderableRowProperty func(cypher.Expression) bool) ([]OrderKey, bool) {
 	if order == nil {
 		return nil, true
 	}
@@ -3127,7 +4417,35 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 		}
 		v, ok := unwrapParens(item.Expression).(*cypher.Variable)
 		if !ok || v == nil {
-			return nil, false
+			// `ORDER BY n.score` names the same thing `RETURN n.score`
+			// projects, and projectionName gives both the identical
+			// "n.score" handle -- so resolve the property lookup to that
+			// projected alias instead of refusing every non-variable item.
+			// Anything that is not a projected alias still refuses.
+			name, named := orderPropertyName(item.Expression)
+			if !named {
+				return nil, false
+			}
+			if _, isProjected := projectedKinds[name]; !isProjected {
+				// Not projected. PostgreSQL still sorts by it -- `RETURN u
+				// ORDER BY u.lastlogontimestamp DESC LIMIT 10` is the top-k
+				// shape -- so evaluate the property off each row, under the
+				// same never-string gate the projected case uses. Under
+				// DISTINCT pg rejects an unprojected sort key outright
+				// ("for SELECT DISTINCT, ORDER BY expressions must appear in
+				// select list"), so that combination keeps declining.
+				if distinct || !orderableRowProperty(item.Expression) {
+					return nil, false
+				}
+				keys = append(keys, OrderKey{
+					Symbol:         name,
+					Descending:     !item.Ascending,
+					RuntimeNumeric: true,
+					Expr:           item.Expression,
+				})
+				continue
+			}
+			v = &cypher.Variable{Symbol: name}
 		}
 		// The carried-COUNT exception below orders by a value the
 		// projection does not output. PostgreSQL allows that for a plain
@@ -3152,7 +4470,20 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 			return nil, false
 		}
 		if !projectedNumeric[v.Symbol] {
-			return nil, false
+			// A bare PROPERTY lookup cannot be proven numeric statically --
+			// what a property holds is a per-node fact -- but it is the
+			// single most common thing anyone sorts by (`ORDER BY
+			// n.lastlogontimestamp DESC LIMIT 10`). Admit it as a
+			// RUNTIME-checked key: sortRows serves it only if every value
+			// it actually sees is a number or a null, and declines the
+			// whole query otherwise, so a string column still delegates
+			// rather than risk PostgreSQL's collation (value.go's Compare
+			// refuses strings outright, ErrCollation).
+			if !projectedProperty[v.Symbol] {
+				return nil, false
+			}
+			keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending, RuntimeNumeric: true})
+			continue
 		}
 		keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})
 	}
@@ -3219,4 +4550,39 @@ func isStaticallyNumericScalar(expr cypher.Expression, numericScalars map[string
 	default:
 		return false
 	}
+}
+
+// coalesceDefaultOf returns the string COALESCE(sym.prop, <default>) yields
+// for a node that does not carry the property, for the operand shape
+// coalescePropOpLiteral has already accepted. "" for a default that is not a
+// string literal -- a number or boolean default satisfies no string
+// predicate, and the empty string is the most permissive stand-in, so
+// treating it as the default can only make a caller MORE cautious.
+func coalesceDefaultOf(left, right cypher.Expression, sym string) string {
+	for _, side := range []cypher.Expression{left, right} {
+		fi, isFunc := unwrapParens(side).(*cypher.FunctionInvocation)
+		if !isFunc || fi == nil || strings.ToLower(fi.Name) != "coalesce" || len(fi.Arguments) != 2 {
+			continue
+		}
+		pl, isProp := unwrapParens(fi.Arguments[0]).(*cypher.PropertyLookup)
+		if !isProp || pl == nil {
+			continue
+		}
+		v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+		if !isVar || v == nil || v.Symbol != sym {
+			continue
+		}
+		defLit, isLit := asLiteral(fi.Arguments[1])
+		if !isLit || defLit == nil || defLit.Null {
+			continue
+		}
+		raw, isStr := defLit.Value.(string)
+		if !isStr {
+			continue
+		}
+		if decoded, err := decodeCypherStringLiteral(raw); err == nil {
+			return decoded
+		}
+	}
+	return ""
 }

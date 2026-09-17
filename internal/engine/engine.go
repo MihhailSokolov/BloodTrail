@@ -541,6 +541,9 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 	if e.applyEpoch.Load() != epoch {
 		return false
 	}
+	// Build the derived read indexes now, on the write path, rather than
+	// leaving them for whichever query arrives first -- see Snapshot.Warm.
+	view.Base().Warm()
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 
@@ -843,7 +846,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork, MaxLiveRows: maxCypherLiveRows})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
 		return nil, false

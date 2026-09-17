@@ -31,6 +31,13 @@ fits in about 0.6 GB for 5 million nodes and 50 million edges as compressed-spar
 arrays, and a single CPU core sweeps every edge in under a second. See
 [bench/csrbench](bench/csrbench) for the measurement.
 
+On a 1M-node hybrid AD/Entra forest, every query BloodHound ships plus a set written to
+attack the engine's weak spots totals 85.6s on the stock PostgreSQL driver and 7.9s with
+BloodTrail -- and the worst shipped prebuilt goes from 49 seconds to 63ms. 122 of 182
+scenarios are faster, the worst case is 1.5x slower on a query both answer in about
+20ms, and the cost is memory. [BENCHMARK.md](BENCHMARK.md) has every scenario, the
+method, and what the numbers do not show.
+
 ## How it works
 
 - BloodTrail is a DAWGS driver, selected with `graph_driver: "bloodtrail"`. BloodHound's
@@ -610,6 +617,36 @@ validated.
   backup taken at the start of that install holds the state it replaced.
 - `bloodtrail status` prints both the image the compose files name and the image the
   container is actually running, which differ while an install or rollback is half done.
+
+### Give the container a memory limit
+
+BloodTrail holds the graph in memory, so the container's memory ceiling is the one
+setting worth choosing deliberately. Go's collector, left alone, lets the heap grow to
+roughly twice what is live before collecting, and on a 1M-node graph that is the
+difference between a container resident in 1.6GiB and one resident in 3.9GiB for the
+same work.
+
+Setting `GOMEMLIMIT` on the BloodHound service caps it:
+
+```yaml
+services:
+  bloodhound:
+    environment:
+      - bhe_graph_driver=bloodtrail
+      - GOMEMLIMIT=2800MiB
+```
+
+Measured on the 1M-node/2.4M-edge benchmark graph, that took the container from 3.9GiB
+resident to 1.6-2.2GiB with no latency cost -- the 185-query corpus was fractionally
+FASTER, because a host that is not short of memory serves every request better. Pick a
+value with headroom over `bloodtrail status`'s reported snapshot size (the engine logs
+it as `bytes` on every `snapshot rebuilt`); allow roughly three times that, since the
+derived read indexes and each query's working set live alongside it.
+
+`GOMEMLIMIT` is a SOFT limit: Go collects harder as it approaches, and never fails an
+allocation to stay under. `GOGC` is not a substitute -- raising it to trade memory for
+CPU does the opposite of what is wanted here, and on this graph `GOGC=400` had the
+container OOM-killed.
 
 ## What's here, and what's not
 

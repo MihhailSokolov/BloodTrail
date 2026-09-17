@@ -8,7 +8,18 @@
 /cypherbench
 /applybench
 /shgen
+# Each bench tool's binary is also ignored where `go build` drops it by
+# default -- next to its own main package. The root-anchored entries above
+# only cover `go build -o <name>` run from the repo root, which let
+# bench/shgen/shgen (4.5MB, and carrying the build machine's Go toolchain
+# paths) reach the public repo.
+bench/adgen/adgen
+bench/applybench/applybench
+bench/builderbench/builderbench
 bench/csrbench/csrbench
+bench/cypherbench/cypherbench
+bench/pathbench/pathbench
+bench/shgen/shgen
 
 # Benchmark and render scratch
 .bench/

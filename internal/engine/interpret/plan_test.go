@@ -259,7 +259,6 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "duplicate identical id anchors dedup", cypher: `MATCH (s) WHERE id(s) = 1 AND id(s) = 1 RETURN s`, want: true},
 		{name: "unwind", cypher: `UNWIND [1,2,3] AS x RETURN x`, want: false},
 		{name: "quantifier", cypher: `MATCH (n:User) WHERE ANY(x IN n.spns WHERE x = 'a') RETURN n`, want: false},
-		{name: "pattern predicate", cypher: `MATCH (n:User) WHERE (n)-[:X]->() RETURN n`, want: false},
 
 		// Pattern-predicate gap fix: the narrow WHERE-clause pattern-predicate
 		// shape pg itself supports for a single fixed-length step between
@@ -274,11 +273,21 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "pattern predicate no kind restriction ok", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-->(m) RETURN n`, want: true},
 		{name: "pattern predicate self-reference ok", cypher: `MATCH (n:User) WHERE (n)-[:X]->(n) RETURN n`, want: true},
 		{name: "pattern predicate unknown kind rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:NoSuchKind]->(m) RETURN n`, want: false},
+		// An ANONYMOUS endpoint binds nothing, so the predicate stays the
+		// existence check pg lowers it to and is now served, with or without
+		// labels on it. A NAMED fresh variable would have to bind and is
+		// still rejected, as are two anonymous endpoints (nothing to anchor
+		// the walk on) and an anonymous label this snapshot never interned.
+		{name: "pattern predicate anonymous endpoint ok", cypher: `MATCH (n:User) WHERE (n)-[:X]->() RETURN n`, want: true},
+		{name: "pattern predicate anonymous kinded endpoint ok", cypher: `MATCH (n:User) WHERE NOT (n)-[:X]->(:Computer) RETURN n`, want: true},
+		{name: "pattern predicate anonymous kinded source ok", cypher: `MATCH (n:User) WHERE (:Computer)-[:X]->(n) RETURN n`, want: true},
+		{name: "pattern predicate both endpoints anonymous rejected", cypher: `MATCH (n:User) WHERE ()-[:X]->(:Computer) RETURN n`, want: false},
+		{name: "pattern predicate fresh named endpoint rejected", cypher: `MATCH (n:User) WHERE (n)-[:X]->(fresh:Computer) RETURN n`, want: false},
+		{name: "pattern predicate anonymous unknown kind rejected", cypher: `MATCH (n:User) WHERE (n)-[:X]->(:NoSuchKind) RETURN n`, want: false},
 		{name: "pattern predicate expansion rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X*1..]->(m) RETURN n`, want: false},
 		{name: "pattern predicate multi-hop chain rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer),(o:User) WHERE (n)-[:X]->(m)-[:X]->(o) RETURN n`, want: false},
 		{name: "pattern predicate named relationship variable rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[r:X]->(m) RETURN n`, want: false},
 		{name: "pattern predicate relationship inline map rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X {a:1}]->(m) RETURN n`, want: false},
-		{name: "pattern predicate anonymous endpoint rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->() RETURN n`, want: false},
 		{name: "pattern predicate fresh endpoint variable rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->(z) RETURN n`, want: false},
 		{name: "pattern predicate endpoint re-labeled in predicate rejected", cypher: `MATCH (n:User)-[:X]->(m:Computer) WHERE (n)-[:X]->(m:Group) RETURN n`, want: false},
 		{name: "list comprehension", cypher: `MATCH (n:User) RETURN [x IN n.spns] AS s`, want: false},

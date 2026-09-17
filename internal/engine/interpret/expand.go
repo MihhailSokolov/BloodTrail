@@ -135,6 +135,7 @@ package interpret
 import (
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
 	"github.com/specterops/dawgs/graph"
@@ -268,7 +269,13 @@ func expandVarLengthComponent(env *Env, meter *workMeter, part *Part, step *Step
 // the EdgeSym/FromSym==ToSym decline above happens BEFORE any anchor scan is
 // charged for.
 func expandVarLengthComponentForward(env *Env, meter *workMeter, part *Part, step *Step) ([]*Row, error) {
-	seeds, err := scanAnchor(env, meter, step.FromSym, part.Nodes[step.FromSym])
+	// The step's own relationship kinds narrow the seed set: a node with no
+	// admissible outgoing edge cannot start a trail of minimum length one, so
+	// enumerating it is pure waste. This is what keeps
+	// `(:AZBase)-[:AZGlobalAdmin*1..]->(:AZTenant)` from seeding all 84,481
+	// AZBase nodes to reach the graph's single AZGlobalAdmin edge.
+	seeds, err := scanAnchorHinted(env, meter, step.FromSym, part.Nodes[step.FromSym],
+		newEdgeHint(env, step, step.FromSym))
 	if err != nil {
 		return nil, err
 	}
@@ -297,14 +304,26 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 	}
 
 	toNC := part.Nodes[step.ToSym]
+	if len(anchorRows) == 0 {
+		return nil, nil
+	}
+	// The forward walk follows edges outward, so a node extends the trail
+	// when it has an admissible OUTGOING edge.
+	contIDs, err := varLengthWalkSetup(env, step, true)
+	if err != nil {
+		return nil, err
+	}
 
 	var out []*Row
 	for _, seed := range anchorRows {
-		rows, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, seed, step.PathSym)
+		rows, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, seed, step.PathSym, contIDs)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, rows...)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	return out, nil
@@ -330,16 +349,9 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // chain is named) belongs to the WHOLE chain, not just this one step's
 // segment -- see assembleChainPathVal's doc. "" skips binding entirely,
 // matching a caller with no path to assemble.
-func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
-	// A self-loop of an admitted kind anywhere in the view makes pg's
-	// seed-side is_cycle guard placement observable, and that placement
-	// depends on dawgs heuristics this engine deliberately does not mirror
-	// -- decline and delegate. See the package doc's SELF-LOOPS bullet and
-	// View.SelfLoopHazard.
-	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
-		return nil, errUnsupportedStep
-	}
-
+// contIDs is the step's continuation set, resolved ONCE by the caller via
+// varLengthWalkSetup rather than here -- see that function for why.
+func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string, contIDs []snapshot.NodeID) ([]*Row, error) {
 	root, _ := seed.Node(step.FromSym)
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
@@ -357,6 +369,9 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			return nil, err
 		}
 		out = append(out, nr)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	if maxHops <= 0 {
@@ -404,6 +419,9 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 
 		if depth == maxHops {
@@ -429,6 +447,16 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			// excluded -- see Row.trailEdges' doc.
 			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
+			}
+
+			// Same pruning the reverse walker applies, for the same reason:
+			// a neighbour that can neither carry the trail further nor be
+			// the pattern's endpoint never becomes a frame. See
+			// trailCanContinue.
+			if depth+1 == maxHops || !trailCanContinue(contIDs, c.other) {
+				if depth+1 < minDepth || !nodeSatisfiesConstraint(env, toNC, c.other) {
+					continue
+				}
 			}
 
 			nextNodes := make([]snapshot.NodeID, depth+2)
@@ -482,8 +510,10 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     kinds-only far endpoint contributes no filtering beyond what its own
 //     candidate source already enumerates, so seeding from it buys nothing
 //     while giving up the near side's structure.
+//
 //   - The near endpoint must NOT narrow. If it does, it is already the cheap
 //     side and the ordinary forward route is the right one.
+//
 //   - The near endpoint's own candidate source must COST what a full scan
 //     costs (scanEquivalentNearSide) -- not merely be "not narrowing". A kind
 //     bitmap is "not narrowing" in endpointNarrows' sense (the bitmap IS its
@@ -550,72 +580,91 @@ func varLengthReverseEligible(env *Env, part *Part, step *Step) bool {
 		return false
 	}
 	fromNC, toNC := part.Nodes[step.FromSym], part.Nodes[step.ToSym]
-	if !endpointNarrows(toNC) || endpointNarrows(fromNC) {
+
+	// The near side must NOT narrow: a pushed predicate there makes it the
+	// already-cheap side, and rankOf cannot see how much it narrows by, so
+	// the near estimate would be an OVER-estimate and reversing away from it
+	// would be a guess in the unsafe direction.
+	//
+	// There is deliberately no matching precondition on the far side. One
+	// used to be here -- the far side had to narrow, on the reasoning that
+	// seeding from a side that narrows nothing is a full scan -- and it was
+	// both redundant and harmful. Redundant because the margin below already
+	// refuses that case arithmetically: a far side that narrows nothing has
+	// farN = |V|, and nearN can never exceed |V|, so the ratio cannot reach
+	// reverseSeedMargin. Harmful because endpointNarrows deliberately
+	// discounts kind tests, so a far side that is narrow purely BY KIND --
+	// `WHERE (t:Tag_Tier_Zero)`, a handful of nodes out of a million -- read
+	// as "narrows nothing" and had the route refused, which is the exact
+	// shape this rule exists to catch. An over-estimated far side (one whose
+	// pushed predicate cuts further than rankOf can see) only shrinks the
+	// ratio, so it errs toward the forward walk, which is the safe direction.
+	if endpointNarrows(fromNC) {
 		return false
 	}
-	fromRank := rankOf(env, fromNC)
-	if !scanEquivalentNearSide(env, fromRank) {
+
+	// Both ends priced on the same basis, INCLUDING the step's own
+	// relationship-kind narrowing, and the route reverses only when the near
+	// side is EXPENSIVE IN ABSOLUTE TERMS and the far side is cheaper by a
+	// wide margin.
+	//
+	// The absolute part is what keeps this safe, and it is not a formality.
+	// Seed count alone does not decide which route is cheaper, because a walk
+	// fans out by the degree of what it seeds from: a one-node near side with
+	// no admissible out-edges answers in zero work, while a one-node far side
+	// that is a hub walks its way back through hundreds of predecessors. The
+	// two look identical on seed count and could not be more different in
+	// cost, which is exactly the shape TestVarLengthReverseRejectsHighInDegree
+	// Hub pins. Requiring the near side to be genuinely large means the route
+	// only ever switches away from work that is definitely being spent.
+	//
+	// What this REPLACED was a pair of structural preconditions -- the near
+	// side had to narrow nothing, and had to be "scan-equivalent" (a full
+	// scan, or a kind holding a MAJORITY of the graph). Those encoded
+	// "reverse only when the near side is hopeless" rather than "reverse when
+	// the far side is much cheaper", and they refused the route wherever the
+	// near side was merely large. Measured against PostgreSQL on the
+	// benchmark graph, shipped prebuilts lost to that: 84,481 near-side nodes
+	// against twenty on the far side was refused because 84,481 is not a
+	// majority of a million.
+	//
+	// Fan-out past the first hop is still not estimated here, by either
+	// route. The work meter is the backstop, as it is forward: a walk that
+	// fans out too far spends past its budget and declines to PostgreSQL,
+	// never returning a truncated answer.
+	near := rankOfHinted(env, fromNC, newEdgeHint(env, step, step.FromSym))
+	far := rankOfHinted(env, toNC, newEdgeHint(env, step, step.ToSym))
+
+	nearN, farN := near.candidateEstimate(env), far.candidateEstimate(env)
+	if nearN < reverseMinNearSeeds {
 		return false
 	}
-	return rankOf(env, toNC).better(fromRank)
+	if farN < 1 {
+		farN = 1
+	}
+	return nearN/farN >= reverseSeedMargin
 }
 
+const (
+	// reverseMinNearSeeds is how large the near side must be before switching
+	// routes is worth considering at all. Below it the forward walk is cheap
+	// whatever its shape, and reversing can only add risk. Small, because the
+	// margin below is what actually does the work -- this suppresses the case
+	// where BOTH sides are a handful, where the ratio between two small
+	// numbers says nothing and the forward walk is cheap in absolute terms
+	// whatever its shape.
+	reverseMinNearSeeds = 16
 
-// scanEquivalentNearSide reports whether r -- a variable-length step's NEAR
-// endpoint rank -- costs what a full scan costs, which is what
-// varLengthReverseEligible's third condition is actually about (see its doc).
-//
-// A bare tierScan qualifies by definition. So does a kind bitmap that holds
-// essentially every node in the snapshot: such a "kind" narrows nothing, so
-// enumerating it IS the full scan the condition means to require, and the
-// structural hazard the condition guards against -- a SMALL kind bitmap whose
-// few seeds turn out to be high in-degree hubs -- cannot arise at that
-// population.
-//
-// This is the second half of the same bug the kindOnlyPredicate rule below
-// fixed. That one taught endpointNarrows to ignore a kind test written in
-// WHERE; a kind written in the PATTERN never reached endpointNarrows at all,
-// it reached this cost test through rankOf -- which returns tierKind for any
-// non-empty Kinds list, and anchorRank.better compares tier before size. So
-// `(:Base)`, 1,025,105 nodes out of 1,025,106 in bench/shgen's 500k graph,
-// outranked a full scan of 1,025,106 and disqualified the constrained-side
-// route. On the shipped "all members of Protected Users" prebuilt
-// (`(:Base)-[:MemberOf*1..]->(g:Group) WHERE g.objectid ENDS WITH '-525'`)
-// that cost 2551ms where seeding from the far side costs 50ms -- 51x, for the
-// identical answer, with the whole difference in which end got seeded.
-//
-// The threshold is "a majority of the graph", not near-equality, and the
-// distinction was MEASURED, not chosen aesthetically. A first version of this
-// rule required >=99% coverage, reasoning that a hybrid AD+Entra graph --
-// where `Base` labels only the AD side -- should keep declining. That was
-// backwards: on the hybrid benchmark graph `Base` covers ~91% of 1.01M
-// nodes, the 99% rule refused the reverse route, and the shipped
-// Protected-Users prebuilt walked forward for ~3.0 seconds against ~20ms of
-// far-side seeding -- on exactly the deployment shape (hybrid) real
-// installations run. What the condition is protecting is the HAZARD CASE: a
-// small kind bitmap whose few seeds hide an unbounded in-degree surprise
-// (see the third-condition bullet above). A kind covering at least half the
-// graph cannot be that case -- walking it forward already costs scan-order
-// work, which is precisely when giving up the near side's structure for the
-// far side's selectivity is worth the in-degree risk the work meter
-// backstops. Below a majority the near side keeps the forward route: its
-// bitmap is genuinely bounded, and the hub hazard is live
-// (TestVarLengthReverseRejectsHighInDegreeHub pins the extreme).
-//
-// A fraction rather than exact equality also matters at the top end:
-// BloodHound's datapipe leaves at least one node (its Meta node) unlabelled
-// by `Base`, so even an AD-only deployment's bitmap is always at least one
-// short of the node count.
-func scanEquivalentNearSide(env *Env, r anchorRank) bool {
-	if r.tier == tierScan {
-		return true
-	}
-	if r.tier != tierKind {
-		return false
-	}
-	total := env.Snap.NodeCount()
-	return total > 0 && r.size*2 >= total
-}
+	// reverseSeedMargin is how many times cheaper the far side must be.
+	//
+	// The near estimate is EXACT here rather than an upper bound, because the
+	// precondition above already refused any near side carrying a pushed
+	// predicate -- what is left is a kind bitmap or a full scan, both of
+	// which rankOf counts exactly. So the margin is covering one unknown
+	// rather than two: fan-out past the first hop, which neither route
+	// estimates.
+	reverseSeedMargin = 4
+)
 
 // endpointNarrows reports whether nc actually cuts its symbol's candidate set
 // below whatever its candidate source already enumerates: explicit ids, an
@@ -643,11 +692,41 @@ func endpointNarrows(nc *NodeConstraint) bool {
 		return true
 	}
 	for _, p := range nc.Predicates {
-		if !kindOnlyPredicate(p) {
-			return true
+		if kindOnlyPredicate(p) || negatedPredicate(p) {
+			continue
 		}
+		return true
 	}
 	return false
+}
+
+// negatedPredicate reports whether expr is a negation, which endpointNarrows
+// treats as not narrowing at all.
+//
+// The reasoning is that a negation is the COMPLEMENT of whatever it wraps, so
+// its selectivity is the complement's: the more selective `x ENDS WITH '-512'`
+// is, the LESS selective `NOT x ENDS WITH '-512'` is. Counting one as a
+// narrowing is backwards, and it is what kept the shipped "Nested groups
+// within Tier Zero / High Value" prebuilt on the forward route -- its near
+// side carries `NOT s.objectid ENDS WITH '-512' AND NOT s.objectid ENDS WITH
+// '-519'`, which between them exclude two groups out of thousands, while its
+// far side is the handful tagged admin_tier_0.
+//
+// Like kindOnlyPredicate, this only affects which end the route SEEDS from.
+// The predicate itself stays in Part.Where and filters every row either way.
+func negatedPredicate(expr cypher.Expression) bool {
+	switch typed := unwrapParens(expr).(type) {
+	case *cypher.Negation:
+		return typed != nil
+	case *cypher.Comparison:
+		// `a <> b` is a negation written as an operator.
+		if typed == nil || len(typed.Partials) != 1 || typed.Partials[0] == nil {
+			return false
+		}
+		return typed.Partials[0].Operator == cypher.OperatorNotEquals
+	default:
+		return false
+	}
 }
 
 // kindOnlyPredicate reports whether expr tests nothing but kind membership --
@@ -708,18 +787,126 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 		return nil, err
 	}
 
+	// This route is deliberately kept away from the chunked LIMIT driver
+	// (componentPrefersReverseSeeding), because that driver can only walk
+	// forward and forward is the expensive direction here. So the LIMIT has
+	// to be honoured by the walk itself, or it is not honoured until after
+	// every trail in the graph has been enumerated -- which is what the
+	// shipped "Nested groups within Tier Zero / High Value" prebuilt was
+	// paying: eight seeds, a LIMIT of 1000, and every nested-membership
+	// trail materialized before the pipeline's own SKIP/LIMIT threw nearly
+	// all of them away.
+	cap := reverseTrailRowCap(meter, part, step)
+	// The reverse walk follows edges backward, so a node extends the trail
+	// when it has an admissible INCOMING edge.
+	contIDs := trailContinuationSet(env, step, false)
+
 	var out []*Row
 	for _, id := range seedIDs {
+		if cap > 0 && len(out) >= cap {
+			break
+		}
+		remaining := 0
+		if cap > 0 {
+			remaining = cap - len(out)
+		}
 		seed := NewRow()
 		seed.SetNode(step.ToSym, id)
-		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym)
+		rows, err := expandVarLengthTrailsToSeed(env, meter, step, fromNC, seed, step.PathSym, remaining, contIDs)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, rows...)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	return out, nil
+}
+
+// reverseTrailRowCap is how many rows the reverse walk may stop after, or 0
+// for no cap.
+//
+// It is the whole query's own SKIP+LIMIT (limitTarget, which already refuses
+// to produce a target for an ORDER BY or DISTINCT query -- both of which have
+// to see every row before they can emit any). Truncating is sound only when
+// nothing downstream can reject a row this walk produced, which is exactly
+// what noResidualWhere establishes: every WHERE conjunct is either already
+// pushed into one of the two endpoints' own constraints, and therefore
+// already checked per row here, or is the endpoint inequality this route
+// handles itself. With no residual filter, the first N rows are as good an
+// answer as any other N -- the same latitude an unordered LIMIT already gives
+// every other path in this package.
+func reverseTrailRowCap(meter *workMeter, part *Part, step *Step) int {
+	if !meter.limitTargetSet || meter.limitTarget <= 0 {
+		return 0
+	}
+	if !noResidualWhere(part, step) {
+		return 0
+	}
+	return int(meter.limitTarget)
+}
+
+// trailCanContinue reports whether n can extend a trail one more hop, by
+// membership in the endpoint set for the walk's own direction. ids must be
+// the sorted set EdgeKindEndpoints returns; a nil set means "unknown", which
+// admits everything.
+//
+// This is what stops a trail walk from paying for nodes that cannot matter.
+// Walking BACKWARD over MemberOf from a Tier Zero group reaches every member
+// -- hundreds of thousands of users on a real graph -- and a user can neither
+// continue the trail (nothing is a member OF a user, so it has no admissible
+// incoming edge) nor be the pattern's endpoint (which is labelled Group). The
+// shipped "Nested groups within Tier Zero / High Value" prebuilt answers with
+// twelve paths and was allocating a stack frame, a node slice and an edge
+// slice for each of those users on the way.
+func trailCanContinue(ids []snapshot.NodeID, n snapshot.NodeID) bool {
+	if ids == nil {
+		return true
+	}
+	i := sort.Search(len(ids), func(i int) bool { return ids[i] >= n })
+	return i < len(ids) && ids[i] == n
+}
+
+// varLengthWalkSetup resolves everything a trail walk needs that depends on
+// the STEP rather than on the seed: whether the step is servable at all, and
+// the endpoint set its walk can continue from.
+//
+// Both used to be resolved inside expandVarLengthTrailsForSeed, which the
+// callers invoke once per seed row. On an overlay the continuation set is a
+// merge of the base and delta endpoint sets, so a walk seeded from n nodes
+// rebuilt the same set n times -- tens of thousands of times for one query on
+// the benchmark graph, to compute the same answer. The reverse walker already
+// hoisted it; this is the forward walker catching up.
+//
+// The callers invoke this only when they have at least one seed, so a step
+// that would decline but never runs still does not decline -- exactly the
+// behaviour of the per-seed check it replaces.
+func varLengthWalkSetup(env *Env, step *Step, outgoing bool) ([]snapshot.NodeID, error) {
+	// A self-loop of an admitted kind anywhere in the view makes pg's
+	// seed-side is_cycle guard placement observable, and that placement
+	// depends on dawgs heuristics this engine deliberately does not mirror
+	// -- decline and delegate. See the package doc's SELF-LOOPS bullet and
+	// View.SelfLoopHazard.
+	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
+		return nil, errUnsupportedStep
+	}
+	return trailContinuationSet(env, step, outgoing), nil
+}
+
+// trailContinuationSet resolves the endpoint set a trail walk can continue
+// from, or nil when the step declares no relationship kinds (every edge
+// qualifies, so the set narrows nothing).
+func trailContinuationSet(env *Env, step *Step, outgoing bool) []snapshot.NodeID {
+	if len(step.EdgeKinds) == 0 {
+		return nil
+	}
+	ids, ok := env.Snap.EdgeKindEndpoints(step.EdgeKinds, outgoing)
+	if !ok {
+		return nil
+	}
+	return ids
 }
 
 // reverseTrailFrame is one partial (or complete) trail on
@@ -771,7 +958,9 @@ type reverseTrailFrame struct {
 // pathArcKey behaves exactly as it does for the forward walk: when non-empty,
 // each output row additionally binds its own trail as a *PathVal under that
 // key.
-func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string) ([]*Row, error) {
+// rowCap, when positive, stops the walk once it has produced that many rows;
+// see reverseTrailRowCap for why truncating is sound and when it is offered.
+func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC *NodeConstraint, seed *Row, pathArcKey string, rowCap int, contIDs []snapshot.NodeID) ([]*Row, error) {
 	// Same self-loop hazard decline as the forward walker -- see its comment
 	// and the package doc's SELF-LOOPS bullet.
 	if env.Snap.SelfLoopHazard(step.EdgeKinds) {
@@ -795,14 +984,24 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			return nil, err
 		}
 		out = append(out, nr)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 
 	if maxHops <= 0 {
 		return out, nil
 	}
 
+	if rowCap > 0 && len(out) >= rowCap {
+		return out, nil
+	}
+
 	stack := []reverseTrailFrame{{nodes: []snapshot.NodeID{terminal}}}
 	for len(stack) > 0 {
+		if rowCap > 0 && len(out) >= rowCap {
+			break
+		}
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
@@ -841,6 +1040,9 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 
 		if depth == maxHops {
@@ -864,6 +1066,17 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			// ever hands this walker a row carrying fixed-step edges.
 			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
 				continue
+			}
+
+			// A neighbour that can neither carry the trail further nor be
+			// the pattern's own endpoint cannot contribute anything, so it
+			// never becomes a frame. The cheap index test comes first: a
+			// node that CAN continue needs no constraint evaluation here,
+			// and one that cannot is usually a leaf the constraint rejects.
+			if depth+1 == maxHops || !trailCanContinue(contIDs, c.other) {
+				if depth+1 < minDepth || !nodeSatisfiesConstraint(env, fromNC, c.other) {
+					continue
+				}
 			}
 
 			nextNodes := make([]snapshot.NodeID, depth+2)
@@ -1004,6 +1217,9 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 			return nil, err
 		}
 		out = append(out, nr)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

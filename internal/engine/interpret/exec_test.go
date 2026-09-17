@@ -1188,8 +1188,14 @@ func TestRunComponentFromDispatchMatchesRunComponent(t *testing.T) {
 			t.Fatalf("%s: runComponent: %v", query, err)
 		}
 
+		// Seeded exactly as every production caller of runComponentFrom
+		// seeds -- through hintForAnchor. A caller that scanned WITHOUT the
+		// hint would enumerate more candidates than runComponent does and
+		// spend more work for the identical rows, which is the divergence
+		// this test exists to catch.
 		split := &workMeter{budget: generousBudget}
-		anchorRows, err := scanAnchor(env, split, anchorSym, part.Nodes[anchorSym])
+		anchorRows, err := scanAnchorHinted(env, split, anchorSym, part.Nodes[anchorSym],
+			hintForAnchor(env, part, comp.stepIdxs, anchorSym))
 		if err != nil {
 			t.Fatalf("%s: scanAnchor(%q): %v", query, anchorSym, err)
 		}
@@ -1266,23 +1272,33 @@ func TestRunComponentFromDispatchMatchesRunComponent(t *testing.T) {
 // symbol name for a deterministic rowKey, purely so this test can compare
 // row sets with rowKey/rowKeys -- runComponent/runComponentFrom's own
 // []*Row output has no OutVal form of its own. Reaches into Row's
-// unexported nodes map directly (same package, see cloneRow's identical
+// unexported node bindings directly (same package, see cloneRow's identical
 // reasoning) rather than adding an exported enumeration method purely for
-// this test's need.
+// this test's need. Sorted by symbol rather than taken in binding order, so
+// two rows that bound the same symbols in a different order still compare
+// equal -- which is what this helper is for.
 func rowsToOutVals(t *testing.T, rows []*Row) [][]OutVal {
 	t.Helper()
 	out := make([][]OutVal, len(rows))
 	for i, r := range rows {
-		keys := make([]string, 0, len(r.nodes))
-		for k := range r.nodes {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		vals := make([]OutVal, len(keys))
-		for j, k := range keys {
-			vals[j] = OutVal{Kind: OutNode, Node: r.nodes[k]}
+		bound := append([]nodeBinding(nil), r.nodes...)
+		sort.Slice(bound, func(a, b int) bool { return bound[a].sym < bound[b].sym })
+		vals := make([]OutVal, len(bound))
+		for j, b := range bound {
+			vals[j] = OutVal{Kind: OutNode, Node: b.id}
 		}
 		out[i] = vals
 	}
 	return out
+}
+
+// planNoFail plans query and reports whether it was served, without failing
+// the test when it is declined -- for assertions ABOUT declines.
+func planNoFail(t *testing.T, snap *snapshot.View, query string) (*Query, bool) {
+	t.Helper()
+	rq, err := frontend.ParseCypher(frontend.NewContext(), query)
+	if err != nil {
+		return nil, false
+	}
+	return Plan(rq, snap)
 }

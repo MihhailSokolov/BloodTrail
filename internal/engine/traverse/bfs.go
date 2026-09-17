@@ -24,7 +24,6 @@ func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapsh
 	frontier := []snapshot.NodeID{seed}
 	deepest := 0
 
-	overlay := s.Overlay()
 	for d := 0; d < maxDepth && len(frontier) > 0; d++ {
 		var next []snapshot.NodeID
 		for _, u := range frontier {
@@ -38,27 +37,12 @@ func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapsh
 				sc.set(w, int8(d+1))
 				next = append(next, w)
 			}
-			if !overlay {
-				var targets []snapshot.NodeID
-				var edgeKinds []snapshot.KindID
-				if forward {
-					targets, edgeKinds, _ = s.Out(u)
-				} else {
-					targets, edgeKinds = s.In(u)
+			if ns, ks, ok := cleanAdjacency(s, u, forward); ok {
+				for i, w := range ns {
+					visit(w, ks[i])
 				}
-				for i, w := range targets {
-					visit(w, edgeKinds[i])
-				}
-			} else if forward {
-				s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-					visit(w, k)
-					return true
-				})
 			} else {
-				s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-					visit(w, k)
-					return true
-				})
+				walkAdjacency(s, u, forward, visit)
 			}
 		}
 		if len(next) > 0 {
@@ -107,7 +91,6 @@ type pathState struct {
 func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path, forward bool) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{from}}}
 
-	overlay := s.Overlay()
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -157,27 +140,12 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 
 			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
 		}
-		if !overlay {
-			var targets []snapshot.NodeID
-			var edgeKinds []snapshot.KindID
-			if forward {
-				targets, edgeKinds, _ = s.Out(u)
-			} else {
-				targets, edgeKinds = s.In(u)
+		if ns, ks, ok := cleanAdjacency(s, u, forward); ok {
+			for i, w := range ns {
+				visit(w, ks[i])
 			}
-			for i, w := range targets {
-				visit(w, edgeKinds[i])
-			}
-		} else if forward {
-			s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-				visit(w, k)
-				return true
-			})
 		} else {
-			s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-				visit(w, k)
-				return true
-			})
+			walkAdjacency(s, u, forward, visit)
 		}
 	}
 
@@ -241,8 +209,6 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 	levelsF, levelsB := 0, 0
 	D := -1
 
-	overlay := s.Overlay()
-
 	for len(frontF) > 0 && len(frontB) > 0 {
 		limit := maxDepth
 		if D >= 0 && D < limit {
@@ -271,16 +237,12 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 				}
 			}
 			for _, u := range frontF {
-				if !overlay {
-					targets, edgeKinds, _ := s.Out(u)
-					for i, w := range targets {
-						visit(w, edgeKinds[i])
+				if ns, ks, ok := cleanAdjacency(s, u, true); ok {
+					for i, w := range ns {
+						visit(w, ks[i])
 					}
 				} else {
-					s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-						visit(w, k)
-						return true
-					})
+					walkAdjacency(s, u, true, visit)
 				}
 			}
 			levelsF++
@@ -304,16 +266,12 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 				}
 			}
 			for _, u := range frontB {
-				if !overlay {
-					targets, edgeKinds := s.In(u)
-					for i, w := range targets {
-						visit(w, edgeKinds[i])
+				if ns, ks, ok := cleanAdjacency(s, u, false); ok {
+					for i, w := range ns {
+						visit(w, ks[i])
 					}
 				} else {
-					s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-						visit(w, k)
-						return true
-					})
+					walkAdjacency(s, u, false, visit)
 				}
 			}
 			levelsB++
@@ -367,7 +325,6 @@ func pairPaths(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask,
 func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapshot.KindMask, cap int, budget *memBudget, scF, scT *scratch, out []Path) ([]Path, error) {
 	stack := []pathState{{nodes: []snapshot.NodeID{r}}}
 
-	overlay := s.Overlay()
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -415,18 +372,56 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 
 			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
 		}
-		if !overlay {
-			targets, edgeKinds, _ := s.Out(u)
-			for i, w := range targets {
-				visit(w, edgeKinds[i])
+		if ns, ks, ok := cleanAdjacency(s, u, true); ok {
+			for i, w := range ns {
+				visit(w, ks[i])
 			}
 		} else {
-			s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
-				visit(w, k)
-				return true
-			})
+			walkAdjacency(s, u, true, visit)
 		}
 	}
 
 	return out, nil
+}
+
+// cleanAdjacency returns u's neighbours on one side as slices, exact for the
+// View: the base CSR for a node the delta leaves alone, a merged copy built
+// once per View for one it touches (snapshot.View.OutSlices owns both).
+// ok=false -- an id outside the View -- sends the caller to walkAdjacency.
+//
+// The previous rule was all or nothing: any overlay at all sent every node
+// through OutEdges, so a delta of 90k edges nowhere near a path search still
+// cost it an indirect call and a set of membership tests per edge, and the
+// shipped "Shortest paths from Entra Users to Tier Zero" prebuilt ran at three
+// times its no-overlay cost.
+//
+// It hands back SLICES rather than taking a visit callback, deliberately. Each
+// call site defines its visit closure locally and calls it in a plain loop,
+// which lets the compiler inline the closure body into that loop. Routing the
+// loop through a helper that took the closure turned every edge into an
+// indirect call and made the no-overlay path 40% slower (37ms to 52ms on the
+// same prebuilt) while fixing the overlay one.
+//
+// The walks here yield (neighbour, kind) and never an edge id, which is what
+// makes mixing the two sources within one search safe.
+func cleanAdjacency(s *snapshot.View, u snapshot.NodeID, forward bool) ([]snapshot.NodeID, []snapshot.KindID, bool) {
+	if forward {
+		return s.OutSlices(u)
+	}
+	return s.InSlices(u)
+}
+
+// walkAdjacency is cleanAdjacency's fallback for a node the delta touches.
+func walkAdjacency(s *snapshot.View, u snapshot.NodeID, forward bool, visit func(snapshot.NodeID, snapshot.KindID)) {
+	if forward {
+		s.OutEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+			visit(w, k)
+			return true
+		})
+		return
+	}
+	s.InEdges(u, func(w snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+		visit(w, k)
+		return true
+	})
 }

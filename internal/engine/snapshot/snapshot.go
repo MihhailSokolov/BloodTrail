@@ -3,6 +3,7 @@ package snapshot
 
 import (
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -76,6 +77,36 @@ type Snapshot struct {
 	// edge on a multi-million-edge build, where self-loops are rare enough
 	// that theirs stays tiny. Read through View.EdgeKindPresent.
 	edgeKindSeen []bool
+
+	// stringIdx memoizes per-property value indexes (propindex.go), built
+	// lazily on first use rather than at Build time: a deployment queries a
+	// handful of properties out of the dozens BloodHound collects, and
+	// sorting every one of them eagerly would cost far more than it saves.
+	// Guarded by stringIdxMu because a Snapshot is otherwise immutable and
+	// shared across concurrently-served queries.
+	stringIdxMu sync.Mutex
+	stringIdx   map[PropID]*stringIndex
+
+	// valueIdx memoizes per-property EXACT-match postings (valueindex.go),
+	// built lazily like stringIdx and guarded for the same reason.
+	// distinctCount memoizes a property's EXACT distinct-string-value count
+	// once one has been computed -- see stringDistinctAtMost, which abandons
+	// the count for a high-cardinality property rather than finishing it.
+	distinctMu    sync.Mutex
+	distinctCount map[PropID]int
+	// distinctAtLeast records a LOWER bound for a property whose count was
+	// abandoned, so the walk is not repeated for every later query.
+	distinctAtLeast map[PropID]int
+
+	valueIdxMu sync.Mutex
+	valueIdx   map[PropID]*valueIndex
+
+	// edgeKindIdx memoizes the per-edge-kind endpoint index
+	// (edgekindindex.go), built lazily in one pass on first use. Guarded for
+	// the same reason stringIdx is: a Snapshot is otherwise immutable and
+	// shared across concurrently-served queries.
+	edgeKindIdxMu sync.Mutex
+	edgeKindIdx   *edgeKindIndex
 
 	// edgeIDPerm holds forward-CSR indices 0..EdgeCount()-1 permuted into
 	// ascending OutEdgeIDs order, letting EdgeByID binary-search by database

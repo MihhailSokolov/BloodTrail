@@ -102,6 +102,8 @@ import (
 	"sort"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
 // idSet is the value shape a CollectMembershipAgg's alias is bound to: every
@@ -168,9 +170,49 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	}
 
 	part0 := &q.Parts[0]
+
+	// A query that must materialize every row before it can answer, over a
+	// candidate source already larger than the row budget, cannot finish --
+	// so it declines here rather than after scanning its way to the same
+	// conclusion. `MATCH (u:User) RETURN DISTINCT u.enabled LIMIT 1000` and
+	// `... RETURN u.objectid ORDER BY u.objectid LIMIT 1000` each spent tens
+	// of milliseconds discovering that, on top of the PostgreSQL time they
+	// then cost anyway, which is the whole of why they measured slower than
+	// the database they delegate to.
+	// A bare `COUNT` over a kind needs no rows at all -- the bitmap knows how
+	// many there are.
+	if rs, handled := runKindCount(env, q); handled {
+		return rs, nil
+	}
+
+	// DISTINCT over a wide scan is served by streaming instead of declining:
+	// the rows that matter are the DEDUPED ones, and there are few of them.
+	if rs, handled, err := runDistinctStreaming(env, q, meter); handled {
+		return rs, err
+	}
+
+	if declinesOnRowBudget(env, q, meter) {
+		return nil, ErrBudget
+	}
+
+	// Only Part[0] runs through matchPartPlain, which is where the OPTIONAL
+	// MATCH left join lives. A Part after a WITH boundary is matched per
+	// carried seed by a different driver entirely, so an Optional hanging off
+	// one would be silently ignored -- a wrong answer, not a slow one.
+	// Decline instead; PostgreSQL serves it.
+	for i := 1; i < len(q.Parts); i++ {
+		if q.Parts[i].Optional != nil {
+			return nil, errUnsupportedStep
+		}
+	}
+
 	var rows []*Row
 	var err error
-	if len(q.Parts) == 1 && target >= 0 {
+	// An OPTIONAL MATCH opts out of LIMIT early termination: the chunked
+	// driver bypasses matchPartPlain (and therefore the left join) entirely,
+	// and truncating the mandatory side before the join would decide the
+	// answer from a prefix of rows rather than from the rows themselves.
+	if len(q.Parts) == 1 && target >= 0 && part0.Optional == nil {
 		rows, err = matchPartLimited(env, meter, part0, target)
 	} else {
 		rows, err = matchPartPlain(env, meter, part0)
@@ -249,6 +291,16 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		return nil, errUnsupportedStep
 	}
 
+	// A RETURN carrying aggregates groups here, immediately before
+	// projection, through the very same stage an explicit WITH boundary
+	// uses -- see Query.ReturnGroup and desugarReturnAggregates.
+	if q.ReturnGroup != nil {
+		rows, err = runWithStage(env, meter, q.ReturnGroup, rows)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Admit every surviving row into the query's row budget -- this is the
 	// "final result" MaxRows' own doc comment describes: a 2-part query's
 	// Part[0]-filtered-but-pre-WITH rows are an intermediate quantity already
@@ -275,7 +327,7 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	}
 
 	if len(q.Order) > 0 {
-		if err := sortRows(rows, outRows, q.Order, aliasIndexFor(q.Returning)); err != nil {
+		if err := sortRows(env, rows, outRows, q.Order, aliasIndexFor(q.Returning)); err != nil {
 			return nil, err
 		}
 	}
@@ -453,12 +505,140 @@ const limitChunk = 1024
 // function, so every ineligible query -- and every eligible-looking one that
 // still isn't actually servable by the chunked driver -- gets exactly the
 // same treatment it always got.
+// declinesOnRowBudget reports whether q provably cannot finish within
+// Budgets.MaxRows, cheaply enough to be worth asking before any scanning.
+//
+// Deliberately narrow, because the cost of being wrong is declining a query
+// that would have succeeded. It fires only for a single Part with no pattern
+// steps and one symbol -- a bare kind scan -- whose candidate source carries
+// no predicate that could reduce it, in a query that must see every row
+// before it can emit any (DISTINCT, or ORDER BY). For that shape the final
+// row count IS the candidate count, exactly, and a LIMIT cannot stop the scan
+// early because the rows have to be deduplicated or sorted first.
+func declinesOnRowBudget(env *Env, q *Query, meter *workMeter) bool {
+	if meter.budget.MaxRows <= 0 || len(q.Parts) != 1 {
+		return false
+	}
+	if !q.Returning.Distinct && len(q.Order) == 0 {
+		return false
+	}
+	if q.ReturnGroup != nil {
+		// An aggregate collapses rows, so the candidate count says nothing
+		// about how many come out.
+		return false
+	}
+	part := &q.Parts[0]
+	if len(part.Chains) != 0 || len(part.Nodes) != 1 || part.Where != nil || part.Optional != nil {
+		return false
+	}
+	for _, nc := range part.Nodes {
+		if nc == nil || len(nc.Predicates) > 0 || len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil {
+			return false
+		}
+		if len(nc.Kinds) == 0 {
+			return false
+		}
+		return smallestKindBitmap(env, nc.Kinds).Count() > meter.budget.MaxRows
+	}
+	return false
+}
+
 func matchPartPlain(env *Env, meter *workMeter, part *Part) ([]*Row, error) {
 	rows, err := matchPart(env, part, meter)
 	if err != nil {
 		return nil, err
 	}
-	return filterRows(env, rows, part.Where, nil)
+	rows, err = filterRows(env, rows, part.Where, nil)
+	if err != nil {
+		return nil, err
+	}
+	return leftJoinOptional(env, meter, part, rows)
+}
+
+// leftJoinOptional extends each surviving row with part's OPTIONAL MATCH.
+// A row that the optional pattern matches is emitted once per match; a row it
+// does not match is emitted unchanged, with the optional pattern's own
+// symbols left UNBOUND, which is how a null column is represented here.
+//
+// The optional side is matched ONCE over the whole graph and hashed on the
+// shared symbols, rather than re-run per row: the pattern is the same for
+// every row, and the mandatory Part's constraints were copied into it at plan
+// time (see planOptionalPart), so the set it produces is already narrowed to
+// roughly what the rows can join against.
+//
+// It runs AFTER Part.Where, which is what Cypher requires: the WHERE belongs
+// to the mandatory MATCH, and filtering afterwards would drop rows the
+// optional clause is supposed to preserve.
+func leftJoinOptional(env *Env, meter *workMeter, part *Part, rows []*Row) ([]*Row, error) {
+	if part.Optional == nil || len(rows) == 0 {
+		return rows, nil
+	}
+
+	optRows, err := matchPart(env, seedOptionalPart(part.Optional, part.OptionalShared, rows), meter)
+	if err != nil {
+		return nil, err
+	}
+	optRows, err = filterRows(env, optRows, part.Optional.Where, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	buckets := make(map[string][]*Row, len(optRows))
+	for _, r := range optRows {
+		key, ok := optionalJoinKey(r, part.OptionalShared)
+		if !ok {
+			continue
+		}
+		buckets[key] = append(buckets[key], r)
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]*Row, 0, len(rows))
+	for _, l := range rows {
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+		key, ok := optionalJoinKey(l, part.OptionalShared)
+		matches := buckets[key]
+		if !ok || len(matches) == 0 {
+			// No match: the row survives with the optional symbols unbound.
+			out = append(out, l)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		for _, r := range matches {
+			nr := cloneRow(l)
+			mergeRowInto(nr, r)
+			if err := meter.spend(1); err != nil {
+				return nil, err
+			}
+			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// optionalJoinKey encodes a row's bindings for the shared symbols into one
+// self-delimiting key. ok is false when the row does not bind them all, which
+// cannot happen for a row either side actually produced but is handled rather
+// than assumed.
+func optionalJoinKey(r *Row, shared []string) (string, bool) {
+	var buf []byte
+	for _, sym := range shared {
+		id, bound := r.Node(sym)
+		if !bound {
+			return "", false
+		}
+		buf = appendUint32(buf, uint32(id))
+	}
+	return string(buf), true
 }
 
 // matchPartLimited is runQuery's single-part (no WITH boundary) entry point
@@ -691,7 +871,11 @@ func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component,
 		return nil
 	}
 
-	scanErr := scanAnchorVisit(env, meter, anchor, part.Nodes[anchor], func(r *Row) error {
+	// Same hint every other seeding path uses, so the chunked driver
+	// enumerates the same candidates and charges the same work as the
+	// unchunked one it stands in for.
+	hint := hintForAnchor(env, part, comp.stepIdxs, anchor)
+	scanErr := scanAnchorVisitHinted(env, meter, anchor, part.Nodes[anchor], hint, func(r *Row) error {
 		chunk = append(chunk, r)
 		if len(chunk) < limitChunk {
 			return nil
@@ -724,6 +908,28 @@ func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component,
 // producing the carried row set for whatever comes next -- see this file's
 // package doc comment for the grouping-vs-pass-through dispatch rule.
 func runWithStage(env *Env, meter *workMeter, wc *WithClause, rows []*Row) ([]*Row, error) {
+	// Computed items bind first, on the INPUT rows, because a grouping key
+	// may BE one of them (`WITH u.domain AS d, COUNT(u) AS n` groups by the
+	// evaluated property, not by the expression's text). Binding them as
+	// ordinary scalars under their alias is what lets every stage below --
+	// group-key encoding, projection, ORDER BY -- treat a computed key
+	// exactly like any other carried symbol, with no special case.
+	//
+	// Writing to the input rows is safe: they belong to this query alone,
+	// and the alias namespace ("$ret..." for a desugared RETURN, an explicit
+	// user alias otherwise) cannot collide with a pattern binding.
+	for _, c := range wc.Computed {
+		for _, r := range rows {
+			v, ok, err := EvalValue(env, r, c.Expr)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				v = nil
+			}
+			r.SetScalar(c.Alias, v)
+		}
+	}
 	if len(wc.Aggregates) == 0 {
 		return runWithPassThrough(env, meter, wc, rows)
 	}
@@ -890,6 +1096,11 @@ func applyAggregate(env *Env, out *Row, agg WithAggregate, groupRows []*Row) {
 // distinct composites, which equals distinct ids" -- CountAgg's own doc
 // comment) or by the same ScalarEq-consistent encoding grouping uses.
 func countAggregate(env *Env, agg *CountAgg, rows []*Row) int64 {
+	if agg.Star {
+		// COUNT(*) counts ROWS, with no value to test for null and no
+		// DISTINCT to apply -- pg's own semantics.
+		return int64(len(rows))
+	}
 	if !agg.Distinct {
 		if len(rows) == 0 {
 			return 0
@@ -1107,27 +1318,34 @@ func rowDistinctKey(env *Env, row []OutVal) string {
 // PostgreSQL itself never dedups the two together (SQL NULL vs the non-NULL
 // jsonb value 'null'::jsonb).
 func outValKey(env *Env, v OutVal) []byte {
+	return appendOutValKey(env, nil, v)
+}
+
+// appendOutValKey is outValKey appending into dst, so a caller keying
+// millions of rows -- runDistinctStreaming -- can reuse one buffer rather
+// than allocating a fresh slice per column per row.
+func appendOutValKey(env *Env, dst []byte, v OutVal) []byte {
 	switch v.Kind {
 	case OutNode:
-		return appendTaggedUint(nil, 'N', env.Snap.GraphID(v.Node))
+		return appendTaggedUint(dst, 'N', env.Snap.GraphID(v.Node))
 	case OutEdge:
-		return appendTaggedUint(nil, 'D', v.Edge.DatabaseID(env.Snap))
+		return appendTaggedUint(dst, 'D', v.Edge.DatabaseID(env.Snap))
 	case OutPath:
-		buf := []byte{'P'}
-		buf = appendUint32(buf, uint32(len(v.Path.Nodes)))
+		dst = append(dst, 'P')
+		dst = appendUint32(dst, uint32(len(v.Path.Nodes)))
 		for _, n := range v.Path.Nodes {
-			buf = appendTaggedUint(buf, 'n', env.Snap.GraphID(n))
+			dst = appendTaggedUint(dst, 'n', env.Snap.GraphID(n))
 		}
-		buf = appendUint32(buf, uint32(len(v.Path.Edges)))
+		dst = appendUint32(dst, uint32(len(v.Path.Edges)))
 		for _, e := range v.Path.Edges {
-			buf = appendTaggedUint(buf, 'e', e.DatabaseID(env.Snap))
+			dst = appendTaggedUint(dst, 'e', e.DatabaseID(env.Snap))
 		}
-		return buf
+		return dst
 	default: // OutScalar
 		if v.ScalarAbsent {
-			return []byte{'u'}
+			return append(dst, 'u')
 		}
-		return appendScalarKey(nil, v.Scalar)
+		return appendScalarKey(dst, v.Scalar)
 	}
 }
 
@@ -1158,6 +1376,70 @@ func resolveOrderValue(aliasIndex map[string]int, row *Row, outRow []OutVal, sym
 	return v
 }
 
+// resolveOrderAbsent reports whether sym's value for this row is an ABSENT
+// property rather than a present null. PostgreSQL ranks the two
+// differently in ORDER BY -- an absent property is SQL NULL (last ascending),
+// a stored JSON null is a jsonb value (first ascending) -- so
+// compareRuntimeNumericOrder needs to tell them apart. Only a projected
+// alias can be absent; a WITH-stage scalar is always a present value.
+func resolveOrderAbsent(aliasIndex map[string]int, outRow []OutVal, sym string) bool {
+	if idx, ok := aliasIndex[sym]; ok {
+		return outRow[idx].ScalarAbsent
+	}
+	return false
+}
+
+// runtimeNumericRank ranks one ORDER BY value under PostgreSQL's own
+// ordering for a jsonb column, measured against a live database rather than
+// assumed:
+//
+//	ORDER BY n.val        -> [stored null] [1] [3] [absent]
+//	ORDER BY n.val DESC   -> [absent] [3] [1] [stored null]
+//
+// so a stored JSON null sorts BELOW every number, an absent property sorts
+// ABOVE every number, and DESC is the exact reverse of ASC -- which is why
+// sortRows can keep implementing DESC as a plain negation.
+//
+// ok is false for anything else (a string, bool, array, object): pg orders
+// strings by a database collation this package cannot know (value.go's
+// Compare refuses them outright), and the remaining type ranks were never
+// verified, so those decline instead of guessing.
+func runtimeNumericRank(v any, absent bool) (rank int, num float64, ok bool) {
+	switch {
+	case absent:
+		return 2, 0, true
+	case v == nil:
+		return 0, 0, true
+	}
+	f, isNum := v.(float64)
+	if !isNum {
+		return 0, 0, false
+	}
+	return 1, f, true
+}
+
+// compareRuntimeNumericOrder compares two ORDER BY values for a
+// RuntimeNumeric key, returning ErrUnsupported (which declines the query to
+// PostgreSQL) the moment it sees a value whose ordering this package cannot
+// reproduce.
+func compareRuntimeNumericOrder(av any, aAbsent bool, bv any, bAbsent bool) (int, error) {
+	ar, an, aok := runtimeNumericRank(av, aAbsent)
+	br, bn, bok := runtimeNumericRank(bv, bAbsent)
+	if !aok || !bok {
+		return 0, ErrUnsupported
+	}
+	if ar != br {
+		if ar < br {
+			return -1, nil
+		}
+		return 1, nil
+	}
+	if ar != 1 {
+		return 0, nil
+	}
+	return compareFloat(an, bn), nil
+}
+
 // sortRows stably sorts rows and outRows in lockstep (both index i always
 // describes the same logical row) by order, resolving each key via
 // resolveOrderValue and comparing via value.go's Compare. Compare's
@@ -1166,6 +1448,14 @@ func resolveOrderValue(aliasIndex map[string]int, row *Row, outRow []OutVal, sym
 // silently swallowed; sort.SliceStable's comparator signature has no error
 // return, so the first Compare error encountered is latched via sortErr and
 // checked once the sort call returns.
+//
+// TIES: sort.SliceStable keeps equal-keyed rows in input order, but
+// PostgreSQL guarantees no tie-break of its own, so a query combining
+// ORDER BY with LIMIT over a key with duplicates can legitimately return a
+// DIFFERENT set of rows here than pg returns -- the same latitude
+// `RETURN n LIMIT 5` without any ORDER BY already has, and which this
+// package already serves. What is NOT latitude is the ordering of
+// DISTINCT keys, which compareRuntimeNumericOrder reproduces exactly.
 //
 // DESC is implemented as a plain negation of Compare's numeric result, never
 // as "compare normally, but always keep NULL last regardless of direction".
@@ -1179,7 +1469,7 @@ func resolveOrderValue(aliasIndex map[string]int, row *Row, outRow []OutVal, sym
 // no matter what". A naive DESC that special-cased null to stay last
 // independent of direction would silently disagree with pg here -- exactly
 // the corner this comparator is written to get right.
-func sortRows(rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[string]int) error {
+func sortRows(env *Env, rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[string]int) error {
 	idx := make([]int, len(rows))
 	for i := range idx {
 		idx[i] = i
@@ -1192,9 +1482,29 @@ func sortRows(rows []*Row, outRows [][]OutVal, order []OrderKey, aliasIndex map[
 		}
 		a, b := idx[i], idx[j]
 		for _, ok := range order {
-			av := resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol)
-			bv := resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol)
-			c, err := Compare(av, bv)
+			var (
+				c   int
+				err error
+			)
+			switch {
+			case ok.Expr != nil:
+				// Sort key the projection never outputs: read it off the row.
+				av, aPresent, aerr := EvalValue(env, rows[a], ok.Expr)
+				bv, bPresent, berr := EvalValue(env, rows[b], ok.Expr)
+				if aerr != nil || berr != nil {
+					sortErr = ErrUnsupported
+					return false
+				}
+				c, err = compareRuntimeNumericOrder(av, !aPresent, bv, !bPresent)
+			case ok.RuntimeNumeric:
+				c, err = compareRuntimeNumericOrder(
+					resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol), resolveOrderAbsent(aliasIndex, outRows[a], ok.Symbol),
+					resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol), resolveOrderAbsent(aliasIndex, outRows[b], ok.Symbol))
+			default:
+				c, err = Compare(
+					resolveOrderValue(aliasIndex, rows[a], outRows[a], ok.Symbol),
+					resolveOrderValue(aliasIndex, rows[b], outRows[b], ok.Symbol))
+			}
 			if err != nil {
 				sortErr = err
 				return false
@@ -1423,4 +1733,318 @@ func tryMembershipComparison(env *Env, row *Row, cmp *cypher.Comparison, members
 	}
 	_, in := set[env.Snap.GraphID(nodeID)]
 	return boolToTri(in), true
+}
+
+// runDistinctStreaming serves `RETURN DISTINCT ...` over a single Part by
+// projecting and deduplicating rows AS THEY ARE PRODUCED, rather than
+// materializing every matched row and deduplicating at the end. handled is
+// false for any shape it does not take, and the caller proceeds unchanged.
+//
+// The shape this exists for is `MATCH (u:User) RETURN DISTINCT u.enabled
+// LIMIT 1000`. Every row has to be seen before the answer is known, so the
+// ordinary path materializes one row per User -- hundreds of thousands of
+// them, past Budgets.MaxRows -- and declinesOnRowBudget used to recognize
+// that in advance and delegate to PostgreSQL rather than spend the scan
+// discovering it. But the quantity MaxRows is meant to bound is the ANSWER,
+// and the answer here is two rows. Streaming makes the two quantities agree:
+// the scan still visits every candidate and still pays MaxWork for each, and
+// the row budget is charged per DISTINCT output tuple, which is what the
+// caller actually receives.
+//
+// Under a LIMIT it additionally stops early -- once SKIP+LIMIT distinct
+// tuples exist, no later row can change the result, which is exactly the
+// early termination limitTarget has to refuse for DISTINCT on the
+// pre-projection driver (two different matched rows can project to the same
+// tuple, so that driver cannot count what it has).
+//
+// ORDER BY is excluded: sorting decides WHICH rows a LIMIT keeps, so an
+// early stop could keep the wrong ones. Aggregates and WITH are excluded
+// because they collapse rows on their own terms, and OPTIONAL MATCH because
+// the chunked driver bypasses the left join.
+func runDistinctStreaming(env *Env, q *Query, meter *workMeter) (*ResultSet, bool, error) {
+	if len(q.Parts) != 1 || !q.Returning.Distinct || len(q.Order) > 0 {
+		return nil, false, nil
+	}
+	if q.ReturnGroup != nil {
+		return nil, false, nil
+	}
+	part := &q.Parts[0]
+	if part.With != nil || part.Optional != nil {
+		return nil, false, nil
+	}
+	if partCannotMatch(env, part) {
+		return &ResultSet{Keys: projectionKeys(q.Returning)}, true, nil
+	}
+	comp, anchor, ok := limitEligibleComponent(env, meter, part)
+	if !ok {
+		return nil, false, nil
+	}
+
+	// -1 means "no early stop": stream anyway, because the row-budget saving
+	// stands on its own even when every candidate has to be visited.
+	target := int64(-1)
+	if q.Limit >= 0 {
+		target = q.Skip + q.Limit
+	}
+
+	seen := make(map[string]struct{})
+	var outRows [][]OutVal
+	done := false
+
+	// A DISTINCT projection over a wide scan sees far more duplicates than
+	// distinct tuples -- two values across two hundred thousand users, for the
+	// shape this exists for -- so the per-row path allocates nothing. The
+	// projection lands in a scratch slice, and its key is built into a reused
+	// buffer that Go looks up in the map without copying (m[string(b)] is
+	// allocation-free). Only a genuinely NEW tuple is copied out and kept.
+	scratch := make([]OutVal, len(q.Returning.Items))
+	var keyBuf []byte
+
+	emit := func(rows []*Row) error {
+		for _, r := range rows {
+			if err := projectRowInto(env, q.Returning, r, scratch); err != nil {
+				return err
+			}
+			keyBuf = keyBuf[:0]
+			for _, v := range scratch {
+				keyBuf = appendOutValKey(env, keyBuf, v)
+			}
+			if _, dup := seen[string(keyBuf)]; dup {
+				continue
+			}
+			out := make([]OutVal, len(scratch))
+			copy(out, scratch)
+			seen[string(keyBuf)] = struct{}{}
+			// Charged per DISTINCT tuple: this is the "final result" MaxRows
+			// bounds, and the duplicates never become result rows.
+			if err := meter.addFinalRow(); err != nil {
+				return err
+			}
+			outRows = append(outRows, out)
+			if target >= 0 && int64(len(outRows)) >= target {
+				done = true
+				return nil
+			}
+		}
+		return nil
+	}
+
+	chunk := make([]*Row, 0, limitChunk)
+	flush := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		rows, err := runComponentFrom(env, meter, part, comp, chunk)
+		chunk = chunk[:0]
+		if err != nil {
+			return err
+		}
+		rows, err = filterRows(env, rows, part.Where, nil)
+		if err != nil {
+			return err
+		}
+		return emit(rows)
+	}
+
+	hint := hintForAnchor(env, part, comp.stepIdxs, anchor)
+
+	// With no steps to expand, each candidate IS the row: it is projected and
+	// dropped before the next one arrives, so one row is reused for all of
+	// them rather than allocating one per node of the scanned kind.
+	var reuse *Row
+	// one backs the single-row slice handed to emit below. It belongs to this
+	// call, not to the package: queries run concurrently, and a shared buffer
+	// here would be a data race between them.
+	var one [1]*Row
+	if len(comp.stepIdxs) == 0 {
+		reuse = NewRow()
+	}
+	scanErr := scanAnchorVisitReusing(env, meter, anchor, part.Nodes[anchor], hint, reuse, func(r *Row) error {
+		if reuse != nil {
+			// Straight through: no chunk to accumulate, and nothing retains r.
+			one[0] = r
+			if err := emit(one[:]); err != nil {
+				return err
+			}
+			if done {
+				return errStopScan
+			}
+			return nil
+		}
+		chunk = append(chunk, r)
+		if len(chunk) < limitChunk {
+			return nil
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+		if done {
+			return errStopScan
+		}
+		return nil
+	})
+	if scanErr != nil && scanErr != errStopScan {
+		return nil, true, scanErr
+	}
+	if !done {
+		if err := flush(); err != nil {
+			return nil, true, err
+		}
+	}
+
+	if err := meter.check(); err != nil {
+		return nil, true, err
+	}
+	return &ResultSet{
+		Keys: projectionKeys(q.Returning),
+		Rows: applySkipLimit(outRows, q.Skip, q.Limit),
+	}, true, nil
+}
+
+// runKindCount answers `MATCH (u:Kind) RETURN COUNT(u)` from the kind
+// bitmap's own population, materializing no rows. handled is false for any
+// other shape.
+//
+// The query asks how many nodes carry a kind, and that is a number the
+// snapshot already maintains -- NodesOfKind returns a bitmap whose Count is
+// exact, including an overlay's additions and tombstones (buildKindBitmap
+// resolves both). Answering it by binding a row per node and counting the
+// rows cost 63ms on the benchmark graph's users, against a PostgreSQL index
+// scan's 85ms, for an answer that is one integer.
+//
+// Deliberately narrow. It requires a single Part with no pattern steps, one
+// symbol constrained by kinds ALONE -- no predicates, ids or objectid anchor,
+// any of which would make the bitmap's population the wrong number -- and a
+// RETURN of exactly one ungrouped, non-DISTINCT COUNT of that symbol. A
+// COUNT(*) is excluded too: it counts ROWS, which is the same thing only for
+// this shape, and reading it as such elsewhere would be a silent wrong
+// answer.
+func runKindCount(env *Env, q *Query) (*ResultSet, bool) {
+	if len(q.Parts) != 1 || q.ReturnGroup == nil || len(q.Order) > 0 {
+		return nil, false
+	}
+	g := q.ReturnGroup
+	if len(g.GroupKeys) != 0 || len(g.Aggregates) != 1 || len(g.Constants) != 0 || len(g.Computed) != 0 {
+		return nil, false
+	}
+	agg := g.Aggregates[0].Count
+	if agg == nil || agg.Star || agg.Distinct || agg.Sym == "" {
+		return nil, false
+	}
+	part := &q.Parts[0]
+	if len(part.Chains) != 0 || len(part.Nodes) != 1 || part.Where != nil ||
+		part.Optional != nil || part.With != nil {
+		return nil, false
+	}
+	nc, ok := part.Nodes[agg.Sym]
+	if !ok || nc == nil || len(nc.Kinds) == 0 || len(nc.Predicates) > 0 ||
+		len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil || nc.PropIndexed {
+		return nil, false
+	}
+	// A multi-kind constraint is an AND across bitmaps, which smallestKind
+	// Bitmap does not intersect -- its population would be an over-count.
+	if len(nc.Kinds) != 1 {
+		return nil, false
+	}
+
+	n := float64(env.Snap.NodesOfKind(nc.Kinds[0]).Count())
+	rows := applySkipLimit([][]OutVal{{{Kind: OutScalar, Scalar: n}}}, q.Skip, q.Limit)
+	return &ResultSet{Keys: projectionKeys(q.Returning), Rows: rows}, true
+}
+
+// seedOptionalPart returns opt with each shared symbol restricted to the
+// nodes the mandatory rows actually bound it to, so the OPTIONAL MATCH is
+// matched outward from those nodes instead of across the whole graph.
+//
+// Without it the optional pattern ran uncorrelated and was hash-joined
+// afterwards. `MATCH (u:User) WHERE u.admincount = true OPTIONAL MATCH
+// (u)-[:MemberOf]->(g:Group)` resolved its mandatory side to eight users in
+// 0.06ms, then matched every User-MemberOf-Group edge in the graph to find
+// the handful belonging to them: 89ms, against 0.07ms for the identical
+// pattern written as a plain MATCH -- and slower than PostgreSQL, which
+// correlates the join.
+//
+// The restriction is exact for this join: an optional row can only pair with
+// a mandatory row that bound the shared symbol to the same node, so a node no
+// mandatory row bound can contribute nothing. The hash join in
+// leftJoinOptional still runs over what comes back, so correctness does not
+// depend on the planner choosing the seeded symbol as its anchor -- only the
+// speed does, and a candidate list this small is what the anchor chooser
+// prices cheapest.
+//
+// opt itself is never modified: NodeConstraints are read-only once planned,
+// and the same Part serves every later execution of the query.
+func seedOptionalPart(opt *Part, shared []string, rows []*Row) *Part {
+	if opt == nil || len(shared) == 0 || len(rows) == 0 {
+		return opt
+	}
+	seeded := *opt
+	seeded.Nodes = make(map[string]*NodeConstraint, len(opt.Nodes))
+	for k, v := range opt.Nodes {
+		seeded.Nodes[k] = v
+	}
+	changed := false
+	for _, sym := range shared {
+		seen := make(map[snapshot.NodeID]struct{})
+		ids := make([]snapshot.NodeID, 0, len(rows))
+		bound := true
+		for _, r := range rows {
+			id, ok := r.Node(sym)
+			if !ok {
+				// A shared symbol some row leaves unbound: nothing safe to
+				// restrict it to, so leave this symbol unseeded.
+				bound = false
+				break
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		if !bound {
+			continue
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+
+		var nc NodeConstraint
+		if orig := opt.Nodes[sym]; orig != nil {
+			nc = *orig
+		}
+		if nc.PropIndexed {
+			// Already narrowed by a predicate of its own: the seed can only
+			// narrow further, never widen past what that predicate allows.
+			ids = intersectNodeIDs(nc.PropCandidates, ids)
+		}
+		nc.PropCandidates, nc.PropIndexed = ids, true
+		seeded.Nodes[sym] = &nc
+		changed = true
+	}
+	if !changed {
+		return opt
+	}
+	return &seeded
+}
+
+// intersectNodeIDs returns the ids present in both a and b, ascending. b must
+// be ascending; a is copied and sorted, since a plan-time candidate list makes
+// no ordering promise.
+func intersectNodeIDs(a, b []snapshot.NodeID) []snapshot.NodeID {
+	sa := append([]snapshot.NodeID(nil), a...)
+	sort.Slice(sa, func(i, j int) bool { return sa[i] < sa[j] })
+	out := make([]snapshot.NodeID, 0, len(b))
+	i, j := 0, 0
+	for i < len(sa) && j < len(b) {
+		switch {
+		case sa[i] < b[j]:
+			i++
+		case b[j] < sa[i]:
+			j++
+		default:
+			out = append(out, sa[i])
+			i++
+			j++
+		}
+	}
+	return out
 }

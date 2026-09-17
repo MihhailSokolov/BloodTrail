@@ -64,6 +64,22 @@ const (
 	// local serving slower than simply delegating to PostgreSQL.
 	maxCypherWork = 1 << 28
 
+	// maxCypherLiveRows caps the largest MATERIALIZED intermediate row set
+	// (Budgets.MaxLiveRows). maxCypherWork above cannot bound memory: it is
+	// cumulative and counts adjacency slots alongside rows, so the value
+	// that lets a legitimate deep traversal inspect 268M slots also lets a
+	// pathological one hold 268M live rows -- tens of gigabytes. That is
+	// not hypothetical: the 500k benchmark's heaviest shape
+	// (`(u)-[:MemberOf|AdminTo*1..]->(c:Computer)` under an aggregate)
+	// peaked at 6.7 GiB and OOM-killed the container rather than declining.
+	//
+	// 2,000,000 rows is roughly 600 MB at this executor's per-row cost, and
+	// about four times the largest legitimate intermediate the shipped
+	// corpus produces (a ~500k-member group listing). Past it, PostgreSQL
+	// serves the query -- more slowly, but it spills to disk instead of
+	// dying.
+	maxCypherLiveRows = 2_000_000
+
 	// edgePropsBatchSize caps how many database edge ids one edge-property
 	// hydration query batches into a single `WHERE id = ANY($1)`
 	// round trip, mirroring hydrate.go's own edgeBatchSize for node/edge

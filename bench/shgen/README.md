@@ -153,12 +153,19 @@ prebuilt/selector queries + 34 adversarial shapes:
 
 | | stock (pg driver) | BloodTrail |
 |---|---|---|
-| whole-corpus p50 total | 90.5 s | **35.0 s** (0.39x) |
+| whole-corpus p50 total | 90.5 s | **29.9 s** (0.33x) |
 | azure-touching queries | 55.7 s | **9.0 s** |
 | worst single query | 49.5 s (Shortest paths to Azure Subscriptions) | 1.1 s |
-| queries >5x slower than the other arm | 7 | 7 |
+| queries >10x slower than the other arm | 3 | **0** |
+| queries >5x slower than the other arm | 10 | **3** |
+| queries >2x slower than the other arm | 40 | 22 |
 | ingest (upload -> datapipe idle) | 262 s | 341 s (+30%, write-through) |
-| peak RSS over the sweep | 3.2 GiB | 5.7 GiB |
+| peak RSS over the sweep | 3.2 GiB | 6.3 GiB |
+
+Every remaining regression is between 2x and 6x, with absolute times from
+62 ms to 1.0 s; nothing is catastrophic and nothing is unbounded. A query
+whose intermediate row set would exceed `MaxLiveRows` now declines to
+PostgreSQL rather than growing until the container is OOM-killed.
 
 All 22 azure derived-edge checks (AZGlobalAdmin, SyncedToEntraUser/
 SyncedToADUser, the AZMG* family, AZResetPassword, AZRoleEligible/Approver,

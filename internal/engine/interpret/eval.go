@@ -19,7 +19,6 @@ package interpret
 import (
 	"errors"
 	"math"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -108,10 +107,30 @@ func (e EdgeRef) Kind(snap *snapshot.View) snapshot.KindID {
 // namespace a symbol lives in is a property of the query's pattern, not
 // something this package needs to infer from the stored value's shape.
 type Row struct {
-	nodes   map[string]snapshot.NodeID
-	edges   map[string]EdgeRef
-	paths   map[string]any
-	scalars map[string]any
+	// The four binding namespaces are association SLICES, not maps, for the
+	// reason usedEdges below already gives for itself: a row binds the
+	// symbols of one pattern, which is a handful, and at that size a linear
+	// scan over contiguous memory beats hashing. The difference that made
+	// this worth changing is allocation, not lookup -- a lazily-created map
+	// costs a header plus its first bucket, so a freshly bound one-symbol
+	// row cost three allocations where it now costs one.
+	//
+	// That cost is paid per CANDIDATE, not per result: scanAnchorVisit binds
+	// a row for every node a candidate source yields, and a wide anchor
+	// feeding a selective step discards nearly all of them. Measured on the
+	// benchmark graph's "All Global Administrators" shape -- 84k AZBase
+	// nodes seeding a step whose edge kind has exactly ONE edge in the whole
+	// graph -- Row construction was 76% of the query's allocations.
+	//
+	// Set overwrites in place when the symbol is already bound, so these
+	// carry the same one-value-per-symbol semantics a map did. Iteration
+	// order is now insertion order rather than random; nothing depends on
+	// it (cloneRow and mergeRowInto are this package's only iterators, and
+	// both build a complete copy).
+	nodes   []nodeBinding
+	edges   []edgeBinding
+	paths   []anyBinding
+	scalars []anyBinding
 
 	// usedEdges records the forward-CSR index of every edge any Step has
 	// bound while constructing this row, regardless of whether that Step
@@ -149,75 +168,122 @@ type Row struct {
 	trailEdges []uint64
 }
 
+// nodeBinding, edgeBinding and anyBinding are one symbol's entry in a Row's
+// corresponding namespace -- see Row's own doc for why these are slices.
+type nodeBinding struct {
+	sym string
+	id  snapshot.NodeID
+}
+
+type edgeBinding struct {
+	sym string
+	ref EdgeRef
+}
+
+type anyBinding struct {
+	sym string
+	val any
+}
+
 // NewRow returns an empty Row ready for SetNode/SetEdge/SetPathVar/
 // SetScalar.
 func NewRow() *Row {
 	return &Row{}
 }
 
-// SetNode binds sym to a node's dense NodeID.
+// SetNode binds sym to a node's dense NodeID, replacing any previous
+// binding for sym.
 func (r *Row) SetNode(sym string, id snapshot.NodeID) {
-	if r.nodes == nil {
-		r.nodes = make(map[string]snapshot.NodeID)
+	for i := range r.nodes {
+		if r.nodes[i].sym == sym {
+			r.nodes[i].id = id
+			return
+		}
 	}
-	r.nodes[sym] = id
+	r.nodes = append(r.nodes, nodeBinding{sym: sym, id: id})
 }
 
 // Node returns the dense NodeID bound to sym, and whether sym is bound as a
 // node variable at all.
 func (r *Row) Node(sym string) (snapshot.NodeID, bool) {
-	id, ok := r.nodes[sym]
-	return id, ok
+	for i := range r.nodes {
+		if r.nodes[i].sym == sym {
+			return r.nodes[i].id, true
+		}
+	}
+	return 0, false
 }
 
-// SetEdge binds sym to an edge reference.
+// SetEdge binds sym to an edge reference, replacing any previous binding
+// for sym.
 func (r *Row) SetEdge(sym string, ref EdgeRef) {
-	if r.edges == nil {
-		r.edges = make(map[string]EdgeRef)
+	for i := range r.edges {
+		if r.edges[i].sym == sym {
+			r.edges[i].ref = ref
+			return
+		}
 	}
-	r.edges[sym] = ref
+	r.edges = append(r.edges, edgeBinding{sym: sym, ref: ref})
 }
 
 // Edge returns the EdgeRef bound to sym, and whether sym is bound as an edge
 // variable at all.
 func (r *Row) Edge(sym string) (EdgeRef, bool) {
-	ref, ok := r.edges[sym]
-	return ref, ok
+	for i := range r.edges {
+		if r.edges[i].sym == sym {
+			return r.edges[i].ref, true
+		}
+	}
+	return EdgeRef{}, false
 }
 
-// SetPathVar binds sym to a path value. Nothing produced a path value when
-// this was written, so v's shape is not defined by anything other than the
-// caller; this exists purely so Row's namespace shape already carries the
-// path slot, ahead of the code that populates it.
+// SetPathVar binds sym to a path value, replacing any previous binding for
+// sym. Nothing produced a path value when this was written, so v's shape is
+// not defined by anything other than the caller; this exists purely so
+// Row's namespace shape already carries the path slot, ahead of the code
+// that populates it.
 func (r *Row) SetPathVar(sym string, v any) {
-	if r.paths == nil {
-		r.paths = make(map[string]any)
-	}
-	r.paths[sym] = v
+	r.paths = setAnyBinding(r.paths, sym, v)
 }
 
 // PathVar returns the path value bound to sym, and whether sym is bound as a
 // path variable at all.
 func (r *Row) PathVar(sym string) (any, bool) {
-	v, ok := r.paths[sym]
-	return v, ok
+	return getAnyBinding(r.paths, sym)
 }
 
 // SetScalar binds sym to a plain computed/bound value (e.g. an UNWIND
 // element), in the same post-JSON value model as everything else in this
-// package.
+// package, replacing any previous binding for sym.
 func (r *Row) SetScalar(sym string, v any) {
-	if r.scalars == nil {
-		r.scalars = make(map[string]any)
-	}
-	r.scalars[sym] = v
+	r.scalars = setAnyBinding(r.scalars, sym, v)
 }
 
 // Scalar returns the scalar value bound to sym, and whether sym is bound as
 // a scalar variable at all.
 func (r *Row) Scalar(sym string) (any, bool) {
-	v, ok := r.scalars[sym]
-	return v, ok
+	return getAnyBinding(r.scalars, sym)
+}
+
+// setAnyBinding and getAnyBinding are the paths/scalars namespaces' shared
+// bodies -- both are []anyBinding, so the scan is written once.
+func setAnyBinding(bs []anyBinding, sym string, v any) []anyBinding {
+	for i := range bs {
+		if bs[i].sym == sym {
+			bs[i].val = v
+			return bs
+		}
+	}
+	return append(bs, anyBinding{sym: sym, val: v})
+}
+
+func getAnyBinding(bs []anyBinding, sym string) (any, bool) {
+	for i := range bs {
+		if bs[i].sym == sym {
+			return bs[i].val, true
+		}
+	}
+	return nil, false
 }
 
 // markEdgeUsed records fwd (a forward-CSR index) as consumed by some Step
@@ -280,7 +346,48 @@ type Env struct {
 	Now  time.Time
 
 	regexMu    sync.Mutex
-	regexCache map[string]*regexp.Regexp
+	regexCache map[string]*RegexMatcher
+
+	// litMu guards litCache, the decoded form of each string literal the
+	// query mentions -- see literalValue.
+	litMu    sync.Mutex
+	litCache map[*cypher.Literal]any
+}
+
+// literalValue is evalLiteralValue memoized per Env, which is per query.
+//
+// The frontend hands string literals over in SOURCE form -- quotes intact,
+// escapes un-decoded -- so reading one means decoding it, and decoding it
+// means allocating a string. Predicates are evaluated once per ROW, and the
+// literal on the right-hand side never changes between them: `MATCH (u:User)
+// WHERE u.name CONTAINS 'ADMIN'` decoded 'ADMIN' once per user in the graph,
+// which profiling put at a tenth of that query's whole cost.
+//
+// Keyed by the literal node's identity rather than its text, so two different
+// literals that happen to share a spelling stay separate and no hashing of
+// the token is needed.
+func (e *Env) literalValue(lit *cypher.Literal) (any, bool, error) {
+	if lit == nil {
+		return nil, false, ErrUnsupported
+	}
+	e.litMu.Lock()
+	if v, ok := e.litCache[lit]; ok {
+		e.litMu.Unlock()
+		return v, true, nil
+	}
+	e.litMu.Unlock()
+
+	v, ok, err := evalLiteralValue(lit)
+	if err != nil || !ok {
+		return v, ok, err
+	}
+	e.litMu.Lock()
+	if e.litCache == nil {
+		e.litCache = make(map[*cypher.Literal]any)
+	}
+	e.litCache[lit] = v
+	e.litMu.Unlock()
+	return v, true, nil
 }
 
 // compiledRegex returns a compiled, cached *regexp.Regexp for pattern,
@@ -288,19 +395,19 @@ type Env struct {
 // cache exists instead of compiling on every call the way value.go's own
 // matchString (used for the STARTS WITH/ENDS WITH/CONTAINS operators, which
 // have no compilation cost to amortize) deliberately still does.
-func (e *Env) compiledRegex(pattern string) (*regexp.Regexp, error) {
+func (e *Env) compiledRegex(pattern string) (*RegexMatcher, error) {
 	e.regexMu.Lock()
 	defer e.regexMu.Unlock()
 
 	if re, ok := e.regexCache[pattern]; ok {
 		return re, nil
 	}
-	re, err := regexp.Compile(pattern)
+	re, err := NewRegexMatcher(pattern)
 	if err != nil {
 		return nil, err
 	}
 	if e.regexCache == nil {
-		e.regexCache = make(map[string]*regexp.Regexp)
+		e.regexCache = make(map[string]*RegexMatcher)
 	}
 	e.regexCache[pattern] = re
 	return re, nil
@@ -707,7 +814,7 @@ func evalLiteralComparison(env *Env, row *Row, otherExpr cypher.Expression, op c
 	if err != nil {
 		return TriNull, err
 	}
-	litVal, _, err := evalLiteralValue(lit)
+	litVal, _, err := env.literalValue(lit)
 	if err != nil {
 		return TriNull, err
 	}
@@ -850,7 +957,7 @@ func evalRegexPredicate(env *Env, val any, ok bool, pattern string, negated bool
 	if compileErr != nil {
 		re = nil
 	}
-	return RegexPredicate(re, val, ok, negated)
+	return RegexMatcherPredicate(re, val, ok, negated)
 }
 
 // literalStringValue evaluates expr and requires the result to be a present
@@ -986,19 +1093,6 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 	if !isNode || !isRel || !isNode2 || fromNode == nil || rel == nil || toNode == nil {
 		return TriNull, ErrUnsupported
 	}
-	if fromNode.Variable == nil || toNode.Variable == nil {
-		return TriNull, ErrUnsupported
-	}
-
-	fromID, ok := row.Node(fromNode.Variable.Symbol)
-	if !ok {
-		return TriNull, ErrUnsupported
-	}
-	toID, ok := row.Node(toNode.Variable.Symbol)
-	if !ok {
-		return TriNull, ErrUnsupported
-	}
-
 	kinds := make([]snapshot.KindID, 0, len(rel.Kinds))
 	for _, k := range rel.Kinds {
 		id, found := env.Snap.Kinds().ID(k.String())
@@ -1008,16 +1102,135 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 		kinds = append(kinds, id)
 	}
 
-	switch rel.Direction {
-	case graph.DirectionOutbound:
-		return boolToTri(hasAdjacentEdge(env, fromID, toID, kinds)), nil
-	case graph.DirectionInbound:
-		return boolToTri(hasAdjacentEdge(env, toID, fromID, kinds)), nil
-	case graph.DirectionBoth:
-		return boolToTri(hasAdjacentEdge(env, fromID, toID, kinds) || hasAdjacentEdge(env, toID, fromID, kinds)), nil
+	// One endpoint may be an ANONYMOUS node carrying kind labels -- the
+	// `(:Group)` in `WHERE NOT (u)-[:MemberOf]->(:Group)`. It binds nothing,
+	// so the predicate is the existential pg lowers it to ("is there an edge
+	// from u to SOME node labelled Group"), reached by walking the bound
+	// side's adjacency and testing each neighbour's labels instead of
+	// probing one already-known pair. A NAMED fresh variable is still
+	// rejected at plan time, because that one really would have to bind.
+	fromBound, fromOK := patternEndpointNode(row, fromNode)
+	toBound, toOK := patternEndpointNode(row, toNode)
+
+	switch {
+	case fromOK && toOK:
+		return boolToTri(adjacentInDirection(env, rel.Direction, fromBound, toBound, kinds)), nil
+	case fromOK:
+		return boolToTri(hasKindedNeighbor(env, fromBound, rel.Direction, nodeKindIDs(env, toNode), kinds)), nil
+	case toOK:
+		return boolToTri(hasKindedNeighbor(env, toBound, reverseDirection(rel.Direction), nodeKindIDs(env, fromNode), kinds)), nil
 	default:
 		return TriNull, ErrUnsupported
 	}
+}
+
+// patternEndpointNode resolves a pattern-predicate endpoint to the node the
+// row already bound it to, or reports that it is not a bound variable.
+func patternEndpointNode(row *Row, np *cypher.NodePattern) (snapshot.NodeID, bool) {
+	if np.Variable == nil || np.Variable.Symbol == "" {
+		return 0, false
+	}
+	return row.Node(np.Variable.Symbol)
+}
+
+// nodeKindIDs resolves a pattern node's kind labels to snapshot ids. A label
+// this snapshot has never interned yields the sentinel "no node can match"
+// value, which is correct rather than an error: nothing carries a kind that
+// does not exist. nil (no labels at all) means "any node".
+func nodeKindIDs(env *Env, np *cypher.NodePattern) []snapshot.KindID {
+	if len(np.Kinds) == 0 {
+		return nil
+	}
+	out := make([]snapshot.KindID, 0, len(np.Kinds))
+	for _, k := range np.Kinds {
+		id, found := env.Snap.Kinds().ID(k.String())
+		if !found {
+			return []snapshot.KindID{kindIDNoMatch}
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// kindIDNoMatch is a kind id no node can carry, used to represent a pattern
+// label this snapshot never interned. Kind ids are assigned densely upward
+// from zero, so a negative one is unreachable by construction.
+const kindIDNoMatch = snapshot.KindID(-1)
+
+// reverseDirection flips a relationship direction so a predicate anchored on
+// its OTHER endpoint walks the correct adjacency. DirectionBoth is its own
+// reverse.
+func reverseDirection(d graph.Direction) graph.Direction {
+	switch d {
+	case graph.DirectionOutbound:
+		return graph.DirectionInbound
+	case graph.DirectionInbound:
+		return graph.DirectionOutbound
+	default:
+		return d
+	}
+}
+
+// adjacentInDirection is the both-endpoints-bound probe, unchanged: does an
+// admissible edge connect these two specific nodes the declared way round?
+func adjacentInDirection(env *Env, dir graph.Direction, from, to snapshot.NodeID, kinds []snapshot.KindID) bool {
+	switch dir {
+	case graph.DirectionOutbound:
+		return hasAdjacentEdge(env, from, to, kinds)
+	case graph.DirectionInbound:
+		return hasAdjacentEdge(env, to, from, kinds)
+	case graph.DirectionBoth:
+		return hasAdjacentEdge(env, from, to, kinds) || hasAdjacentEdge(env, to, from, kinds)
+	default:
+		return false
+	}
+}
+
+// hasKindedNeighbor reports whether src has at least one edge, in dir and of
+// an admissible edge kind, to a node carrying every label in nodeKinds (nil
+// nodeKinds admitting any node). It stops at the first hit, so the common
+// answer on a dense graph costs one edge.
+func hasKindedNeighbor(env *Env, src snapshot.NodeID, dir graph.Direction, nodeKinds, edgeKinds []snapshot.KindID) bool {
+	match := func(n snapshot.NodeID, k snapshot.KindID) bool {
+		return edgeKindOK(edgeKinds, k) && nodeHasAllKinds(env, n, nodeKinds)
+	}
+	found := false
+	visit := func(n snapshot.NodeID, k snapshot.KindID, _ uint64) bool {
+		if match(n, k) {
+			found = true
+			return false
+		}
+		return true
+	}
+	if dir == graph.DirectionOutbound || dir == graph.DirectionBoth {
+		env.Snap.OutEdges(src, visit)
+	}
+	if !found && (dir == graph.DirectionInbound || dir == graph.DirectionBoth) {
+		env.Snap.InEdges(src, visit)
+	}
+	return found
+}
+
+// nodeHasAllKinds reports whether n carries every kind in kinds -- Cypher's
+// `(n:A:B)` AND semantics. An empty list admits every node.
+func nodeHasAllKinds(env *Env, n snapshot.NodeID, kinds []snapshot.KindID) bool {
+	if len(kinds) == 0 {
+		return true
+	}
+	have := env.Snap.KindIDsOf(n)
+	for _, want := range kinds {
+		ok := false
+		for _, h := range have {
+			if h == want {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // hasAdjacentEdge reports whether src has at least one outgoing edge to dst
@@ -1069,7 +1282,7 @@ func EvalValue(env *Env, row *Row, expr cypher.Expression) (val any, ok bool, er
 		if typed == nil {
 			return nil, false, ErrUnsupported
 		}
-		return evalLiteralValue(typed)
+		return env.literalValue(typed)
 
 	case *cypher.Parenthetical:
 		if typed == nil {

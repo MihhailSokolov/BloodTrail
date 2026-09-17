@@ -357,6 +357,17 @@ func RegexPredicate(re *regexp.Regexp, val any, ok bool, negated bool) (Tri, err
 	}, val, ok, negated)
 }
 
+// RegexMatcherPredicate is RegexPredicate over a RegexMatcher, which answers
+// the identical question and does it with a substring search when the pattern
+// allows one (see RegexMatcher). m may be nil -- a pattern that failed to
+// compile -- and then treats every input as no-match, exactly as
+// RegexPredicate does for a nil *regexp.Regexp.
+func RegexMatcherPredicate(m *RegexMatcher, val any, ok bool, negated bool) (Tri, error) {
+	return stringPredicateCore(func(s string) bool {
+		return m.MatchString(s)
+	}, val, ok, negated)
+}
+
 // stringPredicateCore implements the coalesce-then-match-then-invert
 // three-valued semantics shared by StringPredicate (STARTS WITH/ENDS
 // WITH/CONTAINS/regex-by-needle-string) and RegexPredicate

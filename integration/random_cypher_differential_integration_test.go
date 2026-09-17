@@ -556,6 +556,55 @@ var randomCypherTemplates = []randomCypherTemplate{
 		return fmt.Sprintf(`MATCH (n:%s) WHERE %s IN n.tags RETURN n`, randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickTagCandidate(rng)))
 	},
 
+	// Pattern predicates with an ANONYMOUS endpoint -- the existential shape
+	// BloodHound writes for "principals with no group membership". The label
+	// on that endpoint is the whole point: it has to filter by the NEIGHBOUR's
+	// kind, not just by the edge kind, and it binds nothing, so both engines
+	// must agree it is a pure EXISTS. Negated and undirected forms included
+	// because those are where a wrong answer hides -- a semi-join that
+	// silently ignored the label would still look plausible positively.
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (n)-[:%s]->(:%s) RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE NOT (n)-[:%s]->(:%s) RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (n)-[:%s]-(:%s) RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (:%s)-[:%s]->(n) RETURN n`,
+			randomCypherPickKind(rng), randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))])
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE (n)-[:%s]->() RETURN n`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))])
+	},
+
+	// OPTIONAL MATCH: a LEFT join, so the row count is the point -- an
+	// unmatched left row must SURVIVE with a null column rather than being
+	// dropped, and a left row with several matches must fan out. Both
+	// failure modes (inner-join semantics, and null-padding a row that
+	// should have matched) change the row count, which is what the
+	// differential compares.
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (a:%s) OPTIONAL MATCH (a)-[:%s]->(b:%s) RETURN a, b`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (a:%s) WHERE a.val > %s OPTIONAL MATCH (a)-[:%s]->(b:%s) RETURN a, b`,
+			randomCypherPickKind(rng), cypherNumberLiteral(randomCypherPickNumber(rng)),
+			randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))], randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (a:%s) OPTIONAL MATCH (a)-[:%s]->(b:%s) WHERE b.str STARTS WITH %s RETURN a, b`,
+			randomCypherPickKind(rng), randomCypherEdgeKindNames[rng.Intn(len(randomCypherEdgeKindNames))],
+			randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
+	},
+
 	// Single-Part (still a bare SinglePartQuery, per planStages): two MATCH
 	// clauses chaining a *0..2/*1..3 var-length relationship, exercising the
 	// fixture's self-loops and parallel multi-kind edges.
@@ -586,6 +635,57 @@ var randomCypherTemplates = []randomCypherTemplate{
 	func(rng *rand.Rand) string {
 		return fmt.Sprintf(`MATCH (n:%s) WHERE n.str CONTAINS %s WITH count(n) AS cnt RETURN cnt`,
 			randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
+	},
+
+	// RETURN-position aggregation (desugarReturnAggregates), which pg
+	// answers with its own GROUP BY: the single-row forms pin the fold and
+	// the empty-match "one row of zero" rule, and the grouped form pins
+	// that the engine's first-occurrence group order and pg's hash-agg
+	// order agree as SETS -- the comparison below sorts, which is the only
+	// sense in which either engine promises an order here.
+	func(rng *rand.Rand) string {
+		op := []string{"=", "<>", "<", ">"}[rng.Intn(4)]
+		return fmt.Sprintf(`MATCH (n:%s) WHERE n.val %s %s RETURN count(n)`,
+			randomCypherPickKind(rng), op, cypherNumberLiteral(randomCypherPickNumber(rng)))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) RETURN count(*)`, randomCypherPickKind(rng))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) WHERE n.str CONTAINS %s RETURN count(n) AS cnt`,
+			randomCypherPickKind(rng), cypherStringLiteral(randomCypherPickString(rng)))
+	},
+	func(rng *rand.Rand) string {
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n.flag, count(n)`, randomCypherPickKind(rng))
+	},
+
+	// ORDER BY a NUMERIC property -- served only after the property index
+	// confirms the column is never string-valued, because pg orders strings
+	// by a collation this package cannot know. The ordering itself (stored
+	// null < numbers < absent, DESC its exact reverse) was measured against
+	// a live database; these templates keep it measured.
+	func(rng *rand.Rand) string {
+		dir := []string{"", " DESC"}[rng.Intn(2)]
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n.val ORDER BY n.val%s`, randomCypherPickKind(rng), dir)
+	},
+	func(rng *rand.Rand) string {
+		dir := []string{"", " DESC"}[rng.Intn(2)]
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n.val AS v ORDER BY v%s LIMIT 5`, randomCypherPickKind(rng), dir)
+	},
+	// The top-k shape: the result is the NODE, the sort key is a property
+	// the projection never outputs.
+	//
+	// Deliberately WITHOUT a LIMIT. `ORDER BY n.val LIMIT 5` over this
+	// fixture is not a differential test at all: many nodes share a val (and
+	// many share "absent"), PostgreSQL guarantees no tie-break, and a LIMIT
+	// then keeps an arbitrary 5 of the tied rows -- so the two engines
+	// legitimately return DIFFERENT rows for the same query. Projecting the
+	// sort key hides that (tied rows project equal values); projecting the
+	// node exposes it. The ordering itself is pinned against PostgreSQL's
+	// measured behavior in interpret's own order tests.
+	func(rng *rand.Rand) string {
+		dir := []string{"", " DESC"}[rng.Intn(2)]
+		return fmt.Sprintf(`MATCH (n:%s) RETURN n ORDER BY n.val%s`, randomCypherPickKind(rng), dir)
 	},
 }
 

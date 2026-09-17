@@ -32,6 +32,7 @@ package interpret
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
@@ -65,6 +66,20 @@ var errUnsupportedStep = errors.New("interpret: unsupported step")
 type Budgets struct {
 	MaxRows int
 	MaxWork int64
+
+	// MaxLiveRows caps the size of any single MATERIALIZED intermediate row
+	// set, which is what actually bounds this executor's memory. MaxWork
+	// cannot: it is a CUMULATIVE counter over the whole query, charged +1
+	// per row produced among much cheaper events (adjacency slots, node
+	// visits), so a budget loose enough to let a legitimate deep traversal
+	// inspect a hundred million adjacency slots also lets a pathological
+	// one accumulate a hundred million live rows -- tens of gigabytes, and
+	// an OOM-killed container rather than a decline. Exceeding this is
+	// ErrBudget like any other overrun, so the query delegates to
+	// PostgreSQL, which spills to disk instead of dying.
+	//
+	// Zero or negative means "unlimited", matching the other two fields.
+	MaxLiveRows int
 }
 
 // OutKind discriminates OutVal's payload.
@@ -163,6 +178,25 @@ type workMeter struct {
 	limitTarget    int64
 	limitTargetSet bool
 	finalRows      int
+	peakRows       int
+}
+
+// observeRows reports the current size of a materialized intermediate row
+// set. Called as such a set grows -- not after it is finished -- so a
+// runaway expansion is refused while it is still small enough to refuse,
+// rather than after the allocation that would have killed the process.
+//
+// Checked exactly rather than sampled: unlike work units, where an
+// outstanding balance below the 1024 threshold is immaterial, a single
+// oversized row set IS the failure being prevented.
+func (m *workMeter) observeRows(n int) error {
+	if n > m.peakRows {
+		m.peakRows = n
+	}
+	if m.budget.MaxLiveRows > 0 && n > m.budget.MaxLiveRows {
+		return ErrBudget
+	}
+	return nil
 }
 
 // spend adds units to the work counter, checking it against
@@ -279,23 +313,161 @@ func matchPart(env *Env, part *Part, meter *workMeter) ([]*Row, error) {
 		return nil, nil
 	}
 
+	comps := groupComponents(part)
 	var merged []*Row
+	var mergedSyms []string
 	first := true
-	for _, comp := range groupComponents(part) {
+	for _, comp := range comps {
 		rows, err := runComponent(env, meter, part, comp.syms, comp.stepIdxs)
 		if err != nil {
 			return nil, err
 		}
 		if first {
-			merged, first = rows, false
+			merged, mergedSyms, first = rows, append([]string(nil), comp.syms...), false
 			continue
 		}
-		merged, err = cartesianJoin(meter, merged, rows)
+		// A WHERE equality linking the two sides turns what would be a
+		// cartesian product into an equi-join. Cypher writes cross-cloud
+		// correlations exactly this way -- `MATCH (E:AZBase) MATCH (A:Base)
+		// WHERE E.onpremid = A.objectid` -- and the product of those two
+		// components on a real graph is ~60k x 920k rows, which no budget
+		// can afford and which spendProduct correctly refuses. Hashing one
+		// side on the join value answers the same query in one pass.
+		if left, right, ok := equiJoinKeys(part.Where, mergedSyms, comp.syms); ok {
+			merged, err = hashJoin(env, meter, merged, rows, left, right)
+		} else {
+			merged, err = cartesianJoin(meter, merged, rows)
+		}
 		if err != nil {
 			return nil, err
 		}
+		mergedSyms = append(mergedSyms, comp.syms...)
 	}
 	return merged, nil
+}
+
+// equiJoinKeys finds a top-level WHERE conjunct of the form
+// `<leftExpr> = <rightExpr>` whose two sides reference symbols from
+// DIFFERENT components -- the join condition hiding in a cartesian product.
+// The returned expressions are oriented to match the caller's (left, right)
+// row sets.
+//
+// Only a property lookup per side qualifies, and only `=`: this exists to
+// replace a product that cannot be afforded, not to build a general join
+// planner, and any conjunct it does not recognize simply leaves the product
+// in place -- still correct, and still refused by the budget when it is too
+// large.
+//
+// Recognizing a conjunct that does NOT hold for every result row is the one
+// way this can be wrong, which is why the search is restricted to top-level
+// conjuncts: matchPart does not apply WHERE (Execute does, over the complete
+// row set), so the join only has to avoid DROPPING a row that WHERE would
+// keep. Every such row satisfies every top-level conjunct, this one
+// included, so hashing on it drops nothing. A conjunct under an OR or a NOT
+// carries no such guarantee, and flattenTopLevelConjuncts hands those back
+// whole rather than descending into them.
+func equiJoinKeys(where cypher.Expression, leftSyms, rightSyms []string) (left, right cypher.Expression, ok bool) {
+	if where == nil {
+		return nil, nil, false
+	}
+	inSet := func(syms []string, sym string) bool {
+		for _, s := range syms {
+			if s == sym {
+				return true
+			}
+		}
+		return false
+	}
+	for _, conjunct := range flattenTopLevelConjuncts(where) {
+		op, a, b, isCmp := asSingleComparison(conjunct)
+		if !isCmp || op != cypher.OperatorEquals {
+			continue
+		}
+		aSym, aOK := propertyLookupSymbol(a)
+		bSym, bOK := propertyLookupSymbol(b)
+		if !aOK || !bOK || aSym == bSym {
+			continue
+		}
+		switch {
+		case inSet(leftSyms, aSym) && inSet(rightSyms, bSym):
+			return a, b, true
+		case inSet(leftSyms, bSym) && inSet(rightSyms, aSym):
+			return b, a, true
+		}
+	}
+	return nil, nil, false
+}
+
+// propertyLookupSymbol returns the variable a property lookup reads, or
+// false for any other expression shape.
+func propertyLookupSymbol(expr cypher.Expression) (string, bool) {
+	pl, isProp := unwrapParens(expr).(*cypher.PropertyLookup)
+	if !isProp || pl == nil || pl.Symbol == "" {
+		return "", false
+	}
+	v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+	if !isVar || v == nil || v.Symbol == "" {
+		return "", false
+	}
+	return v.Symbol, true
+}
+
+// hashJoin joins left and right on leftExpr == rightExpr, hashing the RIGHT
+// side and probing with the left. Row cost is charged per emitted row, the
+// same accounting cartesianJoin uses, so a join whose output is genuinely
+// enormous is still refused -- what changes is that a SELECTIVE join no
+// longer has to pay for the product it would have built.
+//
+// Only an ABSENT property is skipped, because absence is the sole source of
+// NULL in PropEq -- the predicate this join has to agree with. A PRESENT
+// JSON null is a value like any other here and joins with another present
+// JSON null, because pg's jsonb `=` says `'null'::jsonb = 'null'::jsonb` is
+// true and PropEq (via jsonbEqual) reproduces that. appendScalarKey already
+// encodes present null as its own key, so this needs no special case -- but
+// it does need the skip to test presence, NOT nil-ness: skipping nil would
+// drop rows the WHERE that follows would have kept.
+func hashJoin(env *Env, meter *workMeter, left, right []*Row, leftExpr, rightExpr cypher.Expression) ([]*Row, error) {
+	buckets := make(map[string][]*Row, len(right))
+	for _, r := range right {
+		v, present, err := EvalValue(env, r, rightExpr)
+		if err != nil {
+			return nil, err
+		}
+		if !present {
+			continue
+		}
+		key := string(appendScalarKey(nil, v))
+		buckets[key] = append(buckets[key], r)
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+	}
+
+	var out []*Row
+	for _, l := range left {
+		v, present, err := EvalValue(env, l, leftExpr)
+		if err != nil {
+			return nil, err
+		}
+		if err := meter.spend(1); err != nil {
+			return nil, err
+		}
+		if !present {
+			continue
+		}
+		for _, r := range buckets[string(appendScalarKey(nil, v))] {
+			nr := cloneRow(l)
+			mergeRowInto(nr, r)
+			if err := meter.spend(1); err != nil {
+				return nil, err
+			}
+			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
 }
 
 // partCannotMatch reports whether part contains a Step that requires at least
@@ -430,17 +602,43 @@ func cartesianJoin(meter *workMeter, left, right []*Row) ([]*Row, error) {
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return out, nil
 }
 
 // cloneRow returns a shallow copy of r's bindings on a fresh Row. Reaches
-// into Row's unexported maps directly (same package) rather than adding a
-// new exported Row method purely for this internal need.
+// into Row's unexported binding slices directly (same package) rather than
+// adding a new exported Row method purely for this internal need.
+//
+// The destination is empty by construction, so every binding is new and the
+// slices copy wholesale -- no per-binding "is this symbol already bound"
+// scan, which is what mergeRowInto has to do and what this used to pay for
+// by routing through it. cloneRow runs once per emitted row on the hot
+// expansion paths, so the difference is worth the duplication.
 func cloneRow(r *Row) *Row {
 	nr := NewRow()
-	mergeRowInto(nr, r)
+	if len(r.nodes) > 0 {
+		nr.nodes = append(make([]nodeBinding, 0, len(r.nodes)), r.nodes...)
+	}
+	if len(r.edges) > 0 {
+		nr.edges = append(make([]edgeBinding, 0, len(r.edges)), r.edges...)
+	}
+	if len(r.scalars) > 0 {
+		nr.scalars = append(make([]anyBinding, 0, len(r.scalars)), r.scalars...)
+	}
+	if len(r.paths) > 0 {
+		nr.paths = append(make([]anyBinding, 0, len(r.paths)), r.paths...)
+	}
+	if len(r.usedEdges) > 0 {
+		nr.usedEdges = append(make([]uint64, 0, len(r.usedEdges)), r.usedEdges...)
+	}
+	if len(r.trailEdges) > 0 {
+		nr.trailEdges = append(make([]uint64, 0, len(r.trailEdges)), r.trailEdges...)
+	}
 	return nr
 }
 
@@ -449,17 +647,17 @@ func cloneRow(r *Row) *Row {
 // sets union together, so a closing Step evaluated after the merge still
 // sees every edge either side already consumed.
 func mergeRowInto(dst, src *Row) {
-	for k, v := range src.nodes {
-		dst.SetNode(k, v)
+	for _, b := range src.nodes {
+		dst.SetNode(b.sym, b.id)
 	}
-	for k, v := range src.edges {
-		dst.SetEdge(k, v)
+	for _, b := range src.edges {
+		dst.SetEdge(b.sym, b.ref)
 	}
-	for k, v := range src.scalars {
-		dst.SetScalar(k, v)
+	for _, b := range src.scalars {
+		dst.SetScalar(b.sym, b.val)
 	}
-	for k, v := range src.paths {
-		dst.SetPathVar(k, v)
+	for _, b := range src.paths {
+		dst.SetPathVar(b.sym, b.val)
 	}
 	for _, fwd := range src.usedEdges {
 		dst.markEdgeUsed(fwd)
@@ -533,19 +731,40 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 		return expandChainComponent(env, meter, part, stepIdxs, pathSym)
 	}
 
+	hintFor := func(sym string) *edgeHint { return hintForAnchor(env, part, stepIdxs, sym) }
+
 	if pathSym != "" {
-		if !isStrictLinearChain(part, stepIdxs) {
+		if isStrictLinearChain(part, stepIdxs) {
+			return expandChainComponent(env, meter, part, stepIdxs, pathSym)
+		}
+		seq, ok := patternLinearChain(part, stepIdxs)
+		if !ok {
 			return nil, errUnsupportedStep
 		}
-		return expandChainComponent(env, meter, part, stepIdxs, pathSym)
+		anchor := chooseAnchorHinted(env, part.Nodes, syms, hintFor)
+		rows, err := scanAnchorHinted(env, meter, anchor, part.Nodes[anchor], hintFor(anchor))
+		if err != nil {
+			return nil, err
+		}
+		if est, ok := treeRowEstimate(env, part, stepIdxs, anchor, rows); ok &&
+			meter.budget.MaxRows > 0 && est > int64(meter.budget.MaxRows) {
+			// Provably past the row budget: say so now rather than expanding
+			// forty billion paths to find out. See treeRowEstimate.
+			return nil, ErrBudget
+		}
+		rows, err = runComponentTreeFrom(env, meter, part, stepIdxs, anchor, rows, true)
+		if err != nil {
+			return nil, err
+		}
+		return bindPatternPathVal(rows, part, stepIdxs, seq, pathSym)
 	}
 
-	anchor := chooseAnchor(env, part.Nodes, syms)
-	rows, err := scanAnchor(env, meter, anchor, part.Nodes[anchor])
+	anchor := chooseAnchorHinted(env, part.Nodes, syms, hintFor)
+	rows, err := scanAnchorHinted(env, meter, anchor, part.Nodes[anchor], hintFor(anchor))
 	if err != nil {
 		return nil, err
 	}
-	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, rows)
+	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, rows, false)
 }
 
 // runComponentTreeFrom is runComponent's own tree-walk/closing-edge
@@ -558,7 +777,7 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 // stepIdxs is the component's Steps, unfiltered -- runComponentTreeFrom
 // rediscovers which of them are "tree" vs. "closing" itself via the same
 // BFS runComponent always ran.
-func runComponentTreeFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, anchor string, anchorRows []*Row) ([]*Row, error) {
+func runComponentTreeFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, anchor string, anchorRows []*Row, bindArcs bool) ([]*Row, error) {
 	rows := anchorRows
 	if len(stepIdxs) == 0 {
 		return rows, nil
@@ -604,7 +823,15 @@ func runComponentTreeFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int
 				boundSym, unboundSym = st.ToSym, st.FromSym
 			}
 
-			rows, err = expandStep(env, meter, rows, st, boundSym, unboundSym, boundIsFrom, part.Nodes[unboundSym], "")
+			arcKey := ""
+			if bindArcs {
+				// A named path has to name the specific edge each step
+				// traversed, and an anonymous relationship binds no EdgeSym
+				// of its own -- so the step records it under its own arc key,
+				// exactly as the linear-chain executor does.
+				arcKey = pathStepArcKey(idx)
+			}
+			rows, err = expandStep(env, meter, rows, st, boundSym, unboundSym, boundIsFrom, part.Nodes[unboundSym], arcKey)
 			if err != nil {
 				return nil, err
 			}
@@ -658,14 +885,29 @@ func runComponentFrom(env *Env, meter *workMeter, part *Part, comp component, an
 	}
 
 	if pathSym != "" {
-		if !isStrictLinearChain(part, stepIdxs) {
+		if isStrictLinearChain(part, stepIdxs) {
+			return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, anchorRows)
+		}
+		seq, ok := patternLinearChain(part, stepIdxs)
+		if !ok {
 			return nil, errUnsupportedStep
 		}
-		return expandChainComponentFrom(env, meter, part, stepIdxs, pathSym, anchorRows)
+		anchor := chooseAnchor(env, part.Nodes, comp.syms)
+		if est, ok := treeRowEstimate(env, part, stepIdxs, anchor, anchorRows); ok &&
+			meter.budget.MaxRows > 0 && est > int64(meter.budget.MaxRows) {
+			// See treeRowEstimate: the degrees already settle it. Declining
+			// here also stops the chunked driver from asking again per chunk.
+			return nil, ErrBudget
+		}
+		rows, err := runComponentTreeFrom(env, meter, part, stepIdxs, anchor, anchorRows, true)
+		if err != nil {
+			return nil, err
+		}
+		return bindPatternPathVal(rows, part, stepIdxs, seq, pathSym)
 	}
 
 	anchor := chooseAnchor(env, part.Nodes, comp.syms)
-	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, anchorRows)
+	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, anchorRows, false)
 }
 
 // hasSpecialStep reports whether any of part.Chains[stepIdxs] is a
@@ -811,7 +1053,8 @@ func pathStepArcKey(stepIdx int) string {
 // package doc's CROSS-STEP bullet and Row.trailEdges' doc).
 func expandChainComponent(env *Env, meter *workMeter, part *Part, stepIdxs []int, pathSym string) ([]*Row, error) {
 	startSym := chainAnchorSym(env, part, stepIdxs)
-	rows, err := scanAnchor(env, meter, startSym, part.Nodes[startSym])
+	rows, err := scanAnchorHinted(env, meter, startSym, part.Nodes[startSym],
+		hintForAnchor(env, part, stepIdxs, startSym))
 	if err != nil {
 		return nil, err
 	}
@@ -930,13 +1173,24 @@ func expandChainComponentFrom(env *Env, meter *workMeter, part *Part, stepIdxs [
 			return nil, errUnsupportedStep
 		}
 
+		if len(rows) == 0 {
+			continue
+		}
+		contIDs, err := varLengthWalkSetup(env, step, true)
+		if err != nil {
+			return nil, err
+		}
+
 		next := make([]*Row, 0, len(rows))
 		for _, r := range rows {
-			grown, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, r, arcKey)
+			grown, err := expandVarLengthTrailsForSeed(env, meter, step, toNC, r, arcKey, contIDs)
 			if err != nil {
 				return nil, err
 			}
 			next = append(next, grown...)
+			if err := meter.observeRows(len(next)); err != nil {
+				return nil, err
+			}
 		}
 		rows = next
 	}
@@ -1086,6 +1340,28 @@ type anchorRank struct {
 	size int
 }
 
+// candidateEstimate is how many candidates this rank expects to enumerate,
+// on one scale across every tier -- what a cost COMPARISON needs, as opposed
+// to better()'s tier-first ordering, which deliberately prefers an id lookup
+// over any bitmap regardless of size.
+//
+// An id or objectid anchor resolves to a handful; both are reported as one,
+// since the distinction between one and three candidates never decides
+// anything a caller of this asks.
+func (r anchorRank) candidateEstimate(env *Env) int {
+	switch r.tier {
+	case tierID, tierObjectID:
+		return 1
+	case tierScan:
+		if r.size > 0 {
+			return r.size
+		}
+		return env.Snap.NodeCount()
+	default:
+		return r.size
+	}
+}
+
 // better reports whether r is a strictly cheaper anchor than o.
 func (r anchorRank) better(o anchorRank) bool {
 	if r.tier != o.tier {
@@ -1099,6 +1375,23 @@ func (r anchorRank) better(o anchorRank) bool {
 // NodeConstraint's doc) beats an objectid anchor beats the smallest single
 // kind bitmap among every AND-ed kind label beats an unconstrained full
 // scan.
+// rankOfHinted is rankOf with a step's edge-kind endpoint set available as an
+// additional candidate source -- see edgeHint. rankOf itself is this with no
+// hint, so every existing caller keeps its exact previous behavior.
+func rankOfHinted(env *Env, nc *NodeConstraint, h *edgeHint) anchorRank {
+	base := rankOf(env, nc)
+	if !edgeHintPreferred(env, nc, h) {
+		return base
+	}
+	// Same tier as a kind bitmap, for the same reason PropCandidates is: it
+	// is a bounded enumerable set that competes on size, not a lookup that
+	// outranks one.
+	if r := (anchorRank{tier: tierKind, size: h.size()}); r.better(base) {
+		return r
+	}
+	return base
+}
+
 func rankOf(env *Env, nc *NodeConstraint) anchorRank {
 	if nc != nil && len(nc.IDs) > 0 {
 		return anchorRank{tier: tierID}
@@ -1106,10 +1399,175 @@ func rankOf(env *Env, nc *NodeConstraint) anchorRank {
 	if nc != nil && nc.ObjectIDAnchor != nil {
 		return anchorRank{tier: tierObjectID}
 	}
+	// A plan-time-resolved string-index candidate set (NodeConstraint's
+	// PropCandidates) is a bounded enumerable candidate source exactly like
+	// a kind bitmap, so it competes at the SAME tier and wins or loses on
+	// size alone. Ranking it as its own better tier would be wrong: an
+	// unselective `name CONTAINS 'A'` can resolve to most of the graph and
+	// must not outrank a five-node kind bitmap.
+	if nc != nil && nc.PropIndexed {
+		size := len(nc.PropCandidates)
+		if len(nc.Kinds) > 0 {
+			if kindSize := smallestKindBitmap(env, nc.Kinds).Count(); kindSize < size {
+				size = kindSize
+			}
+		}
+		return anchorRank{tier: tierKind, size: size}
+	}
 	if nc != nil && len(nc.Kinds) > 0 {
 		return anchorRank{tier: tierKind, size: smallestKindBitmap(env, nc.Kinds).Count()}
 	}
 	return anchorRank{tier: tierScan, size: env.Snap.NodeCount()}
+}
+
+// edgeHint is a resolved "this symbol must have an admissible edge" candidate
+// source: the endpoint set of a step's declared relationship kinds, on the
+// side the symbol sits.
+//
+// It exists because PostgreSQL has an access path this engine did not.
+// BloodHound's schema indexes `edge` by kind_id alone, so pg answers a
+// pattern anchored on a rare relationship with one btree probe, while this
+// engine's candidate sources knew only about node kinds, ids, objectids and
+// property values. The shipped "All Global Administrators" prebuilt is the
+// extreme case: `(:AZBase)-[:AZGlobalAdmin*1..]->(:AZTenant)` seeded from all
+// 84,481 AZBase nodes to find the ONE AZGlobalAdmin edge in the graph.
+//
+// Resolved ONCE by the caller rather than per rank/scan call, because a
+// kind alternation (the shipped shortest-path prebuilts name upwards of sixty
+// relationship kinds) costs a union to materialize.
+type edgeHint struct {
+	ids []snapshot.NodeID
+	ok  bool
+}
+
+// newEdgeHint resolves the endpoint set sym must belong to in order to take
+// part in step.
+//
+// Unusable, rather than wrong, for every shape where that set is not a
+// superset of the matches:
+//
+//   - a step that does NOT mandate a hop (`*0..`), which a zero-length match
+//     satisfies without traversing any edge, so a node with no admissible
+//     edge still matches and must not be skipped;
+//   - an undirected step, where an edge on either side qualifies and the
+//     endpoint set would have to be the union of both directions;
+//   - a step with no declared relationship kinds, which every edge satisfies.
+func newEdgeHint(env *Env, step *Step, sym string) *edgeHint {
+	if step == nil || len(step.EdgeKinds) == 0 || sym == "" {
+		return &edgeHint{}
+	}
+	if step.Range != nil && step.Range.Min == 0 {
+		return &edgeHint{}
+	}
+
+	var outgoing bool
+	switch {
+	case step.Direction == graph.DirectionOutbound && sym == step.FromSym:
+		outgoing = true
+	case step.Direction == graph.DirectionOutbound && sym == step.ToSym:
+		outgoing = false
+	case step.Direction == graph.DirectionInbound && sym == step.FromSym:
+		outgoing = false
+	case step.Direction == graph.DirectionInbound && sym == step.ToSym:
+		outgoing = true
+	default:
+		// Undirected, or a symbol this step does not touch.
+		return &edgeHint{}
+	}
+
+	ids, ok := env.Snap.EdgeKindEndpoints(step.EdgeKinds, outgoing)
+	if !ok {
+		return &edgeHint{}
+	}
+	return &edgeHint{ids: ids, ok: true}
+}
+
+// hintForAnchor picks the most selective edge hint anchor can take from any
+// step of the component it seeds. Every step the anchor is an endpoint of
+// must be satisfied by a matching row, so any one of their endpoint sets is a
+// valid superset; the smallest is the cheapest to enumerate.
+//
+// Shared by every path that seeds a component -- the ordinary scan, the chain
+// walk, the variable-length route and the chunked LIMIT driver -- so all of
+// them enumerate the same candidates and charge the same work. A path that
+// seeded without it would silently spend more than the one beside it, which
+// is exactly the inconsistency TestRunComponentFromDispatchMatchesRunComponent
+// exists to catch.
+func hintForAnchor(env *Env, part *Part, stepIdxs []int, anchor string) *edgeHint {
+	best := &edgeHint{}
+	for _, idx := range stepIdxs {
+		if idx < 0 || idx >= len(part.Chains) {
+			continue
+		}
+		h := newEdgeHint(env, &part.Chains[idx], anchor)
+		if h.usable() && h.size() < best.size() {
+			best = h
+		}
+	}
+	return best
+}
+
+// usable reports whether h resolved to a real candidate set.
+func (h *edgeHint) usable() bool { return h != nil && h.ok }
+
+// size is h's candidate count, or a value no source can beat when unusable.
+func (h *edgeHint) size() int {
+	if !h.usable() {
+		return math.MaxInt
+	}
+	return len(h.ids)
+}
+
+// edgeHintPreferred reports whether h is the cheapest enumerable source for
+// nc -- strictly smaller than whatever nc would otherwise enumerate. rankOf
+// and scanAnchorVisit agree by both asking this, so the cost the planner
+// priced is the one the executor pays.
+//
+// It deliberately does NOT compete with an id or objectid anchor: those
+// resolve to at most a handful of nodes already, and preferring a hint over
+// them could only ever cost more.
+func edgeHintPreferred(env *Env, nc *NodeConstraint, h *edgeHint) bool {
+	if !h.usable() {
+		return false
+	}
+	if nc != nil && (len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil) {
+		return false
+	}
+	return h.size() < otherwiseEnumerated(env, nc)
+}
+
+// otherwiseEnumerated is the size of the candidate source nc would use with
+// no hint at all -- its property-index candidates, its smallest kind bitmap,
+// or the whole graph.
+func otherwiseEnumerated(env *Env, nc *NodeConstraint) int {
+	best := env.Snap.NodeCount()
+	if nc == nil {
+		return best
+	}
+	if len(nc.Kinds) > 0 {
+		if n := smallestKindBitmap(env, nc.Kinds).Count(); n < best {
+			best = n
+		}
+	}
+	if nc.PropIndexed && len(nc.PropCandidates) < best {
+		best = len(nc.PropCandidates)
+	}
+	return best
+}
+
+// propIndexPreferred reports whether nc's resolved string-index candidate
+// set is the cheapest enumerable source for the symbol -- i.e. it exists and
+// no kind bitmap it also carries is smaller. scanAnchorVisit and rankOf
+// agree by both asking this, so the cost the planner priced is the one the
+// executor pays.
+func propIndexPreferred(env *Env, nc *NodeConstraint) bool {
+	if nc == nil || !nc.PropIndexed {
+		return false
+	}
+	if len(nc.Kinds) == 0 {
+		return true
+	}
+	return len(nc.PropCandidates) <= smallestKindBitmap(env, nc.Kinds).Count()
 }
 
 // chooseAnchor picks the best (chooseAnchor.better) ranked symbol among
@@ -1117,10 +1575,29 @@ func rankOf(env *Env, nc *NodeConstraint) anchorRank {
 // that a tie breaks toward the lexicographically first symbol name
 // deterministically.
 func chooseAnchor(env *Env, nodes map[string]*NodeConstraint, syms []string) string {
+	return chooseAnchorHinted(env, nodes, syms, nil)
+}
+
+// chooseAnchorHinted is chooseAnchor with each candidate symbol priced
+// against the edge-kind endpoint set it could seed from (see edgeHint), so
+// the symbol the executor scans is chosen on the same cost basis the scan
+// will actually pay.
+//
+// Without this the choice ignores relationship selectivity entirely: for
+// `(a:Wide)-[:Rare]->(b:Narrow)` it compares two kind bitmaps and never sees
+// that the step's own relationship kind narrows either end to a handful.
+// hint may be nil, which reproduces chooseAnchor exactly.
+func chooseAnchorHinted(env *Env, nodes map[string]*NodeConstraint, syms []string, hint func(string) *edgeHint) string {
+	rank := func(sym string) anchorRank {
+		if hint == nil {
+			return rankOf(env, nodes[sym])
+		}
+		return rankOfHinted(env, nodes[sym], hint(sym))
+	}
 	best := syms[0]
-	bestRank := rankOf(env, nodes[best])
+	bestRank := rank(best)
 	for _, s := range syms[1:] {
-		if r := rankOf(env, nodes[s]); r.better(bestRank) {
+		if r := rank(s); r.better(bestRank) {
 			best, bestRank = s, r
 		}
 	}
@@ -1170,7 +1647,35 @@ var errStopScan = errors.New("interpret: stop anchor scan")
 // error (any other non-nil return from visit aborts the scan the same way
 // and is likewise returned unchanged).
 func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint, visit func(*Row) error) error {
+	return scanAnchorVisitHinted(env, meter, sym, nc, nil, visit)
+}
+
+// scanAnchorVisitHinted is scanAnchorVisit with a step's edge-kind endpoint
+// set offered as an additional candidate source (see edgeHint). The hint is
+// used only when it is strictly cheaper than what nc would otherwise
+// enumerate, and admit re-verifies every candidate against the COMPLETE nc
+// either way -- so a hint can only change how many candidates are inspected,
+// never which rows come out.
+func scanAnchorVisitHinted(env *Env, meter *workMeter, sym string, nc *NodeConstraint, hint *edgeHint, visit func(*Row) error) error {
+	return scanAnchorVisitReusing(env, meter, sym, nc, hint, nil, visit)
+}
+
+// scanAnchorVisitReusing is scanAnchorVisitHinted with one addition: when
+// reuse is non-nil, every candidate is bound into THAT row instead of a fresh
+// one.
+//
+// A caller may pass a row only if it does not retain what it is handed --
+// the next candidate overwrites it. That is worth the constraint because the
+// allocation is paid per CANDIDATE, not per result: `MATCH (u:User) RETURN
+// DISTINCT u.enabled` binds a row for every user in the graph to keep two
+// tuples, and profiling put Row construction and the memory churn behind it
+// at 97% of that query.
+func scanAnchorVisitReusing(env *Env, meter *workMeter, sym string, nc *NodeConstraint, hint *edgeHint, reuse *Row, visit func(*Row) error) error {
 	overlay := env.Snap.Overlay()
+	// probe is the scratch row rejected candidates are tested on; it is
+	// reused until one survives and claims it. nil when the caller supplied
+	// its own reusable row.
+	var probe *Row
 	admit := func(id snapshot.NodeID) error {
 		// A tombstoned base node's dense id still resolves through Dense
 		// (snapshot.View.Alive's own doc) and still occupies a slot in
@@ -1192,7 +1697,19 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 		if !nodeSatisfiesConstraint(env, nc, id) {
 			return nil
 		}
-		r := NewRow()
+		// The candidate is tested on a SCRATCH row, and a row of its own is
+		// allocated only once it survives. A pushed predicate is usually
+		// what makes an anchor worth scanning at all -- `MATCH (u:User)
+		// WHERE u.name CONTAINS 'ADMIN'` tests a million users to keep four
+		// -- so allocating before the test meant a million rows built and
+		// immediately dropped.
+		r := reuse
+		if r == nil {
+			if probe == nil {
+				probe = NewRow()
+			}
+			r = probe
+		}
 		r.SetNode(sym, id)
 		// Pushed single-symbol predicates are applied HERE, not only in the
 		// eventual Part.Where pass (where they remain and run again,
@@ -1218,6 +1735,14 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 		if err := meter.spend(1); err != nil {
 			return err
 		}
+		if r == probe {
+			// Survived: give it a row the caller may keep, and start a fresh
+			// probe, since this one is now the caller's.
+			probe = nil
+			out := NewRow()
+			out.SetNode(sym, id)
+			r = out
+		}
 		return visit(r)
 	}
 
@@ -1238,6 +1763,29 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 				if err := admit(id); err != nil {
 					return err
 				}
+			}
+		}
+
+	case edgeHintPreferred(env, nc, hint):
+		// Nodes carrying an admissible edge for the step this symbol
+		// anchors. A superset by contract, like every source here: admit
+		// re-verifies kinds and every pushed predicate. Valid only because
+		// the caller resolved the hint from a step that MANDATES a hop --
+		// see newEdgeHint.
+		for _, id := range hint.ids {
+			if err := admit(id); err != nil {
+				return err
+			}
+		}
+
+	case propIndexPreferred(env, nc):
+		// Resolved at plan time from the snapshot's per-property string
+		// index (extractStringAnchor). A superset by contract -- admit
+		// re-verifies kinds and every pushed predicate, including the one
+		// that produced this set.
+		for _, id := range nc.PropCandidates {
+			if err := admit(id); err != nil {
+				return err
 			}
 		}
 
@@ -1271,6 +1819,17 @@ func scanAnchorVisit(env *Env, meter *workMeter, sym string, nc *NodeConstraint,
 // append-collecting wrapper over scanAnchorVisit: its own visit callback
 // never returns errStopScan, so scanAnchorVisit's return value here is
 // always either nil or a genuine evaluator error, never the sentinel.
+func scanAnchorHinted(env *Env, meter *workMeter, sym string, nc *NodeConstraint, hint *edgeHint) ([]*Row, error) {
+	var rows []*Row
+	if err := scanAnchorVisitHinted(env, meter, sym, nc, hint, func(r *Row) error {
+		rows = append(rows, r)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 func scanAnchor(env *Env, meter *workMeter, sym string, nc *NodeConstraint) ([]*Row, error) {
 	var rows []*Row
 	if err := scanAnchorVisit(env, meter, sym, nc, func(r *Row) error {
@@ -1467,8 +2026,23 @@ func edgeRefIdentity(snap *snapshot.View, ref EdgeRef) uint64 {
 // Both (an inbound arrow is swapped into an outbound one at plan time), so
 // this is exhaustive over what a Step can actually carry.
 func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, boundIsFrom bool) ([]adjCandidate, error) {
-	var out []adjCandidate
 	sameSymbol := step.FromSym == step.ToSym
+
+	// Sized up front from the node's own degree rather than grown from nil.
+	// This is called once per bound node of an expansion, and on an overlay
+	// the neighbours arrive through a callback that offers nothing to size
+	// by -- which put 42% of a profiled prebuilt in runtime.growslice,
+	// zeroing and copying the same slice through every doubling.
+	capHint := 0
+	switch step.Direction {
+	case graph.DirectionOutbound:
+		capHint = env.Snap.DegreeHint(bound, boundIsFrom)
+	case graph.DirectionInbound:
+		capHint = env.Snap.DegreeHint(bound, !boundIsFrom)
+	default:
+		capHint = env.Snap.DegreeHint(bound, true) + env.Snap.DegreeHint(bound, false)
+	}
+	out := make([]adjCandidate, 0, capHint)
 
 	visitOut := func() error {
 		if !env.Snap.Overlay() {
@@ -1482,6 +2056,30 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 					continue
 				}
 				out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: lo + uint64(i)})
+			}
+			return nil
+		}
+		// An overlay does not make every node's adjacency uncertain, only the
+		// nodes its delta touches. For the rest the base CSR is still exact,
+		// and reading it costs a slice index per edge where OutEdges costs an
+		// indirect call and a set of membership tests. Measured: the shipped
+		// "All Global Administrators" prebuilt answered in 1.6ms with no
+		// overlay and 4.4ms beside 90k delta edges it never traverses.
+		//
+		// edgeID is taken from the base slot, which is exactly what OutEdges
+		// yields for the same edge, so a trail's edge-uniqueness key is the
+		// same whichever branch produced the candidate.
+		if lo, hi, ok := env.Snap.CleanOutSlots(bound); ok {
+			base := env.Snap.Base()
+			for i := lo; i < hi; i++ {
+				if err := meter.spend(1); err != nil {
+					return err
+				}
+				other := base.OutTargets[i]
+				if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
+					continue
+				}
+				out = append(out, adjCandidate{other: other, kind: base.OutKinds[i], edgeID: base.OutEdgeIDs[i]})
 			}
 			return nil
 		}
@@ -1511,6 +2109,26 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 					continue
 				}
 				out = append(out, adjCandidate{other: other, kind: kinds[i], fwd: uint64(env.Snap.Base().InEdgeIdx[lo+uint64(i)])})
+			}
+			return nil
+		}
+		// The same reduction as visitOut, over the reverse CSR: an in-slot's
+		// edge id lives at OutEdgeIDs[InEdgeIdx[i]].
+		if lo, hi, ok := env.Snap.CleanInSlots(bound); ok {
+			base := env.Snap.Base()
+			for i := lo; i < hi; i++ {
+				if err := meter.spend(1); err != nil {
+					return err
+				}
+				other := base.InTargets[i]
+				if step.Direction == graph.DirectionBoth && !sameSymbol && other == bound {
+					continue
+				}
+				out = append(out, adjCandidate{
+					other:  other,
+					kind:   base.InKinds[i],
+					edgeID: base.OutEdgeIDs[base.InEdgeIdx[i]],
+				})
 			}
 			return nil
 		}
@@ -1656,6 +2274,9 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 				return nil, err
 			}
 			out = append(out, nr)
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return out, nil
@@ -1745,14 +2366,25 @@ func projectionKeys(proj Projection) []string {
 // projectRow evaluates every RETURN item in proj against r, in order.
 func projectRow(env *Env, proj Projection, r *Row) ([]OutVal, error) {
 	out := make([]OutVal, len(proj.Items))
+	if err := projectRowInto(env, proj, r, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// projectRowInto is projectRow writing into a caller-owned slice, so a caller
+// projecting millions of rows to keep a handful -- runDistinctStreaming --
+// can reuse one buffer instead of allocating per row. dst must have exactly
+// one slot per projection item.
+func projectRowInto(env *Env, proj Projection, r *Row, dst []OutVal) error {
 	for i, item := range proj.Items {
 		v, err := projectItem(env, r, item)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out[i] = v
+		dst[i] = v
 	}
-	return out, nil
+	return nil
 }
 
 // projectItem evaluates one RETURN item. A bare node, edge, or path variable
@@ -1777,6 +2409,17 @@ func projectItem(env *Env, r *Row, item ProjectionOutput) (OutVal, error) {
 			// predates that task, per its own doc comment.
 			return OutVal{Kind: OutPath, Path: pv.(*PathVal)}, nil
 		}
+		if item.Optional {
+			// An OPTIONAL MATCH symbol this row did not match: a null
+			// column. Falling through would reach EvalValue, which reports
+			// an unbound variable as an unsupported expression and would
+			// decline the whole query on the first null-padded row.
+			//
+			// ScalarAbsent, not a present JSON null: the column has no
+			// value at all, which is what PostgreSQL returns here (verified
+			// against the live oracle -- a plain nil).
+			return OutVal{Kind: OutScalar, Scalar: nil, ScalarAbsent: true}, nil
+		}
 	}
 
 	val, ok, err := EvalValue(env, r, item.Expr)
@@ -1788,4 +2431,172 @@ func projectItem(env *Env, r *Row, item ProjectionOutput) (OutVal, error) {
 		return OutVal{Kind: OutScalar, Scalar: nil, ScalarAbsent: true}, nil
 	}
 	return OutVal{Kind: OutScalar, Scalar: val}, nil
+}
+
+// patternLinearChain reports the sequence of node symbols a component's steps
+// trace through the pattern AS WRITTEN, for a component that is a simple path
+// once each step is allowed its own orientation -- and false for anything
+// else.
+//
+// isStrictLinearChain answers a narrower question: it requires every step to
+// be traversed left to right, because buildStep normalizes an inbound arrow
+// by swapping FromSym/ToSym so a recorded Step always points the way the
+// executor walks it. That makes a converging pattern
+//
+//	MATCH p = (a:User)-[:MemberOf]->(g:Group)<-[:MemberOf]-(b:User)
+//
+// fail the test -- both its steps end at `g` -- even though it is, as
+// written, the plain three-node path a-g-b. The rows come out correctly
+// either way (the tree walk in runComponentTreeFrom has no trouble with it);
+// what used to be impossible was naming it, so the shipped shape above was
+// declined to PostgreSQL purely for the `p =`.
+//
+// Restricted to FIXED-length steps. A variable-length step contributes a
+// whole trail rather than one edge, and splicing a trail into a chain
+// depends on knowing which end it was grown from -- the reasoning
+// assembleChainPathVal's own doc sets out, which this function deliberately
+// does not try to generalize.
+func patternLinearChain(part *Part, stepIdxs []int) ([]string, bool) {
+	if len(stepIdxs) < 2 {
+		return nil, false
+	}
+	for _, idx := range stepIdxs {
+		st := &part.Chains[idx]
+		if st.Range != nil || st.Shortest != ShortestNone || st.FromSym == st.ToSym {
+			return nil, false
+		}
+	}
+
+	// The first step's own starting symbol is whichever of its endpoints the
+	// SECOND step does not also touch.
+	first, second := &part.Chains[stepIdxs[0]], &part.Chains[stepIdxs[1]]
+	touches := func(st *Step, sym string) bool { return st.FromSym == sym || st.ToSym == sym }
+	var start string
+	switch {
+	case !touches(second, first.FromSym):
+		start = first.FromSym
+	case !touches(second, first.ToSym):
+		start = first.ToSym
+	default:
+		// Both endpoints shared: a two-step cycle, not a path.
+		return nil, false
+	}
+
+	seq := make([]string, 0, len(stepIdxs)+1)
+	seq = append(seq, start)
+	seen := map[string]bool{start: true}
+	cur := start
+	for _, idx := range stepIdxs {
+		st := &part.Chains[idx]
+		var next string
+		switch cur {
+		case st.FromSym:
+			next = st.ToSym
+		case st.ToSym:
+			next = st.FromSym
+		default:
+			// This step does not continue from where the last one ended, so
+			// the component branches rather than forming a single path.
+			return nil, false
+		}
+		if seen[next] {
+			return nil, false
+		}
+		seen[next] = true
+		seq = append(seq, next)
+		cur = next
+	}
+	return seq, true
+}
+
+// bindPatternPathVal binds each row's named path for a component
+// patternLinearChain accepted: the nodes in pattern order, and the edge each
+// step contributed, in the order the pattern writes them.
+//
+// Orientation is already accounted for by seq -- seq[i] and seq[i+1] are
+// step i's endpoints in WRITTEN order, whichever way the executor happened to
+// traverse it -- so the path reads the way the query wrote it, which is the
+// order PostgreSQL returns too.
+func bindPatternPathVal(rows []*Row, part *Part, stepIdxs []int, seq []string, pathSym string) ([]*Row, error) {
+	for _, r := range rows {
+		pv := &PathVal{Nodes: make([]snapshot.NodeID, 0, len(seq))}
+		for _, sym := range seq {
+			id, ok := r.Node(sym)
+			if !ok {
+				return nil, fmt.Errorf("interpret: bindPatternPathVal: symbol %q not bound", sym)
+			}
+			pv.Nodes = append(pv.Nodes, id)
+		}
+		for _, idx := range stepIdxs {
+			edgeKey := part.Chains[idx].EdgeSym
+			if edgeKey == "" {
+				edgeKey = pathStepArcKey(idx)
+			}
+			edge, ok := r.Edge(edgeKey)
+			if !ok {
+				return nil, fmt.Errorf("interpret: bindPatternPathVal: step %d edge %q not bound", idx, edgeKey)
+			}
+			pv.Edges = append(pv.Edges, edge)
+		}
+		r.SetPathVar(pathSym, pv)
+	}
+	return rows, nil
+}
+
+// treeRowEstimate bounds how many rows a component anchored at `anchor` will
+// produce, for the shape where every step is incident to the anchor -- a
+// converging or diverging fan, whose row count is the PRODUCT of the anchor
+// node's degrees rather than a sum. Returns false when the shape is not that,
+// and no estimate is attempted.
+//
+// This exists because such a fan can be astronomically larger than the graph.
+// BloodHound's shipped two-hop shape
+//
+//	MATCH p = (a:User)-[:MemberOf]->(g:Group)<-[:MemberOf]-(b:User)
+//	WHERE g.objectid ENDS WITH '-513'
+//
+// anchors on Domain Users, which every account in the domain belongs to: two
+// hundred thousand members on the benchmark graph, and therefore forty
+// billion paths. No budget serves that, and the engine's answer is to decline
+// -- but it should decline having spent nothing, not after expanding its way
+// to the same conclusion. Measured, the difference was a 705ms query against
+// a 105ms one, all of it spent discovering what the degrees said up front.
+//
+// Degrees come from the base CSR (DegreeHint), which ignores relationship
+// kind and any overlay -- both make it an OVER-estimate of the fan, never an
+// under-estimate, so a component it clears is genuinely small.
+func treeRowEstimate(env *Env, part *Part, stepIdxs []int, anchor string, rows []*Row) (int64, bool) {
+	for _, idx := range stepIdxs {
+		st := &part.Chains[idx]
+		if st.FromSym != anchor && st.ToSym != anchor {
+			return 0, false
+		}
+	}
+	var total int64
+	for _, r := range rows {
+		id, ok := r.Node(anchor)
+		if !ok {
+			return 0, false
+		}
+		product := int64(1)
+		for _, idx := range stepIdxs {
+			st := &part.Chains[idx]
+			// Walking away from the anchor along this step uses the side the
+			// anchor sits on: an edge INTO the anchor is followed backward.
+			d := int64(env.Snap.DegreeHint(id, st.FromSym == anchor))
+			if d == 0 {
+				product = 0
+				break
+			}
+			product *= d
+			if product > math.MaxInt32 {
+				return math.MaxInt32, true
+			}
+		}
+		total += product
+		if total > math.MaxInt32 {
+			return math.MaxInt32, true
+		}
+	}
+	return total, true
 }
