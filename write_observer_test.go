@@ -829,7 +829,7 @@ func TestObservingTransactionNodesReturnsObservingNodeQuery(t *testing.T) {
 	if !ok {
 		t.Fatalf("Nodes() returned %T, want *observingNodeQuery", tx.Nodes())
 	}
-	if nq.scope != scope {
+	if nq.current() != scope {
 		t.Fatalf("observingNodeQuery.scope is not the transaction's scope")
 	}
 	if nq.NodeQuery != innerNodes {
@@ -846,7 +846,7 @@ func TestObservingTransactionRelationshipsReturnsObservingRelationshipQuery(t *t
 	if !ok {
 		t.Fatalf("Relationships() returned %T, want *observingRelationshipQuery", tx.Relationships())
 	}
-	if rq.scope != scope {
+	if rq.current() != scope {
 		t.Fatalf("observingRelationshipQuery.scope is not the transaction's scope")
 	}
 	if rq.RelationshipQuery != innerRel {
@@ -924,7 +924,7 @@ func TestObservingTransactionWithGraphRecordsFallbackAndKeepsObserving(t *testin
 	if !ok {
 		t.Fatalf("WithGraph returned %T, want *observingTransaction", got)
 	}
-	if wrapped.scope != scope {
+	if wrapped.current() != scope {
 		t.Fatalf("WithGraph did not keep the same scope")
 	}
 	if wrapped.Transaction != retargeted {
@@ -1935,7 +1935,7 @@ func TestObservingBatchNodesAndRelationshipsReturnObservingWrappers(t *testing.T
 	if !ok {
 		t.Fatalf("Nodes() returned %T, want *observingNodeQuery", b.Nodes())
 	}
-	if nq.scope != scope || nq.NodeQuery != innerNodes {
+	if nq.current() != scope || nq.NodeQuery != innerNodes {
 		t.Fatalf("Nodes() did not wrap the inner batch's NodeQuery with the batch's scope")
 	}
 
@@ -1943,7 +1943,7 @@ func TestObservingBatchNodesAndRelationshipsReturnObservingWrappers(t *testing.T
 	if !ok {
 		t.Fatalf("Relationships() returned %T, want *observingRelationshipQuery", b.Relationships())
 	}
-	if rq.scope != scope || rq.RelationshipQuery != innerRel {
+	if rq.current() != scope || rq.RelationshipQuery != innerRel {
 		t.Fatalf("Relationships() did not wrap the inner batch's RelationshipQuery with the batch's scope")
 	}
 }
@@ -2274,7 +2274,7 @@ func TestObservingBatchWithGraphRecordsFallbackAndKeepsObserving(t *testing.T) {
 	if !ok {
 		t.Fatalf("WithGraph returned %T, want *observingBatch", got)
 	}
-	if wrapped.scope != scope {
+	if wrapped.current() != scope {
 		t.Fatalf("WithGraph did not keep the same scope")
 	}
 	if wrapped.Batch != retargeted {
@@ -2458,5 +2458,104 @@ func TestBatchCreateNodeWithZeroIDKeysOnObjectID(t *testing.T) {
 	recordBatchCreateNodeIdentity(preset, graph.NewNode(graph.ID(42), graph.NewProperties(), graph.StringKind("User")))
 	if got := preset.Changes().NodeIDs(); len(got) != 1 || got[0] != uint64(42) {
 		t.Errorf("NodeIDs = %v, want the preset id 42", got)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Scope sharing across Commit (scopeSlot)
+// -----------------------------------------------------------------------
+
+// TestObservingBatchWithGraphChildWritesAfterItsOwnCommitReachTheRoot pins
+// scopeSlot's first case: a WithGraph child that commits and keeps writing
+// must record into the scope Driver.BatchOperation will apply -- the root
+// observer's current one. With a copied scope pointer, the child's Commit
+// reset only the child's own field, so node 42 landed in a scope nothing
+// ever applied.
+func TestObservingBatchWithGraphChildWritesAfterItsOwnCommitReachTheRoot(t *testing.T) {
+	retargeted := &fakeBatch{}
+	inner := &fakeBatch{withGraphReturn: retargeted}
+	initial := engine.NewWriteScope()
+	root := &observingBatch{Batch: inner, scope: initial, eng: disabledEngine()}
+
+	child := root.WithGraph(graph.Graph{Name: "other"})
+	if err := child.Commit(); err != nil {
+		t.Fatalf("child Commit: unexpected error: %v", err)
+	}
+	if err := child.CreateNode(&graph.Node{ID: 42}); err != nil {
+		t.Fatalf("child CreateNode: unexpected error: %v", err)
+	}
+
+	if root.scope == initial {
+		t.Fatalf("the child's Commit did not replace the root's scope, which that Commit had already applied")
+	}
+	if got, want := root.scope.Changes().NodeIDs(), []uint64{42}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("root scope NodeIDs = %v, want %v: the child's post-Commit write never reaches the scope BatchOperation applies", got, want)
+	}
+}
+
+// TestObservingBatchQueryHeldAcrossCommitRecordsIntoTheLiveScope pins
+// scopeSlot's second case: a query handed out before a Commit and used
+// after it must record into the scope Commit installed, not the one Commit
+// already applied and discarded.
+func TestObservingBatchQueryHeldAcrossCommitRecordsIntoTheLiveScope(t *testing.T) {
+	inner := &fakeBatch{nodesReturn: &fakeNodeQuery{}}
+	b := &observingBatch{Batch: inner, scope: engine.NewWriteScope(), eng: disabledEngine()}
+
+	q := b.Nodes()
+	if err := b.Commit(); err != nil {
+		t.Fatalf("Commit: unexpected error: %v", err)
+	}
+	if err := q.Filter(inIDsCriteria(nodeIDSymbol, 7)).Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+
+	if got, want := b.scope.Changes().NodeIDs(), []uint64{7}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("batch scope NodeIDs = %v, want %v: a delete through a query held across Commit was recorded into the discarded scope", got, want)
+	}
+}
+
+// TestObservingTransactionWithGraphChildWritesAfterItsOwnCommitReachTheRoot
+// is the transaction-side twin of the batch test above: Driver.
+// WriteTransaction applies the root observer's current scope, so a
+// retargeted child's post-Commit write must land there.
+func TestObservingTransactionWithGraphChildWritesAfterItsOwnCommitReachTheRoot(t *testing.T) {
+	retargeted := &fakeTransaction{createNodeReturn: &graph.Node{ID: 42}}
+	inner := &fakeTransaction{withGraphReturn: retargeted}
+	root, initial := newObservingTransaction(inner)
+	root.eng = disabledEngine()
+
+	child := root.WithGraph(graph.Graph{Name: "other"})
+	if err := child.Commit(); err != nil {
+		t.Fatalf("child Commit: unexpected error: %v", err)
+	}
+	if _, err := child.CreateNode(graph.NewProperties(), graph.StringKind("User")); err != nil {
+		t.Fatalf("child CreateNode: unexpected error: %v", err)
+	}
+
+	if root.scope == initial {
+		t.Fatalf("the child's Commit did not replace the root's scope, which that Commit had already applied")
+	}
+	if got, want := root.scope.Changes().NodeIDs(), []uint64{42}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("root scope NodeIDs = %v, want %v", got, want)
+	}
+}
+
+// TestObservingTransactionQueryHeldAcrossCommitRecordsIntoTheLiveScope is
+// the transaction-side twin of the batch test above.
+func TestObservingTransactionQueryHeldAcrossCommitRecordsIntoTheLiveScope(t *testing.T) {
+	inner := &fakeTransaction{nodesReturn: &fakeNodeQuery{}}
+	tx, _ := newObservingTransaction(inner)
+	tx.eng = disabledEngine()
+
+	q := tx.Nodes()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: unexpected error: %v", err)
+	}
+	if err := q.Filter(inIDsCriteria(nodeIDSymbol, 7)).Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+
+	if got, want := tx.scope.Changes().NodeIDs(), []uint64{7}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("transaction scope NodeIDs = %v, want %v", got, want)
 	}
 }

@@ -26,3 +26,28 @@ index dffab65..2c76fcc 100644
  	default:
  		return nil, fmt.Errorf("unknown graphdb driver name: %s", driverName)
  	}
+diff --git a/cmd/api/src/migrations/manifest.go b/cmd/api/src/migrations/manifest.go
+index c0625f4..a39eedc 100644
+--- a/cmd/api/src/migrations/manifest.go
++++ b/cmd/api/src/migrations/manifest.go
+@@ -24,6 +24,7 @@
+ 	"strings"
+ 	"time"
+ 
++	bloodtrail "github.com/MihhailSokolov/BloodTrail"
+ 	"github.com/specterops/bloodhound/cmd/api/src/database"
+ 	"github.com/specterops/bloodhound/cmd/api/src/model"
+ 	"github.com/specterops/bloodhound/cmd/api/src/version"
+@@ -236,7 +237,11 @@
+ 	// The incorrectly assigned edges were only created in PG. Due to the way translation
+ 	// works, edge queries match on nodes and will not be able to address edges created
+ 	// with non-existent node IDs.
+-	if pg.IsPostgreSQLGraph(db) {
++	// The BloodTrail driver embeds *pg.Driver rather than being one, so
++	// pg.IsPostgreSQLGraph alone does not recognise it -- but its graph lives
++	// in PostgreSQL all the same, and skipping this would record the
++	// migration as done without running it.
++	if pg.IsPostgreSQLGraph(db) || graph.IsDriver[*bloodtrail.Driver](db) {
+ 		return db.Run(ctx, removalQuery, nil)
+ 	}
+ 

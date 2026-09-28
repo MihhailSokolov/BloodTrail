@@ -19,6 +19,8 @@ package interpret
 import (
 	"errors"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -852,6 +854,23 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 	if !aOk || !bOk {
 		return TriNull, nil
 	}
+	// A bare property against a numeric operand (the only property shape
+	// relationalComparisonSafe admits) is `(properties ->> 'x')::int8 < ...`
+	// in pg -- a CAST of the property's text, not a jsonb comparison. See
+	// castPropertyForOrder.
+	leftProp, rightProp := isBarePropertyLookup(leftExpr), isBarePropertyLookup(rightExpr)
+	if leftProp && !rightProp {
+		if aVal, err = castPropertyForOrder(aVal, isFloatLiteral(rightExpr)); err != nil {
+			return TriNull, err
+		}
+	} else if rightProp && !leftProp {
+		if bVal, err = castPropertyForOrder(bVal, isFloatLiteral(leftExpr)); err != nil {
+			return TriNull, err
+		}
+	}
+	if aVal == nil || bVal == nil {
+		return TriNull, nil // a stored JSON null extracts to SQL NULL
+	}
 
 	c, err := OrderCompare(aVal, bVal)
 	if err != nil {
@@ -872,6 +891,70 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 		return boolToTri(c >= 0), nil
 	default:
 		return TriNull, ErrUnsupported
+	}
+}
+
+// isFloatLiteral reports whether expr is a bare float literal -- the one
+// numeric operand whose type (float8) this package knows dawgs casts the
+// other side to. An integer literal is int8; any other numeric expression
+// is left undecided, and castPropertyForOrder is conservative about it.
+func isFloatLiteral(expr cypher.Expression) bool {
+	lit, ok := asLiteral(expr)
+	if !ok || lit == nil {
+		return false
+	}
+	_, isFloat := lit.Value.(float64)
+	return isFloat
+}
+
+// maxExactInt is the largest integer magnitude a float64 holds exactly.
+const maxExactInt = 1 << 53
+
+// castPropertyForOrder reproduces pg's `(properties ->> 'x')::int8` (or
+// `::float8` when floatCast) for a relational comparison, over this
+// package's value model.
+//
+// The cast is what decides the row, not jsonb typing: the STRING '7' casts to
+// 7 and matches `x > 5`, where OrderCompare -- which refuses to order a
+// string against a number -- used to drop it. And every value the cast
+// rejects ('abc', true, a list, 7.5 under int8) is a PostgreSQL ERROR that
+// aborts the whole query, so it declines here (ErrRuntimeCast) rather than
+// quietly dropping the row, which was once an accepted divergence and served
+// an answer for a query pg refuses. When the cast type is undecided (the
+// numeric side is not a bare literal) anything that is not an integer --
+// where int8 and float8 agree -- declines.
+//
+// A nil (stored JSON null) passes through: it extracts to SQL NULL.
+func castPropertyForOrder(v any, floatCast bool) (any, error) {
+	switch val := v.(type) {
+	case nil:
+		return nil, nil
+	case float64:
+		if floatCast {
+			return val, nil
+		}
+		if val != math.Trunc(val) || math.Abs(val) > maxExactInt {
+			return nil, ErrRuntimeCast
+		}
+		return val, nil
+	case string:
+		if pgInt8Text.MatchString(val) {
+			n, err := strconv.ParseInt(val, 10, 64)
+			if err != nil || n > maxExactInt || n < -maxExactInt {
+				return nil, ErrRuntimeCast
+			}
+			return float64(n), nil
+		}
+		if floatCast && pgFloat8Text.MatchString(val) {
+			f, err := strconv.ParseFloat(val, 64)
+			if err != nil {
+				return nil, ErrRuntimeCast
+			}
+			return f, nil
+		}
+		return nil, ErrRuntimeCast
+	default:
+		return nil, ErrRuntimeCast
 	}
 }
 
@@ -1002,7 +1085,93 @@ func evalIn(env *Env, row *Row, leftExpr, rightExpr cypher.Expression) (Tri, err
 	if !isList {
 		return TriNull, ErrUnsupported
 	}
+	if inListIsJSONValue(rightExpr) {
+		lit, isLit := asLiteral(leftExpr)
+		if !isLit {
+			return TriNull, ErrUnsupported // checkInOperands admits only a literal here
+		}
+		return inTextElements(lit, list)
+	}
 	return In(val, ok, list)
+}
+
+// inListIsJSONValue reports whether the right-hand side of an IN is a list
+// that comes out of a stored JSON value -- a property, or a function over one
+// -- rather than a list literal or a parameter. dawgs translates that shape
+// as `<lit> = any(jsonb_to_text_array(<value>)::<lit type>[])`, which is not
+// In's semantics: see inTextElements.
+func inListIsJSONValue(rightExpr cypher.Expression) bool {
+	switch unwrapParens(rightExpr).(type) {
+	case *cypher.ListLiteral, *cypher.Parameter:
+		return false
+	}
+	return true
+}
+
+// inTextElements implements `<literal> IN <stored list>` as dawgs translates
+// it: `<lit> = any(jsonb_to_text_array(p)::<lit type>[])`.
+// jsonb_to_text_array is `array(select jsonb_array_elements_text(p))`, so
+// every element is compared as its TEXT -- the number 1 is '1', true is
+// 'true' -- and for a numeric literal the whole array is first cast to
+// int8[]/float8[], so ANY element that is not a number's text is a pg error,
+// matched or not. In types the comparison by the LIST's elements instead,
+// which answered `'true' IN [true]` FALSE and `'1.0' IN [1]` TRUE, both the
+// opposite of pg.
+//
+// A JSON null element is SQL NULL: never equal, but it turns a miss into
+// NULL rather than FALSE (`= any` semantics). A nested list or object
+// element renders as JSON source this package does not reproduce, so it
+// declines.
+func inTextElements(lit *cypher.Literal, list []any) (Tri, error) {
+	if lit == nil || lit.Null {
+		return TriNull, ErrUnsupported
+	}
+	kind := coalesceText
+	switch lit.Value.(type) {
+	case string:
+	case int64, uint64:
+		kind = coalesceInt8
+	case float64:
+		kind = coalesceFloat8
+	default:
+		return TriNull, ErrUnsupported // dawgs cannot translate a bool/other literal here
+	}
+	want, _, err := evalLiteralValue(lit)
+	if err != nil {
+		return TriNull, err
+	}
+
+	// Cast every element first: pg casts the whole array before comparing,
+	// so a bad element is an error even when an earlier one matches.
+	cast := make([]any, len(list))
+	for i, el := range list {
+		if el == nil {
+			continue
+		}
+		text, present := jsonText(el)
+		if !present {
+			return TriNull, ErrUnsupported
+		}
+		v, err := castTextAs(text, kind)
+		if err != nil {
+			return TriNull, err
+		}
+		cast[i] = v
+	}
+	sawNull := false
+	for i, v := range cast {
+		if list[i] == nil {
+			sawNull = true
+			continue
+		}
+		if v == want {
+			return TriTrue, nil
+		}
+	}
+	if sawNull {
+		return TriNull, nil
+	}
+	return TriFalse, nil
 }
 
 // evalKindMatcher implements `n:Kind` (and edge kind matchers, `r:TYPE`,
@@ -1109,8 +1278,21 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 	// side's adjacency and testing each neighbour's labels instead of
 	// probing one already-known pair. A NAMED fresh variable is still
 	// rejected at plan time, because that one really would have to bind.
-	fromBound, fromOK := patternEndpointNode(row, fromNode)
-	toBound, toOK := patternEndpointNode(row, toNode)
+	//
+	// A NAMED endpoint this row does not bind is therefore never a fresh
+	// variable -- it is an OPTIONAL MATCH symbol the row left null (`OPTIONAL
+	// MATCH (u)-[:MemberOf]->(g:Group) WITH u, g MATCH (c:Computer) WHERE
+	// (g)-[:MemberOf]->(c)`). Reading it as "not bound" sent it down the
+	// anonymous branch below, which asks whether SOME node fits, so a null g
+	// behaved as a wildcard: 4 rows served where pg answers 0, and 3 under
+	// NOT where pg answers 7. The answer pg gives for a null endpoint is a
+	// dawgs lowering detail this evaluator has no parity evidence for, so it
+	// declines rather than pick one.
+	fromBound, fromOK, fromErr := patternEndpointNode(row, fromNode)
+	toBound, toOK, toErr := patternEndpointNode(row, toNode)
+	if fromErr != nil || toErr != nil {
+		return TriNull, ErrUnsupported
+	}
 
 	switch {
 	case fromOK && toOK:
@@ -1125,12 +1307,18 @@ func evalPatternPredicate(env *Env, row *Row, pp *cypher.PatternPredicate) (Tri,
 }
 
 // patternEndpointNode resolves a pattern-predicate endpoint to the node the
-// row already bound it to, or reports that it is not a bound variable.
-func patternEndpointNode(row *Row, np *cypher.NodePattern) (snapshot.NodeID, bool) {
+// row already bound it to. bound is false only for an ANONYMOUS endpoint; a
+// named endpoint the row does not bind as a node -- a null OPTIONAL MATCH
+// symbol -- is ErrUnsupported, never "anonymous" (see evalPatternPredicate).
+func patternEndpointNode(row *Row, np *cypher.NodePattern) (id snapshot.NodeID, bound bool, err error) {
 	if np.Variable == nil || np.Variable.Symbol == "" {
-		return 0, false
+		return 0, false, nil
 	}
-	return row.Node(np.Variable.Symbol)
+	id, bound = row.Node(np.Variable.Symbol)
+	if !bound {
+		return 0, false, ErrUnsupported
+	}
+	return id, true, nil
 }
 
 // nodeKindIDs resolves a pattern node's kind labels to snapshot ids. A label
@@ -1691,22 +1879,164 @@ func evalCaseFunction(env *Env, row *Row, fi *cypher.FunctionInvocation, upper b
 	return strings.ToLower(s), true, nil
 }
 
-// evalCoalesce implements coalesce(): the first argument that is neither
-// absent nor a present JSON null wins; if every argument is NULL (in either
-// sense), the result itself is NULL. This is naive by design (per the
-// brief): heterogeneous-type arguments are assumed already rejected upstream
-// by the gate, so no type-unification is attempted here.
+// evalCoalesce implements coalesce() as dawgs translates it, which is NOT a
+// plain "first non-null jsonb value": every property argument is extracted as
+// `->>` TEXT and cast to the type of the call's literal arguments --
+// `coalesce(n.x, 0)` is `coalesce((properties ->> 'x')::int8, 0)::int8`,
+// `coalesce(n.x, '')` is `coalesce(properties ->> 'x', '')::text`, and with
+// no literal at all the result is the text. So the number 5 under a string
+// default is '5', the string '5' under a numeric default is 5, and a value
+// the cast rejects is a PostgreSQL error. Returning the raw jsonb value, as
+// this once did, made `coalesce(n.x, '') = '5'` miss a numeric 5 and
+// `coalesce(n.x, 0) = 5` miss a string '5'.
+//
+// coalesceCastKind (checked at plan time too) admits only property lookups
+// and literals of one kind; anything else, and any value this cannot cast
+// exactly as pg would, declines.
 func evalCoalesce(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool, error) {
+	kind, ok := coalesceCastKind(fi)
+	if !ok {
+		return nil, false, ErrUnsupported
+	}
 	for _, arg := range fi.Arguments {
+		if lit, isLit := asLiteral(arg); isLit {
+			val, _, err := evalLiteralValue(lit)
+			if err != nil {
+				return nil, false, err
+			}
+			return val, true, nil
+		}
 		val, ok, err := EvalValue(env, row, arg)
 		if err != nil {
 			return nil, false, err
 		}
-		if ok && val != nil {
-			return val, true, nil
+		if !ok || val == nil {
+			continue
 		}
+		text, present := jsonText(val)
+		if !present {
+			// A list or object: `->>` renders its JSON source, whose exact
+			// spelling (spacing, key order, number format) this package does
+			// not reproduce.
+			return nil, false, ErrUnsupported
+		}
+		cast, err := castTextAs(text, kind)
+		if err != nil {
+			return nil, false, err
+		}
+		return cast, true, nil
 	}
 	return nil, false, nil
+}
+
+// coalesceKind is the SQL type dawgs gives a coalesce() call.
+type coalesceKind uint8
+
+const (
+	coalesceText coalesceKind = iota
+	coalesceInt8
+	coalesceFloat8
+	coalesceBool
+)
+
+// coalesceCastKind reports the type dawgs casts a coalesce() call to, and
+// whether this package can evaluate the call at all: every argument must be
+// a bare property lookup or a non-null literal, and the literals must agree
+// on one kind (pg rejects a mix at translation time). No literal means text.
+func coalesceCastKind(fi *cypher.FunctionInvocation) (coalesceKind, bool) {
+	if fi == nil || len(fi.Arguments) == 0 {
+		return 0, false
+	}
+	kind, seen := coalesceText, false
+	for _, arg := range fi.Arguments {
+		if lit, isLit := asLiteral(arg); isLit {
+			if lit == nil || lit.Null {
+				return 0, false
+			}
+			var k coalesceKind
+			switch lit.Value.(type) {
+			case string:
+				k = coalesceText
+			case int64, uint64:
+				k = coalesceInt8
+			case float64:
+				k = coalesceFloat8
+			case bool:
+				k = coalesceBool
+			default:
+				return 0, false
+			}
+			if seen && k != kind {
+				return 0, false
+			}
+			kind, seen = k, true
+			continue
+		}
+		pl, isProp := unwrapParens(arg).(*cypher.PropertyLookup)
+		if !isProp || pl == nil {
+			return 0, false
+		}
+		if v, isVar := unwrapParens(pl.Atom).(*cypher.Variable); !isVar || v == nil {
+			return 0, false
+		}
+	}
+	return kind, true
+}
+
+// CoalesceIsInt8 reports whether expr is a coalesce() call dawgs types as
+// int8 -- the one coalesce result whose projected Go type (int64) differs
+// from this package's float64 number model.
+func CoalesceIsInt8(expr cypher.Expression) bool {
+	fi, ok := unwrapParens(expr).(*cypher.FunctionInvocation)
+	if !ok || fi == nil || !strings.EqualFold(fi.Name, cypher.CoalesceFunction) {
+		return false
+	}
+	kind, ok := coalesceCastKind(fi)
+	return ok && kind == coalesceInt8
+}
+
+var (
+	pgInt8Text   = regexp.MustCompile(`^[+-]?[0-9]+$`)
+	pgFloat8Text = regexp.MustCompile(`^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
+)
+
+// castTextAs casts a `->>` text value to kind the way PostgreSQL's input
+// functions would, accepting only the spellings it is certain pg accepts
+// identically. Anything else is ErrRuntimeCast: pg would either raise the
+// same error or accept a spelling this does not model (' 5', '1_000',
+// 'yes'), and declining is correct in both cases.
+func castTextAs(text string, kind coalesceKind) (any, error) {
+	switch kind {
+	case coalesceText:
+		return text, nil
+	case coalesceInt8:
+		if !pgInt8Text.MatchString(text) {
+			return nil, ErrRuntimeCast
+		}
+		n, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			return nil, ErrRuntimeCast
+		}
+		return float64(n), nil
+	case coalesceFloat8:
+		if !pgFloat8Text.MatchString(text) {
+			return nil, ErrRuntimeCast
+		}
+		f, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return nil, ErrRuntimeCast
+		}
+		return f, nil
+	case coalesceBool:
+		switch text {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		}
+		return nil, ErrRuntimeCast
+	}
+	return nil, ErrUnsupported
 }
 
 // evalSizeFunction implements size(list-property) -> list length, returned

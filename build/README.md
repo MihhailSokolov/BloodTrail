@@ -3,9 +3,14 @@
 `build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform …]` builds
 BloodHound CE at the given upstream release tag with the BloodTrail driver compiled in.
 
-The only source change to BloodHound is `patches/bloodhound-driver.patch`
-(one file: `cmd/api/src/bootstrap/util.go`). `go.mod` is edited by the script with
-`go mod edit`, so upstream dependency bumps never conflict with the patch.
+The only source change to BloodHound is `patches/bloodhound-driver.patch`, which touches
+two files: `cmd/api/src/bootstrap/util.go` registers the driver name, and
+`cmd/api/src/migrations/manifest.go` makes the one PostgreSQL-only graph migration
+(`Version_852_Migration`) recognise BloodTrail. Upstream detects PostgreSQL with
+`pg.IsPostgreSQLGraph`, a concrete `*pg.Driver` type match that BloodTrail's driver (which
+embeds one) does not satisfy, so without that hunk the migration is skipped and still
+recorded as done. `go.mod` is edited by the script with `go mod edit`, so upstream
+dependency bumps never conflict with the patch.
 
 Vendoring copies the driver's root Go files plus `internal/engine` -- the in-memory path
 engine -- into `packages/go/bloodtrail`, which the upstream Dockerfile's builder stage already
@@ -19,8 +24,11 @@ business inside the served image and stays out.
 
 Images are tagged `ghcr.io/mihhailsokolov/bloodtrail:<tag>-bt<driver version>`
 and `:<tag>`. The second is a moving alias for the newest driver build against that
-upstream release; the installer falls back to it when the tag for its own version has
-not been published. A leading `v` is stripped from the driver version, so the same
+upstream release -- including the weekly builds from `main`, so it can hold an unreleased
+driver. A released installer therefore never falls back to it: when the tag for its own
+version is missing it stops and names both, and `--image <alias>` is the explicit way to
+accept the alias anyway. Only a source-built (`dev`) installer targets the alias by
+default, since it has no version of its own to pin. A leading `v` is stripped from the driver version, so the same
 string is stamped into `Version` and used in the image tag.
 
 (Releases up to and including v0.1.0 resolve images under the package's original name,
@@ -97,8 +105,9 @@ run against that same fixture, still installed, before rollback:
    watermark read, the memory limit, or no file attempt at all still fails. One more
    `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths.
 
-Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Run it
-with `PLATFORM=linux/arm64 ./build/e2e.sh` on Apple Silicon to avoid amd64 emulation.
+Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Like a
+local `build-image.sh`, it builds for the Docker daemon's own platform, so the stack runs
+natively; set `PLATFORM` (e.g. `PLATFORM=linux/amd64 ./build/e2e.sh`) to build for another.
 
 ### Log markers
 
@@ -125,19 +134,21 @@ regardless.
 
 The installer derives its image tag from the running upstream tag plus its own version
 (`<upstream>-bt<version>`), so the version-suffixed images have to exist before a
-released CLI can install anything. In order (the ordering is load-bearing twice:
-`release.yml` refuses to run until the package is public, and the `image` workflow can
-only be dispatched from a ref that already exists):
+released CLI can install anything. `release.yml` builds them itself, from the release
+tag's own ref (`git describe` on it is what stamps the driver version), for every
+upstream tag in its matrix -- kept equal to `ci.yml`'s patch-guard matrix -- and refuses
+to publish the CLI until each of those exact tags is anonymously pullable. In order:
 
 1. Set the GHCR package `bloodtrail` to public in its package settings.
 2. Confirm an unauthenticated client can see it:
    `docker logout ghcr.io && docker manifest inspect ghcr.io/mihhailsokolov/bloodtrail:v9.6.0`.
-3. Push the `vX.Y.Z` tag to trigger `release.yml`, which verifies that anonymous pull
-   itself and then builds the CLI archives, `checksums.txt` and `install.sh`.
-4. For each supported upstream tag, dispatch the `image` workflow from the release tag
-   (`gh workflow run image.yml --ref vX.Y.Z -f upstream_tag=v9.6.0`): `git describe` on
-   that ref is what stamps the driver version, so this publishes the
-   `v9.6.0-btX.Y.Z`-style image the released CLI derives and pulls.
+3. Push the `vX.Y.Z` tag to trigger `release.yml`: it publishes the
+   `<upstream>-btX.Y.Z` images, verifies an anonymous pull of each, and only then builds
+   the CLI archives, `checksums.txt` and `install.sh`.
+4. For an upstream tag outside that matrix, dispatch the `image` workflow from the
+   release tag (`gh workflow run image.yml --ref vX.Y.Z -f upstream_tag=v9.8.0`); until
+   then the released CLI refuses to install on that upstream version rather than take
+   the alias.
 5. On a clean host with a BloodHound CE deployment, run the documented one-liner
    (`curl -fsSL …/install.sh | sh -s -- install`) end to end, including
    `bloodtrail rollback`.

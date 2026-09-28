@@ -165,11 +165,40 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	// len(q.Parts) == 1 (matchPartLimited is never called otherwise) --
 	// this gate closes the same gap for the meter-threaded path
 	// expandShortestPathComponent reads instead of a direct parameter.
-	if len(q.Parts) == 1 {
+	//
+	// An OPTIONAL MATCH is excluded the same way: leftJoinOptional runs the
+	// optional Part through matchPart with this very meter, so a target set
+	// here would also cap how many OPTIONAL rows a component executor may
+	// produce -- a quantity the final LIMIT says nothing about. A reverse
+	// var-length expansion inside the optional side stopped after one trail,
+	// every other mandatory row then found no match and null-padded, and
+	// `... OPTIONAL MATCH (u)-[:MemberOf*1..]->(g) ... RETURN u, g LIMIT 1`
+	// served (U0, null), a row the unlimited answer does not contain.
+	if len(q.Parts) == 1 && q.Parts[0].Optional == nil {
 		meter.limitTarget, meter.limitTargetSet = target, target >= 0
 	}
 
 	part0 := &q.Parts[0]
+
+	// A row-evaluated ORDER BY key (OrderKey.Expr -- a property lookup the
+	// projection does not output) under a RETURN aggregate is evaluated
+	// against the GROUPED rows, which bind nothing but the group's own
+	// aliases (desugarReturnAggregates turns every non-aggregate item into a
+	// computed alias). pg has no answer to give either: dawgs lowers `RETURN
+	// count(u) ORDER BY u.x` to `select count(s0.n0) ... order by
+	// (s0.n0).properties -> 'x'`, which PostgreSQL rejects because the key is
+	// neither grouped nor aggregated -- while the engine, with a single group
+	// and so no comparison to make, served [3]. Even the shape pg does accept
+	// (`RETURN u, count(g) ORDER BY u.x`, grouped by s0.n0) sorts by a symbol
+	// the grouped rows no longer bind. Declined outright; the delegated query
+	// then answers, or errors, exactly as pg does.
+	if q.ReturnGroup != nil {
+		for _, k := range q.Order {
+			if k.Expr != nil {
+				return nil, errUnsupportedStep
+			}
+		}
+	}
 
 	// A query that must materialize every row before it can answer, over a
 	// candidate source already larger than the row budget, cannot finish --
@@ -313,9 +342,10 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 		}
 	}
 
+	absent := absentableAliases(q)
 	outRows := make([][]OutVal, len(rows))
 	for i, r := range rows {
-		outRow, err := projectRow(env, q.Returning, r)
+		outRow, err := projectRowAbsentable(env, q.Returning, r, absent)
 		if err != nil {
 			return nil, err
 		}
@@ -339,6 +369,51 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 	}
 
 	return &ResultSet{Keys: projectionKeys(q.Returning), Rows: outRows}, nil
+}
+
+// absentableAliases returns every computed alias of q's RETURN aggregate
+// (q.ReturnGroup's Computed items) -- the aliases runWithStage leaves
+// UNBOUND, rather than binding a Go nil, in a group whose key expression
+// evaluated to an absent value (see its own comment). nil when there are
+// none. An explicit WITH's computed aliases are not listed: Plan serves no
+// query that projects one after the boundary, and an unbound one reaching
+// EvalValue declines, which is the safe answer for a shape nothing pins.
+func absentableAliases(q *Query) map[string]bool {
+	if q.ReturnGroup == nil || len(q.ReturnGroup.Computed) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(q.ReturnGroup.Computed))
+	for _, c := range q.ReturnGroup.Computed {
+		out[c.Alias] = true
+	}
+	return out
+}
+
+// projectRowAbsentable is projectRow, except that a RETURN item that is a
+// bare reference to an absentable alias (absentableAliases) the row leaves
+// unbound projects as an ABSENT scalar column -- SQL NULL, the value pg
+// returns for the absent property the alias was computed from -- instead of
+// reaching EvalValue, which reports an unbound variable as unsupported. A
+// bound alias, and every other item, projects exactly as projectRow would.
+func projectRowAbsentable(env *Env, proj Projection, r *Row, absent map[string]bool) ([]OutVal, error) {
+	if len(absent) == 0 {
+		return projectRow(env, proj, r)
+	}
+	out := make([]OutVal, len(proj.Items))
+	for i, item := range proj.Items {
+		if v, isVar := unwrapParens(item.Expr).(*cypher.Variable); isVar && v != nil && absent[v.Symbol] {
+			if _, bound := r.Scalar(v.Symbol); !bound {
+				out[i] = OutVal{Kind: OutScalar, Scalar: nil, ScalarAbsent: true}
+				continue
+			}
+		}
+		val, err := projectItem(env, r, item)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = val
+	}
+	return out, nil
 }
 
 // filterRows evaluates expr (a Part's Where, or nil for no filter at all)
@@ -479,8 +554,20 @@ func collectAliasNames(aggs []WithAggregate) []string {
 // then discarded by applySkipLimit, exactly like today's unlimited path
 // already does -- so they still count toward how many post-filter rows must
 // exist before stopping.
+//
+// A RETURN aggregate (q.ReturnGroup) is refused for the same reason as
+// DISTINCT, only more so: its LIMIT counts GROUPS, and a group's value is a
+// fold over every row that falls into it, so no prefix of the matched rows
+// can stand in for the whole. Honoring the target anyway truncated the fold
+// itself -- `RETURN count(u) LIMIT 1` over 3000 users stopped after one
+// 1024-row chunk and answered 1024, and the same target, threaded through
+// meter.limitTarget, capped a reverse var-length expansion to one trail and
+// answered 1 where pg answers 50. A WITH boundary's own aggregate needs no
+// clause here: runQuery only ever applies the target to the LAST Part (the
+// one after the boundary) or to a single-Part query, never to rows a WITH
+// aggregate is still going to fold.
 func limitTarget(q *Query) int64 {
-	if q.Limit < 0 || len(q.Order) > 0 || q.Returning.Distinct {
+	if q.Limit < 0 || len(q.Order) > 0 || q.Returning.Distinct || q.ReturnGroup != nil {
 		return -1
 	}
 	return q.Skip + q.Limit
@@ -595,6 +682,15 @@ func leftJoinOptional(env *Env, meter *workMeter, part *Part, rows []*Row) ([]*R
 		}
 	}
 
+	// Every node symbol of the mandatory pattern, in a fixed order, for the
+	// repeated-tuple decline below.
+	tupleSyms := make([]string, 0, len(part.Nodes))
+	for sym := range part.Nodes {
+		tupleSyms = append(tupleSyms, sym)
+	}
+	sort.Strings(tupleSyms)
+	var matchedTuples map[string]struct{}
+
 	out := make([]*Row, 0, len(rows))
 	for _, l := range rows {
 		if err := meter.spend(1); err != nil {
@@ -602,6 +698,36 @@ func leftJoinOptional(env *Env, meter *workMeter, part *Part, rows []*Row) ([]*R
 		}
 		key, ok := optionalJoinKey(l, part.OptionalShared)
 		matches := buckets[key]
+		if ok && len(matches) > 0 {
+			// dawgs does not left-join the mandatory rows to the optional
+			// ones row by row. It builds the optional CTE FROM the mandatory
+			// CTE (one optional row per mandatory row per match) and then
+			// left-joins the mandatory CTE to it on every mandatory NODE
+			// column (plus, depending on the pattern, some edge columns) --
+			// `left outer join s1 on (s0.n1 = s1.n1) and (s0.n0 = s1.n0)`.
+			// A node tuple the mandatory side produces k times, with m
+			// optional matches, therefore comes out k*k*m times, not k*m:
+			// each of its k copies joins every optional row all k copies
+			// contributed. Repeats are ordinary -- two var-length trails to
+			// the same group, or two parallel edges of admitted kinds -- and
+			// the engine reproducing that squaring deliberately would pin a
+			// dawgs plan detail, so a repeated tuple that the optional side
+			// actually matches declines instead. A repeat the optional side
+			// does NOT match is safe: its optional CTE contributes nothing,
+			// and pg's left join null-pads each of the k copies exactly once,
+			// as below. Keying on nodes alone can only over-decline -- when
+			// dawgs also joins on an edge column, rows differing there are
+			// not repeats to pg -- never under-decline, because every node
+			// column is in dawgs' join key.
+			tuple := string(groupKeyBytes(env, l, tupleSyms))
+			if matchedTuples == nil {
+				matchedTuples = make(map[string]struct{})
+			}
+			if _, dup := matchedTuples[tuple]; dup {
+				return nil, errUnsupportedStep
+			}
+			matchedTuples[tuple] = struct{}{}
+		}
 		if !ok || len(matches) == 0 {
 			// No match: the row survives with the optional symbols unbound.
 			out = append(out, l)
@@ -918,6 +1044,17 @@ func runWithStage(env *Env, meter *workMeter, wc *WithClause, rows []*Row) ([]*R
 	// Writing to the input rows is safe: they belong to this query alone,
 	// and the alias namespace ("$ret..." for a desugared RETURN, an explicit
 	// user alias otherwise) cannot collide with a pattern binding.
+	//
+	// An ABSENT value (EvalValue's ok == false -- `u.x` on a node with no x)
+	// leaves the alias UNBOUND rather than binding a Go nil: nil is how a
+	// stored JSON null is represented, and pg keeps the two apart -- an
+	// absent key is SQL NULL, a stored null is the non-NULL jsonb 'null', and
+	// `group by ((s0.n0).properties -> 'x')` puts them in different groups.
+	// Binding both as nil merged them (`RETURN u.x, count(u)` over two
+	// stored nulls and one absent answered [null:3] where pg answers two
+	// rows). Unbound, appendSymbolKey encodes the alias with its dedicated
+	// 'u' tag, copySymbolBinding carries nothing forward, and the RETURN
+	// projection renders it as an absent column (absentableProjection).
 	for _, c := range wc.Computed {
 		for _, r := range rows {
 			v, ok, err := EvalValue(env, r, c.Expr)
@@ -925,7 +1062,7 @@ func runWithStage(env *Env, meter *workMeter, wc *WithClause, rows []*Row) ([]*R
 				return nil, err
 			}
 			if !ok {
-				v = nil
+				continue
 			}
 			r.SetScalar(c.Alias, v)
 		}
@@ -1081,20 +1218,16 @@ func applyAggregate(env *Env, out *Row, agg WithAggregate, groupRows []*Row) {
 }
 
 // countAggregate implements COUNT(sym)/COUNT(DISTINCT sym) over one group.
-// agg.Sym is always bound as a node or edge variable for any query this
-// package's planner can currently produce (Part[0] -- the only Part a
-// WithClause's Aggregates are ever attached to -- never has a pre-existing
-// scalar symbol of its own, since that would require a second WITH boundary,
-// which Plan rejects), and a bound node/edge is unconditionally non-null in
-// every row this package's matchPart ever produces (no OPTIONAL MATCH
-// support, so a matched row never carries a "missing" pattern variable) --
-// so a plain COUNT(sym) over a node/edge symbol is exactly the group's own
-// row count. The scalar branch below implements the general Cypher rule
-// (count non-NULL values) anyway, for correctness against a hypothetical
-// future scalar Sym, though no query this planner accepts today can reach
-// it. COUNT(DISTINCT sym) dedupes by node/edge database id ("pg counts
-// distinct composites, which equals distinct ids" -- CountAgg's own doc
-// comment) or by the same ScalarEq-consistent encoding grouping uses.
+// COUNT counts the rows whose sym is non-NULL, and every row is tested: an
+// OPTIONAL MATCH leaves its symbols unbound on a null-padded row, so one row
+// binding sym says nothing about the next. (This used to return len(rows)
+// whenever rows[0] bound sym as a node or edge, on the since-broken
+// assumption that a matched row always binds every pattern variable; over
+// an OPTIONAL MATCH it counted the nulls, 7 where pg says 3.) An unbound
+// symbol and a scalar bound to nil are both NULL. COUNT(DISTINCT sym)
+// dedupes by node/edge database id ("pg counts distinct composites, which
+// equals distinct ids" -- CountAgg's own doc comment) or by the same
+// ScalarEq-consistent encoding grouping uses, skipping NULLs the same way.
 func countAggregate(env *Env, agg *CountAgg, rows []*Row) int64 {
 	if agg.Star {
 		// COUNT(*) counts ROWS, with no value to test for null and no
@@ -1102,18 +1235,13 @@ func countAggregate(env *Env, agg *CountAgg, rows []*Row) int64 {
 		return int64(len(rows))
 	}
 	if !agg.Distinct {
-		if len(rows) == 0 {
-			return 0
-		}
-		if _, ok := rows[0].Node(agg.Sym); ok {
-			return int64(len(rows))
-		}
-		if _, ok := rows[0].Edge(agg.Sym); ok {
-			return int64(len(rows))
-		}
 		var n int64
 		for _, r := range rows {
-			if v, ok := r.Scalar(agg.Sym); ok && v != nil {
+			if _, ok := r.Node(agg.Sym); ok {
+				n++
+			} else if _, ok := r.Edge(agg.Sym); ok {
+				n++
+			} else if v, ok := r.Scalar(agg.Sym); ok && v != nil {
 				n++
 			}
 		}
@@ -1862,6 +1990,24 @@ func runDistinctStreaming(env *Env, q *Query, meter *workMeter) (*ResultSet, boo
 	scanErr := scanAnchorVisitReusing(env, meter, anchor, part.Nodes[anchor], hint, reuse, func(r *Row) error {
 		if reuse != nil {
 			// Straight through: no chunk to accumulate, and nothing retains r.
+			//
+			// Part.Where still applies, exactly as flush applies it to a
+			// chunk: pushdown folds a conjunct into a candidate source only
+			// when it touches a pattern symbol, so one that touches none
+			// (`WHERE 1 = 2`, `WHERE false`) survives ONLY here. Skipping it
+			// emitted every scanned candidate where pg returns nothing.
+			// Evaluated directly rather than through filterRows, which would
+			// allocate a result slice per candidate on this allocation-free
+			// path.
+			if part.Where != nil {
+				t, err := EvalPredicate(env, r, part.Where)
+				if err != nil {
+					return err
+				}
+				if t != TriTrue {
+					return nil
+				}
+			}
 			one[0] = r
 			if err := emit(one[:]); err != nil {
 				return err

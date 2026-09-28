@@ -41,6 +41,11 @@ type deltaPropPostings struct {
 
 	// n is how many distinct delta nodes carry the property at all.
 	n int
+
+	// nonString and nonStringList are valueShape's two flags for the delta's
+	// own values: some delta node carries the property as other than a
+	// string (or null), or as other than a list of strings (or null).
+	nonString, nonStringList bool
 }
 
 type deltaStringEntry struct {
@@ -82,6 +87,20 @@ func (v *View) deltaPropFor(name string) *deltaPropPostings {
 				return true
 			}
 			idx.n++
+			switch typed := val.(type) {
+			case nil:
+			case string:
+				idx.nonStringList = true
+			case []any:
+				idx.nonString = true
+				for _, el := range typed {
+					if _, isStr := el.(string); !isStr {
+						idx.nonStringList = true
+					}
+				}
+			default:
+				idx.nonString, idx.nonStringList = true, true
+			}
 			if s, isStr := val.(string); isStr {
 				idx.strings = append(idx.strings, deltaStringEntry{id: dense, s: s})
 			}

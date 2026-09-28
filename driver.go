@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
@@ -79,6 +81,30 @@ type Driver struct {
 	*pg.Driver
 	settings Settings
 	engine   *engine.Engine
+
+	// pgOverride, when non-nil, stands in for the embedded driver in every
+	// call backend makes. Only unit tests set it: the outcomes the overrides
+	// below branch on (a write that failed after it may have committed, a
+	// delegate that ran) cannot be produced on demand by a live PostgreSQL.
+	pgOverride pgBackend
+}
+
+// pgBackend is the slice of *pg.Driver the overrides below call through.
+type pgBackend interface {
+	ReadTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error
+	WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error
+	SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error
+	DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error
+	DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kinds) error
+}
+
+// backend is the embedded PostgreSQL driver, or pgOverride when a test set
+// one.
+func (d *Driver) backend() pgBackend {
+	if d.pgOverride != nil {
+		return d.pgOverride
+	}
+	return d.Driver
 }
 
 // Settings returns the driver's parsed configuration.
@@ -219,10 +245,22 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 // retried invocation, should the embedded driver ever retry a
 // TransactionDelegate -- so wrapper state (declined) never leaks from one
 // invocation to another.
+//
+// Every wrapper carries ctx, so an engine-served read honors the caller's
+// cancellation and deadline exactly as a PostgreSQL read would
+// (wrappedTransaction.ctx's doc). The wrappers also share one readWrites,
+// which is built outside the delegate -- unlike declined, a write is durable
+// the moment it runs, so it must survive a retried invocation -- and
+// settled after the call whatever it returned (readWrites' doc: dawgs' pg
+// ReadTransaction is not read-only, and a write through it has to reach the
+// replica like any other).
 func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
-	return d.Driver.ReadTransaction(ctx, func(tx graph.Transaction) error {
-		return txDelegate(&wrappedTransaction{Transaction: tx, engine: d.engine})
+	writes := &readWrites{eng: d.engine, ctx: ctx}
+	err := d.backend().ReadTransaction(ctx, func(tx graph.Transaction) error {
+		return txDelegate(&wrappedTransaction{Transaction: tx, engine: d.engine, ctx: ctx, writes: writes})
 	}, options...)
+	writes.settle()
+	return err
 }
 
 // WriteTransaction runs txDelegate against the embedded PostgreSQL driver --
@@ -319,7 +357,7 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 		observer    *observingTransaction
 		delegateErr error
 	)
-	if err := d.Driver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+	if err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
 		observer = &observingTransaction{Transaction: tx, scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
 		delegateErr = txDelegate(observer)
 		return delegateErr
@@ -495,24 +533,33 @@ func (d *Driver) Close(ctx context.Context) error {
 // replica instead (engine.enterFallback), which is the only sound answer
 // for a write nothing in this package can describe.
 //
-// ensureBumped runs first, before d.Driver.Run even attempts its own pg
+// ensureBumped runs first, before the statement even attempts its own pg
 // effect -- the watermark protocol's spec amendment (internal/engine/
 // watermark.go's BumpWatermark doc) requires every mutating entry point to
-// bump eagerly, this one included. On failure, resolveAbandonedWrite resolves
-// that bump directly (no read-back to perform -- the call never reached
-// PostgreSQL at all) rather than calling the full Apply this method uses on
-// success.
+// bump eagerly, this one included.
+//
+// The body is pg.Driver.Run's own (drivers/pg/driver.go in the pinned dawgs
+// v0.8.0: one Raw statement inside the embedded driver's WriteTransaction),
+// reproduced rather than called because calling it hides WHERE an error
+// arose, and only one of the two places proves nothing committed -- see
+// settleOverrideWrite.
 func (d *Driver) Run(ctx context.Context, query string, parameters map[string]any) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.Driver.Run(ctx, query, parameters); err != nil {
-		resolveAbandonedWrite(ctx, d.engine, scope)
-		return err
-	}
-	scope.Changes().RecordFallback("Run: raw Cypher outside a transaction escapes changelog tracking")
-	d.engine.Apply(ctx, scope)
-	return nil
+	reachedCommit := false
+	err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
+		result := tx.Raw(query, parameters)
+		defer result.Close()
+
+		if err := result.Error(); err != nil {
+			return err
+		}
+		reachedCommit = true
+		return nil
+	})
+	settleOverrideWrite(ctx, d.engine, scope, err, reachedCommit, "Run: raw Cypher outside a transaction escapes changelog tracking")
+	return err
 }
 
 // WipeGraph truncates the graph through the embedded PostgreSQL driver and
@@ -521,19 +568,66 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 // keep serving shortest paths through data PostgreSQL no longer has. See
 // Run's doc for why an override is needed at all, for why the scope handed
 // to Apply carries a ChangeSet fallback rather than replaying anything
-// narrowly, and for why ensureBumped/resolveAbandonedWrite bracket the call the
-// same way.
+// narrowly, for why ensureBumped runs first, and for why the body is
+// pg.Driver.WipeGraph's own (the pinned dawgs v0.8.0's, truncate then the
+// retain delegate, inside the embedded driver's WriteTransaction).
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.Driver.WipeGraph(ctx, retain); err != nil {
-		resolveAbandonedWrite(ctx, d.engine, scope)
-		return err
+	reachedCommit := false
+	err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
+		result := tx.Raw("truncate table node, edge;", nil)
+
+		// Close before issuing further statements: a pgx transaction shares a
+		// single connection and cannot run the retain delegate's queries
+		// while these rows remain open.
+		result.Close()
+
+		if err := result.Error(); err != nil {
+			return fmt.Errorf("truncating graph tables: %w", err)
+		}
+
+		if retain != nil {
+			if err := retain(tx); err != nil {
+				return err
+			}
+		}
+		reachedCommit = true
+		return nil
+	})
+	settleOverrideWrite(ctx, d.engine, scope, err, reachedCommit, "WipeGraph: full graph truncation escapes changelog tracking")
+	return err
+}
+
+// settleOverrideWrite settles the engine's accounting for Run or WipeGraph
+// once the embedded WriteTransaction returned err, the same three-way split
+// resolveWriteTransactionFailure makes for WriteTransaction itself:
+//
+//   - err == nil: the write committed; record fallbackReason and Apply.
+//   - err != nil and !reachedCommit: the statement itself failed (or the
+//     delegate never ran at all -- no connection, no BEGIN), and the embedded
+//     driver rolled back or never began, so nothing is durable --
+//     resolveAbandonedWrite settles the eager bump without an Apply.
+//   - err != nil and reachedCommit: the error came from the embedded
+//     driver's own final COMMIT, whose outcome is AMBIGUOUS -- the truncate
+//     may well be durable. Resolving that as abandoned (as both methods once
+//     did for every error) advanced the applied watermark past a write the
+//     replica never saw: the engine then claimed convergence while still
+//     serving the pre-truncate graph, and a shutdown snapshot was stamped as
+//     matching PostgreSQL. Record the fallback and Apply instead: the
+//     rebuild reloads whatever PostgreSQL actually holds, whichever way the
+//     commit went.
+func settleOverrideWrite(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope, err error, reachedCommit bool, fallbackReason string) {
+	if err != nil && !reachedCommit {
+		resolveAbandonedWrite(ctx, eng, scope)
+		return
 	}
-	scope.Changes().RecordFallback("WipeGraph: full graph truncation escapes changelog tracking")
-	d.engine.Apply(ctx, scope)
-	return nil
+	scope.Changes().RecordFallback(fallbackReason)
+	if err != nil {
+		scope.Changes().RecordFallback(fmt.Sprintf("commit outcome ambiguous: %v", err))
+	}
+	eng.Apply(ctx, scope)
 }
 
 // SetDefaultGraph retargets the embedded PostgreSQL driver's default graph
@@ -555,13 +649,20 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 // WriteScope/ChangeSet) reasons about -- the same "outside what tracking
 // can reason about" call observingTransaction.WithGraph and
 // observingBatch.WithGraph (write_observer.go) already make for a
-// mid-transaction graph retarget. ensureBumped/resolveAbandonedWrite bracket the
-// call exactly as Run's doc describes.
+// mid-transaction graph retarget. ensureBumped runs first, as Run's doc
+// describes.
+//
+// Unlike Run and WipeGraph, EVERY error here proves the call had no effect,
+// so resolveAbandonedWrite settles all of them: the call's only effect is
+// the in-process default-graph assignment (SchemaManager.setDefaultGraph),
+// which the pinned dawgs v0.8.0 makes only after the graph lookup succeeded
+// and immediately before its delegate returns nil -- it writes nothing to
+// PostgreSQL at all.
 func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.Driver.SetDefaultGraph(ctx, graphSchema); err != nil {
+	if err := d.backend().SetDefaultGraph(ctx, graphSchema); err != nil {
 		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
@@ -579,14 +680,14 @@ func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) e
 // cascade to every edge incident to a deleted node, which the applier's own
 // tombstoneNodeWithCascade derives directly from the View rather than
 // needing this call to report anything about edges at all. See Run's doc
-// for why an override is needed at all, and for why ensureBumped/
-// resolveAbandonedWrite bracket the call the same way.
+// for why an override is needed at all and why ensureBumped runs first, and
+// settleDeleteFailure for how an error is settled.
 func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.Driver.DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
-		resolveAbandonedWrite(ctx, d.engine, scope)
+	if err := d.backend().DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
+		settleDeleteFailure(ctx, d.engine, scope, "DeleteNodesByKinds", err)
 		return err
 	}
 	scope.Changes().RecordDeleteNodesByKinds(includeAny, excludeAny)
@@ -601,17 +702,59 @@ func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds,
 // criteria: unlike DeleteNodesByKinds, deleting relationships has no
 // cascade -- removing an edge never removes a node or any other edge -- so
 // kinds fully describes what this call could possibly have touched. See
-// Run's doc for why an override is needed at all, and for why ensureBumped/
-// resolveAbandonedWrite bracket the call the same way.
+// DeleteNodesByKinds' doc for the rest.
 func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kinds) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.Driver.DeleteRelationshipsByKinds(ctx, kinds); err != nil {
-		resolveAbandonedWrite(ctx, d.engine, scope)
+	if err := d.backend().DeleteRelationshipsByKinds(ctx, kinds); err != nil {
+		settleDeleteFailure(ctx, d.engine, scope, "DeleteRelationshipsByKinds", err)
 		return err
 	}
 	scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
 	d.engine.Apply(ctx, scope)
 	return nil
+}
+
+// settleDeleteFailure settles the engine's accounting for a Delete*ByKinds
+// call that returned err.
+//
+// The pinned dawgs v0.8.0 runs both deletes as one autocommitted statement
+// on a pooled connection (drivers/pg/driver.go's execDelete: conn.Exec, no
+// transaction), so an error from the statement itself -- a cancelled
+// context, a dropped connection -- can arrive AFTER PostgreSQL applied the
+// delete. Only errors that provably arose before the statement was sent
+// resolve as abandoned (deleteNeverExecuted); every other one records a
+// fallback and Applies, so the rebuild reloads what PostgreSQL actually
+// holds. The recognized kind-scoped delete is deliberately NOT recorded on
+// that path: it replays as an instruction, not a read-back key, and
+// replaying a delete that did not happen would tombstone rows PostgreSQL
+// still has.
+func settleDeleteFailure(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope, op string, err error) {
+	if deleteNeverExecuted(err) {
+		resolveAbandonedWrite(ctx, eng, scope)
+		return
+	}
+	scope.Changes().RecordFallback(fmt.Sprintf("%s: outcome ambiguous: %v", op, err))
+	eng.Apply(ctx, scope)
+}
+
+// deleteNeverExecuted reports whether err, returned by the embedded driver's
+// DeleteNodesByKinds or DeleteRelationshipsByKinds, provably arose before
+// the delete statement reached PostgreSQL. It recognizes only what the
+// pinned dawgs v0.8.0 (drivers/pg/driver.go) produces before execDelete's
+// conn.Exec: a connection that was never established (*pgconn.ConnectError,
+// e.g. from the kind-cache refresh or the pool), execDelete's own
+// "acquire connection for ..." wrap, and DeleteNodesByKinds' refusal to
+// exclude undefined kinds. Anything else -- including a message a future
+// dawgs rewords -- is treated as possibly executed: that costs one rebuild,
+// where guessing the other way would leave the replica silently stale.
+func deleteNeverExecuted(err error) bool {
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return true
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, "acquire connection for ") ||
+		strings.HasPrefix(msg, "cannot exclude undefined kinds from node delete")
 }

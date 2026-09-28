@@ -4,6 +4,7 @@ package bloodtrail
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine"
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/recognize"
 )
 
 // -----------------------------------------------------------------------
@@ -1357,5 +1359,322 @@ func TestDriverMutatingCapabilityMethodsDoNotCallApplyOnError(t *testing.T) {
 				t.Fatalf("%s: Apply was called %d time(s) after a failed call, want unchanged (%d)", tc.name, after-before, before)
 			}
 		})
+	}
+}
+
+// fakePGBackend stands in for the embedded *pg.Driver (Driver.pgOverride),
+// producing on demand the outcomes a live PostgreSQL cannot: a
+// WriteTransaction whose delegate succeeded but whose final COMMIT failed,
+// or a Delete*ByKinds that failed after reaching its statement.
+type fakePGBackend struct {
+	tx graph.Transaction
+
+	// beginErr fails Read/WriteTransaction before the delegate runs;
+	// commitErr fails WriteTransaction after a successful delegate.
+	beginErr  error
+	commitErr error
+
+	setDefaultGraphErr error
+	deleteErr          error
+}
+
+func (f *fakePGBackend) ReadTransaction(_ context.Context, txDelegate graph.TransactionDelegate, _ ...graph.TransactionOption) error {
+	if f.beginErr != nil {
+		return f.beginErr
+	}
+	return txDelegate(f.tx)
+}
+
+func (f *fakePGBackend) WriteTransaction(_ context.Context, txDelegate graph.TransactionDelegate, _ ...graph.TransactionOption) error {
+	if f.beginErr != nil {
+		return f.beginErr
+	}
+	if err := txDelegate(f.tx); err != nil {
+		return err
+	}
+	return f.commitErr
+}
+
+func (f *fakePGBackend) SetDefaultGraph(context.Context, graph.Graph) error {
+	return f.setDefaultGraphErr
+}
+
+func (f *fakePGBackend) DeleteNodesByKinds(context.Context, graph.Kinds, graph.Kinds) error {
+	return f.deleteErr
+}
+
+func (f *fakePGBackend) DeleteRelationshipsByKinds(context.Context, graph.Kinds) error {
+	return f.deleteErr
+}
+
+// TestDriverCapabilityWritesSettleByWhereTheErrorArose pins
+// settleOverrideWrite and settleDeleteFailure: an error that proves nothing
+// was executed resolves without an Apply, but an error that may have
+// followed a durable write (a failed final COMMIT, a delete statement that
+// errored after reaching PostgreSQL) must Apply -- with a fallback, so the
+// replica is rebuilt from what PostgreSQL actually holds. Resolving those as
+// abandoned advanced the applied watermark past a write the replica never
+// saw.
+func TestDriverCapabilityWritesSettleByWhereTheErrorArose(t *testing.T) {
+	okTx := func() graph.Transaction { return &fakeTransaction{rawResult: graph.NewErrorResult(nil)} }
+	failingStatementTx := func() graph.Transaction {
+		return &fakeTransaction{rawResult: graph.NewErrorResult(errors.New("syntax error"))}
+	}
+	commitFailed := errors.New("commit: connection reset by peer")
+
+	cases := []struct {
+		name      string
+		backend   *fakePGBackend
+		call      func(ctx context.Context, d *Driver) error
+		wantApply bool
+	}{
+		{"Run: statement failed, rolled back", &fakePGBackend{tx: failingStatementTx()},
+			func(ctx context.Context, d *Driver) error { return d.Run(ctx, "MATCH (n) DELETE n", nil) }, false},
+		{"Run: never began", &fakePGBackend{beginErr: errors.New("acquire: refused")},
+			func(ctx context.Context, d *Driver) error { return d.Run(ctx, "MATCH (n) DELETE n", nil) }, false},
+		{"Run: commit outcome ambiguous", &fakePGBackend{tx: okTx(), commitErr: commitFailed},
+			func(ctx context.Context, d *Driver) error { return d.Run(ctx, "MATCH (n) DELETE n", nil) }, true},
+		{"WipeGraph: truncate failed, rolled back", &fakePGBackend{tx: failingStatementTx()},
+			func(ctx context.Context, d *Driver) error { return d.WipeGraph(ctx, nil) }, false},
+		{"WipeGraph: retain failed, rolled back", &fakePGBackend{tx: okTx()},
+			func(ctx context.Context, d *Driver) error {
+				return d.WipeGraph(ctx, func(graph.Transaction) error { return errors.New("retain failed") })
+			}, false},
+		{"WipeGraph: commit outcome ambiguous", &fakePGBackend{tx: okTx(), commitErr: commitFailed},
+			func(ctx context.Context, d *Driver) error { return d.WipeGraph(ctx, nil) }, true},
+		{"SetDefaultGraph: any error is effect-free", &fakePGBackend{setDefaultGraphErr: errors.New("no rows")},
+			func(ctx context.Context, d *Driver) error { return d.SetDefaultGraph(ctx, graph.Graph{Name: "g"}) }, false},
+		{"DeleteNodesByKinds: acquire failed", &fakePGBackend{deleteErr: errors.New("acquire connection for node delete: context canceled")},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteNodesByKinds(ctx, graph.Kinds{graph.StringKind("A")}, nil)
+			}, false},
+		{"DeleteNodesByKinds: undefined exclude kind", &fakePGBackend{deleteErr: errors.New("cannot exclude undefined kinds from node delete: [B]")},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteNodesByKinds(ctx, nil, graph.Kinds{graph.StringKind("B")})
+			}, false},
+		{"DeleteNodesByKinds: statement errored", &fakePGBackend{deleteErr: errors.New("delete from node: context canceled")},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteNodesByKinds(ctx, graph.Kinds{graph.StringKind("A")}, nil)
+			}, true},
+		{"DeleteRelationshipsByKinds: acquire failed", &fakePGBackend{deleteErr: errors.New("acquire connection for relationship delete: context canceled")},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteRelationshipsByKinds(ctx, graph.Kinds{graph.StringKind("A")})
+			}, false},
+		{"DeleteRelationshipsByKinds: statement errored", &fakePGBackend{deleteErr: errors.New("delete from edge where kind_id = any($1::int2[]): conn closed")},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteRelationshipsByKinds(ctx, graph.Kinds{graph.StringKind("A")})
+			}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := disabledEngine()
+			d := &Driver{engine: eng, pgOverride: tc.backend}
+			before := eng.ApplyCount()
+
+			if err := tc.call(context.Background(), d); err == nil {
+				t.Fatalf("expected the backend's error to be returned, got nil")
+			}
+
+			applied := eng.ApplyCount() != before
+			if applied != tc.wantApply {
+				t.Fatalf("Apply called = %v, want %v", applied, tc.wantApply)
+			}
+		})
+	}
+}
+
+// TestDriverRunAndWipeGraphApplyOnSuccess pins that reproducing pg.Driver's
+// Run/WipeGraph bodies (settleOverrideWrite's doc) kept the success path:
+// a committed write is applied, and the retain delegate still runs inside
+// the same transaction as the truncate.
+func TestDriverRunAndWipeGraphApplyOnSuccess(t *testing.T) {
+	inner := &fakeTransaction{rawResult: graph.NewErrorResult(nil)}
+	eng := disabledEngine()
+	d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: inner}}
+
+	if err := d.Run(context.Background(), "MATCH (n) DELETE n", nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var retainedOn graph.Transaction
+	if err := d.WipeGraph(context.Background(), func(tx graph.Transaction) error { retainedOn = tx; return nil }); err != nil {
+		t.Fatalf("WipeGraph: %v", err)
+	}
+
+	if got := eng.ApplyCount(); got != 2 {
+		t.Fatalf("ApplyCount = %d, want 2 (one per committed write)", got)
+	}
+	if len(inner.rawCalls) != 2 || inner.rawCalls[0].query != "MATCH (n) DELETE n" || inner.rawCalls[1].query != "truncate table node, edge;" {
+		t.Fatalf("raw statements = %+v, want the Run query then the truncate", inner.rawCalls)
+	}
+	if retainedOn != graph.Transaction(inner) {
+		t.Fatalf("retain ran on %v, want the truncating transaction", retainedOn)
+	}
+}
+
+// ctxKey tags the context a test hands to a driver or wrapper, so what
+// reaches the engine can be told apart from context.Background().
+type ctxKey struct{}
+
+// ctxRecordingEngine is a servingEngine that declines everything but records
+// the context each Try* call it overrides was given.
+type ctxRecordingEngine struct {
+	servingEngine
+	seen []context.Context
+}
+
+func (e *ctxRecordingEngine) TryCypher(ctx context.Context, _ graph.Transaction, _ string, _ map[string]any) (graph.Result, bool) {
+	e.seen = append(e.seen, ctx)
+	return nil, false
+}
+
+func (e *ctxRecordingEngine) TryNodeCount(ctx context.Context, _ recognize.NodeSpec) (int64, bool) {
+	e.seen = append(e.seen, ctx)
+	return 0, false
+}
+
+// TestWrappedTransactionServesUnderTheCallersContext pins
+// wrappedTransaction.ctx: an engine-served read runs under the context the
+// caller opened the ReadTransaction with, never context.Background() --
+// hydration hits PostgreSQL, and must honor the caller's deadline.
+func TestWrappedTransactionServesUnderTheCallersContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ctxKey{}, "caller")
+	eng := &ctxRecordingEngine{}
+	tx := &wrappedTransaction{
+		Transaction: &mockTransaction{nodeQuery: &mockNodeQuery{}},
+		engine:      eng,
+		ctx:         ctx,
+	}
+
+	_ = tx.Query("MATCH (n) RETURN n", nil)
+	if _, err := tx.Nodes().Filter(query.Kind(query.Node(), graph.StringKind("User"))).Count(); err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+
+	if len(eng.seen) != 2 {
+		t.Fatalf("engine consulted %d times, want 2 (Query, then Count)", len(eng.seen))
+	}
+	for i, got := range eng.seen {
+		if got.Value(ctxKey{}) != "caller" {
+			t.Fatalf("serving call %d ran under a context other than the caller's", i)
+		}
+	}
+}
+
+// TestDriverReadTransactionHandsTheWrapperItsContext pins the other half:
+// Driver.ReadTransaction is what puts the caller's context on the wrapper.
+func TestDriverReadTransactionHandsTheWrapperItsContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ctxKey{}, "caller")
+	d := &Driver{engine: disabledEngine(), pgOverride: &fakePGBackend{tx: &mockTransaction{}}}
+
+	err := d.ReadTransaction(ctx, func(tx graph.Transaction) error {
+		wrapped, ok := tx.(*wrappedTransaction)
+		if !ok {
+			t.Fatalf("delegate got %T, want *wrappedTransaction", tx)
+		}
+		if wrapped.readContext().Value(ctxKey{}) != "caller" {
+			t.Fatalf("wrapper does not carry the ReadTransaction's context")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+}
+
+// TestDriverReadTransactionAppliesWritesMadeThroughIt pins readWrites: a
+// write through a ReadTransaction autocommits in the pinned pg driver, so it
+// must reach the engine (Apply, with a fallback) once the call returns --
+// even when the delegate then fails, since the write is already durable --
+// and a write must stop any later read on the same call from being served
+// from the not-yet-updated replica.
+func TestDriverReadTransactionAppliesWritesMadeThroughIt(t *testing.T) {
+	writes := []struct {
+		name  string
+		write func(tx graph.Transaction) error
+	}{
+		{"CreateNode", func(tx graph.Transaction) error {
+			_, err := tx.CreateNode(graph.NewProperties(), graph.StringKind("User"))
+			return err
+		}},
+		{"UpdateNode", func(tx graph.Transaction) error { return tx.UpdateNode(&graph.Node{ID: 1}) }},
+		{"CreateRelationshipByIDs", func(tx graph.Transaction) error {
+			_, err := tx.CreateRelationshipByIDs(1, 2, graph.StringKind("MemberOf"), graph.NewProperties())
+			return err
+		}},
+		{"UpdateRelationship", func(tx graph.Transaction) error { return tx.UpdateRelationship(&graph.Relationship{ID: 1}) }},
+		{"Raw", func(tx graph.Transaction) error { return tx.Raw("delete from node", nil).Error() }},
+		{"mutating Cypher", func(tx graph.Transaction) error { return tx.Query("MATCH (n) DETACH DELETE n", nil).Error() }},
+		{"NodeQuery.Delete", func(tx graph.Transaction) error { return tx.Nodes().Delete() }},
+		{"NodeQuery.Update", func(tx graph.Transaction) error { return tx.Nodes().Update(graph.NewProperties()) }},
+		{"RelationshipQuery.Delete", func(tx graph.Transaction) error { return tx.Relationships().Delete() }},
+		{"RelationshipQuery.Update", func(tx graph.Transaction) error { return tx.Relationships().Update(graph.NewProperties()) }},
+		{"write through a WithGraph child", func(tx graph.Transaction) error {
+			_, err := tx.WithGraph(graph.Graph{Name: "other"}).CreateNode(graph.NewProperties())
+			return err
+		}},
+	}
+
+	for _, w := range writes {
+		for _, delegateFails := range []bool{false, true} {
+			name := w.name
+			if delegateFails {
+				name += ", delegate then fails"
+			}
+			t.Run(name, func(t *testing.T) {
+				inner := &fakeTransaction{
+					rawResult:           graph.NewErrorResult(nil),
+					queryResult:         graph.NewErrorResult(nil),
+					nodesReturn:         &fakeNodeQuery{},
+					relationshipsReturn: &mockRelationshipQuery{},
+				}
+				inner.withGraphReturn = inner
+				eng := disabledEngine()
+				d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: inner}}
+
+				_ = d.ReadTransaction(context.Background(), func(tx graph.Transaction) error {
+					if err := w.write(tx); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+					if tx.(*wrappedTransaction).serveable() {
+						t.Fatalf("the engine may still serve reads on a transaction that has written")
+					}
+					if delegateFails {
+						return errors.New("delegate failed after writing")
+					}
+					return nil
+				})
+
+				if got := eng.ApplyCount(); got != 1 {
+					t.Fatalf("ApplyCount = %d, want 1: a write through ReadTransaction never reached the engine", got)
+				}
+			})
+		}
+	}
+}
+
+// TestDriverReadTransactionWithoutWritesDoesNotApply pins the other side of
+// readWrites: a pure read never Applies anything -- including Cypher that
+// cypherMutates' filtered parse would reject (a $parameter, a procedure
+// CALL) and text no parse accepts, none of which can write (readQueryMutates'
+// doc). Reporting those as writes turned every parameterized read into a
+// replica rebuild.
+func TestDriverReadTransactionWithoutWritesDoesNotApply(t *testing.T) {
+	inner := &mockTransaction{queryResult: graph.NewErrorResult(nil), nodeQuery: &mockNodeQuery{}}
+	eng := disabledEngine()
+	d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: inner}}
+
+	if err := d.ReadTransaction(context.Background(), func(tx graph.Transaction) error {
+		_ = tx.Query("MATCH (n) RETURN n", nil)
+		_ = tx.Query("MATCH (n) WHERE n.name = $name RETURN n", map[string]any{"name": "a"})
+		_ = tx.Query("CALL db.labels()", nil)
+		_ = tx.Query("MATCH (n RETURN", nil)
+		_, err := tx.Nodes().Count()
+		return err
+	}); err != nil {
+		t.Fatalf("ReadTransaction: %v", err)
+	}
+	if got := eng.ApplyCount(); got != 0 {
+		t.Fatalf("ApplyCount = %d, want 0 for a transaction that only read", got)
 	}
 }

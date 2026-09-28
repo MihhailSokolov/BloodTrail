@@ -407,6 +407,85 @@ func TestProjectionValueKindsEndToEndCount(t *testing.T) {
 	}
 }
 
+// TestProjectionValueKindsReturnCount: a RETURN-position COUNT is desugared
+// into Query.ReturnGroup (interpret's desugarReturnAggregates), not a
+// Part's WithClause, and must come out int64 exactly like the WITH form --
+// pg types count() as int8. Both executor routes are covered: the kind
+// bitmap shortcut (runKindCount) and the general grouping path.
+func TestProjectionValueKindsReturnCount(t *testing.T) {
+	const (
+		kindUser    snapshot.KindID = 1
+		kindAdmin   snapshot.KindID = 2
+		kindAdminTo snapshot.KindID = 3
+	)
+	snap := buildCypherTestSnapshot(t,
+		map[snapshot.KindID]string{kindUser: "User", kindAdmin: "Admin", kindAdminTo: "AdminTo"},
+		[]cypherTestNode{
+			{id: 1, kinds: []snapshot.KindID{kindUser}, props: map[string]any{"name": "Alice"}},
+			{id: 2, kinds: []snapshot.KindID{kindAdmin}},
+			{id: 3, kinds: []snapshot.KindID{kindAdmin}},
+		},
+		[]cypherTestEdge{
+			{id: 1001, start: 1, end: 2, kind: kindAdminTo},
+			{id: 1002, start: 1, end: 3, kind: kindAdminTo},
+		},
+	)
+
+	for _, tc := range []struct {
+		query string
+		col   int
+		want  int64
+	}{
+		{`MATCH (a:Admin) RETURN count(a)`, 0, 2},
+		{`MATCH (a:Admin) RETURN count(*)`, 0, 2},
+		{`MATCH (u:User)-[:AdminTo]->(c:Admin) RETURN u.name, count(c) AS n`, 1, 2},
+		{`MATCH (u:User)-[:AdminTo]->(c:Admin) RETURN u, count(DISTINCT c)`, 1, 2},
+	} {
+		q := planAndExec(t, snap, tc.query)
+		kinds := projectionValueKinds(q.query)
+		if len(q.rs.Rows) != 1 {
+			t.Fatalf("%s: rows = %d, want 1", tc.query, len(q.rs.Rows))
+		}
+		got := materializeScalar(q.rs.Rows[0][tc.col].Scalar, kinds[tc.col])
+		if got != tc.want {
+			t.Errorf("%s: count materialized as %#v (%T), want int64(%d)", tc.query, got, got, tc.want)
+		}
+		for i := range kinds {
+			if i != tc.col && kinds[i] == valueInt64 {
+				t.Errorf("%s: non-count column %d flagged valueInt64", tc.query, i)
+			}
+		}
+	}
+}
+
+// TestProjectionValueKindsCoalesceInt8: dawgs casts a coalesce() with an
+// integer default to int8 (`coalesce((properties ->> 'x')::int8, 0)::int8`),
+// so the column is an int64 in pg, not the float64 this package computes
+// with -- and a string property holding a number's text is cast, not kept.
+func TestProjectionValueKindsCoalesceInt8(t *testing.T) {
+	snap := buildCypherTestSnapshot(t,
+		map[snapshot.KindID]string{1: "User"},
+		[]cypherTestNode{
+			{id: 1, kinds: []snapshot.KindID{1}, props: map[string]any{"name": "a", "x": "5"}},
+		}, nil,
+	)
+	for _, tc := range []struct {
+		query string
+		want  any
+	}{
+		{`MATCH (u:User) RETURN coalesce(u.x, 0) AS c`, int64(5)},
+		{`MATCH (u:User) RETURN coalesce(u.missing, 0) AS c`, int64(0)},
+		{`MATCH (u:User) RETURN coalesce(u.x, '') AS c`, "5"},
+	} {
+		q := planAndExec(t, snap, tc.query)
+		kinds := projectionValueKinds(q.query)
+		got := materializeScalar(q.rs.Rows[0][0].Scalar, kinds[0])
+		if got != tc.want {
+			t.Errorf("%s: materialized %#v (%T), want %#v (%T)", tc.query, got, got, tc.want, tc.want)
+		}
+	}
+}
+
 // TestProjectionValueKindsPropertyStaysDefault confirms a plain property
 // projection is never mistaken for a bare amendment call: its interpreter
 // value passes through materializeScalar unconverted (float64 stays

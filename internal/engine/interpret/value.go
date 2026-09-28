@@ -416,7 +416,7 @@ func matchString(op StringOp, s, needle string) bool {
 	case OpContains:
 		return strings.Contains(s, needle)
 	case OpRegex:
-		re, err := regexp.Compile(needle)
+		re, err := regexp.Compile(goRegexFor(needle))
 		if err != nil {
 			return false
 		}

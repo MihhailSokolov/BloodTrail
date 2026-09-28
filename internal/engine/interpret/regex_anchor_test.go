@@ -133,7 +133,7 @@ func TestRegexAnchorRefusesAPerNodeProperty(t *testing.T) {
 
 	// And the answer is still right on that route.
 	loose := Budgets{MaxRows: 100000, MaxWork: 100000000, MaxLiveRows: 100000}
-	rs := mustExec(t, snap, `MATCH (c:Computer) WHERE c.name =~ '.*HOST0001[0-9]\\.CORP.*' RETURN c`, loose)
+	rs := mustExec(t, snap, `MATCH (c:Computer) WHERE c.name =~ '.*HOST0001[0-9][.]CORP.*' RETURN c`, loose)
 	if len(rs.Rows) != 10 {
 		t.Fatalf("got %d rows, want 10", len(rs.Rows))
 	}

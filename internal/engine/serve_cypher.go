@@ -451,31 +451,31 @@ const (
 // valueInt64, "size" -> valueInt32) already flags three of the controller's
 // four amendment calls directly at plan time -- see interpret/plan.go's
 // bareCallKind/projectionTypingOK. COUNT is the one exception, and it needs
-// a second pass here rather than a BareCallKind of its own: COUNT is never
-// itself a RETURN item's own top-level expression under this planner's
-// accepted grammar (a bare `RETURN count(x)` is rejected outright --
-// checkExpr's generic FunctionInvocation switch, interpret/plan.go, has no
-// case for "count" at all; classifyAggregate is the *only* place that name
-// is recognized, and it is reachable only from planWith). A WITH COUNT(sym)
-// AS alias instead flows into RETURN as an ordinary bare-variable reference
-// to that alias (planWith's outputKnown[alias] = symScalar), indistinguishable
-// at the RETURN item's own level from any other scalar carry-over -- exactly
-// the gap this resolver's second pass closes: it separately collects every
-// COUNT alias declared by any Part's WithClause (q.Parts[i].With.Aggregates,
-// Count != nil -- at most one Part can carry a non-nil With under this
-// planner's "at most one WITH boundary" restriction, but every Part is
-// scanned regardless, for robustness against that restriction ever
-// loosening) and flags a RETURN item as valueInt64 whenever its own
-// expression is a bare reference to one of those aliases, however deeply
-// parenthesized, and regardless of whether the RETURN item itself renames
-// the output column via AS.
+// a second pass here rather than a BareCallKind of its own: a COUNT never
+// reaches RETURN as its own expression. `WITH COUNT(sym) AS alias` flows
+// into RETURN as a bare reference to alias, and a RETURN-position
+// `RETURN count(x)` is desugared (interpret's desugarReturnAggregates) into
+// Query.ReturnGroup plus a RETURN of a bare reference to a synthetic alias.
+// Either way the RETURN item is indistinguishable from any other scalar
+// carry-over, so this resolver collects every COUNT alias declared by any
+// Part's WithClause AND by q.ReturnGroup, and flags a RETURN item as
+// valueInt64 whenever its own expression is a bare reference to one of
+// them, however deeply parenthesized, and regardless of whether the RETURN
+// item renames the column via AS. The executor stores every count as
+// float64 (interpret's applyAggregate and runKindCount alike); pg types
+// count() as int8, which is the int64 materializeScalar converts it to.
 func projectionValueKinds(q *interpret.Query) []valueKind {
 	countAliases := map[string]bool{}
-	for _, part := range q.Parts {
-		if part.With == nil {
+	groups := make([]*interpret.WithClause, 0, len(q.Parts)+1)
+	for i := range q.Parts {
+		groups = append(groups, q.Parts[i].With)
+	}
+	groups = append(groups, q.ReturnGroup)
+	for _, wc := range groups {
+		if wc == nil {
 			continue
 		}
-		for _, agg := range part.With.Aggregates {
+		for _, agg := range wc.Aggregates {
 			if agg.Count != nil {
 				countAliases[agg.Alias] = true
 			}
@@ -493,6 +493,13 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 			continue
 		}
 		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil && countAliases[v.Symbol] {
+			kinds[i] = valueInt64
+			continue
+		}
+		// `coalesce(n.x, 0)` is `coalesce(...::int8, 0)::int8` in pg: an
+		// int8 column, not the text one projectsTextColumn assumes for
+		// every coalesce.
+		if interpret.CoalesceIsInt8(item.Expr) {
 			kinds[i] = valueInt64
 			continue
 		}

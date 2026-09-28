@@ -4,7 +4,9 @@ package dockerx
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"strings"
 )
 
 // Compose addresses one compose project by file and project directory.
@@ -68,13 +70,32 @@ func (s Compose) Exec(ctx context.Context, service string, stdin io.Reader, args
 // ExecEnv is Exec with extra "NAME=value" environment entries set for the
 // command inside the container, which keeps secrets off the command line of
 // the process that reads them.
+//
+// The values stay off the host's command lines too: docker is passed only
+// `-e NAME`, which it resolves from its own environment, and the value goes
+// into that environment (EnvRunner) -- `-e NAME=value` would put it in the
+// docker client's argv, readable by any local user through ps, and into
+// every error message that echoes the command. A Runner that cannot set the
+// environment is refused rather than falling back to argv.
 func (s Compose) ExecEnv(ctx context.Context, service string, env []string, stdin io.Reader, args ...string) ([]byte, error) {
 	sub := []string{"exec", "-T"}
 	for _, e := range env {
-		sub = append(sub, "-e", e)
+		name, _, ok := strings.Cut(e, "=")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("environment entry for %s is not NAME=value", service)
+		}
+		sub = append(sub, "-e", name)
 	}
 	sub = append(sub, service)
-	return s.run(ctx, stdin, append(sub, args...)...)
+	sub = append(sub, args...)
+	if len(env) == 0 {
+		return s.run(ctx, stdin, sub...)
+	}
+	envRunner, ok := s.Runner.(EnvRunner)
+	if !ok {
+		return nil, fmt.Errorf("runner %T cannot pass environment variables without putting them on the command line", s.Runner)
+	}
+	return envRunner.RunEnv(ctx, env, stdin, "docker", s.Args(sub...)...)
 }
 
 // ExecTo is Exec for a command whose output is too large to hold in memory:
