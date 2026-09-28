@@ -1189,4 +1189,102 @@ func TestWriteThroughDifferential(t *testing.T) {
 		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
 		assertNoNewFallback(t, buf, fallbacks, t.Name())
 	})
+
+	// -----------------------------------------------------------------
+	// Class 15: a sourceless delete -- DeleteNodesByKinds with no include
+	// kinds -- whose exclusions name a kind registered in PostgreSQL that
+	// no row carries, so this replica has never seen it. BloodHound's
+	// "delete sourceless data" excludes every registered source kind, and
+	// an OpenGraph upload that fails after registering its
+	// metadata.source_kind leaves exactly such a kind behind.
+	//
+	// This class must stay LAST: with no include kinds, the delete removes
+	// every node carrying none of the excluded kinds, every earlier class's
+	// fixture included -- on both sides, which the whole-graph comparison
+	// below relies on.
+	// -----------------------------------------------------------------
+	t.Run("SourcelessDeleteExcludingRowlessKind", func(t *testing.T) {
+		sourceKind := graph.StringKind("WT15Source")
+		sourcelessKind := graph.StringKind("WT15Sourceless")
+		edgeKindKept := graph.StringKind("WT15EdgeKept")
+		edgeKindCascaded := graph.StringKind("WT15EdgeCascaded")
+
+		// Timestamp-suffixed for class 11's reason: a fixed name would
+		// already sit in the never-truncated `kind` table from an earlier
+		// run, the boot load would know it, and this class would prove
+		// nothing.
+		rowlessKind := graph.StringKind(fmt.Sprintf("WT15Rowless%d", time.Now().UnixNano()))
+
+		// Captured BEFORE the fixture setup write below -- see class 2's
+		// identical comment on why the baseline has to be this early.
+		rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
+		fallbacks := markerCount(buf, fallbackEnteredMarker)
+
+		if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+			kept1, err := tx.CreateNode(graph.NewProperties().Set("name", "kept1"), sourceKind)
+			if err != nil {
+				return err
+			}
+			kept2, err := tx.CreateNode(graph.NewProperties().Set("name", "kept2"), sourceKind)
+			if err != nil {
+				return err
+			}
+			dropped, err := tx.CreateNode(graph.NewProperties().Set("name", "dropped"), sourcelessKind)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.CreateRelationshipByIDs(kept1.ID, kept2.ID, edgeKindKept, graph.NewProperties()); err != nil {
+				return err
+			}
+			_, err = tx.CreateRelationshipByIDs(kept1.ID, dropped.ID, edgeKindCascaded, graph.NewProperties())
+			return err
+		}); err != nil {
+			t.Fatalf("fixture setup WriteTransaction: %v", err)
+		}
+
+		// Register the row-less kind the way BloodHound's RegisterSourceKind
+		// does: straight into the shared `kind` table, then RefreshKinds.
+		if _, err := pool.Exec(ctx, "insert into kind (name) values ($1)", rowlessKind.String()); err != nil {
+			t.Fatalf("register kind %s: %v", rowlessKind, err)
+		}
+		if err := bt.RefreshKinds(ctx); err != nil {
+			t.Fatalf("RefreshKinds: %v", err)
+		}
+
+		if err := d.DeleteNodesByKinds(ctx, nil, graph.Kinds{sourceKind, rowlessKind}); err != nil {
+			t.Fatalf("DeleteNodesByKinds: %v", err)
+		}
+
+		// Literal anchors alongside every oracle comparison, for class 9's
+		// reason: a delete that silently no-op'd on both sides must not pass.
+		assertOracleLiteral := func(label string, got, want int64) {
+			t.Helper()
+			if got != want {
+				t.Fatalf("test fixture assumption violated: %s: oracle's own value = %d, want %d", label, got, want)
+			}
+		}
+
+		assertOracleLiteral("sourceKind", nodeCountByKind(t, ctx, oracle, sourceKind), 2)
+		requireMarkerDelta(t, buf, builderServedMarker, 1, "nodes carrying an excluded kind survive",
+			func() int64 { return nodeCountByKind(t, ctx, bt, sourceKind) }, int64(2))
+		assertOracleLiteral("sourcelessKind", nodeCountByKind(t, ctx, oracle, sourcelessKind), 0)
+		requireMarkerDelta(t, buf, builderServedMarker, 1, "a node carrying no excluded kind is gone",
+			func() int64 { return nodeCountByKind(t, ctx, bt, sourcelessKind) }, int64(0))
+		assertOracleLiteral("edgeKindKept", relCountByKind(t, ctx, oracle, edgeKindKept), 1)
+		requireMarkerDelta(t, buf, builderServedMarker, 1, "an edge between two surviving nodes survives",
+			func() int64 { return relCountByKind(t, ctx, bt, edgeKindKept) }, int64(1))
+		assertOracleLiteral("edgeKindCascaded", relCountByKind(t, ctx, oracle, edgeKindCascaded), 0)
+		requireMarkerDelta(t, buf, builderServedMarker, 1, "an edge into the deleted node went with it",
+			func() int64 { return relCountByKind(t, ctx, bt, edgeKindCascaded) }, int64(0))
+
+		requireServedNodeSignaturesEqual(t, ctx, buf, bt, oracle, `MATCH (n) RETURN n`, "whole graph after the sourceless delete")
+
+		// The replica now knows the row-less kind, as a rebuild's full
+		// `kind` table scan would, so a query naming it is served rather
+		// than declined.
+		requireServedNodeSignaturesEqual(t, ctx, buf, bt, oracle, fmt.Sprintf(`MATCH (n:%s) RETURN n`, rowlessKind), "a query naming the row-less kind")
+
+		assertRebuildCountUnchanged(t, d, rebuilds, t.Name())
+		assertNoNewFallback(t, buf, fallbacks, t.Name())
+	})
 }

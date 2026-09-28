@@ -271,7 +271,9 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 // by last-call-wins (its own doc):
 //
 //  1. Newly resolved kinds (AddKind), so the segment can name the kind ids
-//     the node/edge states below carry.
+//     the node/edge states below carry -- and so the delete criteria in
+//     step 2 resolve their kind names against the same table the new View
+//     will publish (kindLookup).
 //  2. Every tombstone: node ids and objectids read-back reported absent
 //     (each cascading to the edges incident to that node in view -- deleting
 //     a node deletes its edges, and the base CSR slots for those edges would
@@ -286,15 +288,17 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 //
 // The error return covers the two ways a segment cannot be built faithfully:
 // a node's property bag failing to parse or exhausting the segment's PropID
-// space (AddNodeState), and a delete criteria naming an exclude kind this
-// View's kind table cannot resolve (applyNodeKindCriteria) -- both of which
-// Apply turns into a fallback rather than publishing a partial delta.
+// space (AddNodeState), and a delete criteria naming an exclude kind that
+// neither this View's kind table nor read-back could resolve
+// (applyNodeKindCriteria) -- both of which Apply turns into a fallback
+// rather than publishing a partial delta.
 func buildApplySegment(view *snapshot.View, rb *readbackResult, cs *ChangeSet) (*snapshot.Segment, error) {
 	var b snapshot.SegmentBuilder
 
 	for id, name := range rb.resolvedKinds {
 		b.AddKind(id, name)
 	}
+	lookup := newKindLookup(view, rb.resolvedKinds)
 
 	for _, id := range rb.absentNodeIDs {
 		tombstoneNodeWithCascade(&b, view, id)
@@ -319,12 +323,12 @@ func buildApplySegment(view *snapshot.View, rb *readbackResult, cs *ChangeSet) (
 	}
 
 	for _, criteria := range cs.NodeKindCriteria() {
-		if err := applyNodeKindCriteria(&b, view, criteria); err != nil {
+		if err := applyNodeKindCriteria(&b, view, lookup, criteria); err != nil {
 			return nil, err
 		}
 	}
 	for _, kinds := range cs.EdgeKindCriteria() {
-		applyEdgeKindCriteria(&b, view, kinds)
+		applyEdgeKindCriteria(&b, view, lookup, kinds)
 	}
 
 	for _, ns := range rb.nodes {
@@ -337,6 +341,37 @@ func buildApplySegment(view *snapshot.View, rb *readbackResult, cs *ChangeSet) (
 	}
 
 	return b.Build(), nil
+}
+
+// kindLookup resolves a delete criteria's kind names against the kind table
+// the View buildApplySegment is building will publish: the current View's
+// own table, then every kind this write's read-back resolved -- the same
+// pairs the segment registers through AddKind. The two never disagree about
+// a name both hold, since a kind's id never changes once PostgreSQL has
+// assigned it.
+type kindLookup struct {
+	table *snapshot.KindTable
+	added map[string]snapshot.KindID
+}
+
+// newKindLookup builds view's kindLookup, inverting resolved (read-back's
+// resolvedKinds, id->name) into the name->id direction criteria need.
+func newKindLookup(view *snapshot.View, resolved map[snapshot.KindID]string) kindLookup {
+	added := make(map[string]snapshot.KindID, len(resolved))
+	for id, name := range resolved {
+		added[name] = id
+	}
+	return kindLookup{table: view.Kinds(), added: added}
+}
+
+// id returns kind's id, and whether either source resolves it.
+func (l kindLookup) id(kind graph.Kind) (snapshot.KindID, bool) {
+	name := kindName(kind)
+	if id, ok := l.table.ID(name); ok {
+		return id, true
+	}
+	id, ok := l.added[name]
+	return id, ok
 }
 
 // tombstoneNodeWithCascade stages node pgID as removed, along with every
@@ -414,36 +449,39 @@ func tombstoneAbsentTriple(b *snapshot.SegmentBuilder, view *snapshot.View, trip
 // The matching rule mirrors dawgs' pg driver exactly (drivers/pg/driver.go's
 // DeleteNodesByKinds and buildNodeDeleteStatement, v0.8.0): a node is
 // deleted when its kinds overlap Include -- or, when Include is empty, for
-// every node -- and do not overlap Exclude. An Include kind this View's kind
-// table does not know matches nothing, exactly as an include kind
-// PostgreSQL has never asserted maps to no kind id and matches no row.
+// every node -- and do not overlap Exclude. Kind names resolve through
+// lookup (this View's own table, then whatever read-back resolved for this
+// write -- resolveCriteriaKinds) and match by id against each node's own
+// kind ids, so a kind PostgreSQL registered after this View's last full
+// load still resolves when no node carries it, and then excludes (or
+// includes) nothing, exactly as it does in PostgreSQL. An Include kind that
+// resolves nowhere matches nothing, exactly as an include kind PostgreSQL
+// has never asserted maps to no kind id and matches no row.
 //
-// An Exclude kind the View cannot resolve is the one case that cannot be
+// An Exclude kind that resolves nowhere is the one case that cannot be
 // replayed soundly: PostgreSQL refuses that delete outright (it fails
 // closed rather than silently widening the delete), so reaching this point
-// with one means the View's kind table and PostgreSQL's disagree, and
-// guessing either way could tombstone nodes that still exist. It returns an
-// error instead, which Apply turns into a fallback.
+// with one means the applier and PostgreSQL disagree about what the delete
+// even was, and guessing either way could tombstone nodes that still exist.
+// It returns an error instead, which Apply turns into a fallback.
 //
 // Enumeration walks the kind bitmaps when Include names any kind -- the
 // common case, and far cheaper than a full node scan -- and only falls back
 // to scanning every node when Include is empty, i.e. when the delete
 // genuinely targets the whole graph.
-func applyNodeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, criteria NodeKindDeleteCriteria) error {
-	table := view.Kinds()
-
+func applyNodeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, lookup kindLookup, criteria NodeKindDeleteCriteria) error {
 	include := make([]snapshot.KindID, 0, len(criteria.Include))
 	for _, kind := range criteria.Include {
-		if id, ok := table.ID(kindName(kind)); ok {
+		if id, ok := lookup.id(kind); ok {
 			include = append(include, id)
 		}
 	}
 
 	exclude := make([]snapshot.KindID, 0, len(criteria.Exclude))
 	for _, kind := range criteria.Exclude {
-		id, ok := table.ID(kindName(kind))
+		id, ok := lookup.id(kind)
 		if !ok {
-			return fmt.Errorf("engine: Apply: node delete criteria excludes kind %q, which the current view cannot resolve", kindName(kind))
+			return fmt.Errorf("engine: Apply: node delete criteria excludes kind %q, which neither the current view nor read-back could resolve", kindName(kind))
 		}
 		exclude = append(exclude, id)
 	}
@@ -482,11 +520,12 @@ func applyNodeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, crit
 // removes exactly those edges and nothing else (no cascade: deleting an
 // edge never removes a node).
 //
-// A kind this View's kind table does not know is skipped, matching dawgs'
-// own tolerant mapping (drivers/pg/driver.go: kinds that are not defined in
-// the database map to no ids and delete nothing); an empty kinds set
-// therefore stages nothing at all, exactly as the pg driver's own empty-set
-// early return deletes nothing.
+// Kind names resolve through lookup exactly as applyNodeKindCriteria's do. A
+// kind that resolves nowhere is skipped, matching dawgs' own tolerant
+// mapping (drivers/pg/driver.go: kinds that are not defined in the database
+// map to no ids and delete nothing); an empty kinds set therefore stages
+// nothing at all, exactly as the pg driver's own empty-set early return
+// deletes nothing.
 //
 // Enumeration is a full scan: every alive node's out-edges, which visits
 // every edge in the View exactly once (each edge has exactly one source).
@@ -494,12 +533,10 @@ func applyNodeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, crit
 // kind-keyed edge index on a View, and a kind-scoped relationship delete is
 // a rare, bulk operation (BloodHound's analysis reset, and the driver-level
 // DeleteRelationshipsByKinds entry point), not a hot path.
-func applyEdgeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, kinds graph.Kinds) {
-	table := view.Kinds()
-
+func applyEdgeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, lookup kindLookup, kinds graph.Kinds) {
 	wanted := make(map[snapshot.KindID]struct{}, len(kinds))
 	for _, kind := range kinds {
-		if id, ok := table.ID(kindName(kind)); ok {
+		if id, ok := lookup.id(kind); ok {
 			wanted[id] = struct{}{}
 		}
 	}
