@@ -5,18 +5,44 @@ on:
 permissions:
   contents: write
 jobs:
+  # A released CLI installs exactly <upstream>-bt<its own version> and never
+  # falls back to the moving <upstream> alias (which the weekly image builds
+  # republish from main), so those exact images have to exist before the CLI
+  # does. Built here, from this tag's own ref, which is what stamps the
+  # version. The upstream list matches ci.yml's patch-guard matrix.
+  images:
+    strategy:
+      fail-fast: false
+      matrix:
+        upstream: [v9.6.0, v9.7.0]
+    uses: ./.github/workflows/image.yml
+    with:
+      upstream_tag: ${{ matrix.upstream }}
+    permissions:
+      contents: read
+      packages: write
   goreleaser:
+    needs: images
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      # The installer a release ships is useless if the patched images cannot
-      # be pulled anonymously (first-release checklist, build/README.md):
-      # refuse to publish a CLI before the GHCR package is public.
-      - name: Verify the GHCR images are anonymously pullable
+      # The installer a release ships is useless if the images it asks for
+      # cannot be pulled anonymously (first-release checklist,
+      # build/README.md): refuse to publish a CLI until every
+      # version-stamped image it will request is publicly pullable -- the
+      # exact tags, not the moving alias, which says nothing about this
+      # release.
+      - name: Verify this release's images are anonymously pullable
+        env:
+          UPSTREAM_TAGS: v9.6.0 v9.7.0
         run: |
           docker logout ghcr.io 2>/dev/null || true
-          docker manifest inspect ghcr.io/mihhailsokolov/bloodtrail:v9.6.0 > /dev/null
+          version="${GITHUB_REF_NAME#v}"
+          for upstream in $UPSTREAM_TAGS; do
+            image="ghcr.io/mihhailsokolov/bloodtrail:${upstream}-bt${version}"
+            docker manifest inspect "$image" > /dev/null || { echo "::error::$image is not anonymously pullable"; exit 1; }
+          done
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - uses: goreleaser/goreleaser-action@v6

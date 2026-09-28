@@ -23,7 +23,10 @@ api_ready() {
 }
 
 echo "==> Building image $IMAGE"
-"$ROOT/build/build-image.sh" "$TAG" e2e --platform "${PLATFORM:-linux/amd64}"
+# No --platform unless PLATFORM asks for one: build-image.sh then targets the
+# Docker daemon's own platform, so the stack below runs the image natively
+# rather than under emulation on a host of another architecture.
+"$ROOT/build/build-image.sh" "$TAG" e2e ${PLATFORM:+--platform "$PLATFORM"}
 
 echo "==> Starting the upstream stack"
 cp "$ROOT/.build/upstream-$TAG/examples/docker-compose/docker-compose.yml" "$WORK/"
@@ -536,7 +539,7 @@ restart_node_count="$(jq '.data.nodes | length' "$WORK/restart-shortest-path.jso
 [ "$restart_node_count" -gt 0 ] || { echo "GET /api/v2/graphs/shortest-path after the restart returned no nodes" >&2; cat "$WORK/restart-shortest-path.json" >&2; exit 1; }
 
 echo "==> Rolling back"
-(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
+(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml" --yes)
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"
 api_ready
 
@@ -552,7 +555,7 @@ fi
 grep -q "refusing to migrate on top of them" "$WORK/second-install.log"
 # The refused install took a backup and wrote its manifest before finding the
 # stale graph; rollback clears both without touching the deployment.
-(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
+(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml" --yes)
 
 echo "==> Reinstalling with --replace-postgres-graph"
 (cd "$ROOT" && go run ./cmd/bloodtrail install --compose-file "$WORK/docker-compose.yml" --image "$IMAGE" --migration-timeout 30m --replace-postgres-graph --yes)
@@ -560,7 +563,7 @@ docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --fo
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" exec -T app-db psql -U bloodhound -d bloodhound -tAc 'select driver from database_switch' | grep -qx bloodtrail
 
 echo "==> Rolling back again"
-(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml")
+(cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml" --yes)
 docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" ps --format json bloodhound | grep -q "specterops/bloodhound:$DOCKERHUB_TAG"
 api_ready
 echo "==> e2e passed"

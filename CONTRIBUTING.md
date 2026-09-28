@@ -15,11 +15,24 @@ the notes below are what keep it that way.
 
 ## Before opening a pull request
 
-CI runs exactly these; green locally means green there:
+Run these locally:
 
-    make test          # unit suite (add -race locally when touching concurrency)
-    make lint          # golangci-lint, the pinned CI version
+    make test          # unit suite
+    make lint          # golangci-lint; refuses any version but the one CI pins
     make integration   # the full -tags integration suite against BLOODTRAIL_TEST_PG
+
+CI (`.github/workflows/`) runs more than that, so green locally is necessary but not
+sufficient:
+
+- `ci.yml` runs the unit and integration suites with `-race` (`go test -race ./...`, and
+  `go test -race -tags integration -count=1 -p 1 ./...`) -- add `-race` locally when
+  touching concurrency; `go vet` and `go test` in `bench/csrbench`, a separate module
+  the `./...` patterns above never reach; and a patch-guard job that checks
+  `patches/bloodhound-driver.patch` still applies (`git apply --check`) to every
+  upstream tag in its matrix.
+- `e2e.yml` builds the patched image and runs `build/e2e.sh v9.6.0`, the full
+  install/verify/rollback cycle against a live compose stack (needs Docker; see
+  [build/README.md](build/README.md#end-to-end-test)).
 
 ## Ground rules the codebase follows
 

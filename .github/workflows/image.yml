@@ -3,6 +3,12 @@ on:
   workflow_dispatch:
     inputs:
       upstream_tag: { description: "BloodHound release tag, e.g. v9.6.0", required: true }
+  # release.yml calls this for each supported upstream tag, from the release
+  # tag's own ref, so the version-stamped images a released CLI asks for exist
+  # before that CLI is published.
+  workflow_call:
+    inputs:
+      upstream_tag: { type: string, required: true }
   schedule:
     - cron: "17 6 * * 1"   # weekly: build any new upstream release not yet published
 permissions:
