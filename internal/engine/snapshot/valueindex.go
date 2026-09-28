@@ -499,6 +499,13 @@ func (v *View) NodesMatchingString(name string, match func(string) bool) ([]Node
 		if idx == nil {
 			return nil, false
 		}
+		// A LIST value is not in idx.scalar at all -- and `->>` renders it as
+		// its JSON text, which the pattern may well match -- so its presence
+		// refuses the question just as a non-string scalar does below. So
+		// does any value the index could not key (an object).
+		if shape, ok := v.base.valueShapeFor(prop); !ok || shape.nonString {
+			return nil, false
+		}
 		for key, ids := range idx.scalar {
 			if len(key) == 0 || key[0] != 's' {
 				// A non-string value for this property. `match` decides a

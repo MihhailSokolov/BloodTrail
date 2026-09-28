@@ -50,7 +50,10 @@ type RegexMatcher struct {
 }
 
 // NewRegexMatcher compiles pattern and derives its substring plan, if any.
+// The pattern is compiled as goRegexFor renders it -- with `.` matching a
+// newline, as PostgreSQL's does -- so every consumer asks the same question.
 func NewRegexMatcher(pattern string) (*RegexMatcher, error) {
+	pattern = goRegexFor(pattern)
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err
@@ -402,4 +405,46 @@ func asciiLower(b byte) byte {
 		return b + ('a' - 'A')
 	}
 	return b
+}
+
+// goRegexFor renders a Cypher regex literal as the Go pattern that matches
+// what PostgreSQL's `~` matches for it. The one rewrite is the dot: pg's
+// advanced regexes are not newline-sensitive by default, so `.` matches
+// '\n' there and not in Go unless the s flag is set. Only patterns
+// PgRegexCompatible admits reach this; for them, that is the whole
+// difference.
+func goRegexFor(pattern string) string {
+	return "(?s)" + pattern
+}
+
+// PgRegexCompatible reports whether pattern means the same thing to Go's
+// regexp as it does to PostgreSQL after dawgs translates `x =~ pattern`.
+// Declining everything else is what keeps a served regex answer pg's:
+//
+//   - No backslash at all. dawgs escapes a property-side regex literal for
+//     LIKE before handing it to `~` (rewriteStringWildCardLiteral doubles
+//     every backslash), so `\.` reaches pg as "a literal backslash, then any
+//     character"; and where it is not doubled, pg's escapes differ from
+//     Go's anyway (`\b` is a backspace in pg, a word boundary in Go).
+//   - No embedded flag group other than one leading `(?i)`. pg accepts
+//     options only at the very start, and gives some letters different
+//     meanings (`m` is newline-sensitivity there, multi-line here); Go also
+//     accepts scoped `(?i:...)` and named groups, which pg rejects. A plain
+//     non-capturing `(?:...)` means the same in both.
+func PgRegexCompatible(pattern string) bool {
+	if strings.ContainsRune(pattern, '\\') {
+		return false
+	}
+	rest := strings.TrimPrefix(pattern, "(?i)")
+	for i := strings.Index(rest, "(?"); i >= 0; {
+		if i+2 >= len(rest) || rest[i+2] != ':' {
+			return false
+		}
+		next := strings.Index(rest[i+2:], "(?")
+		if next < 0 {
+			break
+		}
+		i += 2 + next
+	}
+	return true
 }

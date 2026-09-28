@@ -189,3 +189,109 @@ func TestOptionalMatchRejectedShapes(t *testing.T) {
 		})
 	}
 }
+
+// TestOptionalMatchAggregates pins RETURN-position aggregation over an
+// OPTIONAL MATCH against pg's semantics: COUNT(sym) counts only the rows
+// that BOUND sym (a null-padded row is a NULL, which COUNT skips), COUNT(*)
+// counts every row, and a null-padded group key groups all its nulls
+// together. countAggregate used to read "rows[0] binds sym" as "every row
+// does" and returned 7 here, where pg returns 3.
+func TestOptionalMatchAggregates(t *testing.T) {
+	snap := buildOptionalFixture(t)
+	budget := Budgets{MaxRows: 1000, MaxWork: 100000, MaxLiveRows: 10000}
+
+	scalarOf := func(t *testing.T, query string) any {
+		t.Helper()
+		rs := mustExec(t, snap, query, budget)
+		if len(rs.Rows) != 1 || len(rs.Rows[0]) != 1 {
+			t.Fatalf("%s: got %v, want one single-column row", query, rs.Rows)
+		}
+		return rs.Rows[0][0].Scalar
+	}
+
+	for _, tc := range []struct {
+		query string
+		want  float64
+	}{
+		// u0 fans out to GA and GB, u1 to GA; the four null-padded rows are
+		// NULLs COUNT skips.
+		{`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN count(g)`, 3},
+		// The first row binds g, which is exactly where the shortcut broke.
+		{`MATCH (u:User) WHERE u.name = 'U0' OR u.name = 'U4' OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN count(g)`, 2},
+		{`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN count(*)`, 7},
+		{`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN count(u)`, 7},
+		{`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN count(DISTINCT g)`, 2},
+		// The explicit WITH boundary folds through the same countAggregate.
+		{`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) WITH count(g) AS c RETURN c`, 3},
+	} {
+		if got := scalarOf(t, tc.query); got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+
+	t.Run("a grouped null-padded key groups its nulls together", func(t *testing.T) {
+		rs := mustExec(t, snap,
+			`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN g, count(u)`, budget)
+		got := map[string]float64{}
+		for _, row := range rs.Rows {
+			key := "null"
+			switch row[0].Kind {
+			case OutNode:
+				key = fmt.Sprint(snap.GraphID(row[0].Node))
+			case OutScalar:
+				if row[0].Scalar != nil {
+					t.Fatalf("null g column carried a value: %#v", row[0].Scalar)
+				}
+			default:
+				t.Fatalf("g projected as %v", row[0].Kind)
+			}
+			got[key] = row[1].Scalar.(float64)
+		}
+		want := map[string]float64{"200": 2, "201": 1, "null": 4}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a mandatory group key projects as a node", func(t *testing.T) {
+		rs := mustExec(t, snap,
+			`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN u, count(g)`, budget)
+		if len(rs.Rows) != 6 {
+			t.Fatalf("got %d rows, want 6", len(rs.Rows))
+		}
+		var total float64
+		for _, row := range rs.Rows {
+			if row[0].Kind != OutNode {
+				t.Fatalf("u projected as %v, want OutNode", row[0].Kind)
+			}
+			total += row[1].Scalar.(float64)
+		}
+		if total != 3 {
+			t.Fatalf("per-user counts sum to %v, want 3", total)
+		}
+	})
+
+	t.Run("a property of a mandatory symbol is still served", func(t *testing.T) {
+		rs := mustExec(t, snap,
+			`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN u.name, count(g)`, budget)
+		if len(rs.Rows) != 6 {
+			t.Fatalf("got %d rows, want 6", len(rs.Rows))
+		}
+	})
+}
+
+// TestOptionalMatchAggregateRejectedShapes: a grouping expression that reads
+// an optional symbol would need the null propagation admitOptionalProjection
+// exists to avoid inventing, so it declines at plan time.
+func TestOptionalMatchAggregateRejectedShapes(t *testing.T) {
+	snap := buildOptionalFixture(t)
+	for _, q := range []string{
+		`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN g.name, count(u)`,
+		`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN toLower(u.name), count(g)`,
+		`MATCH (u:User) OPTIONAL MATCH (u)-[:MemberOf]->(g:Group) RETURN coalesce(g.name, u.name), count(u)`,
+	} {
+		if _, ok := planNoFail(t, snap, q); ok {
+			t.Errorf("expected a plan-time decline for %q", q)
+		}
+	}
+}

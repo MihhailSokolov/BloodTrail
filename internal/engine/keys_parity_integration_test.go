@@ -74,6 +74,10 @@ func TestTryCypherKeysMatchOracle(t *testing.T) {
 		`MATCH (n:KeysNode) RETURN n.name, n.objectid`,
 		`MATCH (n:KeysNode) RETURN toLower(n.name) AS lowered, n`,
 		`MATCH (n:KeysNode) RETURN count(n) AS c`,
+		// dawgs writes aliases unquoted, so pg folds them to lower case.
+		`MATCH (n:KeysNode) RETURN count(n) AS adminCount`,
+		`MATCH (n:KeysNode) RETURN n AS Foo`,
+		`MATCH (N:KeysNode) RETURN N`,
 		// RETURN-position aggregation: pg names an unaliased aggregate
 		// after its function and an unaliased property lookup `?column?`,
 		// which is where those rules in desugarReturnAggregates come from.

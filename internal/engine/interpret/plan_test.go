@@ -301,7 +301,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "multi-part with beyond one boundary", cypher: `MATCH (a:User) WITH a MATCH (b:Computer) WITH b MATCH (c:Group) RETURN c`, want: false},
 		{name: "with-level where", cypher: `MATCH (a:User) WITH a WHERE a.enabled = true RETURN a`, want: false},
 		{name: "aliased plain variable in with", cypher: `MATCH (a:User) WITH a AS b RETURN b`, want: false},
-		{name: "with constant literal", cypher: `MATCH (a:User) WITH a, 1 AS one RETURN a, one`, want: true},
+		{name: "with constant literal", cypher: `MATCH (a:User) WITH a, 'x' AS one RETURN a, one`, want: true},
 		{name: "collect used as projected value", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs RETURN xs`, want: false},
 		{name: "collect alias used outside membership", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE xs = b RETURN b`, want: false},
 		{name: "collect alias positive IN", cypher: `MATCH (a:User) WITH COLLECT(a) AS xs MATCH (b:User) WHERE b IN xs RETURN b`, want: true},
@@ -393,8 +393,8 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// cross-type ambiguity) comparison for these.
 		{name: "order by id() alias ok", cypher: `MATCH (n:User) RETURN id(n) AS nid ORDER BY nid`, want: true},
 		{name: "order by size() alias ok", cypher: `MATCH (n:User) RETURN size(n.spns) AS sz ORDER BY sz`, want: true},
-		{name: "order by numeric literal alias ok", cypher: `MATCH (n:User) RETURN 1 AS one ORDER BY one`, want: true},
-		{name: "order by arithmetic over numeric literals alias ok", cypher: `MATCH (n:User) RETURN 1 + 2 AS y ORDER BY y`, want: true},
+		{name: "order by numeric literal alias declines (pg types it int4)", cypher: `MATCH (n:User) RETURN 1 AS one ORDER BY one`, want: false},
+		{name: "order by arithmetic over numeric literals alias declines (pg types it int4)", cypher: `MATCH (n:User) RETURN 1 + 2 AS y ORDER BY y`, want: false},
 
 		// shortestPath range restrictions (finding 3): a conservative
 		// tightening over plain var-length, which keeps its existing,
@@ -452,7 +452,7 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// classifyAddOperand (eval.go) for the shared static classifier.
 		{name: "arithmetic + both operands property lookups rejected", cypher: `MATCH (n:User),(m:Computer) RETURN n.a + m.b AS x`, want: false},
 		{name: "arithmetic + same property lookup added to itself rejected", cypher: `MATCH (n:User) RETURN n.score + n.score AS x`, want: false},
-		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) RETURN n.a + 1 AS x`, want: true},
+		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) WHERE n.a + 1 IS NOT NULL RETURN n`, want: true},
 
 		// Coalesce-typing fix: classifyAddOperand used to bucket
 		// EVERY coalesce() call as addOther (numeric), but pg's own
@@ -471,11 +471,11 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// call a known type (Text), so it classifies addStaticText, same as
 		// a bare string literal -- accepted (see eval_test.go for the
 		// concat-semantics runtime behavior this then takes).
-		{name: "arithmetic + coalesce with a string-literal argument accepted (addStaticText)", cypher: `MATCH (n:User) RETURN coalesce(n.score, 'default') + 1 AS x`, want: true},
+		{name: "arithmetic + coalesce with a string-literal argument accepted (addStaticText)", cypher: `MATCH (n:User) WHERE coalesce(n.score, 'default') + 1 IS NOT NULL RETURN n`, want: true},
 		// coalesce(prop, 5): the numeric-literal argument gives the whole
 		// call a known, non-Text type, so it classifies addOther, same as a
 		// bare numeric literal -- accepted, numeric semantics.
-		{name: "arithmetic + coalesce with a numeric-literal argument accepted (addOther)", cypher: `MATCH (n:User) RETURN coalesce(n.score, 5) + 1 AS x`, want: true},
+		{name: "arithmetic + coalesce with a numeric-literal argument accepted (addOther)", cypher: `MATCH (n:User) WHERE coalesce(n.score, 5) + 1 IS NOT NULL RETURN n`, want: true},
 
 		// pg-parity audit: `type(r)` is statically Text in pg
 		// (EdgeTypeFunction's `CastType: pgsql.Text`, dawgs' function.go),
@@ -486,14 +486,14 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// static/dynamic dispatch changed -- see eval_test.go's
 		// TestEvalStringConcatenation for the behavior this actually
 		// changes).
-		{name: "arithmetic + type() with a property lookup accepted (addStaticText)", cypher: `MATCH ()-[r]->(),(n:User) RETURN type(r) + n.name AS x`, want: true},
+		{name: "arithmetic + type() with a property lookup accepted (addStaticText)", cypher: `MATCH ()-[r]->(),(n:User) WHERE type(r) + n.name IS NOT NULL RETURN n`, want: true},
 		// split()/labels() are array-typed in pg but this package implements
 		// no list-concatenation semantics for `+` -- classifyAddOperand
 		// leaves both addOther (audit table, eval.go); accepted at plan
 		// time exactly as before, always safely bailing at eval time
 		// instead (see eval_test.go).
-		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN split(n.name, ',') + 1 AS x`, want: true},
-		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) RETURN labels(n) + 1 AS x`, want: true},
+		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) WHERE split(n.name, ',') + 1 IS NOT NULL RETURN n`, want: true},
+		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) WHERE labels(n) + 1 IS NOT NULL RETURN n`, want: true},
 
 		// Negative-numeric-literal divergence fix: dawgs'
 		// pgsql translator lowers a direct `n.prop = <literal>`/`<>` via

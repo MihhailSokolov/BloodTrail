@@ -89,13 +89,6 @@ func TestCoalesceAnchorOnlyWhenTheDefaultCannotMatch(t *testing.T) {
 			want:  tagged,
 		},
 		{
-			// A non-string default satisfies no string predicate under pg's
-			// jsonb comparison, so it is safe to anchor.
-			name:  "non-string default anchors",
-			query: `MATCH (t:Group) WHERE COALESCE(t.system_tags, false) CONTAINS 'admin_tier_0' RETURN t`,
-			want:  tagged,
-		},
-		{
 			name:  "prefix default that matches must not anchor",
 			query: `MATCH (t:Group) WHERE COALESCE(t.system_tags, 'admin_tier_0_x') STARTS WITH 'admin' RETURN t`,
 			want:  groups,
@@ -107,5 +100,22 @@ func TestCoalesceAnchorOnlyWhenTheDefaultCannotMatch(t *testing.T) {
 				t.Fatalf("got %d rows, want %d", len(rs.Rows), tc.want)
 			}
 		})
+	}
+}
+
+// TestCoalesceNonStringDefaultUnderStringPredicateIsNotServed: dawgs refuses
+// to translate a string predicate over a coalesce() whose default is not a
+// string ("coalesce has type bool but is being compared against type text"),
+// so PostgreSQL answers this with an error. It was once pinned here as a
+// served query; it must decline instead.
+func TestCoalesceNonStringDefaultUnderStringPredicateIsNotServed(t *testing.T) {
+	snap := buildCoalesceFixture(t, 40, 3)
+	const q = `MATCH (t:Group) WHERE COALESCE(t.system_tags, false) CONTAINS 'admin_tier_0' RETURN t`
+	pq, ok := planNoFail(t, snap, q)
+	if !ok {
+		return
+	}
+	if rs, err := Execute(&Env{Snap: snap}, pq, generousBudget); err == nil {
+		t.Fatalf("served %d rows for a query PostgreSQL rejects", len(rs.Rows))
 	}
 }

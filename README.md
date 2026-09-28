@@ -478,14 +478,8 @@ query BloodHound's UI ships.
   PostgreSQL oracle (the corpus and randomized suites named in "What is served" above),
   not formally proven, and plan-time rejects exist specifically for every comparison/
   ordering shape those suites found the two engines could otherwise disagree on.
-  **Known residual divergences** (both deliberately accepted, neither ever a *wrong*
-  row -- only a dropped one or a value that can differ by a small amount):
-  - A relational comparison (`<`/`<=`/`>`/`>=`) between a property and a statically
-    numeric expression casts the property to a number on both sides; if that property
-    holds a non-numeric value on some row, PostgreSQL aborts the whole query with a
-    runtime error, while the interpreter just drops that one row instead of erroring.
-    Unrealistic for real BloodHound timestamp-shaped data, which is why this shape is
-    still served rather than declined outright.
+  **Known residual divergence** (deliberately accepted; never a *wrong* row, only a
+  value that can differ by a small amount):
   - `datetime()`'s epoch accessors are evaluated once, against BloodTrail's own host
     clock, at the moment it starts executing the query -- a delegated query instead
     evaluates PostgreSQL's `now()` on the database server's own clock, at whatever
@@ -564,7 +558,9 @@ Building from source (`go build ./cmd/bloodtrail`) also works, with one behavior
 difference worth knowing: a source-built binary reports version `dev`, so instead of
 deriving a version-pinned image tag it resolves the image by the upstream tag alone --
 the moving alias the weekly image builds republish -- rather than the exact image a
-released CLI of the same vintage would pick.
+released CLI of the same vintage would pick. A released CLI never substitutes that alias
+for its own image: if `<upstream>-bt<version>` is not published it stops before changing
+anything and names the alias, which `--image` then selects explicitly.
 
 The installer inventories the deployment, backs up the application database and the
 compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
@@ -581,9 +577,11 @@ To undo everything:
 
     bloodtrail rollback
 
+Rollback asks for confirmation the same way install does; `--yes` skips it.
+
 Supported upstream releases are the tags published at
 `ghcr.io/mihhailsokolov/bloodtrail`. Images are built from the upstream
-Dockerfile with a one-file patch (`patches/bloodhound-driver.patch`); see
+Dockerfile with a small patch (`patches/bloodhound-driver.patch`); see
 [Upstream versions](#upstream-versions) for which tags exist and how they are
 validated.
 
@@ -642,9 +640,10 @@ services:
 Measured on the 1M-node/2.4M-edge benchmark graph, that took the container from 3.9GiB
 resident to 1.6-2.2GiB with no latency cost -- the 185-query corpus was fractionally
 FASTER, because a host that is not short of memory serves every request better. Pick a
-value with headroom over `bloodtrail status`'s reported snapshot size (the engine logs
-it as `bytes` on every `snapshot rebuilt`); allow roughly three times that, since the
-derived read indexes and each query's working set live alongside it.
+value with headroom over the snapshot size, which the engine logs as `bytes` on every
+`snapshot rebuilt` line in the `bloodhound` container's logs (`bloodtrail status` does not
+report it); allow roughly three times that, since the derived read indexes and each
+query's working set live alongside it.
 
 `GOMEMLIMIT` is a SOFT limit: Go collects harder as it approaches, and never fails an
 allocation to stay under. `GOGC` is not a substitute -- raising it to trade memory for

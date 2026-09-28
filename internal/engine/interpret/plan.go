@@ -578,7 +578,7 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 			if !ok {
 				return nil, false
 			}
-			if !admitOptionalProjection(parts, &proj, order) {
+			if !admitOptionalProjection(parts, returnGroup, &proj, order) {
 				return nil, false
 			}
 			return &Query{
@@ -1010,14 +1010,37 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 // than a decline. A bare variable needs none of it: bound projects as the
 // node, unbound projects as null, and there is nothing in between.
 //
+// A RETURN with aggregates (group, non-nil) was already rewritten by
+// desugarReturnAggregates, so its items are bare variables by construction
+// and the rule has to be applied to what they stand for. COUNT(sym) and
+// COUNT(*) are fine: countAggregate tests every row for a NULL sym. A bare
+// node/edge group key is a GroupKeys entry and projects exactly like a bare
+// RETURN variable, null included. A computed group key is admitted only
+// when it is a property of a MANDATORY symbol (`u.name`, never null-padded);
+// anything else -- an optional symbol's property, a function call, any
+// expression that could read an optional symbol -- declines, for the same
+// null-propagation reason as above.
+//
 // Everything this refuses is delegated and answered correctly by PostgreSQL.
-func admitOptionalProjection(parts []Part, proj *Projection, order []OrderKey) bool {
+func admitOptionalProjection(parts []Part, group *WithClause, proj *Projection, order []OrderKey) bool {
 	optional := optionalOnlySymbols(parts)
 	if len(optional) == 0 {
 		return true
 	}
 	if len(order) > 0 {
 		return false
+	}
+	if group != nil {
+		for _, c := range group.Computed {
+			pl, isLookup := unwrapParens(c.Expr).(*cypher.PropertyLookup)
+			if !isLookup || pl == nil {
+				return false
+			}
+			v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
+			if !isVar || v == nil || optional[v.Symbol] {
+				return false
+			}
+		}
 	}
 	for i := range proj.Items {
 		v, isVar := unwrapParens(proj.Items[i].Expr).(*cypher.Variable)
@@ -1706,7 +1729,7 @@ func (pb *partBuilder) pushdown(conjunct cypher.Expression) bool {
 	for s := range pb.touched {
 		sym = s
 	}
-	if pb.known[sym] != symNode {
+	if !isNodeSymbol(pb.known, sym) {
 		return true
 	}
 
@@ -1800,6 +1823,9 @@ func (pb *partBuilder) extractRegexAnchor(sym string, conjunct cypher.Expression
 	// Compiled through the same matcher eval.go uses, so the substring
 	// rewrite applies here too and the per-value test is the identical
 	// question the per-row test would have asked.
+	if !PgRegexCompatible(pattern) {
+		return
+	}
 	m, err := NewRegexMatcher(pattern)
 	if err != nil {
 		return
@@ -1873,8 +1899,10 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 	// Cypher for the string operators, and for `=` the literal-on-the-left
 	// form is already covered by whichever side carries the PropertyLookup.
 	name, operand, ok := propOpLiteral(left, right, sym)
+	coalesced := false
 	if !ok {
 		name, operand, ok = coalescePropOpLiteral(left, right, sym, match)
+		coalesced = ok
 	}
 	if !ok {
 		if name, operand, ok = propOpLiteral(right, left, sym); !ok {
@@ -1883,6 +1911,15 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 		if op != cypher.OperatorEquals {
 			return
 		}
+	}
+	// Only a bare `sym.prop = 'x'` is type-strict in pg (dawgs guards it with
+	// jsonb_typeof(...) = 'string'). Every other shape here -- STARTS WITH,
+	// ENDS WITH, CONTAINS, and anything under COALESCE -- compares the `->>`
+	// TEXT of the value, so a number or boolean whose text matches is a
+	// match, and the string index, which holds only string values, would be
+	// a short candidate source. See snapshot.valueShape.
+	if (match != snapshot.StringEquals || coalesced) && !pb.snap.StringValuesOnly(name) {
+		return
 	}
 	// Resolution goes through the NAME, never through a PropID this function
 	// resolved itself: a PropID miss means only that the BASE snapshot never
@@ -1997,6 +2034,12 @@ func (pb *partBuilder) extractStringInAnchor(sym string, nc *NodeConstraint, lef
 			return
 		}
 		operands = append(operands, decoded)
+	}
+	// dawgs translates this to `(properties ->> 'p') = any(array[...]::text[])`
+	// -- TEXT equality, so a number or boolean whose rendering is in the list
+	// matches too, and the string index holds only string values.
+	if !pb.snap.StringValuesOnly(pl.Symbol) {
+		return
 	}
 	// By NAME, for the reason NodesWithStringByName's doc gives: a PropID
 	// miss means the base never interned the property, which decides nothing
@@ -2216,6 +2259,15 @@ func (pb *partBuilder) valueAnchorTerm(sym string, expr cypher.Expression) (valu
 		}
 		val, ok := literalValue(left)
 		if !ok {
+			return valueAnchorTerm{}, false
+		}
+		// dawgs translates this to `<lit> = any(jsonb_to_text_array(p)::<lit
+		// type>[])`: every element is compared as TEXT (or cast to the
+		// literal's numeric type, which fails on a non-numeric element), and a
+		// non-list value is a pg error. The element index is keyed by JSON
+		// type, so it answers this completely only for a string literal
+		// against a property that is a list of strings wherever present.
+		if _, isStr := val.(string); !isStr || !pb.snap.StringListValuesOnly(pl.Symbol) {
 			return valueAnchorTerm{}, false
 		}
 		return valueAnchorTerm{name: pl.Symbol, value: val, element: true}, true
@@ -2900,19 +2952,13 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 // The corpus's own required shape, a bare property lookup relationally
 // compared against a statically-numeric expression on the other side (e.g.
 // `n.lastlogontimestamp < (datetime().epochseconds - 60*86400)`), is kept:
-// pg's cast there is unambiguously numeric (int8/float8, hinted by the
-// other side's own static numeric type), and so is this evaluator's --
-// EXCEPT for one residual, deliberately accepted divergence, documented in
-// the README's known-divergences note: if the property happens to hold a
-// non-numeric value on some row (unrealistic for a real timestamp-shaped AD
-// property, but not impossible in principle), pg's cast ABORTS the whole
-// query with a runtime error, while this evaluator's OrderCompare instead
-// answers ErrNotComparable, which TriNull-drops just that one row. Silently
-// serving fewer rows than an aborting pg query technically "would have
-// returned" (none, since it errors) is the one case this package accepts
-// as safe-by-construction rather than a false serve: a dropped row is never
-// a WRONG row, and real BloodHound data never puts a string in a timestamp
-// property.
+// pg's cast there is unambiguously numeric (int8/float8/numeric, hinted by
+// the other side's own static numeric type), and eval.go's
+// castPropertyForOrder reproduces it: a string holding an integer's text
+// casts and compares, and every value the cast would reject -- which aborts
+// the whole query in pg -- declines. (This was once an accepted divergence
+// that dropped such a row instead; it also dropped the string '7' from
+// `x > 5`, which pg matches.)
 //
 // isStaticallyNumericScalar (shared with planOrder's own ORDER BY use) is
 // exactly the right notion of "statically numeric" here too: it accepts a
@@ -3074,12 +3120,28 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 				return false
 			}
 			lv, ok := unwrapParens(left).(*cypher.Variable)
-			if !ok || lv == nil || pb.known[lv.Symbol] != symNode {
+			if !ok || lv == nil || !isNodeSymbol(pb.known, lv.Symbol) {
 				return false
 			}
 			pb.touched[lv.Symbol] = true
 			pb.touched[rv.Symbol] = true
 			return true
+		}
+	}
+	if inListIsJSONValue(right) {
+		// `<x> IN <stored list>`: dawgs types the comparison by the LEFT
+		// operand (`<x> = any(jsonb_to_text_array(...)::<type of x>[])`), and
+		// fails to translate at all when that type is not a string or number
+		// -- a property, a boolean, null. evalIn reproduces the literal cases
+		// only; see inTextElements.
+		lit, isLit := asLiteral(left)
+		if !isLit || lit == nil || lit.Null {
+			return false
+		}
+		switch lit.Value.(type) {
+		case string, int64, uint64, float64:
+		default:
+			return false
 		}
 	}
 	return pb.checkExpr(left, false) && pb.checkExpr(right, false)
@@ -3110,10 +3172,13 @@ func (pb *partBuilder) checkRegexOperands(left, right cypher.Expression) bool {
 	if err != nil {
 		return false
 	}
+	if !PgRegexCompatible(decoded) {
+		return false
+	}
 	if _, exists := pb.regexes[decoded]; exists {
 		return true
 	}
-	re, err := regexp.Compile(decoded)
+	re, err := regexp.Compile(goRegexFor(decoded))
 	if err != nil {
 		return false
 	}
@@ -3393,7 +3458,7 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 		if !ok {
 			return false
 		}
-		if pb.known[v.Symbol] != symNode {
+		if !isNodeSymbol(pb.known, v.Symbol) {
 			return false
 		}
 		pb.touched[v.Symbol] = true
@@ -3414,7 +3479,8 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 		return len(fi.Arguments) == 1 && pb.checkExpr(fi.Arguments[0], false)
 
 	case cypher.CoalesceFunction:
-		if len(fi.Arguments) == 0 {
+		// Only the shapes evalCoalesce reproduces dawgs' casts for.
+		if _, ok := coalesceCastKind(fi); !ok {
 			return false
 		}
 		return pb.checkExprList(fi.Arguments, false)
@@ -3719,7 +3785,7 @@ func classifyAggregate(known map[string]symKind, fi *cypher.FunctionInvocation) 
 		if !ok || v == nil {
 			return WithAggregate{}, false
 		}
-		if known[v.Symbol] != symNode {
+		if !isNodeSymbol(known, v.Symbol) {
 			return WithAggregate{}, false
 		}
 		return WithAggregate{Collect: &CollectMembershipAgg{Sym: v.Symbol}}, true
@@ -3928,7 +3994,38 @@ func desugarReturnAggregates(known map[string]symKind, ret *cypher.Return) (*cyp
 			}
 			agg.Alias = alias
 			wc.Aggregates = append(wc.Aggregates, agg)
+		} else if v, isVar := bare.(*cypher.Variable); isVar && v != nil && isEntitySymbol(known, v.Symbol) {
+			// A bare node or edge variable is a group key BY IDENTITY and
+			// projects as the entity itself -- exactly the carry-over an
+			// explicit `WITH u, count(g) AS c` does (planWith). Evaluated as
+			// a computed expression instead it becomes the entity's
+			// property map: the column came back as a map where pg returns
+			// a node, and two distinct nodes with identical properties
+			// merged into one group.
+			if _, dup := groupKnown[v.Symbol]; dup {
+				return nil, nil, nil, false
+			}
+			wc.GroupKeys = append(wc.GroupKeys, v.Symbol)
+			groupKnown[v.Symbol] = known[v.Symbol]
+			if key, ok := projectionKeyOf(item.Expression); ok {
+				aliasByKey[key] = v.Symbol
+			}
+			newItems = append(newItems, &cypher.ProjectionItem{
+				Expression: &cypher.Variable{Symbol: v.Symbol},
+				Alias:      &cypher.Variable{Symbol: outName},
+			})
+			continue
 		} else {
+			if _, isProp := bare.(*cypher.PropertyLookup); !isProp {
+				// A computed group key is served only as a bare property
+				// lookup, the shape the corpus groups by. Anything else loses
+				// the typing and naming planReturn gives it once it is
+				// rewritten to a synthetic alias: `id(u)` would come back
+				// float64 where pg returns int8, `toLower(u.name)` would be
+				// named "tolower" where pg names it "lower", a carried
+				// count alias would lose its int8. Decline them.
+				return nil, nil, nil, false
+			}
 			if containsAggregateCall(item.Expression) {
 				// An aggregate nested inside a larger expression
 				// (`count(n) + 1`): grouping it correctly means evaluating
@@ -3982,6 +4079,22 @@ func desugarReturnAggregates(known map[string]symKind, ret *cypher.Return) (*cyp
 		Limit:    ret.Projection.Limit,
 	}}
 	return rewritten, wc, groupKnown, true
+}
+
+// isNodeSymbol reports whether sym is DECLARED as a node variable. A bare
+// `known[sym] == symNode` is also true for an undeclared symbol, because
+// symNode is symKind's zero value.
+func isNodeSymbol(known map[string]symKind, sym string) bool {
+	kind, ok := known[sym]
+	return ok && kind == symNode
+}
+
+// isEntitySymbol reports whether sym is DECLARED as a node or edge variable.
+// The presence check matters: symNode is symKind's zero value, so a bare
+// known[sym] == symNode is also true for a symbol that was never declared.
+func isEntitySymbol(known map[string]symKind, sym string) bool {
+	kind, ok := known[sym]
+	return ok && (kind == symNode || kind == symEdge)
 }
 
 // aggregateOutputName returns the column name PostgreSQL gives one RETURN
@@ -4076,7 +4189,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 			itemKind = pb.known[pv.Symbol]
 		}
 
-		if !projectionTypingOK(item.Expression) {
+		if !projectionTypingOK(item.Expression) || !literalProjectionTypingOK(item.Expression, numericScalars, countAliases) {
 			return Projection{}, nil, 0, -1, false
 		}
 
@@ -4114,6 +4227,11 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 				outputName = pgPlaceholderColumn
 			}
 		}
+		if outputName != pgPlaceholderColumn {
+			if outputName, ok = pgColumnName(outputName); !ok {
+				return Projection{}, nil, 0, -1, false
+			}
+		}
 
 		items = append(items, ProjectionOutput{
 			Alias:        name,
@@ -4133,7 +4251,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 				return false
 			}
 			v, isVar := unwrapParens(pl.Atom).(*cypher.Variable)
-			if !isVar || v == nil || known[v.Symbol] != symNode {
+			if !isVar || v == nil || !isNodeSymbol(known, v.Symbol) {
 				return false
 			}
 			propID, interned := snap.PropIDByName(pl.Symbol)
@@ -4163,6 +4281,26 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 	}
 
 	return Projection{Distinct: proj.Distinct, Items: items}, orderKeys, skip, limit, true
+}
+
+// pgColumnName returns the column name PostgreSQL reports for a projection
+// dawgs aliases as `name`. dawgs writes the alias UNQUOTED (`select s0.n0 as
+// adminCount`), and pg folds an unquoted identifier to lower case, so the
+// caller sees `admincount` -- the engine used to report the Cypher spelling.
+// The folding is ASCII-only, as pg's downcase_identifier is for a multibyte
+// encoding. A backticked alias reaches pg with its backticks, which is a
+// syntax error there, so it is refused.
+func pgColumnName(name string) (string, bool) {
+	if strings.ContainsRune(name, '`') {
+		return "", false
+	}
+	b := []byte(name)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b), true
 }
 
 func skipExpr(s *cypher.Skip) cypher.Expression {
@@ -4289,11 +4427,122 @@ func bareCallKind(expr cypher.Expression) string {
 // query, since pg keeps integer typing there (a nested `id(n) + 1` is still
 // an int8 addition in SQL) that this package's uniform float64 evaluator
 // cannot reproduce.
+//
+// Arithmetic in a RETURN item is served only when pg's result is float8.
+// pg types arithmetic by its operands -- `n.x + 1` is `(properties ->>
+// 'x')::int8 + 1`, an int8 column, and `1 + 2` an int4 one -- where this
+// package computes every number as a float64, so an integer-typed column
+// would come back with the wrong type, and the int8 cast rejects a fractional
+// value pg-side that the float64 sum accepts. With every numeric literal a
+// float and every other operand a property (cast to float8 to match), the
+// result is float8 throughout. No corpus query projects arithmetic at all.
 func projectionTypingOK(expr cypher.Expression) bool {
 	if bareCallKind(expr) != "" {
 		return true
 	}
-	return !containsFlaggedCallNested(expr)
+	if containsFlaggedCallNested(expr) {
+		return false
+	}
+	return !containsArithmetic(expr) || isFloat8Arithmetic(expr)
+}
+
+// literalProjectionTypingOK refuses the RETURN items whose pg column type is
+// a literal's SQL type rather than anything this package's float64 model
+// reproduces: `RETURN 1 AS x` is `select 1 as x`, an int4 column (1.5 is
+// numeric), `RETURN [1, 2]` is an int8[] one, and a carried numeric WITH
+// constant (`WITH 60 AS d ... RETURN d`) is the same int4 -- all served as
+// float64 here. A carried COUNT alias is exempt: the serve layer types it as
+// the int8 it is.
+func literalProjectionTypingOK(expr cypher.Expression, numericScalars, countAliases map[string]bool) bool {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.Literal:
+		if e == nil || e.Null {
+			return true
+		}
+		switch e.Value.(type) {
+		case string, bool:
+			return true
+		}
+		return false
+	case *cypher.ListLiteral:
+		return false
+	case *cypher.Variable:
+		return e == nil || !numericScalars[e.Symbol] || countAliases[e.Symbol]
+	}
+	return true
+}
+
+// containsArithmetic reports whether expr has an arithmetic or unary sign
+// operator anywhere in it.
+func containsArithmetic(expr cypher.Expression) bool {
+	switch e := expr.(type) {
+	case *cypher.ArithmeticExpression, *cypher.UnaryAddOrSubtractExpression:
+		return true
+	case *cypher.Parenthetical:
+		return e != nil && containsArithmetic(e.Expression)
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return false
+		}
+		for _, a := range e.Arguments {
+			if containsArithmetic(a) {
+				return true
+			}
+		}
+		return false
+	case *cypher.PropertyLookup:
+		return e != nil && containsArithmetic(e.Atom)
+	case *cypher.ListLiteral:
+		if e == nil {
+			return false
+		}
+		for _, el := range *e {
+			if containsArithmetic(el) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// isFloat8Arithmetic reports whether expr is arithmetic built only from
+// float literals and property lookups, with at least one float literal --
+// the shape whose pg result type is float8 throughout.
+func isFloat8Arithmetic(expr cypher.Expression) bool {
+	sawFloat := false
+	var walk func(cypher.Expression) bool
+	walk = func(x cypher.Expression) bool {
+		switch e := x.(type) {
+		case *cypher.Parenthetical:
+			return e != nil && walk(e.Expression)
+		case *cypher.UnaryAddOrSubtractExpression:
+			return e != nil && walk(e.Right)
+		case *cypher.ArithmeticExpression:
+			if e == nil || !walk(e.Left) {
+				return false
+			}
+			for _, p := range e.Partials {
+				if p == nil || !walk(p.Right) {
+					return false
+				}
+			}
+			return true
+		case *cypher.Literal:
+			if e == nil || e.Null {
+				return false
+			}
+			_, isFloat := e.Value.(float64)
+			sawFloat = sawFloat || isFloat
+			return isFloat
+		case *cypher.PropertyLookup:
+			return e != nil
+		default:
+			return false
+		}
+	}
+	return walk(expr) && sawFloat
 }
 
 // containsFlaggedCallNested reports whether one of the four flagged calls

@@ -48,8 +48,20 @@ func TestDeclinesShapesPostgresEvaluatesDifferently(t *testing.T) {
 		{"integer modulo", `MATCH (n:User) RETURN n.val % 5 AS x`, false},
 		{"division by a float still served", `MATCH (n:User) RETURN n.val / 2.0 AS x`, true},
 		{"division by a negative float still served", `MATCH (n:User) RETURN n.val / -2.0 AS x`, true},
-		{"float earlier in the chain still served", `MATCH (n:User) RETURN n.val * 1.5 / 2 AS x`, true},
-		{"addition still served", `MATCH (n:User) RETURN n.val + 1 AS x`, true},
+		// An integer literal makes pg's column int8/int4 (`(properties ->>
+		// 'val')::int8 + 1`), where this evaluator's is float64.
+		{"integer literal in a float chain", `MATCH (n:User) RETURN n.val * 1.5 / 2 AS x`, false},
+		{"integer addition", `MATCH (n:User) RETURN n.val + 1 AS x`, false},
+		{"float addition still served", `MATCH (n:User) RETURN n.val + 1.0 AS x`, true},
+
+		// A projected literal's column type is the literal's SQL type: int4
+		// for 1, numeric for 1.5, int8[] for a list -- never float64.
+		{"integer literal projection", `MATCH (n:User) RETURN 1 AS x`, false},
+		{"float literal projection", `MATCH (n:User) RETURN 1.5 AS x`, false},
+		{"list literal projection", `MATCH (n:User) RETURN [1, 2] AS x`, false},
+		{"numeric WITH constant projection", `MATCH (n:User) WITH n, 60 AS d RETURN d`, false},
+		{"string literal projection still served", `MATCH (n:User) RETURN 'a' AS x`, true},
+		{"count alias projection still served", `MATCH (n:User) WITH count(n) AS c RETURN c`, true},
 	})
 }
 

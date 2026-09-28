@@ -3,7 +3,10 @@
 package interpret
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
 // TestReturnAggregates pins RETURN-position aggregation: the shapes, the
@@ -122,5 +125,119 @@ func TestReturnAggregateRefusals(t *testing.T) {
 		if _, ok := planNoFail(t, snap, q); ok {
 			t.Fatalf("expected a decline for %q", q)
 		}
+	}
+}
+
+// TestReturnAggregateNodeGroupKey: a bare node variable next to an aggregate
+// groups by node IDENTITY and projects the node, as pg does. It used to be
+// evaluated as a computed expression, which yields the node's property map:
+// the column came back as a map instead of a node, and two distinct nodes
+// with identical properties merged into one group.
+func TestReturnAggregateNodeGroupKey(t *testing.T) {
+	const (
+		kiUser     snapshot.KindID = 1
+		kiGroup    snapshot.KindID = 2
+		keMemberOf snapshot.KindID = 3
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kiUser: "User", kiGroup: "Group", keMemberOf: "MemberOf"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kiUser}, map[string]any{"name": "twin"}},
+			{2, []snapshot.KindID{kiUser}, map[string]any{"name": "twin"}},
+			{3, []snapshot.KindID{kiGroup}, map[string]any{"name": "G"}},
+		},
+		[]execEdgeSpec{{10, 1, 3, keMemberOf}, {11, 2, 3, keMemberOf}},
+	)
+
+	for _, q := range []string{
+		`MATCH (u:User) RETURN u, count(u)`,
+		`MATCH (u:User)-[:MemberOf]->(g:Group) RETURN u, count(g)`,
+		`MATCH (u:User) RETURN u AS who, count(*)`,
+	} {
+		rs := mustExec(t, snap, q, generousBudget)
+		if len(rs.Rows) != 2 {
+			t.Fatalf("%s: got %d rows, want 2 (one per node, not per property bag)", q, len(rs.Rows))
+		}
+		for _, row := range rs.Rows {
+			if row[0].Kind != OutNode {
+				t.Fatalf("%s: grouping column projected as %v (%#v), want OutNode", q, row[0].Kind, row[0].Scalar)
+			}
+			if row[1].Scalar != float64(1) {
+				t.Fatalf("%s: count = %v, want 1", q, row[1].Scalar)
+			}
+		}
+	}
+
+	rs := mustExec(t, snap, `MATCH (u:User)-[r:MemberOf]->(g:Group) RETURN r, count(u)`, generousBudget)
+	if len(rs.Rows) != 2 || rs.Rows[0][0].Kind != OutEdge {
+		t.Fatalf("edge group key: got %+v, want 2 rows with an OutEdge column", rs.Rows)
+	}
+}
+
+// TestReturnAggregateUndeclaredVariableNotServed: pg rejects a RETURN that
+// names an undeclared variable, so the engine must not answer it -- a
+// plan-time decline or an Execute error both delegate. (desugarReturnAggregates
+// routes node/edge variables to group keys; isEntitySymbol's presence check
+// keeps an undeclared one, whose zero-value kind reads as symNode, off that
+// route.)
+func TestReturnAggregateUndeclaredVariableNotServed(t *testing.T) {
+	snap := buildPropAnchorFixture(t, 10)
+	const q = `MATCH (u:User) RETURN nope, count(u)`
+	pq, ok := planNoFail(t, snap, q)
+	if !ok {
+		return
+	}
+	if rs, err := Execute(&Env{Snap: snap}, pq, generousBudget); err == nil {
+		t.Fatalf("served %q: %+v", q, rs.Rows)
+	}
+}
+
+// TestReturnAggregateComputedKeysArePropertiesOnly: a computed group key is
+// rewritten to a synthetic alias, which loses the typing and naming
+// planReturn would give the expression -- `id(u)` came back float64 where pg
+// returns int8, `toLower(u.name)` was named "tolower" where pg names it
+// "lower", a carried count alias lost its int8. Only a bare property lookup,
+// the corpus's shape, is served.
+func TestReturnAggregateComputedKeysArePropertiesOnly(t *testing.T) {
+	snap := buildPropAnchorFixture(t, 10)
+	for _, q := range []string{
+		`MATCH (u:User) RETURN id(u), count(u)`,
+		`MATCH (u:User) RETURN toLower(u.name), count(u)`,
+		`MATCH (u:User) RETURN size(u.name), count(u)`,
+		`MATCH (u:User) WITH u, count(*) AS n RETURN n, count(u)`,
+	} {
+		if _, ok := planNoFail(t, snap, q); ok {
+			t.Errorf("expected a decline for %q", q)
+		}
+	}
+	if _, ok := planNoFail(t, snap, `MATCH (u:User) RETURN u.enabled, count(u)`); !ok {
+		t.Error("a bare property group key must still be served")
+	}
+}
+
+// TestReturnColumnNamesFoldLikePostgres: dawgs writes every alias unquoted
+// (`select s0.n0 as adminCount`), so PostgreSQL reports it folded to lower
+// case -- `admincount`, which is what BloodHound's own
+// `WITH u, COUNT(c) AS adminCount RETURN u, adminCount` prebuilt gets back.
+// A backticked alias reaches pg with its backticks, a syntax error there.
+func TestReturnColumnNamesFoldLikePostgres(t *testing.T) {
+	snap := buildPropAnchorFixture(t, 10)
+	for _, tc := range []struct {
+		query string
+		want  []string
+	}{
+		{`MATCH (u:User) RETURN u AS Foo`, []string{"foo"}},
+		{`MATCH (U:User) RETURN U`, []string{"u"}},
+		{`MATCH (u:User) RETURN u.name AS Name, u.name`, []string{"name", "?column?"}},
+		{`MATCH (u:User) WITH u, count(u) AS adminCount RETURN u, adminCount`, []string{"u", "admincount"}},
+		{`MATCH (u:User) RETURN count(u) AS adminCount`, []string{"admincount"}},
+	} {
+		rs := mustExec(t, snap, tc.query, generousBudget)
+		if fmt.Sprint(rs.Keys) != fmt.Sprint(tc.want) {
+			t.Errorf("%s: keys %v, want %v", tc.query, rs.Keys, tc.want)
+		}
+	}
+	if _, ok := planNoFail(t, snap, "MATCH (u:User) RETURN u.name AS `u.x`"); ok {
+		t.Error("a backticked alias must decline")
 	}
 }

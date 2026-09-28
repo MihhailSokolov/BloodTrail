@@ -101,6 +101,12 @@ type Snapshot struct {
 	valueIdxMu sync.Mutex
 	valueIdx   map[PropID]*valueIndex
 
+	// valueShape memoizes which JSON types a property's values take
+	// (valueshape.go), built lazily like stringIdx and guarded for the same
+	// reason.
+	valueShapeMu sync.Mutex
+	valueShape   map[PropID]valueShape
+
 	// edgeKindIdx memoizes the per-edge-kind endpoint index
 	// (edgekindindex.go), built lazily in one pass on first use. Guarded for
 	// the same reason stringIdx is: a Snapshot is otherwise immutable and
