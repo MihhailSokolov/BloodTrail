@@ -136,7 +136,8 @@ The installer derives its image tag from the running upstream tag plus its own v
 (`<upstream>-bt<version>`), so the version-suffixed images have to exist before a
 released CLI can install anything. `release.yml` builds them itself, from the release
 tag's own ref (`git describe` on it is what stamps the driver version), for every
-upstream tag in its matrix -- kept equal to `ci.yml`'s patch-guard matrix -- and refuses
+supported upstream tag -- `build/upstream-tags.sh`, the same list `ci.yml`'s patch
+guard checks: every stable upstream release from the v9.6.0 floor on -- and refuses
 to publish the CLI until each of those exact tags is anonymously pullable. In order:
 
 1. Set the GHCR package `bloodtrail` to public in its package settings.
@@ -145,10 +146,11 @@ to publish the CLI until each of those exact tags is anonymously pullable. In or
 3. Push the `vX.Y.Z` tag to trigger `release.yml`: it publishes the
    `<upstream>-btX.Y.Z` images, verifies an anonymous pull of each, and only then builds
    the CLI archives, `checksums.txt` and `install.sh`.
-4. For an upstream tag outside that matrix, dispatch the `image` workflow from the
-   release tag (`gh workflow run image.yml --ref vX.Y.Z -f upstream_tag=v9.8.0`); until
-   then the released CLI refuses to install on that upstream version rather than take
-   the alias.
+4. For an upstream release published AFTER the release tag -- which the release could
+   not have known about -- dispatch the `image` workflow from the release tag
+   (`gh workflow run image.yml --ref vX.Y.Z -f upstream_tag=v9.8.0`), once the patch
+   guard shows the patch applies to it; until then the released CLI refuses to install
+   on that upstream version rather than take the alias.
 5. On a clean host with a BloodHound CE deployment, run the documented one-liner
    (`curl -fsSL …/install.sh | sh -s -- install`) end to end, including
    `bloodtrail rollback`.

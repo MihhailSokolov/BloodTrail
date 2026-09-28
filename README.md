@@ -729,14 +729,18 @@ Developed and continuously validated against `github.com/specterops/bloodhound`
 **v9.6.0** (the driver-integration analysis was pinned at its commit `441f20b`) and
 `github.com/specterops/dawgs` `v0.8.0` (`0ea9646`).
 
-Patched images are published per upstream release tag by a weekly workflow that
-discovers the three most recent non-prerelease upstream tags and builds each one.
+**Supported upstream tags** are every stable BloodHound CE release from **v9.6.0** on
+-- derived from upstream's own release list by `build/upstream-tags.sh`, not written
+down, so a new upstream release is covered without anyone editing a list. That one
+list drives the CI patch-application guard, the images each BloodTrail release
+publishes (`<upstream>-bt<version>`, one per supported tag), and a weekly workflow
+that builds the moving `<upstream>` alias for any supported tag not yet published.
 The validation levels differ, deliberately:
 
 - **v9.6.0** is the tag CI validates most deeply: the full install-and-rollback e2e
   runs against it on every change, alongside the patch-application guard.
-- **Newer tags** (v9.7.0 at the time of writing, verified end to end by hand on
-  2026-09-12) get the patch-application guard in CI and are gated at image-build time
+- **Newer tags** (v9.7.0 was verified end to end by hand on 2026-09-12) get the
+  patch-application guard in CI and are gated at image-build time
   -- the patch must apply cleanly and the patched server must compile, or no image is
   published -- but no automated e2e runs against them per change. A behavioral break
   upstream could in principle ship in a buildable image; the installer's own

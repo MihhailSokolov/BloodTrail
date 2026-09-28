@@ -9,12 +9,24 @@ jobs:
   # falls back to the moving <upstream> alias (which the weekly image builds
   # republish from main), so those exact images have to exist before the CLI
   # does. Built here, from this tag's own ref, which is what stamps the
-  # version. The upstream list matches ci.yml's patch-guard matrix.
+  # version. The upstream list is build/upstream-tags.sh's, the same one
+  # ci.yml's patch guard checks.
+  upstreams:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.list.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tags=$(./build/upstream-tags.sh)" >> "$GITHUB_OUTPUT"
   images:
+    needs: upstreams
     strategy:
       fail-fast: false
       matrix:
-        upstream: [v9.6.0, v9.7.0]
+        upstream: ${{ fromJson(needs.upstreams.outputs.tags) }}
     uses: ./.github/workflows/image.yml
     with:
       upstream_tag: ${{ matrix.upstream }}
@@ -22,7 +34,7 @@ jobs:
       contents: read
       packages: write
   goreleaser:
-    needs: images
+    needs: [upstreams, images]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +47,7 @@ jobs:
       # release.
       - name: Verify this release's images are anonymously pullable
         env:
-          UPSTREAM_TAGS: v9.6.0 v9.7.0
+          UPSTREAM_TAGS: ${{ join(fromJson(needs.upstreams.outputs.tags), ' ') }}
         run: |
           docker logout ghcr.io 2>/dev/null || true
           version="${GITHUB_REF_NAME#v}"

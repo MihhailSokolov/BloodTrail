@@ -29,14 +29,28 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+  upstreams:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.list.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      # Every supported upstream release, derived from upstream's own release
+      # list (build/upstream-tags.sh), so a new BloodHound release is guarded
+      # from the next CI run on rather than whenever someone edits a list.
+      - id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tags=$(./build/upstream-tags.sh)" >> "$GITHUB_OUTPUT"
   patch-guard:
+    needs: upstreams
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # v9.6.0 is the e2e-validated tag; newer published tags get at least
-        # this apply-check per change (see README "Upstream versions").
-        upstream: [v9.6.0, v9.7.0]
+        # v9.6.0 is the e2e-validated tag; every supported published tag gets
+        # at least this apply-check per change (see README "Upstream versions").
+        upstream: ${{ fromJson(needs.upstreams.outputs.tags) }}
     steps:
       - uses: actions/checkout@v4
       - name: Apply the patch to ${{ matrix.upstream }}

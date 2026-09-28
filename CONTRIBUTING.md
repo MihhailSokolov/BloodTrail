@@ -29,7 +29,10 @@ sufficient:
   touching concurrency; `go vet` and `go test` in `bench/csrbench`, a separate module
   the `./...` patterns above never reach; and a patch-guard job that checks
   `patches/bloodhound-driver.patch` still applies (`git apply --check`) to every
-  upstream tag in its matrix.
+  supported upstream tag (`build/upstream-tags.sh`: each stable BloodHound CE release
+  from v9.6.0 on, read from upstream's release list -- so a new upstream release can
+  turn this job red on a change that did not touch the patch; that is the signal to
+  update the patch, not noise).
 - `e2e.yml` builds the patched image and runs `build/e2e.sh v9.6.0`, the full
   install/verify/rollback cycle against a live compose stack (needs Docker; see
   [build/README.md](build/README.md#end-to-end-test)).

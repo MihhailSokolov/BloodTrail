@@ -28,6 +28,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
       - id: pick
         env:
           GH_TOKEN: ${{ github.token }}
@@ -36,11 +37,11 @@ jobs:
           if [ -n "$UPSTREAM_TAG" ]; then
             echo "tags=[\"$UPSTREAM_TAG\"]" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          # Latest stable (non-rc) upstream releases not yet in GHCR for this repo.
-          latest=$(gh release list -R SpecterOps/BloodHound --limit 20 --json tagName,isPrerelease \
-            --jq '[.[] | select(.isPrerelease|not) | .tagName] | .[0:3]')
+          # Supported upstream releases (build/upstream-tags.sh) not yet in
+          # GHCR for this repo.
+          supported=$(./build/upstream-tags.sh)
           missing="[]"
-          for t in $(echo "$latest" | jq -r '.[]'); do
+          for t in $(echo "$supported" | jq -r '.[]'); do
             if ! docker manifest inspect "ghcr.io/mihhailsokolov/bloodtrail:$t" >/dev/null 2>&1; then
               missing=$(echo "$missing" | jq -c --arg t "$t" '. + [$t]')
             fi
