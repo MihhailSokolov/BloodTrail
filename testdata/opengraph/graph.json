@@ -1,0 +1,289 @@
+{
+  "metadata": {
+    "source_kind": "ghx_Base"
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "GHX_ORG_1",
+        "kinds": [
+          "ghx_Organization"
+        ],
+        "properties": {
+          "name": "acme",
+          "plan": "enterprise"
+        }
+      },
+      {
+        "id": "GHX_USER_1",
+        "kinds": [
+          "ghx_User"
+        ],
+        "properties": {
+          "name": "alice",
+          "login": "alice",
+          "mfa_enabled": true,
+          "contributions": 120,
+          "emails": [
+            "alice@acme.test"
+          ]
+        }
+      },
+      {
+        "id": "GHX_USER_2",
+        "kinds": [
+          "ghx_User"
+        ],
+        "properties": {
+          "name": "bob",
+          "login": "bob",
+          "mfa_enabled": false,
+          "contributions": 7
+        }
+      },
+      {
+        "id": "GHX_USER_3",
+        "kinds": [
+          "ghx_User"
+        ],
+        "properties": {
+          "name": "carol",
+          "login": "carol",
+          "mfa_enabled": true,
+          "contributions": 51
+        }
+      },
+      {
+        "id": "GHX_USER_4",
+        "kinds": [
+          "ghx_User",
+          "ghx_OrgOwner"
+        ],
+        "properties": {
+          "name": "dave",
+          "login": "dave",
+          "mfa_enabled": true,
+          "contributions": 3
+        }
+      },
+      {
+        "id": "GHX_TEAM_1",
+        "kinds": [
+          "ghx_Team"
+        ],
+        "properties": {
+          "name": "platform",
+          "privacy": "closed"
+        }
+      },
+      {
+        "id": "GHX_TEAM_2",
+        "kinds": [
+          "ghx_Team"
+        ],
+        "properties": {
+          "name": "security",
+          "privacy": "secret"
+        }
+      },
+      {
+        "id": "GHX_REPO_1",
+        "kinds": [
+          "ghx_Repository"
+        ],
+        "properties": {
+          "name": "infra",
+          "full_name": "acme/infra",
+          "visibility": "private",
+          "archived": false
+        }
+      },
+      {
+        "id": "GHX_REPO_2",
+        "kinds": [
+          "ghx_Repository"
+        ],
+        "properties": {
+          "name": "website",
+          "full_name": "acme/website",
+          "visibility": "public",
+          "archived": false
+        }
+      },
+      {
+        "id": "GHX_ROLE_1",
+        "kinds": [
+          "ghx_RepoRole"
+        ],
+        "properties": {
+          "name": "infra-admin",
+          "permission": "admin"
+        }
+      },
+      {
+        "id": "GHX_ROLE_2",
+        "kinds": [
+          "ghx_RepoRole"
+        ],
+        "properties": {
+          "name": "infra-write",
+          "permission": "write"
+        }
+      },
+      {
+        "id": "GHX_ROLE_3",
+        "kinds": [
+          "ghx_RepoRole"
+        ],
+        "properties": {
+          "name": "website-read",
+          "permission": "read"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "start": {
+          "value": "GHX_USER_1"
+        },
+        "end": {
+          "value": "GHX_TEAM_1"
+        },
+        "kind": "ghx_MemberOf",
+        "properties": {
+          "role": "member"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_USER_2"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_TEAM_2"
+        },
+        "kind": "ghx_MemberOf",
+        "properties": {
+          "role": "maintainer"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_TEAM_2"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_TEAM_1"
+        },
+        "kind": "ghx_MemberOf"
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_TEAM_1"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_ROLE_2"
+        },
+        "kind": "ghx_HasRole",
+        "properties": {
+          "assigned_by": "dave"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_ROLE_1"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_REPO_1"
+        },
+        "kind": "ghx_CanAdmin",
+        "properties": {
+          "permission": "admin"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_ROLE_3"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_REPO_2"
+        },
+        "kind": "ghx_CanRead",
+        "properties": {
+          "permission": "read"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_ORG_1"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_REPO_1"
+        },
+        "kind": "ghx_Owns"
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_ORG_1"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_REPO_2"
+        },
+        "kind": "ghx_Owns"
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_USER_4"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_ORG_1"
+        },
+        "kind": "ghx_OrgAdmin"
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_USER_9",
+          "kind": "ghx_User"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_TEAM_2"
+        },
+        "kind": "ghx_MemberOf",
+        "properties": {
+          "role": "member"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "S-1-5-21-3130019616-2776909439-2417379446-2106",
+          "kind": "User"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_USER_2"
+        },
+        "kind": "ghx_SyncedTo",
+        "properties": {
+          "via": "saml"
+        }
+      }
+    ]
+  }
+}
