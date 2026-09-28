@@ -5,19 +5,59 @@ packaged as a [DAWGS](https://github.com/SpecterOps/DAWGS) driver, so that attac
 analysis and every other graph query stay fast on large Active Directory environments
 and ordinary hardware.
 
-**Status:** feature-complete and validated at 5-million-node scale, heading for its first
-tagged release. Shortest paths, all shortest paths, a defined set of structural
-node/relationship queries BloodHound's query builder issues, and a broad surface of Cypher
-itself -- property predicates and scans, point lookups, `shortestPath`/`allShortestPaths`
-patterns, and a range of aggregations, reached through a real Cypher interpreter rather than
-pattern-matching a handful of recognized shapes -- are all served from an in-memory replica
-kept in sync with PostgreSQL write by write: a recognized write updates the replica
-synchronously, before the call that made it returns, so the very next query -- even the one
-that write's own caller issues immediately after -- already sees it. Only a small, closed
-list of write shapes that cannot be expressed that way fall back to PostgreSQL temporarily
-while the replica rebuilds in the background; see [Write-through](#write-through). Every
-query the engine cannot (or should not) answer from memory delegates to PostgreSQL, so
-results are always correct -- the only difference an operator should ever see is latency.
+Shortest paths, the structural queries BloodHound's own code issues, and a broad surface
+of Cypher -- including every pre-built query the UI ships -- are served from an in-memory
+replica that is kept in sync with PostgreSQL write by write. Anything the engine cannot
+answer exactly as PostgreSQL would is delegated to PostgreSQL, so results are always the
+same; the only difference you should ever see is latency. On a 1M-node forest the whole
+shipped query corpus runs in 7.9s instead of 85.6s ([BENCHMARK.md](BENCHMARK.md)).
+
+## Quick start
+
+On the host that runs your BloodHound CE docker compose deployment (BloodHound
+**v9.6.0 or newer** -- see [Upstream versions](#upstream-versions)):
+
+```sh
+curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
+```
+
+The installer shows what it found and asks before changing anything. It backs up the
+application database and compose files, migrates the graph from Neo4j to PostgreSQL if
+needed, switches the `bloodhound` service to the BloodTrail image, and verifies the
+result. If your deployment still runs Neo4j, **pause ingestion first** (see
+[Operating notes](#operating-notes)). Then give the container a memory limit
+([how](#give-the-container-a-memory-limit)).
+
+To undo everything:
+
+```sh
+bloodtrail rollback
+```
+
+[Installing](#installing-on-an-existing-bloodhound-ce-deployment) has the details:
+pinning a release, unattended installs, the smoke test, and what rollback restores.
+
+## Contents
+
+- **Using BloodTrail**
+  - [Quick start](#quick-start)
+  - [Why](#why)
+  - [Installing on an existing BloodHound CE deployment](#installing-on-an-existing-bloodhound-ce-deployment)
+    -- [operating notes](#operating-notes), [memory limit](#give-the-container-a-memory-limit)
+  - [Configuration](#configuration)
+  - [Log markers](#log-markers)
+  - [Upstream versions](#upstream-versions)
+- **How it works**
+  - [Overview](#how-it-works)
+  - [Write-through](#write-through) -- how the replica stays current, and the few writes that trigger a rebuild
+  - [In-memory path engine](#in-memory-path-engine) -- shortest paths
+  - [Query-builder serving](#query-builder-serving) -- entity panels, analysis, tagging
+  - [Cypher interpreter](#cypher-interpreter) -- what Cypher is served, and what always goes to PostgreSQL
+  - [Scope: what's here, and what's not](#whats-here-and-whats-not)
+- **Contributing**
+  - [Developing and testing](#developing-and-testing)
+  - [Repository layout](#repository-layout)
+  - [Licence](#licence)
 
 ## Why
 
@@ -37,6 +77,220 @@ BloodTrail -- and the worst shipped prebuilt goes from 49 seconds to 63ms. 122 o
 scenarios are faster, the worst case is 1.5x slower on a query both answer in about
 20ms, and the cost is memory. [BENCHMARK.md](BENCHMARK.md) has every scenario, the
 method, and what the numbers do not show.
+
+## Installing on an existing BloodHound CE deployment
+
+BloodTrail ships as a patched BloodHound image plus an installer. On the host that runs
+the compose deployment:
+
+    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
+
+The installer asks for confirmation before it changes anything, reading the answer from
+the terminal; add `--yes` to run it unattended.
+
+The bootstrap script downloads the latest released CLI for your platform, verifies its
+checksum (`sha256sum` where available, `shasum -a 256` on stock macOS), and runs it. To
+pin the exact release you audited instead of `latest`, set `BLOODTRAIL_VERSION`:
+
+    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | BLOODTRAIL_VERSION=v0.1.1 sh -s -- install
+
+Pin v0.1.1 or newer. A v0.1.0 binary resolves its images under the package's original
+name, which is no longer published, so it cannot complete an install.
+
+Building from source (`go build ./cmd/bloodtrail`) also works, with one behavioral
+difference worth knowing: a source-built binary reports version `dev`, so instead of
+deriving a version-pinned image tag it resolves the image by the upstream tag alone --
+the moving alias the weekly image builds republish -- rather than the exact image a
+released CLI of the same vintage would pick. A released CLI never substitutes that alias
+for its own image: if `<upstream>-bt<version>` is not published it stops before changing
+anything and names the alias, which `--image` then selects explicitly.
+
+The installer inventories the deployment, backs up the application database and the
+compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
+if needed (using BloodHound's own migrator), switches the `bloodhound` service to the
+BloodTrail image through a compose override file, and verifies the result.
+
+Passing `--admin-password` (or setting `BLOODTRAIL_ADMIN_PASSWORD`) adds an
+ingest-and-search smoke test to that verification. **It is for test and staging
+deployments only**: it permanently ingests a fictional `TESTLAB.LOCAL` domain into the
+graph and triggers a full analysis, which on a production-sized graph can run longer
+than `--verify-timeout` and leaves the fixture objects behind afterwards.
+
+To undo everything:
+
+    bloodtrail rollback
+
+Rollback asks for confirmation the same way install does; `--yes` skips it.
+
+Supported upstream releases are the tags published at
+`ghcr.io/mihhailsokolov/bloodtrail`. Images are built from the upstream
+Dockerfile with a small patch (`patches/bloodhound-driver.patch`); see
+[Upstream versions](#upstream-versions) for which tags exist and how they are
+validated.
+
+### Operating notes
+
+- **Pause ingestion for the install window** on a deployment migrating from Neo4j.
+  BloodHound keeps ingesting into Neo4j while the migration runs, and its migrator
+  does not carry mid-migration arrivals over; the installer counts Neo4j again after
+  the migration and aborts (with the rollback hint) when PostgreSQL came up short, so
+  active ingestion makes the install fail rather than silently lose data. The
+  installer also aborts if the bloodhound container restarts mid-migration, or if the
+  post-migration Neo4j recount cannot be read at all.
+- The installer adds its override file to `COMPOSE_FILE` in `.env`, so a plain
+  `docker compose up -d` keeps it. Automation that names files explicitly
+  (`docker compose -f docker-compose.yml up -d`) makes docker compose ignore
+  `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail` driver setting
+  and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or drop the
+  explicit `-f` and let `.env` decide.
+- Writing that entry replaces docker compose's own file discovery, so the installer
+  writes out everything discovery would have found: the compose file it was given and,
+  when one sits beside it, the conventional `docker-compose.override.yml`. Deployments
+  that keep their customizations in that override file therefore keep them, both in the
+  installer's own commands and in the operator's afterwards. `bloodtrail rollback`
+  removes the whole entry again when the install was what created it, which puts
+  discovery back the way it was.
+- `bloodtrail rollback` returns the deployment to the graph it had before the install.
+  On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
+  ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
+  to the restored deployment. Re-ingest it, or reinstall with
+  `--replace-postgres-graph` to migrate the current Neo4j graph again.
+- A second install after a rollback is refused while the earlier migration's graph is
+  still in PostgreSQL, because BloodHound's migrator would layer the new graph on top of
+  the old one instead of replacing it. `--replace-postgres-graph` clears it first; the
+  backup taken at the start of that install holds the state it replaced.
+- `bloodtrail status` prints both the image the compose files name and the image the
+  container is actually running, which differ while an install or rollback is half done.
+
+### Give the container a memory limit
+
+BloodTrail holds the graph in memory, so the container's memory ceiling is the one
+setting worth choosing deliberately. Go's collector, left alone, lets the heap grow to
+roughly twice what is live before collecting, and on a 1M-node graph that is the
+difference between a container resident in 1.6GiB and one resident in 3.9GiB for the
+same work.
+
+Setting `GOMEMLIMIT` on the BloodHound service caps it:
+
+```yaml
+services:
+  bloodhound:
+    environment:
+      - bhe_graph_driver=bloodtrail
+      - GOMEMLIMIT=2800MiB
+```
+
+Measured on the 1M-node/2.4M-edge benchmark graph, that took the container from 3.9GiB
+resident to 1.6-2.2GiB with no latency cost -- the 185-query corpus was fractionally
+FASTER, because a host that is not short of memory serves every request better. Pick a
+value with headroom over the snapshot size, which the engine logs as `bytes` on every
+`snapshot rebuilt` line in the `bloodhound` container's logs (`bloodtrail status` does not
+report it); allow roughly three times that, since the derived read indexes and each
+query's working set live alongside it.
+
+`GOMEMLIMIT` is a SOFT limit: Go collects harder as it approaches, and never fails an
+allocation to stay under. `GOGC` is not a substitute -- raising it to trade memory for
+CPU does the opposite of what is wanted here, and on this graph `GOGC=400` had the
+container OOM-killed.
+
+## Configuration
+
+Environment variables on the `bloodhound` service (in the compose file's `environment:`
+list, next to `bhe_graph_driver=bloodtrail`), read once at driver startup:
+
+- `BLOODTRAIL_ENGINE` -- `on` (default) or `off` (also accepts `true`/`false`/`1`/`0`).
+  `off` makes every read delegate straight to PostgreSQL; writes still
+  bump the watermark (see [Write-through](#write-through)) but the engine never applies or
+  serves anything.
+- `BLOODTRAIL_SNAPSHOT_DIR` -- directory for the snapshot file described in
+  [Write-through](#write-through). Unset (the default) disables the feature entirely: no
+  file is ever read or written, and every boot rebuilds from PostgreSQL.
+- `BLOODTRAIL_COMPACT_ENTRIES` / `BLOODTRAIL_COMPACT_BYTES` -- how large the write-through
+  delta may grow, in entries and approximate bytes respectively, before a background
+  compaction folds it back into the base snapshot (see [Write-through](#write-through)).
+  Default to `65536` entries and `512MiB`. `0` on either means "no bound on that
+  dimension" (the same convention `BLOODTRAIL_MEMORY_LIMIT` uses), not "compact on
+  every write"; `0` on both disables compaction outright. These thresholds govern how
+  large the delta is allowed to get, and reading through a delta costs time
+  proportional to its total size on each newly published view -- so a larger threshold
+  trades write and read overhead for less frequent folding. The shipped defaults are
+  considerably larger than any delta measured so far; see [Known performance
+  characteristics](bench/applybench/README.md#known-performance-characteristics).
+- `BLOODTRAIL_MEMORY_LIMIT` -- caps the replica's approximate resident size (e.g. `4GiB`,
+  `512MiB`, or a plain byte count). A rebuild, or an applied write, that would push the
+  replica's base-plus-delta size past this limit is refused instead: the engine enters
+  FALLBACK and retries the resulting rebuild on the existing rate-limited backoff, the same
+  way it already recovers from any other fallback trigger. Unset or `0` means unbounded.
+- `BLOODTRAIL_LOG_LEVEL` -- `debug`, `info`, `warn`, or `error`. When set, it widens the
+  minimum level BloodTrail's own log lines are guaranteed to be visible at, on top of
+  whatever already configures the process's logger -- it can only add visibility, never
+  take it away. Left unset -- or declared with an empty value, the shape a
+  compose variable with nothing assigned to it produces -- it is a complete no-op. `debug` is what surfaces e.g.
+  `bloodtrail: builder engine served` and `bloodtrail: write-through applied`.
+
+## Log markers
+
+BloodTrail's log lines all carry a `bloodtrail:` prefix. Grouped by what they cover:
+
+- **Serving**: `bloodtrail: path engine served` (Info, once per shortest-path query
+  actually answered from memory) / `bloodtrail: path engine declined` (Debug, with a
+  `reason` attr); their query-builder counterpart `bloodtrail: builder engine served` /
+  `bloodtrail: builder engine declined` (both Debug); and the Cypher interpreter's own
+  `bloodtrail: cypher engine served` (Debug) -- a *declined* Cypher query logs the
+  shared `bloodtrail: path engine declined` line above rather than a distinct marker of
+  its own, since only the served side needed one to stay distinguishable from the path
+  engine's identically-shaped success case.
+- **Write-through apply**: `bloodtrail: write-through applied` (Debug, per committed write
+  that updated the replica) and `bloodtrail: segment stack merged` (Debug, when an
+  overgrown delta stack is synchronously collapsed -- an internal bookkeeping event, not a
+  fallback).
+- **Fallback**: `bloodtrail: fallback entered` (Warn, with a `reason` attr -- one of the
+  closed list in [Write-through](#write-through), a read-back/segment-build/memory-limit
+  failure, or a watermark bump that itself failed) and `bloodtrail: fallback exited`
+  (Info, once the recovery rebuild lands and serving resumes).
+- **Rebuild** (boot, or fallback recovery -- the only two triggers left): `bloodtrail:
+  snapshot rebuilt` (Info, on every successful rebuild), `bloodtrail: snapshot rebuild
+  refused: exceeds memory limit` (Warn, rate-limited), `bloodtrail: boot load waiting for
+  the default graph` (Debug, expected on every ordinary startup -- see
+  [Write-through](#write-through)'s own note), `bloodtrail: boot load failed` (Warn) and
+  `bloodtrail: fallback rebuild failed` (Warn).
+- **Watermark**: `bloodtrail: watermark bump failed` (Warn) and `bloodtrail: watermark table
+  DDL failed` (Warn).
+- **Snapshot file**: `bloodtrail: snapshot file loaded` (Info), `bloodtrail: snapshot file
+  rejected` (Info, with a `reason` attr) / `bloodtrail: no snapshot file` (Debug, the
+  ordinary first-boot case), `bloodtrail: snapshot file written` (Info) / `bloodtrail:
+  snapshot file not written` (Debug or Warn, depending on why) / `bloodtrail: snapshot file
+  skipped` (Debug), `bloodtrail: snapshot file write failed` (Warn), and `bloodtrail:
+  removed stale snapshot temp file` (Info, a boot-time reap of a file an earlier process's
+  write left half-finished).
+- **Compaction**: `bloodtrail: compaction triggered` (Debug), `bloodtrail: compaction
+  started` / `bloodtrail: compaction finished` (Info, the latter with `duration`, `nodes`
+  and `edges` attrs), `bloodtrail: compaction discarded` (Info, a stale fold safely thrown
+  away rather than adopted) and `bloodtrail: compaction failed` / `bloodtrail: compaction
+  snapshot save failed` (Warn).
+
+## Upstream versions
+
+Developed and continuously validated against `github.com/specterops/bloodhound`
+**v9.6.0** (the driver-integration analysis was pinned at its commit `441f20b`) and
+`github.com/specterops/dawgs` `v0.8.0` (`0ea9646`).
+
+**Supported upstream tags** are every stable BloodHound CE release from **v9.6.0** on
+-- derived from upstream's own release list by `build/upstream-tags.sh`, not written
+down, so a new upstream release is covered without anyone editing a list. That one
+list drives the CI patch-application guard, the images each BloodTrail release
+publishes (`<upstream>-bt<version>`, one per supported tag), and a weekly workflow
+that builds the moving `<upstream>` alias for any supported tag not yet published.
+The validation levels differ, deliberately:
+
+- **v9.6.0** is the tag CI validates most deeply: the full install-and-rollback e2e
+  runs against it on every change, alongside the patch-application guard.
+- **Newer tags** (v9.7.0 was verified end to end by hand on 2026-09-12) get the
+  patch-application guard in CI and are gated at image-build time
+  -- the patch must apply cleanly and the patched server must compile, or no image is
+  published -- but no automated e2e runs against them per change. A behavioral break
+  upstream could in principle ship in a buildable image; the installer's own
+  post-install verification is the backstop.
 
 ## How it works
 
@@ -232,7 +486,7 @@ caller has already been told committed.
   `replayed_writes` count.
 - **Compaction.** Every applied write layers one more delta on top of the engine's base
   snapshot; past a size threshold (`BLOODTRAIL_COMPACT_ENTRIES`/`BLOODTRAIL_COMPACT_BYTES`,
-  see Configuration below), a background compaction folds the base and every delta into
+  see [Configuration](#configuration)), a background compaction folds the base and every delta into
   a fresh base entirely in memory -- no PostgreSQL round trip, no JSON parsing, the two
   costs that make a full rebuild slow. Ordinary writes keep applying (as further deltas)
   while a compaction runs; when it finishes, it also writes the snapshot file, so a
@@ -269,74 +523,8 @@ are correct regardless of the replica's state.
   traversal -- makes the engine decline outright and PostgreSQL answers instead; the only
   difference an operator or user should ever see is latency.
 
-- **Configuration** (environment variables, read once at driver startup):
-  - `BLOODTRAIL_ENGINE` -- `on` (default) or `off` (also accepts `true`/`false`/`1`/`0`).
-    `off` makes every read delegate straight to PostgreSQL; writes still
-    bump the watermark (see [Write-through](#write-through)) but the engine never applies or
-    serves anything.
-  - `BLOODTRAIL_SNAPSHOT_DIR` -- directory for the snapshot file described in
-    [Write-through](#write-through). Unset (the default) disables the feature entirely: no
-    file is ever read or written, and every boot rebuilds from PostgreSQL.
-  - `BLOODTRAIL_COMPACT_ENTRIES` / `BLOODTRAIL_COMPACT_BYTES` -- how large the write-through
-    delta may grow, in entries and approximate bytes respectively, before a background
-    compaction folds it back into the base snapshot (see [Write-through](#write-through)).
-    Default to `65536` entries and `512MiB`. `0` on either means "no bound on that
-    dimension" (the same convention `BLOODTRAIL_MEMORY_LIMIT` below uses), not "compact on
-    every write"; `0` on both disables compaction outright. These thresholds govern how
-    large the delta is allowed to get, and reading through a delta costs time
-    proportional to its total size on each newly published view -- so a larger threshold
-    trades write and read overhead for less frequent folding. The shipped defaults are
-    considerably larger than any delta measured so far; see [Known performance
-    characteristics](bench/applybench/README.md#known-performance-characteristics).
-  - `BLOODTRAIL_MEMORY_LIMIT` -- caps the replica's approximate resident size (e.g. `4GiB`,
-    `512MiB`, or a plain byte count). A rebuild, or an applied write, that would push the
-    replica's base-plus-delta size past this limit is refused instead: the engine enters
-    FALLBACK and retries the resulting rebuild on the existing rate-limited backoff, the same
-    way it already recovers from any other fallback trigger. Unset or `0` means unbounded.
-  - `BLOODTRAIL_LOG_LEVEL` -- `debug`, `info`, `warn`, or `error`. When set, it widens the
-    minimum level BloodTrail's own log lines are guaranteed to be visible at, on top of
-    whatever already configures the process's logger -- it can only add visibility, never
-    take it away. Left unset -- or declared with an empty value, the shape a
-    compose variable with nothing assigned to it produces -- it is a complete no-op. `debug` is what surfaces e.g.
-    `bloodtrail: builder engine served` and `bloodtrail: write-through applied`.
-
-- **Log markers**, all under a `bloodtrail:` prefix, grouped by what they cover:
-  - **Serving**: `bloodtrail: path engine served` (Info, once per shortest-path query
-    actually answered from memory) / `bloodtrail: path engine declined` (Debug, with a
-    `reason` attr); their query-builder counterpart `bloodtrail: builder engine served` /
-    `bloodtrail: builder engine declined` (both Debug); and the Cypher interpreter's own
-    `bloodtrail: cypher engine served` (Debug) -- a *declined* Cypher query logs the
-    shared `bloodtrail: path engine declined` line above rather than a distinct marker of
-    its own, since only the served side needed one to stay distinguishable from the path
-    engine's identically-shaped success case.
-  - **Write-through apply**: `bloodtrail: write-through applied` (Debug, per committed write
-    that updated the replica) and `bloodtrail: segment stack merged` (Debug, when an
-    overgrown delta stack is synchronously collapsed -- an internal bookkeeping event, not a
-    fallback).
-  - **Fallback**: `bloodtrail: fallback entered` (Warn, with a `reason` attr -- one of the
-    closed list in [Write-through](#write-through), a read-back/segment-build/memory-limit
-    failure, or a watermark bump that itself failed) and `bloodtrail: fallback exited`
-    (Info, once the recovery rebuild lands and serving resumes).
-  - **Rebuild** (boot, or fallback recovery -- the only two triggers left): `bloodtrail:
-    snapshot rebuilt` (Info, on every successful rebuild), `bloodtrail: snapshot rebuild
-    refused: exceeds memory limit` (Warn, rate-limited), `bloodtrail: boot load waiting for
-    the default graph` (Debug, expected on every ordinary startup -- see
-    [Write-through](#write-through)'s own note), `bloodtrail: boot load failed` (Warn) and
-    `bloodtrail: fallback rebuild failed` (Warn).
-  - **Watermark**: `bloodtrail: watermark bump failed` (Warn) and `bloodtrail: watermark table
-    DDL failed` (Warn).
-  - **Snapshot file**: `bloodtrail: snapshot file loaded` (Info), `bloodtrail: snapshot file
-    rejected` (Info, with a `reason` attr) / `bloodtrail: no snapshot file` (Debug, the
-    ordinary first-boot case), `bloodtrail: snapshot file written` (Info) / `bloodtrail:
-    snapshot file not written` (Debug or Warn, depending on why) / `bloodtrail: snapshot file
-    skipped` (Debug), `bloodtrail: snapshot file write failed` (Warn), and `bloodtrail:
-    removed stale snapshot temp file` (Info, a boot-time reap of a file an earlier process's
-    write left half-finished).
-  - **Compaction**: `bloodtrail: compaction triggered` (Debug), `bloodtrail: compaction
-    started` / `bloodtrail: compaction finished` (Info, the latter with `duration`, `nodes`
-    and `edges` attrs), `bloodtrail: compaction discarded` (Info, a stale fold safely thrown
-    away rather than adopted) and `bloodtrail: compaction failed` / `bloodtrail: compaction
-    snapshot save failed` (Warn).
+Configuration and log lines for every serving path are collected in
+[Configuration](#configuration) and [Log markers](#log-markers).
 
 ## Query-builder serving
 
@@ -389,7 +577,7 @@ the path engine already has.
   properties and an objectid index come on top of that in turn -- see
   [Cypher interpreter](#cypher-interpreter)'s own Memory note for the full formula and
   the measured total at 4.76 million nodes / ~48.9 million edges. `BLOODTRAIL_MEMORY_LIMIT`
-  (see Configuration above) caps the whole replica -- base snapshot plus any
+  (see [Configuration](#configuration)) caps the whole replica -- base snapshot plus any
   write-through delta layered on it -- the same way it always has: a rebuild, or an
   applied write, that would exceed it is refused instead.
 
@@ -535,121 +723,6 @@ refused instead (see [Write-through](#write-through)).
 
 See [bench/cypherbench](bench/cypherbench) for the measurement.
 
-## Installing on an existing BloodHound CE deployment
-
-BloodTrail ships as a patched BloodHound image plus an installer. On the host that runs
-the compose deployment:
-
-    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
-
-The installer asks for confirmation before it changes anything, reading the answer from
-the terminal; add `--yes` to run it unattended.
-
-The bootstrap script downloads the latest released CLI for your platform, verifies its
-checksum (`sha256sum` where available, `shasum -a 256` on stock macOS), and runs it. To
-pin the exact release you audited instead of `latest`, set `BLOODTRAIL_VERSION`:
-
-    curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | BLOODTRAIL_VERSION=v0.1.1 sh -s -- install
-
-Pin v0.1.1 or newer. A v0.1.0 binary resolves its images under the package's original
-name, which is no longer published, so it cannot complete an install.
-
-Building from source (`go build ./cmd/bloodtrail`) also works, with one behavioral
-difference worth knowing: a source-built binary reports version `dev`, so instead of
-deriving a version-pinned image tag it resolves the image by the upstream tag alone --
-the moving alias the weekly image builds republish -- rather than the exact image a
-released CLI of the same vintage would pick. A released CLI never substitutes that alias
-for its own image: if `<upstream>-bt<version>` is not published it stops before changing
-anything and names the alias, which `--image` then selects explicitly.
-
-The installer inventories the deployment, backs up the application database and the
-compose files into `.bloodtrail/backups/`, migrates the graph from Neo4j to PostgreSQL
-if needed (using BloodHound's own migrator), switches the `bloodhound` service to the
-BloodTrail image through a compose override file, and verifies the result.
-
-Passing `--admin-password` (or setting `BLOODTRAIL_ADMIN_PASSWORD`) adds an
-ingest-and-search smoke test to that verification. **It is for test and staging
-deployments only**: it permanently ingests a fictional `TESTLAB.LOCAL` domain into the
-graph and triggers a full analysis, which on a production-sized graph can run longer
-than `--verify-timeout` and leaves the fixture objects behind afterwards.
-
-To undo everything:
-
-    bloodtrail rollback
-
-Rollback asks for confirmation the same way install does; `--yes` skips it.
-
-Supported upstream releases are the tags published at
-`ghcr.io/mihhailsokolov/bloodtrail`. Images are built from the upstream
-Dockerfile with a small patch (`patches/bloodhound-driver.patch`); see
-[Upstream versions](#upstream-versions) for which tags exist and how they are
-validated.
-
-### Operating notes
-
-- **Pause ingestion for the install window** on a deployment migrating from Neo4j.
-  BloodHound keeps ingesting into Neo4j while the migration runs, and its migrator
-  does not carry mid-migration arrivals over; the installer counts Neo4j again after
-  the migration and aborts (with the rollback hint) when PostgreSQL came up short, so
-  active ingestion makes the install fail rather than silently lose data. The
-  installer also aborts if the bloodhound container restarts mid-migration, or if the
-  post-migration Neo4j recount cannot be read at all.
-- The installer adds its override file to `COMPOSE_FILE` in `.env`, so a plain
-  `docker compose up -d` keeps it. Automation that names files explicitly
-  (`docker compose -f docker-compose.yml up -d`) makes docker compose ignore
-  `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail` driver setting
-  and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or drop the
-  explicit `-f` and let `.env` decide.
-- Writing that entry replaces docker compose's own file discovery, so the installer
-  writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the conventional `docker-compose.override.yml`. Deployments
-  that keep their customizations in that override file therefore keep them, both in the
-  installer's own commands and in the operator's afterwards. `bloodtrail rollback`
-  removes the whole entry again when the install was what created it, which puts
-  discovery back the way it was.
-- `bloodtrail rollback` returns the deployment to the graph it had before the install.
-  On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
-  ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
-  to the restored deployment. Re-ingest it, or reinstall with
-  `--replace-postgres-graph` to migrate the current Neo4j graph again.
-- A second install after a rollback is refused while the earlier migration's graph is
-  still in PostgreSQL, because BloodHound's migrator would layer the new graph on top of
-  the old one instead of replacing it. `--replace-postgres-graph` clears it first; the
-  backup taken at the start of that install holds the state it replaced.
-- `bloodtrail status` prints both the image the compose files name and the image the
-  container is actually running, which differ while an install or rollback is half done.
-
-### Give the container a memory limit
-
-BloodTrail holds the graph in memory, so the container's memory ceiling is the one
-setting worth choosing deliberately. Go's collector, left alone, lets the heap grow to
-roughly twice what is live before collecting, and on a 1M-node graph that is the
-difference between a container resident in 1.6GiB and one resident in 3.9GiB for the
-same work.
-
-Setting `GOMEMLIMIT` on the BloodHound service caps it:
-
-```yaml
-services:
-  bloodhound:
-    environment:
-      - bhe_graph_driver=bloodtrail
-      - GOMEMLIMIT=2800MiB
-```
-
-Measured on the 1M-node/2.4M-edge benchmark graph, that took the container from 3.9GiB
-resident to 1.6-2.2GiB with no latency cost -- the 185-query corpus was fractionally
-FASTER, because a host that is not short of memory serves every request better. Pick a
-value with headroom over the snapshot size, which the engine logs as `bytes` on every
-`snapshot rebuilt` line in the `bloodhound` container's logs (`bloodtrail status` does not
-report it); allow roughly three times that, since the derived read indexes and each
-query's working set live alongside it.
-
-`GOMEMLIMIT` is a SOFT limit: Go collects harder as it approaches, and never fails an
-allocation to stay under. `GOGC` is not a substitute -- raising it to trade memory for
-CPU does the opposite of what is wanted here, and on this graph `GOGC=400` had the
-container OOM-killed.
-
 ## What's here, and what's not
 
 Everything the sections above describe is implemented and validated at 5M-node scale:
@@ -715,36 +788,13 @@ bench/applybench/      Benchmarks the write-through apply path against a loaded 
 build/                 Builds a BloodHound CE image with the BloodTrail driver compiled
                        in (build-image.sh) and the e2e smoke-test script (e2e.sh)
 patches/               The upstream BloodHound CE source patch this driver is built
-                       against (see Upstream versions below)
+                       against (see Upstream versions in the README)
 scripts/               One-off tooling: extract-prebuilt-queries.go (regenerates
                        testdata/prebuilt/ from an upstream checkout) and install.sh
 testdata/              Fixtures for the differential test suites: dawgs/ (ported from
                        specterops/dawgs) and prebuilt/ (BloodHound's own pre-built
                        Cypher query corpus, extracted by scripts/)
 ```
-
-## Upstream versions
-
-Developed and continuously validated against `github.com/specterops/bloodhound`
-**v9.6.0** (the driver-integration analysis was pinned at its commit `441f20b`) and
-`github.com/specterops/dawgs` `v0.8.0` (`0ea9646`).
-
-**Supported upstream tags** are every stable BloodHound CE release from **v9.6.0** on
--- derived from upstream's own release list by `build/upstream-tags.sh`, not written
-down, so a new upstream release is covered without anyone editing a list. That one
-list drives the CI patch-application guard, the images each BloodTrail release
-publishes (`<upstream>-bt<version>`, one per supported tag), and a weekly workflow
-that builds the moving `<upstream>` alias for any supported tag not yet published.
-The validation levels differ, deliberately:
-
-- **v9.6.0** is the tag CI validates most deeply: the full install-and-rollback e2e
-  runs against it on every change, alongside the patch-application guard.
-- **Newer tags** (v9.7.0 was verified end to end by hand on 2026-09-12) get the
-  patch-application guard in CI and are gated at image-build time
-  -- the patch must apply cleanly and the patched server must compile, or no image is
-  published -- but no automated e2e runs against them per change. A behavioral break
-  upstream could in principle ship in a buildable image; the installer's own
-  post-install verification is the backstop.
 
 ## Licence
 
