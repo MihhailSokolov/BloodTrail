@@ -3,8 +3,6 @@
 package bloodtrail
 
 import (
-	"context"
-
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/recognize"
@@ -85,15 +83,19 @@ func (r *recordingNodeQuery) Limit(limit int) graph.NodeQuery {
 	return r
 }
 
-// Update taints the query (see tainted's doc) and delegates.
+// Update taints the query (see tainted's doc), notes the write on the owning
+// transaction (readWrites' doc, transaction.go), and delegates.
 func (r *recordingNodeQuery) Update(properties *graph.Properties) error {
 	r.tainted = true
+	r.tx.writes.note("ReadTransaction: NodeQuery.Update escapes changelog tracking")
 	return r.NodeQuery.Update(properties)
 }
 
-// Delete taints the query (see tainted's doc) and delegates.
+// Delete taints the query (see tainted's doc), notes the write on the owning
+// transaction (readWrites' doc, transaction.go), and delegates.
 func (r *recordingNodeQuery) Delete() error {
 	r.tainted = true
+	r.tx.writes.note("ReadTransaction: NodeQuery.Delete escapes changelog tracking")
 	return r.NodeQuery.Delete()
 }
 
@@ -111,15 +113,15 @@ func (r *recordingNodeQuery) Query(delegate func(results graph.Result) error, fi
 
 // Count attempts to serve the query from the engine when nothing has tainted
 // it, the owning transaction has not been declined
-// (wrappedTransaction.declined, set by WithGraph), and exactly one criteria
+// (wrappedTransaction.serveable: no WithGraph, no write), and exactly one criteria
 // was recorded: recognize.FromNodeCriteria is run against it, and on a
 // recognized shape, engine.TryNodeCount is tried. Every other case (tainted,
 // declined, criteria count != 1, unrecognized shape, or the engine itself
 // declining) falls through to the inner query's own Count.
 func (r *recordingNodeQuery) Count() (int64, error) {
-	if !r.tainted && !r.tx.declined && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromNodeCriteria(r.criteria[0]); ok {
-			if n, served := r.tx.engine.TryNodeCount(context.Background(), spec); served {
+			if n, served := r.tx.engine.TryNodeCount(r.tx.readContext(), spec); served {
 				return n, nil
 			}
 		}
@@ -139,9 +141,9 @@ func (r *recordingNodeQuery) Count() (int64, error) {
 // leak the feeder goroutine, which blocks forever on an unbuffered send
 // until something cancels its context -- only Close() does that.
 func (r *recordingNodeQuery) FetchIDs(delegate func(cursor graph.Cursor[graph.ID]) error) error {
-	if !r.tainted && !r.tx.declined && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromNodeCriteria(r.criteria[0]); ok {
-			if cursor, served := r.tx.engine.TryNodeFetchIDs(context.Background(), spec); served {
+			if cursor, served := r.tx.engine.TryNodeFetchIDs(r.tx.readContext(), spec); served {
 				defer cursor.Close()
 				return delegate(cursor)
 			}
@@ -154,9 +156,9 @@ func (r *recordingNodeQuery) FetchIDs(delegate func(cursor graph.Cursor[graph.ID
 // conditions as Count (see its doc). See FetchIDs' doc for the cursor-close
 // convention, applied identically here.
 func (r *recordingNodeQuery) FetchKinds(delegate func(cursor graph.Cursor[graph.KindsResult]) error) error {
-	if !r.tainted && !r.tx.declined && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromNodeCriteria(r.criteria[0]); ok {
-			if cursor, served := r.tx.engine.TryNodeFetchKinds(context.Background(), spec); served {
+			if cursor, served := r.tx.engine.TryNodeFetchKinds(r.tx.readContext(), spec); served {
 				defer cursor.Close()
 				return delegate(cursor)
 			}

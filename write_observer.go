@@ -124,6 +124,28 @@ const (
 	edgeIDSymbol = "r"
 )
 
+// scopeSlot returns where a write wrapper's current WriteScope lives: shared
+// when the wrapper was handed out by an observingTransaction/observingBatch
+// (Nodes, Relationships, WithGraph), otherwise the wrapper's own scope field.
+//
+// A handed-out wrapper must reach its owner's scope through the owner's own
+// field, never through a copy of the pointer it held when the wrapper was
+// made: Commit REPLACES the owner's scope (Apply, then a fresh WriteScope),
+// and Driver.WriteTransaction/BatchOperation apply whatever the root
+// observer's field holds once the delegate returns. With copied pointers, a
+// query held across a Commit (q := b.Nodes(); b.Commit();
+// q.Filter(...).Delete()) recorded into the scope that Commit had already
+// applied and discarded, and a WithGraph child's own Commit reset only the
+// child's copy -- every later write through the child landed in a scope
+// nothing ever applied, while the root's (already applied) one was applied
+// a second time. Either way a durable write never reached the replica.
+func scopeSlot(own, shared **engine.WriteScope) **engine.WriteScope {
+	if shared != nil {
+		return shared
+	}
+	return own
+}
+
 // observingTransaction wraps a live graph.Transaction so that Driver.
 // WriteTransaction (driver.go) can learn -- from the very same calls the
 // caller was always going to make -- the ChangeSet (changes.go) Apply
@@ -171,7 +193,12 @@ type observingTransaction struct {
 	graph.Transaction
 
 	scope *engine.WriteScope
-	eng   *engine.Engine
+
+	// shared, when set, points at the scope field of the observer this
+	// wrapper was handed out by, and is used in place of scope -- see
+	// scopeSlot.
+	shared **engine.WriteScope
+	eng    *engine.Engine
 
 	// ctx is the context Driver.WriteTransaction was called with, carried
 	// here purely so a mid-transaction Commit's engine.Apply call (which
@@ -181,6 +208,10 @@ type observingTransaction struct {
 	// needs a context -- which applyContext turns into context.Background().
 	ctx context.Context
 }
+
+// slotRef and current resolve this wrapper's scope -- see scopeSlot.
+func (t *observingTransaction) slotRef() **engine.WriteScope { return scopeSlot(&t.scope, t.shared) }
+func (t *observingTransaction) current() *engine.WriteScope  { return *t.slotRef() }
 
 // wrote reports whether this transaction has recorded any write onto scope
 // since Driver.WriteTransaction (driver.go) began it -- equivalently,
@@ -196,17 +227,17 @@ type observingTransaction struct {
 // read path actually consults wrote() today, and for exactly which future
 // change would need to.
 func (t *observingTransaction) wrote() bool {
-	return !t.scope.Empty()
+	return !t.current().Empty()
 }
 
 // CreateNode delegates, then, once the delegate reports success, records
 // the new node's own database id (only ever known from its return value,
 // which this method used to discard) as a ChangeSet read-back key.
 func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ...graph.Kind) (*graph.Node, error) {
-	ensureBumped(t.ctx, t.eng, t.scope)
+	ensureBumped(t.ctx, t.eng, t.current())
 	node, err := t.Transaction.CreateNode(properties, kinds...)
 	if err == nil && node != nil {
-		t.scope.Changes().RecordNodeID(node.ID)
+		t.current().Changes().RecordNodeID(node.ID)
 	}
 	return node, err
 }
@@ -216,9 +247,9 @@ func (t *observingTransaction) CreateNode(properties *graph.Properties, kinds ..
 // whatever PostgreSQL's row actually holds after the update, regardless of
 // whether this particular call changed labels, properties, or both.
 func (t *observingTransaction) UpdateNode(node *graph.Node) error {
-	ensureBumped(t.ctx, t.eng, t.scope)
+	ensureBumped(t.ctx, t.eng, t.current())
 	if node != nil {
-		t.scope.Changes().RecordNodeID(node.ID)
+		t.current().Changes().RecordNodeID(node.ID)
 	}
 	return t.Transaction.UpdateNode(node)
 }
@@ -228,10 +259,10 @@ func (t *observingTransaction) UpdateNode(node *graph.Node) error {
 // from its return value, which this method used to discard) as a ChangeSet
 // read-back key.
 func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) (*graph.Relationship, error) {
-	ensureBumped(t.ctx, t.eng, t.scope)
+	ensureBumped(t.ctx, t.eng, t.current())
 	rel, err := t.Transaction.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
 	if err == nil && rel != nil {
-		t.scope.Changes().RecordEdgeID(rel.ID)
+		t.current().Changes().RecordEdgeID(rel.ID)
 	}
 	return rel, err
 }
@@ -244,9 +275,9 @@ func (t *observingTransaction) CreateRelationshipByIDs(startNodeID, endNodeID gr
 // edge id key every time this call runs, even though it only ever changes
 // properties (a graph.Relationship's Kind is fixed at creation).
 func (t *observingTransaction) UpdateRelationship(relationship *graph.Relationship) error {
-	ensureBumped(t.ctx, t.eng, t.scope)
+	ensureBumped(t.ctx, t.eng, t.current())
 	if relationship != nil {
-		t.scope.Changes().RecordEdgeID(relationship.ID)
+		t.current().Changes().RecordEdgeID(relationship.ID)
 	}
 	return t.Transaction.UpdateRelationship(relationship)
 }
@@ -262,7 +293,7 @@ func (t *observingTransaction) UpdateRelationship(relationship *graph.Relationsh
 // the type doc's composition-point note; a future change that gives it one
 // must decline whenever wrote() is true.
 func (t *observingTransaction) Nodes() graph.NodeQuery {
-	return &observingNodeQuery{NodeQuery: t.Transaction.Nodes(), scope: t.scope, eng: t.eng, ctx: t.ctx}
+	return &observingNodeQuery{NodeQuery: t.Transaction.Nodes(), shared: t.slotRef(), eng: t.eng, ctx: t.ctx}
 }
 
 // Relationships returns an observingRelationshipQuery wrapping the inner
@@ -271,7 +302,7 @@ func (t *observingTransaction) Nodes() graph.NodeQuery {
 // doc immediately above gives). See that doc for the identical
 // composition-point note.
 func (t *observingTransaction) Relationships() graph.RelationshipQuery {
-	return &observingRelationshipQuery{RelationshipQuery: t.Transaction.Relationships(), scope: t.scope, eng: t.eng, ctx: t.ctx}
+	return &observingRelationshipQuery{RelationshipQuery: t.Transaction.Relationships(), shared: t.slotRef(), eng: t.eng, ctx: t.ctx}
 }
 
 // Query sniffs query for a Cypher updating clause (cypherMutates) and, if
@@ -294,8 +325,8 @@ func (t *observingTransaction) Relationships() graph.RelationshipQuery {
 // reports true.
 func (t *observingTransaction) Query(query string, parameters map[string]any) graph.Result {
 	if cypherMutates(query) {
-		t.scope.Changes().RecordFallback("Query: mutating Cypher escapes changelog tracking")
-		ensureBumped(t.ctx, t.eng, t.scope)
+		t.current().Changes().RecordFallback("Query: mutating Cypher escapes changelog tracking")
+		ensureBumped(t.ctx, t.eng, t.current())
 	}
 	return t.Transaction.Query(query, parameters)
 }
@@ -305,8 +336,8 @@ func (t *observingTransaction) Query(query string, parameters map[string]any) gr
 // driver-specific (SQL, for the PostgreSQL backend this driver wraps) and
 // this package has no way to parse it at all.
 func (t *observingTransaction) Raw(query string, parameters map[string]any) graph.Result {
-	t.scope.Changes().RecordFallback("Raw: driver-specific query escapes changelog tracking")
-	ensureBumped(t.ctx, t.eng, t.scope)
+	t.current().Changes().RecordFallback("Raw: driver-specific query escapes changelog tracking")
+	ensureBumped(t.ctx, t.eng, t.current())
 	return t.Transaction.Raw(query, parameters)
 }
 
@@ -319,8 +350,8 @@ func (t *observingTransaction) Raw(query string, parameters map[string]any) grap
 // WriteTransaction call will eventually report) and the same eng (so Commit
 // still works correctly on the retargeted wrapper).
 func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transaction {
-	t.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
-	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), scope: t.scope, eng: t.eng, ctx: t.ctx}
+	t.current().Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
+	return &observingTransaction{Transaction: t.Transaction.WithGraph(graphSchema), shared: t.slotRef(), eng: t.eng, ctx: t.ctx}
 }
 
 // Commit delegates to the inner transaction's own Commit FIRST, then applies
@@ -372,10 +403,10 @@ func (t *observingTransaction) Commit() error {
 		// rebuild path instead: correct for every change shape under either
 		// commit outcome, at the cost of one background rebuild on an error
 		// path that is already exceptional.
-		t.scope.Changes().RecordFallback(fmt.Sprintf("Commit: outcome ambiguous: %v", err))
+		t.current().Changes().RecordFallback(fmt.Sprintf("Commit: outcome ambiguous: %v", err))
 	}
-	t.eng.Apply(applyContext(t.ctx), t.scope)
-	t.scope = engine.NewWriteScope()
+	t.eng.Apply(applyContext(t.ctx), t.current())
+	*t.slotRef() = engine.NewWriteScope()
 	return err
 }
 
@@ -404,6 +435,11 @@ type observingNodeQuery struct {
 
 	scope *engine.WriteScope
 
+	// shared, when set, points at the scope field of the observer this
+	// wrapper was handed out by, and is used in place of scope -- see
+	// scopeSlot.
+	shared **engine.WriteScope
+
 	// eng and ctx are Nodes()'s own eng/ctx, carried here purely so
 	// Delete()/Update() can bump the watermark eagerly (ensureBumped)
 	// before delegating -- the same fields, and the same nil tolerance, as
@@ -418,6 +454,10 @@ type observingNodeQuery struct {
 	// nodeIDsFromCriteria's doc.
 	criteria []graph.Criteria
 }
+
+// slotRef and current resolve this wrapper's scope -- see scopeSlot.
+func (q *observingNodeQuery) slotRef() **engine.WriteScope { return scopeSlot(&q.scope, q.shared) }
+func (q *observingNodeQuery) current() *engine.WriteScope  { return *q.slotRef() }
 
 // Filter records criteria and delegates to the inner query, returning this
 // same wrapper so the fluent chain keeps flowing through observingNodeQuery
@@ -481,13 +521,13 @@ func (q *observingNodeQuery) Limit(limit int) graph.NodeQuery {
 // -- so this method's own recognizer only ever needs to look for InIDs, not
 // a kind matcher).
 func (q *observingNodeQuery) Delete() error {
-	ensureBumped(q.ctx, q.eng, q.scope)
+	ensureBumped(q.ctx, q.eng, q.current())
 	if ids, ok := nodeIDsFromCriteria(q.criteria); ok {
 		for _, id := range ids {
-			q.scope.Changes().RecordNodeID(id)
+			q.current().Changes().RecordNodeID(id)
 		}
 	} else {
-		q.scope.Changes().RecordFallback("NodeQuery.Delete: unrecognized criteria")
+		q.current().Changes().RecordFallback("NodeQuery.Delete: unrecognized criteria")
 	}
 	return q.NodeQuery.Delete()
 }
@@ -495,13 +535,13 @@ func (q *observingNodeQuery) Delete() error {
 // Update records either a recognized InIDs target list or a fallback
 // before delegating, mirroring Delete's own reasoning immediately above.
 func (q *observingNodeQuery) Update(properties *graph.Properties) error {
-	ensureBumped(q.ctx, q.eng, q.scope)
+	ensureBumped(q.ctx, q.eng, q.current())
 	if ids, ok := nodeIDsFromCriteria(q.criteria); ok {
 		for _, id := range ids {
-			q.scope.Changes().RecordNodeID(id)
+			q.current().Changes().RecordNodeID(id)
 		}
 	} else {
-		q.scope.Changes().RecordFallback("NodeQuery.Update: unrecognized criteria")
+		q.current().Changes().RecordFallback("NodeQuery.Update: unrecognized criteria")
 	}
 	return q.NodeQuery.Update(properties)
 }
@@ -522,6 +562,11 @@ type observingRelationshipQuery struct {
 
 	scope *engine.WriteScope
 
+	// shared, when set, points at the scope field of the observer this
+	// wrapper was handed out by, and is used in place of scope -- see
+	// scopeSlot.
+	shared **engine.WriteScope
+
 	// eng and ctx are Relationships()'s own eng/ctx, carried here purely so
 	// Delete()/Update() can bump the watermark eagerly (ensureBumped)
 	// before delegating -- the same fields, and the same nil tolerance, as
@@ -537,6 +582,12 @@ type observingRelationshipQuery struct {
 	// call, never several composed together.
 	criteria []graph.Criteria
 }
+
+// slotRef and current resolve this wrapper's scope -- see scopeSlot.
+func (r *observingRelationshipQuery) slotRef() **engine.WriteScope {
+	return scopeSlot(&r.scope, r.shared)
+}
+func (r *observingRelationshipQuery) current() *engine.WriteScope { return *r.slotRef() }
 
 // Filter records criteria and delegates to the inner query, returning this
 // same wrapper so the fluent chain keeps flowing through
@@ -612,17 +663,17 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 // a fallback instead, which is the honest description of what the replica
 // now knows: nothing.
 func (r *observingRelationshipQuery) Delete() error {
-	ensureBumped(r.ctx, r.eng, r.scope)
+	ensureBumped(r.ctx, r.eng, r.current())
 	kinds, touchAll := relationshipDeleteScope(r.criteria)
 	if touchAll {
-		r.scope.Changes().RecordFallback("RelationshipQuery.Delete: unrecognized criteria")
+		r.current().Changes().RecordFallback("RelationshipQuery.Delete: unrecognized criteria")
 		return r.RelationshipQuery.Delete()
 	}
 	if err := r.RelationshipQuery.Delete(); err != nil {
-		r.scope.Changes().RecordFallback("RelationshipQuery.Delete: delete failed")
+		r.current().Changes().RecordFallback("RelationshipQuery.Delete: delete failed")
 		return err
 	}
-	r.scope.Changes().RecordDeleteRelationshipsByKinds(kinds)
+	r.current().Changes().RecordDeleteRelationshipsByKinds(kinds)
 	return nil
 }
 
@@ -630,13 +681,13 @@ func (r *observingRelationshipQuery) Delete() error {
 // before delegating -- the RelationshipQuery half of
 // observingNodeQuery.Update's identical reasoning.
 func (r *observingRelationshipQuery) Update(properties *graph.Properties) error {
-	ensureBumped(r.ctx, r.eng, r.scope)
+	ensureBumped(r.ctx, r.eng, r.current())
 	if ids, ok := edgeIDsFromCriteria(r.criteria); ok {
 		for _, id := range ids {
-			r.scope.Changes().RecordEdgeID(id)
+			r.current().Changes().RecordEdgeID(id)
 		}
 	} else {
-		r.scope.Changes().RecordFallback("RelationshipQuery.Update: unrecognized criteria")
+		r.current().Changes().RecordFallback("RelationshipQuery.Update: unrecognized criteria")
 	}
 	return r.RelationshipQuery.Update(properties)
 }
@@ -874,12 +925,21 @@ type observingBatch struct {
 	graph.Batch
 
 	scope *engine.WriteScope
-	eng   *engine.Engine
+
+	// shared, when set, points at the scope field of the observer this
+	// wrapper was handed out by, and is used in place of scope -- see
+	// scopeSlot.
+	shared **engine.WriteScope
+	eng    *engine.Engine
 
 	// ctx is Driver.BatchOperation's own context, carried for the same
 	// reason (and with the same nil tolerance) as observingTransaction.ctx.
 	ctx context.Context
 }
+
+// slotRef and current resolve this wrapper's scope -- see scopeSlot.
+func (b *observingBatch) slotRef() **engine.WriteScope { return scopeSlot(&b.scope, b.shared) }
+func (b *observingBatch) current() *engine.WriteScope  { return *b.slotRef() }
 
 // wrote reports whether this batch has recorded any write onto scope since
 // it began (Driver.BatchOperation, driver.go) or since the last Commit
@@ -887,7 +947,7 @@ type observingBatch struct {
 // non-empty. See observingTransaction.wrote's doc for the full reasoning:
 // identical here, substituting "batch" for "transaction" throughout.
 func (b *observingBatch) wrote() bool {
-	return !b.scope.Empty()
+	return !b.current().Empty()
 }
 
 // CreateNode delegates, then, once the delegate reports success, records a
@@ -896,10 +956,10 @@ func (b *observingBatch) wrote() bool {
 // property it prefers, and why a create that offers neither records a
 // fallback instead of an enumerable key.
 func (b *observingBatch) CreateNode(node *graph.Node) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
+	ensureBumped(b.ctx, b.eng, b.current())
 	err := b.Batch.CreateNode(node)
 	if err == nil {
-		recordBatchCreateNodeIdentity(b.scope, node)
+		recordBatchCreateNodeIdentity(b.current(), node)
 	}
 	return err
 }
@@ -977,7 +1037,7 @@ func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 	// doesn't support NodeBatchCreator at all never reaches PostgreSQL for
 	// this call, so bumping ahead of that check would advance the counter
 	// for a call that had no pg effect at all.
-	ensureBumped(b.ctx, b.eng, b.scope)
+	ensureBumped(b.ctx, b.eng, b.current())
 
 	ids, err := creator.CreateNodes(nodes)
 	if err != nil {
@@ -985,7 +1045,7 @@ func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 	}
 
 	for _, id := range ids {
-		b.scope.Changes().RecordNodeID(id)
+		b.current().Changes().RecordNodeID(id)
 	}
 	return ids, nil
 }
@@ -994,8 +1054,8 @@ func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 // re-reads it from PostgreSQL the same way every other RecordNodeID
 // caller's target is re-read, finding it gone and applying the delete.
 func (b *observingBatch) DeleteNode(id graph.ID) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
-	b.scope.Changes().RecordNodeID(id)
+	ensureBumped(b.ctx, b.eng, b.current())
+	b.current().Changes().RecordNodeID(id)
 	return b.Batch.DeleteNode(id)
 }
 
@@ -1007,7 +1067,7 @@ func (b *observingBatch) DeleteNode(id graph.ID) error {
 // capable today, and a future change that gives it one must decline
 // whenever wrote() is true.
 func (b *observingBatch) Nodes() graph.NodeQuery {
-	return &observingNodeQuery{NodeQuery: b.Batch.Nodes(), scope: b.scope, eng: b.eng, ctx: b.ctx}
+	return &observingNodeQuery{NodeQuery: b.Batch.Nodes(), shared: b.slotRef(), eng: b.eng, ctx: b.ctx}
 }
 
 // Relationships returns an observingRelationshipQuery wrapping the inner
@@ -1015,14 +1075,14 @@ func (b *observingBatch) Nodes() graph.NodeQuery {
 // Relationships does. See Nodes' doc immediately above for the identical
 // composition-point note.
 func (b *observingBatch) Relationships() graph.RelationshipQuery {
-	return &observingRelationshipQuery{RelationshipQuery: b.Batch.Relationships(), scope: b.scope, eng: b.eng, ctx: b.ctx}
+	return &observingRelationshipQuery{RelationshipQuery: b.Batch.Relationships(), shared: b.slotRef(), eng: b.eng, ctx: b.ctx}
 }
 
 // UpdateNodeBy records update's ChangeSet entry via recordNodeUpsertIdentity,
 // then delegates.
 func (b *observingBatch) UpdateNodeBy(update graph.NodeUpdate) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
-	recordNodeUpsertIdentity(b.scope, update)
+	ensureBumped(b.ctx, b.eng, b.current())
+	recordNodeUpsertIdentity(b.current(), update)
 	return b.Batch.UpdateNodeBy(update)
 }
 
@@ -1089,10 +1149,10 @@ func objectIDFromProperties(properties *graph.Properties) (string, bool) {
 // UpdateNodes records each node's own database id as a ChangeSet read-back
 // key, then delegates.
 func (b *observingBatch) UpdateNodes(nodes []*graph.Node) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
+	ensureBumped(b.ctx, b.eng, b.current())
 	for _, node := range nodes {
 		if node != nil {
-			b.scope.Changes().RecordNodeID(node.ID)
+			b.current().Changes().RecordNodeID(node.ID)
 		}
 	}
 	return b.Batch.UpdateNodes(nodes)
@@ -1100,9 +1160,9 @@ func (b *observingBatch) UpdateNodes(nodes []*graph.Node) error {
 
 // CreateRelationship records a ChangeSet edge triple, then delegates.
 func (b *observingBatch) CreateRelationship(relationship *graph.Relationship) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
+	ensureBumped(b.ctx, b.eng, b.current())
 	if relationship != nil {
-		b.scope.Changes().RecordEdgeTriple(relationship.StartID, relationship.EndID, relationship.Kind)
+		b.current().Changes().RecordEdgeTriple(relationship.StartID, relationship.EndID, relationship.Kind)
 	}
 	return b.Batch.CreateRelationship(relationship)
 }
@@ -1121,24 +1181,24 @@ func (b *observingBatch) CreateRelationship(relationship *graph.Relationship) er
 //
 //nolint:staticcheck // SA1019: deliberate passthrough of a deprecated call, see doc above.
 func (b *observingBatch) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
-	b.scope.Changes().RecordEdgeTriple(startNodeID, endNodeID, kind)
+	ensureBumped(b.ctx, b.eng, b.current())
+	b.current().Changes().RecordEdgeTriple(startNodeID, endNodeID, kind)
 	return b.Batch.CreateRelationshipByIDs(startNodeID, endNodeID, kind, properties)
 }
 
 // DeleteRelationship records id onto the ChangeSet as a read-back key
 // (mirroring DeleteNode's identical reasoning), then delegates.
 func (b *observingBatch) DeleteRelationship(id graph.ID) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
-	b.scope.Changes().RecordEdgeID(id)
+	ensureBumped(b.ctx, b.eng, b.current())
+	b.current().Changes().RecordEdgeID(id)
 	return b.Batch.DeleteRelationship(id)
 }
 
 // UpdateRelationshipBy records update's ChangeSet entry via
 // recordRelationshipUpsertIdentity, then delegates.
 func (b *observingBatch) UpdateRelationshipBy(update graph.RelationshipUpdate) error {
-	ensureBumped(b.ctx, b.eng, b.scope)
-	recordRelationshipUpsertIdentity(b.scope, update)
+	ensureBumped(b.ctx, b.eng, b.current())
+	recordRelationshipUpsertIdentity(b.current(), update)
 	return b.Batch.UpdateRelationshipBy(update)
 }
 
@@ -1173,8 +1233,8 @@ func recordRelationshipUpsertIdentity(scope *engine.WriteScope, update graph.Rel
 // wrapping the inner WithGraph's result, sharing the same scope -- mirroring
 // observingTransaction.WithGraph's identical reasoning.
 func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
-	b.scope.Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
-	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), scope: b.scope, eng: b.eng, ctx: b.ctx}
+	b.current().Changes().RecordFallback("WithGraph: graph retarget escapes changelog tracking")
+	return &observingBatch{Batch: b.Batch.WithGraph(graphSchema), shared: b.slotRef(), eng: b.eng, ctx: b.ctx}
 }
 
 // Commit delegates to the inner batch's own Commit FIRST -- which flushes
@@ -1220,8 +1280,8 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // intended.
 func (b *observingBatch) Commit() error {
 	err := b.Batch.Commit()
-	b.eng.Apply(applyContext(b.ctx), b.scope)
-	b.scope = engine.NewWriteScope()
+	b.eng.Apply(applyContext(b.ctx), b.current())
+	*b.slotRef() = engine.NewWriteScope()
 	return err
 }
 

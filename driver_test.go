@@ -6,10 +6,14 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/specterops/dawgs"
+	"github.com/specterops/dawgs/drivers/pg"
+	"github.com/specterops/dawgs/graph"
 )
 
 func TestDriverIsRegisteredUnderItsName(t *testing.T) {
@@ -35,6 +39,34 @@ func TestOpenRejectsMalformedSettingsBeforeConnecting(t *testing.T) {
 	_, err := dawgs.Open(context.Background(), DriverName, dawgs.Config{})
 	if err == nil || !strings.Contains(err.Error(), EnvMemoryLimit) {
 		t.Fatalf("expected a settings error naming %s, got: %v", EnvMemoryLimit, err)
+	}
+}
+
+// TestUpstreamPostgreSQLDetectionNeedsThePatchedCheck pins why
+// patches/bloodhound-driver.patch edits upstream's migration manifest.
+// BloodHound hands its migrations a graph.DatabaseSwitch around this driver,
+// and pg.IsPostgreSQLGraph (graph.IsDriver[*pg.Driver]) is a concrete type
+// match that a *Driver embedding *pg.Driver does not satisfy -- so
+// upstream's PostgreSQL-only Version_852_Migration was silently skipped and
+// recorded as done. The patch adds graph.IsDriver[*bloodtrail.Driver],
+// which does match; this checks both halves and that the patch still
+// carries the check.
+func TestUpstreamPostgreSQLDetectionNeedsThePatchedCheck(t *testing.T) {
+	db := graph.NewDatabaseSwitch(context.Background(), &Driver{})
+
+	if pg.IsPostgreSQLGraph(db) {
+		t.Fatalf("pg.IsPostgreSQLGraph now recognizes the BloodTrail driver; the manifest hunk in patches/bloodhound-driver.patch may be redundant")
+	}
+	if !graph.IsDriver[*Driver](db) {
+		t.Fatalf("graph.IsDriver[*bloodtrail.Driver] does not recognize the BloodTrail driver behind a DatabaseSwitch")
+	}
+
+	patch, err := os.ReadFile(filepath.Join("patches", "bloodhound-driver.patch"))
+	if err != nil {
+		t.Fatalf("reading the upstream patch: %v", err)
+	}
+	if !strings.Contains(string(patch), "+\tif pg.IsPostgreSQLGraph(db) || graph.IsDriver[*bloodtrail.Driver](db) {") {
+		t.Fatalf("patches/bloodhound-driver.patch no longer extends upstream's PostgreSQL detection to the BloodTrail driver")
 	}
 }
 

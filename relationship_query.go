@@ -3,8 +3,6 @@
 package bloodtrail
 
 import (
-	"context"
-
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine"
@@ -121,21 +119,25 @@ func (r *recordingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 	return r
 }
 
-// Update taints the query (see tainted's doc) and delegates.
+// Update taints the query (see tainted's doc), notes the write on the owning
+// transaction (readWrites' doc, transaction.go), and delegates.
 func (r *recordingRelationshipQuery) Update(properties *graph.Properties) error {
 	r.tainted = true
+	r.tx.writes.note("ReadTransaction: RelationshipQuery.Update escapes changelog tracking")
 	return r.RelationshipQuery.Update(properties)
 }
 
-// Delete taints the query (see tainted's doc) and delegates.
+// Delete taints the query (see tainted's doc), notes the write on the owning
+// transaction (readWrites' doc, transaction.go), and delegates.
 func (r *recordingRelationshipQuery) Delete() error {
 	r.tainted = true
+	r.tx.writes.note("ReadTransaction: RelationshipQuery.Delete escapes changelog tracking")
 	return r.RelationshipQuery.Delete()
 }
 
 // FetchAllShortestPaths attempts to serve the query from the engine when
 // nothing has tainted it, the owning transaction has not been declined
-// (wrappedTransaction.declined, set by WithGraph), orderByEdgeID has not
+// (wrappedTransaction.serveable: no WithGraph, no write), orderByEdgeID has not
 // been set (an ordered query is not the canonical path shape
 // recognize.FromCriteria models -- see orderByEdgeID's own doc), and exactly
 // one criteria was recorded: recognize.FromCriteria is run against it, and
@@ -155,10 +157,10 @@ func (r *recordingRelationshipQuery) Delete() error {
 // an unbuffered send until something cancels its context -- only Close()
 // does that.
 func (r *recordingRelationshipQuery) FetchAllShortestPaths(delegate func(cursor graph.Cursor[graph.Path]) error) error {
-	if !r.tainted && !r.tx.declined && !r.orderByEdgeID && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && !r.orderByEdgeID && len(r.criteria) == 1 {
 		if pq, ok := recognize.FromCriteria(r.criteria[0]); ok {
-			if paths, served := r.tx.engine.TryAllShortestPaths(context.Background(), r.tx, pq); served {
-				cursor := engine.NewPathCursor(context.Background(), paths)
+			if paths, served := r.tx.engine.TryAllShortestPaths(r.tx.readContext(), r.tx, pq); served {
+				cursor := engine.NewPathCursor(r.tx.readContext(), paths)
 				defer cursor.Close()
 				return delegate(cursor)
 			}
@@ -169,7 +171,7 @@ func (r *recordingRelationshipQuery) FetchAllShortestPaths(delegate func(cursor 
 
 // Count attempts to serve the query from the engine when nothing has
 // tainted it, the owning transaction has not been declined
-// (wrappedTransaction.declined, set by WithGraph), orderByEdgeID has not
+// (wrappedTransaction.serveable: no WithGraph, no write), orderByEdgeID has not
 // been set (an order has no meaning for a bare count -- see orderByEdgeID's
 // own doc), and exactly one criteria was recorded: recognize.FromRelCriteria
 // is run against it, and on a recognized shape, engine.TryRelCount is tried.
@@ -177,9 +179,9 @@ func (r *recordingRelationshipQuery) FetchAllShortestPaths(delegate func(cursor 
 // unrecognized shape, or the engine itself declining) falls through to the
 // inner query's own Count.
 func (r *recordingRelationshipQuery) Count() (int64, error) {
-	if !r.tainted && !r.tx.declined && !r.orderByEdgeID && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && !r.orderByEdgeID && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromRelCriteria(r.criteria[0]); ok {
-			if n, served := r.tx.engine.TryRelCount(context.Background(), spec); served {
+			if n, served := r.tx.engine.TryRelCount(r.tx.readContext(), spec); served {
 				return n, nil
 			}
 		}
@@ -199,9 +201,9 @@ func (r *recordingRelationshipQuery) Count() (int64, error) {
 // goroutine, which blocks forever on an unbuffered send until something
 // cancels its context -- only Close() does that.
 func (r *recordingRelationshipQuery) FetchIDs(delegate func(cursor graph.Cursor[graph.ID]) error) error {
-	if !r.tainted && !r.tx.declined && !r.orderByEdgeID && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && !r.orderByEdgeID && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromRelCriteria(r.criteria[0]); ok {
-			if cursor, served := r.tx.engine.TryRelFetchIDs(context.Background(), spec); served {
+			if cursor, served := r.tx.engine.TryRelFetchIDs(r.tx.readContext(), spec); served {
 				defer cursor.Close()
 				return delegate(cursor)
 			}
@@ -214,9 +216,9 @@ func (r *recordingRelationshipQuery) FetchIDs(delegate func(cursor graph.Cursor[
 // conditions as Count (see its doc). See FetchIDs' doc for the cursor-close
 // convention, applied identically here.
 func (r *recordingRelationshipQuery) FetchTriples(delegate func(cursor graph.Cursor[graph.RelationshipTripleResult]) error) error {
-	if !r.tainted && !r.tx.declined && !r.orderByEdgeID && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && !r.orderByEdgeID && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromRelCriteria(r.criteria[0]); ok {
-			if cursor, served := r.tx.engine.TryRelFetchTriples(context.Background(), spec); served {
+			if cursor, served := r.tx.engine.TryRelFetchTriples(r.tx.readContext(), spec); served {
 				defer cursor.Close()
 				return delegate(cursor)
 			}
@@ -229,9 +231,9 @@ func (r *recordingRelationshipQuery) FetchTriples(delegate func(cursor graph.Cur
 // conditions as Count (see its doc). See FetchIDs' doc for the cursor-close
 // convention, applied identically here.
 func (r *recordingRelationshipQuery) FetchKinds(delegate func(cursor graph.Cursor[graph.RelationshipKindsResult]) error) error {
-	if !r.tainted && !r.tx.declined && !r.orderByEdgeID && len(r.criteria) == 1 {
+	if !r.tainted && r.tx.serveable() && !r.orderByEdgeID && len(r.criteria) == 1 {
 		if spec, ok := recognize.FromRelCriteria(r.criteria[0]); ok {
-			if cursor, served := r.tx.engine.TryRelFetchKinds(context.Background(), spec); served {
+			if cursor, served := r.tx.engine.TryRelFetchKinds(r.tx.readContext(), spec); served {
 				defer cursor.Close()
 				return delegate(cursor)
 			}
@@ -271,7 +273,7 @@ func projectionDirectionConsistent(proj recognize.RowProjection, spec recognize.
 
 // Query attempts to serve a structural row-projection query entirely from
 // the engine when nothing has tainted it, the owning transaction has not
-// been declined (wrappedTransaction.declined, set by WithGraph), and exactly
+// been declined (wrappedTransaction.serveable: no WithGraph, no write), and exactly
 // one criteria was recorded and exactly one finalCriteria was given --
 // unlike Count/FetchIDs/FetchTriples/FetchKinds above, Query's caller
 // supplies its own RETURN-shaped criteria rather than this wrapper choosing
@@ -299,10 +301,10 @@ func projectionDirectionConsistent(proj recognize.RowProjection, spec recognize.
 // convention as FetchAllShortestPaths/Count/FetchIDs/FetchTriples/
 // FetchKinds above.
 func (r *recordingRelationshipQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
-	if !r.tainted && !r.tx.declined && len(r.criteria) == 1 && len(finalCriteria) == 1 {
+	if !r.tainted && r.tx.serveable() && len(r.criteria) == 1 && len(finalCriteria) == 1 {
 		if proj, ok := recognize.FromReturning(finalCriteria[0]); ok {
 			if spec, ok := recognize.FromRelCriteria(r.criteria[0]); ok && projectionDirectionConsistent(proj, spec) {
-				if result, served := r.tx.engine.TryRelQueryRows(context.Background(), spec, proj, r.orderByEdgeID); served {
+				if result, served := r.tx.engine.TryRelQueryRows(r.tx.readContext(), spec, proj, r.orderByEdgeID); served {
 					defer result.Close()
 					return delegate(result)
 				}
