@@ -53,6 +53,7 @@ pinning a release, unattended installs, the smoke test, and what rollback restor
   - [In-memory path engine](#in-memory-path-engine) -- shortest paths
   - [Query-builder serving](#query-builder-serving) -- entity panels, analysis, tagging
   - [Cypher interpreter](#cypher-interpreter) -- what Cypher is served, and what always goes to PostgreSQL
+  - [OpenGraph](#opengraph) -- custom node and edge kinds
   - [Scope: what's here, and what's not](#whats-here-and-whats-not)
 - **Contributing**
   - [Developing and testing](#developing-and-testing)
@@ -723,6 +724,41 @@ refused instead (see [Write-through](#write-through)).
 
 See [bench/cypherbench](bench/cypherbench) for the measurement.
 
+## OpenGraph
+
+BloodHound's OpenGraph data (custom node and edge kinds uploaded as JSON, with an
+optional extension schema) reaches the graph through the same driver calls collector
+data does, so BloodTrail needs nothing OpenGraph-specific. What happens to it:
+
+- **Uploads replay by write-through.** An upload registers its `metadata.source_kind`
+  and node kinds in the `kind` table, then upserts nodes with `UpdateNodeBy` and edges
+  with `UpdateRelationshipBy`, both keyed on objectid. Every one of those writes is
+  replayed into the replica, including stub endpoints and an AD node gaining the source
+  kind through a hybrid edge. Endpoints matched by name or property are resolved by
+  ordinary read queries first.
+- **Reads are served from memory.** Cypher over custom kinds (label and property scans
+  over every OpenGraph value type, multi-kind nodes, variable-length paths,
+  `shortestPath`, both `allShortestPaths` answers, aggregates) and the pathfinding
+  endpoint with an extension's traversable kinds. `allShortestPaths` has two answers in
+  PostgreSQL: every pair's own shortest paths when both endpoints carry a property or
+  id constraint, and only the query's overall shortest paths otherwise. BloodTrail
+  reads which one applies from dawgs' own translation of the query.
+- **Deletes replay incrementally.** "Clear database" by source kind, of sourceless
+  data (which excludes every registered source kind, including one a failed upload
+  registered and no row carries) and by edge kind.
+- **What still goes to PostgreSQL**: a query naming a kind no row carries yet, such as
+  a failed upload's source kind, until the replica learns the kind; and the same shapes
+  that delegate for any other data.
+
+The evidence: `integration/opengraph_integration_test.go` replays upstream's OpenGraph
+call shapes and compares every step with the plain pg driver;
+`integration/shortest_path_level_integration_test.go` pins both `allShortestPaths`
+answers against PostgreSQL; and the end-to-end test uploads OpenGraph files through a
+real BloodHound ([build/README.md](build/README.md#end-to-end-test)). On a 190k-node
+organization, path queries answer 30-70x faster than on the PostgreSQL driver and
+scans about 2x, for about a quarter more ingest time ([BENCHMARK.md](BENCHMARK.md#opengraph),
+[bench/oggen](bench/oggen)).
+
 ## What's here, and what's not
 
 Everything the sections above describe is implemented and validated at 5M-node scale:
@@ -781,19 +817,23 @@ bench/csrbench/        CSR traversal micro-benchmark (self-contained Go module)
 bench/adgen/           Generates a synthetic AD-shaped graph and loads it into PostgreSQL
 bench/shgen/           Generates a fictitious AD forest as SharpHound v6 JSON, for
                        benchmarking a whole deployment through BloodHound's own ingest
+bench/oggen/           Generates a fictitious source-control organization as OpenGraph
+                       JSON, and benchmarks a deployment on it (bench.py)
 bench/pathbench/       Benchmarks the in-memory path engine against a loaded graph
 bench/builderbench/    Benchmarks query-builder serving against a loaded graph
 bench/cypherbench/     Benchmarks Cypher-interpreter serving against a loaded graph
 bench/applybench/      Benchmarks the write-through apply path against a loaded graph
 build/                 Builds a BloodHound CE image with the BloodTrail driver compiled
-                       in (build-image.sh) and the e2e smoke-test script (e2e.sh)
+                       in (build-image.sh) and the e2e smoke-test script (e2e.sh, with
+                       its OpenGraph phase in e2e-opengraph.sh)
 patches/               The upstream BloodHound CE source patch this driver is built
                        against (see Upstream versions in the README)
 scripts/               One-off tooling: extract-prebuilt-queries.go (regenerates
                        testdata/prebuilt/ from an upstream checkout) and install.sh
 testdata/              Fixtures for the differential test suites: dawgs/ (ported from
                        specterops/dawgs) and prebuilt/ (BloodHound's own pre-built
-                       Cypher query corpus, extracted by scripts/)
+                       Cypher query corpus, extracted by scripts/), and the e2e
+                       test's OpenGraph uploads (opengraph/)
 ```
 
 ## Licence

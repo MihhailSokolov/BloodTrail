@@ -350,3 +350,69 @@ python3 bench/shgen/sweep.py --port 8080 --password "$PASS" \
 - **Memory is the cost.** BloodTrail held 1.92 GiB resident against stock's
   1.21 GiB on this run, and the gap is wider on a quiet instance -- the stock
   arm's figure includes PostgreSQL's own page cache warmed by the sweep.
+
+## OpenGraph
+
+A separate, smaller comparison on OpenGraph data (custom node and edge kinds),
+not part of the sweep above: what a user of OpenGraph data sees with and
+without BloodTrail.
+
+| | |
+|---|---|
+| Hardware | Linux VM, 4 vCPU, 15 GiB RAM; both arms native binaries against one local PostgreSQL 16 |
+| BloodHound CE | v9.6.0 built from source with BloodTrail's patch; only `graph_driver` differs (`pg` / `bloodtrail`) |
+| Graph | a [`bench/shgen`](bench/shgen) forest (`-users 20000`) and a [`bench/oggen`](bench/oggen) organization (`-users 100000`): 190,001 OpenGraph nodes and 361,098 edges, 10,000 of them hybrid edges from AD users |
+| Harness | [`bench/oggen/bench.py`](bench/oggen/bench.py): each arm starts on an empty database, one arm at a time; per query one discarded warm-up then the median of 7; three complete runs, medians across them; datapipe interval 1 s on both arms |
+
+Every query returned the identical answer on both arms in all three runs
+(the harness compares a digest of every node, edge and literal), and
+BloodTrail served all of them from memory: its logs show no decline, no
+fallback, and no rebuild after the boot load.
+
+| Query | Stock (pg driver) | BloodTrail | |
+|---|---:|---:|---|
+| Hybrid AD user to repository, pathfinding endpoint | 531.8 ms | 7.7 ms | **69.1x faster** |
+| Hybrid AD user to repository, `shortestPath` | 464.8 ms | 7.0 ms | **66.4x faster** |
+| User to repository, pathfinding endpoint | 276.0 ms | 6.4 ms | **43.1x faster** |
+| `shortestPath`, user to repository | 303.6 ms | 7.7 ms | **39.4x faster** |
+| Nested team membership, `[:sc_MemberOf*1..]` | 286.9 ms | 7.6 ms | **37.8x faster** |
+| `allShortestPaths`, every user to a repository | 333.7 ms | 9.3 ms | **35.9x faster** |
+| `allShortestPaths`, three named users to a repository | 251.7 ms | 8.0 ms | **31.5x faster** |
+| `count(n)` over the source kind | 46.9 ms | 5.8 ms | **8.1x faster** |
+| User to team to role, fixed two hops | 32.0 ms | 6.9 ms | **4.6x faster** |
+| Repositories with team admins, `count(DISTINCT r)` | 84.6 ms | 31.8 ms | **2.7x faster** |
+| Array property filter (`'security' IN n.topics`) | 28.8 ms | 11.9 ms | **2.4x faster** |
+| `count(r)` over one edge kind | 80.3 ms | 34.5 ms | **2.3x faster** |
+| Property scan (`visibility`, `stars`) | 23.4 ms | 12.4 ms | **1.9x faster** |
+| objectid point lookup | 5.7 ms | 6.8 ms | 1.2x slower |
+
+| Write | Stock (pg driver) | BloodTrail | |
+|---|---:|---:|---|
+| OpenGraph upload, ingest and analysis | 54.5 s | 68.5 s | +26% |
+| AD forest upload, ingest and analysis | 27.0 s | 37.7 s | +40% |
+| Clear the OpenGraph source kind | 12.3 s | 13.2 s | +7% |
+| API process resident memory after load | 164 MB | 435 MB | |
+
+- **Paths are the win**, as on AD data: every path-shaped query, including
+  the pathfinding endpoint and hybrid AD-to-OpenGraph paths, answers 30-70x
+  faster. Scans and aggregates gain 2-8x; a point lookup is about a
+  millisecond slower, BloodHound's own request pipeline being most of its
+  cost (see [Where BloodTrail is slower](#where-bloodtrail-is-slower)).
+- **Ingest pays for write-through**, a quarter more on the OpenGraph upload.
+- **Memory**: the replica lives in the API process. The stock figure leaves
+  out PostgreSQL's own memory, which serves the stock arm's queries.
+- **One outlier per arm, both excluded by the medians.** One AD load on each
+  arm (BloodTrail's in the second run, stock's in the third) took about 50 s
+  longer, all of it in BloodHound's data quality step. Neither arm serves
+  that step's count queries from memory, so both send PostgreSQL the same
+  SQL. Right after a bulk load, how fast PostgreSQL answers it depends on
+  whether autoanalyze has run yet.
+
+```bash
+go run ./bench/shgen -users 20000 -out shgen-out
+go run ./bench/oggen -users 100000 -ad shgen-out -out oggen-out
+# One arm at a time, each on an empty database:
+python3 bench/oggen/bench.py --port 8080 --password "$PASS" --label stock-pg \
+    --ad shgen-out --data oggen-out --delete --repeats 7 --out og-stock.json
+python3 bench/shgen/compare.py og-stock.json og-bloodtrail.json
+```
