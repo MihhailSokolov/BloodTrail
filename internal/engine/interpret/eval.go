@@ -343,9 +343,19 @@ func (r *Row) trailEdgeUsed(identity uint64) bool {
 // recompile the same regexp.Regexp from source text on every single row.
 // Both fields are safe to leave at their zero value; a nil map is treated as
 // empty and lazily allocated on first use.
+//
+// AllShortestPerPair selects how allShortestPaths() resolves a query with
+// more than one root/terminal pair: false (the default) returns only the
+// paths of the query's overall shortest length, true returns every pair's
+// shortest paths at that pair's own length. dawgs' pg driver does the latter
+// only when its translation resolves pairs through a pair filter, so a
+// caller serving on PostgreSQL's behalf must set it from that translation
+// (engine.translateGate).
 type Env struct {
 	Snap *snapshot.View
 	Now  time.Time
+
+	AllShortestPerPair bool
 
 	regexMu    sync.Mutex
 	regexCache map[string]*RegexMatcher

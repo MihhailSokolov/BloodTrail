@@ -5,6 +5,7 @@ package interpret
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 
@@ -502,6 +503,53 @@ func TestExpandShortestPathMatchesTraverseDirectly(t *testing.T) {
 			`MATCH p = shortestPath((t:Target)<-[:E*1..]-(s:Root)) WHERE s<>t RETURN p`, 0,
 			[]string{"N:4,3,1,|E:303,302,"})
 	})
+}
+
+// TestExpandAllShortestPathsFollowsEnvPairSemantics pins how Env picks
+// between PostgreSQL's two allShortestPaths answers when two roots sit at
+// different distances from the terminal (1 -> 3 -> 4 is two hops, 2 -> 4
+// one): by default only the query's overall shortest length survives, and
+// with AllShortestPerPair every pair keeps its own shortest paths.
+func TestExpandAllShortestPathsFollowsEnvPairSemantics(t *testing.T) {
+	const (
+		kindRoot   snapshot.KindID = 1
+		kindTarget snapshot.KindID = 2
+		kindE      snapshot.KindID = 10
+	)
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindRoot}},
+			{id: 2, kinds: []snapshot.KindID{kindRoot}},
+			{id: 3},
+			{id: 4, kinds: []snapshot.KindID{kindTarget}},
+		},
+		[]execEdgeSpec{
+			{id: 400, start: 1, end: 3, kind: kindE},
+			{id: 401, start: 3, end: 4, kind: kindE},
+			{id: 402, start: 2, end: 4, kind: kindE},
+		},
+	)
+	const query = `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) RETURN p`
+
+	for _, tc := range []struct {
+		name    string
+		perPair bool
+		want    []string
+	}{
+		{"overall shortest length", false, []string{"N:2,4,|E:402,"}},
+		{"per pair", true, []string{"N:1,3,4,|E:400,401,", "N:2,4,|E:402,"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rs, err := Execute(&Env{Snap: snap, AllShortestPerPair: tc.perPair}, planQuery(t, snap, query), generousBudget)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if got := pathSigsAtColumn(t, snap, rs, 0); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestExpandVarLengthBackwardArrowNamedPathWrittenOrder is a regression

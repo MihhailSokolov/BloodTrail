@@ -44,8 +44,11 @@ const (
 type Mode int
 
 const (
-	// ModeAll returns every shortest path per pair (allShortestPaths /
-	// FetchAllShortestPaths).
+	// ModeAll returns every shortest path per pair, each pair at its own
+	// length (FetchAllShortestPaths). FromCriteria only recognizes a single
+	// pair, where that is also cypher allShortestPaths()'s answer; over
+	// several pairs PostgreSQL may instead keep only the overall shortest
+	// length (see traverse.ModeAll).
 	ModeAll Mode = iota
 	// ModeOne returns a single shortest path per pair (cypher
 	// shortestPath()).

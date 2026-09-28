@@ -24,10 +24,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/cypher/models/pgsql"
 	"github.com/specterops/dawgs/cypher/models/pgsql/translate"
+	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -107,14 +110,144 @@ func (m snapshotKindMapper) AssertKinds(context.Context, graph.Kinds) ([]int16, 
 // input tree, and a panic during a gate check must never propagate out and
 // take down the query-serving path the same way an ordinary translation
 // error would not.
-func translateGateOK(ctx context.Context, q *cypher.RegularQuery, snap *snapshot.View) (ok bool) {
+func translateGateOK(ctx context.Context, q *cypher.RegularQuery, snap *snapshot.View) bool {
+	_, ok := translateGate(ctx, q, snap)
+	return ok
+}
+
+// translateGate is translateGateOK that also hands back the translation, for
+// a caller that needs to know what PostgreSQL will do with it (see
+// harnessSemantics). It translates with the optimizer setting the pg driver
+// itself compiles with (pg.OptimizedTranslationEnabled, drivers/pg/
+// compiler.go), since the optimizer is what picks a shortest-path harness.
+func translateGate(ctx context.Context, q *cypher.RegularQuery, snap *snapshot.View) (result translate.Result, ok bool) {
 	defer func() {
 		if recover() != nil {
-			ok = false
+			result, ok = translate.Result{}, false
 		}
 	}()
 
+	options := translate.Options{OptimizerMode: translate.OptimizerDisabled}
+	if pg.OptimizedTranslationEnabled() {
+		options.OptimizerMode = translate.OptimizerEnabled
+	}
+
 	mapper := snapshotKindMapper{kinds: snap.Kinds()}
-	_, err := translate.Translate(ctx, q, mapper, nil, int32(snap.Base().GraphID))
-	return err == nil
+	result, err := translate.TranslateWithOptions(ctx, q, mapper, nil, int32(snap.Base().GraphID), options)
+	return result, err == nil
+}
+
+// allShortestSemantics is how PostgreSQL resolves a query's allShortestPaths()
+// patterns, read off the harness calls in its translation.
+type allShortestSemantics int
+
+const (
+	// allShortestNone: the translation calls no asp harness.
+	allShortestNone allShortestSemantics = iota
+	// allShortestOverall: every asp harness returns at the first depth where
+	// any root reaches any terminal (traverse.ModeAll).
+	allShortestOverall
+	// allShortestPerPair: every asp harness resolves each root/terminal pair
+	// at its own depth (traverse.ModeAllPerPair).
+	allShortestPerPair
+	// allShortestMixed: the query has harnesses of both kinds.
+	allShortestMixed
+)
+
+// harnessSemantics classifies every asp harness call in stmt.
+// bidirectional_asp_harness resolves pairs one by one exactly when its
+// eighth argument, the pair filter, is non-empty (use_pair_filter in
+// drivers/pg/query/sql/schema_up.sql, dawgs v0.8.0); the translator passes
+// that argument only when it builds a pair filter (boundEndpointFilter
+// Parameters, translate/expansion.go). unidirectional_asp_harness and a
+// filterless bidirectional_asp_harness both stop at the query's first
+// satisfied depth.
+func harnessSemantics(stmt pgsql.Statement) allShortestSemantics {
+	semantics := allShortestNone
+	note := func(s allShortestSemantics) {
+		if semantics == allShortestNone || semantics == s {
+			semantics = s
+		} else {
+			semantics = allShortestMixed
+		}
+	}
+
+	for _, call := range functionCalls(stmt) {
+		switch call.Function {
+		case pgsql.FunctionUnidirectionalASPHarness:
+			note(allShortestOverall)
+		case pgsql.FunctionBidirectionalASPHarness:
+			if len(call.Parameters) >= 8 && nonEmptyTextArgument(call.Parameters[7]) {
+				note(allShortestPerPair)
+			} else {
+				note(allShortestOverall)
+			}
+		}
+	}
+	return semantics
+}
+
+// functionCalls collects every pgsql.FunctionCall in stmt. It walks the
+// tree by reflection because dawgs' own walk.PgSQL stops at the first node
+// type its cursor does not know, and the harness sits right behind one:
+// shortestPathSearchCTE selects `*` (pgsql.Wildcard) from the harness call.
+func functionCalls(stmt pgsql.Statement) []pgsql.FunctionCall {
+	var (
+		calls    []pgsql.FunctionCall
+		seen     = map[uintptr]bool{}
+		callType = reflect.TypeOf(pgsql.FunctionCall{})
+		visit    func(v reflect.Value)
+	)
+	visit = func(v reflect.Value) {
+		switch v.Kind() {
+		case reflect.Interface:
+			if !v.IsNil() {
+				visit(v.Elem())
+			}
+		case reflect.Pointer:
+			if v.IsNil() || seen[v.Pointer()] {
+				return
+			}
+			seen[v.Pointer()] = true
+			visit(v.Elem())
+		case reflect.Struct:
+			if v.Type() == callType {
+				calls = append(calls, v.Interface().(pgsql.FunctionCall))
+			}
+			for i := 0; i < v.NumField(); i++ {
+				if v.Type().Field(i).IsExported() {
+					visit(v.Field(i))
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < v.Len(); i++ {
+				visit(v.Index(i))
+			}
+		case reflect.Map:
+			iter := v.MapRange()
+			for iter.Next() {
+				visit(iter.Value())
+			}
+		}
+	}
+	visit(reflect.ValueOf(stmt))
+	return calls
+}
+
+// nonEmptyTextArgument reports whether expr is a string literal (possibly
+// wrapped in a type cast) with at least one character.
+func nonEmptyTextArgument(expr pgsql.Expression) bool {
+	switch typed := expr.(type) {
+	case pgsql.TypeCast:
+		return nonEmptyTextArgument(typed.Expression)
+	case *pgsql.TypeCast:
+		return nonEmptyTextArgument(typed.Expression)
+	case pgsql.Literal:
+		text, isText := typed.Value.(string)
+		return isText && text != ""
+	case *pgsql.Literal:
+		text, isText := typed.Value.(string)
+		return isText && text != ""
+	}
+	return false
 }

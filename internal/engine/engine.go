@@ -641,6 +641,12 @@ const (
 	// PostgreSQL itself would never return. See gate.go's package doc for
 	// why this check exists at all.
 	reasonTranslateGate = "translate_gate"
+	// reasonShortestSemantics is TryCypher-only: the query plans an
+	// allShortestPaths() step, but its translation does not say which of
+	// PostgreSQL's two answers it gets (traverse.ModeAll or
+	// traverse.ModeAllPerPair) -- its asp harnesses disagree, or it has
+	// none (harnessSemantics, gate.go).
+	reasonShortestSemantics = "shortest_semantics"
 	// reasonBudget is TryCypher-only: interpret.Execute reported
 	// interpret.ErrBudget -- the query's row or work budget (maxCypherRows/
 	// maxCypherWork, serve_cypher.go) was exceeded during materialization.
@@ -749,8 +755,13 @@ const cypherServedLogMessage = "bloodtrail: cypher engine served"
 //
 //  6. snap.MultiGraph -- decline reasonMultiGraph.
 //
-//  7. translateGateOK(ctx, cypher.Copy(rq), snap) false -- decline
-//     reasonTranslateGate. A *copy* of rq is handed to the gate, never rq
+//  7. translateGate(ctx, cypher.Copy(rq), snap) not ok -- decline
+//     reasonTranslateGate. For a query that plans an allShortestPaths()
+//     step, the same translation also says how PostgreSQL resolves it
+//     (harnessSemantics), which the interpreter must follow
+//     (Env.AllShortestPerPair); a translation with no asp harness, or with
+//     harnesses that disagree, declines reasonShortestSemantics. A *copy*
+//     of rq is handed to the gate, never rq
 //     itself: dawgs' own translator's optimizer can mutate the AST it is
 //     given in place (translateGateOK's own doc), and interpret.Plan's
 //     Query IR (already built from rq at step 5) holds direct pointers into
@@ -836,9 +847,21 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 	}
 
 	// A fresh copy, never rq itself -- see this method's own step 7 doc.
-	if !translateGateOK(ctx, cypher.Copy[*cypher.RegularQuery](rq), snap) {
+	translation, translated := translateGate(ctx, cypher.Copy[*cypher.RegularQuery](rq), snap)
+	if !translated {
 		e.decline(ctx, reasonTranslateGate, nil)
 		return nil, false
+	}
+	perPair := false
+	if q.HasAllShortestPaths() {
+		switch harnessSemantics(translation.Statement) {
+		case allShortestOverall:
+		case allShortestPerPair:
+			perPair = true
+		default:
+			e.decline(ctx, reasonShortestSemantics, nil)
+			return nil, false
+		}
 	}
 
 	if !serving {
@@ -846,7 +869,8 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	rs, err := safeExecuteCypher(&interpret.Env{Snap: snap, Now: time.Now()}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork, MaxLiveRows: maxCypherLiveRows})
+	env := &interpret.Env{Snap: snap, Now: time.Now(), AllShortestPerPair: perPair}
+	rs, err := safeExecuteCypher(env, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork, MaxLiveRows: maxCypherLiveRows})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
 		return nil, false
@@ -1179,13 +1203,15 @@ func buildKindMask(ctx context.Context, kindMapper pg.KindMapper, maxKindID snap
 
 // convertMode translates recognize.Mode to traverse.Mode. The two types are
 // deliberately kept separate (see the recognize package doc, which avoids a
-// recognize<->traverse import cycle) but their constants are defined in the
-// same order, so this mapping is total and always successful.
+// recognize<->traverse import cycle). recognize.ModeAll is per pair by
+// contract, so it maps to traverse.ModeAllPerPair; recognize.FromCriteria
+// only ever recognizes a single root/terminal pair, where that is also
+// PostgreSQL's allShortestPaths answer (traverse.ModeAllPerPair's doc).
 func convertMode(m recognize.Mode) traverse.Mode {
 	if m == recognize.ModeOne {
 		return traverse.ModeOne
 	}
-	return traverse.ModeAll
+	return traverse.ModeAllPerPair
 }
 
 // modeLabel renders m for the "bloodtrail: path engine served" log line.
