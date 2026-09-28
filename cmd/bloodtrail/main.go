@@ -75,7 +75,37 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, cmd func(context.Context, installer.Deps, installer.Options) error) error {
+	opts, err := parseFlags(args, os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if opts.AdminPassword == "" {
+		opts.AdminPassword = os.Getenv("BLOODTRAIL_ADMIN_PASSWORD")
+	}
+	opts.DriverVersion = strings.TrimPrefix(version, "v")
+	if opts.DriverVersion == "dev" {
+		opts.DriverVersion = ""
+	}
+	deps := installer.Deps{
+		Out:              os.Stdout,
+		InstallerVersion: version,
+		Confirm:          confirm,
+	}
+	return cmd(ctx, deps, opts)
+}
+
+// parseFlags parses a command's flags, reporting problems on errOut. It
+// returns flag.ErrHelp for -h, and errUsage for anything malformed --
+// including any argument left over after the flags. No command takes a
+// positional argument, and the flag package stops at the first one it meets,
+// so `rollback ./bh --yes --compose-file /x.yml` used to run a rollback that
+// had silently dropped both flags (no --yes, the default compose file).
+func parseFlags(args []string, errOut io.Writer) (installer.Options, error) {
 	fs := flag.NewFlagSet("bloodtrail", flag.ContinueOnError)
+	fs.SetOutput(errOut)
 	var opts installer.Options
 	fs.StringVar(&opts.ComposeFile, "compose-file", "docker-compose.yml", "path to the BloodHound compose file")
 	fs.StringVar(&opts.ProjectDir, "project-dir", "", "compose project directory (default: directory of the compose file)")
@@ -91,23 +121,16 @@ func run(ctx context.Context, args []string, cmd func(context.Context, installer
 	fs.DurationVar(&opts.VerifyTimeout, "verify-timeout", 20*time.Minute, "how long to wait for the API and the smoke test")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return nil
+			return opts, flag.ErrHelp
 		}
-		return errUsage
+		return opts, errUsage
 	}
-	if opts.AdminPassword == "" {
-		opts.AdminPassword = os.Getenv("BLOODTRAIL_ADMIN_PASSWORD")
+	if fs.NArg() > 0 {
+		_, _ = fmt.Fprintf(errOut, "unexpected argument %q: commands take no positional arguments, and every flag must come before anything that is not one (use --project-dir or --compose-file to name the deployment)\n", fs.Arg(0))
+		fs.Usage()
+		return opts, errUsage
 	}
-	opts.DriverVersion = strings.TrimPrefix(version, "v")
-	if opts.DriverVersion == "dev" {
-		opts.DriverVersion = ""
-	}
-	deps := installer.Deps{
-		Out:              os.Stdout,
-		InstallerVersion: version,
-		Confirm:          confirm,
-	}
-	return cmd(ctx, deps, opts)
+	return opts, nil
 }
 
 // confirm asks the question on stderr and reads the answer from the terminal.

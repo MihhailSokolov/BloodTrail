@@ -31,8 +31,8 @@ const testNeo4jPassword = "test-only"
 // neo4jNodeCount and neo4jEdgeCount are the exact commands the inventory runs
 // to count the Neo4j graph, minus the compose prefix each test builds.
 const (
-	neo4jNodeCount = "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell -u neo4j --format plain MATCH (n) RETURN count(n)"
-	neo4jEdgeCount = "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell -u neo4j --format plain MATCH ()-[r]->() RETURN count(r)"
+	neo4jNodeCount = "exec -T -e NEO4J_PASSWORD graph-db cypher-shell -u neo4j --format plain MATCH (n) RETURN count(n)"
+	neo4jEdgeCount = "exec -T -e NEO4J_PASSWORD graph-db cypher-shell -u neo4j --format plain MATCH ()-[r]->() RETURN count(r)"
 )
 
 func composeConfigJSON(image, driver string) []byte {
@@ -155,6 +155,21 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 
 	if !manifestExistsBeforeMigration {
 		t.Fatal("manifest must be saved before migration begins, so a failed migration can still be rolled back")
+	}
+
+	// The Neo4j password reaches cypher-shell through docker's environment,
+	// never through a command line (Compose.ExecEnv's doc).
+	passedByEnv := false
+	for i, call := range fake.Calls {
+		if strings.Contains(call, testNeo4jPassword) {
+			t.Fatalf("the Neo4j password is on a docker command line: %q", call)
+		}
+		for _, e := range fake.Envs[i] {
+			passedByEnv = passedByEnv || e == "NEO4J_PASSWORD="+testNeo4jPassword
+		}
+	}
+	if !passedByEnv {
+		t.Fatalf("the Neo4j password was never handed to docker's environment")
 	}
 
 	// Override file and .env
@@ -530,8 +545,8 @@ func TestInstallRefusesMigrationIntoPopulatedPostgres(t *testing.T) {
 			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 		},
 		Prefixes: map[string][]byte{
-			psql + "select (select count(*) from node)":                                        []byte("10|20\n"),
-			base + "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell": []byte("count\n10\n"),
+			psql + "select (select count(*) from node)":              []byte("10|20\n"),
+			base + "exec -T -e NEO4J_PASSWORD graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	deps := Deps{
@@ -697,7 +712,7 @@ func TestInstallRefusesUnknownImage(t *testing.T) {
 			"docker manifest inspect " + image: errors.New("no such manifest"),
 		},
 		Prefixes: map[string][]byte{
-			base + "exec -T -e NEO4J_PASSWORD=" + testNeo4jPassword + " graph-db cypher-shell": []byte("count\n10\n"),
+			base + "exec -T -e NEO4J_PASSWORD graph-db cypher-shell": []byte("count\n10\n"),
 		},
 	}
 	opts := Options{ComposeFile: composeFile, Image: image, Yes: true}
@@ -710,10 +725,13 @@ func TestInstallRefusesUnknownImage(t *testing.T) {
 	}
 }
 
-// TestInstallFallsBackToTheImageAlias covers a released CLI meeting a registry
-// where the image for its own version has not been built yet: the moving alias
-// for the same upstream release is the closest published thing.
-func TestInstallFallsBackToTheImageAlias(t *testing.T) {
+// TestInstallRefusesToSubstituteTheImageAlias covers a released CLI meeting a
+// registry where the image for its own version has not been built yet. The
+// moving alias for the same upstream release is republished from main by the
+// weekly image builds, so it may hold an unreleased driver: the install must
+// stop before changing anything and name the alias as an explicit --image
+// choice, never install it silently.
+func TestInstallRefusesToSubstituteTheImageAlias(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	repo := "ghcr.io/x/bt"
 	versioned, alias := repo+":v9.6.0-bt0.2.0", repo+":v9.6.0"
@@ -745,19 +763,18 @@ func TestInstallFallsBackToTheImageAlias(t *testing.T) {
 	var out bytes.Buffer
 	opts := Options{ComposeFile: composeFile, ImageRepo: repo, DriverVersion: "0.2.0", APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
-	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, opts); err != nil {
-		t.Fatalf("install failed: %v\noutput:\n%s", err, out.String())
+	err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, opts)
+	if err == nil {
+		t.Fatalf("install succeeded on the moving alias; a released CLI must not substitute it\noutput:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "falling back to "+alias) {
-		t.Fatalf("the fallback must be reported:\n%s", out.String())
+	if !strings.Contains(err.Error(), versioned) || !strings.Contains(err.Error(), "--image "+alias) {
+		t.Fatalf("the error must name the missing image and the explicit --image %s choice, got: %v", alias, err)
 	}
-	override, _ := os.ReadFile(overridePath)
-	if !strings.Contains(string(override), "image: "+alias) {
-		t.Fatalf("override should install the alias, got %s", override)
+	if fake.Called(base + "exec -T app-db pg_dump") {
+		t.Fatalf("nothing should be changed when the target image is missing:\n%s", strings.Join(fake.Calls, "\n"))
 	}
-	m, err := manifest.Load(dir)
-	if err != nil || m.TargetImage != alias {
-		t.Fatalf("the manifest must record the image actually installed: %+v err=%v", m, err)
+	if _, statErr := os.Stat(overridePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("no override may be written when the target image is missing (stat: %v)", statErr)
 	}
 }
 
@@ -811,7 +828,7 @@ func TestRollbackRestoresEverything(t *testing.T) {
 			psql + "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')": []byte("INSERT 0 1\n"),
 		},
 	}
-	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.bloodtrail.yml")); !os.IsNotExist(err) {
@@ -847,7 +864,7 @@ func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
 			psql + "delete from database_switch": nil,
 		},
 	}
-	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	if !fake.Called(psql + "delete from database_switch") {
@@ -882,7 +899,7 @@ func TestRollbackSaysWhatIsAlreadyRestoredWhenTheRestartFails(t *testing.T) {
 		},
 		Errors: map[string]error{base + "up -d": errors.New("port is already allocated")},
 	}
-	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, VerifyTimeout: time.Second})
+	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, VerifyTimeout: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "already restored") {
 		t.Fatalf("expected an error saying what is already restored, got %v", err)
 	}
@@ -1093,7 +1110,7 @@ func TestRollbackRemovesAnEnvEntryItCreated(t *testing.T) {
 		},
 	}
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
-		Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
@@ -1117,11 +1134,152 @@ func TestComposeHandleSkipsAMissingExtraFile(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, ".env"),
 		[]byte("COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml\n"), 0o644)
 
-	args := strings.Join(composeHandle(&dockerx.FakeRunner{}, composeFile, dir).Args("up", "-d"), " ")
+	c, err := composeHandle(&dockerx.FakeRunner{}, composeFile, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(c.Args("up", "-d"), " ")
 	if !strings.Contains(args, " -f "+present) {
 		t.Errorf("the file that is there was dropped: %s", args)
 	}
 	if strings.Contains(args, "docker-compose.bloodtrail.yml") {
 		t.Errorf("the file that is gone was passed on anyway: %s", args)
+	}
+}
+
+// TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry pins the fail
+// closed half of compose.ComposeFiles at the installer: an entry it cannot
+// read with certainty stops every command before it runs anything, rather
+// than addressing (and later rewriting) a guessed project.
+func TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=\"docker-compose.yml:${EXTRA}\"\n"), 0o644)
+	fake := &dockerx.FakeRunner{}
+
+	if err := Install(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true}); err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE") {
+		t.Fatalf("install: expected an error about the COMPOSE_FILE entry, got %v", err)
+	}
+
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml")}.Save(dir)
+	if err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true}); err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE") {
+		t.Fatalf("rollback: expected an error about the COMPOSE_FILE entry, got %v", err)
+	}
+	if len(fake.Calls) != 0 {
+		t.Fatalf("commands ran against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// TestOptionsMakeARelativeProjectDirAbsolute pins that --project-dir is made
+// absolute like --compose-file: the manifest records it, and a rollback run
+// from another working directory must still find the same project.
+func TestOptionsMakeARelativeProjectDirAbsolute(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	t.Chdir(dir)
+
+	opts := Options{ComposeFile: composeFile, ProjectDir: "."}
+	if err := opts.defaults(); err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(opts.ProjectDir) {
+		t.Fatalf("ProjectDir = %q, want an absolute path", opts.ProjectDir)
+	}
+	want, _ := filepath.Abs(".")
+	if opts.ProjectDir != want {
+		t.Fatalf("ProjectDir = %q, want %q", opts.ProjectDir, want)
+	}
+}
+
+// rollbackFixture saves a manifest for an installed project and scripts the
+// commands a full rollback of it runs.
+func rollbackFixture(t *testing.T) (dir, composeFile string, fake *dockerx.FakeRunner, api *httptest.Server) {
+	dir, composeFile = setupProject(t)
+	_ = os.WriteFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound"}.Save(dir)
+	api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	t.Cleanup(api.Close)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	fake = &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "up -d": nil,
+		installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc delete from database_switch": nil,
+	}}
+	return dir, composeFile, fake, api
+}
+
+// TestRollbackAsksBeforeChangingAnything pins that rollback confirms the way
+// install does: a "no" leaves the deployment exactly as it was, and --yes
+// skips the question.
+func TestRollbackAsksBeforeChangingAnything(t *testing.T) {
+	t.Run("declined", func(t *testing.T) {
+		dir, composeFile, fake, api := rollbackFixture(t)
+		asked := false
+		deps := Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
+			Confirm: func(string) bool { asked = true; return false }}
+		err := Rollback(context.Background(), deps, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second})
+		if err == nil || !strings.Contains(err.Error(), "aborted") {
+			t.Fatalf("expected an abort, got %v", err)
+		}
+		if !asked {
+			t.Fatal("rollback did not ask for confirmation")
+		}
+		if len(fake.Calls) != 0 {
+			t.Fatalf("a declined rollback ran commands:\n%s", strings.Join(fake.Calls, "\n"))
+		}
+		if _, err := os.Stat(filepath.Join(dir, "docker-compose.bloodtrail.yml")); err != nil {
+			t.Fatalf("a declined rollback removed the override: %v", err)
+		}
+		if !manifest.Exists(dir) {
+			t.Fatal("a declined rollback removed the manifest")
+		}
+	})
+	t.Run("--yes", func(t *testing.T) {
+		dir, composeFile, fake, api := rollbackFixture(t)
+		deps := Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
+			Confirm: func(string) bool { t.Fatal("confirm must not be called with Yes"); return false }}
+		if err := Rollback(context.Background(), deps, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second, Yes: true}); err != nil {
+			t.Fatal(err)
+		}
+		if manifest.Exists(dir) {
+			t.Fatal("rollback with --yes did not complete")
+		}
+	})
+}
+
+// TestStatusDistinguishesACorruptManifestFromNone pins that only a missing
+// manifest reads as "not installed": a corrupt one is an installation that
+// cannot be rolled back until it is repaired, and must be reported as an
+// error, never as a deployment that is free to install onto.
+func TestStatusDistinguishesACorruptManifestFromNone(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                       composeConfigJSON(upstreamImage, "bloodtrail"),
+			psql + "select driver from database_switch limit 1": []byte("bloodtrail\n"),
+			base + "ps --format json bloodhound":                []byte("[]\n"),
+		},
+		Prefixes: map[string][]byte{psql + "select (select count(*) from node)": []byte("10|20\n")},
+	}
+
+	var out bytes.Buffer
+	if err := Status(context.Background(), Deps{Runner: fake, Out: &out}, Options{ComposeFile: composeFile}); err != nil {
+		t.Fatalf("status with no manifest: %v", err)
+	}
+	if !strings.Contains(out.String(), "not installed") {
+		t.Fatalf("no manifest should read as not installed:\n%s", out.String())
+	}
+
+	_ = os.MkdirAll(filepath.Dir(manifest.Path(dir)), 0o755)
+	_ = os.WriteFile(manifest.Path(dir), []byte("{not json"), 0o644)
+	out.Reset()
+	err := Status(context.Background(), Deps{Runner: fake, Out: &out}, Options{ComposeFile: composeFile})
+	if err == nil {
+		t.Fatalf("status accepted a corrupt manifest:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "not installed") {
+		t.Fatalf("a corrupt manifest was reported as not installed:\n%s", out.String())
 	}
 }

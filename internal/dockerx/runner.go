@@ -37,6 +37,15 @@ type StreamRunner interface {
 	RunTo(ctx context.Context, stdout io.Writer, stdin io.Reader, name string, args ...string) error
 }
 
+// EnvRunner is a Runner that can also set environment variables for the
+// command it runs, which is how Compose.ExecEnv hands docker a secret without
+// putting it on the command line. Implementing it is optional; ExecEnv
+// refuses a Runner that does not.
+type EnvRunner interface {
+	Runner
+	RunEnv(ctx context.Context, env []string, stdin io.Reader, name string, args ...string) ([]byte, error)
+}
+
 // ExecRunner is the real Runner. Stderr receives the child's standard error
 // (defaults to os.Stderr) so operators see docker's own messages.
 type ExecRunner struct {
@@ -44,7 +53,17 @@ type ExecRunner struct {
 }
 
 func (s ExecRunner) Run(ctx context.Context, stdin io.Reader, name string, args ...string) ([]byte, error) {
+	return s.RunEnv(ctx, nil, stdin, name, args...)
+}
+
+// RunEnv is Run with env ("NAME=value" entries) added to the environment the
+// command inherits from this process. The values appear nowhere in the error
+// it returns.
+func (s ExecRunner) RunEnv(ctx context.Context, env []string, stdin io.Reader, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	cmd.Stdin = stdin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -54,7 +73,7 @@ func (s ExecRunner) Run(ctx context.Context, stdin io.Reader, name string, args 
 	}
 	cmd.Stderr = io.MultiWriter(&stderr, errSink)
 	if err := cmd.Run(); err != nil {
-		return stdout.Bytes(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return stdout.Bytes(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(redactArgs(args), " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.Bytes(), nil
 }
@@ -73,7 +92,24 @@ func (s ExecRunner) RunTo(ctx context.Context, stdout io.Writer, stdin io.Reader
 	}
 	cmd.Stderr = io.MultiWriter(&stderr, errSink)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(redactArgs(args), " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// redactArgs returns args with the value of every "-e NAME=value" /
+// "--env NAME=value" pair replaced, for error messages that echo a command
+// line. Compose.ExecEnv no longer puts values there at all; this keeps any
+// caller that still does from printing one.
+func redactArgs(args []string) []string {
+	out := append([]string(nil), args...)
+	for i := 1; i < len(out); i++ {
+		if out[i-1] != "-e" && out[i-1] != "--env" {
+			continue
+		}
+		if name, _, ok := strings.Cut(out[i], "="); ok {
+			out[i] = name + "=<redacted>"
+		}
+	}
+	return out
 }

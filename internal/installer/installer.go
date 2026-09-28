@@ -75,6 +75,11 @@ func (o *Options) defaults() error {
 	if o.ProjectDir == "" {
 		o.ProjectDir = filepath.Dir(abs)
 	}
+	// Absolute like the compose file: the manifest records it, and a later
+	// rollback run from another directory has to find the same project.
+	if o.ProjectDir, err = filepath.Abs(o.ProjectDir); err != nil {
+		return err
+	}
 	if o.ImageRepo == "" {
 		o.ImageRepo = DefaultImageRepo
 	}
@@ -117,7 +122,7 @@ func (d *Deps) defaults() {
 	}
 }
 
-func (o Options) compose(runner dockerx.Runner) dockerx.Compose {
+func (o Options) compose(runner dockerx.Runner) (dockerx.Compose, error) {
 	return composeHandle(runner, o.ComposeFile, o.ProjectDir)
 }
 
@@ -127,12 +132,19 @@ func (o Options) compose(runner dockerx.Runner) dockerx.Compose {
 // passed along or the project the installer reads and restarts is not the
 // project the operator runs -- and `up -d` would then recreate services
 // without the settings the operator keeps in those files.
-func composeHandle(runner dockerx.Runner, composeFile, projectDir string) dockerx.Compose {
+//
+// It fails when the project's .env cannot be read with certainty
+// (projectExtraFiles), which every command meets before it changes anything.
+func composeHandle(runner dockerx.Runner, composeFile, projectDir string) (dockerx.Compose, error) {
 	c := dockerx.Compose{Runner: runner, File: composeFile, ProjectDir: projectDir}
-	for _, f := range projectExtraFiles(composeFile, projectDir) {
+	extra, err := projectExtraFiles(composeFile, projectDir)
+	if err != nil {
+		return c, err
+	}
+	for _, f := range extra {
 		c = c.WithExtraFile(f)
 	}
-	return c
+	return c, nil
 }
 
 // projectExtraFiles resolves the files that must be merged after the base one,
@@ -148,17 +160,26 @@ func composeHandle(runner dockerx.Runner, composeFile, projectDir string) docker
 // header invites -- with an error telling them to rerun the command that
 // cannot succeed. The base file is never dropped this way; a missing one is
 // a real misconfiguration and compose says so.
-func projectExtraFiles(composeFile, projectDir string) []string {
-	envData, err := os.ReadFile(filepath.Join(projectDir, ".env"))
-	var listed []string
-	if err == nil {
-		listed = compose.ComposeFiles(string(envData))
+//
+// A .env that exists but cannot be read, or whose COMPOSE_FILE entry cannot
+// be parsed with certainty (compose.ComposeFiles), is an error rather than
+// "no entry": guessing there would address -- and later rewrite -- a
+// different project from the one the operator runs.
+func projectExtraFiles(composeFile, projectDir string) ([]string, error) {
+	envPath := filepath.Join(projectDir, ".env")
+	envData, err := os.ReadFile(envPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("reading %s: %w", envPath, err)
+	}
+	listed, err := compose.ComposeFiles(string(envData))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", envPath, err)
 	}
 	if len(listed) == 0 {
 		if auto := autoOverrideFile(composeFile); auto != "" {
-			return []string{auto}
+			return []string{auto}, nil
 		}
-		return nil
+		return nil, nil
 	}
 	var out []string
 	for _, f := range listed {
@@ -173,7 +194,7 @@ func projectExtraFiles(composeFile, projectDir string) []string {
 		}
 		out = append(out, f)
 	}
-	return out
+	return out, nil
 }
 
 // autoOverrideFile returns the override file docker compose would load beside
@@ -201,19 +222,21 @@ func imageExists(ctx context.Context, runner dockerx.Runner, image string) bool 
 	return err == nil
 }
 
-// resolveImage confirms the target image exists, falling back to the moving
-// alias for the same upstream release when the version-stamped tag is not
-// published. A CLI release always names an image built for its own version,
-// but the images are built on their own schedule, so that tag can lag behind.
-// The alias carries the newest driver build for the upstream release, which is
-// the closest thing to what was asked for.
+// resolveImage confirms the target image exists. It never substitutes the
+// moving alias for the same upstream release (alias) when a version-stamped
+// target is missing: the alias is republished by the weekly image builds from
+// main, so it can hold a driver no release ever shipped, and a released CLI
+// that silently installed it would put an untested build on the operator's
+// deployment under a version it does not match. The error names the alias
+// instead, so taking it is an explicit --image choice.
 func resolveImage(ctx context.Context, deps Deps, target, alias string) (string, error) {
 	if imageExists(ctx, deps.Runner, target) {
 		return target, nil
 	}
-	if alias != "" && alias != target && imageExists(ctx, deps.Runner, alias) {
-		_, _ = fmt.Fprintf(deps.Out, "    %s is not published; falling back to %s, which holds the newest driver build for this release\n", target, alias)
-		return alias, nil
+	if alias != "" && alias != target {
+		return "", fmt.Errorf("target image %s, built for this installer's version, is neither present locally nor in a registry; "+
+			"its release may not be published for this upstream version yet. %s holds the newest driver build for this upstream "+
+			"release, which may be unreleased; pass --image %s to install it anyway", target, alias, alias)
 	}
 	return "", fmt.Errorf("target image %s is neither present locally nor in a registry; build or pull it first", target)
 }
@@ -255,14 +278,18 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf("a previous install did not complete or is still installed in %s; run `bloodtrail rollback` first", opts.ProjectDir)
 	}
 
-	c := opts.compose(deps.Runner)
+	c, err := opts.compose(deps.Runner)
+	if err != nil {
+		return err
+	}
 	say("==> Inventory")
 	inv, store, err := takeInventory(ctx, c)
 	if err != nil {
 		return err
 	}
-	// alias is the moving tag for this upstream release, used only as a
-	// fallback for a derived target: an explicit --image is taken literally.
+	// alias is the moving tag for this upstream release, named only in the
+	// error for a derived target that is missing (resolveImage's doc): an
+	// explicit --image is taken literally.
 	target, alias := opts.Image, ""
 	if target == "" {
 		if inv.UpstreamTag == "" {
@@ -322,7 +349,11 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	// .env between here and that write, and an unreadable or absent file
 	// means no entry, which the write below handles on its own.
 	envProbe, _ := os.ReadFile(filepath.Join(opts.ProjectDir, ".env"))
-	envComposeFileCreated := len(compose.ComposeFiles(string(envProbe))) == 0
+	probed, err := compose.ComposeFiles(string(envProbe))
+	if err != nil {
+		return fmt.Errorf(".env: %w", err)
+	}
+	envComposeFileCreated := len(probed) == 0
 	m := manifest.Manifest{
 		InstallerVersion: deps.InstallerVersion, InstalledAt: opts.Now().UTC().Format(time.RFC3339),
 		ComposeFile: opts.ComposeFile, ProjectDir: opts.ProjectDir, ProjectName: inv.Config.Name,
@@ -432,7 +463,11 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 			baseFiles = append(baseFiles, autoRel)
 		}
 	}
-	if err := os.WriteFile(envPath, []byte(compose.AddComposeFile(string(envData), baseFiles, compose.OverrideFileName)), 0o644); err != nil {
+	newEnv, err := compose.AddComposeFile(string(envData), baseFiles, compose.OverrideFileName)
+	if err != nil {
+		return fmt.Errorf(".env: %w; %s", err, rollbackHint)
+	}
+	if err := os.WriteFile(envPath, []byte(newEnv), 0o644); err != nil {
 		return fmt.Errorf("writing .env: %w; %s", err, rollbackHint)
 	}
 	if err := store.Set(ctx, driverName); err != nil {
@@ -562,10 +597,30 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	say := func(format string, a ...any) { _, _ = fmt.Fprintf(deps.Out, format+"\n", a...) }
 
 	m, err := manifest.Load(opts.ProjectDir)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("no BloodTrail installation found in %s: %w", opts.ProjectDir, err)
+	} else if err != nil {
+		return fmt.Errorf("the install manifest %s cannot be used: %w", manifest.Path(opts.ProjectDir), err)
 	}
-	c := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir)
+
+	// Rollback changes the deployment exactly as much as install does -- the
+	// driver row, the compose files, a restart onto another image -- so it
+	// asks the same way, and --yes skips the question the same way.
+	say("    project:        %s (%s)", m.ProjectName, m.ProjectDir)
+	say("    restore image:  %s", m.OriginalImage)
+	if m.OriginalDriverRow != nil {
+		say("    restore driver: %s", *m.OriginalDriverRow)
+	} else {
+		say("    restore driver: none (the row is deleted)")
+	}
+	if !opts.Yes && !deps.Confirm("Proceed with the rollback?") {
+		return errors.New("aborted by user")
+	}
+
+	c, err := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir)
+	if err != nil {
+		return err
+	}
 	store := dbswitch.Store{Compose: c, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 
 	say("==> Restoring the graph driver setting")
@@ -591,9 +646,12 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		// line behind would keep compose's file discovery off, so the
 		// operator's conventional override file would stay unloaded by their
 		// own commands even after the rollback.
-		restoredEnv := compose.RemoveComposeFile(string(envData), compose.OverrideFileName)
+		restoredEnv, err := compose.RemoveComposeFile(string(envData), compose.OverrideFileName)
 		if m.EnvComposeFileCreated {
-			restoredEnv = compose.RemoveComposeFileLine(string(envData))
+			restoredEnv, err = compose.RemoveComposeFileLine(string(envData))
+		}
+		if err != nil {
+			return fmt.Errorf(".env: %w", err)
 		}
 		if err := os.WriteFile(envPath, []byte(restoredEnv), 0o644); err != nil {
 			return err
@@ -606,7 +664,11 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	// about the rollback being incomplete. Say so: the manifest is still
 	// there, and rerunning rollback picks up where this left off.
 	restored := "the driver row and the compose files are already restored; rerun `bloodtrail rollback` once the deployment can start"
-	if err := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir).Up(ctx); err != nil {
+	restarted, err := composeHandle(deps.Runner, m.ComposeFile, m.ProjectDir)
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, restored)
+	}
+	if err := restarted.Up(ctx); err != nil {
 		return fmt.Errorf("restarting with the original image: %w (%s)", err, restored)
 	}
 	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
@@ -685,17 +747,29 @@ func Status(ctx context.Context, deps Deps, opts Options) error {
 		return err
 	}
 	deps.defaults()
-	c := opts.compose(deps.Runner)
+	c, err := opts.compose(deps.Runner)
+	if err != nil {
+		return err
+	}
 	inv, _, err := takeInventory(ctx, c)
 	if err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(deps.Out, "project:       %s\nconfigured:    %s\nrunning:       %s\nactive driver: %s\n",
 		inv.Config.Name, inv.Image, runningImage(ctx, c, bloodhoundService), inv.ActiveDriver)
-	if m, err := manifest.Load(opts.ProjectDir); err == nil {
+	// Only a missing manifest means "not installed". One that is there but
+	// unreadable or corrupt belongs to an installation rollback cannot undo
+	// until it is repaired, and reporting it as "not installed" would invite
+	// a second install over the first.
+	m, err := manifest.Load(opts.ProjectDir)
+	switch {
+	case err == nil:
 		_, _ = fmt.Fprintf(deps.Out, "bloodtrail:    installed %s, image %s, backups %s\n", m.InstalledAt, m.TargetImage, m.BackupDir)
-	} else {
+	case errors.Is(err, os.ErrNotExist):
 		_, _ = fmt.Fprintln(deps.Out, "bloodtrail:    not installed")
+	default:
+		_, _ = fmt.Fprintln(deps.Out, "bloodtrail:    install manifest present but unreadable")
+		return fmt.Errorf("the install manifest %s cannot be used: %w", manifest.Path(opts.ProjectDir), err)
 	}
 	return nil
 }
@@ -706,5 +780,9 @@ func Verify(ctx context.Context, deps Deps, opts Options) error {
 		return err
 	}
 	deps.defaults()
-	return runVerification(ctx, deps, opts, opts.compose(deps.Runner))
+	c, err := opts.compose(deps.Runner)
+	if err != nil {
+		return err
+	}
+	return runVerification(ctx, deps, opts, c)
 }

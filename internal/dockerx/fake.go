@@ -12,7 +12,11 @@ import (
 // FakeRunner scripts command outputs for tests. Keys are the full command line
 // joined by single spaces, e.g. "docker compose -f x up -d".
 type FakeRunner struct {
-	Calls    []string
+	Calls []string
+	// Envs holds, for each entry of Calls, the environment entries RunEnv was
+	// given (nil for a plain Run), so a test can check that a secret went to
+	// the environment and not onto the command line.
+	Envs     [][]string
 	Outputs  map[string][]byte
 	Errors   map[string]error
 	Prefixes map[string][]byte // fallback when no exact Outputs/Errors key matches
@@ -24,9 +28,15 @@ type FakeRunner struct {
 	Sequences map[string][][]byte
 }
 
-func (s *FakeRunner) Run(_ context.Context, _ io.Reader, name string, args ...string) ([]byte, error) {
+func (s *FakeRunner) Run(ctx context.Context, stdin io.Reader, name string, args ...string) ([]byte, error) {
+	return s.RunEnv(ctx, nil, stdin, name, args...)
+}
+
+// RunEnv records env alongside the call, then answers exactly as Run does.
+func (s *FakeRunner) RunEnv(_ context.Context, env []string, _ io.Reader, name string, args ...string) ([]byte, error) {
 	line := strings.Join(append([]string{name}, args...), " ")
 	s.Calls = append(s.Calls, line)
+	s.Envs = append(s.Envs, env)
 	if key := longestPrefix(line, s.Sequences); key != "" {
 		out := s.Sequences[key][0]
 		s.Sequences[key] = s.Sequences[key][1:]
