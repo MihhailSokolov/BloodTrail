@@ -45,11 +45,13 @@ func mustFiles(t *testing.T, env string) []string {
 
 // TestComposeFileEntrySpellingsAreReadAndRewrittenInPlace pins the dotenv
 // shapes compose accepts for COMPOSE_FILE: quoted values, an export prefix,
-// spaces around '=', a trailing comment. Each must be read as the same list,
-// extended in place (keeping its spelling, never adding a second line, which
-// compose would honour instead), and restored in place. These used to be
-// missed entirely: the installer appended a second entry, and rollback left
-// the operator's own line behind.
+// spaces around '=', a trailing comment, the YAML-style `KEY: value` its
+// parser also takes, and a CRLF line in a file that otherwise ends lines
+// with LF (compose reads every line whatever its ending). Each must be read
+// as the same list, extended in place (keeping its spelling, never adding a
+// second line, which compose would honour instead), and restored in place.
+// These used to be missed entirely: the installer appended a second entry,
+// and rollback left the operator's own line behind.
 func TestComposeFileEntrySpellingsAreReadAndRewrittenInPlace(t *testing.T) {
 	cases := []struct {
 		name, line, added string
@@ -61,6 +63,9 @@ func TestComposeFileEntrySpellingsAreReadAndRewrittenInPlace(t *testing.T) {
 		{"spaced", `COMPOSE_FILE = docker-compose.yml:extra.yml`, `COMPOSE_FILE = docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml`},
 		{"commented", `COMPOSE_FILE=docker-compose.yml:extra.yml # ours`, `COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml # ours`},
 		{"quoted and commented", `COMPOSE_FILE="docker-compose.yml:extra.yml"  # ours`, `COMPOSE_FILE="docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml"  # ours`},
+		{"yaml-style", `COMPOSE_FILE: docker-compose.yml:extra.yml`, `COMPOSE_FILE: docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml`},
+		{"yaml-style unspaced", `COMPOSE_FILE:docker-compose.yml:extra.yml`, `COMPOSE_FILE:docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml`},
+		{"CRLF line in an LF file", "COMPOSE_FILE=docker-compose.yml:extra.yml\r", "COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml\r"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -85,19 +90,88 @@ func TestComposeFileEntrySpellingsAreReadAndRewrittenInPlace(t *testing.T) {
 	}
 }
 
+// TestComposeFileEntryIsFoundWhateverTheFileAroundIt covers what surrounds
+// the entry rather than its own spelling: a UTF-8 byte order mark, which
+// Windows editors write and compose skips, an LF line in a file that
+// otherwise ends lines with CRLF, and blank lines at the end. Compose reads
+// the entry in each. The parser used to miss it after a byte order mark, and
+// split a mixed file on CRLF alone -- missing the entry, or reading the next
+// line into it -- so the installer appended a second entry; and every
+// rewrite dropped the blank lines.
+func TestComposeFileEntryIsFoundWhateverTheFileAroundIt(t *testing.T) {
+	cases := []struct {
+		name, env, added, gone string
+	}{
+		{"byte order mark",
+			"\ufeffCOMPOSE_FILE=docker-compose.yml:extra.yml\nA=b\n",
+			"\ufeffCOMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml\nA=b\n",
+			"\ufeffA=b\n"},
+		{"LF line in a CRLF file",
+			"A=b\r\nCOMPOSE_FILE=docker-compose.yml:extra.yml\nC=d\r\n",
+			"A=b\r\nCOMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml\nC=d\r\n",
+			"A=b\r\nC=d\r\n"},
+		{"trailing blank lines",
+			"COMPOSE_FILE=docker-compose.yml:extra.yml\n\n",
+			"COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.bloodtrail.yml\n\n",
+			"\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := strings.Join(mustFiles(t, c.env), ","); got != "docker-compose.yml,extra.yml" {
+				t.Fatalf("ComposeFiles = %q", got)
+			}
+			added := mustAdd(t, c.env, []string{"docker-compose.yml"}, OverrideFileName)
+			if added != c.added {
+				t.Fatalf("AddComposeFile = %q, want %q", added, c.added)
+			}
+			if removed := mustRemove(t, added, OverrideFileName); removed != c.env {
+				t.Fatalf("RemoveComposeFile = %q, want the original %q", removed, c.env)
+			}
+			if gone := mustRemoveLine(t, added); gone != c.gone {
+				t.Fatalf("RemoveComposeFileLine = %q, want %q", gone, c.gone)
+			}
+		})
+	}
+}
+
+// TestAddedLineComesOffWithoutATrace pins what rollback relies on when the
+// install created the entry: adding the line and removing it again gives the
+// file back byte for byte -- blank lines, byte order mark and line endings
+// included.
+func TestAddedLineComesOffWithoutATrace(t *testing.T) {
+	for _, env := range []string{"", "A=b\n", "A=b\n\n", "\ufeffA=b\n", "A=b\r\n\r\n"} {
+		added := mustAdd(t, env, []string{"docker-compose.yml"}, OverrideFileName)
+		if gone := mustRemoveLine(t, added); gone != env {
+			t.Errorf("adding to %q and removing the line again gave %q", env, gone)
+		}
+	}
+}
+
 // TestComposeFileEntryFailsClosed pins that an entry the parser cannot read
 // with certainty is an error from every function, never a guess the
-// installer then writes back.
+// installer then writes back. That includes lists compose itself fails to
+// load: an empty entry between separators, which it resolves to the project
+// directory, and spaces around an entry, which it keeps as part of the file
+// name. These used to be tidied up instead -- dropped or trimmed -- so the
+// installer ran against, and wrote back, a project compose never loads.
 func TestComposeFileEntryFailsClosed(t *testing.T) {
 	for _, env := range []string{
-		"COMPOSE_FILE=\"docker-compose.yml:extra.yml\n",        // unterminated quote
-		"COMPOSE_FILE=\"docker-compose.yml:${EXTRA}\"\n",       // interpolation
-		"COMPOSE_FILE=docker-compose.yml:$EXTRA\n",             // interpolation
-		"COMPOSE_FILE=\"docker-compose.yml\\:extra.yml\"\n",    // escape
-		"COMPOSE_FILE=\"docker-compose.yml\" extra.yml\n",      // text after the quote
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE=b.yml\n",             // two entries
-		"export COMPOSE_FILE\n",                                // no value
-		"COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml;b.yml\n", // another separator
+		"COMPOSE_FILE=\"docker-compose.yml:extra.yml\n",         // unterminated quote
+		"COMPOSE_FILE=\"docker-compose.yml:${EXTRA}\"\n",        // interpolation
+		"COMPOSE_FILE=docker-compose.yml:$EXTRA\n",              // interpolation
+		"COMPOSE_FILE=\"docker-compose.yml\\:extra.yml\"\n",     // escape
+		"COMPOSE_FILE='docker-compose.yml:extra.yml\\' # x'\n",  // escaped quote, which compose honours in single quotes too
+		"COMPOSE_FILE=\"docker-compose.yml\" extra.yml\n",       // text after the quote
+		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE=b.yml\n",              // two entries
+		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE: b.yml\n",             // two entries, one YAML-style
+		"export COMPOSE_FILE\n",                                 // no value
+		"COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml;b.yml\n",  // another separator
+		"COMPOSE_PATH_SEPARATOR: ;\nCOMPOSE_FILE=a.yml;b.yml\n", // another separator, YAML-style
+		"COMPOSE_FILE=docker-compose.yml::extra.yml\n",          // empty entry
+		"COMPOSE_FILE=docker-compose.yml:\n",                    // empty entry at the end
+		"COMPOSE_FILE=:docker-compose.yml\n",                    // empty entry at the start
+		"COMPOSE_FILE=docker-compose.yml : extra.yml\n",         // spaces around entries
+		"COMPOSE_FILE=\" docker-compose.yml:extra.yml\"\n",      // a space inside the quotes
 	} {
 		t.Run(env, func(t *testing.T) {
 			if _, err := ComposeFiles(env); err == nil {
@@ -194,7 +268,12 @@ func TestComposeFiles(t *testing.T) {
 		{"single", "COMPOSE_FILE=docker-compose.yml\n", "docker-compose.yml"},
 		{"several", "A=b\nCOMPOSE_FILE=docker-compose.yml:extra.yml:/srv/abs.yml\n", "docker-compose.yml,extra.yml,/srv/abs.yml"},
 		{"crlf", "COMPOSE_FILE=docker-compose.yml:extra.yml\r\n", "docker-compose.yml,extra.yml"},
-		{"empty entries dropped", "COMPOSE_FILE=docker-compose.yml::\n", "docker-compose.yml"},
+		// Compose starts an inline comment only at " #": a '#' after a tab,
+		// or inside a name, is part of the file name, and reading it any
+		// other way would address a project compose does not load.
+		{"comment after a space", "COMPOSE_FILE=docker-compose.yml:extra.yml # ours\n", "docker-compose.yml,extra.yml"},
+		{"no comment after a tab", "COMPOSE_FILE=docker-compose.yml:extra.yml\t# ours\n", "docker-compose.yml,extra.yml\t# ours"},
+		{"no comment inside a name", "COMPOSE_FILE=docker-compose.yml:extra#1.yml\n", "docker-compose.yml,extra#1.yml"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
