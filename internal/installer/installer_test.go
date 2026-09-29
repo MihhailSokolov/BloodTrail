@@ -1346,6 +1346,8 @@ func TestRollbackKeepsFilesAddedToTheEntryItCreated(t *testing.T) {
 				base + "up -d":                nil,
 				base + "-f " + tls + " up -d": nil,
 			}}
+			scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
+			scriptLineageEnd(fake, base+"-f "+tls+" exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 			if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
 				t.Fatalf("rollback: %v", err)
 			}
@@ -1424,6 +1426,7 @@ func TestRollbackWorksOnWhatEarlierInstallsLeft(t *testing.T) {
 				project(c.first) + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
 				project(c.restart) + "up -d": nil,
 			}}
+			scriptLineageEnd(fake, project(c.restart)+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 			var out bytes.Buffer
 			if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out},
 				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
@@ -1463,6 +1466,7 @@ func TestRollbackOfAnInstallThatNeverWroteTheEntry(t *testing.T) {
 		base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
 		base + "up -d": nil,
 	}}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	var out bytes.Buffer
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out},
 		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
@@ -1794,6 +1798,7 @@ func scriptPGInstall(fake *dockerx.FakeRunner, project, overridePath, image stri
 		fake.Outputs[cmd] = out
 	}
 	fake.Prefixes[psql+"select (select count(*) from node)"] = []byte("10|20\n")
+	scriptLineageEnd(fake, psql)
 	return fake
 }
 
@@ -1856,6 +1861,7 @@ func TestInstallStopsOnAnEmptyComposeFileEntry(t *testing.T) {
 				psql + restoreRow:           []byte("INSERT 0 1\n"),
 				discoveredProject + "up -d": nil,
 			}}
+			scriptLineageEnd(fake, discoveredProject+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 			err = Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
 				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second})
 			env, _ = os.ReadFile(envPath)
