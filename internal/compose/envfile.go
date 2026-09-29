@@ -21,7 +21,7 @@ type composeFileEntry struct {
 	index  int      // line number within envFile.lines
 	prefix string   // the line up to where the value starts
 	quote  string   // "", "'" or `"`
-	files  []string // the list as compose reads it: never empty, no name empty or space-padded
+	files  []string // the list as written, split on ":" -- empty names included
 	suffix string   // what follows the value and its closing quote
 }
 
@@ -45,20 +45,33 @@ func (e composeFileEntry) render(files []string) string {
 // (compose honours the last one) and rollback left the operator's entry
 // behind.
 //
-// A list compose itself fails to load is refused as well, never tidied up
-// into one it would load. An entry that lists no files (`COMPOSE_FILE=`,
-// `COMPOSE_FILE=""`) is not unset to compose: the key alone switches its file
-// discovery off, and the empty path resolves to the project directory, so
-// every plain `docker compose` there fails. Taken for no entry, it used to be
-// rewritten to name the installer's override alone, dropping the base file
-// and the conventional override from the operator's own commands, and
-// rollback then deleted the line outright. An empty name between separators
-// fails the same way, and compose keeps spaces around a name as part of it.
+// Other keys' values are followed as compose reads them too: a quoted one
+// runs on across lines to its closing quote, so a COMPOSE_FILE line inside it
+// is part of that value, not an entry; and what follows a closing quote on
+// the same line is read as further assignments, among which the entry could
+// not be rewritten in place, so it is refused there.
+//
+// The names come back exactly as written. A list compose itself fails to
+// load -- no files, an empty name, spaces around one -- is refused only by
+// the readers install goes by (strictComposeFile), since rollback has to
+// undo what earlier installs left in exactly those shapes.
 func findComposeFile(lines []string) (*composeFileEntry, error) {
 	var found *composeFileEntry
+	var open byte // the quote of another key's value left open by an earlier line
 	for i, raw := range lines {
 		line := strings.TrimRight(raw, "\r")
 		cr := raw[len(line):]
+		if open != 0 {
+			end := closingQuote(line, open)
+			if end < 0 {
+				continue
+			}
+			var err error
+			if open, err = afterQuote(line[end+1:], i+1); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		key, value, hasValue, ok := splitAssignment(line)
 		if !ok {
 			continue
@@ -68,6 +81,12 @@ func findComposeFile(lines []string) (*composeFileEntry, error) {
 			return nil, fmt.Errorf(".env line %d sets %s, which this installer does not support; remove it or set COMPOSE_FILE by hand", i+1, composePathSeparatorKey)
 		case composeFileKey:
 		default:
+			if hasValue {
+				var err error
+				if open, err = skipValue(value, i+1); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 		if !hasValue {
@@ -85,6 +104,85 @@ func findComposeFile(lines []string) (*composeFileEntry, error) {
 		found = &entry
 	}
 	return found, nil
+}
+
+// strictComposeFile is findComposeFile for the readers install goes by: it
+// also refuses a list compose itself fails to load, rather than have the
+// installer run against -- or tidy it up into -- one compose never loads. An
+// entry that lists no files (`COMPOSE_FILE=`, `COMPOSE_FILE=""`) is not unset
+// to compose: the key alone switches its file discovery off, and the empty
+// path resolves to the project directory, so every plain `docker compose`
+// there fails. Taken for no entry, it used to be rewritten to name the
+// installer's override alone, dropping the base file and the conventional
+// override from the operator's own commands, and rollback then deleted the
+// line outright. An empty name between separators fails the same way, and
+// compose keeps spaces around a name as part of it.
+func strictComposeFile(lines []string) (*composeFileEntry, error) {
+	entry, err := findComposeFile(lines)
+	if err != nil || entry == nil {
+		return nil, err
+	}
+	line := entry.index + 1
+	if strings.Trim(strings.Join(entry.files, ":"), ": \t") == "" {
+		return nil, fmt.Errorf(".env line %d: %s lists no files; docker compose does not read that as unset but fails to load the project, so delete the line to let compose find its files on its own, or list them", line, composeFileKey)
+	}
+	for _, f := range entry.files {
+		switch {
+		case f == "":
+			return nil, fmt.Errorf(".env line %d: %s has an empty entry, which docker compose reads as the project directory and fails on; remove the extra ':'", line, composeFileKey)
+		case strings.TrimSpace(f) != f:
+			return nil, fmt.Errorf(".env line %d: %s: docker compose keeps the spaces around %q as part of the file name; remove them", line, composeFileKey, f)
+		}
+	}
+	return entry, nil
+}
+
+// skipValue follows the value of a key other than COMPOSE_FILE -- value is
+// the raw text after its `=` -- as compose reads it: an unquoted value runs
+// to the end of the line, a quoted one to its closing quote, which may be on
+// a later line. It returns the quote still open at the end of the line, or 0.
+func skipValue(value string, line int) (byte, error) {
+	v := strings.TrimLeft(value, " \t")
+	if v == "" || (v[0] != '"' && v[0] != '\'') {
+		return 0, nil
+	}
+	end := closingQuote(v[1:], v[0])
+	if end < 0 {
+		return v[0], nil
+	}
+	return afterQuote(v[end+2:], line)
+}
+
+// afterQuote reads what follows a closing quote on its line, which compose
+// takes for further assignments.
+func afterQuote(rest string, line int) (byte, error) {
+	key, value, hasValue, ok := splitAssignment(rest)
+	switch {
+	case !ok:
+		return 0, nil
+	case key == composeFileKey || key == composePathSeparatorKey:
+		return 0, fmt.Errorf(".env line %d sets %s after another value on the same line, which this installer does not support; put it on a line of its own", line, key)
+	case !hasValue:
+		return 0, nil
+	}
+	return skipValue(value, line)
+}
+
+// closingQuote returns where quote q closes in s -- at the first q no
+// backslash escapes, as compose reads either kind of quotes -- or -1.
+func closingQuote(s string, q byte) int {
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case s[i] == '\\':
+			escaped = true
+		case s[i] == q:
+			return i
+		}
+	}
+	return -1
 }
 
 // splitAssignment splits a dotenv line into its key and the raw text after
@@ -141,18 +239,7 @@ func parseComposeFileValue(head, value string) (composeFileEntry, error) {
 		}
 	}
 
-	if strings.Trim(list, ": \t") == "" {
-		return entry, fmt.Errorf("%s lists no files; docker compose does not read that as unset but fails to load the project, so delete the line to let compose find its files on its own, or list them", composeFileKey)
-	}
-	for _, f := range strings.Split(list, ":") {
-		switch {
-		case f == "":
-			return entry, fmt.Errorf("%s has an empty entry, which docker compose reads as the project directory and fails on; remove the extra ':'", composeFileKey)
-		case strings.TrimSpace(f) != f:
-			return entry, fmt.Errorf("%s: docker compose keeps the spaces around %q as part of the file name; remove them", composeFileKey, f)
-		}
-		entry.files = append(entry.files, f)
-	}
+	entry.files = strings.Split(list, ":")
 	return entry, nil
 }
 
@@ -174,10 +261,25 @@ func commentStart(v string) int {
 // ComposeFiles returns the files listed in the .env contents' COMPOSE_FILE
 // entry, in order, or nil when there is no such line. Paths are returned as
 // written, so relative entries still have to be resolved against the compose
-// project directory. An entry it cannot read with certainty, or one that
-// lists no files, is an error (see findComposeFile), so nil always means
-// there is no line.
+// project directory. An entry it cannot read with certainty, or a list
+// compose itself cannot load, is an error (see findComposeFile and
+// strictComposeFile), so nil always means there is no line. This is the
+// reading install goes by.
 func ComposeFiles(env string) ([]string, error) {
+	entry, err := strictComposeFile(parseEnvFile(env).lines)
+	if err != nil || entry == nil {
+		return nil, err
+	}
+	return entry.files, nil
+}
+
+// ListedComposeFiles is ComposeFiles for the commands that have to keep
+// working on whatever an install -- this one or an earlier version -- left
+// behind: rollback, status, verify. The names come back as written, empty
+// ones included, even where compose itself could not load the list; only an
+// entry that cannot be read with certainty is an error, and nil still means
+// there is no line.
+func ListedComposeFiles(env string) ([]string, error) {
 	entry, err := findComposeFile(parseEnvFile(env).lines)
 	if err != nil || entry == nil {
 		return nil, err
@@ -199,7 +301,7 @@ func ComposeFiles(env string) ([]string, error) {
 // commands, permanently and invisibly.
 func AddComposeFile(env string, baseFiles []string, overrideFile string) (string, error) {
 	f := parseEnvFile(env)
-	entry, err := findComposeFile(f.lines)
+	entry, err := strictComposeFile(f.lines)
 	if err != nil {
 		return "", err
 	}
@@ -219,8 +321,24 @@ func AddComposeFile(env string, baseFiles []string, overrideFile string) (string
 // line only if the override was the sole entry. Use RemoveComposeFileLine
 // instead when the install created the entry itself: what has to be restored
 // then is the absence of the line, not a line naming the base file (see
-// AddComposeFile for why a present line is not equivalent to no line).
+// AddComposeFile for why a present line is not equivalent to no line). The
+// other names are kept exactly as written, even ones compose cannot load.
 func RemoveComposeFile(env, overrideFile string) (string, error) {
+	return takeOut(env, overrideFile, false)
+}
+
+// RestoreEmptyComposeFile drops the override from COMPOSE_FILE like
+// RemoveComposeFile, but keeps the line when nothing else is listed, spelled
+// as it was. That puts back an entry which was empty before an earlier
+// install took it for none and wrote its override into it -- as
+// `COMPOSE_FILE=docker-compose.bloodtrail.yml` in the operator's own
+// spelling, or, from before entries were parsed at all, as
+// `COMPOSE_FILE=:docker-compose.bloodtrail.yml`.
+func RestoreEmptyComposeFile(env, overrideFile string) (string, error) {
+	return takeOut(env, overrideFile, true)
+}
+
+func takeOut(env, overrideFile string, keepLine bool) (string, error) {
 	f := parseEnvFile(env)
 	entry, err := findComposeFile(f.lines)
 	if err != nil || entry == nil {
@@ -232,7 +350,10 @@ func RemoveComposeFile(env, overrideFile string) (string, error) {
 			kept = append(kept, file)
 		}
 	}
-	if len(kept) == 0 {
+	switch {
+	case len(kept) == len(entry.files):
+		return env, nil
+	case len(kept) == 0 && !keepLine:
 		return f.removeLine(entry.index).String(), nil
 	}
 	f.lines[entry.index] = entry.render(kept)

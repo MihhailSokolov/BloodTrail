@@ -134,6 +134,61 @@ func TestComposeFileEntryIsFoundWhateverTheFileAroundIt(t *testing.T) {
 	}
 }
 
+// TestComposeFileLineInsideAnotherValueIsNotTheEntry covers a COMPOSE_FILE
+// line inside another variable's quoted value, which compose reads on across
+// lines to the closing quote -- a backslash-escaped quote does not close it.
+// That line is part of the value, not an entry (confirmed with Compose
+// v5.1.1), but used to be read as one: as the entry, or as a second entry
+// beside the real one.
+func TestComposeFileLineInsideAnotherValueIsNotTheEntry(t *testing.T) {
+	for _, c := range []struct {
+		name, env, files string
+	}{
+		{"double quotes", "CERT=\"-----BEGIN\nCOMPOSE_FILE=evil.yml\n-----END\"\n", ""},
+		{"single quotes", "CERT='-----BEGIN\nCOMPOSE_FILE=evil.yml\n-----END'\n", ""},
+		{"an escaped quote", "CERT=\"a\\\"\nCOMPOSE_FILE=evil.yml\n\"\n", ""},
+		{"YAML-style key", "CERT: '-----BEGIN\nCOMPOSE_FILE=evil.yml\n-----END' # pem\n", ""},
+		{"the entry after it", "CERT=\"-----BEGIN\nCOMPOSE_FILE=evil.yml\n-----END\"\nCOMPOSE_FILE=docker-compose.yml:extra.yml\n", "docker-compose.yml,extra.yml"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := strings.Join(mustFiles(t, c.env), ","); got != c.files {
+				t.Fatalf("ComposeFiles = %q, want %q", got, c.files)
+			}
+			added := mustAdd(t, c.env, []string{"docker-compose.yml"}, OverrideFileName)
+			want := c.env + "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"
+			if c.files != "" {
+				want = strings.Replace(c.env, ":extra.yml\n", ":extra.yml:docker-compose.bloodtrail.yml\n", 1)
+			}
+			if added != want {
+				t.Fatalf("AddComposeFile = %q, want %q", added, want)
+			}
+		})
+	}
+}
+
+// TestRestoreEmptyComposeFile pins what rollback puts back when an earlier
+// install took an empty entry for none and wrote its override into it --
+// `COMPOSE_FILE=docker-compose.bloodtrail.yml` in the operator's own spelling,
+// or `COMPOSE_FILE=:docker-compose.bloodtrail.yml` from before entries were
+// parsed at all: the empty entry, exactly as it was.
+func TestRestoreEmptyComposeFile(t *testing.T) {
+	for _, c := range []struct {
+		env, want string
+	}{
+		{"A=b\nCOMPOSE_FILE=docker-compose.bloodtrail.yml\nC=d\n", "A=b\nCOMPOSE_FILE=\nC=d\n"},
+		{"COMPOSE_FILE=\"docker-compose.bloodtrail.yml\"\n", "COMPOSE_FILE=\"\"\n"},
+		{"export COMPOSE_FILE='docker-compose.bloodtrail.yml' # ours\n", "export COMPOSE_FILE='' # ours\n"},
+		{"COMPOSE_FILE=:docker-compose.bloodtrail.yml\n", "COMPOSE_FILE=\n"},
+		{"A=b\r\nCOMPOSE_FILE=docker-compose.bloodtrail.yml\r\n", "A=b\r\nCOMPOSE_FILE=\r\n"},
+		{"COMPOSE_FILE=\n", "COMPOSE_FILE=\n"},
+		{"A=b\n", "A=b\n"},
+	} {
+		if got, err := RestoreEmptyComposeFile(c.env, OverrideFileName); err != nil || got != c.want {
+			t.Errorf("RestoreEmptyComposeFile(%q) = %q, %v; want %q", c.env, got, err, c.want)
+		}
+	}
+}
+
 // TestAddedLineComesOffWithoutATrace pins what rollback relies on when the
 // install created the entry: adding the line and removing it again gives the
 // file back byte for byte -- blank lines, byte order mark and line endings
@@ -149,33 +204,33 @@ func TestAddedLineComesOffWithoutATrace(t *testing.T) {
 
 // TestComposeFileEntryFailsClosed pins that an entry the parser cannot read
 // with certainty is an error from every function, never a guess the
-// installer then writes back. That includes lists compose itself fails to
-// load: an empty entry between separators, which it resolves to the project
-// directory, and spaces around an entry, which it keeps as part of the file
-// name. These used to be tidied up instead -- dropped or trimmed -- so the
-// installer ran against, and wrote back, a project compose never loads.
+// installer then writes back -- rollback's readers included, since a misread
+// line is one rollback would rewrite. That covers an assignment compose reads
+// after another value's closing quote on the same line, which cannot be
+// rewritten in place.
 func TestComposeFileEntryFailsClosed(t *testing.T) {
 	for _, env := range []string{
-		"COMPOSE_FILE=\"docker-compose.yml:extra.yml\n",         // unterminated quote
-		"COMPOSE_FILE=\"docker-compose.yml:${EXTRA}\"\n",        // interpolation
-		"COMPOSE_FILE=docker-compose.yml:$EXTRA\n",              // interpolation
-		"COMPOSE_FILE=\"docker-compose.yml\\:extra.yml\"\n",     // escape
-		"COMPOSE_FILE='docker-compose.yml:extra.yml\\' # x'\n",  // escaped quote, which compose honours in single quotes too
-		"COMPOSE_FILE=\"docker-compose.yml\" extra.yml\n",       // text after the quote
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE=b.yml\n",              // two entries
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE: b.yml\n",             // two entries, one YAML-style
-		"export COMPOSE_FILE\n",                                 // no value
-		"COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml;b.yml\n",  // another separator
-		"COMPOSE_PATH_SEPARATOR: ;\nCOMPOSE_FILE=a.yml;b.yml\n", // another separator, YAML-style
-		"COMPOSE_FILE=docker-compose.yml::extra.yml\n",          // empty entry
-		"COMPOSE_FILE=docker-compose.yml:\n",                    // empty entry at the end
-		"COMPOSE_FILE=:docker-compose.yml\n",                    // empty entry at the start
-		"COMPOSE_FILE=docker-compose.yml : extra.yml\n",         // spaces around entries
-		"COMPOSE_FILE=\" docker-compose.yml:extra.yml\"\n",      // a space inside the quotes
+		"COMPOSE_FILE=\"docker-compose.yml:extra.yml\n",                         // unterminated quote
+		"COMPOSE_FILE=\"docker-compose.yml:${EXTRA}\"\n",                        // interpolation
+		"COMPOSE_FILE=docker-compose.yml:$EXTRA\n",                              // interpolation
+		"COMPOSE_FILE=\"docker-compose.yml\\:extra.yml\"\n",                     // escape
+		"COMPOSE_FILE='docker-compose.yml:extra.yml\\' # x'\n",                  // escaped quote, which compose honours in single quotes too
+		"COMPOSE_FILE=\"docker-compose.yml\" extra.yml\n",                       // text after the quote
+		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE=b.yml\n",                              // two entries
+		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE: b.yml\n",                             // two entries, one YAML-style
+		"export COMPOSE_FILE\n",                                                 // no value
+		"COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml;b.yml\n",                  // another separator
+		"COMPOSE_PATH_SEPARATOR: ;\nCOMPOSE_FILE=a.yml;b.yml\n",                 // another separator, YAML-style
+		"A=\"x\" COMPOSE_FILE=a.yml\n",                                          // after another value's closing quote
+		"A='x\ny' COMPOSE_FILE=a.yml\n",                                         // after a multi-line value closes
+		"A=\"x\" B=\"y\" export COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml\n", // separator, two values along
 	} {
 		t.Run(env, func(t *testing.T) {
 			if _, err := ComposeFiles(env); err == nil {
 				t.Errorf("ComposeFiles accepted %q", env)
+			}
+			if _, err := ListedComposeFiles(env); err == nil {
+				t.Errorf("ListedComposeFiles accepted %q", env)
 			}
 			if _, err := AddComposeFile(env, []string{"docker-compose.yml"}, OverrideFileName); err == nil {
 				t.Errorf("AddComposeFile accepted %q", env)
@@ -186,26 +241,70 @@ func TestComposeFileEntryFailsClosed(t *testing.T) {
 			if _, err := RemoveComposeFileLine(env); err == nil {
 				t.Errorf("RemoveComposeFileLine accepted %q", env)
 			}
+			if _, err := RestoreEmptyComposeFile(env, OverrideFileName); err == nil {
+				t.Errorf("RestoreEmptyComposeFile accepted %q", env)
+			}
 		})
 	}
 
 	// Look-alikes that are not the entry are left alone.
-	for _, env := range []string{"# COMPOSE_FILE=a.yml\n", "COMPOSE_FILES=a.yml\n", "MY_COMPOSE_FILE=a.yml\n"} {
+	for _, env := range []string{"# COMPOSE_FILE=a.yml\n", "COMPOSE_FILES=a.yml\n", "MY_COMPOSE_FILE=a.yml\n", "A=x COMPOSE_FILE=a.yml\n"} {
 		if files := mustFiles(t, env); files != nil {
 			t.Errorf("ComposeFiles(%q) = %q, want no entry", env, files)
 		}
 	}
 }
 
-// TestComposeFileEntryListingNoFilesFailsClosed pins that an entry naming no
-// file is refused, whatever its spelling, rather than read as no entry.
-// Compose does not treat it as unset: the key alone switches its file
-// discovery off, and the empty path resolves to the project directory, so
-// every plain `docker compose` there fails to load the project. Read as no
-// entry, it used to be rewritten to name the installer's override alone,
-// dropping the base file and the conventional override from the operator's
-// own commands.
-func TestComposeFileEntryListingNoFilesFailsClosed(t *testing.T) {
+// TestComposeFileListComposeCannotLoad covers lists compose itself fails to
+// load: an empty name between separators, which it resolves to the project
+// directory, and spaces around a name, which it keeps as part of it. These
+// used to be tidied up -- dropped or trimmed -- so the installer ran
+// against, and wrote back, a project compose never loads; the readers
+// install goes by now refuse them. Rollback's readers take the names as
+// written instead: rollback has to undo what earlier installs left, some of
+// it in exactly these shapes, and only ever takes the installer's own file
+// out of the list.
+func TestComposeFileListComposeCannotLoad(t *testing.T) {
+	for _, c := range []struct {
+		env, listed string
+	}{
+		{"COMPOSE_FILE=docker-compose.yml::extra.yml\n", "docker-compose.yml,,extra.yml"},
+		{"COMPOSE_FILE=docker-compose.yml:\n", "docker-compose.yml,"},
+		{"COMPOSE_FILE=:docker-compose.yml\n", ",docker-compose.yml"},
+		{"COMPOSE_FILE=docker-compose.yml : extra.yml\n", "docker-compose.yml , extra.yml"},
+		{"COMPOSE_FILE=\" docker-compose.yml:extra.yml\"\n", " docker-compose.yml,extra.yml"},
+	} {
+		t.Run(c.env, func(t *testing.T) {
+			if _, err := ComposeFiles(c.env); err == nil {
+				t.Errorf("ComposeFiles accepted %q", c.env)
+			}
+			if _, err := AddComposeFile(c.env, []string{"docker-compose.yml"}, OverrideFileName); err == nil {
+				t.Errorf("AddComposeFile accepted %q", c.env)
+			}
+			listed, err := ListedComposeFiles(c.env)
+			if err != nil || strings.Join(listed, ",") != c.listed {
+				t.Errorf("ListedComposeFiles(%q) = %q, %v; want %q", c.env, listed, err, c.listed)
+			}
+			added := strings.Replace(c.env, "extra.yml", "extra.yml:"+OverrideFileName, 1)
+			if added != c.env {
+				if got, err := RemoveComposeFile(added, OverrideFileName); err != nil || got != c.env {
+					t.Errorf("RemoveComposeFile(%q) = %q, %v; want %q", added, got, err, c.env)
+				}
+			}
+		})
+	}
+}
+
+// TestComposeFileEntryListingNoFiles pins that an entry naming no file is
+// refused by the readers install goes by, whatever its spelling, rather than
+// read as no entry. Compose does not treat it as unset: the key alone
+// switches its file discovery off, and the empty path resolves to the
+// project directory, so every plain `docker compose` there fails to load the
+// project. Read as no entry, it used to be rewritten to name the installer's
+// override alone, dropping the base file and the conventional override from
+// the operator's own commands. Rollback's readers see it as the entry it is,
+// and leave it as it is.
+func TestComposeFileEntryListingNoFiles(t *testing.T) {
 	for _, env := range []string{
 		"COMPOSE_FILE=\n",
 		"COMPOSE_FILE=\"\"\n",
@@ -224,11 +323,13 @@ func TestComposeFileEntryListingNoFilesFailsClosed(t *testing.T) {
 			if out, err := AddComposeFile(env, []string{"docker-compose.yml", "docker-compose.override.yml"}, OverrideFileName); err == nil {
 				t.Errorf("AddComposeFile accepted %q and wrote %q", env, out)
 			}
-			if out, err := RemoveComposeFile(env, OverrideFileName); err == nil {
-				t.Errorf("RemoveComposeFile accepted %q and wrote %q", env, out)
+			if files, err := ListedComposeFiles(env); err != nil || files == nil || strings.Join(files, "") != "" {
+				t.Errorf("ListedComposeFiles(%q) = %q, %v; want the entry, naming nothing", env, files, err)
 			}
-			if out, err := RemoveComposeFileLine(env); err == nil {
-				t.Errorf("RemoveComposeFileLine accepted %q and wrote %q", env, out)
+			for name, remove := range map[string]func(string, string) (string, error){"RemoveComposeFile": RemoveComposeFile, "RestoreEmptyComposeFile": RestoreEmptyComposeFile} {
+				if out, err := remove(env, OverrideFileName); err != nil || out != env {
+					t.Errorf("%s(%q) = %q, %v; want it left as it is", name, env, out, err)
+				}
 			}
 		})
 	}
