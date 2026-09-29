@@ -1546,6 +1546,13 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 		id, _ := r.Node(sym)
 		ids = append(ids, id)
 	}
+	// traverse.Endpoint.IDs must ascend -- Has binary-searches them -- and
+	// not every candidate source visits in id order: a plan-time property
+	// anchor (PropCandidates) lists an IN list's matches in the order its
+	// operands were written. Unsorted, `t.name IN ['c', 'b']` hid b from
+	// endpointsIntersect, and a self-endpoint query PostgreSQL rejects with
+	// SQLSTATE 22023 was served.
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids, nil
 }
 

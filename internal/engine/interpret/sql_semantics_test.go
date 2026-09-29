@@ -3,6 +3,7 @@
 package interpret
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -200,6 +201,35 @@ func TestAllShortestPathsOverallShortestFiltersEndpointsFirst(t *testing.T) {
 		}
 		if got := pathSigsAtColumn(t, snap, rs, 0); !reflect.DeepEqual(got, tc.want) {
 			t.Fatalf("%s (per pair %v): got %v, want %v", tc.query, tc.perPair, got, tc.want)
+		}
+	}
+}
+
+// A root that is also a terminal is PostgreSQL's SQLSTATE 22023 for a
+// shortest-path query, so the engine declines it (ErrSelfEndpoint). The
+// check probes one endpoint's ids against the other's by binary search, but
+// an IN list's property anchor lists ids in the order its operands are
+// written: with t.name IN ['c', 'b'] the search missed b, and the queries
+// were served where pg errors.
+func TestSelfEndpointSeenThroughUnsortedAnchor(t *testing.T) {
+	snap := buildExecSnapshot(t, semKinds, []execNodeSpec{
+		{1, []snapshot.KindID{semUser}, map[string]any{"name": "a"}},
+		{2, []snapshot.KindID{semUser}, map[string]any{"name": "b"}},
+		{3, []snapshot.KindID{semUser}, map[string]any{"name": "c"}},
+	}, []execEdgeSpec{
+		{10, 1, 2, semEdge},
+		{11, 2, 3, semEdge},
+	})
+	for _, query := range []string{
+		`MATCH p = shortestPath((s:User)-[:MemberOf*1..]->(t:User)) WHERE s.name = 'b' AND t.name IN ['c', 'b'] RETURN p`,
+		`MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(t:User)) WHERE s.name = 'b' AND t.name IN ['c', 'b'] RETURN p`,
+		`MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(t:User)) WHERE s.name IN ['c', 'b'] AND t.name = 'b' RETURN p`,
+	} {
+		for _, perPair := range []bool{false, true} {
+			_, err := Execute(&Env{Snap: snap, AllShortestPerPair: perPair}, planQuery(t, snap, query), generousBudget)
+			if !errors.Is(err, ErrSelfEndpoint) {
+				t.Fatalf("%s (per pair %v): got %v, want ErrSelfEndpoint", query, perPair, err)
+			}
 		}
 	}
 }
