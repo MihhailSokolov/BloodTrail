@@ -117,6 +117,12 @@ type Engine struct {
 	// Apply pays one atomic load here and nothing more.
 	bootGap bootGapBuffer
 
+	// atStart is where PostgreSQL stood when Start ran, before this process
+	// could write anything (captureStartState, watermark.go), or nil when it
+	// was not captured. Stored once, before Start launches the boot-load
+	// goroutine that reads it.
+	atStart atomic.Pointer[startState]
+
 	// fallbackRebuilding is set while EITHER of the engine's two
 	// retry-until-adopted rebuild loops -- Start's boot-load goroutine
 	// (runBootLoad, boot.go) or the fallback recovery goroutine
@@ -452,9 +458,21 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 	// log line (if any) was actually emitted.
 	defer e.rebuildAttempts.Add(1)
 
-	snap, err := LoadSnapshot(ctx, e.pgDriver, e.pool)
+	// The watermark lineage is read only when a snapshot file could ever be
+	// written from this snapshot or a descendant of it (loadSnapshot's doc).
+	// Failing to read it costs nothing but that file, which is exactly why
+	// it is said out loud: SaveSnapshot skips a snapshot with no lineage at
+	// Debug, and nothing else would tell an operator why the file stopped
+	// being written.
+	snap, lineageErr, err := loadSnapshot(ctx, e.pgDriver, e.pool, e.cfg.SnapshotDir != "")
 	if err != nil {
 		return false, fmt.Errorf("engine: RebuildNow: %w", err)
+	}
+	if lineageErr != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not read the watermark lineage; no snapshot file will be written from this rebuild",
+			slog.Any("error", lineageErr),
+			slog.String("trigger", trigger),
+		)
 	}
 
 	approxBytes := snap.ApproxBytes()

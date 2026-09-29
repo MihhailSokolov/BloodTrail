@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
 // watermarkDDL creates bloodtrail_watermark (a single row, id=1, holding a
@@ -24,7 +27,9 @@ import (
 // with a counter this table alone owns, bumped BEFORE that write's own pg
 // effect (see BumpWatermark's own doc for why "before" specifically), is
 // what will let a future loader compare a file's stamped counter against
-// pg's current one and refuse a file that is behind.
+// pg's current one and refuse a file that is behind. The counter alone
+// cannot see a writer that does not bump it; watermarkLineageDDL is what
+// covers those.
 const watermarkDDL = `
 create table if not exists bloodtrail_watermark (
 	id smallint primary key default 1 check (id = 1),
@@ -33,6 +38,226 @@ create table if not exists bloodtrail_watermark (
 );
 insert into bloodtrail_watermark (id) values (1) on conflict do nothing;
 `
+
+// watermarkLineageDDL gives bloodtrail_watermark its lineage column: a
+// random uuid naming the run of counter values the table is currently in.
+// ensureWatermarkTable runs it right after watermarkDDL, as a statement of
+// its own, so a database that cannot run it (gen_random_uuid needs
+// PostgreSQL 13) loses only the snapshot file -- which then has no lineage
+// to be written or adopted under -- never the counter every write bumps.
+//
+// The installer ends lineages with its own statement over the same table
+// and columns (internal/dbswitch's endLineageSQL); renaming anything here
+// means renaming it there, and lineage_integration_test.go, which runs that
+// statement against this table, is what fails if only one side changes.
+//
+// It reads the catalog before it alters anything, because ALTER TABLE takes
+// an ACCESS EXCLUSIVE lock before it ever gets to IF NOT EXISTS: run bare on
+// every start, it would queue BloodHound's startup behind any reader of the
+// table -- a pg_dump holds every table for as long as the dump runs --
+// where watermarkDDL itself takes no lock such a reader blocks. With the
+// check, only the one start that actually adds the column takes that lock,
+// and it gives up after lock_timeout rather than hold startup hostage: all
+// that costs is the snapshot file until a later start adds the column.
+//
+// # Why a counter needs a lineage
+//
+// The counter proves a snapshot file complete only against writes that bump
+// it, and only BloodTrail's own driver does. Anything else that writes the
+// graph -- the stock BloodHound image `bloodtrail rollback` restores,
+// BloodHound's Neo4j migrator, the TRUNCATE behind `bloodtrail install
+// --replace-postgres-graph`, a different database behind the same snapshot
+// directory -- changes PostgreSQL without moving the counter, and a file
+// stamped with the counter's unchanged value then reads as exactly current.
+// The boot adopts it and serves a graph PostgreSQL no longer holds, with
+// nothing to ever correct it: the process's own later saves stamp the same
+// stale replica again.
+//
+// A counter value therefore means something only within its lineage. Every
+// snapshot records the lineage its contents were read in
+// (snapshot.Snapshot.WatermarkLineage: stamped by the load, loadSnapshot,
+// inside the same repeatable-read transaction as the rows; carried by Fold;
+// written into the file), and the boot adopts a file only while PostgreSQL
+// is still in that lineage (adoptSnapshotFileView). A lineage ends by being
+// replaced with a fresh random uuid, never reused, so no counter value
+// counted before can vouch for anything after:
+//
+//   - the column's default gives a table created from scratch -- a new or
+//     reset database -- a lineage of its own;
+//   - `bloodtrail install` and `bloodtrail rollback` end it
+//     (internal/dbswitch's EndWatermarkLineage) around every stretch in
+//     which a writer that does not bump the counter owns the graph.
+//
+// The end has to fall between the last load a BloodTrail process made
+// before such a writer touched the graph and the first load one makes after
+// the writer is done: every file from the old lineage then names a lineage
+// PostgreSQL has left, and nothing loaded in the new one can predate the
+// writer's writes. The installer ends it on both sides of the stock image's
+// time -- once the rollback has the stock image running, and again right
+// before an install starts BloodTrail. Anything else that writes the graph
+// outside BloodTrail takes on the same obligation: end the lineage
+// (`update bloodtrail_watermark set lineage = gen_random_uuid()`) or delete
+// the snapshot file before BloodTrail loads again. That includes BloodHound's
+// own tool API switching a running server to the plain pg driver
+// (/graph-db/switch/pg), and restoring a database backup -- even one that
+// restores the very lineage a file names: the bump commits in a transaction
+// of its own before the write it guards (BumpWatermark), so a dump taken
+// while writes land can hold counter N without write N, and a file stamped N
+// would then vouch for a write the restored database never saw.
+const watermarkLineageDDL = `
+do $$
+begin
+	if not exists (select 1 from pg_attribute
+	               where attrelid = to_regclass('bloodtrail_watermark') and attname = 'lineage' and not attisdropped) then
+		perform set_config('lock_timeout', '2s', true);
+		alter table bloodtrail_watermark add column if not exists lineage uuid not null default gen_random_uuid();
+	end if;
+end
+$$;
+`
+
+// selectWatermarkLineageSQL reads the lineage bloodtrail_watermark is in --
+// the rebuild's read inside its own load transaction (loadSnapshot).
+const selectWatermarkLineageSQL = `select lineage from bloodtrail_watermark where id = 1`
+
+// selectWatermarkAndLineageSQL reads the counter together with the lineage
+// it counts in, from the one row in one statement: the snapshot-file boot's
+// frozen target (readWatermarkAndLineage).
+const selectWatermarkAndLineageSQL = `select counter, lineage from bloodtrail_watermark where id = 1`
+
+// sequencePositionsSQL is where PostgreSQL's node and edge id sequences
+// stand -- the last value each handed out, 0 for one never used -- as two
+// select-list expressions. A database whose graph tables do not exist yet
+// (a start ahead of the first AssertSchema) reads as 0 rather than failing.
+//
+// These are the positions a snapshot file is stamped with
+// (saveSnapshotProbe) and the ones Start captures before this process can
+// write anything (captureStartState); insertedSinceFile says why they are
+// worth comparing.
+const sequencePositionsSQL = `
+	coalesce(case when to_regclass('node') is null then null
+		else pg_sequence_last_value(pg_get_serial_sequence('node', 'id')::regclass) end, 0),
+	coalesce(case when to_regclass('edge') is null then null
+		else pg_sequence_last_value(pg_get_serial_sequence('edge', 'id')::regclass) end, 0)`
+
+// startState is where PostgreSQL stood when this process started, before it
+// could write anything: the watermark counter and the id sequence positions
+// (captureStartState).
+type startState struct {
+	counter          uint64
+	nodeSeq, edgeSeq int64
+}
+
+// startStateTimeout bounds captureStartState's one read. Start runs it on
+// the caller's own context, which may carry no deadline at all, and a read
+// that hangs must not hold BloodHound's startup with it: giving up only
+// costs the check it feeds.
+const startStateTimeout = 5 * time.Second
+
+// captureStartState records where PostgreSQL stood before this process could
+// write anything -- the watermark counter and the id sequence positions, in
+// one statement -- for insertedSinceFile to compare a snapshot file's stamp
+// against. Start calls it before it returns, and so before Open can hand the
+// caller a driver to write through: every write this process makes lands
+// after the capture, every write before it was someone else's.
+//
+// A failed read leaves nothing captured, which only switches that one check
+// off: the watermark lineage and counters still stand between any file and
+// adoption, as they did before this check existed. Logged at Warn so the
+// weaker boot is visible.
+func (e *Engine) captureStartState(ctx context.Context) {
+	if e.pool == nil {
+		return
+	}
+	readCtx, cancel := context.WithTimeout(ctx, startStateTimeout)
+	defer cancel()
+
+	var s startState
+	if err := e.pool.QueryRow(readCtx, `select counter, `+sequencePositionsSQL+` from bloodtrail_watermark where id = 1`).
+		Scan(&s.counter, &s.nodeSeq, &s.edgeSeq); err != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark",
+			slog.Any("error", err))
+		return
+	}
+	e.atStart.Store(&s)
+}
+
+// readSequencePositions reads where the node and edge id sequences stand
+// (sequencePositionsSQL): a snapshot file's own stamp.
+func (e *Engine) readSequencePositions(ctx context.Context) (nodeSeq, edgeSeq int64, err error) {
+	if e.pool == nil {
+		return 0, 0, ErrWatermarkUnavailable
+	}
+	if err := e.pool.QueryRow(ctx, `select `+sequencePositionsSQL).Scan(&nodeSeq, &edgeSeq); err != nil {
+		return 0, 0, fmt.Errorf("engine: read id sequence positions: %w", err)
+	}
+	return nodeSeq, edgeSeq, nil
+}
+
+// insertedSinceFile reports whether rows were inserted after a snapshot file
+// was stamped by a writer the watermark counter never saw -- the stock
+// driver after BloodHound's tool API switched a running server to it, the
+// stock image started by hand, an INSERT from psql: the counter still read,
+// when this process started, exactly what the file was stamped with, so
+// nothing BloodTrail counts was written in between, yet the id sequences
+// had moved.
+//
+// Sound as a refusal and nothing more. Every write BloodTrail makes bumps
+// the counter before it can touch a sequence (BumpWatermark) -- or, when
+// its bump fails, takes the snapshot file out of play first
+// (NoteWatermarkBumpFailure) -- so a sequence that moved while the counter
+// did not moved for someone else; and a write of this process cannot be
+// what moved it, since start is captured before this process can write at
+// all. It sees only inserts that draw their ids from those sequences, and
+// only those made after the file was saved: an UPDATE or DELETE from
+// outside BloodTrail leaves the sequences where they were, and an insert
+// made while the process that saved the file was still running is behind
+// the positions it stamped, which is why the lineage (watermarkLineageDDL)
+// and the obligation it documents still stand. A sequence that moved for
+// any other reason -- one reset, a crash that let PostgreSQL skip ahead, or
+// a second BloodTrail process writing while this one started -- costs a
+// rebuild, never a wrong adoption.
+//
+// A nil at -- nothing captured -- reports false: the check is then simply
+// not made (captureStartState's doc).
+func insertedSinceFile(stamp snapshot.Stamp, at *startState) bool {
+	return at != nil && at.counter == stamp.Watermark &&
+		(at.nodeSeq != stamp.NodeIDSeq || at.edgeSeq != stamp.EdgeIDSeq)
+}
+
+// Snapshot-file refusals fileRefusal can name, each a "reason" on the
+// "bloodtrail: snapshot file rejected" line.
+const (
+	reasonLineageChanged        = "watermark lineage changed since the file was written"
+	reasonInsertedBehindCounter = "rows were inserted since the file was written by a writer that did not advance the watermark"
+)
+
+// fileRefusal is why a snapshot file must be refused before its counters
+// are weighed at all, or "" when nothing about its lineage or stamp rules it
+// out: a file from another lineage than the one PostgreSQL is in (pgLineage;
+// watermarkLineageDDL), or one whose stamp shows rows inserted behind the
+// counter's back (insertedSinceFile). The boot asks it twice: of the file's
+// unverified header, to spare the read of a file it would refuse anyway, and
+// of what ReadSnapshotFile verified, which is the answer adoption rests on.
+func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgLineage snapshot.Lineage) (reason string, attrs []any) {
+	if lineage.IsZero() || lineage != pgLineage {
+		return reasonLineageChanged, []any{
+			slog.String("file_lineage", lineage.String()),
+			slog.String("pg_lineage", pgLineage.String()),
+			slog.Uint64("file_watermark", stamp.Watermark),
+		}
+	}
+	if at := e.atStart.Load(); insertedSinceFile(stamp, at) {
+		return reasonInsertedBehindCounter, []any{
+			slog.Uint64("file_watermark", stamp.Watermark),
+			slog.Int64("file_node_id_seq", stamp.NodeIDSeq),
+			slog.Int64("start_node_id_seq", at.nodeSeq),
+			slog.Int64("file_edge_id_seq", stamp.EdgeIDSeq),
+			slog.Int64("start_edge_id_seq", at.edgeSeq),
+		}
+	}
+	return "", nil
+}
 
 // ErrWatermarkUnavailable is BumpWatermark's and ReadWatermark's own return
 // when this Engine has no pg pool to run the watermark protocol against at
@@ -65,6 +290,13 @@ var ErrWatermarkUnavailable = errors.New("engine: watermark unavailable: no pg p
 // so there is no write whose settling could ever retire it -- see that
 // method's own doc.
 //
+// The lineage column (watermarkLineageDDL) is added afterwards, and its
+// failure is only logged: it guards no write either, and the one thing a
+// missing column costs -- no snapshot loaded from this database has a
+// lineage, so none is written to a file and no file is adopted -- is
+// already the fail-closed outcome, with nothing for a trust generation to
+// add.
+//
 // A no-op when e.pool is nil -- see ErrWatermarkUnavailable's doc for
 // exactly which callers that accommodates (this method has no error to
 // hand back to a caller that already knows there is no database at all).
@@ -75,6 +307,11 @@ func (e *Engine) ensureWatermarkTable(ctx context.Context) {
 	if _, err := e.pool.Exec(ctx, watermarkDDL); err != nil {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: watermark table DDL failed", slog.Any("error", err))
 		e.noteSelfSettlingWatermarkFailure()
+		return
+	}
+	if _, err := e.pool.Exec(ctx, watermarkLineageDDL); err != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: watermark lineage DDL failed; no snapshot file will be written or adopted",
+			slog.Any("error", err))
 	}
 }
 
@@ -139,6 +376,28 @@ func (e *Engine) ReadWatermark(ctx context.Context) (uint64, error) {
 		return 0, fmt.Errorf("engine: ReadWatermark: %w", err)
 	}
 	return counter, nil
+}
+
+// readWatermarkAndLineage reads the pg watermark counter together with the
+// lineage it is counting in (watermarkLineageDDL), from the one row in one
+// statement, so the pair describes a single moment: the snapshot-file
+// boot's frozen target (adoptSnapshotFileView). Returns
+// ErrWatermarkUnavailable when e.pool is nil, mirroring ReadWatermark; a
+// database without the lineage column fails the read, which the boot treats
+// like any other failed watermark read -- the file is refused.
+func (e *Engine) readWatermarkAndLineage(ctx context.Context) (uint64, snapshot.Lineage, error) {
+	if e.pool == nil {
+		return 0, snapshot.Lineage{}, ErrWatermarkUnavailable
+	}
+
+	var (
+		counter uint64
+		lineage [16]byte
+	)
+	if err := e.pool.QueryRow(ctx, selectWatermarkAndLineageSQL).Scan(&counter, &lineage); err != nil {
+		return 0, snapshot.Lineage{}, fmt.Errorf("engine: read watermark and lineage: %w", err)
+	}
+	return counter, snapshot.Lineage(lineage), nil
 }
 
 // NoteWatermarkBumpFailure logs (Warn) that scope's own eager bump genuinely

@@ -131,6 +131,38 @@ func TestClearGraphTolerantOfMissingTables(t *testing.T) {
 	}
 }
 
+// TestClearGraphEndsTheWatermarkLineage pins that the truncate and the end of
+// BloodTrail's watermark lineage travel as one psql statement string, which
+// PostgreSQL runs as one transaction: there is no moment at which the graph
+// is emptied while a saved snapshot file still matches the lineage.
+func TestClearGraphEndsTheWatermarkLineage(t *testing.T) {
+	if !strings.HasPrefix(clearSQL, "truncate table edge, node; ") || !strings.HasSuffix(clearSQL, endLineageSQL) {
+		t.Fatalf("the clear must truncate and then end the lineage in one statement string: %s", clearSQL)
+	}
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{prefix + clearSQL: []byte("TRUNCATE TABLE\nDO\n")}}
+	if err := newStore(fake).ClearGraph(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fake.Calls) != 1 {
+		t.Fatalf("the clear took %d psql calls, want exactly one (one transaction):\n%s", len(fake.Calls), strings.Join(fake.Calls, "\n"))
+	}
+}
+
+func TestEndWatermarkLineage(t *testing.T) {
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{prefix + endLineageSQL: []byte("DO\n")}}
+	if err := newStore(fake).EndWatermarkLineage(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// A failure has to reach the installer, which must not start BloodTrail
+	// while every saved snapshot file still matches the lineage.
+	fake = &dockerx.FakeRunner{Errors: map[string]error{
+		prefix + endLineageSQL: errors.New(`ERROR:  permission denied for table bloodtrail_watermark`),
+	}}
+	if err := newStore(fake).EndWatermarkLineage(context.Background()); err == nil {
+		t.Fatal("a failed statement must propagate")
+	}
+}
+
 func TestCountGraphOtherErrorsPropagate(t *testing.T) {
 	fake := &dockerx.FakeRunner{Errors: map[string]error{
 		prefix + countSQL: errors.New(`FATAL:  role "bh" does not exist`),

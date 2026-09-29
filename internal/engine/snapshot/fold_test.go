@@ -273,6 +273,27 @@ func TestFoldMatchesStackedOverlay(t *testing.T) {
 
 // ---- targeted unit tests -------------------------------------------------
 
+// TestFoldCarriesTheWatermarkLineage pins that compaction keeps a replica in
+// the lineage it was loaded from. A fold that dropped the lineage would only
+// cost the next save its file; one that took it from anywhere other than the
+// base -- the lineage PostgreSQL holds by then, say -- would let a file
+// claim a lineage its contents were never read in.
+func TestFoldCarriesTheWatermarkLineage(t *testing.T) {
+	rng := rand.New(rand.NewSource(20260929))
+
+	base, baseIDs, baseEdgeIDs := buildRandomBaseSnapshot(t, rng, 40, 120)
+	base.WatermarkLineage = Lineage{0x5e, 0xed, 0x01, 0x02, 0x03, 0x04, 0x45, 0x06, 0x87, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e}
+	segs := buildRandomSegments(t, rng, baseIDs, baseEdgeIDs)
+
+	folded, err := Fold(base, segs)
+	if err != nil {
+		t.Fatalf("Fold: %v", err)
+	}
+	if folded.WatermarkLineage != base.WatermarkLineage {
+		t.Fatalf("folded WatermarkLineage = %s, want the base's %s", folded.WatermarkLineage, base.WatermarkLineage)
+	}
+}
+
 // TestFoldNoSegmentsProducesEquivalentSnapshot covers Fold(base, nil):
 // folding an empty delta must produce a fresh snapshot that is
 // content-equivalent to the base itself.
