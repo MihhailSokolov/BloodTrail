@@ -1185,6 +1185,40 @@ func TestRollbackKeepsFilesAddedToTheEntryItCreated(t *testing.T) {
 	}
 }
 
+// TestRollbackOfAnInstallThatNeverWroteTheEntry covers the manifest an install
+// leaves when it stops before its .env write -- a migration it refuses, say,
+// as the e2e run's second install does. The manifest records the entry the
+// install was going to create, but there is none, so rollback has nothing to
+// take out of .env and nothing to say about it.
+func TestRollbackOfAnInstallThatNeverWroteTheEntry(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	envPath := filepath.Join(dir, ".env")
+	_ = os.WriteFile(envPath, []byte("BLOODHOUND_TAG=9.6.0\n"), 0o644)
+	row := "pg"
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound",
+		EnvComposeFileCreated: true, EnvComposeFileWritten: []string{"docker-compose.yml", "docker-compose.bloodtrail.yml"}}.Save(dir)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer api.Close()
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('pg')"
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+		base + "up -d": nil,
+	}}
+	var out bytes.Buffer
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out},
+		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if env, _ := os.ReadFile(envPath); string(env) != "BLOODHOUND_TAG=9.6.0\n" {
+		t.Fatalf("rollback changed .env to %q", env)
+	}
+	if strings.Contains(out.String(), "COMPOSE_FILE") {
+		t.Fatalf("rollback reported on an entry that was never written:\n%s", out.String())
+	}
+}
+
 // TestComposeHandleSkipsAMissingExtraFile covers the state the override
 // file's own header invites: the operator removes the file but leaves its
 // COMPOSE_FILE entry. Passing a missing file to compose fails every command,

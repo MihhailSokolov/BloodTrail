@@ -731,11 +731,11 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		// only the installer's own override comes out.
 		removeLine := m.EnvComposeFileCreated
 		if removeLine {
-			asWritten, err := namesOnlyWhatWasWritten(string(envData), m.EnvComposeFileWritten)
+			changed, err := changedSinceInstall(string(envData), m.EnvComposeFileWritten)
 			if err != nil {
 				return fmt.Errorf(".env: %w", err)
 			}
-			if !asWritten {
+			if changed {
 				removeLine = false
 				say("    COMPOSE_FILE in .env has changed since the install, so only %s comes out of it", compose.OverrideFileName)
 			}
@@ -775,16 +775,18 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	return nil
 }
 
-// namesOnlyWhatWasWritten reports whether env's COMPOSE_FILE entry names just
-// the files an install wrote into it (written), the installer's own override
-// aside -- the operator may already have taken that out. A manifest from
-// before the list was recorded has none, which counts as yes.
-func namesOnlyWhatWasWritten(env string, written []string) (bool, error) {
+// changedSinceInstall reports whether env's COMPOSE_FILE entry, which an
+// install created to name written, names other files now -- the installer's
+// own override aside, which the operator may already have taken out. With no
+// entry left (the install stopped before writing it, or the operator removed
+// it), or no list to compare with (a manifest from before one was recorded),
+// there is nothing to keep, and the answer is no.
+func changedSinceInstall(env string, written []string) (bool, error) {
 	if written == nil {
-		return true, nil
+		return false, nil
 	}
 	listed, err := compose.ComposeFiles(env)
-	if err != nil {
+	if err != nil || listed == nil {
 		return false, err
 	}
 	withoutOverride := func(files []string) []string {
@@ -796,7 +798,7 @@ func namesOnlyWhatWasWritten(env string, written []string) (bool, error) {
 		}
 		return out
 	}
-	return slices.Equal(withoutOverride(listed), withoutOverride(written)), nil
+	return !slices.Equal(withoutOverride(listed), withoutOverride(written)), nil
 }
 
 // bloodhoundContainerEpoch identifies the current incarnation of the
