@@ -1134,6 +1134,9 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 	mode := traverse.ModeOne
 	if step.Shortest == ShortestAll {
 		mode = traverse.ModeAll
+		if env.AllShortestPerPair {
+			mode = traverse.ModeAllPerPair
+		}
 	}
 
 	maxDepth := 0

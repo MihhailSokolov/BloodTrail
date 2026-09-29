@@ -134,11 +134,14 @@ func TestAllShortestPaths(t *testing.T) {
 		s := buildStrategyFixture(t)
 		kinds := maskOf(3, 1, 2)
 
+		// Per pair, so every root's own shortest paths come back, at two
+		// different lengths; ModeAll would keep only the one-hop pairs
+		// (global_min_test.go).
 		q := Query{
 			Roots:     Endpoint{}, // unconstrained
 			Terminals: Endpoint{IDs: []snapshot.NodeID{6}},
 			Kinds:     kinds,
-			Mode:      ModeAll,
+			Mode:      ModeAllPerPair,
 		}
 		got, err := AllShortestPaths(s, q)
 		if err != nil {
@@ -167,7 +170,7 @@ func TestAllShortestPaths(t *testing.T) {
 			Roots:     Endpoint{},
 			Terminals: Endpoint{IDs: []snapshot.NodeID{6}},
 			Kinds:     kinds,
-			Mode:      ModeAll,
+			Mode:      ModeAllPerPair,
 			Limit:     2,
 		}
 		got, err := AllShortestPaths(s, q)
@@ -345,7 +348,8 @@ func TestAllShortestPaths(t *testing.T) {
 		// In-CSR mirror from each reached terminal back toward the root and
 		// reverse the result. Root 0 reaches every other reachable node in
 		// the fixture at kinds {1,2}, including a 3-hop chain (0-1-2-3),
-		// which exercises reversal of a path longer than 2 nodes.
+		// which exercises reversal of a path longer than 2 nodes -- per
+		// pair, since ModeAll would stop at the one-hop terminals.
 		s := buildStrategyFixture(t)
 		kinds := maskOf(3, 1, 2)
 
@@ -353,7 +357,7 @@ func TestAllShortestPaths(t *testing.T) {
 			Roots:     Endpoint{IDs: []snapshot.NodeID{0}},
 			Terminals: Endpoint{}, // unconstrained
 			Kinds:     kinds,
-			Mode:      ModeAll,
+			Mode:      ModeAllPerPair,
 		}
 		got, err := AllShortestPaths(s, q)
 		if err != nil {
@@ -480,12 +484,18 @@ func TestCapTruncation(t *testing.T) {
 
 	t.Run("strategy B: Limit is an absolute target across BFS elements, not a per-element delta", func(t *testing.T) {
 		s := buildCapFixture(t)
+		// Three constrained roots, all two hops from the terminal, with the
+		// budgets forcing small side = terminals. Unconstrained roots would
+		// make the one-hop intermediates roots too, and ModeAll would then
+		// return only their one-hop paths.
 		q := Query{
-			Roots:     Endpoint{}, // unconstrained -> small side = terminals
-			Terminals: Endpoint{IDs: []snapshot.NodeID{2}},
-			Kinds:     kinds,
-			Mode:      ModeAll,
-			Limit:     3,
+			Roots:      Endpoint{IDs: []snapshot.NodeID{0, 1, 7}},
+			Terminals:  Endpoint{IDs: []snapshot.NodeID{2}},
+			Kinds:      kinds,
+			Mode:       ModeAll,
+			Limit:      3,
+			PairBudget: 1,
+			SideBudget: 2,
 		}
 		got, err := AllShortestPaths(s, q)
 		if err != nil {

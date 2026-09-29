@@ -1,0 +1,59 @@
+{
+  "metadata": {
+    "source_kind": "ghx_Base"
+  },
+  "graph": {
+    "nodes": [],
+    "edges": [
+      {
+        "start": {
+          "match_by": "name",
+          "value": "carol",
+          "kind": "ghx_User"
+        },
+        "end": {
+          "match_by": "name",
+          "value": "infra-admin",
+          "kind": "ghx_RepoRole"
+        },
+        "kind": "ghx_HasRole",
+        "properties": {
+          "assigned_by": "dave"
+        }
+      },
+      {
+        "start": {
+          "match_by": "id",
+          "value": "GHX_ROLE_2"
+        },
+        "end": {
+          "match_by": "property",
+          "kind": "ghx_Repository",
+          "property_matchers": [
+            {
+              "key": "full_name",
+              "operator": "equals",
+              "value": "acme/infra"
+            }
+          ]
+        },
+        "kind": "ghx_CanWrite",
+        "properties": {
+          "permission": "write"
+        }
+      },
+      {
+        "start": {
+          "match_by": "name",
+          "value": "nobody",
+          "kind": "ghx_User"
+        },
+        "end": {
+          "match_by": "id",
+          "value": "GHX_TEAM_1"
+        },
+        "kind": "ghx_MemberOf"
+      }
+    ]
+  }
+}

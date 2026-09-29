@@ -243,14 +243,15 @@ func TestBuildApplySegmentNodeKindCriteriaEmptyIncludeMatchesEveryNode(t *testin
 	}
 }
 
-// TestBuildApplySegmentNodeKindCriteriaUnknownExcludeErrors covers the one
-// criteria case that cannot be replayed soundly: PostgreSQL refuses a delete
-// whose exclusion names an undefined kind rather than silently widening it,
-// so an exclude kind this View cannot resolve means the two disagree about
-// what the delete even was -- an error (which Apply turns into a fallback),
-// never a guess. An unknown INCLUDE kind, by contrast, legitimately matches
-// nothing, exactly as it does in PostgreSQL.
-func TestBuildApplySegmentNodeKindCriteriaUnknownExcludeErrors(t *testing.T) {
+// TestBuildApplySegmentNodeKindCriteriaUnresolvableExcludeErrors covers the
+// one criteria case that cannot be replayed soundly: PostgreSQL refuses a
+// delete whose exclusion names an undefined kind rather than silently
+// widening it, so an exclude kind that neither this View nor read-back could
+// resolve means the applier and PostgreSQL disagree about what the delete
+// even was -- an error (which Apply turns into a fallback), never a guess.
+// An unresolvable INCLUDE kind, by contrast, legitimately matches nothing,
+// exactly as it does in PostgreSQL.
+func TestBuildApplySegmentNodeKindCriteriaUnresolvableExcludeErrors(t *testing.T) {
 	view := buildApplyView(t)
 
 	cs := &ChangeSet{}
@@ -270,6 +271,120 @@ func TestBuildApplySegmentNodeKindCriteriaUnknownExcludeErrors(t *testing.T) {
 	if seg.NodeCount() != 0 || seg.EdgeCount() != 0 {
 		t.Fatalf("an unresolvable include kind tombstoned %d nodes / %d edges, want none", seg.NodeCount(), seg.EdgeCount())
 	}
+}
+
+// TestBuildApplySegmentNodeKindCriteriaExcludeResolvedByReadBack covers
+// BloodHound's "delete sourceless data" shape -- no include kinds, every
+// registered source kind excluded -- when one of those source kinds was
+// registered after this View's last full load and no row carries it, so
+// only read-back could resolve it. The delete replays like any other: the
+// unknown kind excludes nothing (no node carries it), the known one still
+// protects its node, and the resolved kind joins the segment's kind table.
+func TestBuildApplySegmentNodeKindCriteriaExcludeResolvedByReadBack(t *testing.T) {
+	view := buildApplyView(t)
+
+	const rowlessSource snapshot.KindID = 42
+
+	cs := &ChangeSet{}
+	cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("Tag"), graph.StringKind("RowlessSource")})
+
+	rb := &readbackResult{resolvedKinds: map[snapshot.KindID]string{rowlessSource: "RowlessSource"}}
+
+	seg, err := buildApplySegment(view, rb, cs)
+	if err != nil {
+		t.Fatalf("buildApplySegment: %v", err)
+	}
+
+	// Nodes 1 and 2 carry no excluded kind: deleted, with every edge
+	// incident to either (10, 11 and 12 all touch node 1 or node 2).
+	requireNodeTombstoned(t, seg, 1)
+	requireNodeTombstoned(t, seg, 2)
+	requireEdgeTombstoned(t, seg, 10)
+	requireEdgeTombstoned(t, seg, 11)
+	requireEdgeTombstoned(t, seg, 12)
+
+	// Node 3 carries Tag, which is excluded: it survives.
+	if _, ok := seg.NodeState(3); ok {
+		t.Fatalf("node 3 was tombstoned despite carrying the excluded Tag kind")
+	}
+
+	if name, ok := seg.AddedKinds()[rowlessSource]; !ok || name != "RowlessSource" {
+		t.Fatalf("segment added kinds = %v, want the read-back-resolved RowlessSource kind", seg.AddedKinds())
+	}
+}
+
+// TestBuildApplySegmentKindCriteriaMatchByID pins why a kind only read-back
+// could resolve is safe to replay: matching is by kind id against every
+// node's and edge's own kind ids, not by what the View's kind table names.
+// A node or edge carrying such an id -- one the table never named -- is
+// therefore still excluded, included or deleted exactly as PostgreSQL
+// treats it, which is what the old refuse-and-fall-back rule was guarding.
+func TestBuildApplySegmentKindCriteriaMatchByID(t *testing.T) {
+	const (
+		unnamedNodeKind snapshot.KindID = 42
+		unnamedEdgeKind snapshot.KindID = 43
+	)
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(applyKindNames())
+	if err := b.AddNode(1, []snapshot.KindID{applyKindUser}, nil); err != nil {
+		t.Fatalf("AddNode(1): %v", err)
+	}
+	if err := b.AddNode(2, []snapshot.KindID{applyKindUser, unnamedNodeKind}, nil); err != nil {
+		t.Fatalf("AddNode(2): %v", err)
+	}
+	b.AddEdge(10, 1, 2, applyKindAdminTo)
+	b.AddEdge(11, 2, 1, unnamedEdgeKind)
+	snap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	view := snapshot.NewView(snap)
+
+	rb := &readbackResult{resolvedKinds: map[snapshot.KindID]string{
+		unnamedNodeKind: "UnnamedNode",
+		unnamedEdgeKind: "UnnamedEdge",
+	}}
+
+	t.Run("exclude", func(t *testing.T) {
+		cs := &ChangeSet{}
+		cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("UnnamedNode")})
+
+		seg, err := buildApplySegment(view, rb, cs)
+		if err != nil {
+			t.Fatalf("buildApplySegment: %v", err)
+		}
+		requireNodeTombstoned(t, seg, 1)
+		if _, ok := seg.NodeState(2); ok {
+			t.Fatalf("node 2 was tombstoned despite carrying the excluded kind's id")
+		}
+	})
+
+	t.Run("include", func(t *testing.T) {
+		cs := &ChangeSet{}
+		cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("UnnamedNode")}, nil)
+
+		seg, err := buildApplySegment(view, rb, cs)
+		if err != nil {
+			t.Fatalf("buildApplySegment: %v", err)
+		}
+		requireNodeTombstoned(t, seg, 2)
+		if _, ok := seg.NodeState(1); ok {
+			t.Fatalf("node 1 was tombstoned despite not carrying the included kind's id")
+		}
+	})
+
+	t.Run("relationships", func(t *testing.T) {
+		cs := &ChangeSet{}
+		cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("UnnamedEdge")})
+
+		seg, err := buildApplySegment(view, rb, cs)
+		if err != nil {
+			t.Fatalf("buildApplySegment: %v", err)
+		}
+		requireEdgeTombstoned(t, seg, 11)
+		requireNoEdgeRecord(t, seg, 10)
+	})
 }
 
 // TestBuildApplySegmentEdgeKindCriteria covers the relationship-delete

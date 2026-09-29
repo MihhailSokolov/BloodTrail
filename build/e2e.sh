@@ -304,6 +304,13 @@ served_after="$(grep -c "cypher engine served" "$WORK/bloodhound-logs.txt" || tr
 cypher_served_delta=$((served_after - served_before))
 [ "$cypher_served_delta" -ge 2 ] || { echo "the cypher interpreter did not serve both corpus queries (\"cypher engine served\" count $served_before -> $served_after, delta $cypher_served_delta); PostgreSQL answered instead" >&2; exit 1; }
 
+echo "==> OpenGraph: extension schema, uploads, queries and deletes"
+# build/e2e-opengraph.sh documents the phase. Its hybrid AD-to-OpenGraph
+# edge starts at a user from the SharpHound fixture install uploaded above.
+env BASE_URL=http://127.0.0.1:8080 PASSWORD="$PASSWORD" WORK="$WORK/opengraph" \
+  LOGS_CMD="docker compose --project-directory '$WORK' -f '$WORK/docker-compose.yml' logs bloodhound" \
+  "$ROOT/build/e2e-opengraph.sh"
+
 echo "==> Enabling the snapshot file for a graceful-restart persistence check"
 # BLOODTRAIL_SNAPSHOT_DIR (settings.go's EnvSnapshotDir) turns on the
 # snapshot-file boot/save cycle: on a clean shutdown, Driver.Close saves a

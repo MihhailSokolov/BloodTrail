@@ -81,7 +81,21 @@ run against that same fixture, still installed, before rollback:
    from BloodHound's own pre-built query corpus, each asserted against its own served-marker delta
    the same way step 2 was -- `builder engine served` and `cypher engine served` are logged at
    Debug, already visible since the stack's first boot.
-5. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
+5. **OpenGraph** (`build/e2e-opengraph.sh`, with `testdata/opengraph`). Register an extension
+   schema (`PUT /api/v2/extensions`), then upload three OpenGraph files through
+   `/api/v2/file-upload`: nodes and id-matched edges with a source kind, including a stub
+   endpoint and an edge from a fixture AD user; edges matched by name and by property,
+   one of them unresolvable (the job must end partially complete with that one warning);
+   and a file that fails validation after registering its own source kind. Then run
+   fourteen Cypher queries (every value type, multi-kind and stub nodes, variable-length
+   paths, `shortestPath`, both `allShortestPaths` answers, a hybrid AD-to-OpenGraph path,
+   counts) and three pathfinding calls with `only_traversable=true`. Last, clear sourceless
+   data, then the source kind (`POST /api/v2/clear-database`). Every expected value is
+   what stock BloodHound v9.6.0 on PostgreSQL returns; every answer must carry its
+   `cypher engine served` or `path engine served` marker, and the phase must log no
+   `snapshot rebuilt` and no `fallback entered`. `CHECK_SERVED=0` runs the same
+   expectations against a BloodHound on the PostgreSQL driver.
+6. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
    directory (so the file survives the container recreate the config change itself causes),
    then `docker compose restart` the same container -- no further config change, so the
    container is not recreated. `snapshot file written` at that shutdown is asserted

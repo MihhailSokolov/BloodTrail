@@ -1,0 +1,21 @@
+{
+  "metadata": {
+    "source_kind": "ghx2_Base"
+  },
+  "graph": {
+    "nodes": [
+      {
+        "id": "GHX2_THING_1",
+        "kinds": [
+          "ghx2_Thing",
+          "ghx2_Widget",
+          "ghx2_Gadget"
+        ],
+        "properties": {
+          "name": "too-many-kinds"
+        }
+      }
+    ],
+    "edges": []
+  }
+}
