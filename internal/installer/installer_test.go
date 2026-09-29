@@ -1255,6 +1255,85 @@ func TestInstallWritesTheOverrideComposeWouldHaveDiscovered(t *testing.T) {
 	}
 }
 
+// TestComposeHandleMergesTheListAsComposeDoes covers the order of what
+// COMPOSE_FILE lists. Compose merges exactly the list, in order: a later file
+// overrides an earlier one, and a file listed twice is merged twice. The
+// installer always put the compose file it was given first and dropped it
+// anywhere else, so for a list that did not start with it, its commands
+// merged another project -- `COMPOSE_FILE=extra.yml:docker-compose.yml` has
+// docker-compose.yml's settings win in the operator's commands and
+// extra.yml's in the installer's. The list has to start with that file, and
+// the rest goes on as listed.
+func TestComposeHandleMergesTheListAsComposeDoes(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	extra := filepath.Join(dir, "extra.yml")
+	_ = os.WriteFile(extra, []byte("services: {}\n"), 0o644)
+	for _, c := range []struct {
+		entry string
+		want  string // the -f files, or "" for a refusal
+	}{
+		{"COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.yml", " -f " + composeFile + " -f " + extra + " -f " + composeFile + " "},
+		{"COMPOSE_FILE=extra.yml:docker-compose.yml", ""},
+		{"COMPOSE_FILE=extra.yml", ""},
+	} {
+		_ = os.WriteFile(filepath.Join(dir, ".env"), []byte(c.entry+"\n"), 0o644)
+		h, err := composeHandle(&dockerx.FakeRunner{}, composeFile, dir)
+		if c.want == "" {
+			if err == nil || !strings.Contains(err.Error(), "starts with extra.yml") {
+				t.Errorf("%s: want a refusal naming the first file, got %v (%s)", c.entry, err, strings.Join(h.Args(), " "))
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", c.entry, err)
+		}
+		if args := strings.Join(h.Args("up", "-d"), " "); !strings.Contains(args, c.want+"up -d") {
+			t.Errorf("%s: compose would merge %q, the installer %q", c.entry, c.want, args)
+		}
+	}
+}
+
+// TestInstallStopsOnAListedFileThatIsMissing covers a COMPOSE_FILE entry
+// naming a file that is not on disk. Compose fails to load the project over
+// it; the installer skipped it and went on, so its `up -d` recreated the
+// operator's services without whatever that file held when they were
+// created. Install now stops first -- except for its own override, which a
+// leftover entry may still name and which it is about to write anyway. (The
+// other commands still skip a missing file; see
+// TestComposeHandleSkipsAMissingExtraFile.)
+func TestInstallStopsOnAListedFileThatIsMissing(t *testing.T) {
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	run := func(t *testing.T, entry string) (string, *dockerx.FakeRunner, error) {
+		dir, composeFile := setupProject(t)
+		_ = os.WriteFile(filepath.Join(dir, ".env"), []byte(entry+"\n"), 0o644)
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+		t.Cleanup(api.Close)
+		base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+		fake := scriptPGInstall(&dockerx.FakeRunner{}, base, filepath.Join(dir, "docker-compose.bloodtrail.yml"), image)
+		opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+			VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+		err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+		env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+		return string(env), fake, err
+	}
+
+	env, fake, err := run(t, "COMPOSE_FILE=docker-compose.yml:tls.yml")
+	if err == nil || !strings.Contains(err.Error(), "tls.yml, which does not exist") {
+		t.Fatalf("want a refusal naming tls.yml, got %v; .env is now %q", err, env)
+	}
+	if len(fake.Calls) != 0 {
+		t.Fatalf("install ran commands without the missing file:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+
+	env, _, err = run(t, "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml")
+	if err != nil {
+		t.Fatalf("a leftover entry naming the installer's own override: %v", err)
+	}
+	if env != "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n" {
+		t.Fatalf(".env = %q", env)
+	}
+}
+
 // TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry pins the fail
 // closed half of compose.ComposeFiles at the installer: an entry it cannot
 // read with certainty stops every command before it runs anything, rather

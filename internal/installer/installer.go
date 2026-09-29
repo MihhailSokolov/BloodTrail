@@ -137,73 +137,100 @@ func (o Options) compose(runner dockerx.Runner) (dockerx.Compose, error) {
 // (projectExtraFiles), which every command meets before it changes anything.
 func composeHandle(runner dockerx.Runner, composeFile, projectDir string) (dockerx.Compose, error) {
 	c := dockerx.Compose{Runner: runner, File: composeFile, ProjectDir: projectDir}
-	extra, err := projectExtraFiles(composeFile, projectDir)
+	extra, _, err := projectExtraFiles(composeFile, projectDir)
 	if err != nil {
 		return c, err
 	}
-	for _, f := range extra {
-		c = c.WithExtraFile(f)
-	}
+	// Set, not added one by one with WithExtraFile: a file listed twice is
+	// merged twice by compose, and has to be here too.
+	c.ExtraFiles = extra
 	return c, nil
 }
 
 // projectExtraFiles resolves the files that must be merged after the base one,
 // in merge order. COMPOSE_FILE wins when it is set, because compose then loads
-// exactly what it lists and discovers nothing. With no such entry compose
-// finds the project on its own (discoveredProject): its base file has to be
-// the one the installer was given -- the operator's own commands run another
-// file otherwise -- and the override it finds beside it is what has to be
-// reproduced. A base file compose does not discover at all is one the
+// exactly what it lists, in that order, and discovers nothing: the list has
+// to start with the base file, which the installer names first, and the rest
+// is merged after it as listed, a repeated file included. With no such entry
+// compose finds the project on its own (discoveredProject): its base file has
+// to be the one the installer was given -- the operator's own commands run
+// another file otherwise -- and the override it finds beside it is what has
+// to be reproduced. A base file compose does not discover at all is one the
 // operator runs with -f, which merges no override either.
 //
-// Entries that are not on disk are skipped rather than passed on: a compose
-// command naming a missing file fails outright, which would otherwise wedge
-// `bloodtrail rollback` for the operator who deleted the override file but
-// left its COMPOSE_FILE entry behind -- exactly what the override file's own
-// header invites -- with an error telling them to rerun the command that
-// cannot succeed. The base file is never dropped this way; a missing one is
-// a real misconfiguration and compose says so.
+// Entries that are not on disk are skipped rather than passed on, and come
+// back as missing: a compose command naming a missing file fails outright,
+// which would otherwise wedge `bloodtrail rollback` for the operator who
+// deleted the override file but left its COMPOSE_FILE entry behind -- exactly
+// what the override file's own header invites -- with an error telling them
+// to rerun the command that cannot succeed. Install refuses them instead
+// (requireListedFiles). The base file is never dropped this way; a missing
+// one is a real misconfiguration and compose says so.
 //
 // A .env that exists but cannot be read, or whose COMPOSE_FILE entry cannot
 // be parsed with certainty or lists no files (compose.ComposeFiles), is an
 // error rather than "no entry": guessing there would address -- and later
 // rewrite -- a different project from the one the operator runs.
-func projectExtraFiles(composeFile, projectDir string) ([]string, error) {
+func projectExtraFiles(composeFile, projectDir string) (extra, missing []string, err error) {
 	envPath := filepath.Join(projectDir, ".env")
 	envData, err := os.ReadFile(envPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("reading %s: %w", envPath, err)
+		return nil, nil, fmt.Errorf("reading %s: %w", envPath, err)
 	}
 	listed, err := compose.ComposeFiles(string(envData))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", envPath, err)
+		return nil, nil, fmt.Errorf("%s: %w", envPath, err)
 	}
 	if listed == nil {
 		base, override := discoveredProject(projectDir)
 		switch {
 		case base == "":
-			return nil, nil
+			return nil, nil, nil
 		case base != composeFile:
-			return nil, fmt.Errorf("%s sets no COMPOSE_FILE, so docker compose loads %s there on its own, not %s; pass --compose-file for the file the deployment runs, or list its files in COMPOSE_FILE", envPath, base, composeFile)
+			return nil, nil, fmt.Errorf("%s sets no COMPOSE_FILE, so docker compose loads %s there on its own, not %s; pass --compose-file for the file the deployment runs, or list its files in COMPOSE_FILE", envPath, base, composeFile)
 		case override != "":
-			return []string{override}, nil
+			return []string{override}, nil, nil
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
-	var out []string
-	for _, f := range listed {
+	resolved := make([]string, len(listed))
+	for i, f := range listed {
 		if !filepath.IsAbs(f) {
 			f = filepath.Join(projectDir, f)
 		}
-		if f == composeFile {
-			continue
-		}
-		if _, err := os.Stat(f); err != nil {
-			continue
-		}
-		out = append(out, f)
+		resolved[i] = f
 	}
-	return out, nil
+	if resolved[0] != composeFile {
+		return nil, nil, fmt.Errorf("%s: COMPOSE_FILE starts with %s, not %s, and docker compose merges the files in the order listed; pass --compose-file for the file it starts with, or list %s first", envPath, listed[0], composeFile, filepath.Base(composeFile))
+	}
+	for _, f := range resolved[1:] {
+		if fileExists(f) {
+			extra = append(extra, f)
+		} else {
+			missing = append(missing, f)
+		}
+	}
+	return extra, missing, nil
+}
+
+// requireListedFiles is install's stricter reading of the project: it refuses
+// a file COMPOSE_FILE lists that is not on disk. The other commands skip one
+// (projectExtraFiles), but compose fails to load the project over it, so the
+// project the installer would address without it is a guess, and `up -d`
+// would recreate the operator's services without whatever the file held when
+// they were created. The installer's own override is exempt: a leftover entry
+// may still name it, and the install is about to write it.
+func requireListedFiles(composeFile, projectDir string) error {
+	_, missing, err := projectExtraFiles(composeFile, projectDir)
+	if err != nil {
+		return err
+	}
+	for _, f := range missing {
+		if f != filepath.Join(projectDir, compose.OverrideFileName) {
+			return fmt.Errorf("%s: COMPOSE_FILE lists %s, which does not exist, so docker compose fails to load the project; restore the file or take it out of the list", filepath.Join(projectDir, ".env"), f)
+		}
+	}
+	return nil
 }
 
 // discoveredProject returns the files docker compose loads on its own in dir
@@ -302,6 +329,9 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 
 	c, err := opts.compose(deps.Runner)
 	if err != nil {
+		return err
+	}
+	if err := requireListedFiles(opts.ComposeFile, opts.ProjectDir); err != nil {
 		return err
 	}
 	say("==> Inventory")
