@@ -21,7 +21,7 @@ type composeFileEntry struct {
 	index  int      // line number within splitLines' result
 	prefix string   // the line up to where the value starts
 	quote  string   // "", "'" or `"`
-	files  []string // the list, entries trimmed, empty ones dropped
+	files  []string // the list, entries trimmed, empty ones dropped; never empty
 	suffix string   // what follows the value and its closing quote
 }
 
@@ -42,6 +42,14 @@ func (e composeFileEntry) render(files []string) string {
 // Misreading used to be silent: a quoted or exported entry did not match at
 // all, so the installer appended a second COMPOSE_FILE line (compose honours
 // the last one) and rollback left the operator's entry behind.
+//
+// An entry that lists no files (`COMPOSE_FILE=`, `COMPOSE_FILE=""`) is refused
+// as well. Compose does not read it as unset: the key alone switches its file
+// discovery off, and the empty path resolves to the project directory, so
+// every plain `docker compose` there fails to load the project. Taken for no
+// entry, it used to be rewritten to name the installer's override alone,
+// dropping the base file and the conventional override from the operator's
+// own commands, and rollback then deleted the line outright.
 func findComposeFile(lines []string) (*composeFileEntry, error) {
 	var found *composeFileEntry
 	for i, raw := range lines {
@@ -127,6 +135,9 @@ func parseComposeFileValue(head, value string) (composeFileEntry, error) {
 			entry.files = append(entry.files, f)
 		}
 	}
+	if len(entry.files) == 0 {
+		return entry, fmt.Errorf("%s lists no files; docker compose does not read that as unset but fails to load the project, so delete the line to let compose find its files on its own, or list them", composeFileKey)
+	}
 	return entry, nil
 }
 
@@ -144,8 +155,9 @@ func commentStart(v string) int {
 // ComposeFiles returns the files listed in the .env contents' COMPOSE_FILE
 // entry, in order, or nil when there is no such line. Paths are returned as
 // written, so relative entries still have to be resolved against the compose
-// project directory. An entry it cannot read with certainty is an error (see
-// findComposeFile).
+// project directory. An entry it cannot read with certainty, or one that
+// lists no files, is an error (see findComposeFile), so nil always means
+// there is no line.
 func ComposeFiles(env string) ([]string, error) {
 	lines, _ := splitLines(env)
 	entry, err := findComposeFile(lines)

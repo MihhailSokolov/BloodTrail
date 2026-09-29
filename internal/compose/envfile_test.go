@@ -123,6 +123,43 @@ func TestComposeFileEntryFailsClosed(t *testing.T) {
 	}
 }
 
+// TestComposeFileEntryListingNoFilesFailsClosed pins that an entry naming no
+// file is refused, whatever its spelling, rather than read as no entry.
+// Compose does not treat it as unset: the key alone switches its file
+// discovery off, and the empty path resolves to the project directory, so
+// every plain `docker compose` there fails to load the project. Read as no
+// entry, it used to be rewritten to name the installer's override alone,
+// dropping the base file and the conventional override from the operator's
+// own commands.
+func TestComposeFileEntryListingNoFilesFailsClosed(t *testing.T) {
+	for _, env := range []string{
+		"COMPOSE_FILE=\n",
+		"COMPOSE_FILE=\"\"\n",
+		"COMPOSE_FILE=''\n",
+		"export COMPOSE_FILE=\n",
+		"COMPOSE_FILE = \n",
+		"COMPOSE_FILE=:\n",
+		"COMPOSE_FILE= # set per host\n",
+		"COMPOSE_FILE=\"\"  # set per host\n",
+		"A=b\r\nCOMPOSE_FILE=\r\nC=d\r\n",
+	} {
+		t.Run(env, func(t *testing.T) {
+			if files, err := ComposeFiles(env); err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE lists no files") {
+				t.Errorf("ComposeFiles(%q) = %q, %v; want an error saying the entry lists no files", env, files, err)
+			}
+			if out, err := AddComposeFile(env, []string{"docker-compose.yml", "docker-compose.override.yml"}, OverrideFileName); err == nil {
+				t.Errorf("AddComposeFile accepted %q and wrote %q", env, out)
+			}
+			if out, err := RemoveComposeFile(env, OverrideFileName); err == nil {
+				t.Errorf("RemoveComposeFile accepted %q and wrote %q", env, out)
+			}
+			if out, err := RemoveComposeFileLine(env); err == nil {
+				t.Errorf("RemoveComposeFileLine accepted %q and wrote %q", env, out)
+			}
+		})
+	}
+}
+
 func TestAddComposeFileToEmptyEnv(t *testing.T) {
 	got := mustAdd(t, "", []string{"docker-compose.yml"}, OverrideFileName)
 	if got != "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n" {

@@ -1169,6 +1169,96 @@ func TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry(t *testing.T) {
 	}
 }
 
+// TestInstallAndRollbackStopOnAnEmptyComposeFileEntry covers a .env whose
+// COMPOSE_FILE entry is there but lists no files. Compose does not read that
+// as unset -- it fails to load the project -- so it is neither the project
+// discovery would find nor a list to extend. Taken for no entry, it used to
+// let the install run against the discovered project and then rewrite the
+// line to name its own override alone, which is all the operator's plain
+// `docker compose up -d` would load; and rollback, told the install had
+// created the entry, deleted the operator's line outright. Both commands are
+// scripted to run to completion here, so only the refusal can stop them.
+func TestInstallAndRollbackStopOnAnEmptyComposeFileEntry(t *testing.T) {
+	for _, entry := range []string{"COMPOSE_FILE=", `COMPOSE_FILE=""`} {
+		t.Run(entry, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			discovered := filepath.Join(dir, "docker-compose.override.yml")
+			_ = os.WriteFile(discovered, []byte("services: {}\n"), 0o644)
+			envPath := filepath.Join(dir, ".env")
+			original := "A=b\n" + entry + "\nC=d\n"
+			_ = os.WriteFile(envPath, []byte(original), 0o644)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+			defer api.Close()
+
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+			discoveredProject := "docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " "
+			psql := discoveredProject + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+			withOverride := discoveredProject + "-f " + overridePath + " "
+			fake := &dockerx.FakeRunner{
+				Outputs: map[string][]byte{
+					discoveredProject + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+					psql + "select driver from database_switch limit 1":                          []byte("pg\n"),
+					discoveredProject + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+					"docker image inspect " + image:                                              []byte(""),
+					psql + setRowSQL:                                                             []byte("INSERT 0 1\n"),
+					withOverride + "up -d":                                                       nil,
+					withOverride + "logs --no-color bloodhound":                                  []byte("BloodTrail driver active version=test\n"),
+				},
+				Prefixes: map[string][]byte{
+					psql + "select (select count(*) from node)": []byte("10|20\n"),
+				},
+			}
+			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+			err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+			env, _ := os.ReadFile(envPath)
+			if err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE lists no files") {
+				t.Fatalf("install: want an error saying the entry lists no files, got %v; .env is now %q", err, env)
+			}
+			if string(env) != original {
+				t.Fatalf("install changed .env to %q, want it left as %q", env, original)
+			}
+			if len(fake.Calls) != 0 {
+				t.Fatalf("install ran commands against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+			if manifest.Exists(dir) {
+				t.Fatal("a refused install saved a manifest")
+			}
+			if _, statErr := os.Stat(overridePath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("a refused install wrote the override (stat: %v)", statErr)
+			}
+
+			// The manifest an install used to leave behind when it stopped
+			// before its .env write (a failed migration, say): it had taken
+			// the entry for none, so it recorded the line as its own.
+			row := "neo4j"
+			_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+				OverrideFile: overridePath, PGUser: "bloodhound", PGDatabase: "bloodhound", EnvComposeFileCreated: true}.Save(dir)
+			restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')"
+			fake = &dockerx.FakeRunner{Outputs: map[string][]byte{
+				psql + restoreRow:           []byte("INSERT 0 1\n"),
+				discoveredProject + "up -d": nil,
+			}}
+			err = Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
+				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second})
+			env, _ = os.ReadFile(envPath)
+			if err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE lists no files") {
+				t.Fatalf("rollback: want an error saying the entry lists no files, got %v; .env is now %q", err, env)
+			}
+			if string(env) != original {
+				t.Fatalf("rollback changed .env to %q, want it left as %q", env, original)
+			}
+			if len(fake.Calls) != 0 {
+				t.Fatalf("rollback ran commands against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+			if !manifest.Exists(dir) {
+				t.Fatal("a refused rollback removed the manifest")
+			}
+		})
+	}
+}
+
 // TestOptionsMakeARelativeProjectDirAbsolute pins that --project-dir is made
 // absolute like --compose-file: the manifest records it, and a rollback run
 // from another working directory must still find the same project.

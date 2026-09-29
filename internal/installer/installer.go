@@ -162,9 +162,9 @@ func composeHandle(runner dockerx.Runner, composeFile, projectDir string) (docke
 // a real misconfiguration and compose says so.
 //
 // A .env that exists but cannot be read, or whose COMPOSE_FILE entry cannot
-// be parsed with certainty (compose.ComposeFiles), is an error rather than
-// "no entry": guessing there would address -- and later rewrite -- a
-// different project from the one the operator runs.
+// be parsed with certainty or lists no files (compose.ComposeFiles), is an
+// error rather than "no entry": guessing there would address -- and later
+// rewrite -- a different project from the one the operator runs.
 func projectExtraFiles(composeFile, projectDir string) ([]string, error) {
 	envPath := filepath.Join(projectDir, ".env")
 	envData, err := os.ReadFile(envPath)
@@ -348,6 +348,8 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	// there before (compose.RemoveComposeFileLine). Nothing else writes
 	// .env between here and that write, and an unreadable or absent file
 	// means no entry, which the write below handles on its own.
+	// ComposeFiles refuses an entry that lists no files, so an empty result
+	// here means there is no line at all.
 	envProbe, _ := os.ReadFile(filepath.Join(opts.ProjectDir, ".env"))
 	probed, err := compose.ComposeFiles(string(envProbe))
 	if err != nil {
