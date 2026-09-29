@@ -158,10 +158,14 @@ validated.
   for `--compose-file` or an entry.
 - The installer stops before changing anything when it cannot be sure which files
   docker compose loads for the operator: a `COMPOSE_FILE` entry that is empty, uses
-  interpolation or escapes, has an empty or space-padded name, does not start with the
-  compose file it was given, or lists a file that does not exist; or `COMPOSE_FILE` (or a
+  interpolation or escapes, has an empty or space-padded name, does not list the compose
+  file it was given, or lists a file that does not exist; or `COMPOSE_FILE` (or a
   `COMPOSE_PATH_SEPARATOR` other than `:`) set in the shell's environment, which docker
-  compose takes over `.env`. The message says what to change.
+  compose takes over `.env`. The message says what to change. `status`, `verify` and
+  `rollback` read the project more forgivingly, so they keep working on whatever an
+  install -- of this version or an earlier one -- left behind; where an earlier version
+  took an empty `COMPOSE_FILE=` entry for none and wrote its override into it,
+  `rollback` puts the empty entry back as it was.
 - `bloodtrail rollback` returns the deployment to the graph it had before the install.
   On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible

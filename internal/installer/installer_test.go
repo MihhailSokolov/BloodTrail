@@ -1185,6 +1185,89 @@ func TestRollbackKeepsFilesAddedToTheEntryItCreated(t *testing.T) {
 	}
 }
 
+// TestRollbackWorksOnWhatEarlierInstallsLeft covers the .env states earlier
+// installers left behind, which rollback has to undo even though install
+// now refuses to create them. Taking an empty COMPOSE_FILE entry for none,
+// v0.1.2 wrote its override into it -- `COMPOSE_FILE=docker-compose.bloodtrail.yml`,
+// in the operator's own spelling -- and earlier versions wrote
+// `COMPOSE_FILE=:docker-compose.bloodtrail.yml`; an install that stopped
+// before its .env write left the empty entry itself, recorded as its own.
+// Rollback puts the empty entry back rather than deleting the line, restores
+// the driver row through the compose file even where the entry leaves it
+// out, and restarts the project as those installs read it. v0.1.2 also
+// extended a list that does not start with the compose file, which rollback
+// follows in compose's own order. The stricter reading this PR gave install
+// used to stop rollback on every one of these.
+func TestRollbackWorksOnWhatEarlierInstallsLeft(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		created bool
+		first   string // the files rollback restores the driver row through
+		restart string // the files it restarts with
+		want    string // .env afterwards
+		note    bool   // whether rollback says the entry it put back fails to load
+	}{
+		{"v0.1.2 over COMPOSE_FILE=", "A=b\nCOMPOSE_FILE=docker-compose.bloodtrail.yml\nC=d\n", true,
+			"base bloodtrail", "base discovered", "A=b\nCOMPOSE_FILE=\nC=d\n", true},
+		{`v0.1.2 over COMPOSE_FILE=""`, "COMPOSE_FILE=\"docker-compose.bloodtrail.yml\"\n", true,
+			"base bloodtrail", "base discovered", "COMPOSE_FILE=\"\"\n", true},
+		{"v0.1.1 over COMPOSE_FILE=", "COMPOSE_FILE=:docker-compose.bloodtrail.yml\n", true,
+			"base bloodtrail", "base discovered", "COMPOSE_FILE=\n", true},
+		{"stopped before writing over COMPOSE_FILE=", "COMPOSE_FILE=\n", true,
+			"base discovered", "base discovered", "COMPOSE_FILE=\n", false},
+		{"v0.1.2 over a list not starting with the compose file", "COMPOSE_FILE=extra.yml:docker-compose.yml:docker-compose.bloodtrail.yml\n", false,
+			"extra base bloodtrail", "extra base", "COMPOSE_FILE=extra.yml:docker-compose.yml\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			path := map[string]string{
+				"base":       composeFile,
+				"discovered": filepath.Join(dir, "docker-compose.override.yml"),
+				"bloodtrail": filepath.Join(dir, "docker-compose.bloodtrail.yml"),
+				"extra":      filepath.Join(dir, "extra.yml"),
+			}
+			for _, f := range []string{"discovered", "bloodtrail", "extra"} {
+				_ = os.WriteFile(path[f], []byte("services: {}\n"), 0o644)
+			}
+			project := func(files string) string {
+				p := "docker compose --project-directory " + dir
+				for _, f := range strings.Fields(files) {
+					p += " -f " + path[f]
+				}
+				return p + " "
+			}
+			envPath := filepath.Join(dir, ".env")
+			_ = os.WriteFile(envPath, []byte(c.env), 0o644)
+			row := "neo4j"
+			_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+				OverrideFile: path["bloodtrail"], PGUser: "bloodhound", PGDatabase: "bloodhound", EnvComposeFileCreated: c.created}.Save(dir)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+			defer api.Close()
+			restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')"
+			fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+				project(c.first) + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+				project(c.restart) + "up -d": nil,
+			}}
+			var out bytes.Buffer
+			if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out},
+				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+				t.Fatalf("rollback: %v\ncalls:\n%s", err, strings.Join(fake.Calls, "\n"))
+			}
+			if env, _ := os.ReadFile(envPath); string(env) != c.want {
+				t.Fatalf("rollback left .env as %q, want %q", env, c.want)
+			}
+			if said := strings.Contains(out.String(), "fails to load the project"); said != c.note {
+				t.Fatalf("rollback said (%v, want %v) that the entry it put back fails to load:\n%s", said, c.note, out.String())
+			}
+			if manifest.Exists(dir) {
+				t.Fatal("rollback did not finish")
+			}
+		})
+	}
+}
+
 // TestRollbackOfAnInstallThatNeverWroteTheEntry covers the manifest an install
 // leaves when it stops before its .env write -- a migration it refuses, say,
 // as the e2e run's second install does. The manifest records the entry the
@@ -1291,14 +1374,15 @@ func TestComposeHandleFindsTheProjectComposeWouldDiscover(t *testing.T) {
 	}
 }
 
-// TestComposeHandleRefusesAFileComposeWouldNotLoad covers a project with no
+// TestInstallRefusesAFileComposeWouldNotLoad covers a project with no
 // COMPOSE_FILE entry in whose directory compose's discovery picks another
 // compose file than the one the installer was given -- compose.yaml beside
 // the default docker-compose.yml, say. The operator's own commands run that
-// other file, so the installer must neither address the one it was given nor
-// pin it with the COMPOSE_FILE entry it writes, which would switch the
-// operator's commands over to it.
-func TestComposeHandleRefusesAFileComposeWouldNotLoad(t *testing.T) {
+// other file, so install must neither address the one it was given nor pin
+// it with the COMPOSE_FILE entry it writes, which would switch the
+// operator's commands over to it. The other commands, which have to keep
+// working, take the file given as run with -f.
+func TestInstallRefusesAFileComposeWouldNotLoad(t *testing.T) {
 	for _, c := range []struct {
 		base, other string
 	}{
@@ -1310,9 +1394,12 @@ func TestComposeHandleRefusesAFileComposeWouldNotLoad(t *testing.T) {
 		for _, f := range []string{c.base, c.other} {
 			_ = os.WriteFile(filepath.Join(dir, f), []byte("services: {}\n"), 0o644)
 		}
-		_, err := composeHandle(&dockerx.FakeRunner{}, filepath.Join(dir, c.base), dir)
-		if err == nil || !strings.Contains(err.Error(), c.other) {
-			t.Errorf("given %s beside %s: want an error naming %s, got %v", c.base, c.other, c.other, err)
+		base := filepath.Join(dir, c.base)
+		if _, err := installHandle(&dockerx.FakeRunner{}, base, dir); err == nil || !strings.Contains(err.Error(), c.other) {
+			t.Errorf("install given %s beside %s: want an error naming %s, got %v", c.base, c.other, c.other, err)
+		}
+		if h, err := composeHandle(&dockerx.FakeRunner{}, base, dir); err != nil || h.File != base || len(h.ExtraFiles) != 0 {
+			t.Errorf("the others given %s beside %s: %v, %v; want %s alone", c.base, c.other, h.Args(), err, c.base)
 		}
 	}
 }
@@ -1359,33 +1446,41 @@ func TestInstallWritesTheOverrideComposeWouldHaveDiscovered(t *testing.T) {
 // anywhere else, so for a list that did not start with it, its commands
 // merged another project -- `COMPOSE_FILE=extra.yml:docker-compose.yml` has
 // docker-compose.yml's settings win in the operator's commands and
-// extra.yml's in the installer's. The list has to start with that file, and
-// the rest goes on as listed.
+// extra.yml's in the installer's. The list now goes on exactly as listed.
+// Install also refuses a list that leaves out the compose file given, which
+// compose then does not load at all; the other commands put it first, as an
+// earlier install may have left an entry naming its override alone.
 func TestComposeHandleMergesTheListAsComposeDoes(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	extra := filepath.Join(dir, "extra.yml")
 	_ = os.WriteFile(extra, []byte("services: {}\n"), 0o644)
 	for _, c := range []struct {
-		entry string
-		want  string // the -f files, or "" for a refusal
+		entry  string
+		want   string // the -f files the handle names
+		strict bool   // whether install goes by them too, rather than refusing
 	}{
-		{"COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.yml", " -f " + composeFile + " -f " + extra + " -f " + composeFile + " "},
-		{"COMPOSE_FILE=extra.yml:docker-compose.yml", ""},
-		{"COMPOSE_FILE=extra.yml", ""},
+		{"COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.yml", " -f " + composeFile + " -f " + extra + " -f " + composeFile + " ", true},
+		{"COMPOSE_FILE=extra.yml:docker-compose.yml", " -f " + extra + " -f " + composeFile + " ", true},
+		{"COMPOSE_FILE=extra.yml", " -f " + composeFile + " -f " + extra + " ", false},
 	} {
 		_ = os.WriteFile(filepath.Join(dir, ".env"), []byte(c.entry+"\n"), 0o644)
-		h, err := composeHandle(&dockerx.FakeRunner{}, composeFile, dir)
-		if c.want == "" {
-			if err == nil || !strings.Contains(err.Error(), "starts with extra.yml") {
-				t.Errorf("%s: want a refusal naming the first file, got %v (%s)", c.entry, err, strings.Join(h.Args(), " "))
+		for _, strict := range []bool{false, true} {
+			h, err := composeHandle(&dockerx.FakeRunner{}, composeFile, dir)
+			if strict {
+				h, err = installHandle(&dockerx.FakeRunner{}, composeFile, dir)
 			}
-			continue
-		}
-		if err != nil {
-			t.Fatalf("%s: %v", c.entry, err)
-		}
-		if args := strings.Join(h.Args("up", "-d"), " "); !strings.Contains(args, c.want+"up -d") {
-			t.Errorf("%s: compose would merge %q, the installer %q", c.entry, c.want, args)
+			if strict && !c.strict {
+				if err == nil || !strings.Contains(err.Error(), "does not list "+composeFile) {
+					t.Errorf("%s: install wants a refusal naming %s, got %v (%s)", c.entry, composeFile, err, strings.Join(h.Args(), " "))
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("%s (strict %v): %v", c.entry, strict, err)
+			}
+			if args := strings.Join(h.Args("up", "-d"), " "); !strings.Contains(args, c.want+"up -d") {
+				t.Errorf("%s (strict %v): want %q merged, the installer merges %q", c.entry, strict, c.want, args)
+			}
 		}
 	}
 }
@@ -1528,16 +1623,18 @@ func scriptPGInstall(fake *dockerx.FakeRunner, project, overridePath, image stri
 	return fake
 }
 
-// TestInstallAndRollbackStopOnAnEmptyComposeFileEntry covers a .env whose
-// COMPOSE_FILE entry is there but lists no files. Compose does not read that
-// as unset -- it fails to load the project -- so it is neither the project
-// discovery would find nor a list to extend. Taken for no entry, it used to
-// let the install run against the discovered project and then rewrite the
-// line to name its own override alone, which is all the operator's plain
-// `docker compose up -d` would load; and rollback, told the install had
-// created the entry, deleted the operator's line outright. Both commands are
-// scripted to run to completion here, so only the refusal can stop them.
-func TestInstallAndRollbackStopOnAnEmptyComposeFileEntry(t *testing.T) {
+// TestInstallStopsOnAnEmptyComposeFileEntry covers a .env whose COMPOSE_FILE
+// entry is there but lists no files. Compose does not read that as unset --
+// it fails to load the project -- so it is neither the project discovery
+// would find nor a list to extend. Taken for no entry, it used to let the
+// install run against the discovered project and then rewrite the line to
+// name its own override alone, which is all the operator's plain `docker
+// compose up -d` would load; and rollback, told the install had created the
+// entry, deleted the operator's line outright. Install is scripted to run to
+// completion here, so only its refusal can stop it; and rollback of the
+// manifest an earlier install left over such an entry -- stopped before its
+// .env write -- completes and leaves the operator's line as it is.
+func TestInstallStopsOnAnEmptyComposeFileEntry(t *testing.T) {
 	for _, entry := range []string{"COMPOSE_FILE=", `COMPOSE_FILE=""`} {
 		t.Run(entry, func(t *testing.T) {
 			dir, composeFile := setupProject(t)
@@ -1588,17 +1685,14 @@ func TestInstallAndRollbackStopOnAnEmptyComposeFileEntry(t *testing.T) {
 			err = Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
 				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second})
 			env, _ = os.ReadFile(envPath)
-			if err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE lists no files") {
-				t.Fatalf("rollback: want an error saying the entry lists no files, got %v; .env is now %q", err, env)
+			if err != nil {
+				t.Fatalf("rollback: %v; .env is now %q", err, env)
 			}
 			if string(env) != original {
 				t.Fatalf("rollback changed .env to %q, want it left as %q", env, original)
 			}
-			if len(fake.Calls) != 0 {
-				t.Fatalf("rollback ran commands against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
-			}
-			if !manifest.Exists(dir) {
-				t.Fatal("a refused rollback removed the manifest")
+			if manifest.Exists(dir) {
+				t.Fatal("rollback did not finish")
 			}
 		})
 	}

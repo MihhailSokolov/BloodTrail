@@ -44,7 +44,9 @@ type Manifest struct {
 	// otherwise drop out of their project, so rollback then takes only the
 	// installer's own override out of the line. Absent in manifests written
 	// before this was recorded, which makes rollback remove the line as
-	// before.
+	// before -- unless the line names nothing but that override: those
+	// installs took an empty entry for none and wrote their override into
+	// it, and rollback puts the empty entry back.
 	EnvComposeFileWritten []string `json:"env_compose_file_written,omitempty"`
 }
 
