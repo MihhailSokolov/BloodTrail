@@ -360,26 +360,16 @@ func TestRemoveComposeFileLine(t *testing.T) {
 	}
 }
 
-// TestAutoOverrideCandidates pins the spellings compose itself would look for
-// beside a base file, same extension first, and that a base file which is not
-// YAML at all has no such sibling.
-func TestAutoOverrideCandidates(t *testing.T) {
-	cases := []struct {
-		base string
-		want string
-	}{
-		{"docker-compose.yml", "docker-compose.override.yml,docker-compose.override.yaml"},
-		{"docker-compose.yaml", "docker-compose.override.yaml,docker-compose.override.yml"},
-		{"compose.yaml", "compose.override.yaml,compose.override.yml"},
-		{"stack.yml", "stack.override.yml,stack.override.yaml"},
-		{"docker-compose.json", ""},
-		{"Makefile", ""},
+// TestDefaultFileNamesFollowCompose pins compose's own discovery order
+// (compose-go v2.10.1's cli.DefaultFileNames and DefaultOverrideFileNames).
+// The override is not paired with the base file by name or extension: it
+// used to be, which missed compose.override.* and preferred the wrong
+// spelling when there were two.
+func TestDefaultFileNamesFollowCompose(t *testing.T) {
+	if got, want := strings.Join(DefaultFileNames(), ","), "compose.yaml,compose.yml,docker-compose.yml,docker-compose.yaml"; got != want {
+		t.Errorf("DefaultFileNames = %s, want %s", got, want)
 	}
-	for _, c := range cases {
-		t.Run(c.base, func(t *testing.T) {
-			if got := strings.Join(AutoOverrideCandidates(c.base), ","); got != c.want {
-				t.Fatalf("AutoOverrideCandidates(%q) = %q, want %q", c.base, got, c.want)
-			}
-		})
+	if got, want := strings.Join(DefaultOverrideFileNames(), ","), "compose.override.yml,compose.override.yaml,docker-compose.override.yml,docker-compose.override.yaml"; got != want {
+		t.Errorf("DefaultOverrideFileNames = %s, want %s", got, want)
 	}
 }

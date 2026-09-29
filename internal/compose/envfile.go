@@ -4,7 +4,6 @@ package compose
 
 import (
 	"fmt"
-	"path"
 	"strings"
 )
 
@@ -194,8 +193,8 @@ func ComposeFiles(env string) ([]string, error) {
 // baseFiles is that existing project, in merge order, and is used only when
 // there is no COMPOSE_FILE entry yet: writing one turns off compose's own
 // file discovery for every later command, so the line has to name everything
-// discovery would have found -- the base file AND the conventional override
-// beside it (AutoOverrideCandidates). Naming only the base file would
+// discovery would have found -- the base file AND the override compose loads
+// beside it (DefaultOverrideFileNames). Naming only the base file would
 // silently drop the operator's docker-compose.override.yml from their own
 // commands, permanently and invisibly.
 func AddComposeFile(env string, baseFiles []string, overrideFile string) (string, error) {
@@ -305,26 +304,21 @@ func (f envFile) removeLine(i int) envFile {
 	return envFile{bom: f.bom, lines: lines}
 }
 
-// AutoOverrideCandidates names the override files docker compose would load
-// on its own beside baseFile, most preferred first. Compose pairs a base file
-// with an "<name>.override.<ext>" sibling and loads it after the base without
-// being told to; naming any file with -f (or through COMPOSE_FILE) switches
-// that discovery off, so both composeHandle and AddComposeFile have to put
-// the sibling back explicitly or the installer and the operator end up
-// running two different projects.
-//
-// The same-extension spelling comes first, then the other one, matching
-// compose's own preference. Callers resolve these against the base file's
-// directory and keep the ones that exist.
-func AutoOverrideCandidates(baseFile string) []string {
-	ext := path.Ext(baseFile)
-	if ext != ".yml" && ext != ".yaml" {
-		return nil
-	}
-	stem := strings.TrimSuffix(baseFile, ext)
-	other := ".yaml"
-	if ext == ".yaml" {
-		other = ".yml"
-	}
-	return []string{stem + ".override" + ext, stem + ".override" + other}
+// DefaultFileNames names the files docker compose looks for when it is given
+// neither -f nor COMPOSE_FILE, in its order of preference: it loads the first
+// one that exists in the project directory as the base file (compose-go's
+// cli.DefaultFileNames).
+func DefaultFileNames() []string {
+	return []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"}
+}
+
+// DefaultOverrideFileNames names the override files compose then looks for
+// beside that base file, in its order of preference: it merges the first one
+// that exists, whatever the base file itself is called (compose-go's
+// cli.DefaultOverrideFileNames). Naming any file with -f, or through
+// COMPOSE_FILE, switches both lookups off, so composeHandle and the entry
+// AddComposeFile writes have to name that override explicitly, or the
+// installer and the operator end up running two different projects.
+func DefaultOverrideFileNames() []string {
+	return []string{"compose.override.yml", "compose.override.yaml", "docker-compose.override.yml", "docker-compose.override.yaml"}
 }

@@ -145,11 +145,15 @@ validated.
   explicit `-f` and let `.env` decide.
 - Writing that entry replaces docker compose's own file discovery, so the installer
   writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the conventional `docker-compose.override.yml`. Deployments
-  that keep their customizations in that override file therefore keep them, both in the
-  installer's own commands and in the operator's afterwards. `bloodtrail rollback`
-  removes the whole entry again when the install was what created it, which puts
-  discovery back the way it was.
+  when one sits beside it, the override file compose loads on its own (the first of
+  `compose.override.yml`, `compose.override.yaml`, `docker-compose.override.yml` and
+  `docker-compose.override.yaml` that exists, whatever the compose file is called).
+  Deployments that keep their customizations in that override file therefore keep them,
+  both in the installer's own commands and in the operator's afterwards. `bloodtrail
+  rollback` removes the whole entry again when the install was what created it, which
+  puts discovery back the way it was. With no entry, the compose file given has to be the
+  one discovery picks (`compose.yaml` wins over `docker-compose.yml` in the same
+  directory); otherwise the installer stops and asks for `--compose-file` or an entry.
 - `bloodtrail rollback` returns the deployment to the graph it had before the install.
   On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible

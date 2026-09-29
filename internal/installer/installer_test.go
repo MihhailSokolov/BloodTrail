@@ -1147,6 +1147,114 @@ func TestComposeHandleSkipsAMissingExtraFile(t *testing.T) {
 	}
 }
 
+// TestComposeHandleFindsTheProjectComposeWouldDiscover pins compose's own
+// file discovery for a project with no COMPOSE_FILE entry (compose-go's
+// cli.DefaultFileNames and DefaultOverrideFileNames): the override is the
+// first of compose.override.yml, compose.override.yaml,
+// docker-compose.override.yml and docker-compose.override.yaml that exists,
+// whatever the base file is called, and there is none at all for a base file
+// compose does not discover itself, which the operator can only run with -f.
+// The installer used to pair the base file with "<name>.override.<ext>"
+// instead: it missed compose.override.* beside docker-compose.yml, took the
+// wrong spelling when there were two, and merged a stack.override.yml
+// compose never loads -- so its `up -d`, and the COMPOSE_FILE entry the
+// install writes, ran a different project from the operator's.
+func TestComposeHandleFindsTheProjectComposeWouldDiscover(t *testing.T) {
+	cases := []struct {
+		name  string
+		base  string   // the compose file the installer is given
+		files []string // the other files in the project directory
+		want  string   // the files merged after the base one
+	}{
+		{"compose.override.yaml beside docker-compose.yml", "docker-compose.yml", []string{"compose.override.yaml"}, "compose.override.yaml"},
+		{"docker-compose.override.yml beside compose.yaml", "compose.yaml", []string{"docker-compose.override.yml"}, "docker-compose.override.yml"},
+		{"compose.override.yml before docker-compose.override.yml", "docker-compose.yml", []string{"docker-compose.override.yml", "compose.override.yml"}, "compose.override.yml"},
+		{".yml before .yaml whatever the base file's", "docker-compose.yaml", []string{"docker-compose.override.yaml", "docker-compose.override.yml"}, "docker-compose.override.yml"},
+		{"none for a base file compose does not discover", "stack.yml", []string{"stack.override.yml", "docker-compose.override.yml"}, ""},
+		{"none there", "docker-compose.yml", nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range append([]string{c.base}, c.files...) {
+				_ = os.WriteFile(filepath.Join(dir, f), []byte("services: {}\n"), 0o644)
+			}
+			h, err := composeHandle(&dockerx.FakeRunner{}, filepath.Join(dir, c.base), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, f := range h.ExtraFiles {
+				got = append(got, strings.TrimPrefix(f, dir+string(filepath.Separator)))
+			}
+			if strings.Join(got, ",") != c.want {
+				t.Fatalf("merged after %s: %q, want %q", c.base, got, c.want)
+			}
+		})
+	}
+}
+
+// TestComposeHandleRefusesAFileComposeWouldNotLoad covers a project with no
+// COMPOSE_FILE entry in whose directory compose's discovery picks another
+// compose file than the one the installer was given -- compose.yaml beside
+// the default docker-compose.yml, say. The operator's own commands run that
+// other file, so the installer must neither address the one it was given nor
+// pin it with the COMPOSE_FILE entry it writes, which would switch the
+// operator's commands over to it.
+func TestComposeHandleRefusesAFileComposeWouldNotLoad(t *testing.T) {
+	for _, c := range []struct {
+		base, other string
+	}{
+		{"docker-compose.yml", "compose.yaml"},
+		{"docker-compose.yaml", "docker-compose.yml"},
+		{"stack.yml", "docker-compose.yml"},
+	} {
+		dir := t.TempDir()
+		for _, f := range []string{c.base, c.other} {
+			_ = os.WriteFile(filepath.Join(dir, f), []byte("services: {}\n"), 0o644)
+		}
+		_, err := composeHandle(&dockerx.FakeRunner{}, filepath.Join(dir, c.base), dir)
+		if err == nil || !strings.Contains(err.Error(), c.other) {
+			t.Errorf("given %s beside %s: want an error naming %s, got %v", c.base, c.other, c.other, err)
+		}
+	}
+}
+
+// TestInstallWritesTheOverrideComposeWouldHaveDiscovered is the install half
+// of TestComposeHandleFindsTheProjectComposeWouldDiscover: the entry the
+// install writes replaces discovery, so it has to name the override compose
+// actually loads -- here compose.override.yaml beside docker-compose.yml,
+// which the installer used to leave out of its own commands and of the
+// operator's. Both projects are scripted, so only what the install did
+// tells them apart.
+func TestInstallWritesTheOverrideComposeWouldHaveDiscovered(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	discovered := filepath.Join(dir, "compose.override.yaml")
+	_ = os.WriteFile(discovered, []byte("services: {}\n"), 0o644)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake := scriptPGInstall(&dockerx.FakeRunner{}, base+"-f "+discovered+" ", overridePath, image)
+	scriptPGInstall(fake, base, overridePath, image)
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	for _, call := range fake.Calls {
+		if strings.HasPrefix(call, "docker compose") && !strings.Contains(call, " -f "+discovered+" ") {
+			t.Fatalf("a compose call dropped the override compose discovers: %s", call)
+		}
+	}
+	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	if want := "COMPOSE_FILE=docker-compose.yml:compose.override.yaml:docker-compose.bloodtrail.yml\n"; string(env) != want {
+		t.Fatalf(".env = %q, want %q", env, want)
+	}
+}
+
 // TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry pins the fail
 // closed half of compose.ComposeFiles at the installer: an entry it cannot
 // read with certainty stops every command before it runs anything, rather
@@ -1167,6 +1275,36 @@ func TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry(t *testing.T) {
 	if len(fake.Calls) != 0 {
 		t.Fatalf("commands ran against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
 	}
+}
+
+// scriptPGInstall scripts on fake a whole install onto a deployment already
+// on PostgreSQL, addressed as project -- the "docker compose ..." prefix that
+// names its files: inventory, backup, driver switch, restart, verification.
+// A test can script more than one project on the same fake, so that the
+// install runs to the end whichever one it addresses and only what it did
+// tells them apart.
+func scriptPGInstall(fake *dockerx.FakeRunner, project, overridePath, image string) *dockerx.FakeRunner {
+	if fake.Outputs == nil {
+		fake.Outputs = map[string][]byte{}
+	}
+	if fake.Prefixes == nil {
+		fake.Prefixes = map[string][]byte{}
+	}
+	psql := project + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	withOverride := project + "-f " + overridePath + " "
+	for cmd, out := range map[string][]byte{
+		project + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+		psql + "select driver from database_switch limit 1":                []byte("pg\n"),
+		project + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+		"docker image inspect " + image:                                    []byte(""),
+		psql + setRowSQL:                                                   []byte("INSERT 0 1\n"),
+		withOverride + "up -d":                                             nil,
+		withOverride + "logs --no-color bloodhound":                        []byte("BloodTrail driver active version=test\n"),
+	} {
+		fake.Outputs[cmd] = out
+	}
+	fake.Prefixes[psql+"select (select count(*) from node)"] = []byte("10|20\n")
+	return fake
 }
 
 // TestInstallAndRollbackStopOnAnEmptyComposeFileEntry covers a .env whose
@@ -1194,21 +1332,7 @@ func TestInstallAndRollbackStopOnAnEmptyComposeFileEntry(t *testing.T) {
 			overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
 			discoveredProject := "docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " "
 			psql := discoveredProject + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
-			withOverride := discoveredProject + "-f " + overridePath + " "
-			fake := &dockerx.FakeRunner{
-				Outputs: map[string][]byte{
-					discoveredProject + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
-					psql + "select driver from database_switch limit 1":                          []byte("pg\n"),
-					discoveredProject + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-					"docker image inspect " + image:                                              []byte(""),
-					psql + setRowSQL:                                                             []byte("INSERT 0 1\n"),
-					withOverride + "up -d":                                                       nil,
-					withOverride + "logs --no-color bloodhound":                                  []byte("BloodTrail driver active version=test\n"),
-				},
-				Prefixes: map[string][]byte{
-					psql + "select (select count(*) from node)": []byte("10|20\n"),
-				},
-			}
+			fake := scriptPGInstall(&dockerx.FakeRunner{}, discoveredProject, overridePath, image)
 			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 			err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)

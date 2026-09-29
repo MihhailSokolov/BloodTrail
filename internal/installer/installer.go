@@ -149,9 +149,12 @@ func composeHandle(runner dockerx.Runner, composeFile, projectDir string) (docke
 
 // projectExtraFiles resolves the files that must be merged after the base one,
 // in merge order. COMPOSE_FILE wins when it is set, because compose then loads
-// exactly what it lists and discovers nothing; with no such entry, compose
-// pairs the base file with its conventional override sibling on its own, so
-// that sibling is what has to be reproduced.
+// exactly what it lists and discovers nothing. With no such entry compose
+// finds the project on its own (discoveredProject): its base file has to be
+// the one the installer was given -- the operator's own commands run another
+// file otherwise -- and the override it finds beside it is what has to be
+// reproduced. A base file compose does not discover at all is one the
+// operator runs with -f, which merges no override either.
 //
 // Entries that are not on disk are skipped rather than passed on: a compose
 // command naming a missing file fails outright, which would otherwise wedge
@@ -175,9 +178,15 @@ func projectExtraFiles(composeFile, projectDir string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", envPath, err)
 	}
-	if len(listed) == 0 {
-		if auto := autoOverrideFile(composeFile); auto != "" {
-			return []string{auto}, nil
+	if listed == nil {
+		base, override := discoveredProject(projectDir)
+		switch {
+		case base == "":
+			return nil, nil
+		case base != composeFile:
+			return nil, fmt.Errorf("%s sets no COMPOSE_FILE, so docker compose loads %s there on its own, not %s; pass --compose-file for the file the deployment runs, or list its files in COMPOSE_FILE", envPath, base, composeFile)
+		case override != "":
+			return []string{override}, nil
 		}
 		return nil, nil
 	}
@@ -197,18 +206,31 @@ func projectExtraFiles(composeFile, projectDir string) ([]string, error) {
 	return out, nil
 }
 
-// autoOverrideFile returns the override file docker compose would load beside
-// composeFile without being told to, or "" when there is none. Compose takes
-// the first spelling that exists, and so does this.
-func autoOverrideFile(composeFile string) string {
-	dir := filepath.Dir(composeFile)
-	for _, candidate := range compose.AutoOverrideCandidates(filepath.Base(composeFile)) {
-		p := filepath.Join(dir, candidate)
-		if _, err := os.Stat(p); err == nil {
+// discoveredProject returns the files docker compose loads on its own in dir
+// when it is given neither -f nor COMPOSE_FILE: the first of
+// compose.DefaultFileNames that exists there as the base file, then the first
+// of compose.DefaultOverrideFileNames beside it -- "" for either that is not
+// there. (With no base file in dir compose goes on to look in the parent
+// directories, but whatever it finds there is not this project either.)
+func discoveredProject(dir string) (base, override string) {
+	if base = firstExisting(dir, compose.DefaultFileNames()); base != "" {
+		override = firstExisting(dir, compose.DefaultOverrideFileNames())
+	}
+	return base, override
+}
+
+func firstExisting(dir string, names []string) string {
+	for _, name := range names {
+		if p := filepath.Join(dir, name); fileExists(p) {
 			return p
 		}
 	}
 	return ""
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // imageExists reports whether the image can be found locally or in a registry
@@ -453,17 +475,15 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading .env: %w; %s", err, rollbackHint)
 	}
-	// The entry this writes replaces compose's own file discovery, so it has
-	// to name what discovery would have found: the base file and, when one is
-	// there, the conventional override beside it. Listing only the base file
-	// would drop that override out of the operator's own `docker compose`
-	// commands from here on.
-	baseRel, _ := filepath.Rel(opts.ProjectDir, opts.ComposeFile)
-	baseFiles := []string{baseRel}
-	if auto := autoOverrideFile(opts.ComposeFile); auto != "" {
-		if autoRel, relErr := filepath.Rel(opts.ProjectDir, auto); relErr == nil {
-			baseFiles = append(baseFiles, autoRel)
-		}
+	// An entry this writes, where there was none, replaces compose's own file
+	// discovery, so it has to name what discovery found and the installer has
+	// been addressing since: the base file and, when there is one, the
+	// override beside it. Listing only the base file would drop that override
+	// out of the operator's own `docker compose` commands from here on.
+	var baseFiles []string
+	for _, f := range append([]string{c.File}, c.ExtraFiles...) {
+		rel, _ := filepath.Rel(opts.ProjectDir, f)
+		baseFiles = append(baseFiles, rel)
 	}
 	newEnv, err := compose.AddComposeFile(string(envData), baseFiles, compose.OverrideFileName)
 	if err != nil {
