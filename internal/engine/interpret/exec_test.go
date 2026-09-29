@@ -423,28 +423,14 @@ func TestExecUndirectedStepExcludesSelfBothOrientations(t *testing.T) {
 
 // --- undirected same-symbol step: self-loop pattern (n)-[:E]-(n) -----------
 
-// TestExecUndirectedSameSymbolSelfLoop pins two things at once, per the
-// review finding that sent us back to dawgs' own SQL:
-//
-//  1. A literal same-symbol undirected pattern must actually find self-loop
-//     edges (it deterministically found zero before this fix, because
-//     adjacency's DirectionBoth "other == bound" self-exclusion fired
-//     unconditionally, even when bound is the *only* node the step can ever
-//     match against).
-//
-//  2. Multiplicity: exactly ONE row per self-loop edge, not two (once per
-//     CSR orientation). This mirrors dawgs@v0.8.0's
-//     buildSelfReferentialDirectionlessTraversalRoot (cypher/models/pgsql/
-//     translate/traversal_directionless.go), confirmed by generating its
-//     actual SQL for `match (u)-[]-(u) return u`:
-//
-//     with s0 as (select ... from edge e0 join node n0
-//     on (n0.id = e0.end_id or n0.id = e0.start_id)
-//     where (n0.id = e0.end_id or n0.id = e0.start_id)) ...
-//
-// -- a single INNER JOIN with one OR-condition shared by the ON and WHERE
-// clauses, not a union of a forward and a reverse traversal, so it emits
-// exactly one row per matching edge.
+// TestExecUndirectedSameSymbolSelfLoop pins that `(n)-[:E]-(n)` declines.
+// dawgs@v0.8.0 lowers it (buildSelfReferentialDirectionlessTraversalRoot)
+// to one join of edge and node on `(n0.id = e0.end_id or n0.id =
+// e0.start_id)`: EITHER endpoint, so every node touching an E edge matches
+// once per such edge -- here s through its self-loop, and t and w through
+// t -> w -- not just the self-loop the Cypher reads as. The live oracle
+// returns 364 rows for the same shape over a graph where the evaluator's
+// self-loop reading gives 1.
 func TestExecUndirectedSameSymbolSelfLoop(t *testing.T) {
 	const kindE snapshot.KindID = 10
 
@@ -456,15 +442,14 @@ func TestExecUndirectedSameSymbolSelfLoop(t *testing.T) {
 			{42, nil, nil}, // w (t's non-self-loop neighbor)
 		},
 		[]execEdgeSpec{
-			{6000, 40, 40, kindE}, // s -> s (self-loop; must be found, exactly once)
-			{6001, 41, 42, kindE}, // t -> w (not a self-loop; must never satisfy (n)-[:E]-(n))
+			{6000, 40, 40, kindE}, // s -> s
+			{6001, 41, 42, kindE}, // t -> w
 		},
 	)
 
-	rs := mustExec(t, snap, `MATCH (n)-[:E]-(n) RETURN n`, generousBudget)
-
-	s, _ := snap.Dense(40)
-	assertRowSet(t, rs, []string{rowKey([]OutVal{{Kind: OutNode, Node: s}})})
+	if _, ok := planNoFail(t, snap, `MATCH (n)-[:E]-(n) RETURN n`); ok {
+		t.Fatal("Plan served a same-variable undirected pattern")
+	}
 }
 
 // TestExecUndirectedDifferentSymbolClosingStepExcludesRuntimeSelfLoop is the

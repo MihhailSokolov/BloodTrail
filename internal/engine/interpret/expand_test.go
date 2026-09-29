@@ -926,6 +926,12 @@ func TestShortestPathLimit(t *testing.T) {
 		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s<>t RETURN p`)
 	residualPart, residualStep := shortestPathPartAndStep(t, snap,
 		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Target)) WHERE s.group = t.group AND s<>t RETURN p`)
+	// t's kind disjunction is pushed onto t, but whether it is ENFORCED
+	// depends on how the route resolved t, which the enforced flags say.
+	pushedPart, pushedStep := shortestPathPartAndStep(t, snap,
+		`MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE (t:Root OR t:Target) AND s<>t RETURN p`)
+
+	all := enforcedConjuncts{fromPredicates: true, toPredicates: true, endpointInequality: true}
 
 	tests := []struct {
 		name           string
@@ -934,6 +940,7 @@ func TestShortestPathLimit(t *testing.T) {
 		rowCapPlusOne  int64
 		part           *Part
 		step           *Step
+		enforced       enforcedConjuncts
 		want           int64
 	}{
 		{
@@ -941,6 +948,7 @@ func TestShortestPathLimit(t *testing.T) {
 			rowCapPlusOne: 11,
 			part:          noResidualPart,
 			step:          noResidualStep,
+			enforced:      all,
 			want:          11,
 		},
 		{
@@ -953,6 +961,7 @@ func TestShortestPathLimit(t *testing.T) {
 			rowCapPlusOne:  11,
 			part:           noResidualPart,
 			step:           noResidualStep,
+			enforced:       all,
 			want:           11,
 		},
 		{
@@ -962,6 +971,7 @@ func TestShortestPathLimit(t *testing.T) {
 			rowCapPlusOne:  11,
 			part:           noResidualPart,
 			step:           noResidualStep,
+			enforced:       all,
 			want:           3,
 		},
 		{
@@ -971,6 +981,7 @@ func TestShortestPathLimit(t *testing.T) {
 			rowCapPlusOne:  11,
 			part:           noResidualPart,
 			step:           noResidualStep,
+			enforced:       all,
 			want:           11,
 		},
 		{
@@ -980,6 +991,43 @@ func TestShortestPathLimit(t *testing.T) {
 			rowCapPlusOne:  11,
 			part:           residualPart,
 			step:           residualStep,
+			enforced:       all,
+			want:           11,
+		},
+		{
+			// The short-answer case: t's predicate is pushed, but a side
+			// that does not narrow reaches traverse as a bare bitmap that
+			// never evaluates it, so Part.Where still filters traverse's
+			// output -- counting LIMIT paths before that served too few.
+			name:           "pushed endpoint predicate the traversal did not enforce: never narrows",
+			limitTargetSet: true,
+			limitTarget:    3,
+			rowCapPlusOne:  11,
+			part:           pushedPart,
+			step:           pushedStep,
+			enforced:       enforcedConjuncts{fromPredicates: true, endpointInequality: true},
+			want:           11,
+		},
+		{
+			name:           "the same predicate, enforced by the traversal: narrows to target",
+			limitTargetSet: true,
+			limitTarget:    3,
+			rowCapPlusOne:  11,
+			part:           pushedPart,
+			step:           pushedStep,
+			enforced:       all,
+			want:           3,
+		},
+		{
+			// Only traverse's ExcludeSelf enforces s<>t; a route that does
+			// not must leave it residual.
+			name:           "endpoint inequality not enforced by the route: never narrows",
+			limitTargetSet: true,
+			limitTarget:    3,
+			rowCapPlusOne:  11,
+			part:           noResidualPart,
+			step:           noResidualStep,
+			enforced:       enforcedConjuncts{fromPredicates: true, toPredicates: true},
 			want:           11,
 		},
 	}
@@ -987,7 +1035,7 @@ func TestShortestPathLimit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			meter := &workMeter{limitTargetSet: tt.limitTargetSet, limitTarget: tt.limitTarget}
-			got := shortestPathLimit(tt.rowCapPlusOne, meter, tt.part, tt.step)
+			got := shortestPathLimit(tt.rowCapPlusOne, meter, tt.part, tt.step, tt.enforced)
 			if got != tt.want {
 				t.Fatalf("shortestPathLimit() = %d, want %d", got, tt.want)
 			}

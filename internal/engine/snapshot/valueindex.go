@@ -508,13 +508,13 @@ func (v *View) NodesMatchingString(name string, match func(string) bool) ([]Node
 		}
 		for key, ids := range idx.scalar {
 			if len(key) == 0 || key[0] != 's' {
-				// A non-string value for this property. `match` decides a
-				// STRING, and interpret's own evaluation of a string
-				// predicate against a non-string is a runtime cast error
-				// that declines the whole query to PostgreSQL. Serving from
-				// an index that quietly skipped these nodes would replace
-				// that decline with an answer that may be SHORT, so the
-				// question is refused entirely and the caller scans.
+				// Past the valueShape check above, only a stored JSON null
+				// can land here. It extracts to SQL NULL and matches no
+				// text predicate, so refusing is merely conservative -- the
+				// delta side, which asks the flag alone, lets one through.
+				// Any other non-string would be the case the check exists
+				// for: interpret declines a string predicate over it, and
+				// an index that skipped it would serve a SHORT answer.
 				return nil, false
 			}
 			if match(key[1:]) {
@@ -533,9 +533,13 @@ func (v *View) NodesMatchingString(name string, match func(string) bool) ([]Node
 	d := v.deltaPropFor(name)
 	var delta []NodeID
 	if d != nil {
-		if d.hasNonString() {
-			// Same refusal as the base side above: a delta-written non-string
-			// value must reach the per-row evaluation that rejects it.
+		if d.nonString {
+			// Same refusal as the base side above, from the same valueShape
+			// flag: a delta-written non-string value must reach the per-row
+			// evaluation that rejects it. The delta's postings cannot stand
+			// in for the flag -- an object has no key there and an empty
+			// list no element -- and reading them instead let exactly those
+			// two slip past, and out of the candidate set.
 			return nil, false
 		}
 		for _, e := range d.strings {

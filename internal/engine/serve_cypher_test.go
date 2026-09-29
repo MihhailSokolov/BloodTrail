@@ -289,15 +289,13 @@ func TestProjectionValueKindsBareCallKinds(t *testing.T) {
 				{Alias: "u", Expr: variable("u")}, // node/edge/path/scalar carry-over: default
 				{Alias: "idx", Expr: variable("_"), BareCallKind: "id"},
 				{Alias: "sz", Expr: variable("_"), BareCallKind: "size"},
-				{Alias: "es", Expr: variable("_"), BareCallKind: "epochseconds"},
-				{Alias: "em", Expr: variable("_"), BareCallKind: "epochmillis"},
 				{Alias: "n.prop", Expr: &cypher.PropertyLookup{Atom: variable("n"), Symbol: "prop"}},
 			},
 		},
 	}
 
 	got := projectionValueKinds(q)
-	want := []valueKind{valueDefault, valueInt64, valueInt32, valueInt64, valueInt64, valueDefault}
+	want := []valueKind{valueDefault, valueInt64, valueInt32, valueDefault}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("projectionValueKinds = %v, want %v", got, want)
 	}

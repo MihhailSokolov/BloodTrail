@@ -452,7 +452,12 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// classifyAddOperand (eval.go) for the shared static classifier.
 		{name: "arithmetic + both operands property lookups rejected", cypher: `MATCH (n:User),(m:Computer) RETURN n.a + m.b AS x`, want: false},
 		{name: "arithmetic + same property lookup added to itself rejected", cypher: `MATCH (n:User) RETURN n.score + n.score AS x`, want: false},
-		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) WHERE n.a + 1 IS NOT NULL RETURN n`, want: true},
+		// The accepted `+` shapes below are carried by an `=` against a
+		// literal. They used to be carried by `IS NOT NULL`, which dawgs
+		// drops from the SQL for any operand but a plain property -- so
+		// checkComparison now declines that vehicle before checkArithmetic
+		// is ever consulted.
+		{name: "arithmetic + one property lookup one literal ok", cypher: `MATCH (n:User) WHERE n.a + 1 = 2 RETURN n`, want: true},
 
 		// Coalesce-typing fix: classifyAddOperand used to bucket
 		// EVERY coalesce() call as addOther (numeric), but pg's own
@@ -460,22 +465,20 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// arguments -- see classifyCoalesceOperand's doc (eval.go) for the
 		// full derivation this rejection and the two accept rows below
 		// mirror. `coalesce(n.a, n.b) + 1`, every argument a bare property
-		// lookup, has no pg-known type at all (addUnresolved) -- pg falls
-		// through to a bare `+` over the coalesce's own unrewritten,
-		// default-text-rendered arguments, which genuinely has no
-		// PostgreSQL operator and errors outright, regardless of runtime
-		// values -- so this rejects at plan time instead of ever risking a
-		// served answer for a query real pg refuses to run at all.
+		// lookup, has no type of its own (addUnresolved): dawgs gives it the
+		// partner's, `coalesce(...)::int8 + 1`, a cast the evaluator does
+		// not reproduce inside arithmetic -- so this rejects at plan time
+		// and PostgreSQL answers it.
 		{name: "arithmetic + coalesce of all bare properties rejected (addUnresolved)", cypher: `MATCH (n:User) RETURN coalesce(n.a, n.b) + 1 AS x`, want: false},
 		// coalesce(prop, 'lit'): the string-literal argument gives the whole
 		// call a known type (Text), so it classifies addStaticText, same as
 		// a bare string literal -- accepted (see eval_test.go for the
 		// concat-semantics runtime behavior this then takes).
-		{name: "arithmetic + coalesce with a string-literal argument accepted (addStaticText)", cypher: `MATCH (n:User) WHERE coalesce(n.score, 'default') + 1 IS NOT NULL RETURN n`, want: true},
+		{name: "arithmetic + coalesce with a string-literal argument accepted (addStaticText)", cypher: `MATCH (n:User) WHERE coalesce(n.score, 'default') + 1 = 'x' RETURN n`, want: true},
 		// coalesce(prop, 5): the numeric-literal argument gives the whole
 		// call a known, non-Text type, so it classifies addOther, same as a
 		// bare numeric literal -- accepted, numeric semantics.
-		{name: "arithmetic + coalesce with a numeric-literal argument accepted (addOther)", cypher: `MATCH (n:User) WHERE coalesce(n.score, 5) + 1 IS NOT NULL RETURN n`, want: true},
+		{name: "arithmetic + coalesce with a numeric-literal argument accepted (addOther)", cypher: `MATCH (n:User) WHERE coalesce(n.score, 5) + 1 = 6 RETURN n`, want: true},
 
 		// pg-parity audit: `type(r)` is statically Text in pg
 		// (EdgeTypeFunction's `CastType: pgsql.Text`, dawgs' function.go),
@@ -486,14 +489,14 @@ func TestPlanRejectMatrix(t *testing.T) {
 		// static/dynamic dispatch changed -- see eval_test.go's
 		// TestEvalStringConcatenation for the behavior this actually
 		// changes).
-		{name: "arithmetic + type() with a property lookup accepted (addStaticText)", cypher: `MATCH ()-[r]->(),(n:User) WHERE type(r) + n.name IS NOT NULL RETURN n`, want: true},
+		{name: "arithmetic + type() with a property lookup accepted (addStaticText)", cypher: `MATCH ()-[r]->(),(n:User) WHERE type(r) + n.name = 'x' RETURN n`, want: true},
 		// split()/labels() are array-typed in pg but this package implements
 		// no list-concatenation semantics for `+` -- classifyAddOperand
 		// leaves both addOther (audit table, eval.go); accepted at plan
 		// time exactly as before, always safely bailing at eval time
 		// instead (see eval_test.go).
-		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) WHERE split(n.name, ',') + 1 IS NOT NULL RETURN n`, want: true},
-		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) WHERE labels(n) + 1 IS NOT NULL RETURN n`, want: true},
+		{name: "arithmetic + split() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) WHERE split(n.name, ',') + 1 = 1 RETURN n`, want: true},
+		{name: "arithmetic + labels() accepted (addOther, safe by runtime type mismatch)", cypher: `MATCH (n:User) WHERE labels(n) + 1 = 1 RETURN n`, want: true},
 
 		// Negative-numeric-literal divergence fix: dawgs'
 		// pgsql translator lowers a direct `n.prop = <literal>`/`<>` via
@@ -576,6 +579,73 @@ func TestPlanRejectMatrix(t *testing.T) {
 		{name: "equality parenthesized string literal vs property (operands swapped) rejected", cypher: `MATCH (n:User) WHERE ('5') = n.x RETURN n`, want: false},
 		{name: "equality property vs bare string literal still accepted", cypher: `MATCH (n:User) WHERE n.x = '5' RETURN n`, want: true},
 		{name: "inequality property vs bare string literal still accepted", cypher: `MATCH (n:User) WHERE n.x <> 'a' RETURN n`, want: true},
+
+		// equalityShapeServed: the `=`/`<>` pairings dawgs lowers to SQL the
+		// evaluator does not reproduce (its doc has the SQL for each).
+		{name: "equality string literal vs property accepted", cypher: `MATCH (n:User) WHERE 'a' = n.x RETURN n`, want: true},
+		{name: "equality number literal vs property rejected", cypher: `MATCH (n:User) WHERE 1 = n.x RETURN n`, want: false},
+		{name: "inequality boolean literal vs property rejected", cypher: `MATCH (n:User) WHERE true <> n.x RETURN n`, want: false},
+		{name: "equality null literal vs property accepted", cypher: `MATCH (n:User) WHERE null = n.x RETURN n`, want: true},
+		{name: "equality property vs property accepted", cypher: `MATCH (n:User) WHERE n.x = n.y RETURN n`, want: true},
+		{name: "equality parenthesised property vs string literal rejected", cypher: `MATCH (n:User) WHERE (n.x) = 'a' RETURN n`, want: false},
+		{name: "equality parenthesised property vs number literal rejected", cypher: `MATCH (n:User) WHERE (n.x) = 1 RETURN n`, want: false},
+		{name: "equality property vs empty list accepted", cypher: `MATCH (n:User) WHERE n.x <> [] RETURN n`, want: true},
+		{name: "equality empty list vs property accepted", cypher: `MATCH (n:User) WHERE [] = n.x RETURN n`, want: true},
+		{name: "equality property vs typed list accepted", cypher: `MATCH (n:User) WHERE n.x = [1] RETURN n`, want: true},
+		{name: "equality string list vs property accepted", cypher: `MATCH (n:User) WHERE [''] = n.x RETURN n`, want: true},
+		{name: "equality property vs nested list rejected", cypher: `MATCH (n:User) WHERE n.x = [[1]] RETURN n`, want: false},
+		{name: "equality property vs parenthesised list rejected", cypher: `MATCH (n:User) WHERE n.x = (['a']) RETURN n`, want: false},
+		{name: "equality property vs concatenation accepted", cypher: `MATCH (n:User), (m:User) WHERE n.x = 'CN=' + m.y RETURN n`, want: true},
+		{name: "equality id() vs list rejected", cypher: `MATCH (n:User) WHERE id(n) = [1] RETURN n`, want: false},
+		{name: "equality labels() vs list rejected", cypher: `MATCH (n:User) WHERE labels(n) = ['User'] RETURN n`, want: false},
+		{name: "equality labels() vs string rejected", cypher: `MATCH (n:User) WHERE labels(n) <> 'User' RETURN n`, want: false},
+		{name: "equality split() vs string rejected", cypher: `MATCH (n:User) WHERE split(n.x, ',') = 'a' RETURN n`, want: false},
+		{name: "equality id() vs string literal rejected", cypher: `MATCH (n:User) WHERE id(n) = '5' RETURN n`, want: false},
+		{name: "equality size() vs boolean literal rejected", cypher: `MATCH (n:User) WHERE size(n.spns) = true RETURN n`, want: false},
+		{name: "equality arithmetic vs string literal rejected", cypher: `MATCH (n:User) WHERE id(n) + 1 = 'a' RETURN n`, want: false},
+		{name: "equality id() vs number literal accepted", cypher: `MATCH (n:User) WHERE id(n) = 5 RETURN n`, want: true},
+		{name: "equality property vs id() rejected", cypher: `MATCH (n:User) WHERE n.x = id(n) RETURN n`, want: false},
+		{name: "equality size() vs property rejected", cypher: `MATCH (n:User) WHERE size(n.spns) = n.x RETURN n`, want: false},
+		{name: "equality property vs toLower() rejected", cypher: `MATCH (n:User) WHERE n.x = toLower(n.y) RETURN n`, want: false},
+		{name: "equality property vs WITH alias rejected", cypher: "WITH 'a' AS t\nMATCH (n:User)\nWHERE n.x = t\nRETURN n", want: false},
+		{name: "equality literals of different types rejected", cypher: `MATCH (n:User) WHERE 0 = 'a' RETURN n`, want: false},
+		{name: "equality literals of one type accepted", cypher: `MATCH (n:User) WHERE 1 = 1.5 RETURN n`, want: true},
+		{name: "equality type() vs number literal rejected", cypher: `MATCH (n:User)-[r:X]->(m) WHERE type(r) = 1 RETURN n`, want: false},
+		{name: "equality type() vs string literal accepted", cypher: `MATCH (n:User)-[r:X]->(m) WHERE type(r) = 'X' RETURN n`, want: true},
+		{name: "XOR rejected", cypher: `MATCH (n:User) WHERE n.x = 1 XOR n.y = 2 RETURN n`, want: false},
+		{name: "IN nested list rejected", cypher: `MATCH (n:User) WHERE n.x IN [[1]] RETURN n`, want: false},
+
+		// sqlClassOf: operand pairs PostgreSQL types apart.
+		{name: "equality concatenation vs number rejected", cypher: `MATCH (n:User) WHERE n.x + 'y' = 1 RETURN n`, want: false},
+		{name: "inequality number vs boolean coalesce rejected", cypher: `MATCH (n:User) WHERE 1 <> coalesce(n.x, true) RETURN n`, want: false},
+		{name: "equality string vs boolean coalesce rejected", cypher: `MATCH (n:User) WHERE 'a' = coalesce(n.x, true) RETURN n`, want: false},
+		{name: "equality number alias vs string rejected", cypher: "WITH 1 AS t\nMATCH (n:User)\nWHERE t <> 'a'\nRETURN n", want: false},
+		{name: "equality string alias vs number rejected", cypher: "WITH 'a' AS t\nMATCH (n:User)\nWHERE t = 1\nRETURN n", want: false},
+		{name: "equality id() vs string alias rejected", cypher: "WITH 'a' AS t\nMATCH (n:User)\nWHERE id(n) = t\nRETURN n", want: false},
+		{name: "equality string alias vs string accepted", cypher: "WITH 'a' AS t\nMATCH (n:User)\nWHERE t = 'b'\nRETURN n", want: true},
+		{name: "WITH boolean constant rejected", cypher: "WITH true AS f\nMATCH (n:User)\nRETURN n", want: false},
+		{name: "WITH null constant rejected", cypher: "WITH null AS f\nMATCH (n:User)\nRETURN n", want: false},
+
+		// String predicates need a text subject; a LIKE needle must parse.
+		{name: "regex over arithmetic rejected", cypher: `MATCH (n:User) WHERE n.x + 1 =~ 'a.*' RETURN n`, want: false},
+		{name: "regex over split() rejected", cypher: `MATCH (n:User) WHERE split(n.x, ',') =~ 'a.*' RETURN n`, want: false},
+		{name: "regex over toLower() accepted", cypher: `MATCH (n:User) WHERE toLower(n.x) =~ 'a.*' RETURN n`, want: true},
+		{name: "STARTS WITH over arithmetic rejected", cypher: `MATCH (n:User) WHERE (n.x + 1) STARTS WITH 'a' RETURN n`, want: false},
+		{name: "STARTS WITH wildcard needle over toLower() accepted", cypher: `MATCH (n:User) WHERE toLower(n.x) STARTS WITH 'a%' RETURN n`, want: true},
+		{name: "ENDS WITH trailing escape over toLower() rejected", cypher: `MATCH (n:User) WHERE toLower(n.x) ENDS WITH '\\' RETURN n`, want: false},
+		{name: "ENDS WITH trailing escape over a property accepted", cypher: `MATCH (n:User) WHERE n.x ENDS WITH '\\' RETURN n`, want: true},
+
+		// IN needs an array on the right, of the left operand's type.
+		{name: "IN parenthesised property rejected", cypher: `MATCH (n:User) WHERE 'a' IN (n.x) RETURN n`, want: false},
+		{name: "IN toLower() rejected", cypher: `MATCH (n:User) WHERE 'a' IN toLower(n.x) RETURN n`, want: false},
+		{name: "IN split() with number rejected", cypher: `MATCH (n:User) WHERE 1 IN split(n.x, ',') RETURN n`, want: false},
+		{name: "IN split() with string accepted", cypher: `MATCH (n:User) WHERE 'a' IN split(n.x, ',') RETURN n`, want: true},
+		{name: "IN concatenation vs number list rejected", cypher: `MATCH (n:User) WHERE n.x + 'y' IN [1, 2] RETURN n`, want: false},
+		{name: "IN split() vs list rejected", cypher: `MATCH (n:User) WHERE split(n.x, ',') IN ['a'] RETURN n`, want: false},
+
+		// Undirected relationships: a pattern's first step only.
+		{name: "undirected second step rejected", cypher: `MATCH (a:User)-[:X]->(b)-[:X]-(c) RETURN a`, want: false},
+		{name: "undirected first step accepted", cypher: `MATCH (a:User)-[:X]-(b)-[:X]->(c) RETURN a`, want: true},
 		// Relational (`<`) comparisons are governed by
 		// relationalComparisonSafe's own numeric-only rule, not the
 		// bare-literal reject above -- a non-numeric literal on the other
@@ -616,14 +686,24 @@ func TestPlanRejectMatrix(t *testing.T) {
 			cypher: `MATCH (n:User) WHERE n.lastlogontimestamp < (datetime().epochseconds - 60*86400) RETURN n`,
 			want:   true,
 		},
+		// A bare WITH alias leaves the property untyped -- `(p ->> 'threshold')
+		// > s0.i0` is `text > integer`, an error in pg -- while arithmetic
+		// over the alias casts it. And a WITH carrying only constants after
+		// a MATCH collapses to one row in pg (planWith's caller).
 		{
-			name: "carried numeric WITH alias vs property still accepted",
-			cypher: `MATCH (n:User) WITH 60 AS days
+			name: "carried numeric WITH alias vs property rejected",
+			cypher: `WITH 60 AS days
 MATCH (m:User)
 WHERE m.threshold > days
 RETURN m`,
-			want: true,
+			want: false,
 		},
+		{name: "carried numeric WITH alias in parentheses vs property rejected", cypher: "WITH 60 AS days\nMATCH (m:User)\nWHERE m.threshold > (days)\nRETURN m", want: false},
+		{name: "carried numeric WITH alias arithmetic vs property accepted", cypher: "WITH 60 AS days\nMATCH (m:User)\nWHERE m.threshold > days * 1\nRETURN m", want: true},
+		{name: "constants-only WITH after a MATCH rejected", cypher: "MATCH (n:User) WITH 60 AS days\nMATCH (m:User)\nWHERE m.threshold > days * 1\nRETURN m", want: false},
+		{name: "constants carried beside a variable after a MATCH accepted", cypher: "MATCH (n:User) WITH n, 60 AS days\nMATCH (m:User)\nWHERE m.threshold > days * 1\nRETURN m", want: true},
+		{name: "less-than parenthesised property vs literal rejected", cypher: `MATCH (n:User) WHERE (n.x) < 5 RETURN n`, want: false},
+		{name: "greater-than literal vs parenthesised property rejected", cypher: `MATCH (n:User) WHERE 5 > (n.x) RETURN n`, want: false},
 		{
 			// Regression coverage for the corpus's own "Users with
 			// passwords not rotated in over 1 year" / "... inactive for 60

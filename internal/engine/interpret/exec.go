@@ -634,10 +634,10 @@ func cloneRow(r *Row) *Row {
 		nr.paths = append(make([]anyBinding, 0, len(r.paths)), r.paths...)
 	}
 	if len(r.usedEdges) > 0 {
-		nr.usedEdges = append(make([]uint64, 0, len(r.usedEdges)), r.usedEdges...)
+		nr.usedEdges = append(make([]patternEdge, 0, len(r.usedEdges)), r.usedEdges...)
 	}
 	if len(r.trailEdges) > 0 {
-		nr.trailEdges = append(make([]uint64, 0, len(r.trailEdges)), r.trailEdges...)
+		nr.trailEdges = append(make([]patternEdge, 0, len(r.trailEdges)), r.trailEdges...)
 	}
 	return nr
 }
@@ -645,7 +645,9 @@ func cloneRow(r *Row) *Row {
 // mergeRowInto copies every binding from src into dst, usedEdges (see Row's
 // own doc) included: two cartesian-joined or WITH-carried rows' used-edge
 // sets union together, so a closing Step evaluated after the merge still
-// sees every edge either side already consumed.
+// sees every edge its own pattern already consumed. Each entry keeps its
+// Step.Pattern, so the union never makes one pattern's edge off-limits to
+// another's.
 func mergeRowInto(dst, src *Row) {
 	for _, b := range src.nodes {
 		dst.SetNode(b.sym, b.id)
@@ -659,12 +661,8 @@ func mergeRowInto(dst, src *Row) {
 	for _, b := range src.paths {
 		dst.SetPathVar(b.sym, b.val)
 	}
-	for _, fwd := range src.usedEdges {
-		dst.markEdgeUsed(fwd)
-	}
-	for _, identity := range src.trailEdges {
-		dst.markTrailEdge(identity)
-	}
+	dst.usedEdges = append(dst.usedEdges, src.usedEdges...)
+	dst.trailEdges = append(dst.trailEdges, src.trailEdges...)
 }
 
 // --- one component: anchor scan + BFS expansion + closing-edge checks ----
@@ -2231,7 +2229,7 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			// co-membership shape
 			// `(u1:User)-[:MemberOf]->(g)<-[:MemberOf]-(u2:User)` paired
 			// every user with themselves through a single membership edge.
-			if r.edgeUsed(candidateIdentity(env.Snap, c)) {
+			if r.edgeUsed(step.Pattern, candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			// The other half of the same rule for a mixed fixed/var-length
@@ -2241,7 +2239,7 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			// fixed step (see Row.trailEdges' doc for the full asymmetric
 			// contract, incl. why the trail DFS itself does NOT check this
 			// set).
-			if r.trailEdgeUsed(candidateIdentity(env.Snap, c)) {
+			if r.trailEdgeUsed(step.Pattern, candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			nr := cloneRow(r)
@@ -2269,7 +2267,7 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 			// a real, specific edge, and verifyClosingStep needs to know
 			// that just as much as it would for a named one. See Row's
 			// usedEdges doc.
-			nr.markEdgeUsed(candidateIdentity(env.Snap, c))
+			nr.markEdgeUsed(step.Pattern, candidateIdentity(env.Snap, c))
 			if err := meter.spend(1); err != nil {
 				return nil, err
 			}
@@ -2325,7 +2323,7 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 			if !edgeKindOK(step.EdgeKinds, c.kind) {
 				continue
 			}
-			if r.edgeUsed(candidateIdentity(env.Snap, c)) {
+			if r.edgeUsed(step.Pattern, candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			// Same trail-edge exclusion expandStep applies (see Row.trailEdges'
@@ -2333,14 +2331,14 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 			// variable-length Step is always a strict linear chain, which
 			// never produces a closing Step -- but checked anyway so the two
 			// fixed-step expanders enforce one rule, not two.
-			if r.trailEdgeUsed(candidateIdentity(env.Snap, c)) {
+			if r.trailEdgeUsed(step.Pattern, candidateIdentity(env.Snap, c)) {
 				continue
 			}
 			nr := cloneRow(r)
 			if step.EdgeSym != "" {
 				nr.SetEdge(step.EdgeSym, edgeRefFor(env.Snap, c))
 			}
-			nr.markEdgeUsed(candidateIdentity(env.Snap, c))
+			nr.markEdgeUsed(step.Pattern, candidateIdentity(env.Snap, c))
 			if err := meter.spend(1); err != nil {
 				return nil, err
 			}

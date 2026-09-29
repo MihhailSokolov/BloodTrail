@@ -3,6 +3,7 @@
 package interpret
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -255,6 +256,43 @@ func TestRegexAnchorCoalesceDefaultThatMatches(t *testing.T) {
 				`MATCH (c:Computer) WHERE COALESCE(c.os, '') =~ '`+tc.pattern+`' RETURN c`, loose)
 			if len(rs.Rows) != tc.want {
 				t.Fatalf("got %d rows, want %d", len(rs.Rows), tc.want)
+			}
+		})
+	}
+}
+
+// TestRegexAnchorOverlayDeltaNonStringDeclines: on an overlay, a delta that
+// writes an object or an empty list for the anchored property must keep the
+// regex anchor from answering. pg's `->>` renders the value as its JSON text,
+// which the pattern may match -- `{"os": "Windows XP"}` contains XP -- so the
+// node belongs to pg's answer, and the per-row evaluation declines the query
+// on it. The anchor's delta half used to miss both shapes, dropping the node
+// from the candidates without a trace, and the query was served without it.
+func TestRegexAnchorOverlayDeltaNonStringDeclines(t *testing.T) {
+	const query = `MATCH (c:Computer) WHERE c.operatingsystem =~ '.*XP.*' RETURN c`
+
+	for _, value := range []string{`{"os":"Windows XP"}`, `[]`, `[{"os":"Windows XP"}]`} {
+		t.Run(value, func(t *testing.T) {
+			base := buildRegexAnchorFixture(t, 5000)
+			// The anchor must fire on the base alone, or nothing below
+			// exercises it.
+			if nc := planQuery(t, base, query).Parts[0].Nodes["c"]; !nc.PropIndexed {
+				t.Fatal("the regex anchor did not fire on the base; this test would be vacuous")
+			}
+
+			var sb snapshot.SegmentBuilder
+			sb.AddKind(raKindComputer, "Computer")
+			if err := sb.AddNodeState(1000, []snapshot.KindID{raKindComputer},
+				[]byte(`{"operatingsystem":`+value+`,"name":"HOST00000.CORP.LOCAL"}`)); err != nil {
+				t.Fatalf("AddNodeState: %v", err)
+			}
+			snap := base.WithSegment(sb.Build())
+
+			if nc := planQuery(t, snap, query).Parts[0].Nodes["c"]; nc.PropIndexed {
+				t.Fatalf("the anchor answered with %d candidates over a delta %s value", len(nc.PropCandidates), value)
+			}
+			if err := execExpectErr(t, snap, query, Budgets{MaxRows: 100000, MaxWork: 100000000}); !errors.Is(err, ErrRuntimeCast) {
+				t.Fatalf("got %v, want ErrRuntimeCast (the per-row evaluation's decline)", err)
 			}
 		})
 	}

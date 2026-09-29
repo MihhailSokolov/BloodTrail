@@ -1169,6 +1169,18 @@ func TestEvalOrderCompare(t *testing.T) {
 			t.Fatalf("err = %v, want ErrCollation", err)
 		}
 	})
+
+	// A pair OrderCompare cannot order used to fold to NULL, as if pg
+	// answered NULL for it. It does not -- it casts (an error on a mismatch)
+	// or compares two jsonb values by type rank -- and Plan never serves such
+	// a pair (relationalComparisonSafe), so the evaluator declines instead.
+	t.Run("a number vs a string declines rather than answering NULL", func(t *testing.T) {
+		row := f.tworow("a", 850, "b", 200)
+		got, err := EvalPredicate(env, row, whereExprOf(t, "MATCH (n) WHERE a.score < b.name RETURN n"))
+		if !errors.Is(err, ErrNotComparable) {
+			t.Fatalf("got %s, %v, want ErrNotComparable", got, err)
+		}
+	})
 }
 
 // --- String predicates (STARTS WITH / ENDS WITH / CONTAINS / =~) ------------
@@ -1229,10 +1241,27 @@ func TestEvalStringPredicates(t *testing.T) {
 		}
 	})
 
-	t.Run("negated regex over an absent property is true", func(t *testing.T) {
+	// dawgs coalesces a negated STARTS WITH/ENDS WITH/CONTAINS over a plain
+	// property, but not a regex: `NOT n.name =~ '...'` is `not (p ->>
+	// 'name') ~ '...'`, NULL over a missing property.
+	t.Run("negated regex over an absent property is null", func(t *testing.T) {
 		got, err := EvalPredicate(env, f.row("n", 100), whereExprOf(t, "MATCH (n) WHERE NOT n.name =~ '^AZURE.*' RETURN n"))
+		if err != nil || got != TriNull {
+			t.Fatalf("got %s, %v, want TriNull", got, err)
+		}
+	})
+
+	t.Run("negated STARTS WITH over an absent property is true", func(t *testing.T) {
+		got, err := EvalPredicate(env, f.row("n", 100), whereExprOf(t, "MATCH (n) WHERE NOT n.name STARTS WITH 'AZURE' RETURN n"))
 		if err != nil || got != TriTrue {
 			t.Fatalf("got %s, %v, want TriTrue", got, err)
+		}
+	})
+
+	t.Run("negated STARTS WITH over a wrapped absent property is null", func(t *testing.T) {
+		got, err := EvalPredicate(env, f.row("n", 100), whereExprOf(t, "MATCH (n) WHERE NOT toLower(n.name) STARTS WITH 'azure' RETURN n"))
+		if err != nil || got != TriNull {
+			t.Fatalf("got %s, %v, want TriNull", got, err)
 		}
 	})
 
