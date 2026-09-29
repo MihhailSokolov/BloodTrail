@@ -567,6 +567,17 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err := store.Set(ctx, driverName); err != nil {
 		return fmt.Errorf("setting database_switch: %w; %s", err, rollbackHint)
 	}
+	// BloodTrail's first boot may adopt a snapshot file an earlier install
+	// saved, and every writer the graph has had since -- the stock image
+	// after a rollback, this install's own migration -- wrote it without the
+	// watermark counter that file's proof rests on. Ending the lineage now,
+	// with no BloodTrail process running and before the one `up` starts has
+	// loaded anything, leaves every such file naming a lineage PostgreSQL
+	// has left. The stock image may keep writing until `up` replaces it;
+	// that is harmless, since it stops before BloodTrail loads.
+	if err := store.EndWatermarkLineage(ctx); err != nil {
+		return fmt.Errorf("ending the snapshot file watermark lineage: %w; %s", err, rollbackHint)
+	}
 	c = c.WithExtraFile(overridePath)
 	if err := c.Up(ctx); err != nil {
 		return fmt.Errorf("docker compose up: %w; %s", err, rollbackHint)
@@ -758,8 +769,26 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("%w (%s)", err, restored)
 	}
+	// The stock image owns the graph from here on and writes it without the
+	// watermark counter. BloodTrail has stopped -- its last snapshot file
+	// save is behind it -- so ending the lineage now leaves any file it
+	// saved unadoptable by whatever brings BloodTrail back: a reinstall ends
+	// the lineage again anyway, but a BloodTrail started any other way would
+	// otherwise find the counter exactly where the file left it. Addressed
+	// through the restored project, since the override file is gone.
+	restoredStore := dbswitch.Store{Compose: restarted, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 	if err := restarted.Up(ctx); err != nil {
+		// A failed up can still have started the stock image -- compose
+		// reports the first service that failed, not the ones it already
+		// started -- and nothing says the operator reruns rollback before
+		// it writes. Ending the lineage costs only a rebuild if it did not.
+		if lineageErr := restoredStore.EndWatermarkLineage(ctx); lineageErr != nil {
+			return fmt.Errorf("restarting with the original image: %w (%s; ending the snapshot file watermark lineage failed too: %v)", err, restored, lineageErr)
+		}
 		return fmt.Errorf("restarting with the original image: %w (%s)", err, restored)
+	}
+	if err := restoredStore.EndWatermarkLineage(ctx); err != nil {
+		return fmt.Errorf("ending the snapshot file watermark lineage: %w (the original image is running again; rerun `bloodtrail rollback` to finish)", err)
 	}
 	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
 		return fmt.Errorf("waiting for the API after the restart: %w (%s; check the %s logs)", err, restored, bloodhoundService)

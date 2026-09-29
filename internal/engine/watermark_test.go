@@ -532,3 +532,73 @@ func TestInvalidateSnapshotFileRemovesTheFile(t *testing.T) {
 	// Idempotent: nothing left to remove is a success, not a failure.
 	e.removeSnapshotFile(context.Background(), path)
 }
+
+// TestInsertedSinceFile pins when a snapshot file's stamp shows rows
+// inserted behind the counter's back: only when the counter still read, at
+// start, exactly what the file was stamped with, and an id sequence had
+// moved anyway. A counter that moved says nothing about the sequences --
+// BloodTrail's own writes move both -- and nothing captured means no check.
+func TestInsertedSinceFile(t *testing.T) {
+	stamp := snapshot.Stamp{Watermark: 7, NodeIDSeq: 100, EdgeIDSeq: 50}
+	cases := []struct {
+		name string
+		at   *startState
+		want bool
+	}{
+		{"nothing captured", nil, false},
+		{"nothing moved", &startState{counter: 7, nodeSeq: 100, edgeSeq: 50}, false},
+		{"node ids drawn behind the counter", &startState{counter: 7, nodeSeq: 101, edgeSeq: 50}, true},
+		{"edge ids drawn behind the counter", &startState{counter: 7, nodeSeq: 100, edgeSeq: 51}, true},
+		{"a sequence reset behind the counter", &startState{counter: 7, nodeSeq: 0, edgeSeq: 50}, true},
+		{"counted writes since the file", &startState{counter: 9, nodeSeq: 140, edgeSeq: 90}, false},
+		{"counter behind the file", &startState{counter: 5, nodeSeq: 140, edgeSeq: 90}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := insertedSinceFile(stamp, tc.at); got != tc.want {
+				t.Fatalf("insertedSinceFile(%+v, %+v) = %v, want %v", stamp, tc.at, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFileRefusal pins the order and the reasons of the refusals that come
+// before any counter is weighed: a file from another lineage is refused for
+// that whatever its stamp says, and one from PostgreSQL's own lineage only
+// when rows were inserted behind the counter since it was written.
+func TestFileRefusal(t *testing.T) {
+	lineage := snapshot.Lineage{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	other := snapshot.Lineage{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+	stamp := snapshot.Stamp{Watermark: 7, NodeIDSeq: 100, EdgeIDSeq: 50}
+	quiet := &startState{counter: 7, nodeSeq: 100, edgeSeq: 50}
+	inserted := &startState{counter: 7, nodeSeq: 101, edgeSeq: 50}
+
+	cases := []struct {
+		name        string
+		fileLineage snapshot.Lineage
+		at          *startState
+		want        string
+	}{
+		{"same lineage, nothing inserted", lineage, quiet, ""},
+		{"same lineage, nothing captured", lineage, nil, ""},
+		{"same lineage, rows inserted", lineage, inserted, reasonInsertedBehindCounter},
+		{"another lineage", other, quiet, reasonLineageChanged},
+		{"another lineage and rows inserted", other, inserted, reasonLineageChanged},
+		{"no lineage at all", snapshot.Lineage{}, quiet, reasonLineageChanged},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New(nil, nil, Config{})
+			if tc.at != nil {
+				e.atStart.Store(tc.at)
+			}
+			reason, attrs := e.fileRefusal(tc.fileLineage, stamp, lineage)
+			if reason != tc.want {
+				t.Fatalf("fileRefusal reason = %q, want %q", reason, tc.want)
+			}
+			if (reason == "") != (len(attrs) == 0) {
+				t.Fatalf("fileRefusal returned attrs %v with reason %q; attrs belong with a reason only", attrs, reason)
+			}
+		})
+	}
+}

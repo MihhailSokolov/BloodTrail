@@ -22,7 +22,9 @@ import "fmt"
 // derived indexes rebuilt from scratch by Build, and nodes staged in
 // strictly ascending database-id order. base's own MultiGraph flag is
 // carried over (informational metadata about the source database, unrelated
-// to this fold).
+// to this fold), and so is its WatermarkLineage: the segments folded in are
+// writes this engine observed and counted, so the result still belongs to
+// exactly the lineage base was loaded from.
 func Fold(base *Snapshot, segments []*Segment) (*Snapshot, error) {
 	merged := MergeSegments(segments)
 
@@ -39,6 +41,7 @@ func Fold(base *Snapshot, segments []*Segment) (*Snapshot, error) {
 		return nil, err
 	}
 	folded.MultiGraph = base.MultiGraph
+	folded.WatermarkLineage = base.WatermarkLineage
 	return folded, nil
 }
 

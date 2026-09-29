@@ -26,7 +26,7 @@ func writeOneNodeFile(t *testing.T) string {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "snapshot.bin")
-	if err := WriteSnapshotFile(path, snap, 7); err != nil {
+	if err := WriteSnapshotFile(path, snap, Stamp{Watermark: 7}); err != nil {
 		t.Fatal(err)
 	}
 	return path

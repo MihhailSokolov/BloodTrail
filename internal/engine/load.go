@@ -28,42 +28,77 @@ import (
 // all three into a snapshot.Builder, and finally runs the multi-graph probe
 // (see probeMultiGraph). Build assigns dense NodeIDs in the node scan's
 // ascending order and stamps the snapshot's BuiltAt.
+//
+// The result's WatermarkLineage is left zero: only the engine's own rebuild
+// asks for it (loadSnapshot), since only a snapshot that may end up in a
+// snapshot file needs one.
 func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) (*snapshot.Snapshot, error) {
+	snap, _, err := loadSnapshot(ctx, pgDriver, pool, false)
+	return snap, err
+}
+
+// loadSnapshot is LoadSnapshot, additionally stamping the result's
+// WatermarkLineage when withLineage is set (watermark.go's
+// watermarkLineageDDL explains lineages). The lineage is read inside the
+// same repeatable-read transaction as the graph, so it is the lineage the
+// scanned rows belong to -- read in a transaction of its own, before or
+// after, it could name a lineage that ended while the load ran, or one that
+// began after the rows were read.
+//
+// It is the transaction's last statement, deliberately: on a database with
+// no lineage column the read fails, which aborts the transaction, so it can
+// only go where nothing else still has to run in it. A failed read leaves
+// the lineage zero rather than failing the load -- the graph read is sound
+// either way, and a snapshot with no lineage is simply never written to a
+// file -- and comes back as lineageErr, for the caller to say why no file
+// will be written from this snapshot.
+func loadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool, withLineage bool) (snap *snapshot.Snapshot, lineageErr, err error) {
 	graphModel, ok := pgDriver.DefaultGraph()
 	if !ok {
-		return nil, fmt.Errorf("engine: LoadSnapshot: no default graph is set")
+		return nil, nil, fmt.Errorf("engine: LoadSnapshot: no default graph is set")
 	}
 
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, fmt.Errorf("engine: LoadSnapshot: begin transaction: %w", err)
+		return nil, nil, fmt.Errorf("engine: LoadSnapshot: begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	builder := snapshot.NewBuilder(graphModel.ID)
 
 	if err := loadKinds(ctx, tx, builder); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := loadNodes(ctx, tx, graphModel.ID, builder); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := loadEdges(ctx, tx, graphModel.ID, builder); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	multiGraph, err := probeMultiGraph(ctx, tx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	snap, err := builder.Build()
+	var lineage snapshot.Lineage
+	if withLineage {
+		var raw [16]byte
+		if err := tx.QueryRow(ctx, selectWatermarkLineageSQL).Scan(&raw); err != nil {
+			lineageErr = fmt.Errorf("engine: LoadSnapshot: read watermark lineage: %w", err)
+		} else {
+			lineage = snapshot.Lineage(raw)
+		}
+	}
+
+	snap, err = builder.Build()
 	if err != nil {
-		return nil, fmt.Errorf("engine: LoadSnapshot: build snapshot: %w", err)
+		return nil, nil, fmt.Errorf("engine: LoadSnapshot: build snapshot: %w", err)
 	}
 	snap.MultiGraph = multiGraph
+	snap.WatermarkLineage = lineage
 
-	return snap, nil
+	return snap, lineageErr, nil
 }
 
 // loadKinds scans the entire `kind` table -- global, not scoped to any one

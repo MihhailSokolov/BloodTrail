@@ -33,11 +33,12 @@ import (
 // DriverName is the value BloodHound's graph_driver setting selects.
 const DriverName = "bloodtrail"
 
-// snapshotSaveTimeout bounds only the shutdown snapshot save's single-row
-// PostgreSQL watermark read (saveSnapshotProbe's ReadWatermark round trip,
-// internal/engine/persist.go) -- see Close's own doc for why that read runs
+// snapshotSaveTimeout bounds only the shutdown snapshot save's PostgreSQL
+// reads -- the single-row watermark read and, once that proves converged,
+// the id sequence positions the file is stamped with (saveSnapshotProbe,
+// internal/engine/persist.go) -- see Close's own doc for why those reads run
 // on a context deliberately detached from the shutdown's own cancellation
-// in the first place, and for why the fold and file write that follow it
+// in the first place, and for why the fold and file write that follow them
 // (snapshot.Fold, snapshot.WriteSnapshotFile) take no context at all and so
 // are bounded by neither this constant nor anything else, regardless of how
 // large the graph being saved is.

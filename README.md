@@ -172,6 +172,10 @@ validated.
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
   to the restored deployment. Re-ingest it, or reinstall with
   `--replace-postgres-graph` to migrate the current Neo4j graph again.
+- Rollback and reinstall never let a snapshot file outlive the stock image's writes,
+  wherever `BLOODTRAIL_SNAPSHOT_DIR` is configured: both end the watermark lineage (see
+  [Write-through](#write-through)), so the first boot after a reinstall rebuilds from
+  PostgreSQL rather than adopt a file saved before the rollback.
 - A second install after a rollback is refused while the earlier migration's graph is
   still in PostgreSQL, because BloodHound's migrator would layer the new graph on top of
   the old one instead of replacing it. `--replace-postgres-graph` clears it first; the
@@ -271,8 +275,12 @@ BloodTrail's log lines all carry a `bloodtrail:` prefix. Grouped by what they co
   the default graph` (Debug, expected on every ordinary startup -- see
   [Write-through](#write-through)'s own note), `bloodtrail: boot load failed` (Warn) and
   `bloodtrail: fallback rebuild failed` (Warn).
-- **Watermark**: `bloodtrail: watermark bump failed` (Warn) and `bloodtrail: watermark table
-  DDL failed` (Warn).
+- **Watermark**: `bloodtrail: watermark bump failed` (Warn), `bloodtrail: watermark table
+  DDL failed` (Warn), `bloodtrail: watermark lineage DDL failed` (Warn: no snapshot file is
+  written or adopted until a later start adds the lineage), `bloodtrail: could not read
+  the watermark lineage` (Warn: no snapshot file is written from that rebuild) and
+  `bloodtrail: could not record where PostgreSQL stood at start` (Warn: that boot does not
+  check its snapshot file for rows inserted behind the watermark).
 - **Snapshot file**: `bloodtrail: snapshot file loaded` (Info), `bloodtrail: snapshot file
   rejected` (Info, with a `reason` attr) / `bloodtrail: no snapshot file` (Debug, the
   ordinary first-boot case), `bloodtrail: snapshot file written` (Info) / `bloodtrail:
@@ -336,9 +344,10 @@ The validation levels differ, deliberately:
   shutdown and after every background compaction; the next boot loads it, replays onto it
   whatever recognized writes landed while it was loading (BloodHound writes to the graph
   on every boot, so this replay is what makes the file usable at all in practice), and
-  proves via the watermark counters that nothing else got in between -- falling back to a
-  normal PostgreSQL rebuild whenever that proof fails, e.g. after a crash or an
-  unrecognizable boot-time write. See [Write-through](#write-through) for details.
+  proves via the watermark counter, and the lineage it counts in, that nothing else got in
+  between -- falling back to a normal PostgreSQL rebuild whenever that proof fails, e.g.
+  after a crash, an unrecognizable boot-time write, or a rollback that let the stock image
+  write the graph. See [Write-through](#write-through) for details.
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
@@ -451,16 +460,43 @@ caller has already been told committed.
   least detected at boot -- see Watermark, next -- rather than silently missed forever,
   but the supported deployment shape is still a single API server process.
 - **Watermark.** A single-row table, `bloodtrail_watermark`, holds a counter that every
-  mutating driver call bumps before its own effect reaches PostgreSQL (inside the same
-  transaction where one exists, so a rolled-back write's bump rolls back with it). This
+  mutating driver call bumps before its own effect reaches PostgreSQL (in a transaction
+  of its own, so even a write that then rolls back has advanced it; the engine accounts
+  for such a write as one that committed nothing). This
   is what makes the snapshot file (next) safe to trust: a file stamped with counter N is
   provably complete for every write up to N, because the counter cannot have advanced
   without a write whose effect the file's own build would then be missing.
+
+  Only writes through BloodTrail's driver bump the counter, so a counter value means
+  something only within its **lineage**: a random id kept in the same row, which every
+  snapshot file records next to its counter. A file from any other lineage is refused
+  outright, and a lineage ends whenever the graph changes hands with something that does
+  not bump the counter: `bloodtrail rollback` ends it once the stock image is running
+  again, `bloodtrail install` ends it again right before starting BloodTrail, and
+  `--replace-postgres-graph` ends it in the same transaction as its truncate. A new or
+  reset database starts a lineage of its own. So a snapshot directory on a persistent
+  volume -- or configured in your own compose file, which rollback leaves in place -- can
+  never hand a reinstalled BloodTrail a file the stock image has since written past.
+  Anything else that writes the graph outside BloodTrail must end the lineage itself before
+  BloodTrail starts again -- `update bloodtrail_watermark set lineage = gen_random_uuid();`
+  -- or delete the snapshot file: `psql`, the stock image started by hand, BloodHound's own
+  tool API switching a running server to the plain `pg` driver (`/graph-db/switch/pg`),
+  and restoring a database backup. A backup needs it even when it restores the lineage
+  the file names: a dump taken while writes are landing can hold a counter whose write it
+  does not, since the bump commits before the write it guards.
+
+  BloodTrail catches the most common of those writes on its own, as a backstop: each file
+  also records where the `node` and `edge` id sequences stood when it was saved, and a
+  boot that finds the counter exactly where the file left it but either sequence moved on
+  refuses the file, since something inserted rows without bumping the counter. Updates
+  and deletes leave the sequences where they were, so this does not replace ending the
+  lineage.
 - **Snapshot file.** Set `BLOODTRAIL_SNAPSHOT_DIR` to let a restart skip the PostgreSQL
   rebuild. The engine writes a versioned binary snapshot of its in-memory state, stamped
-  with the watermark counter that was live at that instant, at two points: on a graceful
-  shutdown, and after every background compaction (next). At boot, it loads that file
-  and adopts it when the watermark counters prove nothing is missing: every write that
+  with the watermark counter that was live at that instant and the lineage its replica
+  was loaded in, at two points: on a graceful shutdown, and after every background
+  compaction (next). At boot, it loads that file and adopts it when it belongs to the
+  current lineage and the watermark counters prove nothing is missing: every write that
   lands while no replica exists yet is buffered (its counter and the keys it touched),
   and the file is adopted exactly when the file's stamped counter plus those buffered
   writes' own counters account for a fixed target -- PostgreSQL's counter as read once,
@@ -490,15 +526,20 @@ caller has already been told committed.
 
   **When the file is still rejected.** Adoption is a proof, not a hope, and every way
   the proof can fail falls back to a normal PostgreSQL rebuild -- always correct, just
-  slower, and a caller cannot tell the outcomes apart. A counter the boot cannot
-  account for even after the settle window rejects the file (`boot gap not covered by
-  buffered writes`, with a `waited` duration): a write from a previous process's crash
-  window, any writer this process never observed, or an in-flight write that outlived
-  the 5s wait. A boot-time write whose effect cannot be expressed as a replay -- raw
-  Cypher, a wipe, the same closed list ordinary write-through falls back on -- trips
-  fallback and rejects the file immediately (nothing to wait for), as does a buffer
-  that outgrew its caps (4,096 writes / 262,144 keys) under a genuinely heavy boot.
-  Each rejection is logged at Info with a `reason` and is followed by an ordinary
+  slower, and a caller cannot tell the outcomes apart. A file from another watermark
+  lineage is refused at once (`watermark lineage changed since the file was written`),
+  which is why the first boot after `bloodtrail install` always rebuilds; so, once, is a
+  file from a release that predated lineages. So is a file whose counter PostgreSQL
+  still reads but whose id sequences have moved on since (`rows were inserted since the
+  file was written by a writer that did not advance the watermark`). A counter the boot
+  cannot account for even after the settle window rejects the file (`boot gap not
+  covered by buffered writes`, with a `waited` duration): a write from a previous
+  process's crash window, any writer this process never observed, or an in-flight write
+  that outlived the 5s wait. A boot-time write whose effect cannot be expressed as a
+  replay -- raw Cypher, a wipe, the same closed list ordinary write-through falls back
+  on -- trips fallback and rejects the file immediately (nothing to wait for), as does a
+  buffer that outgrew its caps (4,096 writes / 262,144 keys) under a genuinely heavy
+  boot. Each rejection is logged at Info with a `reason` and is followed by an ordinary
   `snapshot rebuilt` line; an adoption logs `snapshot file loaded` with a
   `replayed_writes` count.
 - **Compaction.** Every applied write layers one more delta on top of the engine's base

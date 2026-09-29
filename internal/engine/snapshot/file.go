@@ -24,7 +24,12 @@ var snapshotMagic = []byte("BTSNAP\x00")
 // produces and ReadSnapshotFile accepts today. A future incompatible format
 // change bumps this and ReadSnapshotFile rejects anything else via
 // ErrVersionMismatch.
-const snapshotFormatVersion uint32 = 1
+//
+// Version 2 added the watermark lineage (Snapshot.WatermarkLineage). A
+// version 1 file records no lineage, so nothing can prove it belongs to the
+// lineage PostgreSQL is in now; refusing it as a version mismatch is exactly
+// right, and costs an upgraded deployment one ordinary rebuild.
+const snapshotFormatVersion uint32 = 2
 
 // Sentinel errors ReadSnapshotFile wraps its failures in, so a caller (the
 // engine boot path) can tell "this file was never a snapshot" apart from
@@ -49,7 +54,31 @@ var (
 	ErrCorrupt = errors.New("snapshot: corrupt snapshot file")
 )
 
-// WriteSnapshotFile atomically writes s and watermark to path in this
+// Stamp is what a snapshot file records about PostgreSQL at the moment it
+// was written, as distinct from the graph it carries: the watermark counter
+// the file is complete for, and where PostgreSQL's node and edge id
+// sequences stood. The engine's boot weighs both -- the sequences against
+// where they stood when its own process started, to catch rows inserted in
+// between by a writer the counter cannot see.
+type Stamp struct {
+	Watermark uint64
+
+	// NodeIDSeq and EdgeIDSeq are the last values the node and edge id
+	// sequences handed out, 0 for a sequence never used.
+	NodeIDSeq, EdgeIDSeq int64
+}
+
+// Header is the fixed-size start of a snapshot file: the graph it holds,
+// the watermark lineage its contents were read in, and its Stamp --
+// everything a boot weighs before the graph itself. See
+// ReadSnapshotFileHeader.
+type Header struct {
+	GraphID int32
+	Lineage Lineage
+	Stamp   Stamp
+}
+
+// WriteSnapshotFile atomically writes s and stamp to path in this
 // package's versioned binary format (see the format comment above
 // ReadSnapshotFile).
 //
@@ -64,7 +93,7 @@ var (
 // The temp file (and therefore the final file) is created with mode 0600 --
 // os.CreateTemp's default -- since a snapshot's payload is a full copy of
 // the graph's data, including every node's property bag.
-func WriteSnapshotFile(path string, s *Snapshot, watermark uint64) (err error) {
+func WriteSnapshotFile(path string, s *Snapshot, stamp Stamp) (err error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".snapshot-*.tmp")
 	if err != nil {
@@ -97,7 +126,7 @@ func WriteSnapshotFile(path string, s *Snapshot, watermark uint64) (err error) {
 	// own checksum.
 	h := crc32.NewIEEE()
 	mw := io.MultiWriter(bw, h)
-	if err := writeSnapshotBody(mw, s, watermark); err != nil {
+	if err := writeSnapshotBody(mw, s, stamp); err != nil {
 		return fmt.Errorf("snapshot: WriteSnapshotFile: %w", err)
 	}
 
@@ -125,16 +154,20 @@ func WriteSnapshotFile(path string, s *Snapshot, watermark uint64) (err error) {
 }
 
 // writeSnapshotBody writes every field of the format after the magic:
-// version, graph id, watermark, node/edge/kind counts, the packed CSR
-// arrays, the kind table, the PropStore, and finally MultiGraph and
-// DroppedEdges. See ReadSnapshotFile's doc comment for the exact field-by-
-// field layout this must match.
-func writeSnapshotBody(w io.Writer, s *Snapshot, watermark uint64) error {
+// version, graph id, watermark, watermark lineage, the id sequence
+// positions, node/edge/kind counts, the packed CSR arrays, the kind table,
+// the PropStore, and finally MultiGraph and DroppedEdges. See
+// ReadSnapshotFile's doc comment for the exact field-by-field layout this
+// must match.
+func writeSnapshotBody(w io.Writer, s *Snapshot, stamp Stamp) error {
 	bw := &binWriter{w: w}
 
 	bw.u32(snapshotFormatVersion)
 	bw.i32(s.GraphID)
-	bw.u64(watermark)
+	bw.u64(stamp.Watermark)
+	bw.bytes(s.WatermarkLineage[:])
+	bw.u64(uint64(stamp.NodeIDSeq))
+	bw.u64(uint64(stamp.EdgeIDSeq))
 
 	bw.u64(uint64(s.NodeCount()))
 	bw.u64(uint64(s.EdgeCount()))
@@ -237,12 +270,15 @@ func writePropStore(bw *binWriter, p *PropStore) {
 // never observes a partially-verified snapshot: on any error the returned
 // *Snapshot is nil.
 //
-// Format v1, every multi-byte integer little-endian:
+// Format v2, every multi-byte integer little-endian:
 //
 //	magic          [7]byte  "BTSNAP\x00"                    -- NOT covered by the trailing CRC
-//	version        uint32   snapshotFormatVersion (1)
+//	version        uint32   snapshotFormatVersion (2)
 //	graphID        int32    Snapshot.GraphID
-//	watermark      uint64   the caller-supplied watermark
+//	watermark      uint64   Stamp.Watermark
+//	lineage        [16]byte Snapshot.WatermarkLineage
+//	nodeIDSeq      int64    Stamp.NodeIDSeq
+//	edgeIDSeq      int64    Stamp.EdgeIDSeq
 //	nodeCount (N)  uint64   len(GraphIDs)
 //	edgeCount (E)  uint64   len(OutTargets) (== len(InTargets))
 //	nodeKindsLen   uint64   len(NodeKinds)
@@ -271,32 +307,30 @@ func writePropStore(bw *binWriter, p *PropStore) {
 //	droppedEdges   uint64
 //	crc32          uint32   IEEE CRC32 of every byte after the magic, up to (not including) this field
 //
+// Everything from version through edgeIDSeq is the file's Header, which
+// ReadSnapshotFileHeader reads on its own.
+//
 // ReadSnapshotFile never panics on a corrupt file: a nonsensical count
 // field (e.g. one big enough to demand an implausible allocation) is caught
 // and turned into ErrCorrupt rather than crashing the process.
-func ReadSnapshotFile(path string) (snap *Snapshot, watermark uint64, err error) {
+func ReadSnapshotFile(path string) (snap *Snapshot, stamp Stamp, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			snap = nil
-			watermark = 0
+			stamp = Stamp{}
 			err = fmt.Errorf("snapshot: ReadSnapshotFile: %w: panic: %v", ErrCorrupt, r)
 		}
 	}()
 
 	f, openErr := os.Open(path)
 	if openErr != nil {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: open: %w", openErr)
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: open: %w", openErr)
 	}
 	defer func() { _ = f.Close() }()
 
 	raw := bufio.NewReaderSize(f, 1<<20)
-
-	magic := make([]byte, len(snapshotMagic))
-	if _, readErr := io.ReadFull(raw, magic); readErr != nil {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: read magic: %w", ErrNotSnapshot)
-	}
-	if !bytes.Equal(magic, snapshotMagic) {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: %w", ErrNotSnapshot)
+	if err := readMagic(raw); err != nil {
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: %w", err)
 	}
 
 	// Everything from here on is read through tr, which feeds each byte to
@@ -308,16 +342,10 @@ func ReadSnapshotFile(path string) (snap *Snapshot, watermark uint64, err error)
 	tr := io.TeeReader(raw, h)
 	br := &binReader{r: tr}
 
-	version := br.u32()
-	if br.err != nil {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: read version: %w", wrapCorrupt(br.err))
+	header, err := readHeader(br)
+	if err != nil {
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: %w", err)
 	}
-	if version != snapshotFormatVersion {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: version %d: %w", version, ErrVersionMismatch)
-	}
-
-	graphID := br.i32()
-	watermark = br.u64()
 	n := br.u64()
 	e := br.u64()
 	nodeKindsLen := br.u64()
@@ -342,19 +370,19 @@ func ReadSnapshotFile(path string) (snap *Snapshot, watermark uint64, err error)
 	droppedEdges := br.u64()
 
 	if br.err != nil {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: %w", wrapCorrupt(br.err))
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: %w", wrapCorrupt(br.err))
 	}
 
 	var storedCRC [4]byte
 	if _, readErr := io.ReadFull(raw, storedCRC[:]); readErr != nil {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: read crc: %w", wrapCorrupt(readErr))
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: read crc: %w", wrapCorrupt(readErr))
 	}
 	if binary.LittleEndian.Uint32(storedCRC[:]) != h.Sum32() {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: %w", ErrCorrupt)
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: %w", ErrCorrupt)
 	}
 
 	s := &Snapshot{
-		GraphID:      graphID,
+		GraphID:      header.GraphID,
 		GraphIDs:     graphIDs,
 		OutOffsets:   outOffsets,
 		OutTargets:   outTargets,
@@ -373,20 +401,88 @@ func ReadSnapshotFile(path string) (snap *Snapshot, watermark uint64, err error)
 		// bookkeeping timestamp for when this in-memory Snapshot struct was
 		// constructed, not part of the graph data itself, so reloading from
 		// disk gets a fresh one, exactly as a fresh Build would.
-		BuiltAt:    time.Now(),
-		MultiGraph: multiGraph,
-		edgeIDPerm: edgeIDPerm,
+		BuiltAt:          time.Now(),
+		MultiGraph:       multiGraph,
+		WatermarkLineage: header.Lineage,
+		edgeIDPerm:       edgeIDPerm,
 	}
 	// The CRC above proves these are the bytes that were written, not that
 	// they describe a graph. finalizeDerived and every later reader index
 	// straight into these arrays -- one of them through unsafe.String --
 	// so the structure is checked before anything touches it.
 	if validateErr := validateSnapshotStructure(s); validateErr != nil {
-		return nil, 0, fmt.Errorf("snapshot: ReadSnapshotFile: %w", validateErr)
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: %w", validateErr)
 	}
 	finalizeDerived(s)
 
-	return s, watermark, nil
+	return s, header.Stamp, nil
+}
+
+// ReadSnapshotFileHeader reads only a snapshot file's Header -- after
+// checking its magic and format version -- without reading the graph that
+// follows. Nothing it returns is verified: the CRC32 that vouches for these
+// bytes covers the whole file, so a header read is good for refusing a file
+// early, never for trusting one. The engine's boot uses it to turn away a
+// file its header already rules out before paying to read what can be
+// gigabytes of graph, and weighs ReadSnapshotFile's verified result, not
+// this, before it adopts anything.
+//
+// Errors wrap the same sentinels ReadSnapshotFile's do: a missing file is
+// fs.ErrNotExist, a foreign one ErrNotSnapshot, another format version
+// ErrVersionMismatch, and one too short to hold a header ErrCorrupt.
+func ReadSnapshotFileHeader(path string) (Header, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Header{}, fmt.Errorf("snapshot: ReadSnapshotFileHeader: open: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	raw := bufio.NewReader(f)
+	if err := readMagic(raw); err != nil {
+		return Header{}, fmt.Errorf("snapshot: ReadSnapshotFileHeader: %w", err)
+	}
+	header, err := readHeader(&binReader{r: raw})
+	if err != nil {
+		return Header{}, fmt.Errorf("snapshot: ReadSnapshotFileHeader: %w", err)
+	}
+	return header, nil
+}
+
+// readMagic consumes the magic that opens every snapshot file, failing with
+// ErrNotSnapshot when r does not start with it.
+func readMagic(r io.Reader) error {
+	magic := make([]byte, len(snapshotMagic))
+	if _, err := io.ReadFull(r, magic); err != nil {
+		return fmt.Errorf("read magic: %w", ErrNotSnapshot)
+	}
+	if !bytes.Equal(magic, snapshotMagic) {
+		return ErrNotSnapshot
+	}
+	return nil
+}
+
+// readHeader reads the format version and then the Header's fields, in the
+// order writeSnapshotBody writes them -- ReadSnapshotFile's and
+// ReadSnapshotFileHeader's one copy of that order.
+func readHeader(br *binReader) (Header, error) {
+	version := br.u32()
+	if br.err != nil {
+		return Header{}, fmt.Errorf("read version: %w", wrapCorrupt(br.err))
+	}
+	if version != snapshotFormatVersion {
+		return Header{}, fmt.Errorf("version %d: %w", version, ErrVersionMismatch)
+	}
+
+	var header Header
+	header.GraphID = br.i32()
+	header.Stamp.Watermark = br.u64()
+	copy(header.Lineage[:], br.bytes(uint64(len(header.Lineage))))
+	header.Stamp.NodeIDSeq = int64(br.u64())
+	header.Stamp.EdgeIDSeq = int64(br.u64())
+	if br.err != nil {
+		return Header{}, fmt.Errorf("read header: %w", wrapCorrupt(br.err))
+	}
+	return header, nil
 }
 
 // maxKindTableEntries bounds readKindTable's entry count by KindID's own

@@ -99,6 +99,36 @@ func setupProject(t *testing.T) (string, string) {
 // active driver to "bloodtrail".
 const setRowSQL = "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('bloodtrail')"
 
+// endLineageSQL is the exact statement dbswitch.Store.EndWatermarkLineage
+// sends to end BloodTrail's watermark lineage, and dbswitch.Store.ClearGraph
+// appends to its truncate.
+const endLineageSQL = "do $$ begin " +
+	"if to_regclass('bloodtrail_watermark') is null then return; end if; " +
+	"update bloodtrail_watermark set counter = counter + 1, updated_at = now() where id = 1; " +
+	"if exists (select 1 from pg_attribute where attrelid = to_regclass('bloodtrail_watermark') and attname = 'lineage' and not attisdropped) then " +
+	"update bloodtrail_watermark set lineage = gen_random_uuid() where id = 1; " +
+	"end if; end $$"
+
+// clearGraphSQL is the exact statement dbswitch.Store.ClearGraph sends.
+const clearGraphSQL = "truncate table edge, node; " + endLineageSQL
+
+// scriptLineageEnd scripts the statement that ends BloodTrail's watermark
+// lineage, sent through psql, the prefix of the project it is addressed to.
+func scriptLineageEnd(fake *dockerx.FakeRunner, psql string) {
+	fake.Outputs[psql+endLineageSQL] = []byte("DO\n")
+}
+
+// callIndex returns the index of the first call in fake that starts with
+// prefix, or -1 when there is none.
+func callIndex(fake *dockerx.FakeRunner, prefix string) int {
+	for i, c := range fake.Calls {
+		if strings.HasPrefix(c, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestInstallOnNeo4jDeployment(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
@@ -142,6 +172,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 		},
 	}
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	var out bytes.Buffer
 	deps := Deps{
 		Runner:  fake,
@@ -218,6 +249,19 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	upIdx := idx("docker compose --project-directory " + dir + " -f " + composeFile + " -f ")
 	if backupIdx >= driverRowIdx || driverRowIdx >= upIdx {
 		t.Fatalf("unexpected call order:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	// The watermark lineage ends after the migration -- a writer that never
+	// bumps the counter, verified by the PostgreSQL recount that follows it --
+	// and before `up` starts BloodTrail, whose first boot would otherwise
+	// weigh an old snapshot file against a counter the migration never moved.
+	lastCountIdx := -1
+	for i, c := range fake.Calls {
+		if strings.HasPrefix(c, psql+"select (select count(*) from node)") {
+			lastCountIdx = i
+		}
+	}
+	if lineageIdx := idx(psql + endLineageSQL); lineageIdx == -1 || lineageIdx <= lastCountIdx || lineageIdx >= upIdx {
+		t.Fatalf("the watermark lineage must end after the migration and before BloodTrail starts:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 	if !strings.Contains(string(fake.Calls[len(fake.Calls)-1]), "logs --no-color bloodhound") {
 		t.Fatalf("expected verification logs call last, got %v", fake.Calls[len(fake.Calls)-1])
@@ -405,6 +449,7 @@ func TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory(
 	defer tool.Close()
 
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -521,6 +566,7 @@ func TestInstallIgnoresAPreExistingMigratorFailureLog(t *testing.T) {
 	defer tool.Close()
 
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -604,7 +650,7 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 			// and again through the whole project when verifying.
 			base + "logs --no-color bloodhound":                         []byte("BloodTrail driver active version=test\n"),
 			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
-			psql + "truncate table edge, node":                          []byte("TRUNCATE TABLE\n"),
+			psql + clearGraphSQL:                                        []byte("TRUNCATE TABLE\nDO\n"),
 			"docker image inspect " + image:                             []byte(""),
 			"docker image inspect " + toolapi.CurlImage:                 []byte(""),
 			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
@@ -639,6 +685,7 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 	defer tool.Close()
 
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -653,6 +700,55 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 	}
 	if !clearedBeforeMigration {
 		t.Fatalf("the stale graph must be cleared before the migration starts:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	// The truncate ends the lineage as it commits, and the migration that
+	// refills the graph writes without the counter too, so the lineage has to
+	// end again once it is done -- before BloodTrail starts, not just before
+	// the migration.
+	if lineageIdx, upIdx := callIndex(fake, psql+endLineageSQL), callIndex(fake, base+"-f "+overridePath+" up -d"); lineageIdx == -1 || lineageIdx >= upIdx || lineageIdx < callIndex(fake, psql+clearGraphSQL) {
+		t.Fatalf("the watermark lineage must end after the replaced graph was migrated and before BloodTrail starts:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// TestInstallDoesNotStartBloodTrailWhenTheLineageCannotBeEnded pins the
+// install's fail-closed half of the watermark lineage: BloodTrail's first
+// boot is exactly when a snapshot file from before the stock image's writes
+// could be adopted, so an install that could not end the lineage must stop
+// short of starting it -- with the rollback hint, since the driver row and
+// the override are already in place.
+func TestInstallDoesNotStartBloodTrailWhenTheLineageCannotBeEnded(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+			psql + "select driver from database_switch limit 1":             []byte("pg\n"),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker image inspect " + image:                                 []byte(""),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+		},
+		Errors: map[string]error{
+			psql + endLineageSQL: errors.New("psql: error: connection to server failed"),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, Yes: true,
+		Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	err := Install(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, opts)
+	if err == nil || !strings.Contains(err.Error(), "watermark lineage") || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected the lineage failure with the rollback hint, got %v", err)
+	}
+	if fake.Called(base + "-f " + overridePath + " up -d") {
+		t.Fatalf("BloodTrail was started although the watermark lineage could not be ended:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive so `bloodtrail rollback` can undo the switch")
 	}
 }
 
@@ -687,6 +783,7 @@ func TestInstallKeepsTheOperatorsComposeFiles(t *testing.T) {
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
+	scriptLineageEnd(fake, psql)
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
@@ -831,14 +928,23 @@ func TestRollbackRestoresEverything(t *testing.T) {
 	// the project is addressed with both files; the restart afterwards is not.
 	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
 	psql := installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	restoredPSQL := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
 	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
 			base + "up -d": nil,
 			psql + "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')": []byte("INSERT 0 1\n"),
 		},
 	}
+	scriptLineageEnd(fake, restoredPSQL)
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
+	}
+	// The stock image writes the graph without the watermark counter from
+	// the moment it is back, so the lineage every saved snapshot file names
+	// has to end -- once BloodTrail, which saves the last such file as it
+	// stops, is gone: after `up`, through the project as restored.
+	if lineageIdx, upIdx := callIndex(fake, restoredPSQL+endLineageSQL), callIndex(fake, base+"up -d"); lineageIdx == -1 || lineageIdx < upIdx {
+		t.Fatalf("the watermark lineage must end once the original image is running again:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.bloodtrail.yml")); !os.IsNotExist(err) {
 		t.Fatal("override file should be removed")
@@ -873,6 +979,7 @@ func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
 			psql + "delete from database_switch": nil,
 		},
 	}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
 	}
@@ -908,6 +1015,7 @@ func TestRollbackSaysWhatIsAlreadyRestoredWhenTheRestartFails(t *testing.T) {
 		},
 		Errors: map[string]error{base + "up -d": errors.New("port is already allocated")},
 	}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, VerifyTimeout: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "already restored") {
 		t.Fatalf("expected an error saying what is already restored, got %v", err)
@@ -917,6 +1025,69 @@ func TestRollbackSaysWhatIsAlreadyRestoredWhenTheRestartFails(t *testing.T) {
 	}
 	if !manifest.Exists(dir) {
 		t.Fatal("the manifest must survive a failed restart so the rerun finds the installation")
+	}
+	// The failed up may have started the stock image anyway; the lineage
+	// has to end regardless, after the attempt.
+	up, end := callIndex(fake, base+"up -d"), callIndex(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "+endLineageSQL)
+	if end < 0 || end < up {
+		t.Fatalf("the lineage was not ended after the failed restart (up at %d, lineage end at %d):\n%s", up, end, strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// TestRollbackReportsBothFailuresWhenTheRestartAndTheLineageEndFail pins the
+// error a failed restart reports when ending the lineage fails as well --
+// the database may simply not be up -- so neither failure hides the other.
+func TestRollbackReportsBothFailuresWhenTheRestartAndTheLineageEndFail(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	_ = os.WriteFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound"}.Save(dir)
+
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc delete from database_switch": nil,
+		},
+		Errors: map[string]error{
+			base + "up -d": errors.New("port is already allocated"),
+			base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + endLineageSQL: errors.New("service \"app-db\" is not running"),
+		},
+	}
+	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, VerifyTimeout: time.Second})
+	if err == nil {
+		t.Fatal("a rollback whose restart failed reported success")
+	}
+	for _, want := range []string{"port is already allocated", "watermark lineage", "is not running", "rerun `bloodtrail rollback`"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error does not mention %q: %v", want, err)
+		}
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive a failed restart so the rerun finds the installation")
+	}
+}
+
+// TestRollbackKeepsTheManifestWhenTheLineageCannotBeEnded pins that a
+// rollback which restored everything but could not end the watermark
+// lineage does not report itself finished: the manifest stays, so the rerun
+// the error asks for runs again -- and a later install still finds the
+// installation it has to be rolled back first.
+func TestRollbackKeepsTheManifestWhenTheLineageCannotBeEnded(t *testing.T) {
+	dir, composeFile, fake, api := rollbackFixture(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake.Errors = map[string]error{
+		base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + endLineageSQL: errors.New("psql: error: connection to server failed"),
+	}
+
+	err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
+		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "watermark lineage") || !strings.Contains(err.Error(), "rerun `bloodtrail rollback`") {
+		t.Fatalf("expected the lineage failure with the rerun hint, got %v", err)
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive so the rerun ends the lineage")
 	}
 }
 
@@ -1062,6 +1233,7 @@ func TestInstallKeepsTheComposeFileDiscoveryWouldHaveLoaded(t *testing.T) {
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
+	scriptLineageEnd(fake, psql)
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
@@ -1118,6 +1290,8 @@ func TestRollbackRemovesAnEnvEntryItCreated(t *testing.T) {
 			"docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " up -d": nil,
 		},
 	}
+	scriptLineageEnd(fake, "docker compose --project-directory "+dir+" -f "+composeFile+" -f "+discovered+
+		" exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
 		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
@@ -1734,6 +1908,7 @@ func rollbackFixture(t *testing.T) (dir, composeFile string, fake *dockerx.FakeR
 		base + "up -d": nil,
 		installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc delete from database_switch": nil,
 	}}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	return dir, composeFile, fake, api
 }
 
