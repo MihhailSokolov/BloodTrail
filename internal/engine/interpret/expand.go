@@ -1145,6 +1145,31 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		}
 	}
 
+	// ModeAll's answer is the paths of the overall shortest length over every
+	// pair, so which pairs exist decides it: a root Part.Where drops later
+	// can still set that length and hide every other pair's paths.
+	// PostgreSQL's harness starts from endpoint sets its WHERE has already
+	// filtered, so a side whose Endpoint leaves pushed predicates to
+	// Part.Where (a kind bitmap under a negation, say) is resolved here as
+	// its exact set instead. Per-pair answers need none of this: each pair's
+	// paths are the same whichever other pairs exist.
+	if mode == traverse.ModeAll {
+		if !rootsEnforced {
+			ids, err := resolveEndpointSet(env, meter, step.FromSym, part.Nodes[step.FromSym])
+			if err != nil {
+				return nil, err
+			}
+			roots, rootsEnforced = traverse.Endpoint{IDs: ids}, true
+		}
+		if !terminalsEnforced {
+			ids, err := resolveEndpointSet(env, meter, step.ToSym, part.Nodes[step.ToSym])
+			if err != nil {
+				return nil, err
+			}
+			terminals, terminalsEnforced = traverse.Endpoint{IDs: ids}, true
+		}
+	}
+
 	maxDepth := 0
 	if step.Range != nil {
 		maxDepth = step.Range.Max
@@ -1564,10 +1589,13 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 // of them to Part.Where. A materialized side always does (scanAnchor
 // evaluates them all per candidate); a kind bitmap does only when every
 // predicate is a kind test folded into that bitmap (kindBitmapEnforces); an
-// unconstrained side does only when there are none. Nothing about which
-// paths are CORRECT depends on this -- traverse is per pair, and Part.Where
-// filters whatever this leaves over -- but a LIMIT pushed into traverse
-// counts paths before Part.Where runs, so shortestPathLimit must know.
+// unconstrained side does only when there are none. A per-pair answer is
+// correct either way -- each pair's paths do not depend on the others, and
+// Part.Where filters whatever this leaves over -- but two callers must
+// know: traverse.ModeAll, whose overall shortest length depends on every
+// pair (expandShortestPathComponent resolves an unenforced side exactly for
+// it), and a LIMIT pushed into traverse, which counts paths before
+// Part.Where runs (shortestPathLimit).
 func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint) (ep traverse.Endpoint, predicatesEnforced bool, err error) {
 	if nc == nil {
 		return traverse.Endpoint{}, true, nil

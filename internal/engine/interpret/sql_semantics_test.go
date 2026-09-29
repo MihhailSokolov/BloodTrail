@@ -163,6 +163,47 @@ func TestRelationshipUniquenessIsPerPattern(t *testing.T) {
 	assertServedIDs(t, snap, `MATCH (x:User)-[:MemberOf]->(g)<-[:MemberOf]-(y:User) RETURN x`)
 }
 
+// Without a pair filter, allShortestPaths answers with the paths of the
+// query's overall shortest length, taken over the endpoint sets PostgreSQL's
+// harness starts from -- already filtered by the WHERE. The engine took that
+// minimum over the Root kind bitmap and applied the negation afterwards, so
+// root 1, one hop from the terminal, set the length and was then dropped:
+// the query served nothing where pg returns 2 -> 3 -> 4. Per pair, and
+// without the negation, the answers were already right.
+func TestAllShortestPathsOverallShortestFiltersEndpointsFirst(t *testing.T) {
+	const kindRoot, kindTarget snapshot.KindID = 3, 4
+	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", semEdge: "E"},
+		[]execNodeSpec{
+			{1, []snapshot.KindID{kindRoot}, map[string]any{"name": "a"}},
+			{2, []snapshot.KindID{kindRoot}, map[string]any{"name": "b"}},
+			{3, nil, nil},
+			{4, []snapshot.KindID{kindTarget}, nil},
+		}, []execEdgeSpec{
+			{10, 1, 4, semEdge},
+			{11, 2, 3, semEdge},
+			{12, 3, 4, semEdge},
+		})
+
+	for _, tc := range []struct {
+		query   string
+		perPair bool
+		want    []string
+	}{
+		{`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE NOT s.name = 'a' RETURN p`, false, []string{"N:2,3,4,|E:11,12,"}},
+		{`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE NOT s.name = 'a' RETURN p LIMIT 1`, false, []string{"N:2,3,4,|E:11,12,"}},
+		{`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE NOT s.name = 'a' RETURN p`, true, []string{"N:2,3,4,|E:11,12,"}},
+		{`MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) RETURN p`, false, []string{"N:1,4,|E:10,"}},
+	} {
+		rs, err := Execute(&Env{Snap: snap, AllShortestPerPair: tc.perPair}, planQuery(t, snap, tc.query), generousBudget)
+		if err != nil {
+			t.Fatalf("%s (per pair %v): %v", tc.query, tc.perPair, err)
+		}
+		if got := pathSigsAtColumn(t, snap, rs, 0); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s (per pair %v): got %v, want %v", tc.query, tc.perPair, got, tc.want)
+		}
+	}
+}
+
 // `n.v = ['1']` is `jsonb_to_text_array(p -> 'v')::text[] = array ['1']`: a
 // list compares its elements' text, so [1] matches too; a JSON null or a
 // missing value is NULL. Against a numeric list every element is cast
