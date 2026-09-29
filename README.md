@@ -154,6 +154,12 @@ validated.
   puts discovery back the way it was. With no entry, the compose file given has to be the
   one discovery picks (`compose.yaml` wins over `docker-compose.yml` in the same
   directory); otherwise the installer stops and asks for `--compose-file` or an entry.
+- The installer stops before changing anything when it cannot be sure which files
+  docker compose loads for the operator: a `COMPOSE_FILE` entry that is empty, uses
+  interpolation or escapes, has an empty or space-padded name, does not start with the
+  compose file it was given, or lists a file that does not exist; or `COMPOSE_FILE` (or a
+  `COMPOSE_PATH_SEPARATOR` other than `:`) set in the shell's environment, which docker
+  compose takes over `.env`. The message says what to change.
 - `bloodtrail rollback` returns the deployment to the graph it had before the install.
   On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible

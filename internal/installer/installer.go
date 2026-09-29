@@ -213,6 +213,25 @@ func projectExtraFiles(composeFile, projectDir string) (extra, missing []string,
 	return extra, missing, nil
 }
 
+// checkComposeEnvironment refuses what the installer's own environment would
+// change about how docker compose reads the project. Compose takes
+// COMPOSE_FILE and COMPOSE_PATH_SEPARATOR from the shell over .env, so with
+// COMPOSE_FILE set there (even empty) the operator's own `docker compose up
+// -d` from this shell ignores the entry the install writes to .env -- and
+// boots the upstream image against the `bloodtrail` driver setting -- while a
+// separator other than ':' splits that entry into names that do not exist.
+// The installer's own commands name every file with -f, which compose honours
+// over both, so they would never show it.
+func checkComposeEnvironment() error {
+	if _, ok := os.LookupEnv("COMPOSE_FILE"); ok {
+		return errors.New("COMPOSE_FILE is set in this shell's environment, where docker compose takes it over the COMPOSE_FILE entry in .env: a plain `docker compose up -d` from here would not load the override this install adds there; unset it (moving the setting into .env if the project needs it) and rerun")
+	}
+	if sep, ok := os.LookupEnv("COMPOSE_PATH_SEPARATOR"); ok && sep != "" && sep != ":" {
+		return fmt.Errorf("COMPOSE_PATH_SEPARATOR is set in this shell's environment to %q, so docker compose would split COMPOSE_FILE on it rather than on the ':' this installer writes; unset it and rerun", sep)
+	}
+	return nil
+}
+
 // requireListedFiles is install's stricter reading of the project: it refuses
 // a file COMPOSE_FILE lists that is not on disk. The other commands skip one
 // (projectExtraFiles), but compose fails to load the project over it, so the
@@ -325,6 +344,9 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 
 	if manifest.Exists(opts.ProjectDir) {
 		return fmt.Errorf("a previous install did not complete or is still installed in %s; run `bloodtrail rollback` first", opts.ProjectDir)
+	}
+	if err := checkComposeEnvironment(); err != nil {
+		return err
 	}
 
 	c, err := opts.compose(deps.Runner)

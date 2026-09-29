@@ -22,6 +22,15 @@ import (
 
 const upstreamImage = "docker.io/specterops/bloodhound:v9.6.0"
 
+// TestMain keeps the environment the tests run in out of Install's check on
+// COMPOSE_FILE and COMPOSE_PATH_SEPARATOR (see
+// TestInstallStopsWhenTheShellSetsComposeFile).
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("COMPOSE_FILE")
+	_ = os.Unsetenv("COMPOSE_PATH_SEPARATOR")
+	os.Exit(m.Run())
+}
+
 // testNeo4jPassword is built from a plain identifier rather than written as
 // a NEO4J_PASSWORD=literal or NEO4J_AUTH=neo4j/literal assignment anywhere
 // below, so secret scanners do not mistake this fixture for a real
@@ -1331,6 +1340,51 @@ func TestInstallStopsOnAListedFileThatIsMissing(t *testing.T) {
 	}
 	if env != "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n" {
 		t.Fatalf(".env = %q", env)
+	}
+}
+
+// TestInstallStopsWhenTheShellSetsComposeFile covers COMPOSE_FILE -- or a
+// COMPOSE_PATH_SEPARATOR other than compose's default ':' -- set in the
+// environment the installer runs in. Compose takes both from the shell over
+// .env, so a plain `docker compose up -d` from that shell ignores the entry
+// the install writes to .env (booting the upstream image against the
+// `bloodtrail` driver setting the install leaves behind), or splits it into
+// names that do not exist. The installer's own commands name every file with
+// -f, which compose honours over either, so nothing used to notice.
+func TestInstallStopsWhenTheShellSetsComposeFile(t *testing.T) {
+	for _, c := range []struct {
+		key, value string
+		refused    bool
+	}{
+		{"COMPOSE_FILE", "docker-compose.yml", true},
+		{"COMPOSE_FILE", "", true},
+		{"COMPOSE_PATH_SEPARATOR", ";", true},
+		{"COMPOSE_PATH_SEPARATOR", ":", false},
+	} {
+		t.Run(c.key+"="+c.value, func(t *testing.T) {
+			t.Setenv(c.key, c.value)
+			dir, composeFile := setupProject(t)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+			defer api.Close()
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+			fake := scriptPGInstall(&dockerx.FakeRunner{}, base, filepath.Join(dir, "docker-compose.bloodtrail.yml"), image)
+			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+			err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+			if !c.refused {
+				if err != nil {
+					t.Fatalf("install with compose's default separator: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.key+" is set") {
+				t.Fatalf("want a refusal naming %s, got %v", c.key, err)
+			}
+			if len(fake.Calls) != 0 {
+				t.Fatalf("install ran commands first:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+		})
 	}
 }
 
