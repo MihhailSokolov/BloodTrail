@@ -408,24 +408,26 @@ func decodeScalarString(s string) any {
 
 // --- Projection value-kind resolution ------------------------------------
 
-// valueKind names the pg-parity numeric conversion a materialized scalar
-// column needs, beyond the interpreter's own uniform float64 representation
-// (see interpret/value.go's package doc and evalIDFunction/
-// evalSizeFunction/evalDateTimeComponent's doc comments for why the
-// evaluator itself stays float64-only). valueDefault covers every ordinary
-// projection: no conversion is applied, and the interpreter's post-JSON
+// valueKind names the pg-parity conversion a materialized scalar column
+// needs beyond the interpreter's own value model, in which every number is
+// a float64 (interpret/value.go's package doc; evalIDFunction's and
+// evalSizeFunction's docs for why the evaluator keeps even integer-valued
+// calls float64). valueDefault applies none: the interpreter's post-JSON
 // value (nil | string | float64 | bool | []any | map[string]any) passes
-// through materializeScalar unchanged (aside from decodeScalarString's
-// double-decode rule, which applies to every kind except valueText).
+// through materializeScalar unchanged, aside from decodeScalarString's
+// double-decode rule, which applies to every kind except valueText.
+//
+// Only the integer column types have a kind here. A column PostgreSQL types
+// numeric -- datetime().epochseconds/.epochmillis, arithmetic over numeric
+// literals alone -- has no float64 rendering that matches it, so Plan
+// declines those projections outright (interpret's projectionTypingOK)
+// rather than giving them a kind.
 type valueKind uint8
 
 const (
-	// valueDefault applies to every projection item that is not one of the
-	// controller's four projection-typing-amendment calls (or a WITH-COUNT
-	// alias reference to one) -- a property lookup, a bare node/edge/path
-	// variable, arithmetic, a literal, labels()/type()/toLower()/toUpper()/
-	// coalesce()/split(), or a datetime() component other than epochseconds/
-	// epochmillis.
+	// valueDefault applies to every projection item none of the kinds
+	// below claims: a property lookup, a node/edge/path variable, float8
+	// arithmetic over a property, labels(), split(), and the like.
 	valueDefault valueKind = iota
 	// valueText applies to a projection PostgreSQL renders as a `text`
 	// column rather than jsonb -- toLower()/toUpper()/coalesce() and a bare
@@ -433,9 +435,9 @@ const (
 	// conversion; what it changes is that the scalar double-decode is NOT
 	// applied, matching dawgs' own decode-by-column-type rule.
 	valueText
-	// valueInt64 applies to id(), datetime().epochseconds, datetime().
-	// epochmillis, and any bare reference (renamed or not) to a WITH
-	// COUNT(...) alias -- the pinned pg-parity type for all four is int64.
+	// valueInt64 applies to id(), to a coalesce() dawgs types int8
+	// (interpret.CoalesceIsInt8), and to any bare reference (renamed or not)
+	// to a COUNT alias, a WITH's or a RETURN aggregate's -- all int8 in pg.
 	valueInt64
 	// valueInt32 applies to size() -- pg-parity int32.
 	valueInt32
@@ -447,10 +449,11 @@ const (
 // the same *interpret.Query, since Plan/Execute share exactly this column
 // ordering (interpret.ResultSet's own doc comment).
 //
-// ProjectionOutput.BareCallKind ("id"/"epochseconds"/"epochmillis" ->
-// valueInt64, "size" -> valueInt32) already flags three of the controller's
-// four amendment calls directly at plan time -- see interpret/plan.go's
-// bareCallKind/projectionTypingOK. COUNT is the one exception, and it needs
+// ProjectionOutput.BareCallKind ("id" -> valueInt64, "size" -> valueInt32)
+// flags the integer-typed calls directly at plan time -- see
+// interpret/plan.go's bareCallKind/projectionTypingOK; the datetime() epoch
+// accessors it also recognizes never reach a served RETURN, since pg types
+// them numeric. COUNT is the exception, and it needs
 // a second pass here rather than a BareCallKind of its own: a COUNT never
 // reaches RETURN as its own expression. `WITH COUNT(sym) AS alias` flows
 // into RETURN as a bare reference to alias, and a RETURN-position
@@ -485,7 +488,7 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 	kinds := make([]valueKind, len(q.Returning.Items))
 	for i, item := range q.Returning.Items {
 		switch item.BareCallKind {
-		case "id", "epochseconds", "epochmillis":
+		case "id":
 			kinds[i] = valueInt64
 			continue
 		case "size":

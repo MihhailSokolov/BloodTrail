@@ -204,22 +204,3 @@ func (d *deltaPropPostings) exact(key string, element bool) []NodeID {
 	}
 	return d.values[key]
 }
-
-// hasNonString reports whether any delta node carries this property as
-// something other than a string -- a number, boolean, null or list. See
-// NodesMatchingString for why that makes a string-predicate index unusable
-// rather than merely incomplete.
-func (d *deltaPropPostings) hasNonString() bool {
-	if d == nil {
-		return false
-	}
-	if len(d.elements) > 0 {
-		return true
-	}
-	for key := range d.values {
-		if len(key) == 0 || key[0] != 's' {
-			return true
-		}
-	}
-	return false
-}

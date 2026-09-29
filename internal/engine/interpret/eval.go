@@ -150,7 +150,7 @@ type Row struct {
 	// costs less than a map's hashing overhead would, and a plain append in
 	// markEdgeUsed needs no lazy-allocate-on-first-use dance the way the
 	// map-valued fields above do.
-	usedEdges []uint64
+	usedEdges []patternEdge
 
 	// trailEdges records the same overlay-aware edge identities as usedEdges
 	// (see candidateIdentity), but for edges consumed by a variable-length
@@ -167,7 +167,16 @@ type Row struct {
 	// constraint builders skip a preceding expansion entirely). So fixed-step
 	// expansion checks BOTH sets, while the trail DFS checks only usedEdges
 	// and records into trailEdges.
-	trailEdges []uint64
+	trailEdges []patternEdge
+}
+
+// patternEdge is one edge a row's Step consumed, tagged with the pattern
+// (Step.Pattern) that Step belongs to: relationship uniqueness holds only
+// among the Steps of one pattern, so an edge counts as used only for that
+// pattern's later Steps.
+type patternEdge struct {
+	pattern  int
+	identity uint64
 }
 
 // nodeBinding, edgeBinding and anyBinding are one symbol's entry in a Row's
@@ -292,16 +301,20 @@ func getAnyBinding(bs []anyBinding, sym string) (any, bool) {
 // while constructing this row -- see usedEdges' own doc for why this exists
 // separately from SetEdge. Marking the same fwd more than once is harmless
 // (edgeUsed only ever needs a yes/no answer, never a count).
-func (r *Row) markEdgeUsed(fwd uint64) {
-	r.usedEdges = append(r.usedEdges, fwd)
+func (r *Row) markEdgeUsed(pattern int, fwd uint64) {
+	r.usedEdges = append(r.usedEdges, patternEdge{pattern, fwd})
 }
 
-// edgeUsed reports whether fwd was already recorded via markEdgeUsed on this
-// row or on whichever row it was cloned/merged from (cloneRow/mergeRowInto
-// carry usedEdges forward like every other Row field).
-func (r *Row) edgeUsed(fwd uint64) bool {
+// edgeUsed reports whether fwd was already recorded via markEdgeUsed, by a
+// Step of the same pattern, on this row or on whichever row it was
+// cloned/merged from (cloneRow/mergeRowInto carry usedEdges forward like
+// every other Row field). An edge another pattern consumed does not count:
+// dawgs emits `e1.id != e0.id` only between the Steps of one pattern, so
+// `MATCH (a)-[:E]->(g), (b)-[:E]->(g)` -- two patterns -- pairs every edge
+// with itself too.
+func (r *Row) edgeUsed(pattern int, fwd uint64) bool {
 	for _, used := range r.usedEdges {
-		if used == fwd {
+		if used.pattern == pattern && used.identity == fwd {
 			return true
 		}
 	}
@@ -312,17 +325,17 @@ func (r *Row) edgeUsed(fwd uint64) bool {
 // candidateIdentity produces) as consumed by a variable-length step's trail
 // on this row -- see trailEdges' own doc for why this is a separate set from
 // usedEdges. Like markEdgeUsed, re-marking the same identity is harmless.
-func (r *Row) markTrailEdge(identity uint64) {
-	r.trailEdges = append(r.trailEdges, identity)
+func (r *Row) markTrailEdge(pattern int, identity uint64) {
+	r.trailEdges = append(r.trailEdges, patternEdge{pattern, identity})
 }
 
 // trailEdgeUsed reports whether identity was recorded via markTrailEdge on
 // this row or on whichever row it was cloned/merged from. Same linear-scan
 // reasoning as edgeUsed: a row's trail hop count is bounded by the
 // variable-length depth cap, so the slice stays small.
-func (r *Row) trailEdgeUsed(identity uint64) bool {
+func (r *Row) trailEdgeUsed(pattern int, identity uint64) bool {
 	for _, used := range r.trailEdges {
-		if used == identity {
+		if used.pattern == pattern && used.identity == identity {
 			return true
 		}
 	}
@@ -349,6 +362,7 @@ type Env struct {
 
 	regexMu    sync.Mutex
 	regexCache map[string]*RegexMatcher
+	likeCache  map[string]*regexp.Regexp // compiledLike, under regexMu
 
 	// litMu guards litCache, the decoded form of each string literal the
 	// query mentions -- see literalValue.
@@ -412,6 +426,27 @@ func (e *Env) compiledRegex(pattern string) (*RegexMatcher, error) {
 		e.regexCache = make(map[string]*RegexMatcher)
 	}
 	e.regexCache[pattern] = re
+	return re, nil
+}
+
+// compiledLike returns the matcher for a PostgreSQL LIKE pattern, compiled
+// once per query (see compiledRegex), or ErrLikePattern.
+func (e *Env) compiledLike(pattern string) (*regexp.Regexp, error) {
+	e.regexMu.Lock()
+	defer e.regexMu.Unlock()
+
+	if re, ok := e.likeCache[pattern]; ok {
+		return re, nil
+	}
+	lp, err := parseLikePattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+	re := lp.regexp()
+	if e.likeCache == nil {
+		e.likeCache = make(map[string]*regexp.Regexp)
+	}
+	e.likeCache[pattern] = re
 	return re, nil
 }
 
@@ -567,13 +602,17 @@ func evalExclusiveDisjunction(env *Env, row *Row, exprs []cypher.Expression) (Tr
 // Every other predicate shape negates the ordinary way: evaluate positively,
 // then Tri.Not().
 func evalNegation(env *Env, row *Row, expr cypher.Expression) (Tri, error) {
+	// dawgs rewrites a negated STARTS WITH/ENDS WITH/CONTAINS through
+	// coalesce(..., '') only for a PLAIN property operand
+	// (rewriteNegatedStringPredicateExpression coalesces bare property
+	// lookups and nothing else), and never a regex: `NOT n.v =~ 'a'`,
+	// `NOT toLower(n.v) STARTS WITH 'a'` and `NOT (n.v) STARTS WITH 'a'` stay
+	// plain NOT, NULL over a missing or null value.
 	if cmp, isCmp := unwrapParens(expr).(*cypher.Comparison); isCmp && cmp != nil && len(cmp.Partials) == 1 {
-		if partial := cmp.Partials[0]; partial != nil {
+		if partial := cmp.Partials[0]; partial != nil && isPlainPropertyLookup(cmp.Left) {
 			switch partial.Operator {
 			case cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains:
 				return evalStringPredicate(env, row, cmp.Left, partial.Operator, partial.Right, true)
-			case cypher.OperatorRegexMatch:
-				return evalRegexComparison(env, row, cmp.Left, partial.Right, true)
 			}
 		}
 	}
@@ -699,6 +738,36 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 		return t, nil
 	}
 
+	// A plain property against a typed list literal or a text
+	// concatenation: dawgs compares the property's text there, not its
+	// jsonb value (plan.go's equalityShapeServed).
+	propExpr, otherExpr := leftExpr, rightExpr
+	if !isPlainPropertyLookup(propExpr) {
+		propExpr, otherExpr = rightExpr, leftExpr
+	}
+	if isPlainPropertyLookup(propExpr) {
+		if kind, typed := literalListCastKind(otherExpr); typed {
+			t, err := evalListLiteralEquality(env, row, propExpr, otherExpr, kind)
+			if err != nil {
+				return TriNull, err
+			}
+			if op == cypher.OperatorNotEquals {
+				t = t.Not()
+			}
+			return t, nil
+		}
+		if textConcatenation(otherExpr) {
+			t, err := evalPropertyTextEquality(env, row, propExpr, otherExpr)
+			if err != nil {
+				return TriNull, err
+			}
+			if op == cypher.OperatorNotEquals {
+				t = t.Not()
+			}
+			return t, nil
+		}
+	}
+
 	aVal, aOk, err := EvalValue(env, row, leftExpr)
 	if err != nil {
 		return TriNull, err
@@ -707,11 +776,145 @@ func evalEquality(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Oper
 	if err != nil {
 		return TriNull, err
 	}
+	// Against a list literal -- only `n.p = []`, see plan.go's
+	// equalityShapeServed -- dawgs adds `or (p -> 'p') = 'null' and null`,
+	// which makes a stored JSON null NULL rather than unequal.
+	if _, isList := unwrapParens(leftExpr).(*cypher.ListLiteral); isList && bOk && bVal == nil {
+		return TriNull, nil
+	}
+	if _, isList := unwrapParens(rightExpr).(*cypher.ListLiteral); isList && aOk && aVal == nil {
+		return TriNull, nil
+	}
 	t := PropEq(aVal, aOk, bVal, bOk)
 	if op == cypher.OperatorNotEquals {
 		t = t.Not()
 	}
 	return t, nil
+}
+
+// evalListLiteralEquality implements `n.p = [<literals>]` the way dawgs
+// lowers it: `jsonb_to_text_array(p -> 'p')::<type>[] = array [...]`. The
+// stored value must be a list -- a scalar or an object is PostgreSQL's
+// "cannot extract elements" error, and a missing value or a JSON null is
+// NULL -- and its elements are compared as the array type's values: a string
+// by itself and a number or boolean by its text against a string list, each
+// element cast (castPropertyForOrder, every element before any comparison,
+// as the array cast does) against a numeric one. A JSON null element is a
+// NULL element, never equal to a literal.
+func evalListLiteralEquality(env *Env, row *Row, propExpr, listExpr cypher.Expression, kind coalesceKind) (Tri, error) {
+	val, ok, err := EvalValue(env, row, propExpr)
+	if err != nil {
+		return TriNull, err
+	}
+	listVal, _, err := EvalValue(env, row, listExpr)
+	if err != nil {
+		return TriNull, err
+	}
+	lits, isList := listVal.([]any)
+	if !isList {
+		return TriNull, ErrUnsupported
+	}
+	if !ok || val == nil {
+		return TriNull, nil
+	}
+	elems, isList := val.([]any)
+	if !isList {
+		return TriNull, ErrRuntimeCast
+	}
+	cast := make([]any, len(elems))
+	for i, e := range elems {
+		if e == nil {
+			continue
+		}
+		if kind != coalesceText {
+			c, err := castPropertyForOrder(e, kind == coalesceFloat8)
+			if err != nil {
+				return TriNull, err
+			}
+			cast[i] = c
+			continue
+		}
+		switch x := e.(type) {
+		case string:
+			cast[i] = x
+		case []any, map[string]any:
+			// jsonb's own text for a nested container, which this package
+			// does not reproduce.
+			return TriNull, ErrUnsupported
+		default:
+			text, ok := jsonText(x)
+			if !ok {
+				return TriNull, ErrUnsupported
+			}
+			cast[i] = text
+		}
+	}
+	if len(cast) != len(lits) {
+		return TriFalse, nil
+	}
+	for i := range cast {
+		if cast[i] == nil || cast[i] != lits[i] {
+			return TriFalse, nil
+		}
+	}
+	return TriTrue, nil
+}
+
+// textConcatenation reports whether expr is a `+` dawgs lowers to text
+// concatenation (`||`) over at least one operand that is not a literal --
+// `'CN=X,' + n.dn`. A concatenation of literals alone takes the cast
+// route checkComparison declines (isNonBareScalarLiteral).
+func textConcatenation(expr cypher.Expression) bool {
+	ae, ok := expr.(*cypher.ArithmeticExpression)
+	if !ok || ae == nil || len(ae.Partials) == 0 || isScalarLiteralTree(ae) {
+		return false
+	}
+	text := classifyAddOperand(ae.Left) == addStaticText
+	for _, p := range ae.Partials {
+		if p == nil || p.Operator != cypher.OperatorAdd {
+			return false
+		}
+		if classifyAddOperand(p.Right) == addStaticText {
+			text = true
+		}
+	}
+	return text
+}
+
+// evalPropertyTextEquality implements `n.p = <text concatenation>`: dawgs
+// lowers it to `(p ->> 'p') = 'x' || ...`, a plain text comparison with no
+// jsonb_typeof guard, so a number or boolean compares by its text, and a
+// missing value, a JSON null or a NULL concatenation is NULL.
+func evalPropertyTextEquality(env *Env, row *Row, propExpr, textExpr cypher.Expression) (Tri, error) {
+	val, ok, err := EvalValue(env, row, propExpr)
+	if err != nil {
+		return TriNull, err
+	}
+	other, otherOK, err := EvalValue(env, row, textExpr)
+	if err != nil {
+		return TriNull, err
+	}
+	if !ok || val == nil || !otherOK || other == nil {
+		return TriNull, nil
+	}
+	want, isString := other.(string)
+	if !isString {
+		return TriNull, ErrUnsupported
+	}
+	var got string
+	switch x := val.(type) {
+	case string:
+		got = x
+	case []any, map[string]any:
+		return TriNull, ErrUnsupported
+	default:
+		text, ok := jsonText(x)
+		if !ok {
+			return TriNull, ErrUnsupported
+		}
+		got = text
+	}
+	return boolToTri(got == want), nil
 }
 
 // evalIdentityEquality special-cases `<bound node var> = <bound node var>`
@@ -811,8 +1014,32 @@ func evalLiteralComparison(env *Env, row *Row, otherExpr cypher.Expression, op c
 	if lit.Null {
 		return TriNull, nil
 	}
+	// A null literal on the other side is SQL NULL too -- `null <> 0` is
+	// NULL. EvalValue gives it the present-JSON-null shape a stored null
+	// has, which ScalarEq would call unequal to 0.
+	if other, isLit := asLiteral(otherExpr); isLit && other != nil && other.Null {
+		return TriNull, nil
+	}
 
-	val, ok, err := EvalValue(env, row, otherExpr)
+	var (
+		val any
+		ok  bool
+		err error
+	)
+	if fi, untyped := untypedCoalesce(otherExpr); untyped {
+		// dawgs casts the whole call to the literal's type: `coalesce(n.a,
+		// n.b) = 1` compares `coalesce(...)::int8` with 1, so the text the
+		// call picks is cast first (castTextAs), and a text the cast rejects
+		// is pg's error, not a mismatch. Left as text, 1 never equalled '1'
+		// and every numeric or boolean comparison came back FALSE.
+		kind, known := literalCastKind(lit)
+		if !known {
+			return TriNull, ErrUnsupported
+		}
+		val, ok, err = evalCoalesceAs(env, row, fi, kind)
+	} else {
+		val, ok, err = EvalValue(env, row, otherExpr)
+	}
 	if err != nil {
 		return TriNull, err
 	}
@@ -838,10 +1065,13 @@ func evalLiteralComparison(env *Env, row *Row, otherExpr cypher.Expression, op c
 // evalOrder implements `<`/`<=`/`>`/`>=`: an absent operand on either side is
 // TriNull (pg: a comparison against SQL NULL is NULL) before OrderCompare is
 // even consulted, since OrderCompare itself has no presence/absence concept
-// (see its doc comment); otherwise OrderCompare decides, with
-// ErrNotComparable folded to TriNull (a type mismatch/non-orderable pair is
-// a genuine Cypher NULL, not a delegation signal) and ErrCollation bubbled
-// as-is (string-vs-string ordering must delegate to pg's own collation).
+// (see its doc comment); otherwise OrderCompare decides, and any error it
+// returns declines the query -- ErrCollation because string ordering is
+// pg's collation, ErrNotComparable because PostgreSQL never answers NULL for
+// a pair it cannot order: it casts, and the cast raises an error
+// (castPropertyForOrder), or it compares two jsonb values by type rank.
+// Neither reaches here for a served shape (relationalComparisonSafe), so
+// answering NULL for one would be a guess.
 func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operator, rightExpr cypher.Expression) (Tri, error) {
 	aVal, aOk, err := EvalValue(env, row, leftExpr)
 	if err != nil {
@@ -874,9 +1104,6 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 
 	c, err := OrderCompare(aVal, bVal)
 	if err != nil {
-		if errors.Is(err, ErrNotComparable) {
-			return TriNull, nil
-		}
 		return TriNull, err
 	}
 
@@ -973,18 +1200,49 @@ func evalStringPredicate(env *Env, row *Row, leftExpr cypher.Expression, op cyph
 		return TriNull, err
 	}
 
-	var sop StringOp
-	switch op {
-	case cypher.OperatorStartsWith:
-		sop = OpStartsWith
-	case cypher.OperatorEndsWith:
-		sop = OpEndsWith
-	case cypher.OperatorContains:
-		sop = OpContains
-	default:
+	sop, known := stringOpFor(op)
+	if !known {
 		return TriNull, ErrUnsupported
 	}
+	if likeNeedle(leftExpr, rightExpr) {
+		re, err := env.compiledLike(likePatternFor(sop, needle))
+		if err != nil {
+			return TriNull, err
+		}
+		return RegexPredicate(re, val, ok, negated)
+	}
 	return StringPredicate(sop, val, ok, needle, negated)
+}
+
+// stringOpFor maps a STARTS WITH/ENDS WITH/CONTAINS operator to its
+// StringOp.
+func stringOpFor(op cypher.Operator) (StringOp, bool) {
+	switch op {
+	case cypher.OperatorStartsWith:
+		return OpStartsWith, true
+	case cypher.OperatorEndsWith:
+		return OpEndsWith, true
+	case cypher.OperatorContains:
+		return OpContains, true
+	}
+	return 0, false
+}
+
+// likeNeedle reports whether dawgs hands needle to PostgreSQL as an
+// unescaped LIKE pattern: a bare string literal against a subject that is
+// not a plain property. `toLower(n.v) STARTS WITH 'a%'` is `like 'a%%'`,
+// where % and _ are wildcards; a plain property gets its needle escaped
+// (`like 'a\%%'`), and a needle that is not a bare literal goes through
+// cypher_starts_with(), which compares text. See plan.go's likeNeedleServed.
+func likeNeedle(subject, needle cypher.Expression) bool {
+	lit, bare := needle.(*cypher.Literal)
+	if !bare || lit == nil || lit.Null {
+		return false
+	}
+	if _, isString := lit.Value.(string); !isString {
+		return false
+	}
+	return !isPlainPropertyLookup(subject)
 }
 
 // evalRegexComparison implements `=~`. See evalRegexPredicate for why this
@@ -1092,7 +1350,95 @@ func evalIn(env *Env, row *Row, leftExpr, rightExpr cypher.Expression) (Tri, err
 		}
 		return inTextElements(lit, list)
 	}
+	// A parenthesised property is `->>` text here too -- `(n.p) IN ['a']` is
+	// `(p ->> 'p') = any(...)` exactly as the plain form is -- so it takes
+	// the same text comparison; against a numeric list it never gets this far
+	// (checkInOperands).
+	if kind, typed := literalListCastKind(rightExpr); typed &&
+		(isPlainPropertyLookup(leftExpr) || (kind == coalesceText && parenthesisedPropertyLookup(leftExpr))) {
+		return inCastProperty(val, ok, list, kind)
+	}
 	return In(val, ok, list)
+}
+
+// literalListCastKind reports the element type dawgs gives a non-empty list
+// literal of non-null literals that all share one: text, int8 or float8.
+// Anything else -- a mixed list, a boolean one -- fails to translate.
+func literalListCastKind(expr cypher.Expression) (coalesceKind, bool) {
+	list, ok := unwrapParens(expr).(*cypher.ListLiteral)
+	if !ok || list == nil || len(*list) == 0 {
+		return 0, false
+	}
+	var kind coalesceKind
+	for i, el := range *list {
+		lit, isLit := asLiteral(el)
+		if !isLit {
+			return 0, false
+		}
+		k, known := literalCastKind(lit)
+		if !known || k == coalesceBool || (i > 0 && k != kind) {
+			return 0, false
+		}
+		kind = k
+	}
+	return kind, true
+}
+
+// inCastProperty implements `n.p IN [<literals>]` as dawgs translates it
+// for a plain property on the left: the property's `->>` text, cast to the
+// list's element type, `= any(array[...])` -- `(p ->> 'p')::int8 =
+// any(array[1, 2]::int8[])`, or plain text equality for a list of strings.
+//
+//   - A numeric list casts as PostgreSQL does (castPropertyForOrder): '1'
+//     is 1, while '1.0', '1e0', 1.5 under int8, true, a list or an object
+//     are a pg error, which declines here too. In ParseFloat-ed the text
+//     instead, matching '1.0' and '1e0' and answering FALSE for 1.5.
+//   - A string list compares a string, number or boolean by its text, and a
+//     list or object by its jsonb rendering. That rendering begins with '['
+//     or '{', so it equals none of the elements unless one of them begins
+//     that way too -- and then the answer turns on a rendering this package
+//     does not reproduce, so it declines. In answered NULL for an object,
+//     which `NOT n.p IN ['a']` then dropped where pg keeps it, and FALSE for
+//     any list, missing `n.p IN ['[1]']` over [1].
+func inCastProperty(val any, present bool, list []any, kind coalesceKind) (Tri, error) {
+	if len(list) == 0 {
+		return TriFalse, nil
+	}
+	if !present || val == nil {
+		return TriNull, nil
+	}
+	switch kind {
+	case coalesceText:
+		text, scalar := jsonText(val)
+		for _, el := range list {
+			s, isStr := el.(string)
+			if !isStr {
+				return TriNull, ErrUnsupported
+			}
+			if !scalar {
+				if strings.HasPrefix(s, "[") || strings.HasPrefix(s, "{") {
+					return TriNull, ErrUnsupported
+				}
+				continue
+			}
+			if s == text {
+				return TriTrue, nil
+			}
+		}
+		return TriFalse, nil
+	case coalesceInt8, coalesceFloat8:
+		cast, err := castPropertyForOrder(val, kind == coalesceFloat8)
+		if err != nil {
+			return TriNull, err
+		}
+		for _, el := range list {
+			if f, isNum := el.(float64); isNum && cast == f {
+				return TriTrue, nil
+			}
+		}
+		return TriFalse, nil
+	}
+	return TriNull, ErrUnsupported
 }
 
 // inListIsJSONValue reports whether the right-hand side of an IN is a list
@@ -1676,14 +2022,20 @@ func evalPropertyLookup(env *Env, row *Row, pl *cypher.PropertyLookup) (any, boo
 // datetime() component at plan time (before it ever reaches this
 // evaluator). Both derive from Env.Now, fixed once per query.
 //
-// Numeric representation note: the natural reading of these accessors is
-// that they return "int64", and evalIDFunction's doc comment carries the
-// same note -- see it for the full rationale. In short: this package's value model (value.go's
-// own doc comment) is "every JSON number is float64", which is what lets a
-// single set of primitives (ScalarEq/PropEq/OrderCompare/In, all frozen
-// value.go code that only type-switches on float64) work uniformly over every
-// numeric value regardless of where it came from. Handing back a literal Go
-// int64 here would silently opt these two accessors out of that model --
+// Numeric representation note: dawgs renders these as `extract(epoch from
+// now())::numeric` (times 1000 for millis), a numeric with the transaction
+// clock's microseconds, where this returns whole seconds/millis as a
+// float64. Inside WHERE that difference is invisible -- the value is only
+// compared against or combined with other numbers, and the engine's clock
+// is not pg's transaction clock to begin with -- but as a projected column
+// the type and digits would be, so Plan declines that shape
+// (projectionTypingOK). Why float64 and not an integer type: this package's
+// value model (value.go's own doc comment) is "every JSON number is
+// float64", which is what lets a single set of primitives (ScalarEq/PropEq/
+// OrderCompare/In, all value.go code that only type-switches on float64)
+// work uniformly over every numeric value regardless of where it came from.
+// Handing back a literal Go int64 here would silently opt these two
+// accessors out of that model --
 // e.g. `n.lastlogontimestamp < (datetime().epochseconds - (60 * 86400))`,
 // one of this package's own named test scenarios, requires the epochseconds
 // value to flow through evalArithmetic and then OrderCompare, both of which
@@ -1898,6 +2250,15 @@ func evalCoalesce(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool,
 	if !ok {
 		return nil, false, ErrUnsupported
 	}
+	return evalCoalesceAs(env, row, fi, kind)
+}
+
+// evalCoalesceAs is evalCoalesce with the cast kind supplied by the caller:
+// the kind of the call itself for evalCoalesce, or -- for an untyped call,
+// which dawgs types by its context (untypedCoalesce) -- the kind of the
+// literal it is compared against. The caller has already checked fi's shape
+// with coalesceCastKind.
+func evalCoalesceAs(env *Env, row *Row, fi *cypher.FunctionInvocation, kind coalesceKind) (any, bool, error) {
 	for _, arg := range fi.Arguments {
 		if lit, isLit := asLiteral(arg); isLit {
 			val, _, err := evalLiteralValue(lit)
@@ -1950,20 +2311,8 @@ func coalesceCastKind(fi *cypher.FunctionInvocation) (coalesceKind, bool) {
 	kind, seen := coalesceText, false
 	for _, arg := range fi.Arguments {
 		if lit, isLit := asLiteral(arg); isLit {
-			if lit == nil || lit.Null {
-				return 0, false
-			}
-			var k coalesceKind
-			switch lit.Value.(type) {
-			case string:
-				k = coalesceText
-			case int64, uint64:
-				k = coalesceInt8
-			case float64:
-				k = coalesceFloat8
-			case bool:
-				k = coalesceBool
-			default:
+			k, ok := literalCastKind(lit)
+			if !ok {
 				return 0, false
 			}
 			if seen && k != kind {
@@ -1981,6 +2330,50 @@ func coalesceCastKind(fi *cypher.FunctionInvocation) (coalesceKind, bool) {
 		}
 	}
 	return kind, true
+}
+
+// literalCastKind is the SQL type dawgs gives a non-null literal: text for a
+// string, int8 for an integer, float8 for a float, bool for a boolean.
+func literalCastKind(lit *cypher.Literal) (coalesceKind, bool) {
+	if lit == nil || lit.Null {
+		return 0, false
+	}
+	switch lit.Value.(type) {
+	case string:
+		return coalesceText, true
+	case int64, uint64:
+		return coalesceInt8, true
+	case float64:
+		return coalesceFloat8, true
+	case bool:
+		return coalesceBool, true
+	}
+	return 0, false
+}
+
+// untypedCoalesce reports whether expr, exactly as written -- parentheses
+// NOT unwrapped -- is a coalesce() call with no literal argument, only
+// property lookups (`coalesce(n.a, n.b)`). dawgs gives such a call no type of
+// its own. As the immediate operand of a comparison or arithmetic operator
+// it takes the OTHER operand's type (applyTypeFunctionLikeTypeHints):
+// `coalesce(n.a, n.b) = 1` is `coalesce(p ->> 'a', p ->> 'b')::int8 = 1`,
+// `= true` casts to bool, `= '1'` to text. Parenthesised it takes nothing
+// and stays text, so `(coalesce(n.a, n.b)) = 1` is `text = integer`, which
+// PostgreSQL rejects outright -- hence the exact, unwrapped match here.
+func untypedCoalesce(expr cypher.Expression) (*cypher.FunctionInvocation, bool) {
+	fi, ok := expr.(*cypher.FunctionInvocation)
+	if !ok || fi == nil || !strings.EqualFold(fi.Name, cypher.CoalesceFunction) {
+		return nil, false
+	}
+	if _, ok := coalesceCastKind(fi); !ok {
+		return nil, false
+	}
+	for _, arg := range fi.Arguments {
+		if _, isLit := asLiteral(arg); isLit {
+			return nil, false
+		}
+	}
+	return fi, true
 }
 
 // CoalesceIsInt8 reports whether expr is a coalesce() call dawgs types as
@@ -2013,8 +2406,11 @@ func castTextAs(text string, kind coalesceKind) (any, error) {
 		if !pgInt8Text.MatchString(text) {
 			return nil, ErrRuntimeCast
 		}
+		// Past maxExactInt the float64 value model would round the integer,
+		// and a comparison could then match a neighbour: declined, as
+		// castPropertyForOrder does.
 		n, err := strconv.ParseInt(text, 10, 64)
-		if err != nil {
+		if err != nil || n > maxExactInt || n < -maxExactInt {
 			return nil, ErrRuntimeCast
 		}
 		return float64(n), nil
@@ -2165,7 +2561,10 @@ func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, b
 		return nil, false, err
 	}
 	curKind := classifyAddOperand(ae.Left)
-	for _, partial := range ae.Partials {
+	// Whether the value folded so far is statically a float -- what decides
+	// the type dawgs casts a property on the other side of the next step to.
+	leftFloat := staticallyFloatOperand(ae.Left)
+	for i, partial := range ae.Partials {
 		if partial == nil {
 			return nil, false, ErrUnsupported
 		}
@@ -2174,11 +2573,39 @@ func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, b
 			return nil, false, err
 		}
 		rKind := classifyAddOperand(partial.Right)
+		rightFloat := staticallyFloatOperand(partial.Right)
+		numeric := partial.Operator != cypher.OperatorAdd ||
+			(curKind != addStaticText && rKind != addStaticText && (curKind != addPropertyLookup || rKind != addPropertyLookup))
+		if numeric {
+			// dawgs casts a plain property operand of a numeric step to its
+			// partner's type -- `n.v + 1` is `(p ->> 'v')::int8 + 1`, and
+			// float8 once a float literal is in play -- so the stored value
+			// is cast as PostgreSQL casts it: the string '5' is 5, and 5.5
+			// under int8 is a pg error that declines here rather than
+			// quietly computing 6.5. A concatenation keeps the text, and so
+			// does `+` of two properties, which dawgs concatenates.
+			if i == 0 && partial.Operator != cypher.OperatorAdd && isPlainPropertyLookup(ae.Left) && isPlainPropertyLookup(partial.Right) {
+				// `text * text`: PostgreSQL has no such operator. Plan
+				// rejects the shape (checkArithmetic); declined defensively.
+				return nil, false, ErrUnsupported
+			}
+			if i == 0 && isPlainPropertyLookup(ae.Left) {
+				if cur, err = castPropertyForOrder(cur, rightFloat); err != nil {
+					return nil, false, err
+				}
+			}
+			if isPlainPropertyLookup(partial.Right) {
+				if rVal, err = castPropertyForOrder(rVal, leftFloat); err != nil {
+					return nil, false, err
+				}
+			}
+		}
 		cur, curOk, err = applyArithmetic(curKind, cur, curOk, partial.Operator, rKind, rVal, rOk)
 		if err != nil {
 			return nil, false, err
 		}
 		curKind = nextAddKind(partial.Operator, curKind, rKind)
+		leftFloat = leftFloat || rightFloat
 	}
 	return cur, curOk, nil
 }
@@ -2385,23 +2812,18 @@ func classifyAddOperand(expr cypher.Expression) addOperandKind {
 //     rewrites an operand that is DIRECTLY a property-lookup-shaped
 //     BinaryExpression -- a coalesce FunctionCall wrapping property lookups
 //     internally is never that shape either, no matter which side of the
-//     `+` it sits on. So pg falls through to plain arithmetic `+` over
-//     whatever the coalesce's own unrewritten property-lookup arguments
-//     default to (`->>`, i.e. genuine SQL text) -- `text + integer` has no
-//     PostgreSQL operator, so this shape errors outright in real pg,
-//     unconditionally, regardless of what the underlying properties
-//     actually hold at runtime. Reproducing that would mean either
-//     guessing at whether pg errors (a much larger surface than this
-//     package's established "no unpinned rendering reproduction"
-//     convention already declines elsewhere -- applyAdd's own doc, again)
-//     or risking a served numeric answer for a query real pg refuses to run
-//     at all -- worse than the original finding's silent-wrong-number bug,
-//     not merely a repeat of it. checkArithmetic (plan.go) therefore
+//     `+` it sits on. What does type it is applyTypeFunctionLikeTypeHints,
+//     which hands a FunctionCall operand with no type of its own the OTHER
+//     operand's: `coalesce(n.a, n.b) + 1` is `coalesce(p ->> 'a', p ->>
+//     'b')::int8 + 1` -- the coalesced text cast to int8, an error only when
+//     that text is not an integer. This evaluator reproduces that context
+//     cast for `=`/`<>` against a literal (untypedCoalesce,
+//     evalLiteralComparison) but not inside arithmetic, where applyAdd
+//     would see the uncast text. checkArithmetic (plan.go) therefore
 //     rejects the whole query whenever an addUnresolved operand appears in
 //     a `+` without an addStaticText partner (see checkArithmetic's own
-//     doc); this delegates to PostgreSQL, which then either concatenates
-//     correctly (if paired with Text) or raises its own genuine error --
-//     never a value this package invented.
+//     doc); PostgreSQL then answers it -- concatenating when the partner
+//     is Text, casting otherwise -- never a value this package invented.
 //
 // Not handled: two arguments with DIFFERENT known types (e.g.
 // `coalesce(5, 'x')`) makes translateCoalesceFunction itself error out at

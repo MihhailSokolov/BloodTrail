@@ -1042,7 +1042,8 @@ func TestLimitedQueryStillReverseSeeds(t *testing.T) {
 // specific one, and the shipped prebuilts write their near endpoint as
 // `(:Base)` rather than leaving it bare. Group is a small minority of nodes,
 // User and Computer are large minorities, and Base covers everything -- so
-// one fixture exercises all three sides of scanEquivalentNearSide's rule.
+// one fixture prices all three kinds of near side against the same far side
+// (varLengthReverseEligible's seed-count rule).
 func buildBaseLabelledFixture(t *testing.T, users, computers, entraUsers int) *snapshot.View {
 	t.Helper()
 	const (

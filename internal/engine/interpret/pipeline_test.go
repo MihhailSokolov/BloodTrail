@@ -329,10 +329,14 @@ func TestPipelineWithConstantCarryOverFeedsPredicate(t *testing.T) {
 		nil,
 	)
 
+	// n rides along with the constant: a WITH carrying constants alone
+	// after a MATCH is one row in pg whatever the MATCH produced, and
+	// declines (Plan). The alias is compared through arithmetic, which dawgs
+	// casts the property for; bare, it is `text > integer`.
 	query := `MATCH (n:User) WHERE n.objectid = 'anchor'
-WITH 60 AS days
+WITH n, 60 AS days
 MATCH (m:User)
-WHERE m.threshold > days
+WHERE m.threshold > days * 1
 RETURN m`
 
 	rs := mustExec(t, snap, query, generousBudget)
@@ -377,9 +381,11 @@ func TestPipelineLeadingWithNoPrecedingMatchFeedsPredicate(t *testing.T) {
 		nil,
 	)
 
+	// Arithmetic over the alias, as in the corpus case: a bare `days` would
+	// leave the property uncast, `text > integer` in pg (Plan declines it).
 	query := `WITH 60 AS days
 MATCH (m:User)
-WHERE m.threshold > days
+WHERE m.threshold > days * 1
 RETURN m`
 
 	rs := mustExec(t, snap, query, generousBudget)
@@ -1220,7 +1226,7 @@ func TestRowBindingsKeepMapSemantics(t *testing.T) {
 		r := NewRow()
 		r.SetNode("n", 1)
 		r.SetScalar("s", "v")
-		r.markEdgeUsed(42)
+		r.markEdgeUsed(0, 42)
 		c := cloneRow(r)
 		c.SetNode("n", 99)
 		c.SetNode("extra", 5)
@@ -1230,7 +1236,7 @@ func TestRowBindingsKeepMapSemantics(t *testing.T) {
 		if _, ok := r.Node("extra"); ok {
 			t.Fatal("the clone's new binding leaked into the original")
 		}
-		if !c.edgeUsed(42) {
+		if !c.edgeUsed(0, 42) {
 			t.Fatal("clone lost usedEdges")
 		}
 	})

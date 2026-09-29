@@ -128,13 +128,14 @@ var (
 	// ErrNotComparable is returned by OrderCompare for any pair of operand
 	// types that are neither both numbers nor both strings (e.g. a type
 	// mismatch, or either operand being a bool/array/object/JSON-null).
-	// Unlike ErrCollation and ErrRuntimeCast this is not a delegation
-	// signal: Cypher's scalar relational operators (<, >, <=, >=) are only
-	// defined over like-typed orderable scalars, so a type mismatch is a
-	// genuine, locally-answerable Cypher NULL. It is exported (rather than
-	// folded into a bare non-nil error) precisely so callers can tell the
-	// two apart with errors.Is: ErrCollation must delegate, ErrNotComparable
-	// must become TriNull.
+	// Like the two above it declines the query. It once meant a Cypher NULL
+	// -- Cypher's relational operators are defined only over like-typed
+	// scalars -- but PostgreSQL does not answer NULL for such a pair: dawgs
+	// casts the property to the other side's type, which raises an error on
+	// a mismatch (castPropertyForOrder reproduces that), or compares two
+	// jsonb values by type rank. No served shape reaches OrderCompare with
+	// one (relationalComparisonSafe), so it marks a comparison this package
+	// has no answer for.
 	ErrNotComparable = errors.New("interpret: not comparable")
 )
 
@@ -259,14 +260,21 @@ func jsonbEqual(a, b any) bool {
 	}
 }
 
-// jsonText mirrors postgres' `->>` text-extraction operator over the
-// decoded post-JSON value model: a JSON string extracts to itself, a
-// number/bool extracts to its textual JSON rendering, and a JSON null
-// (represented here as ok=false, matching PropStore.Value's own contract
-// that absence and JSON null are only distinguished by the caller's ok/present
-// flag) extracts to SQL NULL -- reported as (_, false). This is the
-// extraction pg's IN-list and negated-string-predicate rewrites both key
-// off of.
+// jsonText mirrors PostgreSQL's `->>` text extraction over the decoded
+// post-JSON value model, for the scalars it can render: a string extracts to
+// itself, a boolean to 'true'/'false', and a number to its shortest decimal
+// form -- which is jsonb's own rendering for a number stored the way Go's
+// encoding/json (and so BloodHound's ingest) writes it; jsonb keeps whatever
+// spelling was stored, and a float64 cannot say whether that was 1 or 1.0.
+// A JSON null (val == nil; PropStore.Value reports it present, with a nil
+// value) extracts to SQL NULL, reported as (_, false).
+//
+// A list or an object is reported as (_, false) too, but it is not NULL:
+// `->>` renders it as jsonb's JSON text (key order, spacing and number
+// formatting included), which this package does not reproduce. Every caller
+// therefore handles that case itself -- evalCoalesce and inTextElements
+// decline, and inCastProperty reasons only about the rendering's first
+// byte.
 func jsonText(val any) (string, bool) {
 	switch v := val.(type) {
 	case nil:
@@ -278,10 +286,6 @@ func jsonText(val any) (string, bool) {
 	case bool:
 		return strconv.FormatBool(v), true
 	default:
-		// Arrays/objects are never valid ->> operands in the predicates this
-		// package evaluates (IN's LHS-is-a-list case is rejected before
-		// jsonText is ever reached; see In below), so this path is not
-		// expected to be exercised. Included only so the function is total.
 		return "", false
 	}
 }
@@ -301,7 +305,9 @@ const (
 //
 // Absent (ok=false) and present-JSON-null (val=nil, ok=true) behave
 // identically in both forms, because pg's `->>` extraction of either is SQL
-// NULL: positive form propagates that to TriNull. Negated form coalesces
+// NULL: positive form propagates that to TriNull. Negated form -- which
+// evalNegation asks for only where dawgs rewrites the negation, a plain
+// property under STARTS WITH/ENDS WITH/CONTAINS -- coalesces
 // the NULL extraction to the empty string first (`coalesce(x ->> ..., ”)`)
 // and runs the *positive* test against "" before inverting -- so the
 // result is whatever the positive match against the empty string is, then
@@ -442,33 +448,27 @@ func IsNotNull(val any, ok bool) Tri {
 	return IsNull(val, ok).Not()
 }
 
-// In evaluates Cypher's `val IN list`.
+// In evaluates Cypher's `val IN list` for a left-hand side that is NOT a
+// plain property -- id(), size(), toLower(), arithmetic, a literal: a value
+// with a SQL type of its own, which checkInOperands has already matched
+// against the list literal's element type. A plain property is cast to that
+// element type instead, the way dawgs translates it; see inCastProperty.
 //
 // Note on signature: the exact return type is (Tri, error) rather than a
-// bare Tri, which a purely three-valued predicate would suggest. The
-// numeric-list branch below must be able to signal ErrRuntimeCast (a
-// non-numeric property text failing pg's `::int8`/`::float8` cast), and
-// that can only reach the caller through a second return value -- the Tri
-// returned alongside a non-nil error carries no meaning and should be
-// ignored.
+// bare Tri, which a purely three-valued predicate would suggest, so the
+// numeric branch can report ErrRuntimeCast for a value that is not a number
+// -- the Tri returned alongside a non-nil error carries no meaning and
+// should be ignored.
 //
 // Rules, in order:
 //   - an empty list is always FALSE, even for a missing/NULL left-hand
-//     side (pg: `x = ANY('{}')` is FALSE, not NULL, regardless of x).
+//     side (dawgs lowers `x IN []` to the constant false).
 //   - a left-hand side that is itself a list is always FALSE (Cypher does
 //     not flatten nested lists for IN).
 //   - a missing (or present JSON-null) left-hand side against a non-empty
 //     list is NULL.
-//   - otherwise, list membership is decided by how DAWGS types the list at
-//     plan time. A list of Cypher string literals becomes a pg text[], and
-//     membership is `(p ->> 'k') = ANY(text[])` -- the property's ->> text
-//     extraction, so a non-string property (number/bool) still matches by
-//     its textual rendering. A list of Cypher numeric literals becomes an
-//     int8[]/float8[], and membership is `(p ->> 'k')::int8 = ANY(...)` --
-//     casting the text extraction to a number, which raises a genuine
-//     runtime error in pg if the text isn't numeric; we reproduce that as
-//     ErrRuntimeCast rather than silently returning FALSE, so the caller
-//     can bail the whole query to delegation.
+//   - otherwise a string list compares the value's text, and a numeric
+//     list compares it as a number (ErrRuntimeCast when it is not one).
 func In(val any, ok bool, list []any) (Tri, error) {
 	if len(list) == 0 {
 		return TriFalse, nil
@@ -737,16 +737,12 @@ func sortedKeys(m map[string]any) []string {
 }
 
 // OrderCompare is Compare's counterpart for the scalar relational operators
-// (<, >, <=, >=), which in Cypher are only ever defined over two
-// like-typed, orderable scalars -- unlike ORDER BY, there is no cross-type
-// total order to fall back on. Numbers compare numerically; strings are
-// refused with ErrCollation for the same reason as Compare. Every other
-// combination (a type mismatch, a bool, an array, an object, or a JSON
-// null on either side) is not a type pg's `<`/`>` defines over JSONB in a
-// collation-independent way, or is not orderable at all in Cypher -- those
-// return ErrNotComparable, which the caller (holding the ok/present flags
-// this function does not see) is expected to turn into TriNull rather than
-// delegate.
+// (<, >, <=, >=) over two values the caller has already cast the way
+// PostgreSQL does (evalOrder, castPropertyForOrder). Numbers compare
+// numerically; strings are refused with ErrCollation for the same reason as
+// Compare. Every other combination (a type mismatch, a bool, an array, an
+// object, or a JSON null on either side) returns ErrNotComparable, which
+// declines the query -- see its doc for why that is not a NULL.
 func OrderCompare(a, b any) (int, error) {
 	if af, aok := a.(float64); aok {
 		if bf, bok := b.(float64); bok {
@@ -759,4 +755,117 @@ func OrderCompare(a, b any) (int, error) {
 		}
 	}
 	return 0, ErrNotComparable
+}
+
+// likePattern is a PostgreSQL LIKE pattern split into its parts: literal
+// runs of text and the wildcards between them, % (any sequence) and _ (any
+// one character), with the default escape character, backslash, already
+// applied -- `a\_b%` is the literal run "a_b" and a trailing %.
+type likePattern struct {
+	parts []likePart
+}
+
+type likePart struct {
+	literal  string // the run's text when wildcard is 0
+	wildcard byte   // '%' or '_', or 0 for a literal run
+}
+
+// parseLikePattern splits pattern the way PostgreSQL's LIKE reads it. A
+// pattern that ends in an unpaired escape is an error there ("LIKE pattern
+// must not end with escape character"), and so here.
+func parseLikePattern(pattern string) (likePattern, error) {
+	var (
+		lp  likePattern
+		run strings.Builder
+	)
+	flush := func() {
+		if run.Len() > 0 {
+			lp.parts = append(lp.parts, likePart{literal: run.String()})
+			run.Reset()
+		}
+	}
+	for i := 0; i < len(pattern); i++ {
+		switch c := pattern[i]; c {
+		case '\\':
+			if i+1 == len(pattern) {
+				return likePattern{}, ErrLikePattern
+			}
+			i++
+			run.WriteByte(pattern[i])
+		case '%', '_':
+			flush()
+			lp.parts = append(lp.parts, likePart{wildcard: c})
+		default:
+			run.WriteByte(c)
+		}
+	}
+	flush()
+	return lp, nil
+}
+
+// ErrLikePattern is PostgreSQL's error for a LIKE pattern that ends in the
+// escape character. Like ErrRuntimeCast it declines the query: pg raises it
+// before returning a row.
+var ErrLikePattern = errors.New("interpret: LIKE pattern ends with the escape character")
+
+// regexp compiles the pattern to an anchored Go regexp that matches exactly
+// the strings PostgreSQL's (case-sensitive) LIKE does. _ is one character,
+// not one byte, and matches a newline too, as it does in pg.
+func (lp likePattern) regexp() *regexp.Regexp {
+	var b strings.Builder
+	b.WriteString(`(?s)\A`)
+	for _, p := range lp.parts {
+		switch p.wildcard {
+		case '%':
+			b.WriteString(`.*`)
+		case '_':
+			b.WriteString(`.`)
+		default:
+			b.WriteString(regexp.QuoteMeta(p.literal))
+		}
+	}
+	b.WriteString(`\z`)
+	return regexp.MustCompile(b.String())
+}
+
+// leadingLiteral, trailingLiteral and longestLiteral return a literal run
+// every string matching the pattern must begin with, end with, or contain --
+// the text a string index can narrow on -- and false when the pattern has
+// none in that position.
+func (lp likePattern) leadingLiteral() (string, bool) {
+	if len(lp.parts) == 0 || lp.parts[0].wildcard != 0 {
+		return "", false
+	}
+	return lp.parts[0].literal, true
+}
+
+func (lp likePattern) trailingLiteral() (string, bool) {
+	if len(lp.parts) == 0 || lp.parts[len(lp.parts)-1].wildcard != 0 {
+		return "", false
+	}
+	return lp.parts[len(lp.parts)-1].literal, true
+}
+
+func (lp likePattern) longestLiteral() (string, bool) {
+	best := ""
+	for _, p := range lp.parts {
+		if p.wildcard == 0 && len(p.literal) > len(best) {
+			best = p.literal
+		}
+	}
+	return best, best != ""
+}
+
+// likePatternFor is the LIKE pattern dawgs builds for a string predicate
+// whose literal needle it does not escape (plan.go's likeNeedleServed):
+// the needle as written, with % appended, prepended, or both.
+func likePatternFor(op StringOp, needle string) string {
+	switch op {
+	case OpStartsWith:
+		return needle + "%"
+	case OpEndsWith:
+		return "%" + needle
+	default:
+		return "%" + needle + "%"
+	}
 }

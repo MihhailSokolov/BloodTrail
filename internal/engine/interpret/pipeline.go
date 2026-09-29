@@ -1053,8 +1053,11 @@ func runWithStage(env *Env, meter *workMeter, wc *WithClause, rows []*Row) ([]*R
 	// Binding both as nil merged them (`RETURN u.x, count(u)` over two
 	// stored nulls and one absent answered [null:3] where pg answers two
 	// rows). Unbound, appendSymbolKey encodes the alias with its dedicated
-	// 'u' tag, copySymbolBinding carries nothing forward, and the RETURN
-	// projection renders it as an absent column (absentableProjection).
+	// 'u' tag, copySymbolBinding carries nothing forward, and a RETURN
+	// aggregate's projection renders it as an absent column
+	// (absentableAliases, projectRowAbsentable); an explicit WITH's alias
+	// left unbound declines instead once projected, as absentableAliases
+	// explains.
 	for _, c := range wc.Computed {
 		for _, r := range rows {
 			v, ok, err := EvalValue(env, r, c.Expr)

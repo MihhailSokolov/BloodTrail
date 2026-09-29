@@ -756,10 +756,9 @@ func TestRegexPredicate(t *testing.T) {
 }
 
 func TestJSONTextExtractionOfCompositeValuesIsDefensive(t *testing.T) {
-	// Arrays/objects are never valid ->> operands for the predicates this
-	// package evaluates (IN's LHS-is-a-list case is rejected before
-	// jsonText is reached), so this pins the defensive fallback rather than
-	// a real pg behavior.
+	// `->>` renders a list or an object as jsonb's JSON text, which this
+	// package does not reproduce; jsonText reports them as not rendered, and
+	// every caller handles that itself (see jsonText's doc).
 	if _, ok := jsonText([]any{float64(1)}); ok {
 		t.Fatalf("expected jsonText of a composite value to report not-present")
 	}
@@ -790,5 +789,57 @@ func TestOrderCompareMixedTypesAreNotComparable(t *testing.T) {
 				t.Fatalf("expected a plain not-comparable error, not ErrCollation, for %v vs %v", c.a, c.b)
 			}
 		})
+	}
+}
+
+// TestLikePattern pins parseLikePattern against PostgreSQL's LIKE: % is any
+// sequence, _ any one character (a whole UTF-8 one, a newline included), a
+// backslash makes the next character literal, and a pattern ending in one
+// is an error. The literal runs are what an index may narrow on.
+func TestLikePattern(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		match   []string
+		miss    []string
+	}{
+		{`a_c%`, []string{"abc", "a_c", "aéc", "a\nc", "abcdef"}, []string{"ac", "abbc", "xabc"}},
+		{`%a\_c%`, []string{"a_c", "xa_cx"}, []string{"abc"}},
+		{`%a\%`, []string{"xa%", "a%"}, []string{"a%x", "ab"}},
+		{`%`, []string{"", "anything"}, nil},
+	} {
+		lp, err := parseLikePattern(tc.pattern)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.pattern, err)
+		}
+		re := lp.regexp()
+		for _, s := range tc.match {
+			if !re.MatchString(s) {
+				t.Errorf("%q LIKE %q = false, want true", s, tc.pattern)
+			}
+		}
+		for _, s := range tc.miss {
+			if re.MatchString(s) {
+				t.Errorf("%q LIKE %q = true, want false", s, tc.pattern)
+			}
+		}
+	}
+
+	if _, err := parseLikePattern(`%a\`); !errors.Is(err, ErrLikePattern) {
+		t.Errorf("trailing escape: err = %v, want ErrLikePattern", err)
+	}
+
+	lp, _ := parseLikePattern(`ab_cde%fg`)
+	if got, ok := lp.leadingLiteral(); !ok || got != "ab" {
+		t.Errorf("leadingLiteral = %q, %v, want ab", got, ok)
+	}
+	if got, ok := lp.trailingLiteral(); !ok || got != "fg" {
+		t.Errorf("trailingLiteral = %q, %v, want fg", got, ok)
+	}
+	if got, ok := lp.longestLiteral(); !ok || got != "cde" {
+		t.Errorf("longestLiteral = %q, %v, want cde", got, ok)
+	}
+	lp, _ = parseLikePattern(`%_`)
+	if _, ok := lp.longestLiteral(); ok {
+		t.Error("longestLiteral of a pattern with no literal run should be false")
 	}
 }

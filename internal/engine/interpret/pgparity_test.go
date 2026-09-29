@@ -125,14 +125,15 @@ func TestFixedStepsDoNotReuseOneEdge(t *testing.T) {
 	}
 	view := snapshot.NewView(snap)
 
-	for _, query := range []string{
-		`MATCH (a:User)-[:MemberOf]->(b:User)<-[:MemberOf]-(c:User) RETURN id(a) AS aid, id(c) AS cid`,
-		`MATCH (a:User)-[:MemberOf]-(b:User)-[:MemberOf]-(c:User) RETURN id(a) AS aid, id(c) AS cid`,
-	} {
-		rows := mustExec(t, view, query, generousBudget).Rows
-		if len(rows) != 0 {
-			t.Errorf("query returned %d rows, want 0 -- one edge cannot satisfy two steps\nquery: %s", len(rows), query)
-		}
+	query := `MATCH (a:User)-[:MemberOf]->(b:User)<-[:MemberOf]-(c:User) RETURN id(a) AS aid, id(c) AS cid`
+	if rows := mustExec(t, view, query, generousBudget).Rows; len(rows) != 0 {
+		t.Errorf("query returned %d rows, want 0 -- one edge cannot satisfy two steps\nquery: %s", len(rows), query)
+	}
+	// The undirected spelling declines instead: past a pattern's first step
+	// dawgs joins both of the next edge's endpoints to the far node, the one
+	// it came from included (plan.go's addPatternPart).
+	if _, ok := planNoFail(t, view, `MATCH (a:User)-[:MemberOf]-(b:User)-[:MemberOf]-(c:User) RETURN id(a) AS aid, id(c) AS cid`); ok {
+		t.Error("Plan served an undirected second step")
 	}
 
 	// A genuine two-edge path still matches: the rule forbids reusing one

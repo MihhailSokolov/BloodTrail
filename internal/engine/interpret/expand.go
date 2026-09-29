@@ -395,7 +395,7 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			// var-length step's own trail deliberately does NOT consult this
 			// set -- see Row.trailEdges' doc for the full pinned contract.
 			for _, e := range cur.edges {
-				nr.markTrailEdge(edgeRefIdentity(env.Snap, e))
+				nr.markTrailEdge(step.Pattern, edgeRefIdentity(env.Snap, e))
 			}
 			if pathArcKey != "" {
 				pv := &PathVal{
@@ -445,7 +445,7 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 			// on); seed carries exactly those edges in usedEdges. Edges used
 			// by ANOTHER var-length step's trail are deliberately not
 			// excluded -- see Row.trailEdges' doc.
-			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
+			if seed.edgeUsed(step.Pattern, candidateIdentity(env.Snap, c)) {
 				continue
 			}
 
@@ -484,74 +484,27 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 // has already checked -- is cheaper to enumerate backward from its far
 // endpoint than forward from its near one.
 //
-// The cost test is a comparison of the two endpoints' own CANDIDATE SOURCES
-// (anchorRank: an id() lookup beats an objectid lookup beats the smallest
-// AND-ed kind bitmap beats a full node scan, ties broken by bitmap
-// population), not a fixed "N times smaller" multiple of their sizes.
-//
-// A fixed multiple is the obvious alternative and it is wrong here, in both
-// directions. Too high a multiple rejects the exact shape this route exists
-// for: in an Active-Directory-shaped graph roughly one node in eight is a
-// Group, so `(s)-[:MemberOf*0..]->(g:Group) WHERE g.objectid ENDS WITH '-516'`
-// -- whose far side really resolves to a handful of nodes once the pushed
-// predicate runs -- separates its two candidate SOURCES by well under an order
-// of magnitude, even though the near side is every node in the graph and the
-// far side ends up being four of them. Too low a multiple is not safe either,
-// since a raw size ratio says nothing about how much a pushed predicate will
-// cut the far side down. The tier comparison sidesteps both: it is exactly the
-// ordering the ordinary anchor chooser already trusts to pick a component's
-// cheapest starting symbol, applied to the same question here.
-//
-// Three further conditions make that comparison sound rather than merely
-// plausible:
-//
-//   - The far endpoint must genuinely NARROW -- carry ids, an objectid anchor,
-//     or pushed single-symbol predicates -- not merely carry kind labels. A
-//     kinds-only far endpoint contributes no filtering beyond what its own
-//     candidate source already enumerates, so seeding from it buys nothing
-//     while giving up the near side's structure.
-//
-//   - The near endpoint must NOT narrow. If it does, it is already the cheap
-//     side and the ordinary forward route is the right one.
-//
-//   - The near endpoint's own candidate source must COST what a full scan
-//     costs (scanEquivalentNearSide) -- not merely be "not narrowing". A kind
-//     bitmap is "not narrowing" in endpointNarrows' sense (the bitmap IS its
-//     candidate source, so re-checking it filters nothing further), but a
-//     SMALL one is still a bounded seed set, and this whole comparison is
-//     silent about
-//     what happens AFTER seeding: the reverse walk's cost is driven by each
-//     far-side seed's IN-DEGREE, which has no relationship to how cheap that
-//     seed was to find, and which this package has no way to estimate before
-//     walking the edges themselves (unlike a candidate source's SIZE, nothing
-//     tracks in-degree ahead of time). A one-node kind bitmap whose lone node
-//     happens to be a hub with hundreds of predecessors -- e.g.
-//     `(c:Computer)-[:MemberOf*1..]->(g) WHERE g.objectid = '...'`, where `c`
-//     ranges over a small Computer kind bitmap rather than a full scan --
-//     would pass every OTHER condition here (far side narrows, near side does
-//     not, far side's tier beats near side's) while costing far more to
-//     reverse than to walk forward. Requiring scan-equivalent cost is the
-//     cheapest available way to rule this out: at that population the near
-//     side's cost is env.Snap.NodeCount() regardless of graph structure, so
-//     there is no structural surprise (like an unlucky seed's in-degree) left
-//     to be wrong about on the near side.
-//
-//     What "scan-equivalent" buys over the exact `tier == tierScan` test this
-//     condition used to spell itself as: a kind bitmap holding a majority of
-//     the graph's nodes costs scan-order work to walk forward, so refusing
-//     the route for it kept the expensive path -- and BloodHound labels
-//     every AD node `Base` and writes its shipped prebuilts against it,
-//     which on a hybrid AD+Entra graph is a large-majority kind rather than
-//     a universal one. See scanEquivalentNearSide for the measurements.
+// Both endpoints are priced on one scale, as the number of seeds each would
+// start from (rankOfHinted's candidateEstimate, the step's own edge-kind
+// endpoint set included), and the route reverses only when the near side is
+// large in absolute terms (reverseMinNearSeeds) and the far side is cheaper
+// by a wide margin (reverseSeedMargin). The near side must also not narrow
+// (endpointNarrows): a pushed predicate there cuts its seeds by an amount the
+// estimate cannot see, so it would be over-estimated -- the unsafe direction
+// to be wrong in. The far side carries no such precondition; an estimate
+// that misses how far its pushed predicates cut only shrinks the ratio,
+// which errs toward the forward walk. The body explains each piece, and what
+// this replaced: a tier comparison with structural preconditions (a far side
+// that had to narrow, a near side that had to be scan-equivalent) that
+// refused the route wherever the near side was merely large.
 //
 // What that leaves bounded, and what it does not:
 //
-//   - SEEDING is bounded. The far side's candidate source is, by the tier
-//     comparison, never a more expensive tier to enumerate than the near
-//     side's full scan -- so resolving the far side's seed set (including its
-//     pushed single-symbol predicates) costs at most one pass over a
-//     candidate source no larger than the one the forward route would have
-//     scanned anyway.
+//   - SEEDING is bounded. The far side's seed estimate is, by the margin, at
+//     most a quarter of the near side's -- and its pushed single-symbol
+//     predicates only cut it further -- so resolving the far side's seed set
+//     costs no more than enumerating the candidate source the forward route
+//     would have scanned anyway.
 //   - TRAVERSAL is NOT bounded by this function at all. Once seeded, the
 //     reverse walk fans out over the snapshot's reverse CSR by each seed's
 //     actual in-degree and (across further hops) the in-degree of everything
@@ -561,14 +514,15 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 //     and returns ErrBudget from meter.spend, which the caller treats exactly
 //     like any other budget overrun -- a decline to PostgreSQL, never a wrong
 //     or truncated answer. The point of the conditions above is to make that
-//     decline RARE by only reversing when the near side is provably no
-//     cheaper to seed from, not to make an oversized reverse walk impossible.
+//     decline RARE by only reversing when the far side is decisively cheaper
+//     to seed from, not to make an oversized reverse walk impossible.
 //
 // And when this function declines, the forward route runs having spent
 // nothing at all: every input to the decision is read from constraint
-// metadata and live kind-bitmap populations, with no metered work of its
-// own, so an ineligible pattern's row set, error behavior and work total are
-// all exactly what they were before this route existed.
+// metadata, live kind-bitmap populations and edge-kind endpoint sets, with no
+// metered work of its own, so an ineligible pattern's row set, error
+// behavior and work total are all exactly what they were before this route
+// existed.
 //
 // The direction requirement is defensive rather than load-bearing: an
 // undirected variable-length pattern is already rejected at plan time (a
@@ -832,17 +786,19 @@ func expandVarLengthComponentReverse(env *Env, meter *workMeter, part *Part, ste
 // to produce a target for an ORDER BY or DISTINCT query -- both of which have
 // to see every row before they can emit any). Truncating is sound only when
 // nothing downstream can reject a row this walk produced, which is exactly
-// what noResidualWhere establishes: every WHERE conjunct is either already
-// pushed into one of the two endpoints' own constraints, and therefore
-// already checked per row here, or is the endpoint inequality this route
-// handles itself. With no residual filter, the first N rows are as good an
-// answer as any other N -- the same latitude an unordered LIMIT already gives
-// every other path in this package.
+// what noResidualWhere establishes, given what this route enforces itself:
+// every pushed predicate of BOTH endpoints -- the far one's through the seed
+// set (resolveEndpointSet), the near one's through nearAdmits. The `a <> t`
+// endpoint inequality is not among them: no var-length walk checks it, and
+// a trail that cycles back to its own seed binds a == t, so it stays
+// residual and keeps the cap off. With no residual filter, the first N rows
+// are as good an answer as any other N -- the same latitude an unordered
+// LIMIT already gives every other path in this package.
 func reverseTrailRowCap(meter *workMeter, part *Part, step *Step) int {
 	if !meter.limitTargetSet || meter.limitTarget <= 0 {
 		return 0
 	}
-	if !noResidualWhere(part, step) {
+	if !noResidualWhere(part, step, enforcedConjuncts{fromPredicates: true, toPredicates: true}) {
 		return 0
 	}
 	return int(meter.limitTarget)
@@ -946,8 +902,12 @@ type reverseTrailFrame struct {
 //     transfer unchanged.
 //   - The endpoint constraints swap roles: the seed set is chosen by the FAR
 //     endpoint's constraint (plus its pushed predicates, see
-//     expandVarLengthComponentReverse), and the NEAR endpoint's constraint is
-//     what each reached node is tested against.
+//     expandVarLengthComponentReverse), and the NEAR endpoint's constraint
+//     (plus ITS pushed predicates -- see nearAdmits below) is what each
+//     reached node is tested against. Neither side's predicates are part of
+//     the trail rule above: they are redundant copies of Part.Where
+//     conjuncts, so the raw rows here are a subset of the forward walk's and
+//     the two agree exactly once Part.Where has run.
 //
 // The historically direction-sensitive clause -- pg's seed-side self-loop
 // dead-end guard -- no longer appears in either walker: both decline
@@ -970,9 +930,44 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 	terminal, _ := seed.Node(step.ToSym)
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
+	// A node binds the near endpoint only if it satisfies fromNC COMPLETELY:
+	// kinds, ids and objectid anchor, and every pushed single-symbol WHERE
+	// predicate too -- the same admission scanAnchor applies to an anchor.
+	// The predicates are a redundant copy of conjuncts Part.Where still
+	// carries, so for an uncapped walk this only drops rows the pipeline
+	// would drop anyway. For a capped one it is what makes the cap sound:
+	// reverseTrailRowCap stops the walk after LIMIT rows on the promise that
+	// Part.Where rejects none of them, and a near endpoint admitted on its
+	// kinds alone broke that promise. `(t:Group)<-[:MemberOf*1..]-(a) WHERE
+	// (a:User OR a:Computer) ... LIMIT 5` counted a nested group toward the
+	// five, the WHERE then dropped it, and four rows came back where pg
+	// returns five. An evaluation error declines, as it would in filterRows.
+	var probe *Row
+	nearAdmits := func(id snapshot.NodeID) (bool, error) {
+		if !nodeSatisfiesConstraint(env, fromNC, id) {
+			return false, nil
+		}
+		if fromNC == nil || len(fromNC.Predicates) == 0 {
+			return true, nil
+		}
+		if probe == nil {
+			probe = NewRow()
+		}
+		probe.SetNode(step.FromSym, id)
+		return predicatesAdmit(env, probe, fromNC)
+	}
+
 	var out []*Row
 
-	if minDepth == 0 && nodeSatisfiesConstraint(env, fromNC, terminal) {
+	admitZero := false
+	if minDepth == 0 {
+		ok, err := nearAdmits(terminal)
+		if err != nil {
+			return nil, err
+		}
+		admitZero = ok
+	}
+	if admitZero {
 		nr := cloneRow(seed)
 		nr.SetNode(step.FromSym, terminal)
 		if pathArcKey != "" {
@@ -1008,7 +1003,15 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		depth := len(cur.edges)
 		curNode := cur.nodes[depth]
 
-		if depth >= 1 && depth >= minDepth && nodeSatisfiesConstraint(env, fromNC, curNode) {
+		emit := false
+		if depth >= 1 && depth >= minDepth {
+			ok, err := nearAdmits(curNode)
+			if err != nil {
+				return nil, err
+			}
+			emit = ok
+		}
+		if emit {
 			nr := cloneRow(seed)
 			nr.SetNode(step.FromSym, curNode)
 			// Mirror of the forward walker's trail-edge recording -- see
@@ -1016,7 +1019,7 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			// standalone single-step components take this route), recorded
 			// anyway so both walkers keep identical bookkeeping.
 			for _, e := range cur.edges {
-				nr.markTrailEdge(edgeRefIdentity(env.Snap, e))
+				nr.markTrailEdge(step.Pattern, edgeRefIdentity(env.Snap, e))
 			}
 			if pathArcKey != "" {
 				pv := &PathVal{
@@ -1064,7 +1067,7 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			// Row.trailEdges' doc. A reverse seed is always a fresh row today
 			// (standalone components only), so this is a no-op until a caller
 			// ever hands this walker a row carrying fixed-step edges.
-			if seed.edgeUsed(candidateIdentity(env.Snap, c)) {
+			if seed.edgeUsed(step.Pattern, candidateIdentity(env.Snap, c)) {
 				continue
 			}
 
@@ -1073,6 +1076,9 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 			// never becomes a frame. The cheap index test comes first: a
 			// node that CAN continue needs no constraint evaluation here,
 			// and one that cannot is usually a leaf the constraint rejects.
+			// Only the cheap part of the constraint is tested: a leaf that
+			// passes it but fails a pushed predicate costs one frame and is
+			// then refused by nearAdmits, never emitted.
 			if depth+1 == maxHops || !trailCanContinue(contIDs, c.other) {
 				if depth+1 < minDepth || !nodeSatisfiesConstraint(env, fromNC, c.other) {
 					continue
@@ -1118,11 +1124,11 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		return nil, errUnsupportedStep
 	}
 
-	roots, err := resolveEndpoint(env, meter, step.FromSym, part.Nodes[step.FromSym])
+	roots, rootsEnforced, err := resolveEndpoint(env, meter, step.FromSym, part.Nodes[step.FromSym])
 	if err != nil {
 		return nil, err
 	}
-	terminals, err := resolveEndpoint(env, meter, step.ToSym, part.Nodes[step.ToSym])
+	terminals, terminalsEnforced, err := resolveEndpoint(env, meter, step.ToSym, part.Nodes[step.ToSym])
 	if err != nil {
 		return nil, err
 	}
@@ -1134,6 +1140,19 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 	mode := traverse.ModeOne
 	if step.Shortest == ShortestAll {
 		mode = traverse.ModeAll
+		// allShortestPaths is served for one root and one terminal only.
+		// Over several pairs PostgreSQL's harness is not "every shortest
+		// path of every pair": without a pair filter,
+		// bidirectional_asp_harness returns the paths of the first
+		// expansion step that satisfies ANY pair and stops -- only the
+		// globally nearest pairs -- and with one, a pair resolved from one
+		// side keeps only the paths that side found. For a single pair
+		// both are that pair's shortest paths, which is what
+		// traverse.ModeAll computes.
+		total := env.Snap.NodeCount()
+		if roots.Count(total) != 1 || terminals.Count(total) != 1 {
+			return nil, errUnsupportedStep
+		}
 	}
 
 	maxDepth := 0
@@ -1159,7 +1178,13 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		if rowCap <= 0 {
 			return nil, ErrBudget
 		}
-		q.Limit = int(shortestPathLimit(int64(rowCap)+1, meter, part, step))
+		q.Limit = int(shortestPathLimit(int64(rowCap)+1, meter, part, step, enforcedConjuncts{
+			fromPredicates: rootsEnforced,
+			toPredicates:   terminalsEnforced,
+			// traverse drops the self-pair itself (ExcludeSelf, above)
+			// exactly when this conjunct is present.
+			endpointInequality: step.HasExplicitEndpointInequality,
+		}))
 		q.MemoryLimit = memLimit
 	}
 
@@ -1344,9 +1369,20 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 // positive, it is smaller than rowCapPlusOne (never widen the cutoff -- a
 // target the budget cannot afford must still decline exactly as an
 // unlimited query would), and the component's Part carries no residual
-// WHERE this function cannot itself evaluate (noResidualWhere -- see
-// shortestPathBudget's own doc for why that gate is what makes this safe at
-// all, the same reason Budgets.MaxRows is never folded in here directly).
+// WHERE (noResidualWhere, told by enforced what this route itself enforces
+// -- see shortestPathBudget's own doc for why that gate is what makes this
+// safe at all, the same reason Budgets.MaxRows is never folded in here
+// directly).
+//
+// enforced must say what the traversal ACTUALLY enforced, not what the
+// query's endpoints carry: resolveEndpoint hands traverse a side that does
+// not narrow as a kind bitmap (or as every node), evaluating none of its
+// pushed predicates beyond the kind tests folded into that bitmap. A kind
+// disjunction or a negation on such a side (`(t:Group OR t:Domain)`, `NOT
+// t.name STARTS WITH 'X'`) is therefore applied only by Part.Where, after
+// traverse has already stopped at LIMIT paths -- some of which Part.Where
+// then drops. Counting those predicates as enforced served one path where pg
+// returns three.
 //
 // limitTarget == 0 (a literal `LIMIT 0`) is deliberately excluded even
 // though workMeter's own convention treats it as a "set" target like any
@@ -1359,8 +1395,8 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 // (rowCapPlusOne) for no cutoff at all, enumerating up to whatever the much
 // looser memory backstop allows before erroring out, purely wasted work
 // this function exists to avoid paying.
-func shortestPathLimit(rowCapPlusOne int64, meter *workMeter, part *Part, step *Step) int64 {
-	if meter.limitTargetSet && meter.limitTarget > 0 && meter.limitTarget < rowCapPlusOne && noResidualWhere(part, step) {
+func shortestPathLimit(rowCapPlusOne int64, meter *workMeter, part *Part, step *Step, enforced enforcedConjuncts) int64 {
+	if meter.limitTargetSet && meter.limitTarget > 0 && meter.limitTarget < rowCapPlusOne && noResidualWhere(part, step, enforced) {
 		return meter.limitTarget
 	}
 	return rowCapPlusOne
@@ -1505,17 +1541,20 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 // is the whole point of this function existing instead of always calling
 // resolveEndpointSet:
 //
-//   - nc == nil, or nc carries no kind/id/objectid/predicate constraint at
-//     all (the symbol is truly unconstrained) -> traverse.Endpoint{}, the
-//     same "matches every node" sentinel traverse's own dispatch already
+//   - nc == nil, or nc does not narrow (endpointNarrows: no ids or
+//     objectid anchor, and every pushed predicate a kind test or a
+//     negation) and carries no Kinds -> traverse.Endpoint{}, the same
+//     "matches every node" sentinel traverse's own dispatch already
 //     understands (traverse.Endpoint.Unconstrained doc).
-//   - nc has one or more Kinds and nothing else (no ids/objectid/
-//     predicates) -> traverse.Endpoint{Bits: ...}: a single kind reuses the
-//     snapshot's own live per-kind bitmap directly (kindsEndpointBitmap), a
-//     multi-kind AND intersects them into a freshly allocated one. Neither
-//     case visits candidates one at a time the way scanAnchor does, so this
-//     is the fix for the wide-kinds-only-side cost this file's package doc
-//     describes.
+//   - nc does not narrow but has one or more Kinds ->
+//     traverse.Endpoint{Bits: ...}: a single kind reuses the snapshot's own
+//     live per-kind bitmap directly (kindsEndpointBitmap), a multi-kind AND
+//     intersects them into a freshly allocated one. Neither case visits
+//     candidates one at a time the way scanAnchor does, so this is the fix
+//     for the wide-kinds-only-side cost this file's package doc describes.
+//     Neither evaluates a pushed predicate either -- only a kind test
+//     folded into Kinds is enforced -- so the rest wait for Part.Where (see
+//     predicatesEnforced below).
 //   - anything that actually narrows the set (ids and/or an objectid anchor
 //     and/or pushed single-symbol Predicates) -> exactly today's
 //     materialized-IDs path (resolveEndpointSet), unchanged: a predicate
@@ -1529,16 +1568,29 @@ func resolveEndpointSet(env *Env, meter *workMeter, sym string, nc *NodeConstrai
 // Endpoint{} -- an allocated zero-population Bitset and an empty non-nil
 // []NodeID slice are both, correctly, "matches nothing", never "matches
 // everything".
-func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint) (traverse.Endpoint, error) {
+//
+// predicatesEnforced reports whether the returned Endpoint admits only nodes
+// satisfying EVERY one of nc's pushed predicates, as opposed to leaving some
+// of them to Part.Where. A materialized side always does (scanAnchor
+// evaluates them all per candidate); a kind bitmap does only when every
+// predicate is a kind test folded into that bitmap (kindBitmapEnforces); an
+// unconstrained side does only when there are none. Nothing about which
+// paths are CORRECT depends on this -- traverse is per pair, and Part.Where
+// filters whatever this leaves over -- but a LIMIT pushed into traverse
+// counts paths before Part.Where runs, so shortestPathLimit must know.
+func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint) (ep traverse.Endpoint, predicatesEnforced bool, err error) {
 	if nc == nil {
-		return traverse.Endpoint{}, nil
+		return traverse.Endpoint{}, true, nil
 	}
 	if !endpointNarrows(nc) {
+		enforced := kindBitmapEnforces(env, sym, nc)
 		if len(nc.Kinds) == 0 {
-			// nc is non-nil but carries no constraint whatsoever: it means
-			// the same thing nc == nil does above, so it gets the same
-			// treatment. Plan genuinely produces this shape -- a bare
-			// shortestPath endpoint with no label at all, e.g.
+			// nc is non-nil but narrows nothing and names no kind: as a
+			// candidate source it means the same thing nc == nil does
+			// above, so it gets the same treatment -- any kind-test or
+			// negated predicate it carries is left to Part.Where
+			// (predicatesEnforced). Plan genuinely produces this shape --
+			// a bare shortestPath endpoint with no label at all, e.g.
 			// `shortestPath((s)-[:E*1..]->(t:Target)) WHERE s<>t`, gives s
 			// exactly this &NodeConstraint{} (every field nil/empty), not a
 			// nil *NodeConstraint -- so this is a real, reachable branch,
@@ -1577,16 +1629,39 @@ func resolveEndpoint(env *Env, meter *workMeter, sym string, nc *NodeConstraint)
 			//     change in which small-graph bare-endpoint queries the
 			//     in-memory path engine itself can still serve, not
 			//     something this comment gets to assert away.
-			return traverse.Endpoint{}, nil
+			return traverse.Endpoint{}, enforced, nil
 		}
-		return traverse.Endpoint{Bits: kindsEndpointBitmap(env, nc.Kinds)}, nil
+		return traverse.Endpoint{Bits: kindsEndpointBitmap(env, nc.Kinds)}, enforced, nil
 	}
 
 	ids, err := resolveEndpointSet(env, meter, sym, nc)
 	if err != nil {
-		return traverse.Endpoint{}, err
+		return traverse.Endpoint{}, false, err
 	}
-	return traverse.Endpoint{IDs: ids}, nil
+	return traverse.Endpoint{IDs: ids}, true, nil
+}
+
+// kindBitmapEnforces reports whether nc's kind bitmap -- all resolveEndpoint
+// hands traverse for a side that does not narrow -- already enforces every
+// one of nc's pushed predicates. That holds exactly when each is a kind test
+// extractKindConjunct folded into nc.Kinds (`WHERE (t:Tag_Tier_Zero)`, which
+// the shipped Tier Zero prebuilts are written with). A kind disjunction, a
+// negation, or a property test is in no bitmap; with no kinds at all there
+// is no bitmap either, so any predicate at all is left to Part.Where.
+func kindBitmapEnforces(env *Env, sym string, nc *NodeConstraint) bool {
+	for _, p := range nc.Predicates {
+		km, ok := foldableKindConjunct(sym, p)
+		if !ok {
+			return false
+		}
+		for _, kind := range km.Kinds {
+			id, ok := env.Snap.Kinds().ID(kind.String())
+			if !ok || !containsKindID(nc.Kinds, id) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // kindsEndpointBitmap returns the traverse.Endpoint{Bits} value for a
@@ -1659,17 +1734,30 @@ func endpointsIntersect(snap *snapshot.View, roots, terminals traverse.Endpoint)
 	return found
 }
 
-// noResidualWhere reports whether part.Where's complete conjunct set (Part's
-// own doc: Where is always the Part's complete and sufficient WHERE
-// expression, never merely "whatever pushdown left over") is fully accounted
-// for by step's own endpoint resolution, so Execute's post-executor
+// enforcedConjuncts names which of a Part's WHERE conjuncts one component
+// route has already enforced on every row it produces, before the pipeline's
+// own Part.Where pass -- the input noResidualWhere needs from its caller,
+// since which conjuncts that is depends on the route, not the query.
+type enforcedConjuncts struct {
+	// fromPredicates/toPredicates: every pushed single-symbol predicate
+	// (NodeConstraint.Predicates) of the step's FromSym/ToSym endpoint.
+	fromPredicates, toPredicates bool
+	// endpointInequality: the `s<>t`/`id(s)<>id(t)` conjunct over the step's
+	// own two endpoints.
+	endpointInequality bool
+}
+
+// noResidualWhere reports whether every conjunct of part.Where (Part's own
+// doc: Where is always the Part's complete and sufficient WHERE expression,
+// never merely "whatever pushdown left over") is one the calling route has
+// already enforced -- enforced says which -- so Execute's post-executor
 // Part.Where pass over this component's produced rows can never actually
-// reject one of them -- the precondition the LIMIT pushdown below needs: a
-// row traverse.AllShortestPaths never got a chance to enumerate (because
-// enumeration stopped once the user's own LIMIT was reached) must never turn
-// out to be one Part.Where would have kept while a row that WAS enumerated
-// gets filtered out, which would silently under-serve the query relative to
-// full enumeration followed by filtering and LIMIT.
+// reject one of them. That is the precondition a LIMIT pushed into the route
+// needs: a row it never got to produce (because production stopped at the
+// user's own LIMIT) must never turn out to be one Part.Where would have kept
+// while a row it DID produce gets filtered out, which would silently
+// under-serve the query relative to full enumeration followed by filtering
+// and LIMIT.
 //
 // plan.go's planPart flattens every WHERE conjunct (including inline-map-
 // desugared equalities) into one slice, walks it once to populate both
@@ -1678,31 +1766,36 @@ func endpointsIntersect(snap *snapshot.View, roots, terminals traverse.Endpoint)
 // (pushdown) -- the identical conjunct value, not a copy, ends up in both
 // places. So re-flattening part.Where (flattenTopLevelConjuncts, the same
 // function planPart itself used to build that slice in the first place) and
-// checking each resulting conjunct for reference equality against
-// step.FromSym's/step.ToSym's own Predicates exactly recovers "did pushdown
-// already consume this piece", with no need to re-walk or duplicate
-// pushdown's own symbol-touch tracking. The one other shape pushdown leaves
-// out of every NodeConstraint.Predicates entirely -- the s<>t/id(s)<>id(t)
-// endpoint inequality finalizeShortestPaths reads directly out of the
-// conjunct list to set step.HasExplicitEndpointInequality -- is recognized
-// here the same structural way that function does (variableInequality/
-// idInequality), since that conjunct becomes traverse.Query.ExcludeSelf
-// instead of a Predicates entry.
+// checking each resulting conjunct for reference equality against an
+// endpoint's own Predicates exactly recovers "did pushdown put this piece on
+// that endpoint". The endpoint inequality is recognized the same structural
+// way finalizeShortestPaths recognizes it (variableInequality/idInequality).
+//
+// Being pushed is not the same as being enforced, and conflating the two is
+// what served short answers: the reverse var-length walk used to test its
+// near endpoint on kinds alone, a shortestPath side that does not narrow is
+// still handed to traverse as a bare kind bitmap (resolveEndpoint), and no
+// var-length walk checks the endpoint inequality -- yet all three were
+// counted as applied, so the route stopped at LIMIT rows and Part.Where then
+// dropped some of them. Hence the caller states what it enforces.
 //
 // Any other conjunct -- one touching some other symbol entirely (a wholly
 // separate MATCH pattern's own predicate sharing this Part), or one touching
 // both of step's endpoints together (e.g. `s.group = t.group`, which cannot
-// be a single-symbol Predicates entry for either) -- is never accounted for
-// by either check, correctly making this false: the pushdown must stay off
-// whenever any such conjunct exists, regardless of how small or large its
-// eventual filtering effect turns out to be.
-func noResidualWhere(part *Part, step *Step) bool {
+// be a single-symbol Predicates entry for either) -- is never accounted for,
+// correctly making this false: the pushdown must stay off whenever any such
+// conjunct exists, regardless of how small or large its eventual filtering
+// effect turns out to be.
+func noResidualWhere(part *Part, step *Step, enforced enforcedConjuncts) bool {
 	fromNC, toNC := part.Nodes[step.FromSym], part.Nodes[step.ToSym]
 	for _, c := range flattenTopLevelConjuncts(part.Where) {
-		if predicateBelongsTo(fromNC, c) || predicateBelongsTo(toNC, c) {
+		if enforced.fromPredicates && predicateBelongsTo(fromNC, c) {
 			continue
 		}
-		if variableInequality(c, step.FromSym, step.ToSym) || idInequality(c, step.FromSym, step.ToSym) {
+		if enforced.toPredicates && predicateBelongsTo(toNC, c) {
+			continue
+		}
+		if enforced.endpointInequality && (variableInequality(c, step.FromSym, step.ToSym) || idInequality(c, step.FromSym, step.ToSym)) {
 			continue
 		}
 		return false

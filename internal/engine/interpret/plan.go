@@ -137,6 +137,15 @@ type Step struct {
 	// this explicitly (errUnsupportedStep) rather than relying on it as an
 	// emergent property of isStrictLinearChain's own logic.
 	Reversed bool
+
+	// Pattern numbers the path pattern -- one comma-separated pattern part
+	// of one MATCH clause -- this Step was written in, unique across the
+	// whole Query. Relationship uniqueness holds among the Steps of one
+	// pattern only: dawgs emits `e1.id != e0.id` (and `!= all (path)` for a
+	// variable-length step) between a pattern's own Steps and nothing
+	// across patterns or MATCH clauses, so the executor keys its used-edge
+	// bookkeeping (Row.usedEdges) by it.
+	Pattern int
 }
 
 // NodeConstraint accumulates everything Plan determined about one pattern
@@ -359,17 +368,17 @@ type Part struct {
 // BareCallKind.
 //
 // BareCallKind is "" for an ordinary item; for a RETURN item whose
-// expression, taken as a *whole*, is exactly one of id(x)/size(x)/
-// datetime().epochseconds/datetime().epochmillis (the controller's
-// projection-typing amendment), it is "id"/"size"/"epochseconds"/
-// "epochmillis" respectively. A later materialization task is expected to
-// convert this package's uniform float64 result to the pg-parity integer
-// type (int64 for id, int32 for size, int64 for the epoch accessors) only
-// for a non-empty BareCallKind; every other item passes through unconverted.
-// Plan itself never accepts one of these four calls *nested* inside
-// arithmetic or another function in a RETURN/WITH item (see
-// projectionTypingOK) -- BareCallKind being non-empty is therefore always a
-// true statement about the item's entire expression, not merely its root.
+// expression, taken as a *whole*, is exactly id(x) or size(x) (the
+// controller's projection-typing amendment), it is "id" or "size". The
+// serve layer converts this package's uniform float64 result to the
+// pg-parity integer type (int64 for id, int32 for size) only for a
+// non-empty BareCallKind; every other item passes through unconverted.
+// Plan itself never accepts one of these calls *nested* inside arithmetic
+// or another function in a RETURN/WITH item (see projectionTypingOK) --
+// BareCallKind being non-empty is therefore always a true statement about
+// the item's entire expression, not merely its root. (bareCallKind also
+// recognizes the datetime() epoch accessors, for the nested-call check; a
+// RETURN item that is one declines, since pg types it numeric.)
 type ProjectionOutput struct {
 	// Optional marks a bare variable that an OPTIONAL MATCH introduced and
 	// that a given row may therefore leave UNBOUND. projectItem emits a null
@@ -525,10 +534,12 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 	known := map[string]symKind{}
 	countAliases := map[string]bool{}
 	numericScalars := map[string]bool{}
+	textScalars := map[string]bool{}
+	patternSeq := 0
 
 	parts := make([]Part, 0, len(stages))
 	for _, st := range stages {
-		part, nextKnown, ok := planPart(snap, regexes, known, numericScalars, st.reading)
+		part, nextKnown, ok := planPart(snap, regexes, &patternSeq, known, numericScalars, textScalars, st.reading)
 		if !ok {
 			return nil, false
 		}
@@ -538,10 +549,21 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 			if !ok {
 				return nil, false
 			}
+			// A WITH carrying only constants -- no variable, no aggregate --
+			// references nothing from its input, and dawgs projects it
+			// without a FROM: `select 60 as i0`, one row whatever the MATCH
+			// before it produced, none included. The evaluator keeps one
+			// row per input row, as Cypher does. The two agree only on the
+			// single empty row a query that opens with the WITH starts
+			// from.
+			if len(wc.GroupKeys) == 0 && len(wc.Aggregates) == 0 && len(st.reading) > 0 {
+				return nil, false
+			}
 			part.With = &wc
 			known = outputKnown
 			countAliases = countAliasSet(wc)
 			numericScalars = numericScalarSet(wc)
+			textScalars = textScalarSet(wc)
 		} else {
 			known = nextKnown
 		}
@@ -573,8 +595,9 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 				known = groupKnown
 				countAliases = countAliasSet(*returnGroup)
 				numericScalars = numericScalarSet(*returnGroup)
+				textScalars = textScalarSet(*returnGroup)
 			}
-			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, ret)
+			proj, order, skip, limit, ok := planReturn(snap, known, countAliases, numericScalars, textScalars, ret)
 			if !ok {
 				return nil, false
 			}
@@ -684,6 +707,19 @@ func numericScalarSet(wc WithClause) map[string]bool {
 	return out
 }
 
+// textScalarSet returns every alias wc carries forward as a string
+// constant -- the text-typed counterpart of numericScalarSet, for
+// sqlClassOf.
+func textScalarSet(wc WithClause) map[string]bool {
+	out := map[string]bool{}
+	for _, c := range wc.Constants {
+		if _, ok := c.Value.(string); ok {
+			out[c.Alias] = true
+		}
+	}
+	return out
+}
+
 // countShortestSteps counts every Step across every given Part whose
 // Shortest is not ShortestNone -- i.e. every shortestPath()/
 // allShortestPaths() pattern part compiled so far, across the whole Query
@@ -770,6 +806,15 @@ type partBuilder struct {
 	// see directly.
 	numericScalars map[string]bool
 
+	// textScalars names the carried aliases that hold a string on every row:
+	// a `'<string>' AS name` WithConstant. sqlClassOf types a reference to
+	// one as text, as dawgs does (`s0.i0` is a text column).
+	textScalars map[string]bool
+
+	// patternSeq numbers path patterns across the whole Query (Step.Pattern);
+	// every partBuilder of one Plan call shares it.
+	patternSeq *int
+
 	// shortestSteps indexes pb.chains entries produced by a shortestPath/
 	// allShortestPaths pattern, for the post-WHERE endpoint-constraint and
 	// HasExplicitEndpointInequality finalize pass.
@@ -802,13 +847,15 @@ type partBuilder struct {
 // WITH boundary). It returns the built Part and this Part's own final
 // symbol table (carried forward as-is unless the caller applies a WITH on
 // top of it).
-func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried map[string]symKind, numericScalars map[string]bool, reading []*cypher.ReadingClause) (Part, map[string]symKind, bool) {
+func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq *int, carried map[string]symKind, numericScalars, textScalars map[string]bool, reading []*cypher.ReadingClause) (Part, map[string]symKind, bool) {
 	pb := &partBuilder{
 		snap:           snap,
 		known:          cloneKnown(carried),
 		nodes:          map[string]*NodeConstraint{},
 		regexes:        regexes,
 		numericScalars: numericScalars,
+		textScalars:    textScalars,
+		patternSeq:     patternSeq,
 	}
 
 	var whereConjuncts []cypher.Expression
@@ -871,7 +918,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, carried ma
 		return part, pb.known, true
 	}
 
-	optPart, optKnown, ok := planOptionalPart(snap, regexes, numericScalars, pb, optionalClause)
+	optPart, optKnown, ok := planOptionalPart(snap, regexes, numericScalars, textScalars, pb, optionalClause)
 	if !ok {
 		return Part{}, nil, false
 	}
@@ -924,7 +971,7 @@ func splitOptionalMatch(reading []*cypher.ReadingClause) (mandatory []*cypher.Re
 // it came from the mandatory side -- and without it the optional pattern's
 // bare `(u)` would anchor on a full scan where the mandatory one anchored on
 // a kind bitmap.
-func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, numericScalars map[string]bool, outer *partBuilder, rc *cypher.ReadingClause) (Part, map[string]symKind, bool) {
+func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, numericScalars, textScalars map[string]bool, outer *partBuilder, rc *cypher.ReadingClause) (Part, map[string]symKind, bool) {
 	if rc.Unwind != nil || rc.Match == nil || len(rc.Match.Pattern) == 0 {
 		return Part{}, nil, false
 	}
@@ -935,6 +982,8 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 		nodes:          map[string]*NodeConstraint{},
 		regexes:        regexes,
 		numericScalars: numericScalars,
+		textScalars:    textScalars,
+		patternSeq:     outer.patternSeq,
 	}
 
 	// nodes starts EMPTY, deliberately: it must end up holding exactly the
@@ -1253,6 +1302,7 @@ func (pb *partBuilder) addPatternPart(part *cypher.PatternPart) bool {
 	}
 
 	stepsBefore := len(pb.chains)
+	pattern := pb.nextPattern()
 
 	for i := 1; i+1 < len(part.PatternElements); i += 2 {
 		rel, isRel := part.PatternElements[i].AsRelationshipPattern()
@@ -1267,10 +1317,21 @@ func (pb *partBuilder) addPatternPart(part *cypher.PatternPart) bool {
 		if !ok {
 			return false
 		}
+		// An undirected relationship is served only as a pattern's first
+		// step between two different variables, the one shape dawgs lowers
+		// to "either direction, endpoints differ" -- the Step's own
+		// DirectionBoth contract. Past the first step it joins both of the
+		// next edge's endpoints to the far node without excluding the near
+		// one, so `(a)-->(b)--(c)` also returns every c = b; and over one
+		// variable, `(a)--(a)`, it matches every edge touching a.
+		if rel.Direction == graph.DirectionBoth && (i > 1 || fromSym == toSym) {
+			return false
+		}
 		step, ok := pb.buildStep(fromSym, toSym, rel, ShortestNone, pathSym)
 		if !ok {
 			return false
 		}
+		step.Pattern = pattern
 		pb.chains = append(pb.chains, step)
 		fromSym = toSym
 	}
@@ -1284,6 +1345,15 @@ func (pb *partBuilder) addPatternPart(part *cypher.PatternPart) bool {
 	}
 
 	return true
+}
+
+// nextPattern returns a fresh Step.Pattern number.
+func (pb *partBuilder) nextPattern() int {
+	if pb.patternSeq == nil {
+		pb.patternSeq = new(int)
+	}
+	*pb.patternSeq++
+	return *pb.patternSeq
 }
 
 // addShortestPathPart processes a shortestPath()/allShortestPaths()
@@ -1334,6 +1404,7 @@ func (pb *partBuilder) addShortestPathPart(part *cypher.PatternPart) bool {
 	if !ok {
 		return false
 	}
+	step.Pattern = pb.nextPattern()
 	pb.chains = append(pb.chains, step)
 	pb.shortestSteps = append(pb.shortestSteps, len(pb.chains)-1)
 	return true
@@ -2355,25 +2426,77 @@ func coalescePropOpLiteral(propSide, litSide cypher.Expression, sym string, matc
 	if err != nil {
 		return "", "", false
 	}
+	if match != snapshot.StringEquals && likeNeedle(propSide, litSide) {
+		return likeCoalesceAnchor(pl.Symbol, defLit, match, decoded)
+	}
 	if !coalesceDefaultRejects(defLit, match, decoded) {
 		return "", "", false
 	}
 	return pl.Symbol, decoded, true
 }
 
+// likeCoalesceAnchor is coalescePropOpLiteral for a bare literal needle,
+// which reaches PostgreSQL as an unescaped LIKE pattern (likeNeedle): in
+// `COALESCE(t.system_tags, "") CONTAINS 'admin_tier_0'` each _ matches any
+// one character, so a substring search for the needle itself would miss
+// 'admin-tier-0' and serve a SHORT answer. The default is tested the way LIKE
+// tests it, and the index narrows on a literal run every match must carry
+// -- the pattern's leading run for STARTS WITH, its trailing run for ENDS
+// WITH, its longest for CONTAINS -- a superset the per-row LIKE then
+// filters exactly. A pattern without such a run gets no anchor.
+func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringMatch, needle string) (string, string, bool) {
+	var op StringOp
+	switch match {
+	case snapshot.StringPrefix:
+		op = OpStartsWith
+	case snapshot.StringSuffix:
+		op = OpEndsWith
+	case snapshot.StringContains:
+		op = OpContains
+	default:
+		return "", "", false
+	}
+	lp, err := parseLikePattern(likePatternFor(op, needle))
+	if err != nil {
+		return "", "", false
+	}
+	if raw, isStr := def.Value.(string); isStr {
+		d, err := decodeCypherStringLiteral(raw)
+		if err != nil || lp.regexp().MatchString(d) {
+			return "", "", false
+		}
+	}
+	var (
+		run string
+		ok  bool
+	)
+	switch match {
+	case snapshot.StringPrefix:
+		run, ok = lp.leadingLiteral()
+	case snapshot.StringSuffix:
+		run, ok = lp.trailingLiteral()
+	default:
+		run, ok = lp.longestLiteral()
+	}
+	if !ok {
+		return "", "", false
+	}
+	return name, run, true
+}
+
 // coalesceDefaultRejects reports whether def, the value COALESCE yields for a
 // node that does not carry the property at all, fails the predicate -- the
 // condition that makes the property index a superset of the matches.
+//
+// def is never null: checkFunction refuses a coalesce() with a null argument
+// (coalesceCastKind) before any anchor is extracted. A number or boolean
+// default types the whole call int8/float8/bool, and dawgs refuses to
+// compare that against a string at all ("coalesce has type int8 but is being
+// compared against type text"), so such a query never passes the translate
+// gate and what this answers for it is moot.
 func coalesceDefaultRejects(def *cypher.Literal, match snapshot.StringMatch, operand string) bool {
-	if def.Null {
-		// COALESCE(x, null) is null for an absent property, and null
-		// satisfies no string predicate.
-		return true
-	}
 	raw, isStr := def.Value.(string)
 	if !isStr {
-		// A number or boolean default: pg's jsonb comparison makes a type
-		// mismatch a definite false, so it satisfies no string predicate.
 		return true
 	}
 	s, err := decodeCypherStringLiteral(raw)
@@ -2436,12 +2559,8 @@ func coalesceDefaultRejects(def *cypher.Literal, match snapshot.StringMatch, ope
 // against the snapshot (checkKindMatcher rejects unknowns); the second
 // lookup is belt-and-braces, never a behavior change.
 func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expression) {
-	km, ok := unwrapParens(conjunct).(*cypher.KindMatcher)
-	if !ok || km == nil || !km.IsExclusive {
-		return
-	}
-	v, ok := unwrapParens(km.Reference).(*cypher.Variable)
-	if !ok || v == nil || v.Symbol != sym {
+	km, ok := foldableKindConjunct(sym, conjunct)
+	if !ok {
 		return
 	}
 	nc := pb.nodeConstraint(sym)
@@ -2450,6 +2569,22 @@ func (pb *partBuilder) extractKindConjunct(sym string, conjunct cypher.Expressio
 			nc.Kinds = append(nc.Kinds, id)
 		}
 	}
+}
+
+// foldableKindConjunct recognizes the conjunct shape extractKindConjunct
+// folds into sym's Kinds: a bare, possibly parenthesised, exclusive kind
+// matcher over sym itself. Shared with kindBitmapEnforces (expand.go), which
+// has to know exactly which pushed predicates a kind bitmap already enforces.
+func foldableKindConjunct(sym string, conjunct cypher.Expression) (*cypher.KindMatcher, bool) {
+	km, ok := unwrapParens(conjunct).(*cypher.KindMatcher)
+	if !ok || km == nil || !km.IsExclusive {
+		return nil, false
+	}
+	v, ok := unwrapParens(km.Reference).(*cypher.Variable)
+	if !ok || v == nil || v.Symbol != sym {
+		return nil, false
+	}
+	return km, true
 }
 
 // extractIDAnchor recognizes `id(sym) = <literal>` (either operand order)
@@ -2569,7 +2704,8 @@ func objectIDEqualsLiteral(propSide, litSide cypher.Expression, sym string) (str
 // Part's own top-level WHERE conjunct (planPart's call below) and threads
 // unchanged through exactly the AST shapes evalWhereWithMembership's own
 // recursion also passes through unmodified -- Parenthetical, Negation,
-// Conjunction, Disjunction, ExclusiveDisjunction -- becoming false the
+// Conjunction, Disjunction (XOR, which it also passes through, is declined
+// outright) -- becoming false the
 // moment expr is validated as a mere *value* operand of something else (a
 // Comparison's own operands, a function argument, an arithmetic operand, a
 // list element, a RETURN/WITH item): eval.go's EvalValue has no case for a
@@ -2600,7 +2736,12 @@ func (pb *partBuilder) checkExpr(expr cypher.Expression, predicatePosition bool)
 		return e != nil && pb.checkExprList(e.GetAll(), predicatePosition)
 
 	case *cypher.ExclusiveDisjunction:
-		return e != nil && pb.checkExprList(e.GetAll(), predicatePosition)
+		// dawgs lowers XOR to `!=` between its operands, unparenthesised:
+		// over two comparisons that is `a = b != c like d`, a syntax error,
+		// and over two properties it is jsonb inequality, TRUE for a stored
+		// JSON null against true where Cypher's XOR is NULL. Neither is the
+		// XOR evalExclusiveDisjunction computes.
+		return false
 
 	case *cypher.Comparison:
 		return pb.checkComparison(e, predicatePosition)
@@ -2644,6 +2785,12 @@ func (pb *partBuilder) checkExpr(expr cypher.Expression, predicatePosition bool)
 		return pb.checkArithmetic(e)
 
 	case *cypher.UnaryAddOrSubtractExpression:
+		// dawgs types a property under a unary sign as a BOOLEAN -- `-n.v`
+		// is `- (p ->> 'v')::bool` -- which PostgreSQL rejects for any data,
+		// while the evaluator negated the number.
+		if e != nil && propertyRead(unwrapBareArithmetic(e.Right)) {
+			return false
+		}
 		// An arithmetic operand is always a value position.
 		return e != nil && pb.checkExpr(e.Right, false)
 
@@ -2816,6 +2963,13 @@ func checkLiteralShape(lit *cypher.Literal) bool {
 // rewritePropertyLookupOperands special-cases hasLeftPropertyLookup &&
 // hasRightPropertyLookup ahead of the single-operand branch above, always
 // rewriting both to native jsonb regardless of either side's shape.
+//
+// This reject covers only the literal side's shape. Which operand pairs are
+// served at all -- a parenthesised property, which dawgs keeps `->>` text; a
+// literal LEFT of a property, which re-parses its text as JSON; a list, a
+// call or an alias against a property; operands of different SQL types --
+// is equalityShapeServed's, and the string, regex and IN operators have
+// their own typing checks (textOperand, likeNeedleServed, inListOperand).
 func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition bool) bool {
 	if cmp == nil || len(cmp.Partials) == 0 {
 		return false
@@ -2877,6 +3031,12 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 				(isBarePropertyLookup(partial.Right) && isNonBareScalarLiteral(left)) {
 				return false
 			}
+			if !equalityTypingOK(left, partial.Right) || !equalityTypingOK(partial.Right, left) {
+				return false
+			}
+			if !pb.equalityShapeServed(left, partial.Right) {
+				return false
+			}
 		case cypher.OperatorLessThan, cypher.OperatorLessThanOrEqualTo,
 			cypher.OperatorGreaterThan, cypher.OperatorGreaterThanOrEqualTo:
 			// Every non-IN/regex operator's operands are plain value
@@ -2898,8 +3058,22 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 			if !pb.relationalComparisonSafe(left, partial.Right) {
 				return false
 			}
-		case cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains,
-			cypher.OperatorIs, cypher.OperatorIsNot:
+		case cypher.OperatorIs, cypher.OperatorIsNot:
+			// dawgs translates `x IS [NOT] NULL` only for x a plain property
+			// lookup (rewritePropertyLookupNullCheck). For any other operand
+			// -- a function call, arithmetic, a variable, even a
+			// parenthesised property -- its IS/IS NOT branch pushes nothing,
+			// so the test silently vanishes from the SQL: `WHERE
+			// coalesce(n.a, n.b) IS NULL` and `WHERE id(n) IS NULL` return
+			// every row, and under NOT the translator panics. The evaluator
+			// applied the test as written, which is a different answer.
+			if !isPlainPropertyLookup(left) {
+				return false
+			}
+			if !pb.checkExpr(left, false) || !pb.checkExpr(partial.Right, false) {
+				return false
+			}
+		case cypher.OperatorStartsWith, cypher.OperatorEndsWith, cypher.OperatorContains:
 			// Every non-IN/regex operator's operands are plain value
 			// positions -- eval.go's evalPartialComparison calls EvalValue
 			// on both sides regardless of predicatePosition here, so a
@@ -2907,6 +3081,12 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 			// shape used as a value, `x = c IN exclude`) can never be
 			// reached by EvalPredicate's structural recursion.
 			if !pb.checkExpr(left, false) || !pb.checkExpr(partial.Right, false) {
+				return false
+			}
+			// dawgs lowers these to LIKE (or cypher_starts_with() for a
+			// needle that is not a literal), which needs a text subject:
+			// `(n.v + 1) STARTS WITH 'a'` is `bigint ~~ unknown`.
+			if !pb.textOperand(left) || !likeNeedleServed(partial.Operator, left, partial.Right) {
 				return false
 			}
 		default:
@@ -2972,19 +3152,34 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 // comparison's non-property side). Never a bare property lookup, which is
 // exactly the operand shape whose static type pg cannot itself prove ahead
 // of execution.
+//
+// The cast needs a plain property (isPlainPropertyLookup) and a partner
+// dawgs can type. A parenthesised property stays `->>` text, and so does a
+// property compared with a bare WITH alias, which dawgs leaves untyped:
+// `(n.x) < 5` is `(p ->> 'x') < 5` and `n.x < days` is `(p ->> 'x') <
+// s0.i0`, both `text < integer` -- errors PostgreSQL raises before reading
+// a row. Arithmetic over the alias does carry a type, so `n.x < days * 1`
+// casts.
 func (pb *partBuilder) relationalComparisonSafe(left, right cypher.Expression) bool {
 	leftNumeric := isStaticallyNumericScalar(left, pb.numericScalars)
 	rightNumeric := isStaticallyNumericScalar(right, pb.numericScalars)
 	switch {
 	case leftNumeric && rightNumeric:
 		return true
-	case leftNumeric && isBarePropertyLookup(right):
-		return true
-	case rightNumeric && isBarePropertyLookup(left):
-		return true
+	case leftNumeric && isPlainPropertyLookup(right):
+		return !isVariableOperand(left)
+	case rightNumeric && isPlainPropertyLookup(left):
+		return !isVariableOperand(right)
 	default:
 		return false
 	}
+}
+
+// isVariableOperand reports whether expr, parentheses aside, is a bare
+// variable reference.
+func isVariableOperand(expr cypher.Expression) bool {
+	v, ok := unwrapParens(expr).(*cypher.Variable)
+	return ok && v != nil
 }
 
 // isBarePropertyLookup reports whether expr (after unwrapping any
@@ -2999,6 +3194,410 @@ func (pb *partBuilder) relationalComparisonSafe(left, right cypher.Expression) b
 func isBarePropertyLookup(expr cypher.Expression) bool {
 	pl, ok := unwrapParens(expr).(*cypher.PropertyLookup)
 	return ok && pl != nil
+}
+
+// isPlainPropertyLookup reports whether expr is `var.prop` exactly as
+// written -- no parentheses around it or its variable -- the only operand
+// shape dawgs' translator keeps an IS [NOT] NULL test for (see
+// checkComparison).
+func isPlainPropertyLookup(expr cypher.Expression) bool {
+	pl, ok := expr.(*cypher.PropertyLookup)
+	if !ok || pl == nil {
+		return false
+	}
+	v, ok := pl.Atom.(*cypher.Variable)
+	return ok && v != nil
+}
+
+// propertyRead reports whether expr, parentheses aside, reads a stored
+// property off a node or edge variable -- `n.v`, `(n.v)` -- as opposed to a
+// datetime() accessor, which is a PropertyLookup too but has a type of its
+// own.
+func propertyRead(expr cypher.Expression) bool {
+	pl, ok := unwrapParens(expr).(*cypher.PropertyLookup)
+	if !ok || pl == nil {
+		return false
+	}
+	v, ok := unwrapParens(pl.Atom).(*cypher.Variable)
+	return ok && v != nil
+}
+
+// unwrapBareArithmetic strips the operator-less ArithmeticExpression the
+// frontend wraps a unary sign's operand in (`-n.v` parses as a sign over
+// ArithmeticExpression{Left: n.v}), along with any parentheses.
+func unwrapBareArithmetic(expr cypher.Expression) cypher.Expression {
+	for {
+		expr = unwrapParens(expr)
+		ae, ok := expr.(*cypher.ArithmeticExpression)
+		if !ok || ae == nil || len(ae.Partials) > 0 {
+			return expr
+		}
+		expr = ae.Left
+	}
+}
+
+// parenthesisedPropertyLookup reports whether expr is a property read
+// wrapped in parentheses, which keeps dawgs from casting it the way it casts
+// a plain one (isPlainPropertyLookup): it stays `->>` text.
+func parenthesisedPropertyLookup(expr cypher.Expression) bool {
+	return propertyRead(expr) && !isPlainPropertyLookup(expr)
+}
+
+// equalityTypingOK reports whether operand, compared by `=`/`<>` against
+// other, has the SQL typing the evaluator reproduces. checkComparison asks
+// it both ways round. Two operand shapes carry a type dawgs decides for
+// them, and the evaluator follows it only so far:
+//
+//   - An untyped coalesce (untypedCoalesce, eval.go) takes other's type.
+//     evalLiteralComparison casts it for a literal; next to a text-typed
+//     operand it is text, which is how it evaluates anyway. Any other
+//     partner -- a property, which has no type to lend and fails to
+//     translate, or id(), size(), arithmetic -- would need that partner's
+//     own dawgs type, which this does not derive.
+//   - A text-typed operand (pgTextOperand) against a number or a boolean is
+//     `text = integer`, which PostgreSQL refuses to run (42883), where the
+//     evaluator answered FALSE for every row: `toLower(n.name) = 1`,
+//     `(coalesce(n.a, n.b)) = 1`, `toLower(n.name) = id(n)`. Against a
+//     property it is a comparison with that property's `->>` text, which
+//     the evaluator's structural PropEq does not reproduce for a
+//     non-string value. Only a string literal, a null, or another text
+//     operand is served.
+func equalityTypingOK(operand, other cypher.Expression) bool {
+	if _, untyped := untypedCoalesce(operand); untyped {
+		if lit, ok := asLiteral(other); ok && lit != nil && !lit.Null {
+			return true
+		}
+		return pgTextOperand(other)
+	}
+	if !pgTextOperand(operand) {
+		return true
+	}
+	if lit, ok := asLiteral(other); ok && lit != nil {
+		_, isString := lit.Value.(string)
+		return lit.Null || isString
+	}
+	if _, untyped := untypedCoalesce(other); untyped {
+		return true
+	}
+	return pgTextOperand(other)
+}
+
+// pgTextOperand reports whether dawgs types expr as text on its own, whatever
+// it is compared with: toLower()/toUpper() (`lower(...)::text`), type()
+// (`kind_name(...)::text`), a coalesce() with a string literal among its
+// arguments (`coalesce(..., 'x')::text`), and an untyped coalesce inside
+// parentheses, which keep it from taking its context's type
+// (untypedCoalesce).
+func pgTextOperand(expr cypher.Expression) bool {
+	if p, ok := expr.(*cypher.Parenthetical); ok && p != nil {
+		if _, untyped := untypedCoalesce(unwrapParens(expr)); untyped {
+			return true
+		}
+	}
+	fi, ok := unwrapParens(expr).(*cypher.FunctionInvocation)
+	if !ok || fi == nil {
+		return false
+	}
+	switch strings.ToLower(fi.Name) {
+	case cypher.ToLowerFunction, cypher.ToUpperFunction, cypher.EdgeTypeFunction:
+		return true
+	case cypher.CoalesceFunction:
+		kind, ok := coalesceCastKind(fi)
+		_, untyped := untypedCoalesce(fi)
+		return ok && kind == coalesceText && !untyped
+	}
+	return false
+}
+
+// equalityShapeServed reports whether dawgs lowers `left = right` (and
+// `<>`) to SQL the evaluator answers the same way. dawgs picks the SQL from
+// the two operands' AST shapes, and most pairings do not compare the values
+// the way evalEquality does:
+//
+//	n.p = 'a'         jsonb_typeof(p -> 'p') = 'string' and p ->> 'p' = 'a'
+//	n.p = 1           (p -> 'p')::jsonb = to_jsonb(1::int8)::jsonb
+//	n.p = []          (p -> 'p') = '[]' or (p -> 'p') = 'null' and null
+//	n.p = ['a']       jsonb_to_text_array(p -> 'p')::text[] = array ['a']::text[]
+//	n.p = 'x' + m.q   (p ->> 'p') = 'x' || (q ->> 'q')
+//	1 = n.p           to_jsonb(1::int8)::jsonb = (p ->> 'p')::jsonb
+//	(n.p) = 1         (p ->> 'p') = 1
+//	n.p = x           (p ->> 'p') = s0.i0              (x a WITH alias)
+//	n.p = id(n)       (p ->> 'p')::int8 = n0.id
+//	size(n.q) = n.p   to_jsonb(jsonb_array_length(...)::int) = (p ->> 'p')::jsonb
+//	n.p = toLower(q)  jsonb_typeof(p -> 'p') = 'string' and p ->> 'p' = lower(...)
+//	id(n) = [1]       n0.id = array [1]::int8[]
+//	labels(n) = 'a'   (dropped from the SQL: every row passes)
+//	split(s, 'x') = 1 string_to_array(...)::text[] = 1
+//	id(n) = 'a'       n0.id = 'a'
+//	0 = 'a'           0 = 'a'
+//
+// Only the first five are comparisons the evaluator makes (StringEq,
+// ScalarEq, PropEq with the JSON-null rule evalEquality applies to an empty
+// list, evalListLiteralEquality and evalPropertyTextEquality), and two plain
+// properties compare as jsonb, as PropEq does.
+// Every other row differs from it somewhere: a number or boolean literal on
+// the LEFT re-parses the property's text as JSON, so the string '1' equals 1
+// and 'abc' is an error; a parenthesised property or a WITH alias compares
+// `->>` text, and against a number is `text = integer`, an error; id() and
+// arithmetic cast the property, an error for a non-integer; size() and a
+// typed coalesce() re-parse it like a literal on the left; a text call is
+// FALSE, not NULL, when it is NULL over a non-string property; a list
+// against anything but a plain property is an array compared with a scalar;
+// labels()
+// vanishes from the WHERE clause, and split() is an array against a
+// scalar. Without a plain property on either side, two operands of
+// different SQL types (sqlClassOf) are an error or cast one side -- `id(n)
+// = 'a'` casts 'a' to bigint, an error, and `id(n) = '5'` matches. Each of
+// those declines here.
+func (pb *partBuilder) equalityShapeServed(left, right cypher.Expression) bool {
+	for _, side := range [2]cypher.Expression{left, right} {
+		if parenthesisedPropertyLookup(side) || listTypedCall(side) {
+			return false
+		}
+	}
+	if _, isList := unwrapParens(left).(*cypher.ListLiteral); isList {
+		return listAgainstProperty(left, right)
+	}
+	if _, isList := unwrapParens(right).(*cypher.ListLiteral); isList {
+		return listAgainstProperty(right, left)
+	}
+	leftProp, rightProp := isPlainPropertyLookup(left), isPlainPropertyLookup(right)
+	switch {
+	case leftProp && rightProp:
+		return true
+	case leftProp:
+		return propertyEqualityPartner(right, true)
+	case rightProp:
+		return propertyEqualityPartner(left, false)
+	}
+	return classesComparable(pb.sqlClassOf(left), pb.sqlClassOf(right))
+}
+
+// propertyEqualityPartner reports whether a plain property compared by
+// `=`/`<>` with other is served: a bare literal -- a string or a null on
+// either side, a number or a boolean only when the property is on the left
+// -- or a text concatenation. See equalityShapeServed.
+func propertyEqualityPartner(other cypher.Expression, propertyOnLeft bool) bool {
+	if textConcatenation(other) {
+		// `(p ->> 'p') = 'x' || ...`: evalPropertyTextEquality.
+		return true
+	}
+	lit, ok := other.(*cypher.Literal)
+	if !ok || lit == nil {
+		return false
+	}
+	if lit.Null {
+		return true
+	}
+	switch lit.Value.(type) {
+	case string:
+		return true
+	case int64, uint64, float64, bool:
+		return propertyOnLeft
+	}
+	return false
+}
+
+// listAgainstProperty reports whether a list literal compared with other
+// is served: only against a plain property, and only a bare list that is
+// empty -- dawgs' jsonb comparison, `(p -> 'p') = '[]'` -- or of literals
+// of one type (literalListCastKind), which it lowers to
+// `jsonb_to_text_array(p -> 'p')::<type>[] = array [...]` and
+// evalListLiteralEquality reproduces.
+func listAgainstProperty(list, other cypher.Expression) bool {
+	l, ok := list.(*cypher.ListLiteral)
+	if !ok || l == nil || !isPlainPropertyLookup(other) {
+		return false
+	}
+	if len(*l) == 0 {
+		return true
+	}
+	_, typed := literalListCastKind(l)
+	return typed
+}
+
+// listTypedCall reports whether expr is a call dawgs types as a PostgreSQL
+// array: labels() and split().
+func listTypedCall(expr cypher.Expression) bool {
+	fi, ok := unwrapParens(expr).(*cypher.FunctionInvocation)
+	if !ok || fi == nil {
+		return false
+	}
+	switch strings.ToLower(fi.Name) {
+	case cypher.NodeLabelsFunction, cypher.StringSplitToArrayFunction:
+		return true
+	}
+	return false
+}
+
+// sqlClass is the family of SQL types dawgs gives an operand on its own,
+// which decides whether PostgreSQL can compare it with another operand at
+// all, and how.
+type sqlClass uint8
+
+const (
+	// classUnknown is an operand this package does not type statically: a
+	// plain property (jsonb, typed by its partner), an untyped coalesce()
+	// (the same), a node or edge variable, and anything else.
+	classUnknown sqlClass = iota
+	classNull
+	classText
+	classNumber
+	classBool
+	classArray
+)
+
+// sqlClassOf returns the SQL type family dawgs gives expr on its own:
+// text for a string literal, toLower()/toUpper()/type(), a string
+// coalesce(), a `+` with a text operand (concatenation) and a parenthesised
+// property (`->>` text); number for a numeric literal, id(), size(), a
+// datetime() epoch accessor, a numeric coalesce(), other arithmetic and a
+// signed operand; boolean for a boolean literal or coalesce() and any
+// predicate; an array for a list literal, labels() and split(). A WITH
+// alias takes its constant's or aggregate's type (numericScalars,
+// textScalars, a collect alias).
+func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
+	switch e := expr.(type) {
+	case *cypher.Parenthetical:
+		if e == nil {
+			return classUnknown
+		}
+		if propertyRead(e) {
+			return classText
+		}
+		return pb.sqlClassOf(e.Expression)
+	case *cypher.Literal:
+		if e == nil {
+			return classUnknown
+		}
+		if e.Null {
+			return classNull
+		}
+		switch e.Value.(type) {
+		case string:
+			return classText
+		case int64, uint64, float64:
+			return classNumber
+		case bool:
+			return classBool
+		}
+	case *cypher.ListLiteral:
+		return classArray
+	case *cypher.PropertyLookup:
+		if e != nil && !propertyRead(e) {
+			return classNumber
+		}
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return classUnknown
+		}
+		switch strings.ToLower(e.Name) {
+		case cypher.ToLowerFunction, cypher.ToUpperFunction, cypher.EdgeTypeFunction:
+			return classText
+		case cypher.IdentityFunction, cypher.ListSizeFunction:
+			return classNumber
+		case cypher.NodeLabelsFunction, cypher.StringSplitToArrayFunction:
+			return classArray
+		case cypher.CoalesceFunction:
+			if _, untyped := untypedCoalesce(e); untyped {
+				return classUnknown
+			}
+			switch kind, ok := coalesceCastKind(e); {
+			case !ok:
+				return classUnknown
+			case kind == coalesceText:
+				return classText
+			case kind == coalesceBool:
+				return classBool
+			default:
+				return classNumber
+			}
+		}
+	case *cypher.ArithmeticExpression:
+		if e == nil {
+			return classUnknown
+		}
+		if classifyAddOperand(e.Left) == addStaticText {
+			return classText
+		}
+		for _, p := range e.Partials {
+			if p != nil && p.Operator == cypher.OperatorAdd && classifyAddOperand(p.Right) == addStaticText {
+				return classText
+			}
+		}
+		return classNumber
+	case *cypher.UnaryAddOrSubtractExpression:
+		return classNumber
+	case *cypher.Variable:
+		if e == nil {
+			return classUnknown
+		}
+		switch {
+		case pb.numericScalars[e.Symbol]:
+			return classNumber
+		case pb.textScalars[e.Symbol]:
+			return classText
+		case pb.known[e.Symbol] == symCollectAlias:
+			return classArray
+		}
+	case *cypher.Comparison, *cypher.Negation, *cypher.Conjunction, *cypher.Disjunction,
+		*cypher.KindMatcher, *cypher.PatternPredicate:
+		return classBool
+	}
+	return classUnknown
+}
+
+// classesComparable reports whether PostgreSQL compares two operands of
+// these classes as they are: the same class, or one it cannot tell (a null,
+// or an operand this package leaves untyped). Any other pair is an error
+// there -- `text = integer`, `bigint ~ unknown` -- or casts one side's
+// literal into the other's type, which is not the comparison the evaluator
+// makes.
+func classesComparable(a, b sqlClass) bool {
+	if a == classUnknown || b == classUnknown || a == classNull || b == classNull {
+		return true
+	}
+	return a == b
+}
+
+// textOperand reports whether a string predicate (STARTS WITH, ENDS WITH,
+// CONTAINS, =~) can take expr as its subject: an operand PostgreSQL has as
+// text -- a plain property's `->>`, a text-typed expression, an untyped
+// coalesce() (text on its own) -- rather than a number, boolean or array,
+// which `~~`/`~` reject (`bigint ~~ unknown`).
+func (pb *partBuilder) textOperand(expr cypher.Expression) bool {
+	if isPlainPropertyLookup(expr) {
+		return true
+	}
+	if _, untyped := untypedCoalesce(unwrapParens(expr)); untyped {
+		return true
+	}
+	switch pb.sqlClassOf(expr) {
+	case classText, classNull:
+		return true
+	}
+	return false
+}
+
+// likeNeedleServed reports whether a STARTS WITH/ENDS WITH/CONTAINS needle
+// dawgs puts into a LIKE pattern unescaped (eval.go's likeNeedle) makes a
+// pattern PostgreSQL accepts: one ending in an unpaired backslash -- `ENDS
+// WITH 'a\\'` against toLower() is `like '%a\'` -- is an error there. The
+// evaluator matches every other such pattern the way LIKE does.
+func likeNeedleServed(op cypher.Operator, subject, needle cypher.Expression) bool {
+	if !likeNeedle(subject, needle) {
+		return true
+	}
+	sop, known := stringOpFor(op)
+	if !known {
+		return false
+	}
+	decoded, err := decodeCypherStringLiteral(needle.(*cypher.Literal).Value.(string))
+	if err != nil {
+		return false
+	}
+	_, err = parseLikePattern(likePatternFor(sop, decoded))
+	return err == nil
 }
 
 // isNonBareScalarLiteral reports whether expr denotes a numeric, boolean, or
@@ -3091,7 +3690,7 @@ func isScalarLiteralTree(expr cypher.Expression) bool {
 // comparison must itself be reachable, in the executor, as a genuine
 // boolean-predicate leaf -- i.e. only through Part.Where's own top-level
 // conjunct or a chain of pure Parenthetical/Negation/Conjunction/
-// Disjunction/ExclusiveDisjunction wrapping it (see checkExpr's
+// Disjunction wrapping it (see checkExpr's
 // predicatePosition doc). Both conditions matter, and for the same reason:
 // the executor's own interception (pipeline.go's tryMembershipComparison) is
 // only ever reached from evalWhereWithMembership's boolean-structural
@@ -3114,6 +3713,61 @@ func isScalarLiteralTree(expr cypher.Expression) bool {
 // the wrong position (e.g. as the *left* operand, or anywhere outside this
 // bypass).
 func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membershipAllowed bool) bool {
+	// An untyped coalesce() (untypedCoalesce, eval.go) takes the type of the
+	// other operand, and next to IN that is an array type: dawgs then lowers
+	// `coalesce(n.a, n.b) IN [1, 2]` to the constant `false` -- no row
+	// matches, and under NOT every row does -- and `1 IN coalesce(n.a,
+	// n.b)` to `1 = any(<text>)`, which PostgreSQL rejects. The evaluator
+	// compared the coalesced value against each element instead. Serving the
+	// constant would pin the engine to an accident of dawgs' typing, so the
+	// shape declines.
+	if _, untyped := untypedCoalesce(unwrapParens(left)); untyped {
+		return false
+	}
+	if _, untyped := untypedCoalesce(unwrapParens(right)); untyped {
+		return false
+	}
+	// A list element that is itself a list makes dawgs build a nested array,
+	// which `= any` flattens: `n.p IN [[1]]` is `(p ->> 'p')::int8 = any
+	// (array [array [1]::int8[]]::int8[])`, true for the number 1, where the
+	// evaluator compares against the list [1].
+	if l, ok := unwrapParens(right).(*cypher.ListLiteral); ok && l != nil {
+		for _, el := range *l {
+			if _, nested := unwrapParens(el).(*cypher.ListLiteral); nested {
+				return false
+			}
+		}
+	}
+	// The right-hand side must be an array dawgs can take `= any(...)` over:
+	// a list literal, a plain property's stored list, labels() or split(),
+	// or a collect alias (below). Anything else -- `'a' IN (n.v)`, `1 IN
+	// toLower(n.v)` -- is `op ANY/ALL (array) requires array on right side`.
+	if !inListOperand(pb, right) {
+		return false
+	}
+	// labels() and split() are text arrays: `1 IN split(n.v, ',')` is
+	// `integer = text`. Only a text operand is served against one.
+	if listTypedCall(right) && pb.sqlClassOf(left) != classText {
+		return false
+	}
+	// A list literal is an array of its elements' type. A plain property on
+	// the left is cast to that type (inCastProperty, eval.go); any other
+	// operand keeps its own (sqlClassOf), and PostgreSQL has no operator
+	// between a text operand and a numeric array or the reverse: `id(n) IN
+	// ['1']` is `bigint = text`, `toLower(n.a) IN [1]`, `(n.a) IN [1]` and
+	// `n.a + 'x' IN [1]` are `text = bigint`, all errors, where the evaluator
+	// compared renderings; and an array on the left (split()) is compared
+	// element-wise against a flattened list.
+	if kind, typed := literalListCastKind(right); typed && !isPlainPropertyLookup(left) {
+		switch class := pb.sqlClassOf(left); {
+		case class == classBool || class == classArray:
+			return false
+		case kind == coalesceText && class == classNumber:
+			return false
+		case kind != coalesceText && class == classText:
+			return false
+		}
+	}
 	if rv, ok := unwrapParens(right).(*cypher.Variable); ok && rv != nil {
 		if pb.known[rv.Symbol] == symCollectAlias {
 			if !membershipAllowed {
@@ -3147,6 +3801,22 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 	return pb.checkExpr(left, false) && pb.checkExpr(right, false)
 }
 
+// inListOperand reports whether expr is an IN right-hand side dawgs lowers
+// to an array: a list literal, a plain property (its stored list), labels()
+// or split(), or a WITH collect alias.
+func inListOperand(pb *partBuilder, expr cypher.Expression) bool {
+	if isPlainPropertyLookup(expr) || listTypedCall(expr) {
+		return true
+	}
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.ListLiteral:
+		return e != nil
+	case *cypher.Variable:
+		return e != nil && pb.known[e.Symbol] == symCollectAlias
+	}
+	return false
+}
+
 // checkRegexOperands validates `left =~ right`: left is checked the
 // ordinary way, but right (the pattern) must be a compile-time string
 // literal -- not merely a present-string-valued expression the way
@@ -3158,6 +3828,11 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 // more than once in the query compiles exactly once.
 func (pb *partBuilder) checkRegexOperands(left, right cypher.Expression) bool {
 	if !pb.checkExpr(left, false) {
+		return false
+	}
+	// `~` needs a text subject: `(n.v + 1) =~ 'a'` is `bigint ~ unknown`
+	// and `split(...) =~ 'a'` is `text[] ~ unknown`, both errors.
+	if !pb.textOperand(left) {
 		return false
 	}
 	lit, ok := asLiteral(right)
@@ -3562,12 +4237,11 @@ func (pb *partBuilder) checkFunction(fi *cypher.FunctionInvocation) bool {
 //     rOperandType == Text` before anything else) means an addUnresolved
 //     operand IS safe when paired with a running fold that is itself
 //     addStaticText (e.g. `'x' + coalesce(n.a,n.b)` genuinely concatenates
-//     in pg) but NOT safe paired with anything else (addUnresolved's own
-//     doc has the full derivation: such a coalesce's arguments were never
-//     rewritten to a resolved type by translateCoalesceFunction, so pg
-//     falls through to a bare `+` over their default `->>` text rendering,
-//     which has no PostgreSQL operator against a non-text partner and
-//     genuinely errors in real pg, regardless of runtime values).
+//     in pg) but NOT safe paired with anything else (classifyCoalesceOperand's
+//     doc has the derivation: dawgs gives such a call its partner's type --
+//     `coalesce(n.a,n.b) + 1` is `coalesce(...)::int8 + 1` -- a cast this
+//     evaluator reproduces only for a comparison against a literal, not in
+//     arithmetic).
 func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
@@ -3607,6 +4281,22 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 			}
 		}
 		leftIsFloat = leftIsFloat || rightIsFloat
+
+		// A numeric step types its operands the way evalArithmetic's casts
+		// assume, and dawgs does not always: it casts only a PLAIN property
+		// operand to its partner's type. A parenthesised one, `(n.v) + 1`,
+		// stays `->>` text and meets `text + integer`; two properties side
+		// by side, `n.a * n.b`, meet `text * text` -- errors PostgreSQL
+		// raises for any data, where the evaluator cast and computed. (`+`
+		// of two properties is the concatenation case rejected below.)
+		if p.Operator != cypher.OperatorAdd || (curKind != addStaticText && rKind != addStaticText) {
+			if parenthesisedPropertyLookup(p.Right) || (i == 0 && parenthesisedPropertyLookup(ae.Left)) {
+				return false
+			}
+			if i == 0 && p.Operator != cypher.OperatorAdd && propertyRead(ae.Left) && propertyRead(p.Right) {
+				return false
+			}
+		}
 
 		if p.Operator == cypher.OperatorAdd {
 			if i == 0 && curKind == addPropertyLookup && rKind == addPropertyLookup {
@@ -3715,6 +4405,16 @@ func planWith(inputKnown map[string]symKind, w *cypher.With) (WithClause, map[st
 			}
 			val, _, err := evalLiteralValue(lit)
 			if err != nil {
+				return WithClause{}, nil, false
+			}
+			// A null or boolean constant has no type dawgs and the evaluator
+			// agree on. The evaluator carries a null as a present value, so
+			// `x <> 'a'` is TRUE where PostgreSQL's NULL column gives NULL;
+			// and PostgreSQL types the column by the literal, so a boolean
+			// against a property is `text = boolean`, an error.
+			switch val.(type) {
+			case string, float64:
+			default:
 				return WithClause{}, nil, false
 			}
 			if _, dup := outputKnown[item.Alias.Symbol]; dup {
@@ -4016,14 +4716,17 @@ func desugarReturnAggregates(known map[string]symKind, ret *cypher.Return) (*cyp
 			})
 			continue
 		} else {
-			if _, isProp := bare.(*cypher.PropertyLookup); !isProp {
+			if !propertyRead(bare) {
 				// A computed group key is served only as a bare property
-				// lookup, the shape the corpus groups by. Anything else loses
+				// read, the shape the corpus groups by. Anything else loses
 				// the typing and naming planReturn gives it once it is
 				// rewritten to a synthetic alias: `id(u)` would come back
 				// float64 where pg returns int8, `toLower(u.name)` would be
 				// named "tolower" where pg names it "lower", a carried
-				// count alias would lose its int8. Decline them.
+				// count alias would lose its int8, and
+				// `datetime().epochseconds` -- a PropertyLookup too, but of
+				// a function -- came back float64 where pg returns numeric.
+				// Decline them.
 				return nil, nil, nil, false
 			}
 			if containsAggregateCall(item.Expression) {
@@ -4136,7 +4839,7 @@ func aggregateOutputName(item *cypher.ProjectionItem) (string, bool) {
 // relationalComparisonSafe's WHERE-side check does, for a RETURN item
 // referencing a carried numeric alias, however deeply nested inside
 // arithmetic); both empty when there was no preceding WITH.
-func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, numericScalars map[string]bool, ret *cypher.Return) (Projection, []OrderKey, int64, int64, bool) {
+func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, numericScalars, textScalars map[string]bool, ret *cypher.Return) (Projection, []OrderKey, int64, int64, bool) {
 	if ret == nil || ret.Projection == nil {
 		return Projection{}, nil, 0, -1, false
 	}
@@ -4145,7 +4848,8 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 		return Projection{}, nil, 0, -1, false
 	}
 
-	pb := &partBuilder{snap: snap, known: known, regexes: map[string]*regexp.Regexp{}}
+	pb := &partBuilder{snap: snap, known: known, regexes: map[string]*regexp.Regexp{},
+		numericScalars: numericScalars, textScalars: textScalars}
 
 	var items []ProjectionOutput
 	projectedAliases := map[string]bool{}
@@ -4340,7 +5044,7 @@ func literalNonNegativeInt(expr cypher.Expression) (int64, bool) {
 // PropertyLookup, ListLiteral, FunctionInvocation, ArithmeticExpression, or
 // UnaryAddOrSubtractExpression. checkExpr itself is shared with WHERE-clause
 // validation and therefore also accepts boolean-only shapes (Comparison,
-// Conjunction, Disjunction, ExclusiveDisjunction, Negation, KindMatcher) --
+// Conjunction, Disjunction, Negation, KindMatcher) --
 // exactly the node types EvalValue's own switch has no case for and would
 // answer with ErrUnsupported. Accepting one of those as a RETURN/WITH item's
 // *own* top-level expression (e.g. `RETURN n.x = 5 AS flag`) would never
@@ -4421,12 +5125,13 @@ func bareCallKind(expr cypher.Expression) string {
 }
 
 // projectionTypingOK implements the controller's projection-typing
-// amendment: id()/size()/datetime().epochseconds/.epochmillis are servable
-// only as the *entire* content of a RETURN item (optionally aliased) --
-// nested inside arithmetic or another function call rejects the whole
-// query, since pg keeps integer typing there (a nested `id(n) + 1` is still
-// an int8 addition in SQL) that this package's uniform float64 evaluator
-// cannot reproduce.
+// amendment: id()/size() are servable only as the *entire* content of a
+// RETURN item (optionally aliased) -- nested inside arithmetic or another
+// function call rejects the whole query, since pg keeps integer typing
+// there (a nested `id(n) + 1` is still an int8 addition in SQL) that this
+// package's uniform float64 evaluator cannot reproduce. The datetime() epoch
+// accessors are not servable as a RETURN item at all: pg's column is
+// numeric (see the switch below).
 //
 // Arithmetic in a RETURN item is served only when pg's result is float8.
 // pg types arithmetic by its operands -- `n.x + 1` is `(properties ->>
@@ -4437,8 +5142,16 @@ func bareCallKind(expr cypher.Expression) string {
 // float and every other operand a property (cast to float8 to match), the
 // result is float8 throughout. No corpus query projects arithmetic at all.
 func projectionTypingOK(expr cypher.Expression) bool {
-	if bareCallKind(expr) != "" {
+	switch bareCallKind(expr) {
+	case "id", "size":
 		return true
+	case "epochseconds", "epochmillis":
+		// dawgs projects these as `extract(epoch from now())::numeric`
+		// (times 1000 for millis): a numeric column carrying the
+		// transaction clock's microseconds, which reaches the caller as a
+		// pgtype.Numeric. This package would have to mint one with pg's
+		// exact digits and scale; it served a truncated int64 instead.
+		return false
 	}
 	if containsFlaggedCallNested(expr) {
 		return false
@@ -4508,10 +5221,14 @@ func containsArithmetic(expr cypher.Expression) bool {
 }
 
 // isFloat8Arithmetic reports whether expr is arithmetic built only from
-// float literals and property lookups, with at least one float literal --
-// the shape whose pg result type is float8 throughout.
+// float literals and property reads, with at least one of each -- the shape
+// whose pg result type is float8 throughout. The property read is what
+// makes it float8: dawgs casts it `::float8` to match the float literal.
+// Without one the literals keep PostgreSQL's own type, numeric -- `1.5 *
+// 2.0` is a numeric 3.0, not the float64 this package computes -- and a
+// datetime() accessor is numeric too.
 func isFloat8Arithmetic(expr cypher.Expression) bool {
-	sawFloat := false
+	sawFloat, sawProperty := false, false
 	var walk func(cypher.Expression) bool
 	walk = func(x cypher.Expression) bool {
 		switch e := x.(type) {
@@ -4537,12 +5254,16 @@ func isFloat8Arithmetic(expr cypher.Expression) bool {
 			sawFloat = sawFloat || isFloat
 			return isFloat
 		case *cypher.PropertyLookup:
-			return e != nil
+			if !propertyRead(e) {
+				return false
+			}
+			sawProperty = true
+			return true
 		default:
 			return false
 		}
 	}
-	return walk(expr) && sawFloat
+	return walk(expr) && sawFloat && sawProperty
 }
 
 // containsFlaggedCallNested reports whether one of the four flagged calls
