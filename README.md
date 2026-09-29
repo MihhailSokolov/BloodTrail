@@ -146,11 +146,27 @@ validated.
   explicit `-f` and let `.env` decide.
 - Writing that entry replaces docker compose's own file discovery, so the installer
   writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the conventional `docker-compose.override.yml`. Deployments
-  that keep their customizations in that override file therefore keep them, both in the
-  installer's own commands and in the operator's afterwards. `bloodtrail rollback`
-  removes the whole entry again when the install was what created it, which puts
-  discovery back the way it was.
+  when one sits beside it, the override file compose loads on its own (the first of
+  `compose.override.yml`, `compose.override.yaml`, `docker-compose.override.yml` and
+  `docker-compose.override.yaml` that exists, whatever the compose file is called).
+  Deployments that keep their customizations in that override file therefore keep them,
+  both in the installer's own commands and in the operator's afterwards. `bloodtrail
+  rollback` removes the whole entry again when the install was what created it, which
+  puts discovery back the way it was -- unless the entry has been changed since (a file
+  added to it, say), in which case it takes out only its own override. With no entry, the
+  compose file given has to be the one discovery picks (`compose.yaml` wins over
+  `docker-compose.yml` in the same directory); otherwise the installer stops and asks
+  for `--compose-file` or an entry.
+- The installer stops before changing anything when it cannot be sure which files
+  docker compose loads for the operator: a `COMPOSE_FILE` entry that is empty, uses
+  interpolation or escapes, has an empty or space-padded name, does not list the compose
+  file it was given, or lists a file that does not exist; or `COMPOSE_FILE` (or a
+  `COMPOSE_PATH_SEPARATOR` other than `:`) set in the shell's environment, which docker
+  compose takes over `.env`. The message says what to change. `status`, `verify` and
+  `rollback` read the project more forgivingly, so they keep working on whatever an
+  install -- of this version or an earlier one -- left behind; where an earlier version
+  took an empty `COMPOSE_FILE=` entry for none and wrote its override into it,
+  `rollback` puts the empty entry back as it was.
 - `bloodtrail rollback` returns the deployment to the graph it had before the install.
   On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
