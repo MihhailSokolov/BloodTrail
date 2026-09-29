@@ -163,35 +163,6 @@ func TestRelationshipUniquenessIsPerPattern(t *testing.T) {
 	assertServedIDs(t, snap, `MATCH (x:User)-[:MemberOf]->(g)<-[:MemberOf]-(y:User) RETURN x`)
 }
 
-// allShortestPaths is served for one root and one terminal: over several
-// pairs PostgreSQL's harness keeps only the globally nearest pairs' paths,
-// or one side's, not every pair's.
-func TestAllShortestPathsServedForOnePairOnly(t *testing.T) {
-	const kindRoot, kindTarget snapshot.KindID = 3, 4
-	snap := buildExecSnapshot(t, map[snapshot.KindID]string{kindRoot: "Root", kindTarget: "Target", semEdge: "E"},
-		[]execNodeSpec{
-			{1, []snapshot.KindID{kindRoot}, nil},
-			{2, []snapshot.KindID{kindRoot}, nil},
-			{3, []snapshot.KindID{kindTarget}, nil},
-		}, []execEdgeSpec{
-			{10, 1, 3, semEdge},
-			{11, 2, 3, semEdge},
-		})
-
-	multi := `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) RETURN p`
-	pq, ok := planNoFail(t, snap, multi)
-	if !ok {
-		t.Fatalf("%s: declined by Plan, want an execution-time decline", multi)
-	}
-	if _, err := Execute(&Env{Snap: snap}, pq, generousBudget); err == nil {
-		t.Fatalf("%s: served over two roots", multi)
-	}
-	rs := mustExec(t, snap, `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t:Target)) WHERE id(s) = 1 RETURN p`, generousBudget)
-	if len(rs.Rows) != 1 {
-		t.Fatalf("one root, one terminal: %d paths, want 1", len(rs.Rows))
-	}
-}
-
 // `n.v = ['1']` is `jsonb_to_text_array(p -> 'v')::text[] = array ['1']`: a
 // list compares its elements' text, so [1] matches too; a JSON null or a
 // missing value is NULL. Against a numeric list every element is cast

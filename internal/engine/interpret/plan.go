@@ -720,6 +720,22 @@ func textScalarSet(wc WithClause) map[string]bool {
 	return out
 }
 
+// HasAllShortestPaths reports whether any Part of q, OPTIONAL MATCH Parts
+// included, holds an allShortestPaths() step -- the one pattern whose answer
+// depends on Env.AllShortestPerPair.
+func (q *Query) HasAllShortestPaths() bool {
+	for i := range q.Parts {
+		for p := &q.Parts[i]; p != nil; p = p.Optional {
+			for _, step := range p.Chains {
+				if step.Shortest == ShortestAll {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // countShortestSteps counts every Step across every given Part whose
 // Shortest is not ShortestNone -- i.e. every shortestPath()/
 // allShortestPaths() pattern part compiled so far, across the whole Query

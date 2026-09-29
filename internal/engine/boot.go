@@ -95,8 +95,11 @@ func (e *Engine) Start(ctx context.Context) {
 	// concludes (runBootLoad) or any View is adopted, every committed
 	// write's ChangeSet is buffered so the snapshot file can be adopted
 	// despite it (bootgap.go). Only worth arming when there is a file that
-	// could ever benefit.
+	// could ever benefit -- and the same goes for recording where PostgreSQL
+	// stands before this process can write, which the file attempt checks
+	// the file against (captureStartState).
 	if e.cfg.SnapshotDir != "" {
+		e.captureStartState(ctx)
 		e.bootGap.activate()
 	}
 
@@ -449,7 +452,7 @@ func (e *Engine) sweepStaleSnapshotTempFiles() {
 // here simply falls through to the retry loop that already exists for the pg
 // path.
 //
-// settledGen is read BEFORE ReadSnapshotFile even opens the file, mirroring
+// settledGen is read BEFORE the file is even opened, mirroring
 // rebuildOnce's identical ordering and for the identical reason (that
 // method's own doc): it is the watermark trust generation this adoption is
 // entitled to resolve. There is no applyEpoch read to pair it with anymore:
@@ -459,6 +462,15 @@ func (e *Engine) sweepStaleSnapshotTempFiles() {
 // counter-coverage proof (bootGapCoveredAt) plus its settledDirtyGen re-check
 // under applyMu, which together refuse exactly the writes the replay cannot
 // account for.
+//
+// The file's header is read first, on its own: a file the lineage or the
+// stamp already rules out (fileRefusal, watermark.go) is refused before its
+// body -- nearly all of a file that can run to gigabytes -- is read at all,
+// which is the ordinary outcome of every boot after `bloodtrail install` or
+// `bloodtrail rollback` ended the lineage. The header is not yet verified
+// at that point (the checksum covers the whole file), which is fine for a
+// refusal and never used for anything else: adoptSnapshotFileView asks
+// fileRefusal again of what ReadSnapshotFile verified before it adopts.
 //
 // Every rejection is logged at Info as "bloodtrail: snapshot file
 // rejected" -- an e2e/observability grep target -- naming why, with one
@@ -489,7 +501,7 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 
 	settledGen := e.settledDirtyGen.Load()
 
-	snap, fileWatermark, err := snapshot.ReadSnapshotFile(path)
+	header, err := snapshot.ReadSnapshotFileHeader(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			e.cfg.Log.DebugContext(ctx, "bloodtrail: no snapshot file", slog.String("path", path))
@@ -499,6 +511,25 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 				slog.Any("error", err),
 			)
 		}
+		return false
+	}
+	// A failed read is no verdict here: adoptSnapshotFileView reads the same
+	// row again and rejects the file itself if it still cannot.
+	if pgWatermark, pgLineage, err := e.readWatermarkAndLineage(ctx); err == nil {
+		if reason, attrs := e.fileRefusal(header.Lineage, header.Stamp, pgLineage); reason != "" {
+			e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
+				append([]any{slog.String("path", path), slog.String("reason", reason)},
+					append(attrs, slog.Uint64("pg_watermark", pgWatermark))...)...)
+			return false
+		}
+	}
+
+	snap, stamp, err := snapshot.ReadSnapshotFile(path)
+	if err != nil {
+		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
+			slog.String("path", path),
+			slog.Any("error", err),
+		)
 		return false
 	}
 
@@ -513,14 +544,15 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 		return false
 	}
 
-	replayed, adopted := e.adoptSnapshotFileView(ctx, path, snap, fileWatermark, settledGen)
+	replayed, adopted := e.adoptSnapshotFileView(ctx, path, snap, stamp, settledGen)
 	if !adopted {
 		return false
 	}
 
 	e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file loaded",
 		slog.String("path", path),
-		slog.Uint64("watermark", fileWatermark),
+		slog.Uint64("watermark", stamp.Watermark),
+		slog.String("lineage", snap.WatermarkLineage.String()),
 		slog.Int("nodes", snap.NodeCount()),
 		slog.Int("edges", snap.EdgeCount()),
 		slog.Int("replayed_writes", replayed),
@@ -591,6 +623,15 @@ const (
 // rewrites. The freeze itself therefore needs no lock: earlier bumps are
 // waited for, later ones are tolerated by construction.
 //
+// Before any attempt, fileRefusal (watermark.go) must find nothing against
+// the file: it has to belong to the watermark lineage PostgreSQL is in,
+// read in the same statement as the frozen target -- the counter
+// comparisons below prove nothing across lineages (watermarkLineageDDL) --
+// and its stamp must not show rows inserted behind the counter since it was
+// written (insertedSinceFile). Either rejects at once: no write this boot
+// could observe will ever make such a file right, so there is nothing to
+// wait for.
+//
 // The proof each attempt demands, evaluated under applyMu so no Apply can
 // move anything mid-attempt:
 //
@@ -641,7 +682,7 @@ const (
 // settled between that read and this publish, so every failure counted in
 // settledGen belongs to a write whose committed rows are either in the
 // file or in the replay.
-func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *snapshot.Snapshot, fileWatermark, settledGen uint64) (replayed int, adopted bool) {
+func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *snapshot.Snapshot, stamp snapshot.Stamp, settledGen uint64) (replayed int, adopted bool) {
 	reject := func(reason string, attrs ...any) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
 			append([]any{slog.String("path", path), slog.String("reason", reason)}, attrs...)...)
@@ -650,11 +691,18 @@ func (e *Engine) adoptSnapshotFileView(ctx context.Context, path string, snap *s
 	// The frozen target (see the doc above for why no lock is needed here):
 	// everything at or below it must be accounted for before adoption,
 	// everything above it is safe by construction.
-	pgSnapshot, err := e.ReadWatermark(ctx)
+	pgSnapshot, pgLineage, err := e.readWatermarkAndLineage(ctx)
 	if err != nil {
 		reject("read pg watermark failed", slog.Any("error", err))
 		return 0, false
 	}
+
+	if reason, attrs := e.fileRefusal(snap.WatermarkLineage, stamp, pgLineage); reason != "" {
+		reject(reason, append(attrs, slog.Uint64("pg_watermark", pgSnapshot))...)
+		return 0, false
+	}
+
+	fileWatermark := stamp.Watermark
 
 	start := time.Now()
 	deadline := start.Add(bootGapSettleTimeout)

@@ -81,8 +81,11 @@ func TestDepthBeyondTheDistanceBufferDeclines(t *testing.T) {
 func TestEveryReturnedPathStartsAtARoot(t *testing.T) {
 	for _, hops := range []int{2, 15, 100, MaxRepresentableDepth} {
 		view := chainView(t, hops)
+		// Per pair, so every node down the chain is a terminal with a path
+		// of its own; ModeAll would stop at the first hop.
 		paths, err := AllShortestPaths(view, Query{
 			Roots:    Endpoint{IDs: []snapshot.NodeID{0}},
+			Mode:     ModeAllPerPair,
 			MaxDepth: hops,
 			Limit:    10000,
 		})

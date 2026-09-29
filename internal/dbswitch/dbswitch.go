@@ -17,8 +17,44 @@ import (
 const (
 	readSQL  = "select driver from database_switch limit 1"
 	countSQL = "select (select count(*) from node) || '|' || (select count(*) from edge)"
-	clearSQL = "truncate table edge, node"
+	// clearSQL ends the watermark lineage in the same statement string, and
+	// so the same transaction (psql -c runs the whole string as one), as the
+	// truncate: a graph emptied behind BloodTrail's back must never leave a
+	// lineage behind that a saved snapshot file still matches.
+	clearSQL = "truncate table edge, node; " + endLineageSQL
 )
+
+// endLineageSQL ends BloodTrail's watermark lineage, if BloodTrail ever ran
+// against this database (internal/engine's watermark.go, at
+// watermarkLineageDDL, has the protocol): a fresh random lineage replaces the
+// current one, so no snapshot file saved before this statement names the
+// lineage PostgreSQL is in afterwards, and the next BloodTrail boot refuses
+// every such file and rebuilds from PostgreSQL instead.
+//
+// The counter is bumped too, for an engine that predates lineages: a table
+// without the lineage column was last run by one, and to it an advance
+// nothing will ever account for is what refuses the file. A newer engine
+// refuses on the lineage alone and ignores the bump.
+//
+// A database without the table is left untouched: BloodTrail never ran
+// there, and the engine gives the table it creates a lineage of its own.
+//
+// The table and its columns are the engine's (watermarkDDL and
+// watermarkLineageDDL), named again here because this package cannot import
+// the engine without pulling it into the command-line tool. What keeps the
+// two spellings together is the engine's lineage_integration_test.go, which
+// runs this very statement, through Store, against a table the engine
+// created, and requires the next boot to refuse the file it ends; this
+// package's own integration test covers the table older engines left.
+//
+// One line, like every statement here, so an error echoing the command
+// stays readable.
+const endLineageSQL = "do $$ begin " +
+	"if to_regclass('bloodtrail_watermark') is null then return; end if; " +
+	"update bloodtrail_watermark set counter = counter + 1, updated_at = now() where id = 1; " +
+	"if exists (select 1 from pg_attribute where attrelid = to_regclass('bloodtrail_watermark') and attname = 'lineage' and not attisdropped) then " +
+	"update bloodtrail_watermark set lineage = gen_random_uuid() where id = 1; " +
+	"end if; end $$"
 
 var driverNamePattern = regexp.MustCompile(`^[a-z0-9+_-]{1,32}$`)
 
@@ -114,10 +150,26 @@ func (s Store) CountGraph(ctx context.Context) (int64, int64, error) {
 // collides with the unique object id index; clearing first is the only way to
 // replace the graph rather than layer on top of it. Absent tables mean there
 // is no PostgreSQL graph yet, which is already the wanted state.
+//
+// The truncate ends BloodTrail's watermark lineage as it commits (clearSQL):
+// neither it nor the migration that refills the tables bumps the watermark
+// counter, so a snapshot file saved from the graph being replaced would
+// otherwise still read as current to the next BloodTrail boot.
 func (s Store) ClearGraph(ctx context.Context) error {
 	_, err := s.psql(ctx, clearSQL)
 	if isMissingRelation(err, "node", "edge") {
 		return nil
 	}
+	return err
+}
+
+// EndWatermarkLineage ends BloodTrail's watermark lineage (endLineageSQL), so
+// that no snapshot file saved so far can be adopted by a later BloodTrail
+// boot. The installer calls it wherever the graph changes hands with a
+// writer that does not bump the watermark counter -- the stock BloodHound
+// image, BloodHound's migrator: once a rollback has the stock image running,
+// and again right before an install starts BloodTrail.
+func (s Store) EndWatermarkLineage(ctx context.Context) error {
+	_, err := s.psql(ctx, endLineageSQL)
 	return err
 }

@@ -81,7 +81,21 @@ run against that same fixture, still installed, before rollback:
    from BloodHound's own pre-built query corpus, each asserted against its own served-marker delta
    the same way step 2 was -- `builder engine served` and `cypher engine served` are logged at
    Debug, already visible since the stack's first boot.
-5. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
+5. **OpenGraph** (`build/e2e-opengraph.sh`, with `testdata/opengraph`). Register an extension
+   schema (`PUT /api/v2/extensions`), then upload three OpenGraph files through
+   `/api/v2/file-upload`: nodes and id-matched edges with a source kind, including a stub
+   endpoint and an edge from a fixture AD user; edges matched by name and by property,
+   one of them unresolvable (the job must end partially complete with that one warning);
+   and a file that fails validation after registering its own source kind. Then run
+   fourteen Cypher queries (every value type, multi-kind and stub nodes, variable-length
+   paths, `shortestPath`, both `allShortestPaths` answers, a hybrid AD-to-OpenGraph path,
+   counts) and three pathfinding calls with `only_traversable=true`. Last, clear sourceless
+   data, then the source kind (`POST /api/v2/clear-database`). Every expected value is
+   what stock BloodHound v9.6.0 on PostgreSQL returns; every answer must carry its
+   `cypher engine served` or `path engine served` marker, and the phase must log no
+   `snapshot rebuilt` and no `fallback entered`. `CHECK_SERVED=0` runs the same
+   expectations against a BloodHound on the PostgreSQL driver.
+6. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
    directory (so the file survives the container recreate the config change itself causes),
    then `docker compose restart` the same container -- no further config change, so the
    container is not recreated. `snapshot file written` at that shutdown is asserted
@@ -101,8 +115,9 @@ run against that same fixture, still installed, before rollback:
      the snapshot-file section of the top-level [README](../README.md#write-through).
 
    Either way the boot must have read the file this phase's own shutdown wrote (compared by
-   stamped watermark), and a rejection for a corrupt or wrong-version file, a failed
-   watermark read, the memory limit, or no file attempt at all still fails. One more
+   stamped watermark), and a rejection for a corrupt or wrong-version file, a changed
+   watermark lineage, rows inserted behind the watermark, a failed watermark read, the
+   memory limit, or no file attempt at all still fails. One more
    `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths.
 
 Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Like a
@@ -124,8 +139,8 @@ regardless.
 | `snapshot rebuilt` | Info | A full PostgreSQL rebuild ran and was adopted -- `trigger` names why: `startup` (the one-shot boot load), `fallback` (recovery from the line above), or `manual`. |
 | `snapshot file written` | Info | The current replica was folded and written to `BLOODTRAIL_SNAPSHOT_DIR` -- by a clean shutdown, or by a background compaction once it had adopted its result. |
 | `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL, after replaying `replayed_writes` boot-time writes onto it (0 on a quiet restart). |
-| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. The causes sharing this marker -- unreadable/corrupt/wrong-version/structurally invalid, a failed PostgreSQL watermark read, an over-`BLOODTRAIL_MEMORY_LIMIT` size, a watermark gap the boot's own buffered writes could not cover, a fallback-shaped boot-time write, a poisoned or overflowed boot-write buffer, and a replay failure -- are distinguished by a `reason` attribute on all but the first, which carries `error` instead. The gap, fallback and overflow shapes are the legitimate outcome of boot-time writes the replay cannot account for (or, for an overflow, cannot hold within its caps), not a fault: the file cannot be proven complete and the rebuild that follows is correct. |
-| `snapshot file invalidated` | Info | A write reached PostgreSQL without advancing the watermark counter (see `watermark bump failed` above), so the saved file was deleted: its stamp still matches what PostgreSQL reads, which would let a later boot declare a zero-sized gap and adopt a replica that is missing that write. Costs one slow boot (a full PostgreSQL rebuild) and nothing else. `snapshot file invalidation failed` (Warn) means the delete itself failed and a later boot may still adopt that file; `snapshot file not invalidated` (Warn) means there was no path to delete yet. |
+| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. The causes sharing this marker -- unreadable/corrupt/wrong-version/structurally invalid, a failed PostgreSQL watermark read, a changed watermark lineage, rows inserted behind the watermark, an over-`BLOODTRAIL_MEMORY_LIMIT` size, a watermark gap the boot's own buffered writes could not cover, a fallback-shaped boot-time write, a poisoned or overflowed boot-write buffer, and a replay failure -- are distinguished by a `reason` attribute on all but the first, which carries `error` instead. The gap, fallback and overflow shapes are the legitimate outcome of boot-time writes the replay cannot account for (or, for an overflow, cannot hold within its caps), not a fault: the file cannot be proven complete and the rebuild that follows is correct. So is `watermark lineage changed since the file was written` (with `file_lineage` and `pg_lineage`) on the first boot after `bloodtrail install`, or against a different or reset database: something that does not advance the counter may have written the graph since the file was saved (see the watermark lineage in the top-level [README](../README.md#write-through)). A version mismatch on the first boot after upgrading from a release whose files predate lineages is expected too. `rows were inserted since the file was written by a writer that did not advance the watermark` (with `file_node_id_seq`/`start_node_id_seq` and their edge counterparts: where the sequences stood when the file was saved, and when this boot started) is the same finding for a file whose lineage still matched: an id sequence moved while the counter did not, so something outside BloodTrail -- the stock image, `psql` -- inserted rows after the file was saved. |
+| `snapshot file invalidated` | Info | A write reached PostgreSQL without advancing the watermark counter (see `watermark bump failed` above), so the saved file was deleted: its stamp still matches what PostgreSQL reads, which would let a later boot declare a zero-sized gap and adopt a replica that is missing that write. Costs one slow boot (a full PostgreSQL rebuild) and nothing else. A save that was already writing its file when the bump failed deletes that file itself once it lands (`snapshot file not written`, Warn, reason `a watermark bump failed while the file was being written`). `snapshot file invalidation failed` (Warn) means the delete itself failed and a later boot may still adopt that file; `snapshot file not invalidated` (Warn) means there was no path to delete yet. |
 | `no snapshot file` | Debug | Boot found `BLOODTRAIL_SNAPSHOT_DIR` set but no file there yet (the ordinary first-ever boot against a given directory). The feature being disabled outright (`BLOODTRAIL_SNAPSHOT_DIR` unset) logs nothing here at all -- boot returns from the check before it would ever log. |
 | `compaction finished` | Info | A background compaction folded the write-through delta back into the base snapshot. |
 | `path engine served` / `builder engine served` / `cypher engine served` | Info / Debug / Debug | The in-memory engine, not PostgreSQL, answered a shortest-path, structural (node/relationship), or Cypher query respectively. |

@@ -1607,14 +1607,14 @@ func measureSnapshotIO(ctx context.Context, cfg config, base *baseGraph, result 
 		fmt.Printf("applybench: repeat %d: save close_wall_time=%s engine_logged_duration=%s\n", i+1, fmtMillis(saveDur), fmtMillis(loggedDur))
 
 		t0 := time.Now()
-		snap, watermark, err := snapshot.ReadSnapshotFile(path)
+		snap, stamp, err := snapshot.ReadSnapshotFile(path)
 		loadDur := time.Since(t0)
 		if err != nil {
 			return fmt.Errorf("repeat %d: read snapshot file %s: %w", i, path, err)
 		}
 		result.loadDurations = append(result.loadDurations, loadDur)
 		fmt.Printf("applybench: repeat %d: load (ReadSnapshotFile, parse only) duration=%s nodes=%d edges=%d watermark=%d\n",
-			i+1, fmtMillis(loadDur), snap.NodeCount(), snap.EdgeCount(), watermark)
+			i+1, fmtMillis(loadDur), snap.NodeCount(), snap.EdgeCount(), stamp.Watermark)
 
 		bootDur, err := runSnapshotBoot(ctx, cfg, dir, i)
 		if err != nil {

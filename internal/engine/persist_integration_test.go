@@ -6,9 +6,11 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/specterops/dawgs/graph"
 
@@ -106,7 +108,7 @@ func TestSaveSnapshotRefusesWhenApplyRacesTheProbe(t *testing.T) {
 
 	// Capture SaveSnapshot's own probe -- epoch, then the pg watermark round
 	// trip -- exactly as SaveSnapshot itself does (persist.go).
-	epoch, pgCounter, converged := eng.saveSnapshotProbe(ctx)
+	epoch, stamp, converged := eng.saveSnapshotProbe(ctx)
 	if !converged {
 		t.Fatalf("saveSnapshotProbe: converged = false before the racing write, want true (the test needs a real converged sample to prove the epoch guard, not convergence, is what refuses the save)")
 	}
@@ -115,7 +117,7 @@ func TestSaveSnapshotRefusesWhenApplyRacesTheProbe(t *testing.T) {
 	// and the commit below.
 	racedNodeID := applyOneWrite(t, ctx, eng)
 
-	if err := eng.saveSnapshotCommit(ctx, path, epoch, pgCounter, converged, false); err != nil {
+	if err := eng.saveSnapshotCommit(ctx, path, epoch, stamp, converged, false); err != nil {
 		t.Fatalf("saveSnapshotCommit after a racing Apply returned an error, want nil (a refusal, not a failure): %v", err)
 	}
 
@@ -194,7 +196,7 @@ func TestSaveSnapshotHappyPathStillWrites(t *testing.T) {
 	// watermark gate, which is exercised end to end by
 	// file_boot_integration_test.go) and confirm the write this test applied
 	// is actually in it.
-	snap, fileWatermark, err := snapshot.ReadSnapshotFile(path)
+	snap, stamp, err := snapshot.ReadSnapshotFile(path)
 	if err != nil {
 		t.Fatalf("ReadSnapshotFile: %v", err)
 	}
@@ -202,11 +204,107 @@ func TestSaveSnapshotHappyPathStillWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadWatermark: %v", err)
 	}
-	if fileWatermark != pgCounter {
-		t.Fatalf("file watermark = %d, want %d (the current, converged pg counter)", fileWatermark, pgCounter)
+	if stamp.Watermark != pgCounter {
+		t.Fatalf("file watermark = %d, want %d (the current, converged pg counter)", stamp.Watermark, pgCounter)
+	}
+	nodeSeq, edgeSeq, err := eng.readSequencePositions(ctx)
+	if err != nil {
+		t.Fatalf("readSequencePositions: %v", err)
+	}
+	if stamp.NodeIDSeq != nodeSeq || stamp.EdgeIDSeq != edgeSeq {
+		t.Fatalf("file id sequence positions = (%d, %d), want (%d, %d) (where PostgreSQL's stood when the file was saved)",
+			stamp.NodeIDSeq, stamp.EdgeIDSeq, nodeSeq, edgeSeq)
+	}
+	if nodeSeq < int64(nodeID) {
+		t.Fatalf("node id sequence at %d, behind node %d this test created: the position read is not the sequence's", nodeSeq, nodeID)
 	}
 	view := snapshot.NewView(snap)
 	if _, ok := view.Dense(uint64(nodeID)); !ok {
 		t.Fatalf("the written-through node is missing from the saved file's own snapshot")
+	}
+}
+
+// TestSaveSnapshotRemovesAFileWrittenAcrossAFailedBump is a save racing a
+// write whose watermark bump fails. The failure removes the snapshot file
+// (NoteWatermarkBumpFailure) because its write reaches PostgreSQL without
+// moving the counter -- but a save that had already decided to write lands
+// its own file after that removal, stamped with the counter the write never
+// moved. After a hard stop the next boot finds that file exactly current by
+// every check it has and serves a graph without the write. The write here
+// is an update, which leaves the id sequences where they were, so the
+// file's stamp cannot give it away either: the save itself has to take the
+// file back.
+//
+// The interleaving is driven the way TestSaveSnapshotRefusesWhenApplyRacesTheProbe
+// drives its own: saveSnapshotPrepare and saveSnapshotWrite are called
+// directly, with the failure and the write in between.
+func TestSaveSnapshotRemovesAFileWrittenAcrossAFailedBump(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	if _, err := pgDriver.AssertKinds(ctx, graph.Kinds{persistRaceKind}); err != nil {
+		t.Fatalf("assert kinds: %v", err)
+	}
+
+	dir := t.TempDir()
+	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	resetWatermarkTable(t, ctx, eng)
+	parkRebuildLoop(eng)
+	defer eng.Stop()
+
+	adoptOneRebuild(t, ctx, eng)
+	nodeID := applyOneWrite(t, ctx, eng)
+	if err := eng.SaveSnapshot(ctx); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	path := snapshotFilePathFor(t, pgDriver, dir)
+
+	epoch, stamp, converged := eng.saveSnapshotProbe(ctx)
+	if !converged {
+		t.Fatalf("saveSnapshotProbe: converged = false, want true (the save has to get as far as writing for the race to exist)")
+	}
+	pending, err := eng.saveSnapshotPrepare(ctx, epoch, converged, false)
+	if err != nil || pending == nil {
+		t.Fatalf("saveSnapshotPrepare = (%v, %v), want a snapshot to write:\n%s", pending, err, buf.String())
+	}
+
+	// The race: a write's bump fails, its removal takes the earlier file
+	// away, and the write commits uncounted -- all before the save's file
+	// lands.
+	eng.NoteWatermarkBumpFailure(ctx, NewWriteScope(), errors.New("simulated bump failure"))
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("the failed bump left the earlier file in place (stat: %v)", err)
+	}
+	stockImageSetName(t, ctx, pgDriver, nodeID, "written-uncounted")
+
+	if err := eng.saveSnapshotWrite(ctx, path, pending, stamp, time.Now()); err != nil {
+		t.Fatalf("saveSnapshotWrite: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a file written across a failed bump was left in place (stat: %v):\n%s", err, buf.String())
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "a watermark bump failed while the file was being written") {
+		t.Fatalf("the save did not say why it took its file back:\n%s", logged)
+	}
+
+	// What the file would have cost: the next process serves the write.
+	engB, bufB := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.Start(ctx)
+	defer engB.Stop()
+	waitForFresh(t, engB)
+	if strings.Contains(bufB.String(), "bloodtrail: snapshot file loaded") {
+		t.Fatalf("the next boot adopted a snapshot file:\n%s", bufB.String())
+	}
+	view, _ := engB.Fresh()
+	dense, ok := view.Dense(uint64(nodeID))
+	if !ok {
+		t.Fatalf("node %d is missing from the served graph", nodeID)
+	}
+	if name, _ := view.PropValueByName(dense, "name"); name != "written-uncounted" {
+		t.Fatalf("node %d serves name %v, want the uncounted write's", nodeID, name)
 	}
 }

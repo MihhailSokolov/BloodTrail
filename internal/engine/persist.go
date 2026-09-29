@@ -17,7 +17,13 @@ import (
 // every write-through delta segment layered onto it (View.Segments) -- into
 // one flat snapshot.Snapshot, and writes it to this engine's own snapshot
 // file (snapshotFilePath, boot.go), stamped with the pg watermark counter
-// that was live and converged at the moment this call decided to proceed.
+// that was live and converged at the moment this call decided to proceed
+// and with where the node and edge id sequences stood right after (the
+// snapshot.Stamp; watermark.go's insertedSinceFile says what a later boot
+// compares them against), and with the watermark lineage the base was
+// loaded in (the snapshot's own WatermarkLineage, never a fresh read: see
+// watermark.go's watermarkLineageDDL). A base whose lineage is unknown is
+// not written.
 // A later boot's tryLoadSnapshotFile compares that stamped counter against
 // pg's own counter at boot time, and trusts the file only when the gap
 // between the two is exactly covered by that boot's own buffered writes
@@ -101,8 +107,8 @@ func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error
 		return nil
 	}
 
-	epoch, pgCounter, converged := e.saveSnapshotProbe(ctx)
-	return e.saveSnapshotCommit(ctx, path, epoch, pgCounter, converged, requireEmptyDelta)
+	epoch, stamp, converged := e.saveSnapshotProbe(ctx)
+	return e.saveSnapshotCommit(ctx, path, epoch, stamp, converged, requireEmptyDelta)
 }
 
 // saveSnapshotProbe is SaveSnapshot's read-only preparation, run BEFORE
@@ -112,10 +118,33 @@ func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error
 // ordering (engine.go): reading the epoch after the round trip would let an
 // Apply that ran during the round trip slip in unnoticed by the later
 // recheck, exactly the gap saveSnapshotCommit's epoch guard exists to close.
-func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64, converged bool) {
+//
+// The id sequence positions the stamp carries are read only once the
+// counter has proven converged, and after it: every write the counter
+// counts has then resolved, so its inserts are already behind the positions
+// read, and a write that bumps after the counter read leaves the stamp's
+// counter behind PostgreSQL's for good, which is all a later boot needs to
+// know not to compare positions at all (insertedSinceFile). Read the other
+// way round, a write landing between the two reads could put its own
+// inserts past the stamped positions under a counter that already counts
+// it, and the next boot would refuse the file for rows this process wrote.
+// A failed read reports not converged: a file without its positions would
+// only ever be refused.
+func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch uint64, stamp snapshot.Stamp, converged bool) {
 	epoch = e.applyEpoch.Load()
-	pgCounter, converged = e.watermarkConverged(ctx)
-	return epoch, pgCounter, converged
+	stamp.Watermark, converged = e.watermarkConverged(ctx)
+	if !converged {
+		return epoch, stamp, false
+	}
+	nodeSeq, edgeSeq, err := e.readSequencePositions(ctx)
+	if err != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
+			slog.String("reason", "could not read the id sequence positions to stamp it with"),
+			slog.Any("error", err))
+		return epoch, stamp, false
+	}
+	stamp.NodeIDSeq, stamp.EdgeIDSeq = nodeSeq, edgeSeq
+	return epoch, stamp, true
 }
 
 // saveSnapshotCommit is SaveSnapshot's locked, epoch-verified fold-and-write
@@ -134,7 +163,7 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // wait for one -- see its own doc) could run its ENTIRE sequence in the gap
 // between the old code's two unlocked reads: this method would load the OLD
 // View (before the Apply's Store), then sample a watermark that has already
-// resolved past the Apply's write (converged, pgCounter == C+1) -- folding
+// resolved past the Apply's write (converged, counter == C+1) -- folding
 // stale data and stamping it with a counter that promises it is not stale.
 // A later boot (adoptSnapshotFileView's empty-gap case, boot.go) would
 // then trust that file and silently serve a replica missing the write.
@@ -167,7 +196,7 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 // re-reading them here would mean a second live pg call while holding
 // applyMu -- exactly the kind of I/O this lock must never gate (see below).
 // That is sound precisely because the epoch stayed unchanged: no Apply
-// resolved any bump in the window, so nothing could have moved pgCounter or
+// resolved any bump in the window, so nothing could have moved the counter or
 // converged in a way an Apply-driven write would need this call to notice.
 // (A bump whose OWN write has not yet reached Apply -- BumpWatermark run,
 // but the write's Apply call not yet made -- cannot make converged flip
@@ -209,23 +238,63 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch, pgCounter uint64
 //
 // The file WRITE, once a snap is decided (folded or bare base), never runs
 // inside the lock either way: applyMu is released before WriteSnapshotFile's
-// own I/O, capturing the folded snapshot and pgCounter as one pair first.
+// own I/O, capturing the folded snapshot and the stamp as one pair first.
 // That release reopens a narrow window -- an Apply that lands between the
 // unlock and the write completing -- but it cannot reintroduce the bug this
-// method exists to fix: the captured (snapshot, pgCounter) pair is still
-// mutually consistent (the data folded is exactly what pgCounter described
-// when this call verified it), and the racing Apply's own AdvanceWatermark
-// moves pg's watermark counter PAST pgCounter -- so the file this call is
-// about to write will be REJECTED by the very next boot's watermark-gap
-// check (bootGapCoveredAt): the racing write's counter belongs to THIS
-// process, so no later boot's own buffer can ever account for it, and the
-// gap can never be covered -- never trusted as complete when it is not.
-// Rejecting a file is always safe (boot.go's own fallback is a genuine
-// PostgreSQL rebuild); silently trusting a wrong one is the only outcome
-// this whole feature exists to rule out.
-func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgCounter uint64, converged bool, requireEmptyDelta bool) error {
+// method exists to fix: the captured (snapshot, stamp) pair is still
+// mutually consistent (the data folded is exactly what the stamped counter
+// described when this call verified it), and the racing Apply's own
+// AdvanceWatermark moves pg's watermark counter PAST the stamped one -- so
+// the file this call is about to write will be REJECTED by the very next
+// boot's watermark-gap check (bootGapCoveredAt): the racing write's counter
+// belongs to THIS process, so no later boot's own buffer can ever account
+// for it, and the gap can never be covered -- never trusted as complete
+// when it is not. Rejecting a file is always safe (boot.go's own fallback
+// is a genuine PostgreSQL rebuild); silently trusting a wrong one is the
+// only outcome this whole feature exists to rule out.
+//
+// The same window is where a racing write's watermark bump can FAIL, and
+// that write, unlike the one above, moves no counter at all: it reaches
+// PostgreSQL uncounted, so nothing about the file this call writes would
+// ever look stale to a later boot. NoteWatermarkBumpFailure removes the
+// snapshot file for exactly that reason (watermark.go), but its removal can
+// land before this call's file does, which would leave this file in place
+// -- stamped with the counter the uncounted write never moved, missing that
+// write's rows -- for the next boot after a hard stop to adopt as current.
+// saveSnapshotWrite therefore checks, once its file is in place, that no
+// bump has failed since the preconditions were checked, and removes the
+// file itself if one has. One of the two removals always comes last:
+// either the failure was noted before that check, which then sees it, or
+// after it, in which case the failure's own removal runs after this file
+// landed.
+//
+// The work is split into saveSnapshotPrepare (the locked decision and the
+// fold) and saveSnapshotWrite (the file) for the same reason SaveSnapshot's
+// own work is split into probe and commit: so a whitebox test can land a
+// failed bump between the two.
+func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch uint64, stamp snapshot.Stamp, converged bool, requireEmptyDelta bool) error {
 	start := time.Now()
+	pending, err := e.saveSnapshotPrepare(ctx, epoch, converged, requireEmptyDelta)
+	if pending == nil {
+		return err
+	}
+	return e.saveSnapshotWrite(ctx, path, pending, stamp, start)
+}
 
+// pendingSnapshotSave is a snapshot saveSnapshotPrepare has decided to
+// write: the folded (or bare base) snapshot, the watermark generation its
+// preconditions were checked against, and how long the fold took.
+type pendingSnapshotSave struct {
+	snap         *snapshot.Snapshot
+	dirtyGen     uint64
+	foldDuration time.Duration
+}
+
+// saveSnapshotPrepare is saveSnapshotCommit's locked half: the epoch guard,
+// the preconditions and the fold, all as that method's doc describes.
+// Returns nil and no error for a save it refused (already logged), nil and
+// the error for a fold that failed (already logged), or what to write.
+func (e *Engine) saveSnapshotPrepare(ctx context.Context, epoch uint64, converged bool, requireEmptyDelta bool) (*pendingSnapshotSave, error) {
 	e.applyMu.Lock()
 
 	if e.applyEpoch.Load() != epoch {
@@ -256,7 +325,7 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 			slog.Uint64("epoch_at_probe", epoch),
 			slog.Uint64("epoch_at_commit", e.applyEpoch.Load()),
 		)
-		return nil
+		return nil, nil
 	}
 
 	state := e.state.Load()
@@ -270,7 +339,17 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 			slog.Bool("gens_equal", dirtyGen == resolvedGen),
 			slog.Bool("converged", converged),
 		)
-		return nil
+		return nil, nil
+	}
+
+	// A file is only as good as the lineage it names, and the boot refuses
+	// one that names none -- so there is nothing worth writing for a base
+	// whose load could not read it (loadSnapshot's doc).
+	if view.Base().WatermarkLineage.IsZero() {
+		e.applyMu.Unlock()
+		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot file not written",
+			slog.String("reason", "the replica's watermark lineage is unknown"))
+		return nil, nil
 	}
 
 	segments := view.Segments()
@@ -280,7 +359,7 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 			slog.String("reason", "segments pending since adoption; the next compaction's own save covers it"),
 			slog.Int("segments", len(segments)),
 		)
-		return nil
+		return nil, nil
 	}
 
 	foldStart := time.Now()
@@ -296,21 +375,41 @@ func (e *Engine) saveSnapshotCommit(ctx context.Context, path string, epoch, pgC
 
 	if foldErr != nil {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "fold"), slog.Any("error", foldErr))
-		return fmt.Errorf("engine: SaveSnapshot: fold: %w", foldErr)
+		return nil, fmt.Errorf("engine: SaveSnapshot: fold: %w", foldErr)
 	}
+	return &pendingSnapshotSave{snap: snap, dirtyGen: dirtyGen, foldDuration: foldDuration}, nil
+}
+
+// saveSnapshotWrite is saveSnapshotCommit's unlocked half: it writes what
+// saveSnapshotPrepare decided on, then takes the file back out of play if a
+// watermark bump failed while it was being written (saveSnapshotCommit's
+// doc says why that cannot be left to NoteWatermarkBumpFailure's own
+// removal alone).
+func (e *Engine) saveSnapshotWrite(ctx context.Context, path string, pending *pendingSnapshotSave, stamp snapshot.Stamp, start time.Time) error {
+	snap := pending.snap
 
 	writeStart := time.Now()
-	if err := snapshot.WriteSnapshotFile(path, snap, pgCounter); err != nil {
+	if err := snapshot.WriteSnapshotFile(path, snap, stamp); err != nil {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "write"), slog.Any("error", err))
 		return fmt.Errorf("engine: SaveSnapshot: %w", err)
 	}
 
+	if e.dirtyGen.Load() != pending.dirtyGen {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
+			slog.String("reason", "a watermark bump failed while the file was being written"))
+		e.removeSnapshotFile(ctx, path)
+		return nil
+	}
+
 	e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file written",
 		slog.String("path", path),
-		slog.Uint64("watermark", pgCounter),
+		slog.Uint64("watermark", stamp.Watermark),
+		slog.String("lineage", snap.WatermarkLineage.String()),
+		slog.Int64("node_id_seq", stamp.NodeIDSeq),
+		slog.Int64("edge_id_seq", stamp.EdgeIDSeq),
 		slog.Int("nodes", snap.NodeCount()),
 		slog.Int("edges", snap.EdgeCount()),
-		slog.Duration("fold_duration", foldDuration),
+		slog.Duration("fold_duration", pending.foldDuration),
 		slog.Duration("write_duration", time.Since(writeStart)),
 		slog.Duration("duration", time.Since(start)),
 	)

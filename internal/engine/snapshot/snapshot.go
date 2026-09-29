@@ -2,6 +2,7 @@
 package snapshot
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -59,6 +60,17 @@ type Snapshot struct {
 	// Set by LoadSnapshot after Build; false on a Builder-only Snapshot
 	// (e.g. in unit tests) that never went through it.
 	MultiGraph bool
+
+	// WatermarkLineage is the watermark lineage this snapshot's contents
+	// belong to: the lineage PostgreSQL's bloodtrail_watermark row held when
+	// they were read (the engine's watermark.go explains lineages). Stamped
+	// by the engine's own load, read back from a snapshot file, and carried
+	// over by Fold, so a file written from any descendant of a load records
+	// the lineage that load saw -- never whatever PostgreSQL holds at save
+	// time. Zero means unknown (a Builder-only Snapshot, or a load that
+	// could not read it), and a snapshot with no known lineage is never
+	// written to a file.
+	WatermarkLineage Lineage
 
 	idIndex     map[uint64]NodeID
 	kindBitmaps map[KindID]*Bitset
@@ -118,6 +130,23 @@ type Snapshot struct {
 	// ascending OutEdgeIDs order, letting EdgeByID binary-search by database
 	// edge id without a separate id->index map.
 	edgeIDPerm []uint32
+}
+
+// Lineage identifies one watermark lineage: the uuid in PostgreSQL's
+// bloodtrail_watermark.lineage column, as its 16 raw bytes.
+type Lineage [16]byte
+
+// IsZero reports whether l is the zero value, which no lineage PostgreSQL
+// assigns (gen_random_uuid always sets the version bits) and which therefore
+// stands for "unknown".
+func (l Lineage) IsZero() bool {
+	return l == Lineage{}
+}
+
+// String formats l the way PostgreSQL prints a uuid, so a logged lineage can
+// be compared directly with `select lineage from bloodtrail_watermark`.
+func (l Lineage) String() string {
+	return fmt.Sprintf("%x-%x-%x-%x-%x", l[0:4], l[4:6], l[6:8], l[8:10], l[10:16])
 }
 
 // NodeCount returns the number of nodes in the snapshot.

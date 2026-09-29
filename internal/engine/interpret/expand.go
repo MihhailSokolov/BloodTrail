@@ -1140,18 +1140,8 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 	mode := traverse.ModeOne
 	if step.Shortest == ShortestAll {
 		mode = traverse.ModeAll
-		// allShortestPaths is served for one root and one terminal only.
-		// Over several pairs PostgreSQL's harness is not "every shortest
-		// path of every pair": without a pair filter,
-		// bidirectional_asp_harness returns the paths of the first
-		// expansion step that satisfies ANY pair and stops -- only the
-		// globally nearest pairs -- and with one, a pair resolved from one
-		// side keeps only the paths that side found. For a single pair
-		// both are that pair's shortest paths, which is what
-		// traverse.ModeAll computes.
-		total := env.Snap.NodeCount()
-		if roots.Count(total) != 1 || terminals.Count(total) != 1 {
-			return nil, errUnsupportedStep
+		if env.AllShortestPerPair {
+			mode = traverse.ModeAllPerPair
 		}
 	}
 

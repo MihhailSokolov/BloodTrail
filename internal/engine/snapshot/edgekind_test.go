@@ -98,7 +98,7 @@ func TestEdgeKindPresentEmptyGraph(t *testing.T) {
 func TestEdgeKindPresentFileRoundTrip(t *testing.T) {
 	s := buildEdgeKindFixture(t, true)
 	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := WriteSnapshotFile(path, s, 7); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 7}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 	got, _, err := ReadSnapshotFile(path)

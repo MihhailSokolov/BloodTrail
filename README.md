@@ -53,6 +53,7 @@ pinning a release, unattended installs, the smoke test, and what rollback restor
   - [In-memory path engine](#in-memory-path-engine) -- shortest paths
   - [Query-builder serving](#query-builder-serving) -- entity panels, analysis, tagging
   - [Cypher interpreter](#cypher-interpreter) -- what Cypher is served, and what always goes to PostgreSQL
+  - [OpenGraph](#opengraph) -- custom node and edge kinds
   - [Scope: what's here, and what's not](#whats-here-and-whats-not)
 - **Contributing**
   - [Developing and testing](#developing-and-testing)
@@ -145,16 +146,36 @@ validated.
   explicit `-f` and let `.env` decide.
 - Writing that entry replaces docker compose's own file discovery, so the installer
   writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the conventional `docker-compose.override.yml`. Deployments
-  that keep their customizations in that override file therefore keep them, both in the
-  installer's own commands and in the operator's afterwards. `bloodtrail rollback`
-  removes the whole entry again when the install was what created it, which puts
-  discovery back the way it was.
+  when one sits beside it, the override file compose loads on its own (the first of
+  `compose.override.yml`, `compose.override.yaml`, `docker-compose.override.yml` and
+  `docker-compose.override.yaml` that exists, whatever the compose file is called).
+  Deployments that keep their customizations in that override file therefore keep them,
+  both in the installer's own commands and in the operator's afterwards. `bloodtrail
+  rollback` removes the whole entry again when the install was what created it, which
+  puts discovery back the way it was -- unless the entry has been changed since (a file
+  added to it, say), in which case it takes out only its own override. With no entry, the
+  compose file given has to be the one discovery picks (`compose.yaml` wins over
+  `docker-compose.yml` in the same directory); otherwise the installer stops and asks
+  for `--compose-file` or an entry.
+- The installer stops before changing anything when it cannot be sure which files
+  docker compose loads for the operator: a `COMPOSE_FILE` entry that is empty, uses
+  interpolation or escapes, has an empty or space-padded name, does not list the compose
+  file it was given, or lists a file that does not exist; or `COMPOSE_FILE` (or a
+  `COMPOSE_PATH_SEPARATOR` other than `:`) set in the shell's environment, which docker
+  compose takes over `.env`. The message says what to change. `status`, `verify` and
+  `rollback` read the project more forgivingly, so they keep working on whatever an
+  install -- of this version or an earlier one -- left behind; where an earlier version
+  took an empty `COMPOSE_FILE=` entry for none and wrote its override into it,
+  `rollback` puts the empty entry back as it was.
 - `bloodtrail rollback` returns the deployment to the graph it had before the install.
   On a deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
   to the restored deployment. Re-ingest it, or reinstall with
   `--replace-postgres-graph` to migrate the current Neo4j graph again.
+- Rollback and reinstall never let a snapshot file outlive the stock image's writes,
+  wherever `BLOODTRAIL_SNAPSHOT_DIR` is configured: both end the watermark lineage (see
+  [Write-through](#write-through)), so the first boot after a reinstall rebuilds from
+  PostgreSQL rather than adopt a file saved before the rollback.
 - A second install after a rollback is refused while the earlier migration's graph is
   still in PostgreSQL, because BloodHound's migrator would layer the new graph on top of
   the old one instead of replacing it. `--replace-postgres-graph` clears it first; the
@@ -254,8 +275,12 @@ BloodTrail's log lines all carry a `bloodtrail:` prefix. Grouped by what they co
   the default graph` (Debug, expected on every ordinary startup -- see
   [Write-through](#write-through)'s own note), `bloodtrail: boot load failed` (Warn) and
   `bloodtrail: fallback rebuild failed` (Warn).
-- **Watermark**: `bloodtrail: watermark bump failed` (Warn) and `bloodtrail: watermark table
-  DDL failed` (Warn).
+- **Watermark**: `bloodtrail: watermark bump failed` (Warn), `bloodtrail: watermark table
+  DDL failed` (Warn), `bloodtrail: watermark lineage DDL failed` (Warn: no snapshot file is
+  written or adopted until a later start adds the lineage), `bloodtrail: could not read
+  the watermark lineage` (Warn: no snapshot file is written from that rebuild) and
+  `bloodtrail: could not record where PostgreSQL stood at start` (Warn: that boot does not
+  check its snapshot file for rows inserted behind the watermark).
 - **Snapshot file**: `bloodtrail: snapshot file loaded` (Info), `bloodtrail: snapshot file
   rejected` (Info, with a `reason` attr) / `bloodtrail: no snapshot file` (Debug, the
   ordinary first-boot case), `bloodtrail: snapshot file written` (Info) / `bloodtrail:
@@ -319,9 +344,10 @@ The validation levels differ, deliberately:
   shutdown and after every background compaction; the next boot loads it, replays onto it
   whatever recognized writes landed while it was loading (BloodHound writes to the graph
   on every boot, so this replay is what makes the file usable at all in practice), and
-  proves via the watermark counters that nothing else got in between -- falling back to a
-  normal PostgreSQL rebuild whenever that proof fails, e.g. after a crash or an
-  unrecognizable boot-time write. See [Write-through](#write-through) for details.
+  proves via the watermark counter, and the lineage it counts in, that nothing else got in
+  between -- falling back to a normal PostgreSQL rebuild whenever that proof fails, e.g.
+  after a crash, an unrecognizable boot-time write, or a rollback that let the stock image
+  write the graph. See [Write-through](#write-through) for details.
 - Deployment is a patched BloodHound image built from the upstream Dockerfile plus a
   one-file patch (the build script also adds the driver module to `go.mod`), and an
   installer that upgrades an existing BloodHound CE deployment with backup and
@@ -434,16 +460,43 @@ caller has already been told committed.
   least detected at boot -- see Watermark, next -- rather than silently missed forever,
   but the supported deployment shape is still a single API server process.
 - **Watermark.** A single-row table, `bloodtrail_watermark`, holds a counter that every
-  mutating driver call bumps before its own effect reaches PostgreSQL (inside the same
-  transaction where one exists, so a rolled-back write's bump rolls back with it). This
+  mutating driver call bumps before its own effect reaches PostgreSQL (in a transaction
+  of its own, so even a write that then rolls back has advanced it; the engine accounts
+  for such a write as one that committed nothing). This
   is what makes the snapshot file (next) safe to trust: a file stamped with counter N is
   provably complete for every write up to N, because the counter cannot have advanced
   without a write whose effect the file's own build would then be missing.
+
+  Only writes through BloodTrail's driver bump the counter, so a counter value means
+  something only within its **lineage**: a random id kept in the same row, which every
+  snapshot file records next to its counter. A file from any other lineage is refused
+  outright, and a lineage ends whenever the graph changes hands with something that does
+  not bump the counter: `bloodtrail rollback` ends it once the stock image is running
+  again, `bloodtrail install` ends it again right before starting BloodTrail, and
+  `--replace-postgres-graph` ends it in the same transaction as its truncate. A new or
+  reset database starts a lineage of its own. So a snapshot directory on a persistent
+  volume -- or configured in your own compose file, which rollback leaves in place -- can
+  never hand a reinstalled BloodTrail a file the stock image has since written past.
+  Anything else that writes the graph outside BloodTrail must end the lineage itself before
+  BloodTrail starts again -- `update bloodtrail_watermark set lineage = gen_random_uuid();`
+  -- or delete the snapshot file: `psql`, the stock image started by hand, BloodHound's own
+  tool API switching a running server to the plain `pg` driver (`/graph-db/switch/pg`),
+  and restoring a database backup. A backup needs it even when it restores the lineage
+  the file names: a dump taken while writes are landing can hold a counter whose write it
+  does not, since the bump commits before the write it guards.
+
+  BloodTrail catches the most common of those writes on its own, as a backstop: each file
+  also records where the `node` and `edge` id sequences stood when it was saved, and a
+  boot that finds the counter exactly where the file left it but either sequence moved on
+  refuses the file, since something inserted rows without bumping the counter. Updates
+  and deletes leave the sequences where they were, so this does not replace ending the
+  lineage.
 - **Snapshot file.** Set `BLOODTRAIL_SNAPSHOT_DIR` to let a restart skip the PostgreSQL
   rebuild. The engine writes a versioned binary snapshot of its in-memory state, stamped
-  with the watermark counter that was live at that instant, at two points: on a graceful
-  shutdown, and after every background compaction (next). At boot, it loads that file
-  and adopts it when the watermark counters prove nothing is missing: every write that
+  with the watermark counter that was live at that instant and the lineage its replica
+  was loaded in, at two points: on a graceful shutdown, and after every background
+  compaction (next). At boot, it loads that file and adopts it when it belongs to the
+  current lineage and the watermark counters prove nothing is missing: every write that
   lands while no replica exists yet is buffered (its counter and the keys it touched),
   and the file is adopted exactly when the file's stamped counter plus those buffered
   writes' own counters account for a fixed target -- PostgreSQL's counter as read once,
@@ -473,15 +526,20 @@ caller has already been told committed.
 
   **When the file is still rejected.** Adoption is a proof, not a hope, and every way
   the proof can fail falls back to a normal PostgreSQL rebuild -- always correct, just
-  slower, and a caller cannot tell the outcomes apart. A counter the boot cannot
-  account for even after the settle window rejects the file (`boot gap not covered by
-  buffered writes`, with a `waited` duration): a write from a previous process's crash
-  window, any writer this process never observed, or an in-flight write that outlived
-  the 5s wait. A boot-time write whose effect cannot be expressed as a replay -- raw
-  Cypher, a wipe, the same closed list ordinary write-through falls back on -- trips
-  fallback and rejects the file immediately (nothing to wait for), as does a buffer
-  that outgrew its caps (4,096 writes / 262,144 keys) under a genuinely heavy boot.
-  Each rejection is logged at Info with a `reason` and is followed by an ordinary
+  slower, and a caller cannot tell the outcomes apart. A file from another watermark
+  lineage is refused at once (`watermark lineage changed since the file was written`),
+  which is why the first boot after `bloodtrail install` always rebuilds; so, once, is a
+  file from a release that predated lineages. So is a file whose counter PostgreSQL
+  still reads but whose id sequences have moved on since (`rows were inserted since the
+  file was written by a writer that did not advance the watermark`). A counter the boot
+  cannot account for even after the settle window rejects the file (`boot gap not
+  covered by buffered writes`, with a `waited` duration): a write from a previous
+  process's crash window, any writer this process never observed, or an in-flight write
+  that outlived the 5s wait. A boot-time write whose effect cannot be expressed as a
+  replay -- raw Cypher, a wipe, the same closed list ordinary write-through falls back
+  on -- trips fallback and rejects the file immediately (nothing to wait for), as does a
+  buffer that outgrew its caps (4,096 writes / 262,144 keys) under a genuinely heavy
+  boot. Each rejection is logged at Info with a `reason` and is followed by an ordinary
   `snapshot rebuilt` line; an adoption logs `snapshot file loaded` with a
   `replayed_writes` count.
 - **Compaction.** Every applied write layers one more delta on top of the engine's base
@@ -723,6 +781,41 @@ refused instead (see [Write-through](#write-through)).
 
 See [bench/cypherbench](bench/cypherbench) for the measurement.
 
+## OpenGraph
+
+BloodHound's OpenGraph data (custom node and edge kinds uploaded as JSON, with an
+optional extension schema) reaches the graph through the same driver calls collector
+data does, so BloodTrail needs nothing OpenGraph-specific. What happens to it:
+
+- **Uploads replay by write-through.** An upload registers its `metadata.source_kind`
+  and node kinds in the `kind` table, then upserts nodes with `UpdateNodeBy` and edges
+  with `UpdateRelationshipBy`, both keyed on objectid. Every one of those writes is
+  replayed into the replica, including stub endpoints and an AD node gaining the source
+  kind through a hybrid edge. Endpoints matched by name or property are resolved by
+  ordinary read queries first.
+- **Reads are served from memory.** Cypher over custom kinds (label and property scans
+  over every OpenGraph value type, multi-kind nodes, variable-length paths,
+  `shortestPath`, both `allShortestPaths` answers, aggregates) and the pathfinding
+  endpoint with an extension's traversable kinds. `allShortestPaths` has two answers in
+  PostgreSQL: every pair's own shortest paths when both endpoints carry a property or
+  id constraint, and only the query's overall shortest paths otherwise. BloodTrail
+  reads which one applies from dawgs' own translation of the query.
+- **Deletes replay incrementally.** "Clear database" by source kind, of sourceless
+  data (which excludes every registered source kind, including one a failed upload
+  registered and no row carries) and by edge kind.
+- **What still goes to PostgreSQL**: a query naming a kind no row carries yet, such as
+  a failed upload's source kind, until the replica learns the kind; and the same shapes
+  that delegate for any other data.
+
+The evidence: `integration/opengraph_integration_test.go` replays upstream's OpenGraph
+call shapes and compares every step with the plain pg driver;
+`integration/shortest_path_level_integration_test.go` pins both `allShortestPaths`
+answers against PostgreSQL; and the end-to-end test uploads OpenGraph files through a
+real BloodHound ([build/README.md](build/README.md#end-to-end-test)). On a 190k-node
+organization, path queries answer 30-70x faster than on the PostgreSQL driver and
+scans about 2x, for about a quarter more ingest time ([BENCHMARK.md](BENCHMARK.md#opengraph),
+[bench/oggen](bench/oggen)).
+
 ## What's here, and what's not
 
 Everything the sections above describe is implemented and validated at 5M-node scale:
@@ -781,19 +874,23 @@ bench/csrbench/        CSR traversal micro-benchmark (self-contained Go module)
 bench/adgen/           Generates a synthetic AD-shaped graph and loads it into PostgreSQL
 bench/shgen/           Generates a fictitious AD forest as SharpHound v6 JSON, for
                        benchmarking a whole deployment through BloodHound's own ingest
+bench/oggen/           Generates a fictitious source-control organization as OpenGraph
+                       JSON, and benchmarks a deployment on it (bench.py)
 bench/pathbench/       Benchmarks the in-memory path engine against a loaded graph
 bench/builderbench/    Benchmarks query-builder serving against a loaded graph
 bench/cypherbench/     Benchmarks Cypher-interpreter serving against a loaded graph
 bench/applybench/      Benchmarks the write-through apply path against a loaded graph
 build/                 Builds a BloodHound CE image with the BloodTrail driver compiled
-                       in (build-image.sh) and the e2e smoke-test script (e2e.sh)
+                       in (build-image.sh) and the e2e smoke-test script (e2e.sh, with
+                       its OpenGraph phase in e2e-opengraph.sh)
 patches/               The upstream BloodHound CE source patch this driver is built
                        against (see Upstream versions in the README)
 scripts/               One-off tooling: extract-prebuilt-queries.go (regenerates
                        testdata/prebuilt/ from an upstream checkout) and install.sh
 testdata/              Fixtures for the differential test suites: dawgs/ (ported from
                        specterops/dawgs) and prebuilt/ (BloodHound's own pre-built
-                       Cypher query corpus, extracted by scripts/)
+                       Cypher query corpus, extracted by scripts/), and the e2e
+                       test's OpenGraph uploads (opengraph/)
 ```
 
 ## Licence

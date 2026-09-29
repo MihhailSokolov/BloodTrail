@@ -22,6 +22,15 @@ import (
 
 const upstreamImage = "docker.io/specterops/bloodhound:v9.6.0"
 
+// TestMain keeps the environment the tests run in out of Install's check on
+// COMPOSE_FILE and COMPOSE_PATH_SEPARATOR (see
+// TestInstallStopsWhenTheShellSetsComposeFile).
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("COMPOSE_FILE")
+	_ = os.Unsetenv("COMPOSE_PATH_SEPARATOR")
+	os.Exit(m.Run())
+}
+
 // testNeo4jPassword is built from a plain identifier rather than written as
 // a NEO4J_PASSWORD=literal or NEO4J_AUTH=neo4j/literal assignment anywhere
 // below, so secret scanners do not mistake this fixture for a real
@@ -90,6 +99,36 @@ func setupProject(t *testing.T) (string, string) {
 // active driver to "bloodtrail".
 const setRowSQL = "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('bloodtrail')"
 
+// endLineageSQL is the exact statement dbswitch.Store.EndWatermarkLineage
+// sends to end BloodTrail's watermark lineage, and dbswitch.Store.ClearGraph
+// appends to its truncate.
+const endLineageSQL = "do $$ begin " +
+	"if to_regclass('bloodtrail_watermark') is null then return; end if; " +
+	"update bloodtrail_watermark set counter = counter + 1, updated_at = now() where id = 1; " +
+	"if exists (select 1 from pg_attribute where attrelid = to_regclass('bloodtrail_watermark') and attname = 'lineage' and not attisdropped) then " +
+	"update bloodtrail_watermark set lineage = gen_random_uuid() where id = 1; " +
+	"end if; end $$"
+
+// clearGraphSQL is the exact statement dbswitch.Store.ClearGraph sends.
+const clearGraphSQL = "truncate table edge, node; " + endLineageSQL
+
+// scriptLineageEnd scripts the statement that ends BloodTrail's watermark
+// lineage, sent through psql, the prefix of the project it is addressed to.
+func scriptLineageEnd(fake *dockerx.FakeRunner, psql string) {
+	fake.Outputs[psql+endLineageSQL] = []byte("DO\n")
+}
+
+// callIndex returns the index of the first call in fake that starts with
+// prefix, or -1 when there is none.
+func callIndex(fake *dockerx.FakeRunner, prefix string) int {
+	for i, c := range fake.Calls {
+		if strings.HasPrefix(c, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestInstallOnNeo4jDeployment(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
@@ -133,6 +172,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 		},
 	}
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	var out bytes.Buffer
 	deps := Deps{
 		Runner:  fake,
@@ -209,6 +249,19 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	upIdx := idx("docker compose --project-directory " + dir + " -f " + composeFile + " -f ")
 	if backupIdx >= driverRowIdx || driverRowIdx >= upIdx {
 		t.Fatalf("unexpected call order:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	// The watermark lineage ends after the migration -- a writer that never
+	// bumps the counter, verified by the PostgreSQL recount that follows it --
+	// and before `up` starts BloodTrail, whose first boot would otherwise
+	// weigh an old snapshot file against a counter the migration never moved.
+	lastCountIdx := -1
+	for i, c := range fake.Calls {
+		if strings.HasPrefix(c, psql+"select (select count(*) from node)") {
+			lastCountIdx = i
+		}
+	}
+	if lineageIdx := idx(psql + endLineageSQL); lineageIdx == -1 || lineageIdx <= lastCountIdx || lineageIdx >= upIdx {
+		t.Fatalf("the watermark lineage must end after the migration and before BloodTrail starts:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 	if !strings.Contains(string(fake.Calls[len(fake.Calls)-1]), "logs --no-color bloodhound") {
 		t.Fatalf("expected verification logs call last, got %v", fake.Calls[len(fake.Calls)-1])
@@ -396,6 +449,7 @@ func TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory(
 	defer tool.Close()
 
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -512,6 +566,7 @@ func TestInstallIgnoresAPreExistingMigratorFailureLog(t *testing.T) {
 	defer tool.Close()
 
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -595,7 +650,7 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 			// and again through the whole project when verifying.
 			base + "logs --no-color bloodhound":                         []byte("BloodTrail driver active version=test\n"),
 			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
-			psql + "truncate table edge, node":                          []byte("TRUNCATE TABLE\n"),
+			psql + clearGraphSQL:                                        []byte("TRUNCATE TABLE\nDO\n"),
 			"docker image inspect " + image:                             []byte(""),
 			"docker image inspect " + toolapi.CurlImage:                 []byte(""),
 			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
@@ -630,6 +685,7 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 	defer tool.Close()
 
 	scriptContainerEpoch(fake, base)
+	scriptLineageEnd(fake, psql)
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -644,6 +700,55 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 	}
 	if !clearedBeforeMigration {
 		t.Fatalf("the stale graph must be cleared before the migration starts:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	// The truncate ends the lineage as it commits, and the migration that
+	// refills the graph writes without the counter too, so the lineage has to
+	// end again once it is done -- before BloodTrail starts, not just before
+	// the migration.
+	if lineageIdx, upIdx := callIndex(fake, psql+endLineageSQL), callIndex(fake, base+"-f "+overridePath+" up -d"); lineageIdx == -1 || lineageIdx >= upIdx || lineageIdx < callIndex(fake, psql+clearGraphSQL) {
+		t.Fatalf("the watermark lineage must end after the replaced graph was migrated and before BloodTrail starts:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// TestInstallDoesNotStartBloodTrailWhenTheLineageCannotBeEnded pins the
+// install's fail-closed half of the watermark lineage: BloodTrail's first
+// boot is exactly when a snapshot file from before the stock image's writes
+// could be adopted, so an install that could not end the lineage must stop
+// short of starting it -- with the rollback hint, since the driver row and
+// the override are already in place.
+func TestInstallDoesNotStartBloodTrailWhenTheLineageCannotBeEnded(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	psql := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			base + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+			psql + "select driver from database_switch limit 1":             []byte("pg\n"),
+			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+			"docker image inspect " + image:                                 []byte(""),
+			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
+		},
+		Errors: map[string]error{
+			psql + endLineageSQL: errors.New("psql: error: connection to server failed"),
+		},
+		Prefixes: map[string][]byte{
+			psql + "select (select count(*) from node)": []byte("10|20\n"),
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, Yes: true,
+		Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+
+	err := Install(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, opts)
+	if err == nil || !strings.Contains(err.Error(), "watermark lineage") || !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("expected the lineage failure with the rollback hint, got %v", err)
+	}
+	if fake.Called(base + "-f " + overridePath + " up -d") {
+		t.Fatalf("BloodTrail was started although the watermark lineage could not be ended:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive so `bloodtrail rollback` can undo the switch")
 	}
 }
 
@@ -678,6 +783,7 @@ func TestInstallKeepsTheOperatorsComposeFiles(t *testing.T) {
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
+	scriptLineageEnd(fake, psql)
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
@@ -822,14 +928,23 @@ func TestRollbackRestoresEverything(t *testing.T) {
 	// the project is addressed with both files; the restart afterwards is not.
 	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
 	psql := installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	restoredPSQL := base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
 	fake := &dockerx.FakeRunner{
 		Outputs: map[string][]byte{
 			base + "up -d": nil,
 			psql + "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')": []byte("INSERT 0 1\n"),
 		},
 	}
+	scriptLineageEnd(fake, restoredPSQL)
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
+	}
+	// The stock image writes the graph without the watermark counter from
+	// the moment it is back, so the lineage every saved snapshot file names
+	// has to end -- once BloodTrail, which saves the last such file as it
+	// stops, is gone: after `up`, through the project as restored.
+	if lineageIdx, upIdx := callIndex(fake, restoredPSQL+endLineageSQL), callIndex(fake, base+"up -d"); lineageIdx == -1 || lineageIdx < upIdx {
+		t.Fatalf("the watermark lineage must end once the original image is running again:\n%s", strings.Join(fake.Calls, "\n"))
 	}
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.bloodtrail.yml")); !os.IsNotExist(err) {
 		t.Fatal("override file should be removed")
@@ -864,6 +979,7 @@ func TestRollbackDeletesRowWhenOriginalAbsent(t *testing.T) {
 			psql + "delete from database_switch": nil,
 		},
 	}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
 	}
@@ -899,6 +1015,7 @@ func TestRollbackSaysWhatIsAlreadyRestoredWhenTheRestartFails(t *testing.T) {
 		},
 		Errors: map[string]error{base + "up -d": errors.New("port is already allocated")},
 	}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, VerifyTimeout: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "already restored") {
 		t.Fatalf("expected an error saying what is already restored, got %v", err)
@@ -908,6 +1025,69 @@ func TestRollbackSaysWhatIsAlreadyRestoredWhenTheRestartFails(t *testing.T) {
 	}
 	if !manifest.Exists(dir) {
 		t.Fatal("the manifest must survive a failed restart so the rerun finds the installation")
+	}
+	// The failed up may have started the stock image anyway; the lineage
+	// has to end regardless, after the attempt.
+	up, end := callIndex(fake, base+"up -d"), callIndex(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "+endLineageSQL)
+	if end < 0 || end < up {
+		t.Fatalf("the lineage was not ended after the failed restart (up at %d, lineage end at %d):\n%s", up, end, strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// TestRollbackReportsBothFailuresWhenTheRestartAndTheLineageEndFail pins the
+// error a failed restart reports when ending the lineage fails as well --
+// the database may simply not be up -- so neither failure hides the other.
+func TestRollbackReportsBothFailuresWhenTheRestartAndTheLineageEndFail(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	_ = os.WriteFile(filepath.Join(dir, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"), 0o644)
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound"}.Save(dir)
+
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	installed := base + "-f " + filepath.Join(dir, "docker-compose.bloodtrail.yml") + " "
+	fake := &dockerx.FakeRunner{
+		Outputs: map[string][]byte{
+			installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc delete from database_switch": nil,
+		},
+		Errors: map[string]error{
+			base + "up -d": errors.New("port is already allocated"),
+			base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + endLineageSQL: errors.New("service \"app-db\" is not running"),
+		},
+	}
+	err := Rollback(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, Yes: true, VerifyTimeout: time.Second})
+	if err == nil {
+		t.Fatal("a rollback whose restart failed reported success")
+	}
+	for _, want := range []string{"port is already allocated", "watermark lineage", "is not running", "rerun `bloodtrail rollback`"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error does not mention %q: %v", want, err)
+		}
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive a failed restart so the rerun finds the installation")
+	}
+}
+
+// TestRollbackKeepsTheManifestWhenTheLineageCannotBeEnded pins that a
+// rollback which restored everything but could not end the watermark
+// lineage does not report itself finished: the manifest stays, so the rerun
+// the error asks for runs again -- and a later install still finds the
+// installation it has to be rolled back first.
+func TestRollbackKeepsTheManifestWhenTheLineageCannotBeEnded(t *testing.T) {
+	dir, composeFile, fake, api := rollbackFixture(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake.Errors = map[string]error{
+		base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + endLineageSQL: errors.New("psql: error: connection to server failed"),
+	}
+
+	err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
+		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "watermark lineage") || !strings.Contains(err.Error(), "rerun `bloodtrail rollback`") {
+		t.Fatalf("expected the lineage failure with the rerun hint, got %v", err)
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("the manifest must survive so the rerun ends the lineage")
 	}
 }
 
@@ -1053,6 +1233,7 @@ func TestInstallKeepsTheComposeFileDiscoveryWouldHaveLoaded(t *testing.T) {
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
+	scriptLineageEnd(fake, psql)
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
@@ -1109,6 +1290,8 @@ func TestRollbackRemovesAnEnvEntryItCreated(t *testing.T) {
 			"docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " up -d": nil,
 		},
 	}
+	scriptLineageEnd(fake, "docker compose --project-directory "+dir+" -f "+composeFile+" -f "+discovered+
+		" exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
 		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
 		t.Fatal(err)
@@ -1119,6 +1302,177 @@ func TestRollbackRemovesAnEnvEntryItCreated(t *testing.T) {
 	}
 	if strings.TrimSpace(string(env)) != "A=b" {
 		t.Fatalf("rollback changed more than the entry it created: %q", env)
+	}
+}
+
+// TestRollbackKeepsFilesAddedToTheEntryItCreated covers an entry the install
+// created and the operator has since added a file to. Rollback deleted the
+// whole line, as for any entry it created, so that file silently dropped out
+// of the operator's project -- and out of rollback's own restart. The entry
+// now goes away only while it names just what the install wrote; otherwise
+// only the installer's own override comes out of it. Both restarts are
+// scripted, so only the result tells them apart.
+func TestRollbackKeepsFilesAddedToTheEntryItCreated(t *testing.T) {
+	for _, c := range []struct {
+		name, edited, restored string
+	}{
+		{"unchanged", "", ""},
+		{"a file added", "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml:tls.yml\n", "COMPOSE_FILE=docker-compose.yml:tls.yml\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			tls := filepath.Join(dir, "tls.yml")
+			_ = os.WriteFile(tls, []byte("services: {}\n"), 0o644)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+			defer api.Close()
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+			base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+			if err := Install(context.Background(), Deps{Runner: scriptPGInstall(&dockerx.FakeRunner{}, base, overridePath, image), HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+				t.Fatalf("install: %v", err)
+			}
+			installed := base + "-f " + overridePath + " "
+			envPath := filepath.Join(dir, ".env")
+			if c.edited != "" {
+				_ = os.WriteFile(envPath, []byte(c.edited), 0o644)
+				installed += "-f " + tls + " "
+			}
+
+			restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('pg')"
+			fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+				installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+				base + "up -d":                nil,
+				base + "-f " + tls + " up -d": nil,
+			}}
+			if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+				t.Fatalf("rollback: %v", err)
+			}
+			if env, _ := os.ReadFile(envPath); string(env) != c.restored {
+				t.Fatalf("rollback left .env as %q, want %q", env, c.restored)
+			}
+			if c.edited != "" && !fake.Called(base+"-f "+tls+" up -d") {
+				t.Fatalf("the restart dropped the file the operator added:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+		})
+	}
+}
+
+// TestRollbackWorksOnWhatEarlierInstallsLeft covers the .env states earlier
+// installers left behind, which rollback has to undo even though install
+// now refuses to create them. Taking an empty COMPOSE_FILE entry for none,
+// v0.1.2 wrote its override into it -- `COMPOSE_FILE=docker-compose.bloodtrail.yml`,
+// in the operator's own spelling -- and earlier versions wrote
+// `COMPOSE_FILE=:docker-compose.bloodtrail.yml`; an install that stopped
+// before its .env write left the empty entry itself, recorded as its own.
+// Rollback puts the empty entry back rather than deleting the line, restores
+// the driver row through the compose file even where the entry leaves it
+// out, and restarts the project as those installs read it. v0.1.2 also
+// extended a list that does not start with the compose file, which rollback
+// follows in compose's own order. The stricter reading this PR gave install
+// used to stop rollback on every one of these.
+func TestRollbackWorksOnWhatEarlierInstallsLeft(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		created bool
+		first   string // the files rollback restores the driver row through
+		restart string // the files it restarts with
+		want    string // .env afterwards
+		note    bool   // whether rollback says the entry it put back fails to load
+	}{
+		{"v0.1.2 over COMPOSE_FILE=", "A=b\nCOMPOSE_FILE=docker-compose.bloodtrail.yml\nC=d\n", true,
+			"base bloodtrail", "base discovered", "A=b\nCOMPOSE_FILE=\nC=d\n", true},
+		{`v0.1.2 over COMPOSE_FILE=""`, "COMPOSE_FILE=\"docker-compose.bloodtrail.yml\"\n", true,
+			"base bloodtrail", "base discovered", "COMPOSE_FILE=\"\"\n", true},
+		{"v0.1.1 over COMPOSE_FILE=", "COMPOSE_FILE=:docker-compose.bloodtrail.yml\n", true,
+			"base bloodtrail", "base discovered", "COMPOSE_FILE=\n", true},
+		{"stopped before writing over COMPOSE_FILE=", "COMPOSE_FILE=\n", true,
+			"base discovered", "base discovered", "COMPOSE_FILE=\n", false},
+		{"v0.1.2 over a list not starting with the compose file", "COMPOSE_FILE=extra.yml:docker-compose.yml:docker-compose.bloodtrail.yml\n", false,
+			"extra base bloodtrail", "extra base", "COMPOSE_FILE=extra.yml:docker-compose.yml\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			path := map[string]string{
+				"base":       composeFile,
+				"discovered": filepath.Join(dir, "docker-compose.override.yml"),
+				"bloodtrail": filepath.Join(dir, "docker-compose.bloodtrail.yml"),
+				"extra":      filepath.Join(dir, "extra.yml"),
+			}
+			for _, f := range []string{"discovered", "bloodtrail", "extra"} {
+				_ = os.WriteFile(path[f], []byte("services: {}\n"), 0o644)
+			}
+			project := func(files string) string {
+				p := "docker compose --project-directory " + dir
+				for _, f := range strings.Fields(files) {
+					p += " -f " + path[f]
+				}
+				return p + " "
+			}
+			envPath := filepath.Join(dir, ".env")
+			_ = os.WriteFile(envPath, []byte(c.env), 0o644)
+			row := "neo4j"
+			_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+				OverrideFile: path["bloodtrail"], PGUser: "bloodhound", PGDatabase: "bloodhound", EnvComposeFileCreated: c.created}.Save(dir)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+			defer api.Close()
+			restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')"
+			fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+				project(c.first) + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+				project(c.restart) + "up -d": nil,
+			}}
+			var out bytes.Buffer
+			if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out},
+				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+				t.Fatalf("rollback: %v\ncalls:\n%s", err, strings.Join(fake.Calls, "\n"))
+			}
+			if env, _ := os.ReadFile(envPath); string(env) != c.want {
+				t.Fatalf("rollback left .env as %q, want %q", env, c.want)
+			}
+			if said := strings.Contains(out.String(), "fails to load the project"); said != c.note {
+				t.Fatalf("rollback said (%v, want %v) that the entry it put back fails to load:\n%s", said, c.note, out.String())
+			}
+			if manifest.Exists(dir) {
+				t.Fatal("rollback did not finish")
+			}
+		})
+	}
+}
+
+// TestRollbackOfAnInstallThatNeverWroteTheEntry covers the manifest an install
+// leaves when it stops before its .env write -- a migration it refuses, say,
+// as the e2e run's second install does. The manifest records the entry the
+// install was going to create, but there is none, so rollback has nothing to
+// take out of .env and nothing to say about it.
+func TestRollbackOfAnInstallThatNeverWroteTheEntry(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	envPath := filepath.Join(dir, ".env")
+	_ = os.WriteFile(envPath, []byte("BLOODHOUND_TAG=9.6.0\n"), 0o644)
+	row := "pg"
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+		OverrideFile: filepath.Join(dir, "docker-compose.bloodtrail.yml"), PGUser: "bloodhound", PGDatabase: "bloodhound",
+		EnvComposeFileCreated: true, EnvComposeFileWritten: []string{"docker-compose.yml", "docker-compose.bloodtrail.yml"}}.Save(dir)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer api.Close()
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('pg')"
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+		base + "up -d": nil,
+	}}
+	var out bytes.Buffer
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out},
+		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if env, _ := os.ReadFile(envPath); string(env) != "BLOODHOUND_TAG=9.6.0\n" {
+		t.Fatalf("rollback changed .env to %q", env)
+	}
+	if strings.Contains(out.String(), "COMPOSE_FILE") {
+		t.Fatalf("rollback reported on an entry that was never written:\n%s", out.String())
 	}
 }
 
@@ -1147,6 +1501,250 @@ func TestComposeHandleSkipsAMissingExtraFile(t *testing.T) {
 	}
 }
 
+// TestComposeHandleFindsTheProjectComposeWouldDiscover pins compose's own
+// file discovery for a project with no COMPOSE_FILE entry (compose-go's
+// cli.DefaultFileNames and DefaultOverrideFileNames): the override is the
+// first of compose.override.yml, compose.override.yaml,
+// docker-compose.override.yml and docker-compose.override.yaml that exists,
+// whatever the base file is called, and there is none at all for a base file
+// compose does not discover itself, which the operator can only run with -f.
+// The installer used to pair the base file with "<name>.override.<ext>"
+// instead: it missed compose.override.* beside docker-compose.yml, took the
+// wrong spelling when there were two, and merged a stack.override.yml
+// compose never loads -- so its `up -d`, and the COMPOSE_FILE entry the
+// install writes, ran a different project from the operator's.
+func TestComposeHandleFindsTheProjectComposeWouldDiscover(t *testing.T) {
+	cases := []struct {
+		name  string
+		base  string   // the compose file the installer is given
+		files []string // the other files in the project directory
+		want  string   // the files merged after the base one
+	}{
+		{"compose.override.yaml beside docker-compose.yml", "docker-compose.yml", []string{"compose.override.yaml"}, "compose.override.yaml"},
+		{"docker-compose.override.yml beside compose.yaml", "compose.yaml", []string{"docker-compose.override.yml"}, "docker-compose.override.yml"},
+		{"compose.override.yml before docker-compose.override.yml", "docker-compose.yml", []string{"docker-compose.override.yml", "compose.override.yml"}, "compose.override.yml"},
+		{".yml before .yaml whatever the base file's", "docker-compose.yaml", []string{"docker-compose.override.yaml", "docker-compose.override.yml"}, "docker-compose.override.yml"},
+		{"none for a base file compose does not discover", "stack.yml", []string{"stack.override.yml", "docker-compose.override.yml"}, ""},
+		{"none there", "docker-compose.yml", nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range append([]string{c.base}, c.files...) {
+				_ = os.WriteFile(filepath.Join(dir, f), []byte("services: {}\n"), 0o644)
+			}
+			h, err := composeHandle(&dockerx.FakeRunner{}, filepath.Join(dir, c.base), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, f := range h.ExtraFiles {
+				got = append(got, strings.TrimPrefix(f, dir+string(filepath.Separator)))
+			}
+			if strings.Join(got, ",") != c.want {
+				t.Fatalf("merged after %s: %q, want %q", c.base, got, c.want)
+			}
+		})
+	}
+}
+
+// TestInstallRefusesAFileComposeWouldNotLoad covers a project with no
+// COMPOSE_FILE entry in whose directory compose's discovery picks another
+// compose file than the one the installer was given -- compose.yaml beside
+// the default docker-compose.yml, say. The operator's own commands run that
+// other file, so install must neither address the one it was given nor pin
+// it with the COMPOSE_FILE entry it writes, which would switch the
+// operator's commands over to it. The other commands, which have to keep
+// working, take the file given as run with -f.
+func TestInstallRefusesAFileComposeWouldNotLoad(t *testing.T) {
+	for _, c := range []struct {
+		base, other string
+	}{
+		{"docker-compose.yml", "compose.yaml"},
+		{"docker-compose.yaml", "docker-compose.yml"},
+		{"stack.yml", "docker-compose.yml"},
+	} {
+		dir := t.TempDir()
+		for _, f := range []string{c.base, c.other} {
+			_ = os.WriteFile(filepath.Join(dir, f), []byte("services: {}\n"), 0o644)
+		}
+		base := filepath.Join(dir, c.base)
+		if _, err := installHandle(&dockerx.FakeRunner{}, base, dir); err == nil || !strings.Contains(err.Error(), c.other) {
+			t.Errorf("install given %s beside %s: want an error naming %s, got %v", c.base, c.other, c.other, err)
+		}
+		if h, err := composeHandle(&dockerx.FakeRunner{}, base, dir); err != nil || h.File != base || len(h.ExtraFiles) != 0 {
+			t.Errorf("the others given %s beside %s: %v, %v; want %s alone", c.base, c.other, h.Args(), err, c.base)
+		}
+	}
+}
+
+// TestInstallWritesTheOverrideComposeWouldHaveDiscovered is the install half
+// of TestComposeHandleFindsTheProjectComposeWouldDiscover: the entry the
+// install writes replaces discovery, so it has to name the override compose
+// actually loads -- here compose.override.yaml beside docker-compose.yml,
+// which the installer used to leave out of its own commands and of the
+// operator's. Both projects are scripted, so only what the install did
+// tells them apart.
+func TestInstallWritesTheOverrideComposeWouldHaveDiscovered(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	discovered := filepath.Join(dir, "compose.override.yaml")
+	_ = os.WriteFile(discovered, []byte("services: {}\n"), 0o644)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	defer api.Close()
+
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake := scriptPGInstall(&dockerx.FakeRunner{}, base+"-f "+discovered+" ", overridePath, image)
+	scriptPGInstall(fake, base, overridePath, image)
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	for _, call := range fake.Calls {
+		if strings.HasPrefix(call, "docker compose") && !strings.Contains(call, " -f "+discovered+" ") {
+			t.Fatalf("a compose call dropped the override compose discovers: %s", call)
+		}
+	}
+	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	if want := "COMPOSE_FILE=docker-compose.yml:compose.override.yaml:docker-compose.bloodtrail.yml\n"; string(env) != want {
+		t.Fatalf(".env = %q, want %q", env, want)
+	}
+}
+
+// TestComposeHandleMergesTheListAsComposeDoes covers the order of what
+// COMPOSE_FILE lists. Compose merges exactly the list, in order: a later file
+// overrides an earlier one, and a file listed twice is merged twice. The
+// installer always put the compose file it was given first and dropped it
+// anywhere else, so for a list that did not start with it, its commands
+// merged another project -- `COMPOSE_FILE=extra.yml:docker-compose.yml` has
+// docker-compose.yml's settings win in the operator's commands and
+// extra.yml's in the installer's. The list now goes on exactly as listed.
+// Install also refuses a list that leaves out the compose file given, which
+// compose then does not load at all; the other commands put it first, as an
+// earlier install may have left an entry naming its override alone.
+func TestComposeHandleMergesTheListAsComposeDoes(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	extra := filepath.Join(dir, "extra.yml")
+	_ = os.WriteFile(extra, []byte("services: {}\n"), 0o644)
+	for _, c := range []struct {
+		entry  string
+		want   string // the -f files the handle names
+		strict bool   // whether install goes by them too, rather than refusing
+	}{
+		{"COMPOSE_FILE=docker-compose.yml:extra.yml:docker-compose.yml", " -f " + composeFile + " -f " + extra + " -f " + composeFile + " ", true},
+		{"COMPOSE_FILE=extra.yml:docker-compose.yml", " -f " + extra + " -f " + composeFile + " ", true},
+		{"COMPOSE_FILE=extra.yml", " -f " + composeFile + " -f " + extra + " ", false},
+	} {
+		_ = os.WriteFile(filepath.Join(dir, ".env"), []byte(c.entry+"\n"), 0o644)
+		for _, strict := range []bool{false, true} {
+			h, err := composeHandle(&dockerx.FakeRunner{}, composeFile, dir)
+			if strict {
+				h, err = installHandle(&dockerx.FakeRunner{}, composeFile, dir)
+			}
+			if strict && !c.strict {
+				if err == nil || !strings.Contains(err.Error(), "does not list "+composeFile) {
+					t.Errorf("%s: install wants a refusal naming %s, got %v (%s)", c.entry, composeFile, err, strings.Join(h.Args(), " "))
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("%s (strict %v): %v", c.entry, strict, err)
+			}
+			if args := strings.Join(h.Args("up", "-d"), " "); !strings.Contains(args, c.want+"up -d") {
+				t.Errorf("%s (strict %v): want %q merged, the installer merges %q", c.entry, strict, c.want, args)
+			}
+		}
+	}
+}
+
+// TestInstallStopsOnAListedFileThatIsMissing covers a COMPOSE_FILE entry
+// naming a file that is not on disk. Compose fails to load the project over
+// it; the installer skipped it and went on, so its `up -d` recreated the
+// operator's services without whatever that file held when they were
+// created. Install now stops first -- except for its own override, which a
+// leftover entry may still name and which it is about to write anyway. (The
+// other commands still skip a missing file; see
+// TestComposeHandleSkipsAMissingExtraFile.)
+func TestInstallStopsOnAListedFileThatIsMissing(t *testing.T) {
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	run := func(t *testing.T, entry string) (string, *dockerx.FakeRunner, error) {
+		dir, composeFile := setupProject(t)
+		_ = os.WriteFile(filepath.Join(dir, ".env"), []byte(entry+"\n"), 0o644)
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+		t.Cleanup(api.Close)
+		base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+		fake := scriptPGInstall(&dockerx.FakeRunner{}, base, filepath.Join(dir, "docker-compose.bloodtrail.yml"), image)
+		opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+			VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+		err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+		env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+		return string(env), fake, err
+	}
+
+	env, fake, err := run(t, "COMPOSE_FILE=docker-compose.yml:tls.yml")
+	if err == nil || !strings.Contains(err.Error(), "tls.yml, which does not exist") {
+		t.Fatalf("want a refusal naming tls.yml, got %v; .env is now %q", err, env)
+	}
+	if len(fake.Calls) != 0 {
+		t.Fatalf("install ran commands without the missing file:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+
+	env, _, err = run(t, "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml")
+	if err != nil {
+		t.Fatalf("a leftover entry naming the installer's own override: %v", err)
+	}
+	if env != "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n" {
+		t.Fatalf(".env = %q", env)
+	}
+}
+
+// TestInstallStopsWhenTheShellSetsComposeFile covers COMPOSE_FILE -- or a
+// COMPOSE_PATH_SEPARATOR other than compose's default ':' -- set in the
+// environment the installer runs in. Compose takes both from the shell over
+// .env, so a plain `docker compose up -d` from that shell ignores the entry
+// the install writes to .env (booting the upstream image against the
+// `bloodtrail` driver setting the install leaves behind), or splits it into
+// names that do not exist. The installer's own commands name every file with
+// -f, which compose honours over either, so nothing used to notice.
+func TestInstallStopsWhenTheShellSetsComposeFile(t *testing.T) {
+	for _, c := range []struct {
+		key, value string
+		refused    bool
+	}{
+		{"COMPOSE_FILE", "docker-compose.yml", true},
+		{"COMPOSE_FILE", "", true},
+		{"COMPOSE_PATH_SEPARATOR", ";", true},
+		{"COMPOSE_PATH_SEPARATOR", ":", false},
+	} {
+		t.Run(c.key+"="+c.value, func(t *testing.T) {
+			t.Setenv(c.key, c.value)
+			dir, composeFile := setupProject(t)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+			defer api.Close()
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+			fake := scriptPGInstall(&dockerx.FakeRunner{}, base, filepath.Join(dir, "docker-compose.bloodtrail.yml"), image)
+			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+			err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+			if !c.refused {
+				if err != nil {
+					t.Fatalf("install with compose's default separator: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.key+" is set") {
+				t.Fatalf("want a refusal naming %s, got %v", c.key, err)
+			}
+			if len(fake.Calls) != 0 {
+				t.Fatalf("install ran commands first:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+		})
+	}
+}
+
 // TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry pins the fail
 // closed half of compose.ComposeFiles at the installer: an entry it cannot
 // read with certainty stops every command before it runs anything, rather
@@ -1166,6 +1764,111 @@ func TestInstallAndRollbackStopOnAnUnreadableComposeFileEntry(t *testing.T) {
 	}
 	if len(fake.Calls) != 0 {
 		t.Fatalf("commands ran against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+}
+
+// scriptPGInstall scripts on fake a whole install onto a deployment already
+// on PostgreSQL, addressed as project -- the "docker compose ..." prefix that
+// names its files: inventory, backup, driver switch, restart, verification.
+// A test can script more than one project on the same fake, so that the
+// install runs to the end whichever one it addresses and only what it did
+// tells them apart.
+func scriptPGInstall(fake *dockerx.FakeRunner, project, overridePath, image string) *dockerx.FakeRunner {
+	if fake.Outputs == nil {
+		fake.Outputs = map[string][]byte{}
+	}
+	if fake.Prefixes == nil {
+		fake.Prefixes = map[string][]byte{}
+	}
+	psql := project + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+	withOverride := project + "-f " + overridePath + " "
+	for cmd, out := range map[string][]byte{
+		project + "config --format json":                                   composeConfigJSON(upstreamImage, "pg"),
+		psql + "select driver from database_switch limit 1":                []byte("pg\n"),
+		project + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
+		"docker image inspect " + image:                                    []byte(""),
+		psql + setRowSQL:                                                   []byte("INSERT 0 1\n"),
+		withOverride + "up -d":                                             nil,
+		withOverride + "logs --no-color bloodhound":                        []byte("BloodTrail driver active version=test\n"),
+	} {
+		fake.Outputs[cmd] = out
+	}
+	fake.Prefixes[psql+"select (select count(*) from node)"] = []byte("10|20\n")
+	return fake
+}
+
+// TestInstallStopsOnAnEmptyComposeFileEntry covers a .env whose COMPOSE_FILE
+// entry is there but lists no files. Compose does not read that as unset --
+// it fails to load the project -- so it is neither the project discovery
+// would find nor a list to extend. Taken for no entry, it used to let the
+// install run against the discovered project and then rewrite the line to
+// name its own override alone, which is all the operator's plain `docker
+// compose up -d` would load; and rollback, told the install had created the
+// entry, deleted the operator's line outright. Install is scripted to run to
+// completion here, so only its refusal can stop it; and rollback of the
+// manifest an earlier install left over such an entry -- stopped before its
+// .env write -- completes and leaves the operator's line as it is.
+func TestInstallStopsOnAnEmptyComposeFileEntry(t *testing.T) {
+	for _, entry := range []string{"COMPOSE_FILE=", `COMPOSE_FILE=""`} {
+		t.Run(entry, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			discovered := filepath.Join(dir, "docker-compose.override.yml")
+			_ = os.WriteFile(discovered, []byte("services: {}\n"), 0o644)
+			envPath := filepath.Join(dir, ".env")
+			original := "A=b\n" + entry + "\nC=d\n"
+			_ = os.WriteFile(envPath, []byte(original), 0o644)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+			defer api.Close()
+
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+			discoveredProject := "docker compose --project-directory " + dir + " -f " + composeFile + " -f " + discovered + " "
+			psql := discoveredProject + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc "
+			fake := scriptPGInstall(&dockerx.FakeRunner{}, discoveredProject, overridePath, image)
+			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+			err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+			env, _ := os.ReadFile(envPath)
+			if err == nil || !strings.Contains(err.Error(), "COMPOSE_FILE lists no files") {
+				t.Fatalf("install: want an error saying the entry lists no files, got %v; .env is now %q", err, env)
+			}
+			if string(env) != original {
+				t.Fatalf("install changed .env to %q, want it left as %q", env, original)
+			}
+			if len(fake.Calls) != 0 {
+				t.Fatalf("install ran commands against a guessed project:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+			if manifest.Exists(dir) {
+				t.Fatal("a refused install saved a manifest")
+			}
+			if _, statErr := os.Stat(overridePath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("a refused install wrote the override (stat: %v)", statErr)
+			}
+
+			// The manifest an install used to leave behind when it stopped
+			// before its .env write (a failed migration, say): it had taken
+			// the entry for none, so it recorded the line as its own.
+			row := "neo4j"
+			_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+				OverrideFile: overridePath, PGUser: "bloodhound", PGDatabase: "bloodhound", EnvComposeFileCreated: true}.Save(dir)
+			restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('neo4j')"
+			fake = &dockerx.FakeRunner{Outputs: map[string][]byte{
+				psql + restoreRow:           []byte("INSERT 0 1\n"),
+				discoveredProject + "up -d": nil,
+			}}
+			err = Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
+				Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second})
+			env, _ = os.ReadFile(envPath)
+			if err != nil {
+				t.Fatalf("rollback: %v; .env is now %q", err, env)
+			}
+			if string(env) != original {
+				t.Fatalf("rollback changed .env to %q, want it left as %q", env, original)
+			}
+			if manifest.Exists(dir) {
+				t.Fatal("rollback did not finish")
+			}
+		})
 	}
 }
 
@@ -1205,6 +1908,7 @@ func rollbackFixture(t *testing.T) (dir, composeFile string, fake *dockerx.FakeR
 		base + "up -d": nil,
 		installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc delete from database_switch": nil,
 	}}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
 	return dir, composeFile, fake, api
 }
 

@@ -274,6 +274,13 @@ func (b *bootGapBuffer) peek() (entries []bootGapEntry, poisoned string) {
 // rejecting, resolves; this predicate stays time-blind and answers only
 // "is the target covered RIGHT NOW".
 //
+// "Every mutating write bumps the counter" holds only within one watermark
+// lineage: a writer that does not bump it -- the stock image, a TRUNCATE --
+// leaves no counter behind at all, so no hole, and is visible only as the
+// lineage it obliges its operator to end (watermark.go's
+// watermarkLineageDDL). adoptSnapshotFileView refuses a file from another
+// lineage before this predicate is ever consulted.
+//
 // Counters ABOVE pgSnapshot are permitted and simply ignored here: they
 // belong to writes that landed after the target was frozen, whose safety
 // is the adoption path's argument (observed ones ride the replay; parked

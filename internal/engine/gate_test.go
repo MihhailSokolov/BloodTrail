@@ -111,6 +111,52 @@ func TestTranslateGateOK(t *testing.T) {
 	}
 }
 
+// TestTranslateGateAllShortestSemantics pins which allShortestPaths shapes
+// dawgs' translator hands a pair filter (per-pair resolution) and which it
+// does not (the query's overall shortest length). Each classification here
+// matches what PostgreSQL returned for the same shape in
+// integration/shortest_path_level_integration_test.go.
+func TestTranslateGateAllShortestSemantics(t *testing.T) {
+	snap := gateTestSnapshot(t)
+
+	tests := []struct {
+		name string
+		text string
+		want allShortestSemantics
+	}{
+		{"no path", `MATCH (n:User) RETURN n`, allShortestNone},
+		{"shortestPath is not allShortestPaths", `MATCH p = shortestPath((s:User)-[:MemberOf*1..]->(e:Group)) RETURN p`, allShortestNone},
+		{"kind-only endpoints", `MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(e:Group)) RETURN p`, allShortestOverall},
+		{"property roots, kind-only terminals", `MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(e:Group)) WHERE s.name IN ['a', 'b'] RETURN p`, allShortestOverall},
+		{"kind-only roots, property terminal", `MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(e:Group)) WHERE e.name = 'x' RETURN p`, allShortestOverall},
+		{"property constraints on both endpoints", `MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(e:Group)) WHERE s.name IN ['a', 'b'] AND e.name = 'x' RETURN p`, allShortestPerPair},
+		{"unconstrained roots", `MATCH p = allShortestPaths((s)-[:MemberOf*1..]->(e:Group)) WHERE e.name = 'x' RETURN p`, allShortestOverall},
+		{
+			"both semantics in one query",
+			`MATCH p = allShortestPaths((s:User)-[:MemberOf*1..]->(e:Group)) WHERE s.name = 'a' AND e.name = 'x'
+			 MATCH q = allShortestPaths((u:User)-[:MemberOf*1..]->(g:Group))
+			 RETURN p, q`,
+			allShortestMixed,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rq, err := frontend.ParseCypher(frontend.NewContext(), tc.text)
+			if err != nil {
+				t.Fatalf("ParseCypher(%q): %v", tc.text, err)
+			}
+			translation, ok := translateGate(context.Background(), rq, snapshot.NewView(snap))
+			if !ok {
+				t.Fatalf("translateGate(%q) did not translate", tc.text)
+			}
+			if got := harnessSemantics(translation.Statement); got != tc.want {
+				t.Fatalf("harnessSemantics(%q) = %d, want %d", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
 // --- snapshotKindMapper --------------------------------------------------
 
 func TestSnapshotKindMapperMapKindsHit(t *testing.T) {

@@ -4,6 +4,7 @@ package manifest
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -24,6 +25,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		UpstreamTag:       "v9.6.0",
 		PGUser:            "bloodhound",
 		PGDatabase:        "bloodhound",
+
+		EnvComposeFileCreated: true,
+		EnvComposeFileWritten: []string{"docker-compose.yml", "docker-compose.bloodtrail.yml"},
 	}
 	if Exists(dir) {
 		t.Fatal("manifest should not exist yet")
@@ -38,12 +42,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got != m && (got.OriginalDriverRow == nil || *got.OriginalDriverRow != "neo4j") {
-		t.Fatalf("round trip mismatch: %+v", got)
-	}
-	got.OriginalDriverRow = nil
-	m.OriginalDriverRow = nil
-	if got != m {
+	if !reflect.DeepEqual(got, m) {
 		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, m)
 	}
 }

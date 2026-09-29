@@ -151,6 +151,14 @@ func (b *memBudget) add(n uint64) error {
 	return nil
 }
 
+// reset forgets every byte accounted so far, for a caller that has just
+// discarded every path those bytes were charged for (shortestLevel.admit).
+func (b *memBudget) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.used = 0
+}
+
 // ErrMemoryLimit is returned by enumerate when accounting a completed path
 // would exceed the memBudget's limit.
 var ErrMemoryLimit = errors.New("bloodtrail: path engine memory limit exceeded")
@@ -171,17 +179,66 @@ const (
 	SideBudget = 16   // max full-BFS runs from the constrained side
 )
 
-// Mode selects how many shortest paths AllShortestPaths returns per pair.
+// Mode selects which shortest paths AllShortestPaths returns.
 type Mode int
 
 const (
-	// ModeAll returns every shortest path per pair (allShortestPaths /
-	// FetchAllShortestPaths).
+	// ModeAll returns every path of the query's overall shortest length
+	// (allShortestPaths): a pair whose own shortest path is longer than the
+	// shortest any pair has contributes nothing. dawgs' pg driver answers
+	// allShortestPaths this way unless it resolves pairs one by one (see
+	// ModeAllPerPair): unidirectional_asp_harness, and
+	// bidirectional_asp_harness without a pair filter, expand from the whole
+	// root set at once and return at the first depth where any root reaches
+	// any terminal (drivers/pg/query/sql/schema_up.sql, v0.8.0). See
+	// shortestLevel.
 	ModeAll Mode = iota
 	// ModeOne returns a single shortest path per pair (cypher
-	// shortestPath()).
+	// shortestPath()), however long each pair's is: dawgs' sp harness keeps
+	// a visited set per root and keeps expanding until every root has
+	// found its terminals.
 	ModeOne
+	// ModeAllPerPair returns every shortest path of every pair, each pair at
+	// its own length: bidirectional_asp_harness's answer when the translator
+	// hands it a pair filter, which it resolves pair by pair
+	// (resolved_pair_depths). It equals ModeAll whenever every pair that
+	// has a path sits at the same distance, a single pair included.
+	ModeAllPerPair
 )
+
+// shortestLevel carries ModeAll's one-length-for-the-whole-query rule
+// through a strategy's enumeration loop, which meets pairs in output order
+// rather than in order of length. best is the shortest pair length (in
+// hops) admitted so far, 0 before the first.
+type shortestLevel struct {
+	best int
+}
+
+// admit reports whether a pair whose shortest path is d hops long belongs in
+// the result. A pair strictly shorter than every one before it starts the
+// result over: out is emptied and budget cleared of the discarded paths'
+// bytes, so a Limit already reached at a longer length never keeps a
+// shorter pair out. d < 1 (no path, or the zero-length self pair no
+// strategy ever emits) is never admitted.
+func (l *shortestLevel) admit(d int, out *[]Path, budget *memBudget) bool {
+	switch {
+	case d < 1:
+		return false
+	case l.best == 0 || d < l.best:
+		l.best = d
+		*out = (*out)[:0]
+		budget.reset()
+		return true
+	default:
+		return d == l.best
+	}
+}
+
+// final reports whether no later pair can beat the current length: one hop
+// is the shortest a path can be, so a full result at one hop is the answer.
+func (l *shortestLevel) final() bool {
+	return l.best == 1
+}
 
 // Endpoint constrains one side (roots or terminals) of a Query. At most one
 // of IDs and Bits is meaningful at a time; IDs takes precedence when both
@@ -400,8 +457,9 @@ var ErrTooLarge = errors.New("bloodtrail: query too large for the path engine")
 //	C. otherwise: return ErrTooLarge (caller delegates to PostgreSQL).
 //
 // Results are ordered by (root dense id, terminal dense id); depths within
-// a pair are equal by construction. Dense ascending == database-id
-// ascending because the snapshot loads nodes ordered by id.
+// a pair are equal by construction, and in ModeAll across pairs too (see
+// ModeAll). Dense ascending == database-id ascending because the snapshot
+// loads nodes ordered by id.
 func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
 	n := s.NodeCount()
 
@@ -494,7 +552,9 @@ func pathCap(limit, have int, oneMore bool) (cap int, done bool) {
 
 // strategyPairs implements strategy A: iterate every (root, terminal) pair
 // in ascending dense order and run pairPaths on each, sharing one set of
-// scratch buffers and stopping once Limit is reached.
+// scratch buffers and stopping once Limit is reached. In ModeAll a pair is
+// only enumerated at the query's overall shortest length (shortestLevel),
+// and a Limit reached at a longer length keeps the scan going.
 func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget) ([]Path, error) {
 	n := s.NodeCount()
 	scF, scT, scTmp := getScratch(n), getScratch(n), getScratch(n)
@@ -505,11 +565,37 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 
 	var out []Path
 	var callErr error
+	var level shortestLevel
 
 	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
 		stopOuter := false
 		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
 			if q.ExcludeSelf && r == t {
+				return true
+			}
+			if q.Mode == ModeAll {
+				// A pair longer than the length already admitted can only be
+				// rejected, so its search stops there instead of at maxDepth.
+				depth := maxDepth
+				if level.best > 0 && level.best < depth {
+					depth = level.best
+				}
+				D := pairShortest(s, r, t, kinds, depth, scF, scT, scTmp)
+				if !level.admit(D, &out, budget) {
+					return true
+				}
+				cap, done := pathCap(q.Limit, len(out), false)
+				if done {
+					stopOuter = level.final()
+					return !stopOuter
+				}
+				var err error
+				out, err = pairEnumerate(s, r, t, D, kinds, cap, budget, scF, scT, out)
+				if err != nil {
+					callErr = err
+					stopOuter = true
+					return false
+				}
 				return true
 			}
 			cap, done := pathCap(q.Limit, len(out), oneMore)
@@ -637,11 +723,13 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 // merge is needed: each root's full contribution is emitted before moving
 // to the next. Per root r, distances are FROM r, so each reached terminal
 // is enumerated backward over the In-CSR mirror (enumerate's forward=false)
-// and reversed into a root-to-terminal Path.
+// and reversed into a root-to-terminal Path. ModeAll admits pairs through
+// shortestLevel, exactly as strategyPairs does.
 func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
 	var out []Path
 	var callErr error
+	var level shortestLevel
 
 	for _, res := range results {
 		r, sc := res.elem, res.dists
@@ -650,7 +738,26 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 			if q.ExcludeSelf && r == t {
 				return true
 			}
-			if _, reached := sc.get(t); !reached {
+			d, reached := sc.get(t)
+			if !reached {
+				return true
+			}
+			if q.Mode == ModeAll {
+				if !level.admit(int(d), &out, budget) {
+					return true
+				}
+				cap, done := pathCap(q.Limit, len(out), false)
+				if done {
+					stop = level.final()
+					return !stop
+				}
+				var err error
+				out, err = enumerate(s, t, sc, kinds, cap, budget, out, false)
+				if err != nil {
+					callErr = err
+					stop = true
+					return false
+				}
 				return true
 			}
 			cap, done := pathCap(q.Limit, len(out), oneMore)
@@ -686,11 +793,13 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 // checking each element's distance buffer for reachability. Per terminal
 // x, distances are TO x, so each reached root is enumerated forward over
 // the Out-CSR (enumerate's forward=true), enumerate's own original
-// direction.
+// direction. ModeAll admits pairs through shortestLevel, exactly as
+// strategyPairs does.
 func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
 	var out []Path
 	var callErr error
+	var level shortestLevel
 
 	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
 		for _, res := range results {
@@ -698,7 +807,27 @@ func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, bu
 			if q.ExcludeSelf && r == t {
 				continue
 			}
-			if _, reached := sc.get(r); !reached {
+			d, reached := sc.get(r)
+			if !reached {
+				continue
+			}
+			if q.Mode == ModeAll {
+				if !level.admit(int(d), &out, budget) {
+					continue
+				}
+				cap, done := pathCap(q.Limit, len(out), false)
+				if done {
+					if level.final() {
+						return false
+					}
+					continue
+				}
+				var err error
+				out, err = enumerate(s, r, sc, kinds, cap, budget, out, true)
+				if err != nil {
+					callErr = err
+					return false
+				}
 				continue
 			}
 			cap, done := pathCap(q.Limit, len(out), oneMore)

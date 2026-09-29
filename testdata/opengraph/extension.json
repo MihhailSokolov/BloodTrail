@@ -1,0 +1,250 @@
+{
+  "schema": {
+    "name": "GHX_Test_Extension",
+    "display_name": "GHX Test Extension",
+    "version": "v1.0.0",
+    "namespace": "ghx"
+  },
+  "node_kinds": [
+    {
+      "name": "ghx_Organization",
+      "display_name": "Organization",
+      "description": "A GitHub-like organization",
+      "is_display_kind": true,
+      "icon": "building",
+      "color": "#455A64",
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "A GitHub-like organization"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_User",
+      "display_name": "User",
+      "description": "A GitHub-like user account",
+      "is_display_kind": true,
+      "icon": "user",
+      "color": "#1976D2",
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "A GitHub-like user account"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_OrgOwner",
+      "display_name": "Org Owner",
+      "description": "A user who owns an organization",
+      "is_display_kind": true,
+      "icon": "crown",
+      "color": "#F9A825",
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "A user who owns an organization"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_Team",
+      "display_name": "Team",
+      "description": "A team of users",
+      "is_display_kind": true,
+      "icon": "users",
+      "color": "#388E3C",
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "A team of users"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_Repository",
+      "display_name": "Repository",
+      "description": "A source repository",
+      "is_display_kind": true,
+      "icon": "code-branch",
+      "color": "#6A1B9A",
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "A source repository"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_RepoRole",
+      "display_name": "Repository Role",
+      "description": "A permission level on one repository",
+      "is_display_kind": true,
+      "icon": "key",
+      "color": "#EF6C00",
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "A permission level on one repository"
+          }
+        }
+      }
+    }
+  ],
+  "relationship_kinds": [
+    {
+      "name": "ghx_MemberOf",
+      "description": "Principal is a member of a team",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Principal is a member of a team"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_HasRole",
+      "description": "Principal holds a repository role",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Principal holds a repository role"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_CanWrite",
+      "description": "Role can push to the repository",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Role can push to the repository"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_CanAdmin",
+      "description": "Role administers the repository",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Role administers the repository"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_CanRead",
+      "description": "Role can read the repository",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Role can read the repository"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_OrgAdmin",
+      "description": "User administers the organization",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "User administers the organization"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_SyncedTo",
+      "description": "Directory identity is synced to this account",
+      "is_traversable": true,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Directory identity is synced to this account"
+          }
+        }
+      }
+    },
+    {
+      "name": "ghx_Owns",
+      "description": "Organization owns the repository (not an attack path)",
+      "is_traversable": false,
+      "info": {
+        "overview": {
+          "title": "Overview",
+          "position": 1,
+          "markdown": {
+            "content": "Organization owns the repository (not an attack path)"
+          }
+        }
+      }
+    }
+  ],
+  "environments": [
+    {
+      "environment_kind": "ghx_Organization",
+      "source_kind": "ghx_Base",
+      "principal_kinds": [
+        "ghx_User",
+        "ghx_Team"
+      ]
+    }
+  ],
+  "relationship_findings": [
+    {
+      "name": "ghx_FindRepoAdmins",
+      "display_name": "Principal Can Administer Repository",
+      "relationship_kind": "ghx_CanAdmin",
+      "environment_kind": "ghx_Organization",
+      "remediation": {
+        "short_description": "A role can administer a repository",
+        "long_description": "A role holds admin on a repository.",
+        "short_remediation": "Review repository admins",
+        "long_remediation": "Confirm every admin grant is intended."
+      }
+    }
+  ]
+}

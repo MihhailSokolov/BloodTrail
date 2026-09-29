@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,6 +75,9 @@ func assertSnapshotsEqual(t *testing.T, want, got *Snapshot) {
 	if got.MultiGraph != want.MultiGraph {
 		t.Fatalf("MultiGraph = %v, want %v", got.MultiGraph, want.MultiGraph)
 	}
+	if got.WatermarkLineage != want.WatermarkLineage {
+		t.Fatalf("WatermarkLineage = %s, want %s", got.WatermarkLineage, want.WatermarkLineage)
+	}
 
 	if got.Kinds.Len() != want.Kinds.Len() {
 		t.Fatalf("Kinds.Len() = %d, want %d", got.Kinds.Len(), want.Kinds.Len())
@@ -109,33 +113,137 @@ func assertSnapshotsEqual(t *testing.T, want, got *Snapshot) {
 	compareViewContents(t, NewView(want), NewView(got))
 }
 
+// testLineage is an arbitrary non-zero watermark lineage, distinct in every
+// byte so a field written or read at the wrong offset cannot round-trip by
+// accident.
+var testLineage = Lineage{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x47, 0x18, 0x89, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0x10}
+
+// testStamp is an arbitrary Stamp whose three fields all differ, so a field
+// written or read in another's place cannot round-trip by accident.
+var testStamp = Stamp{Watermark: 424242, NodeIDSeq: 90001, EdgeIDSeq: 777777}
+
 // TestSnapshotFileRoundTrip writes the fixture snapshot to a file and reads
-// it back, checking every accessor agrees and the watermark survives --
-// once with MultiGraph false and once true, since it's a plain bool field
-// or'd in among everything else derived/copied.
+// it back, checking every accessor agrees and the stamp and watermark
+// lineage survive -- once with MultiGraph false and once true, since it's a
+// plain bool field or'd in among everything else derived/copied.
 func TestSnapshotFileRoundTrip(t *testing.T) {
 	for _, multiGraph := range []bool{false, true} {
 		t.Run(fmt.Sprintf("MultiGraph=%v", multiGraph), func(t *testing.T) {
 			s := buildFileFixture(t)
 			s.MultiGraph = multiGraph
+			s.WatermarkLineage = testLineage
 
 			path := filepath.Join(t.TempDir(), "snap.bin")
-			const watermark = uint64(424242)
-
-			if err := WriteSnapshotFile(path, s, watermark); err != nil {
+			if err := WriteSnapshotFile(path, s, testStamp); err != nil {
 				t.Fatalf("WriteSnapshotFile: %v", err)
 			}
 
-			got, gotWatermark, err := ReadSnapshotFile(path)
+			got, gotStamp, err := ReadSnapshotFile(path)
 			if err != nil {
 				t.Fatalf("ReadSnapshotFile: %v", err)
 			}
-			if gotWatermark != watermark {
-				t.Fatalf("watermark = %d, want %d", gotWatermark, watermark)
+			if gotStamp != testStamp {
+				t.Fatalf("stamp = %+v, want %+v", gotStamp, testStamp)
 			}
 
 			assertSnapshotsEqual(t, s, got)
 		})
+	}
+}
+
+// TestSnapshotFileHeaderMatchesTheFullRead pins ReadSnapshotFileHeader to
+// the format: on the very file ReadSnapshotFile reads, it must report the
+// same graph, lineage and stamp -- a header reader that drifted from the
+// field order would hand the boot's early refusal the wrong values.
+func TestSnapshotFileHeaderMatchesTheFullRead(t *testing.T) {
+	s := buildFileFixture(t)
+	s.WatermarkLineage = testLineage
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	if err := WriteSnapshotFile(path, s, testStamp); err != nil {
+		t.Fatalf("WriteSnapshotFile: %v", err)
+	}
+
+	header, err := ReadSnapshotFileHeader(path)
+	if err != nil {
+		t.Fatalf("ReadSnapshotFileHeader: %v", err)
+	}
+	want := Header{GraphID: s.GraphID, Lineage: testLineage, Stamp: testStamp}
+	if header != want {
+		t.Fatalf("header = %+v, want %+v", header, want)
+	}
+}
+
+// TestSnapshotFileHeaderIgnoresTheBody pins what makes the header read worth
+// having: it stops at the header, so a file whose body is damaged -- here,
+// cut off right after the header -- still yields its header, while the full
+// read refuses the same file.
+func TestSnapshotFileHeaderIgnoresTheBody(t *testing.T) {
+	s := buildFileFixture(t)
+	s.WatermarkLineage = testLineage
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	if err := WriteSnapshotFile(path, s, testStamp); err != nil {
+		t.Fatalf("WriteSnapshotFile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data[:snapshotHeaderLen], 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if header, err := ReadSnapshotFileHeader(path); err != nil || header.Stamp != testStamp || header.Lineage != testLineage {
+		t.Fatalf("ReadSnapshotFileHeader on a file cut off after its header = %+v, %v; want the header", header, err)
+	}
+	if _, _, err := ReadSnapshotFile(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("ReadSnapshotFile on the same file = %v, want ErrCorrupt", err)
+	}
+}
+
+// TestSnapshotFileHeaderErrors checks the header read fails the way the full
+// read does, sentinel for sentinel, on each kind of file it must not
+// describe.
+func TestSnapshotFileHeaderErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := ReadSnapshotFileHeader(filepath.Join(dir, "missing.bin")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing file: %v, want fs.ErrNotExist", err)
+	}
+
+	foreign := filepath.Join(dir, "foreign.bin")
+	if err := os.WriteFile(foreign, []byte("NOT-A-BLOODTRAIL-SNAPSHOT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSnapshotFileHeader(foreign); !errors.Is(err, ErrNotSnapshot) {
+		t.Fatalf("foreign file: %v, want ErrNotSnapshot", err)
+	}
+
+	s := buildFileFixture(t)
+	valid := filepath.Join(dir, "valid.bin")
+	if err := WriteSnapshotFile(valid, s, testStamp); err != nil {
+		t.Fatalf("WriteSnapshotFile: %v", err)
+	}
+	data, err := os.ReadFile(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	short := filepath.Join(dir, "short.bin")
+	if err := os.WriteFile(short, data[:snapshotHeaderLen-1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSnapshotFileHeader(short); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("file cut off inside its header: %v, want ErrCorrupt", err)
+	}
+
+	other := append([]byte(nil), data...)
+	binary.LittleEndian.PutUint32(other[len(snapshotMagic):], snapshotFormatVersion+1)
+	otherVersion := filepath.Join(dir, "other-version.bin")
+	if err := os.WriteFile(otherVersion, other, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSnapshotFileHeader(otherVersion); !errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("other format version: %v, want ErrVersionMismatch", err)
 	}
 }
 
@@ -150,16 +258,16 @@ func TestSnapshotFileRoundTripEmpty(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "empty.bin")
-	if err := WriteSnapshotFile(path, s, 0); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 0}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 
-	got, watermark, err := ReadSnapshotFile(path)
+	got, stamp, err := ReadSnapshotFile(path)
 	if err != nil {
 		t.Fatalf("ReadSnapshotFile: %v", err)
 	}
-	if watermark != 0 {
-		t.Fatalf("watermark = %d, want 0", watermark)
+	if stamp != (Stamp{}) {
+		t.Fatalf("stamp = %+v, want the zero Stamp", stamp)
 	}
 	assertSnapshotsEqual(t, s, got)
 }
@@ -186,7 +294,7 @@ func TestSnapshotFileWrongMagic(t *testing.T) {
 func TestSnapshotFileWrongVersion(t *testing.T) {
 	s := buildFileFixture(t)
 	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := WriteSnapshotFile(path, s, 1); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 
@@ -206,6 +314,35 @@ func TestSnapshotFileWrongVersion(t *testing.T) {
 	}
 }
 
+// TestSnapshotFileFromBeforeLineagesIsRefused pins what an upgrade meets on
+// disk: a version 1 file, written before files recorded their watermark
+// lineage. Nothing in it can show which lineage its watermark was counted
+// in, so it must be refused outright (ErrVersionMismatch, and from there an
+// ordinary rebuild) rather than read as though it belonged to the lineage
+// PostgreSQL is in now.
+func TestSnapshotFileFromBeforeLineagesIsRefused(t *testing.T) {
+	s := buildFileFixture(t)
+	s.WatermarkLineage = testLineage
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
+		t.Fatalf("WriteSnapshotFile: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionOff := len(snapshotMagic)
+	binary.LittleEndian.PutUint32(data[versionOff:versionOff+4], 1)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := ReadSnapshotFile(path); !errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("ReadSnapshotFile(version 1) = %v, want ErrVersionMismatch", err)
+	}
+}
+
 // TestSnapshotFileCorruptByte flips one byte well past the header of an
 // otherwise-valid file and checks it is rejected as ErrCorrupt -- via a
 // CRC32 mismatch in the common case, since the flipped byte almost
@@ -214,7 +351,7 @@ func TestSnapshotFileWrongVersion(t *testing.T) {
 func TestSnapshotFileCorruptByte(t *testing.T) {
 	s := buildFileFixture(t)
 	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := WriteSnapshotFile(path, s, 1); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 
@@ -245,7 +382,7 @@ func TestSnapshotFileCorruptByte(t *testing.T) {
 func TestSnapshotFileTruncated(t *testing.T) {
 	s := buildFileFixture(t)
 	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := WriteSnapshotFile(path, s, 1); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 
@@ -265,8 +402,8 @@ func TestSnapshotFileTruncated(t *testing.T) {
 
 // snapshotFixedHeaderLen replays, using the exact same binWriter helpers
 // writeSnapshotBody itself uses, every field written before writeKindTable
-// is called (version, graphID, watermark, the three counts, and all twelve
-// packed CSR arrays), and returns len(snapshotMagic) plus how many bytes
+// is called (version, graphID, watermark, lineage, the three counts, and all
+// twelve packed CSR arrays), and returns len(snapshotMagic) plus how many bytes
 // that took. A real snapshot file writes the magic directly and then
 // writeSnapshotBody's fields in this exact same order (see
 // WriteSnapshotFile/writeSnapshotBody), so the result is the absolute byte
@@ -282,6 +419,9 @@ func snapshotFixedHeaderLen(t *testing.T, s *Snapshot) int {
 	bw.u32(snapshotFormatVersion)
 	bw.i32(s.GraphID)
 	bw.u64(0) // watermark: any value encodes to the same 8 bytes
+	bw.bytes(s.WatermarkLineage[:])
+	bw.u64(0) // node id sequence
+	bw.u64(0) // edge id sequence
 	bw.u64(uint64(s.NodeCount()))
 	bw.u64(uint64(s.EdgeCount()))
 	bw.u64(uint64(len(s.NodeKinds)))
@@ -303,6 +443,22 @@ func snapshotFixedHeaderLen(t *testing.T, s *Snapshot) int {
 
 	return len(snapshotMagic) + buf.Len()
 }
+
+// snapshotHeaderLen is how many bytes a snapshot file's magic and Header
+// take -- where ReadSnapshotFileHeader stops reading -- derived, like
+// snapshotFixedHeaderLen above, by replaying writeSnapshotBody's own field
+// writes rather than by hand-counted bytes.
+var snapshotHeaderLen = func() int {
+	var buf bytes.Buffer
+	bw := &binWriter{w: &buf}
+	bw.u32(snapshotFormatVersion)
+	bw.i32(0)                              // graphID
+	bw.u64(0)                              // watermark
+	bw.bytes(make([]byte, len(Lineage{}))) // lineage
+	bw.u64(0)                              // node id sequence
+	bw.u64(0)                              // edge id sequence
+	return len(snapshotMagic) + buf.Len()
+}()
 
 // kindTableWireLen replays writeKindTable in isolation and returns how many
 // bytes it puts on the wire for kt -- combined with snapshotFixedHeaderLen,
@@ -390,7 +546,7 @@ func patchU64(t *testing.T, data []byte, off int, v uint64) {
 func TestSnapshotFileHugeKindCountRejected(t *testing.T) {
 	s := buildFileFixture(t)
 	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := WriteSnapshotFile(path, s, 1); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 
@@ -421,7 +577,7 @@ func TestSnapshotFileHugeKindCountRejected(t *testing.T) {
 func TestSnapshotFileHugePropNameCountRejected(t *testing.T) {
 	s := buildFileFixture(t)
 	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := WriteSnapshotFile(path, s, 1); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 
@@ -452,7 +608,7 @@ func TestSnapshotFileAtomicWriteLeavesNoTempFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snap.bin")
 
-	if err := WriteSnapshotFile(path, s, 1); err != nil {
+	if err := WriteSnapshotFile(path, s, Stamp{Watermark: 1}); err != nil {
 		t.Fatalf("WriteSnapshotFile: %v", err)
 	}
 

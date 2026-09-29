@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -133,82 +134,167 @@ func (o Options) compose(runner dockerx.Runner) (dockerx.Compose, error) {
 // project the operator runs -- and `up -d` would then recreate services
 // without the settings the operator keeps in those files.
 //
-// It fails when the project's .env cannot be read with certainty
-// (projectExtraFiles), which every command meets before it changes anything.
+// This is how status, verify and rollback read the project, and it is
+// forgiving (projectFiles): those commands have to keep working on whatever
+// an install -- this version or an earlier one -- left behind, so it fails
+// only when the .env cannot be read with certainty at all. Install, which
+// changes the deployment on the strength of its reading, goes by the strict
+// one instead (installHandle).
 func composeHandle(runner dockerx.Runner, composeFile, projectDir string) (dockerx.Compose, error) {
+	return handle(runner, composeFile, projectDir, false)
+}
+
+// installHandle is composeHandle for install, which refuses whatever it
+// cannot be sure matches the project compose loads for the operator.
+func installHandle(runner dockerx.Runner, composeFile, projectDir string) (dockerx.Compose, error) {
+	return handle(runner, composeFile, projectDir, true)
+}
+
+func handle(runner dockerx.Runner, composeFile, projectDir string, strict bool) (dockerx.Compose, error) {
 	c := dockerx.Compose{Runner: runner, File: composeFile, ProjectDir: projectDir}
-	extra, err := projectExtraFiles(composeFile, projectDir)
+	files, err := projectFiles(composeFile, projectDir, strict)
 	if err != nil {
 		return c, err
 	}
-	for _, f := range extra {
-		c = c.WithExtraFile(f)
-	}
+	// Set, not added one by one with WithExtraFile: a file listed twice is
+	// merged twice by compose, and has to be here too.
+	c.File, c.ExtraFiles = files[0], files[1:]
 	return c, nil
 }
 
-// projectExtraFiles resolves the files that must be merged after the base one,
-// in merge order. COMPOSE_FILE wins when it is set, because compose then loads
-// exactly what it lists and discovers nothing; with no such entry, compose
-// pairs the base file with its conventional override sibling on its own, so
-// that sibling is what has to be reproduced.
+// projectFiles resolves the files the project is made of, in the order
+// compose merges them. COMPOSE_FILE wins when it is set, because compose then
+// loads exactly what it lists, in that order, repeats included, and
+// discovers nothing. With no such entry compose finds the project on its own
+// (discoveredProject): the base file and, when there is one, the override
+// beside it. A compose file discovery does not pick is one the operator runs
+// with -f, which merges no override either.
 //
-// Entries that are not on disk are skipped rather than passed on: a compose
-// command naming a missing file fails outright, which would otherwise wedge
-// `bloodtrail rollback` for the operator who deleted the override file but
-// left its COMPOSE_FILE entry behind -- exactly what the override file's own
-// header invites -- with an error telling them to rerun the command that
-// cannot succeed. The base file is never dropped this way; a missing one is
-// a real misconfiguration and compose says so.
+// Strict, for install, it refuses anything it cannot be sure of: an entry
+// compose itself cannot load (compose.ComposeFiles); one that does not list
+// the compose file given; one listing a file that is not on disk -- compose
+// fails to load the project over it, so the project without it is a guess,
+// and `up -d` would recreate the operator's services without whatever that
+// file held; and, with no entry, a compose file other than the one discovery
+// picks, which is not what the operator's own commands run. Only the
+// installer's own override may be missing: a leftover entry may still name
+// it, and the install is about to write it.
+//
+// Otherwise it takes the project as best it can, for the commands that have
+// to keep working on whatever an install -- this version or an earlier one --
+// left behind: the listed files that are on disk, in their order, with the
+// compose file put first where the entry leaves it out (an earlier install
+// wrote its override alone into an empty entry, and compose's reading of
+// that has none of the project's services); discovery for an entry that
+// names no file, which is how earlier installs read one; and the compose file
+// given where discovery would pick another. Skipping what is not on disk also
+// keeps `bloodtrail rollback` working for the operator who deleted the
+// override file but left its COMPOSE_FILE entry behind -- exactly what the
+// override file's own header invites.
 //
 // A .env that exists but cannot be read, or whose COMPOSE_FILE entry cannot
-// be parsed with certainty (compose.ComposeFiles), is an error rather than
-// "no entry": guessing there would address -- and later rewrite -- a
-// different project from the one the operator runs.
-func projectExtraFiles(composeFile, projectDir string) ([]string, error) {
+// be read with certainty, is an error either way rather than "no entry":
+// guessing there would address -- and later rewrite -- a different project
+// from the one the operator runs.
+func projectFiles(composeFile, projectDir string, strict bool) ([]string, error) {
 	envPath := filepath.Join(projectDir, ".env")
 	envData, err := os.ReadFile(envPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("reading %s: %w", envPath, err)
 	}
-	listed, err := compose.ComposeFiles(string(envData))
+	read := compose.ListedComposeFiles
+	if strict {
+		read = compose.ComposeFiles
+	}
+	listed, err := read(string(envData))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", envPath, err)
 	}
-	if len(listed) == 0 {
-		if auto := autoOverrideFile(composeFile); auto != "" {
-			return []string{auto}, nil
+	if strings.Join(listed, "") != "" {
+		var files []string
+		for _, f := range listed {
+			if f == "" {
+				continue
+			}
+			if !filepath.IsAbs(f) {
+				f = filepath.Join(projectDir, f)
+			}
+			switch {
+			case isFile(f):
+				files = append(files, f)
+			case strict && f != filepath.Join(projectDir, compose.OverrideFileName):
+				return nil, fmt.Errorf("%s: COMPOSE_FILE lists %s, which does not exist, so docker compose fails to load the project; restore the file or take it out of the list", envPath, f)
+			}
 		}
-		return nil, nil
+		switch {
+		case slices.Contains(files, composeFile):
+			return files, nil
+		case strict:
+			return nil, fmt.Errorf("%s: COMPOSE_FILE does not list %s, the compose file given, so docker compose does not load it; pass --compose-file for the one the deployment runs", envPath, composeFile)
+		}
+		return append([]string{composeFile}, files...), nil
 	}
-	var out []string
-	for _, f := range listed {
-		if !filepath.IsAbs(f) {
-			f = filepath.Join(projectDir, f)
-		}
-		if f == composeFile {
-			continue
-		}
-		if _, err := os.Stat(f); err != nil {
-			continue
-		}
-		out = append(out, f)
+	base, override := discoveredProject(projectDir)
+	switch {
+	case base == composeFile && override != "":
+		return []string{composeFile, override}, nil
+	case base != composeFile && base != "" && strict:
+		return nil, fmt.Errorf("%s sets no COMPOSE_FILE, so docker compose loads %s there on its own, not %s; pass --compose-file for the file the deployment runs, or list its files in COMPOSE_FILE", envPath, base, composeFile)
 	}
-	return out, nil
+	return []string{composeFile}, nil
 }
 
-// autoOverrideFile returns the override file docker compose would load beside
-// composeFile without being told to, or "" when there is none. Compose takes
-// the first spelling that exists, and so does this.
-func autoOverrideFile(composeFile string) string {
-	dir := filepath.Dir(composeFile)
-	for _, candidate := range compose.AutoOverrideCandidates(filepath.Base(composeFile)) {
-		p := filepath.Join(dir, candidate)
-		if _, err := os.Stat(p); err == nil {
+// checkComposeEnvironment refuses what the installer's own environment would
+// change about how docker compose reads the project. Compose takes
+// COMPOSE_FILE and COMPOSE_PATH_SEPARATOR from the shell over .env, so with
+// COMPOSE_FILE set there (even empty) the operator's own `docker compose up
+// -d` from this shell ignores the entry the install writes to .env -- and
+// boots the upstream image against the `bloodtrail` driver setting -- while a
+// separator other than ':' splits that entry into names that do not exist.
+// The installer's own commands name every file with -f, which compose honours
+// over both, so they would never show it.
+func checkComposeEnvironment() error {
+	if _, ok := os.LookupEnv("COMPOSE_FILE"); ok {
+		return errors.New("COMPOSE_FILE is set in this shell's environment, where docker compose takes it over the COMPOSE_FILE entry in .env: a plain `docker compose up -d` from here would not load the override this install adds there; unset it (moving the setting into .env if the project needs it) and rerun")
+	}
+	if sep, ok := os.LookupEnv("COMPOSE_PATH_SEPARATOR"); ok && sep != "" && sep != ":" {
+		return fmt.Errorf("COMPOSE_PATH_SEPARATOR is set in this shell's environment to %q, so docker compose would split COMPOSE_FILE on it rather than on the ':' this installer writes; unset it and rerun", sep)
+	}
+	return nil
+}
+
+// discoveredProject returns the files docker compose loads on its own in dir
+// when it is given neither -f nor COMPOSE_FILE: the first of
+// compose.DefaultFileNames that exists there as the base file, then the first
+// of compose.DefaultOverrideFileNames beside it -- "" for either that is not
+// there. (With no base file in dir compose goes on to look in the parent
+// directories, but whatever it finds there is not this project either.)
+func discoveredProject(dir string) (base, override string) {
+	if base = firstExisting(dir, compose.DefaultFileNames()); base != "" {
+		override = firstExisting(dir, compose.DefaultOverrideFileNames())
+	}
+	return base, override
+}
+
+func firstExisting(dir string, names []string) string {
+	for _, name := range names {
+		if p := filepath.Join(dir, name); fileExists(p) {
 			return p
 		}
 	}
 	return ""
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// isFile reports whether path is something compose can load as a file:
+// there, and not a directory.
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // imageExists reports whether the image can be found locally or in a registry
@@ -277,8 +363,11 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if manifest.Exists(opts.ProjectDir) {
 		return fmt.Errorf("a previous install did not complete or is still installed in %s; run `bloodtrail rollback` first", opts.ProjectDir)
 	}
+	if err := checkComposeEnvironment(); err != nil {
+		return err
+	}
 
-	c, err := opts.compose(deps.Runner)
+	c, err := installHandle(deps.Runner, opts.ComposeFile, opts.ProjectDir)
 	if err != nil {
 		return err
 	}
@@ -348,19 +437,36 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	// there before (compose.RemoveComposeFileLine). Nothing else writes
 	// .env between here and that write, and an unreadable or absent file
 	// means no entry, which the write below handles on its own.
+	// ComposeFiles refuses an entry that lists no files, so an empty result
+	// here means there is no line at all.
 	envProbe, _ := os.ReadFile(filepath.Join(opts.ProjectDir, ".env"))
 	probed, err := compose.ComposeFiles(string(envProbe))
 	if err != nil {
 		return fmt.Errorf(".env: %w", err)
 	}
 	envComposeFileCreated := len(probed) == 0
+	// An entry the install writes, where there was none, replaces compose's
+	// own file discovery, so it has to name what discovery found and the
+	// installer has been addressing since: the base file and, when there is
+	// one, the override beside it. Listing only the base file would drop that
+	// override out of the operator's own `docker compose` commands from here
+	// on. The manifest records the list, so rollback can tell whether the
+	// line still names just that.
+	var baseFiles, envComposeFileWritten []string
+	for _, f := range append([]string{c.File}, c.ExtraFiles...) {
+		rel, _ := filepath.Rel(opts.ProjectDir, f)
+		baseFiles = append(baseFiles, rel)
+	}
+	if envComposeFileCreated {
+		envComposeFileWritten = append(append([]string(nil), baseFiles...), compose.OverrideFileName)
+	}
 	m := manifest.Manifest{
 		InstallerVersion: deps.InstallerVersion, InstalledAt: opts.Now().UTC().Format(time.RFC3339),
 		ComposeFile: opts.ComposeFile, ProjectDir: opts.ProjectDir, ProjectName: inv.Config.Name,
 		OriginalImage: inv.Image, OriginalDriverRow: inv.DriverRow, BackupDir: backupDir,
 		OverrideFile: overridePath, TargetImage: target, UpstreamTag: inv.UpstreamTag,
 		PGUser: inv.PGUser, PGDatabase: inv.PGDB,
-		EnvComposeFileCreated: envComposeFileCreated,
+		EnvComposeFileCreated: envComposeFileCreated, EnvComposeFileWritten: envComposeFileWritten,
 	}
 	if err := m.Save(opts.ProjectDir); err != nil {
 		return fmt.Errorf("saving manifest: %w", err)
@@ -451,18 +557,6 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading .env: %w; %s", err, rollbackHint)
 	}
-	// The entry this writes replaces compose's own file discovery, so it has
-	// to name what discovery would have found: the base file and, when one is
-	// there, the conventional override beside it. Listing only the base file
-	// would drop that override out of the operator's own `docker compose`
-	// commands from here on.
-	baseRel, _ := filepath.Rel(opts.ProjectDir, opts.ComposeFile)
-	baseFiles := []string{baseRel}
-	if auto := autoOverrideFile(opts.ComposeFile); auto != "" {
-		if autoRel, relErr := filepath.Rel(opts.ProjectDir, auto); relErr == nil {
-			baseFiles = append(baseFiles, autoRel)
-		}
-	}
 	newEnv, err := compose.AddComposeFile(string(envData), baseFiles, compose.OverrideFileName)
 	if err != nil {
 		return fmt.Errorf(".env: %w; %s", err, rollbackHint)
@@ -472,6 +566,17 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	}
 	if err := store.Set(ctx, driverName); err != nil {
 		return fmt.Errorf("setting database_switch: %w; %s", err, rollbackHint)
+	}
+	// BloodTrail's first boot may adopt a snapshot file an earlier install
+	// saved, and every writer the graph has had since -- the stock image
+	// after a rollback, this install's own migration -- wrote it without the
+	// watermark counter that file's proof rests on. Ending the lineage now,
+	// with no BloodTrail process running and before the one `up` starts has
+	// loaded anything, leaves every such file naming a lineage PostgreSQL
+	// has left. The stock image may keep writing until `up` replaces it;
+	// that is harmless, since it stops before BloodTrail loads.
+	if err := store.EndWatermarkLineage(ctx); err != nil {
+		return fmt.Errorf("ending the snapshot file watermark lineage: %w; %s", err, rollbackHint)
 	}
 	c = c.WithExtraFile(overridePath)
 	if err := c.Up(ctx); err != nil {
@@ -642,16 +747,12 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf("reading .env: %w", err)
 	}
 	if err == nil {
-		// An entry this install created has to go away entirely: leaving a
-		// line behind would keep compose's file discovery off, so the
-		// operator's conventional override file would stay unloaded by their
-		// own commands even after the rollback.
-		restoredEnv, err := compose.RemoveComposeFile(string(envData), compose.OverrideFileName)
-		if m.EnvComposeFileCreated {
-			restoredEnv, err = compose.RemoveComposeFileLine(string(envData))
-		}
+		restoredEnv, note, err := restoreComposeFileEntry(string(envData), m)
 		if err != nil {
 			return fmt.Errorf(".env: %w", err)
+		}
+		if note != "" {
+			say("    %s", note)
 		}
 		if err := os.WriteFile(envPath, []byte(restoredEnv), 0o644); err != nil {
 			return err
@@ -668,8 +769,26 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("%w (%s)", err, restored)
 	}
+	// The stock image owns the graph from here on and writes it without the
+	// watermark counter. BloodTrail has stopped -- its last snapshot file
+	// save is behind it -- so ending the lineage now leaves any file it
+	// saved unadoptable by whatever brings BloodTrail back: a reinstall ends
+	// the lineage again anyway, but a BloodTrail started any other way would
+	// otherwise find the counter exactly where the file left it. Addressed
+	// through the restored project, since the override file is gone.
+	restoredStore := dbswitch.Store{Compose: restarted, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 	if err := restarted.Up(ctx); err != nil {
+		// A failed up can still have started the stock image -- compose
+		// reports the first service that failed, not the ones it already
+		// started -- and nothing says the operator reruns rollback before
+		// it writes. Ending the lineage costs only a rebuild if it did not.
+		if lineageErr := restoredStore.EndWatermarkLineage(ctx); lineageErr != nil {
+			return fmt.Errorf("restarting with the original image: %w (%s; ending the snapshot file watermark lineage failed too: %v)", err, restored, lineageErr)
+		}
 		return fmt.Errorf("restarting with the original image: %w (%s)", err, restored)
+	}
+	if err := restoredStore.EndWatermarkLineage(ctx); err != nil {
+		return fmt.Errorf("ending the snapshot file watermark lineage: %w (the original image is running again; rerun `bloodtrail rollback` to finish)", err)
 	}
 	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
 		return fmt.Errorf("waiting for the API after the restart: %w (%s; check the %s logs)", err, restored, bloodhoundService)
@@ -679,6 +798,56 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 	say("    rolled back; backups kept in %s", m.BackupDir)
 	return nil
+}
+
+// restoreComposeFileEntry undoes what the install m records did to the .env
+// contents' COMPOSE_FILE entry, and says what the operator should know about
+// the result, if anything.
+//
+// An entry the install created goes away entirely: leaving a line behind
+// would keep compose's file discovery off, so the operator's conventional
+// override file would stay unloaded by their own commands even after the
+// rollback. That holds while the line names just what the install wrote,
+// though: a file the operator has added to it since would drop out of their
+// project with it, so then only the installer's own override comes out.
+//
+// Installs from before the written list was recorded also took an empty
+// entry for none, recorded it as created and wrote their override into it.
+// An entry naming nothing besides that override is one of those: it gets
+// its empty entry back, spelled as the operator wrote it -- or keeps it, when
+// the install stopped before its write -- rather than losing the line.
+func restoreComposeFileEntry(env string, m manifest.Manifest) (restored, note string, err error) {
+	listed, err := compose.ListedComposeFiles(env)
+	if err != nil || listed == nil {
+		return env, "", err
+	}
+	others := withoutOverride(listed)
+	switch {
+	case !m.EnvComposeFileCreated:
+		restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName)
+	case m.EnvComposeFileWritten == nil && strings.Join(others, "") == "":
+		if restored, err = compose.RestoreEmptyComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
+			note = "put back the empty COMPOSE_FILE entry .env had before the install; docker compose does not read that as unset but fails to load the project, so delete the line to let compose find its files on its own, or list them"
+		}
+	case m.EnvComposeFileWritten != nil && !slices.Equal(others, withoutOverride(m.EnvComposeFileWritten)):
+		if restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
+			note = fmt.Sprintf("COMPOSE_FILE in .env has changed since the install, so only %s came out of it", compose.OverrideFileName)
+		}
+	default:
+		restored, err = compose.RemoveComposeFileLine(env)
+	}
+	return restored, note, err
+}
+
+// withoutOverride returns files without the installer's own override.
+func withoutOverride(files []string) []string {
+	var out []string
+	for _, f := range files {
+		if f != compose.OverrideFileName {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // bloodhoundContainerEpoch identifies the current incarnation of the
