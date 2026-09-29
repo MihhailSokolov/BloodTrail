@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -430,13 +431,28 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf(".env: %w", err)
 	}
 	envComposeFileCreated := len(probed) == 0
+	// An entry the install writes, where there was none, replaces compose's
+	// own file discovery, so it has to name what discovery found and the
+	// installer has been addressing since: the base file and, when there is
+	// one, the override beside it. Listing only the base file would drop that
+	// override out of the operator's own `docker compose` commands from here
+	// on. The manifest records the list, so rollback can tell whether the
+	// line still names just that.
+	var baseFiles, envComposeFileWritten []string
+	for _, f := range append([]string{c.File}, c.ExtraFiles...) {
+		rel, _ := filepath.Rel(opts.ProjectDir, f)
+		baseFiles = append(baseFiles, rel)
+	}
+	if envComposeFileCreated {
+		envComposeFileWritten = append(append([]string(nil), baseFiles...), compose.OverrideFileName)
+	}
 	m := manifest.Manifest{
 		InstallerVersion: deps.InstallerVersion, InstalledAt: opts.Now().UTC().Format(time.RFC3339),
 		ComposeFile: opts.ComposeFile, ProjectDir: opts.ProjectDir, ProjectName: inv.Config.Name,
 		OriginalImage: inv.Image, OriginalDriverRow: inv.DriverRow, BackupDir: backupDir,
 		OverrideFile: overridePath, TargetImage: target, UpstreamTag: inv.UpstreamTag,
 		PGUser: inv.PGUser, PGDatabase: inv.PGDB,
-		EnvComposeFileCreated: envComposeFileCreated,
+		EnvComposeFileCreated: envComposeFileCreated, EnvComposeFileWritten: envComposeFileWritten,
 	}
 	if err := m.Save(opts.ProjectDir); err != nil {
 		return fmt.Errorf("saving manifest: %w", err)
@@ -526,16 +542,6 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	envData, err := os.ReadFile(envPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading .env: %w; %s", err, rollbackHint)
-	}
-	// An entry this writes, where there was none, replaces compose's own file
-	// discovery, so it has to name what discovery found and the installer has
-	// been addressing since: the base file and, when there is one, the
-	// override beside it. Listing only the base file would drop that override
-	// out of the operator's own `docker compose` commands from here on.
-	var baseFiles []string
-	for _, f := range append([]string{c.File}, c.ExtraFiles...) {
-		rel, _ := filepath.Rel(opts.ProjectDir, f)
-		baseFiles = append(baseFiles, rel)
 	}
 	newEnv, err := compose.AddComposeFile(string(envData), baseFiles, compose.OverrideFileName)
 	if err != nil {
@@ -719,9 +725,23 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		// An entry this install created has to go away entirely: leaving a
 		// line behind would keep compose's file discovery off, so the
 		// operator's conventional override file would stay unloaded by their
-		// own commands even after the rollback.
+		// own commands even after the rollback. That holds while the line
+		// names just what the install wrote, though: a file the operator has
+		// added to it since would drop out of their project with it, so then
+		// only the installer's own override comes out.
+		removeLine := m.EnvComposeFileCreated
+		if removeLine {
+			asWritten, err := namesOnlyWhatWasWritten(string(envData), m.EnvComposeFileWritten)
+			if err != nil {
+				return fmt.Errorf(".env: %w", err)
+			}
+			if !asWritten {
+				removeLine = false
+				say("    COMPOSE_FILE in .env has changed since the install, so only %s comes out of it", compose.OverrideFileName)
+			}
+		}
 		restoredEnv, err := compose.RemoveComposeFile(string(envData), compose.OverrideFileName)
-		if m.EnvComposeFileCreated {
+		if removeLine {
 			restoredEnv, err = compose.RemoveComposeFileLine(string(envData))
 		}
 		if err != nil {
@@ -753,6 +773,30 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 	say("    rolled back; backups kept in %s", m.BackupDir)
 	return nil
+}
+
+// namesOnlyWhatWasWritten reports whether env's COMPOSE_FILE entry names just
+// the files an install wrote into it (written), the installer's own override
+// aside -- the operator may already have taken that out. A manifest from
+// before the list was recorded has none, which counts as yes.
+func namesOnlyWhatWasWritten(env string, written []string) (bool, error) {
+	if written == nil {
+		return true, nil
+	}
+	listed, err := compose.ComposeFiles(env)
+	if err != nil {
+		return false, err
+	}
+	withoutOverride := func(files []string) []string {
+		var out []string
+		for _, f := range files {
+			if f != compose.OverrideFileName {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	return slices.Equal(withoutOverride(listed), withoutOverride(written)), nil
 }
 
 // bloodhoundContainerEpoch identifies the current incarnation of the

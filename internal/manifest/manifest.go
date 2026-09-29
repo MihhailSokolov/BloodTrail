@@ -38,6 +38,14 @@ type Manifest struct {
 	// unloaded for good. Absent in manifests written before this was
 	// recorded, which decodes to false -- the old behaviour.
 	EnvComposeFileCreated bool `json:"env_compose_file_created,omitempty"`
+	// EnvComposeFileWritten is the file list that created entry named when
+	// the install wrote it. Rollback removes the whole line only while it
+	// still names just those files: one the operator has added since would
+	// otherwise drop out of their project, so rollback then takes only the
+	// installer's own override out of the line. Absent in manifests written
+	// before this was recorded, which makes rollback remove the line as
+	// before.
+	EnvComposeFileWritten []string `json:"env_compose_file_written,omitempty"`
 }
 
 // Path returns the manifest location for a compose project directory.

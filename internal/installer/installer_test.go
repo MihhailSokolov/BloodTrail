@@ -1131,6 +1131,60 @@ func TestRollbackRemovesAnEnvEntryItCreated(t *testing.T) {
 	}
 }
 
+// TestRollbackKeepsFilesAddedToTheEntryItCreated covers an entry the install
+// created and the operator has since added a file to. Rollback deleted the
+// whole line, as for any entry it created, so that file silently dropped out
+// of the operator's project -- and out of rollback's own restart. The entry
+// now goes away only while it names just what the install wrote; otherwise
+// only the installer's own override comes out of it. Both restarts are
+// scripted, so only the result tells them apart.
+func TestRollbackKeepsFilesAddedToTheEntryItCreated(t *testing.T) {
+	for _, c := range []struct {
+		name, edited, restored string
+	}{
+		{"unchanged", "", ""},
+		{"a file added", "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml:tls.yml\n", "COMPOSE_FILE=docker-compose.yml:tls.yml\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			tls := filepath.Join(dir, "tls.yml")
+			_ = os.WriteFile(tls, []byte("services: {}\n"), 0o644)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+			defer api.Close()
+			image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+			overridePath := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+			base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+			opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+			if err := Install(context.Background(), Deps{Runner: scriptPGInstall(&dockerx.FakeRunner{}, base, overridePath, image), HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+				t.Fatalf("install: %v", err)
+			}
+			installed := base + "-f " + overridePath + " "
+			envPath := filepath.Join(dir, ".env")
+			if c.edited != "" {
+				_ = os.WriteFile(envPath, []byte(c.edited), 0o644)
+				installed += "-f " + tls + " "
+			}
+
+			restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('pg')"
+			fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+				installed + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+				base + "up -d":                nil,
+				base + "-f " + tls + " up -d": nil,
+			}}
+			if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
+				t.Fatalf("rollback: %v", err)
+			}
+			if env, _ := os.ReadFile(envPath); string(env) != c.restored {
+				t.Fatalf("rollback left .env as %q, want %q", env, c.restored)
+			}
+			if c.edited != "" && !fake.Called(base+"-f "+tls+" up -d") {
+				t.Fatalf("the restart dropped the file the operator added:\n%s", strings.Join(fake.Calls, "\n"))
+			}
+		})
+	}
+}
+
 // TestComposeHandleSkipsAMissingExtraFile covers the state the override
 // file's own header invites: the operator removes the file but leaves its
 // COMPOSE_FILE entry. Passing a missing file to compose fails every command,
