@@ -1737,3 +1737,50 @@ func TestShortestPathMustBeLastPattern(t *testing.T) {
 		{name: "own clause only", cypher: shortest + ` WHERE t.name = 'far' AND s <> t RETURN p`, want: true},
 	})
 }
+
+// TestShortestPathKindLevelSelfEndpointDeclines: without an endpoint
+// inequality, a node matching the seed side's kinds that lies in the other
+// side's set and has an edge the seed would walk can trip PostgreSQL's
+// primer guard even when the seed's property predicates exclude it -- here c,
+// both A and B, with an outgoing edge, while the roots narrow to a. The same
+// query with `x <> y` (no guard) and a both-kinds node without such an edge
+// keep serving.
+func TestShortestPathKindLevelSelfEndpointDeclines(t *testing.T) {
+	const (
+		kindA snapshot.KindID = 1
+		kindB snapshot.KindID = 2
+		kindE snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindA: "A", kindB: "B", kindE: "E"}
+	nodes := []execNodeSpec{
+		{id: 1, kinds: []snapshot.KindID{kindA}, props: map[string]any{"name": "a"}},
+		{id: 2, kinds: []snapshot.KindID{kindB}, props: map[string]any{"name": "b"}},
+		{id: 3, kinds: []snapshot.KindID{kindA, kindB}, props: map[string]any{"name": "c"}},
+		{id: 4, kinds: []snapshot.KindID{kindB}, props: map[string]any{"name": "d"}},
+	}
+	const query = `MATCH p = shortestPath((x:A)-[:E*1..]->(y:B)) WHERE x.name = 'a' RETURN p`
+
+	snap := buildExecSnapshot(t, kinds, nodes, []execEdgeSpec{
+		{id: 20, start: 1, end: 2, kind: kindE},
+		{id: 21, start: 2, end: 3, kind: kindE},
+		{id: 22, start: 3, end: 4, kind: kindE},
+	})
+	if err := execExpectErr(t, snap, query, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
+		t.Fatalf("Execute(%q) error = %v, want ErrSelfEndpoint", query, err)
+	}
+	assertPathSigs(t, snap, `MATCH p = shortestPath((x:A)-[:E*1..]->(y:B)) WHERE x.name = 'a' AND x <> y RETURN p`, 0, []string{
+		"N:1,2,|E:20,",
+		"N:1,2,3,|E:20,21,",
+		"N:1,2,3,4,|E:20,21,22,",
+	})
+
+	// c now has no outgoing edge, and the roots {a} carry no B kind.
+	snap = buildExecSnapshot(t, kinds, nodes, []execEdgeSpec{
+		{id: 20, start: 1, end: 2, kind: kindE},
+		{id: 21, start: 2, end: 3, kind: kindE},
+	})
+	assertPathSigs(t, snap, query, 0, []string{
+		"N:1,2,|E:20,",
+		"N:1,2,3,|E:20,21,",
+	})
+}

@@ -1174,6 +1174,15 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 	if !step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap, roots, terminals) {
 		return nil, ErrSelfEndpoint
 	}
+	// The guard behind that 22023 sits in the harness primer, beside the
+	// seed's own conditions, and PostgreSQL may evaluate it before those
+	// conditions have narrowed the seed -- then a node the seed side's
+	// property predicates exclude still trips it, as long as it matches the
+	// seed side's kinds, lies in the other side's (fully filtered) set and
+	// has an edge the seed would walk.
+	if !step.HasExplicitEndpointInequality && kindLevelSelfEndpoint(env, part, step, roots, terminals) {
+		return nil, ErrSelfEndpoint
+	}
 
 	mode := traverse.ModeOne
 	if step.Shortest == ShortestAll {
@@ -1825,6 +1834,53 @@ func endpointsIntersect(snap *snapshot.View, roots, terminals traverse.Endpoint)
 			return false
 		}
 		return true
+	})
+	return found
+}
+
+// kindLevelSelfEndpoint reports whether a node could trip dawgs' primer
+// self-endpoint guard once the seed side is taken at the level of its kinds
+// alone (an endpoint with no kinds admitting every node). dawgs seeds from
+// either side, so both are checked: seeding from the roots walks outgoing
+// edges and tests each edge's start against the terminals, seeding from the
+// terminals walks incoming edges and tests each edge's end against the
+// roots. roots and terminals are the resolved endpoint sets (a superset where
+// a side was handed over as a kind bitmap). Edges of any kind count: the
+// guard may run before the kind filter beside it.
+func kindLevelSelfEndpoint(env *Env, part *Part, step *Step, roots, terminals traverse.Endpoint) bool {
+	kindLevel := func(nc *NodeConstraint) traverse.Endpoint {
+		if nc == nil || len(nc.Kinds) == 0 {
+			return traverse.Endpoint{}
+		}
+		return traverse.Endpoint{Bits: kindsEndpointBitmap(env, nc.Kinds)}
+	}
+	return sharedNodeWithEdge(env, kindLevel(part.Nodes[step.FromSym]), terminals, true) ||
+		sharedNodeWithEdge(env, kindLevel(part.Nodes[step.ToSym]), roots, false)
+}
+
+// sharedNodeWithEdge reports whether some node in both a and b has an
+// outgoing (outgoing true) or incoming edge, iterating the smaller side and
+// stopping at the first such node.
+func sharedNodeWithEdge(env *Env, a, b traverse.Endpoint, outgoing bool) bool {
+	total := env.Snap.NodeCount()
+	if b.Count(total) < a.Count(total) {
+		a, b = b, a
+	}
+	found := false
+	hasEdge := func(snapshot.NodeID, snapshot.KindID, uint64) bool {
+		found = true
+		return false
+	}
+	a.Iterate(env.Snap, func(id snapshot.NodeID) bool {
+		if !b.Has(id) {
+			return true
+		}
+		if outgoing {
+			env.Snap.OutEdges(id, hasEdge)
+		} else {
+			env.Snap.InEdges(id, hasEdge)
+		}
+		return !found
 	})
 	return found
 }

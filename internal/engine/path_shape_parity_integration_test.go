@@ -558,3 +558,26 @@ func TestShortestPathLaterPatternMatchesOracle(t *testing.T) {
 
 	g.assertServesOracle(t, `MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) WHERE t.name = 'far' RETURN p`)
 }
+
+// TestShortestPathKindLevelSelfEndpointMatchesOracle: without an endpoint
+// inequality, dawgs' harness primer carries a self-endpoint guard -- a seed
+// edge whose start is also a terminal raises SQLSTATE 22023 -- beside the
+// seed's own conditions, and PostgreSQL may evaluate it first. Here c
+// carries both endpoint kinds and has outgoing edges, so the narrowed roots
+// ({a}) do not keep pg from raising -- on these small tables it evaluates
+// the guard over every ZE edge before joining the seed at all, and names b,
+// a terminal whose edge the seed never walks. The engine's check saw only
+// the narrowed roots and served. With `x <> y` the guard is not emitted and
+// both answer.
+func TestShortestPathKindLevelSelfEndpointMatchesOracle(t *testing.T) {
+	g := seedPathParityGraph(t, varLengthCycleFixture())
+	for _, query := range []string{
+		`MATCH p = shortestPath((x:ZA)-[:ZE*1..1]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
+		`MATCH p = shortestPath((x:ZA)-[:ZE*1..2]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
+		`MATCH p = shortestPath((x:ZA)-[:ZE*]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
+		`MATCH p = allShortestPaths((x:ZA)-[:ZE*]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+	}
+	g.assertServesOracle(t, `MATCH p = shortestPath((x:ZA)-[:ZE*]->(y:ZB)) WHERE x.name = 'a' AND x <> y RETURN p`)
+}
