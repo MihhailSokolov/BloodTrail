@@ -646,9 +646,10 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 // is a kind matcher, not an InIDs target list, so "delete every relationship
 // of these kinds" is the operation this delete actually performs, and the
 // one the applier should replay -- an id list captured before the delete
-// ran could go stale by the time the applier reads it back. The
-// unrecognized branch falls back, same as every other unrecognized
-// criteria in this file.
+// ran could go stale by the time the applier reads it back. A recognized
+// shape whose kind set is empty deleted nothing in PostgreSQL, so it
+// records nothing. The unrecognized branch falls back, same as every other
+// unrecognized criteria in this file.
 //
 // Unlike every other observer in this file, the recognized entry is recorded
 // only AFTER the delete has actually succeeded. It is the one entry that is
@@ -673,7 +674,9 @@ func (r *observingRelationshipQuery) Delete() error {
 		r.current().Changes().RecordFallback("RelationshipQuery.Delete: delete failed")
 		return err
 	}
-	r.current().Changes().RecordDeleteRelationshipsByKinds(kinds)
+	if len(kinds) > 0 {
+		r.current().Changes().RecordDeleteRelationshipsByKinds(kinds)
+	}
 	return nil
 }
 
@@ -702,22 +705,21 @@ func (r *observingRelationshipQuery) Update(properties *graph.Properties) error 
 // edges PostgreSQL never touched.
 //
 // When exactly one criteria was recorded and edgeKindsFromCriteria
-// recognizes it with a non-empty result, kinds is that result and touchAll
-// is false: edgeKindsFromCriteria's own recognized shape (see its doc) is
-// now exactly "one or more bare relationship KindMatchers, ANDed together
-// with nothing else that could narrow the match further" -- so the
-// operation the query actually performs really is "delete every edge of
-// these kinds", which is exactly what the applier needs to replay it
-// exactly. Every other case -- zero or more than one criteria, an
-// unrecognized shape, a Conjunction carrying any conjunct that is not
-// itself a bare relationship KindMatcher, or a recognized KindMatcher whose
-// Kinds came back empty (which means "matches every kind", the opposite of
-// a narrow scope, per the KindMatcher/PathQuery.EdgeKinds convention
-// documented on recognize.PathQuery) -- reports touchAll instead, so the
-// applier falls back to a full rebuild rather than guessing.
+// recognizes it, kinds is that result and touchAll is false:
+// edgeKindsFromCriteria's own recognized shape (see its doc) is exactly
+// "one or more bare relationship KindMatchers, ANDed together with nothing
+// else that could narrow the match further", and its result is exactly the
+// kinds whose edges PostgreSQL deletes -- so the operation the query
+// performs really is "delete every edge of these kinds", which is what the
+// applier needs to replay it exactly. An empty result is exact too: that
+// delete matched no edge at all (Delete records nothing for it). Every
+// other case -- zero or more than one criteria, an unrecognized shape, or a
+// Conjunction carrying any conjunct that is not itself a bare relationship
+// KindMatcher -- reports touchAll instead, so the applier falls back to a
+// full rebuild rather than guessing.
 func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touchAll bool) {
 	if len(criteria) == 1 {
-		if ks, ok := edgeKindsFromCriteria(criteria[0]); ok && len(ks) > 0 {
+		if ks, ok := edgeKindsFromCriteria(criteria[0]); ok {
 			return ks, false
 		}
 	}
@@ -737,9 +739,15 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 // variable "r" (what dawgs' query.Kind(query.Relationship(), k)/
 // query.KindIn(query.Relationship(), ks...) builds), or a
 // *cypher.Conjunction all of whose expressions are such KindMatchers --
-// nothing else may appear alongside them. Multiple KindMatchers union their
-// kinds: a delete matching kind K1 or K2 still only touches K1 and K2's
-// edges.
+// nothing else may appear alongside them. The reported kinds are those
+// PostgreSQL actually deletes: dawgs translates an edge KindMatcher as
+// `kind_id = any(<ids>)` (IsExclusive plays no part for an edge, which has
+// exactly one kind), so one matcher selects the edges whose kind is in its
+// list -- none at all for an empty list -- and ANDed matchers select only
+// the kinds present in EVERY list: the intersection, empty whenever two
+// lists are disjoint or one is empty. An empty result means the delete
+// matched nothing. (Reporting the union instead made the applier tombstone
+// every edge of every listed kind while PostgreSQL kept them.)
 //
 // This is deliberately NOT the "ignore what you don't recognize, fall back
 // to RecordFallback" pattern this file's other recognizers use, where
@@ -769,7 +777,7 @@ func edgeKindsFromCriteria(criteria graph.Criteria) (graph.Kinds, bool) {
 		}
 
 		var kinds graph.Kinds
-		for _, expr := range typed.Expressions {
+		for i, expr := range typed.Expressions {
 			km, isKindMatcher := expr.(*cypher.KindMatcher)
 			if !isKindMatcher {
 				// A non-KindMatcher sibling narrows the match beyond the
@@ -785,13 +793,40 @@ func edgeKindsFromCriteria(criteria graph.Criteria) (graph.Kinds, bool) {
 				// just this one.
 				return nil, false
 			}
-			kinds = append(kinds, ks...)
+			if i == 0 {
+				kinds = ks
+			} else {
+				kinds = intersectKinds(kinds, ks)
+			}
 		}
 		return kinds, true
 
 	default:
 		return nil, false
 	}
+}
+
+// intersectKinds returns the kinds of a whose names also appear in b, in a's
+// order: the kinds an edge can carry and still satisfy two ANDed edge
+// KindMatchers (edgeKindsFromCriteria's doc).
+func intersectKinds(a, b graph.Kinds) graph.Kinds {
+	names := make(map[string]struct{}, len(b))
+	for _, kind := range b {
+		if kind != nil {
+			names[kind.String()] = struct{}{}
+		}
+	}
+
+	var shared graph.Kinds
+	for _, kind := range a {
+		if kind == nil {
+			continue
+		}
+		if _, ok := names[kind.String()]; ok {
+			shared = append(shared, kind)
+		}
+	}
+	return shared
 }
 
 // relationshipKindMatcherKinds reports whether km is a KindMatcher over the

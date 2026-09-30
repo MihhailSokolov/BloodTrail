@@ -522,11 +522,42 @@ func TestEdgeKindsFromCriteria(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name: "conjunction with two relationship kind matchers unions",
+			// An edge has exactly one kind, so two ANDed matchers naming
+			// different kinds match no edge at all: PostgreSQL deletes
+			// nothing, and the recognized kind set is empty -- never the
+			// union, which would tombstone every edge of both kinds.
+			name: "conjunction of disjoint relationship kind matchers intersects to nothing",
 			criteria: cypher.NewConjunction(
 				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
 				cypher.NewKindMatcher(relVariable(), graph.Kinds{adminTo}, false),
 			),
+			wantKinds: nil,
+			wantOK:    true,
+		},
+		{
+			name: "conjunction of overlapping kind lists keeps only the shared kinds",
+			criteria: cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession, adminTo}, false),
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{adminTo}, false),
+			),
+			wantKinds: graph.Kinds{adminTo},
+			wantOK:    true,
+		},
+		{
+			name: "conjunction with an empty kind list intersects to nothing",
+			criteria: cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
+				cypher.NewKindMatcher(relVariable(), nil, false),
+			),
+			wantKinds: nil,
+			wantOK:    true,
+		},
+		{
+			// dawgs compares an edge's single kind for equality whatever
+			// IsExclusive says, so an exclusive matcher selects the same
+			// edges as an overlapping one.
+			name:      "exclusive relationship kind matcher selects the same kinds",
+			criteria:  cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession, adminTo}, true),
 			wantKinds: graph.Kinds{hasSession, adminTo},
 			wantOK:    true,
 		},
@@ -594,10 +625,22 @@ func TestRelationshipDeleteScope(t *testing.T) {
 			false,
 		},
 		{
-			"one recognized criteria with empty kinds falls back to touchAll",
+			// dawgs matches an edge's kind against an empty list as
+			// `kind_id = any('{}')`, which no edge satisfies: the delete
+			// removes nothing, exactly, so no fallback is needed.
+			"one recognized criteria with empty kinds deletes nothing",
 			[]graph.Criteria{cypher.NewKindMatcher(relVariable(), nil, false)},
 			nil,
-			true,
+			false,
+		},
+		{
+			"one criteria: conjunction of disjoint relationship kind matchers deletes nothing",
+			[]graph.Criteria{cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{graph.StringKind("AdminTo")}, false),
+			)},
+			nil,
+			false,
 		},
 		{
 			"one unrecognized criteria",
@@ -1479,6 +1522,33 @@ func TestObservingRelationshipQueryDeleteRecognizedKindDelegates(t *testing.T) {
 	got := scope.Changes().EdgeKindCriteria()
 	if len(got) != 1 || !kindsEqual(got[0], graph.Kinds{kind}) {
 		t.Fatalf("Changes().EdgeKindCriteria() = %v, want [[%v]]", got, kind)
+	}
+}
+
+// TestObservingRelationshipQueryDeleteOfDisjointKindMatchersRecordsNothing:
+// Filter(And(Kind(r, A), Kind(r, B))).Delete() matches no edge in
+// PostgreSQL, so the delete still runs but nothing -- neither a kind
+// criteria nor a fallback -- reaches the change log.
+func TestObservingRelationshipQueryDeleteOfDisjointKindMatchersRecordsNothing(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	scope := engine.NewWriteScope()
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+
+	rq.Filter(cypher.NewConjunction(
+		cypher.NewKindMatcher(relVariable(), graph.Kinds{graph.StringKind("HasSession")}, false),
+		cypher.NewKindMatcher(relVariable(), graph.Kinds{graph.StringKind("AdminTo")}, false),
+	))
+
+	if err := rq.Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.deleteCalls != 1 {
+		t.Fatalf("Delete did not delegate to the inner query")
+	}
+	if !scope.Empty() {
+		ok, reasons := scope.Changes().HasFallback()
+		t.Fatalf("scope not empty: fallback=%v %v, edge kind criteria %v -- want nothing recorded for a delete that matched no edge",
+			ok, reasons, scope.Changes().EdgeKindCriteria())
 	}
 }
 
