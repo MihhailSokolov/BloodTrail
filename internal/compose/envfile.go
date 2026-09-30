@@ -56,7 +56,21 @@ func (e composeFileEntry) render(files []string) string {
 // the readers install goes by (strictComposeFile), since rollback has to
 // undo what earlier installs left in exactly those shapes.
 func findComposeFile(lines []string) (*composeFileEntry, error) {
-	var found *composeFileEntry
+	entries, err := findComposeFileEntries(lines)
+	if err != nil || len(entries) == 0 {
+		return nil, err
+	}
+	if len(entries) > 1 {
+		return nil, fmt.Errorf(".env sets %s more than once (lines %d and %d); keep one", composeFileKey, entries[0].index+1, entries[1].index+1)
+	}
+	return &entries[0], nil
+}
+
+// findComposeFileEntries is findComposeFile for every line that sets
+// COMPOSE_FILE, in order: none, one, or the several that compose reads the
+// last of.
+func findComposeFileEntries(lines []string) ([]composeFileEntry, error) {
+	var found []composeFileEntry
 	var open byte // the quote of another key's value left open by an earlier line
 	for i, raw := range lines {
 		line := strings.TrimRight(raw, "\r")
@@ -92,16 +106,13 @@ func findComposeFile(lines []string) (*composeFileEntry, error) {
 		if !hasValue {
 			return nil, fmt.Errorf(".env line %d names %s without a value", i+1, composeFileKey)
 		}
-		if found != nil {
-			return nil, fmt.Errorf(".env sets %s more than once (lines %d and %d); keep one", composeFileKey, found.index+1, i+1)
-		}
 		entry, err := parseComposeFileValue(line[:len(line)-len(value)], value)
 		if err != nil {
 			return nil, fmt.Errorf(".env line %d: %w", i+1, err)
 		}
 		entry.index = i
 		entry.suffix += cr
-		found = &entry
+		found = append(found, entry)
 	}
 	return found, nil
 }
@@ -278,13 +289,55 @@ func ComposeFiles(env string) ([]string, error) {
 // behind: rollback, status, verify. The names come back as written, empty
 // ones included, even where compose itself could not load the list; only an
 // entry that cannot be read with certainty is an error, and nil still means
-// there is no line.
+// there is no line. Where several lines set COMPOSE_FILE, which v0.1.0 and
+// v0.1.1 left beside an entry they did not recognise, it is the last that
+// counts, as for compose.
 func ListedComposeFiles(env string) ([]string, error) {
-	entry, err := findComposeFile(parseEnvFile(env).lines)
-	if err != nil || entry == nil {
+	entries, err := findComposeFileEntries(parseEnvFile(env).lines)
+	if err != nil || len(entries) == 0 {
 		return nil, err
 	}
-	return entry.files, nil
+	return entries[len(entries)-1].files, nil
+}
+
+// EntryLine is one line of an .env that sets COMPOSE_FILE.
+type EntryLine struct {
+	Line  int      // its number, counting from 1
+	Files []string // the list as written, split on ":", empty names included
+}
+
+// ComposeFileLines returns every line of the .env contents that sets
+// COMPOSE_FILE, in order: none, one, or the several that v0.1.0 and v0.1.1
+// left when they appended their own beside an entry they did not recognise.
+// Only an entry that cannot be read with certainty is an error (see
+// ListedComposeFiles); several lines are not.
+func ComposeFileLines(env string) ([]EntryLine, error) {
+	entries, err := findComposeFileEntries(parseEnvFile(env).lines)
+	if err != nil {
+		return nil, err
+	}
+	var out []EntryLine
+	for _, e := range entries {
+		out = append(out, EntryLine{Line: e.index + 1, Files: e.files})
+	}
+	return out, nil
+}
+
+// RemoveComposeFileLineAt drops the line numbered line, which has to be one
+// of those ComposeFileLines returns, together with its line break, and leaves
+// every other byte as it was.
+func RemoveComposeFileLineAt(env string, line int) (string, error) {
+	f := parseEnvFile(env)
+	entries, err := findComposeFileEntries(f.lines)
+	if err != nil {
+		return env, err
+	}
+	for _, e := range entries {
+		if e.index == line-1 {
+			return f.removeLine(e.index).String(), nil
+		}
+	}
+	return env, fmt.Errorf(".env line %d does not set %s", line, composeFileKey)
 }
 
 // AddComposeFile ensures the .env contents make docker compose load the

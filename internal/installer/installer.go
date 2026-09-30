@@ -939,7 +939,7 @@ func envRestore(envPath string, m manifest.Manifest) (current, restored, note st
 	if err != nil {
 		return "", "", "", false, fmt.Errorf("reading .env: %w", err)
 	}
-	restored, note, err = restoreComposeFileEntry(string(data), m)
+	restored, note, err = restoreComposeFileEntry(string(data), m, priorComposeEntry(m))
 	if err != nil {
 		return "", "", "", false, fmt.Errorf(".env: %w", err)
 	}
@@ -948,7 +948,9 @@ func envRestore(envPath string, m manifest.Manifest) (current, restored, note st
 
 // restoreComposeFileEntry undoes what the install m records did to the .env
 // contents' COMPOSE_FILE entry, and says what the operator should know about
-// the result, if anything.
+// the result, if anything. prior is what the .env the install backed up said
+// about the entry (priorComposeEntry), which only the manifests of installs
+// from before the written list was recorded need.
 //
 // An entry the install created goes away entirely: leaving a line behind
 // would keep compose's file discovery off, so the operator's conventional
@@ -956,26 +958,20 @@ func envRestore(envPath string, m manifest.Manifest) (current, restored, note st
 // rollback. That holds while the line names just what the install wrote,
 // though: a file the operator has added to it since would drop out of their
 // project with it, so then only the installer's own override comes out.
-//
-// Installs from before the written list was recorded also took an empty
-// entry for none, recorded it as created and wrote their override into it.
-// An entry naming nothing besides that override is one of those: it gets
-// its empty entry back, spelled as the operator wrote it -- or keeps it, when
-// the install stopped before its write -- rather than losing the line.
-func restoreComposeFileEntry(env string, m manifest.Manifest) (restored, note string, err error) {
+// Whether it still names just that is what the manifest's written list says;
+// installs from before it was recorded are restoreLegacyComposeFileEntry's.
+func restoreComposeFileEntry(env string, m manifest.Manifest, prior priorEntry) (restored, note string, err error) {
+	if m.EnvComposeFileCreated && m.EnvComposeFileWritten == nil {
+		return restoreLegacyComposeFileEntry(env, m, prior)
+	}
 	listed, err := compose.ListedComposeFiles(env)
 	if err != nil || listed == nil {
 		return env, "", err
 	}
-	others := withoutOverride(listed)
 	switch {
 	case !m.EnvComposeFileCreated:
 		restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName)
-	case m.EnvComposeFileWritten == nil && strings.Join(others, "") == "":
-		if restored, err = compose.RestoreEmptyComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
-			note = "put back the empty COMPOSE_FILE entry .env had before the install; docker compose does not read that as unset but fails to load the project, so delete the line to let compose find its files on its own, or list them"
-		}
-	case m.EnvComposeFileWritten != nil && !slices.Equal(others, withoutOverride(m.EnvComposeFileWritten)):
+	case !slices.Equal(withoutOverride(listed), withoutOverride(m.EnvComposeFileWritten)):
 		if restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
 			note = fmt.Sprintf("COMPOSE_FILE in .env has changed since the install, so only %s came out of it", compose.OverrideFileName)
 		}

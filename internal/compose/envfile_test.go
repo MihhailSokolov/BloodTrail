@@ -216,8 +216,6 @@ func TestComposeFileEntryFailsClosed(t *testing.T) {
 		"COMPOSE_FILE=\"docker-compose.yml\\:extra.yml\"\n",                     // escape
 		"COMPOSE_FILE='docker-compose.yml:extra.yml\\' # x'\n",                  // escaped quote, which compose honours in single quotes too
 		"COMPOSE_FILE=\"docker-compose.yml\" extra.yml\n",                       // text after the quote
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE=b.yml\n",                              // two entries
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE: b.yml\n",                             // two entries, one YAML-style
 		"export COMPOSE_FILE\n",                                                 // no value
 		"COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml;b.yml\n",                  // another separator
 		"COMPOSE_PATH_SEPARATOR: ;\nCOMPOSE_FILE=a.yml;b.yml\n",                 // another separator, YAML-style
@@ -252,6 +250,52 @@ func TestComposeFileEntryFailsClosed(t *testing.T) {
 		if files := mustFiles(t, env); files != nil {
 			t.Errorf("ComposeFiles(%q) = %q, want no entry", env, files)
 		}
+	}
+}
+
+// TestSeveralComposeFileLines covers an .env that sets COMPOSE_FILE on more
+// than one line, which v0.1.0 and v0.1.1 left when they appended their own
+// line beside an entry they did not recognise (`export COMPOSE_FILE=...`).
+// Everything that would rewrite such an entry -- and install, which goes by
+// the strict reading -- refuses it: which line is meant is a guess. Compose
+// reads the last, which is what the forgiving reader returns, and
+// ComposeFileLines and RemoveComposeFileLineAt let rollback take one line out
+// and leave every other byte alone.
+func TestSeveralComposeFileLines(t *testing.T) {
+	env := "A=b\r\nexport COMPOSE_FILE=docker-compose.yml:tls.yml # mine\r\nC=d\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n"
+	if _, err := ComposeFiles(env); err == nil || !strings.Contains(err.Error(), "lines 2 and 4") {
+		t.Errorf("ComposeFiles: err = %v, want a refusal naming both lines", err)
+	}
+	if _, err := AddComposeFile(env, []string{"docker-compose.yml"}, OverrideFileName); err == nil {
+		t.Error("AddComposeFile accepted two entries")
+	}
+	if _, err := RemoveComposeFile(env, OverrideFileName); err == nil {
+		t.Error("RemoveComposeFile accepted two entries")
+	}
+	if _, err := RemoveComposeFileLine(env); err == nil {
+		t.Error("RemoveComposeFileLine accepted two entries")
+	}
+	if got, err := ListedComposeFiles(env); err != nil || strings.Join(got, ",") != "docker-compose.yml,docker-compose.bloodtrail.yml" {
+		t.Errorf("ListedComposeFiles = %q, %v; want the last line's list, as compose reads it", got, err)
+	}
+
+	lines, err := ComposeFileLines(env)
+	if err != nil || len(lines) != 2 || lines[0].Line != 2 || lines[1].Line != 4 ||
+		strings.Join(lines[0].Files, ",") != "docker-compose.yml,tls.yml" || strings.Join(lines[1].Files, ",") != "docker-compose.yml,docker-compose.bloodtrail.yml" {
+		t.Fatalf("ComposeFileLines = %+v, %v", lines, err)
+	}
+	got, err := RemoveComposeFileLineAt(env, 4)
+	if want := "A=b\r\nexport COMPOSE_FILE=docker-compose.yml:tls.yml # mine\r\nC=d\r\n"; err != nil || got != want {
+		t.Errorf("RemoveComposeFileLineAt(4) = %q, %v; want %q", got, err, want)
+	}
+	if got, err = RemoveComposeFileLineAt(env, 2); err != nil || got != "A=b\r\nC=d\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n" {
+		t.Errorf("RemoveComposeFileLineAt(2) = %q, %v", got, err)
+	}
+	if _, err := RemoveComposeFileLineAt(env, 3); err == nil {
+		t.Error("RemoveComposeFileLineAt took out a line that does not set COMPOSE_FILE")
+	}
+	if none, err := ComposeFileLines("A=b\n"); err != nil || none != nil {
+		t.Errorf("ComposeFileLines of an .env without the entry = %+v, %v", none, err)
 	}
 }
 
