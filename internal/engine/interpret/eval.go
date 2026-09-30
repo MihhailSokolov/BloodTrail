@@ -3052,9 +3052,9 @@ func nextAddKind(op cypher.Operator, aKind, bKind addOperandKind) addOperandKind
 // operand is a failed cast in PostgreSQL (ErrRuntimeCast) and any other
 // non-number declines (ErrUnsupported; checkArithmetic does not type-check
 // operands, mirroring this runtime dispatch). Integer and numeric steps are
-// computed exactly or decline (integerArithmetic); a float step in float64,
-// as PostgreSQL's float8. aKind/bKind are the operands' static
-// addOperandKind, per evalArithmetic's own doc.
+// computed exactly or decline (integerArithmetic); a float8 step as
+// PostgreSQL's float8 operators compute it (float8Arithmetic). aKind/bKind
+// are the operands' static addOperandKind, per evalArithmetic's own doc.
 func applyArithmetic(aType sqlNum, a any, aOk bool, aKind addOperandKind, op cypher.Operator, bType sqlNum, b any, bOk bool, bKind addOperandKind) (any, bool, sqlNum, error) {
 	t := arithSQLNum(aType, bType)
 	if !aOk || !bOk || a == nil || b == nil {
@@ -3084,24 +3084,11 @@ func applyArithmetic(aType sqlNum, a any, aOk bool, aKind addOperandKind, op cyp
 		}
 		return r, true, t, nil
 	case sqlNumFloat8:
-		switch op {
-		case cypher.OperatorAdd:
-			return af + bf, true, t, nil
-		case cypher.OperatorSubtract:
-			return af - bf, true, t, nil
-		case cypher.OperatorMultiply:
-			return af * bf, true, t, nil
-		case cypher.OperatorDivide:
-			if bf == 0 {
-				return nil, false, sqlNumNone, ErrRuntimeCast
-			}
-			return af / bf, true, t, nil
-		case cypher.OperatorModulo:
-			if bf == 0 {
-				return nil, false, sqlNumNone, ErrRuntimeCast
-			}
-			return math.Mod(af, bf), true, t, nil
+		r, err := float8Arithmetic(af, op, bf)
+		if err != nil {
+			return nil, false, sqlNumNone, err
 		}
+		return r, true, t, nil
 	}
 	return nil, false, sqlNumNone, ErrUnsupported
 }

@@ -84,3 +84,48 @@ func TestTryCypherIntegerArithmeticMatchesOracle(t *testing.T) {
 		{`MATCH (n:IntBig) WHERE n.v = 9007199254740990 RETURN n`, true},
 	})
 }
+
+// TestTryCypherFloatLiteralArithmeticMatchesOracle compares arithmetic over
+// float literals with PostgreSQL. dawgs prints a float literal with
+// FormatFloat('f', -1): `2.0` reaches PostgreSQL as the int4 2 and `0.1` as
+// an exact numeric; only a plain property next to a float literal is cast
+// to float8. So `size(n.l) / 2.0` and `5.0 / 2` divide in integers,
+// `0.1 + 0.2 = 0.3` holds exactly, `n.i % 2.0` has no operator
+// (`double precision % integer`), and `WITH 5.0 AS x` is an int4 column --
+// where the evaluator computed every one of them in float64. float8
+// arithmetic itself raises an error on overflow and on a product that
+// underflows to zero; the evaluator returned Inf and 0.
+func TestTryCypherFloatLiteralArithmeticMatchesOracle(t *testing.T) {
+	pgDriver, eng := seedTypedGraph(t, []typedNode{
+		{"FltDiv", map[string]any{"name": "d1", "l": []any{"a", "b", "c"}}},
+		{"FltLit", map[string]any{"name": "t1", "i": 1, "f": 1.0}},
+		{"FltLit", map[string]any{"name": "t2", "i": 2, "f": 1.5}},
+		{"FltBig", map[string]any{"name": "g1", "f": 10.0}},
+		{"FltTiny", map[string]any{"name": "s1", "f": 1e-300}},
+	})
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:FltDiv) WHERE size(n.l) / 2.0 = 1.5 RETURN n`, false},
+		{`MATCH (n:FltDiv) WHERE size(n.l) / 2.0 > 1 RETURN n`, false},
+		{`MATCH (n:FltDiv) WHERE size(n.l) * 1.0 / 2 = 1.5 RETURN n`, false},
+		{`MATCH (n:FltDiv) WHERE size(n.l) / 2.0 < 1.2 RETURN n`, false},
+		{`MATCH (n:FltDiv) RETURN size(n.l) / 2.0 AS x`, false},
+		{`MATCH (n:FltLit) WHERE 5.0 / 2 = 2.5 RETURN n`, false},
+		{`MATCH (n:FltLit) WHERE 0.1 + 0.2 = 0.3 RETURN n`, false},
+		{`MATCH (n:FltLit) WHERE (0.1 + 0.2) * n.f = 0.3 RETURN n`, false},
+		{`MATCH (n:FltLit) WHERE n.i % 2.0 = 1 RETURN n`, false},
+		{`MATCH (n:FltLit) WHERE 7.0 % 2 = 1 RETURN n`, false},
+		{`WITH 5.0 AS x MATCH (n:FltLit) WHERE x / 2.0 = 2.5 RETURN n`, false},
+		{`WITH 5.5 AS x MATCH (n:FltLit) WHERE x * 2 = 11 RETURN n`, false},
+		{`MATCH (n:FltBig) WHERE n.f * 1e308 = 0 RETURN n`, false},
+		{`MATCH (n:FltTiny) WHERE n.f * 1e-300 = 0 RETURN n`, false},
+
+		{`MATCH (n:FltLit) WHERE n.i / 2.0 = 0.5 RETURN n`, true},
+		{`MATCH (n:FltLit) WHERE n.f * 2.0 = 3.0 RETURN n`, true},
+		{`MATCH (n:FltLit) WHERE 2.0 + 3.0 + n.i = 6 RETURN n`, true},
+		{`MATCH (n:FltLit) WHERE n.i * -2.5 = -2.5 RETURN n`, true},
+		{`MATCH (n:FltLit) WHERE (n.i + 1.0) / 2 = 1.5 RETURN n`, true},
+		{`MATCH (n:FltLit) RETURN n.i / -2.0 AS x`, true},
+		{`MATCH (n:FltLit) RETURN 2.0 * n.f + 0.5 AS x`, true},
+	})
+}

@@ -4272,11 +4272,17 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
 	}
+	// Each numeric step is computed at the type PostgreSQL resolves it to
+	// (eval.go's evalArithmeticTyped), and some of those the evaluator
+	// cannot reproduce: `/` outside float8 (integers truncate, numeric is
+	// exact decimal -- and dawgs prints `2.0` as the int4 2, so
+	// `size(n.l) / 2.0` truncates), `%` at all (float8 has none), and
+	// numeric over a fractional literal (`0.1 + 0.2 = 0.3` is exact there).
+	// See numericStepServed.
+	if _, ok := foldArithSQLNum(ae, numericStepServed); !ok {
+		return false
+	}
 	curKind := classifyAddOperand(ae.Left)
-	// Tracks whether the value accumulated on the left is statically a
-	// float, which is what decides whether PostgreSQL divides in integers
-	// -- see staticallyFloatOperand and the Divide case below.
-	leftIsFloat := staticallyFloatOperand(ae.Left)
 	for i, p := range ae.Partials {
 		if p == nil {
 			return false
@@ -4290,23 +4296,6 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 			return false
 		}
 		rKind := classifyAddOperand(p.Right)
-		rightIsFloat := staticallyFloatOperand(p.Right)
-
-		// `/` and `%` are the two operators whose result depends on whether
-		// PostgreSQL is working in integers or floats, and dawgs decides
-		// that statically: it casts a property lookup to int8 unless some
-		// operand is a float, so `n.val / 2` becomes `(...)::int8 / 2` --
-		// truncating division. This evaluator has only float64 arithmetic,
-		// so it answers 3.5 where PostgreSQL answers 3, and `WHERE n.val /
-		// 2 = 1` then drops a row PostgreSQL returns. Unless some operand
-		// is statically a float (`n.val / 2.0`, where dawgs casts to
-		// float8 and both sides agree), the shape delegates.
-		if p.Operator == cypher.OperatorDivide || p.Operator == cypher.OperatorModulo {
-			if !leftIsFloat && !rightIsFloat {
-				return false
-			}
-		}
-		leftIsFloat = leftIsFloat || rightIsFloat
 
 		// A numeric step types its operands the way evalArithmetic's casts
 		// assume, and dawgs does not always: it casts only a PLAIN property
@@ -4339,16 +4328,15 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	return true
 }
 
-// staticallyFloatOperand reports whether expr is, on its AST alone, a
-// floating-point value -- the thing that decides whether dawgs' translation
-// of a `/` or `%` lands on PostgreSQL's integer or floating-point operator.
-// A float literal anywhere in an operand makes the whole operand float, so
-// parentheses, signs and nested arithmetic are followed through.
+// staticallyFloatOperand reports whether expr carries a float literal on its
+// AST alone -- what makes dawgs cast a plain property it is combined with to
+// float8 rather than int8 (`n.v / 2.0` is `(p ->> 'v')::float8 / 2`). A
+// float literal anywhere in an operand counts, so parentheses, signs and
+// nested arithmetic are followed through. The literal itself is not a float8
+// in PostgreSQL (printedFloatSQLNum); only the property it types is.
 //
 // Everything whose type is not statically knowable here -- a property
-// lookup, a variable, a function result -- answers false, which is the
-// conservative direction: it makes the caller decline rather than assume
-// PostgreSQL will agree with float64 arithmetic.
+// lookup, a variable, a function result -- answers false.
 func staticallyFloatOperand(expr cypher.Expression) bool {
 	switch e := unwrapParens(expr).(type) {
 	case *cypher.Literal:

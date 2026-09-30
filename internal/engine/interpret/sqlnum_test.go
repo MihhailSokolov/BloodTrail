@@ -83,3 +83,76 @@ func TestEvalIntegerLiteralPastExactRangeDeclines(t *testing.T) {
 		t.Errorf("evalLiteralValue(2^53) = %v, %v, %v; want the exact value", got, ok, err)
 	}
 }
+
+// TestFloatLiteralTyping pins how PostgreSQL types a float literal as dawgs
+// prints it (FormatFloat 'f'): a fraction is an exact numeric, a whole
+// number an integer constant, and numeric past int8.
+func TestFloatLiteralTyping(t *testing.T) {
+	for _, tc := range []struct {
+		value float64
+		want  sqlNum
+	}{
+		{2.0, sqlNumInt4},
+		{0.0, sqlNumInt4},
+		{0.1, sqlNumNumeric},
+		{-2.5, sqlNumNumeric},
+		{3e9, sqlNumInt8},
+		{1e20, sqlNumNumeric},
+	} {
+		if got := literalSQLNum(&cypher.Literal{Value: tc.value}); got != tc.want {
+			t.Errorf("literalSQLNum(%v) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+// TestNumericStepServed pins which arithmetic steps Plan admits by their
+// PostgreSQL type.
+func TestNumericStepServed(t *testing.T) {
+	for _, tc := range []struct {
+		op         cypher.Operator
+		typ        sqlNum
+		fractional bool
+		want       bool
+	}{
+		{cypher.OperatorDivide, sqlNumFloat8, false, true},
+		{cypher.OperatorDivide, sqlNumInt4, false, false},
+		{cypher.OperatorDivide, sqlNumNumeric, false, false},
+		{cypher.OperatorModulo, sqlNumFloat8, false, false},
+		{cypher.OperatorModulo, sqlNumInt8, false, false},
+		{cypher.OperatorAdd, sqlNumNumeric, true, false},
+		{cypher.OperatorAdd, sqlNumNumeric, false, true},
+		{cypher.OperatorMultiply, sqlNumFloat8, true, true},
+		{cypher.OperatorMultiply, sqlNumInt4, false, true},
+	} {
+		if got := numericStepServed(tc.op, tc.typ, tc.fractional); got != tc.want {
+			t.Errorf("numericStepServed(%v, %v, %v) = %v, want %v", tc.op, tc.typ, tc.fractional, got, tc.want)
+		}
+	}
+}
+
+// TestFloat8ArithmeticRaisesPostgresErrors pins float8Arithmetic to
+// PostgreSQL's float8 operators: overflow, underflow of a product or
+// quotient, and a zero divisor are errors, not Inf or 0.
+func TestFloat8ArithmeticRaisesPostgresErrors(t *testing.T) {
+	for _, tc := range []struct {
+		a  float64
+		op cypher.Operator
+		b  float64
+	}{
+		{1e308, cypher.OperatorMultiply, 10},
+		{1e308, cypher.OperatorAdd, 1e308},
+		{1e-300, cypher.OperatorMultiply, 1e-300},
+		{1e-300, cypher.OperatorDivide, 1e300},
+		{1, cypher.OperatorDivide, 0},
+	} {
+		if r, err := float8Arithmetic(tc.a, tc.op, tc.b); !errors.Is(err, ErrRuntimeCast) {
+			t.Errorf("float8Arithmetic(%v %v %v) = %v, %v; want ErrRuntimeCast", tc.a, tc.op, tc.b, r, err)
+		}
+	}
+	if r, err := float8Arithmetic(0, cypher.OperatorMultiply, 1e-300); err != nil || r != 0 {
+		t.Errorf("0 * 1e-300 = %v, %v; want an exact 0", r, err)
+	}
+	if _, err := float8Arithmetic(7, cypher.OperatorModulo, 2); !errors.Is(err, ErrUnsupported) {
+		t.Errorf("float8 %% error = %v, want ErrUnsupported", err)
+	}
+}
