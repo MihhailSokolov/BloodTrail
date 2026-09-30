@@ -140,6 +140,7 @@ ROOT="$(fake_repo)"
 CODE=$?
 expect "the build fails instead of guessing" test "$CODE" -ne 0
 expect "the error says so" printed "$ROOT/err" "refusing to guess"
+expect "and go's own explanation is not thrown away" printed "$ROOT/err" "go: module is not a known dependency"
 
 echo "build-image.sh --dawgs-only"
 run_build v9.6.0 v0.7.0 v0.8.0 --dawgs-only

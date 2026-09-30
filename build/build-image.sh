@@ -182,9 +182,10 @@ grep -q "Version = \"$DRIVER_VERSION\"" "$WORK/$VENDOR_DIR/driver.go"
 
 echo "==> Wiring go.mod"
 # What upstream itself pins, read before the edit below can change it.
-UPSTREAM_DAWGS="$(cd "$WORK" && go list -m -f '{{.Version}}' "$DAWGS" 2>/dev/null)" || UPSTREAM_DAWGS=""
+# A failure leaves go's own explanation on stderr and check_dawgs refuses to go on.
+UPSTREAM_DAWGS="$(cd "$WORK" && go list -m -f '{{.Version}}' "$DAWGS")" || UPSTREAM_DAWGS=""
 (cd "$WORK" && go mod edit -require="$MODULE@v0.0.0" -replace="$MODULE=./$VENDOR_DIR" && go mod tidy)
-RESOLVED_DAWGS="$(cd "$WORK" && go list -m -f '{{.Version}}' "$DAWGS" 2>/dev/null)" || RESOLVED_DAWGS=""
+RESOLVED_DAWGS="$(cd "$WORK" && go list -m -f '{{.Version}}' "$DAWGS")" || RESOLVED_DAWGS=""
 check_dawgs
 if [[ -n "$DAWGS_ONLY" ]]; then printf '%s\n' "$RESOLVED_DAWGS" >&3; exit 0; fi
 (cd "$WORK" && go build ./cmd/api/src/cmd/bhapi)   # fail fast before the long Docker build
