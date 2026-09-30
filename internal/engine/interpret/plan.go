@@ -1380,8 +1380,27 @@ func (pb *partBuilder) nextPattern() int {
 // hard assumption, itself mirroring real Cypher grammar -- must be exactly
 // node-relationship-node (3 elements): shortestPath cannot span more than
 // one relationship pattern.
+//
+// It must also be the first thing its query part binds. dawgs compiles the
+// pattern into a harness call whose frame projects every earlier frame's
+// bindings, but joins an earlier frame only when an endpoint is bound or a
+// condition on the seed side refers to it, and whose endpoint filters run
+// as SQL text inside plpgsql EXECUTE, where no outer CTE is visible. So an
+// earlier pattern in the same part -- another MATCH clause or a comma-
+// separated pattern, sharing a variable or not -- and an endpoint bound
+// before the pattern are PostgreSQL's 42P01 ("missing FROM-clause entry",
+// "relation does not exist"). After a WITH (or inside an OPTIONAL MATCH)
+// the harness frame joins the earlier frame only when some condition on it
+// lands on the side dawgs' selectivity model picks as the seed, so pg
+// answers some spellings and rejects near-identical ones (`s <> x` against
+// `b <> x`, or the same join with an extra condition on the far endpoint).
+// Telling them apart would mean mirroring that model, so every symbol
+// already in scope declines, carried ones included.
 func (pb *partBuilder) addShortestPathPart(part *cypher.PatternPart) bool {
 	if len(part.PatternElements) != 3 {
+		return false
+	}
+	if len(pb.known) > 0 {
 		return false
 	}
 	firstNode, isNode := part.PatternElements[0].AsNodePattern()
@@ -1571,6 +1590,16 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 		if min < 0 || max < 0 {
 			return Step{}, false
 		}
+		// An upper bound of zero (`*..0`, `*1..0`, `*0..0`) is not the
+		// empty range it reads as in PostgreSQL. dawgs' expansion primer
+		// emits every depth-1 row without consulting the bound -- only its
+		// recursive member checks `depth < max` -- so `*1..0` returns the
+		// one-hop rows and `*0..0` the zero-length rows plus the one-hop
+		// ones, while a shortestPath harness never enters its loop and
+		// returns nothing. Declined rather than reproduced.
+		if max == 0 {
+			return Step{}, false
+		}
 		rng = &Range{Min: min, Max: max}
 	}
 
@@ -1625,17 +1654,51 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 // finalizeShortestPaths runs after every pattern and WHERE conjunct in the
 // Part has been processed: for every shortestPath/allShortestPaths Step it
 // sets HasExplicitEndpointInequality and enforces the endpoint-constraint
-// rule (see its own doc below), plus the shortest-step mixing restriction
-// (see shortestStepsAreIsolated).
+// rule (below), plus the shortest-step mixing restriction (see
+// shortestStepsAreIsolated).
+//
+// The endpoint-constraint rule is that the pattern's SECOND-written endpoint
+// must be constrained (isConstrained). Without a constraint there, dawgs'
+// harness has no terminal filter and marks a hop satisfied by a continuation
+// test on the seed instead (forwardContinuationSatisfaction, translate/
+// expansion.go): `exists (select 1 from edge where end_id = e0.start_id)`
+// for a forward pattern, `start_id = e0.end_id` for a backward one. At depth
+// 1 that asks whether the seed itself has an incoming (resp. outgoing) edge
+// of any kind, so PostgreSQL drops the one-hop paths of every seed without
+// one and reports that seed's next level instead -- an answer no search the
+// engine runs reproduces. When only the FIRST-written endpoint is
+// unconstrained, dawgs seeds from the constrained one and the same test
+// reduces to always-true, so that spelling (every shipped prebuilt with a
+// bare `(s)`, and `(e)<-[...]-(s:X)`) keeps serving. The rule subsumes the
+// older "at least one endpoint constrained" one.
 func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression) bool {
 	if !pb.shortestStepsAreIsolated() {
 		return false
 	}
 	for _, idx := range pb.shortestSteps {
 		step := &pb.chains[idx]
+
+		// Nothing may follow the pattern in its query part either. dawgs
+		// hands the harness only the conditions of the pattern's own MATCH
+		// clause and applies a later clause's WHERE, labels and inline map
+		// after the harness has picked its paths (a later pattern
+		// re-mentioning an endpoint is moreover a cross join with the whole
+		// node table, and some later clauses are 42P01), while this Part's
+		// WHERE pools every clause into the endpoint constraints and into
+		// HasExplicitEndpointInequality below. Every pattern part draws the
+		// next Pattern number, so the step holding the last one drawn means
+		// nothing followed it.
+		if pb.patternSeq == nil || step.Pattern != *pb.patternSeq {
+			return false
+		}
+
 		step.HasExplicitEndpointInequality = hasEndpointInequality(whereConjuncts, step.FromSym, step.ToSym)
 
-		if !pb.isConstrained(step.FromSym) && !pb.isConstrained(step.ToSym) {
+		secondWritten := step.ToSym
+		if step.Reversed {
+			secondWritten = step.FromSym
+		}
+		if !pb.isConstrained(secondWritten) {
 			return false
 		}
 	}
@@ -1706,10 +1769,13 @@ func (pb *partBuilder) shortestStepsAreIsolated() bool {
 
 // isConstrained reports whether sym's NodeConstraint carries a kind label,
 // an id() anchor, an objectid anchor, or at least one pushed single-symbol
-// WHERE predicate.
+// WHERE predicate -- the same things dawgs puts into a shortest-path
+// harness's endpoint filter, so finalizeShortestPaths asks it about the
+// pattern's second-written endpoint.
 //
 // The original implementation of finalizeShortestPaths' "at least one
-// endpoint constrained" rule (see that function's doc) checked only
+// endpoint constrained" rule (since narrowed to the second-written endpoint
+// -- see that function's doc) checked only
 // Kinds/IDs/ObjectIDAnchor, a literal reading of "kind- or
 // id-constrained". Predicates was added here after that reading was found
 // to exclude a real, required corpus query for no correctness reason: agi.json's
