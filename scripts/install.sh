@@ -37,7 +37,30 @@ trap 'rm -rf "$TMP"' EXIT
 echo "Downloading $ASSET from $BASE" >&2
 curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET"
 curl -fsSL "$BASE/checksums.txt" -o "$TMP/checksums.txt"
-(cd "$TMP" && grep -F " $ASSET" checksums.txt | $SHA256 -c - >/dev/null) || { echo "checksum verification failed" >&2; exit 1; }
+
+# checksums.txt has a "<sha256>  <file>" line per release asset. Take the one
+# line for this asset and compare its hash against the download here, rather
+# than piping whatever grep finds into `sha256sum -c -`: the sha256sum macOS 14
+# and later ship in /sbin exits 0 for input it cannot use -- no line at all,
+# or one that is not a checksum -- so a checksums.txt that lacked the entry
+# would have passed as a verified download.
+NL='
+'
+ENTRY="$(awk -v asset="$ASSET" 'NF == 2 && ($2 == asset || $2 == "*" asset)' "$TMP/checksums.txt")"
+case "$ENTRY" in
+  "") echo "checksums.txt has no checksum for $ASSET; refusing to run an unverified download" >&2; exit 1 ;;
+  *"$NL"*) echo "checksums.txt has more than one checksum for $ASSET; refusing to run a download it cannot tell how to verify" >&2; exit 1 ;;
+esac
+EXPECTED="$(printf '%s\n' "$ENTRY" | awk '{ print tolower($1) }')"
+case "$EXPECTED" in
+  *[!0-9a-f]*) EXPECTED="" ;;
+esac
+if [ "${#EXPECTED}" -ne 64 ]; then
+  echo "the entry for $ASSET in checksums.txt is not a SHA-256 checksum: $ENTRY" >&2; exit 1
+fi
+ACTUAL="$($SHA256 "$TMP/$ASSET")" || { echo "could not compute the checksum of $ASSET" >&2; exit 1; }
+ACTUAL="$(printf '%s\n' "$ACTUAL" | awk '{ print tolower($1) }')"
+[ "$ACTUAL" = "$EXPECTED" ] || { echo "checksum verification failed" >&2; exit 1; }
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 set +e
 "$TMP/bloodtrail" "$@"
