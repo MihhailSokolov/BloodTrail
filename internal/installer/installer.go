@@ -180,10 +180,13 @@ func handle(runner dockerx.Runner, composeFile, projectDir string, strict bool) 
 // the compose file given; one listing a file that is not on disk -- compose
 // fails to load the project over it, so the project without it is a guess,
 // and `up -d` would recreate the operator's services without whatever that
-// file held; and, with no entry, a compose file other than the one discovery
-// picks, which is not what the operator's own commands run. Only the
-// installer's own override may be missing: a leftover entry may still name
-// it, and the install is about to write it.
+// file held; one whose first file is not in the project directory, where
+// compose then takes its project directory from instead of the one the
+// installer addresses the project through (checkProjectDirectory); and, with
+// no entry, a compose file other than the one discovery picks, which is not
+// what the operator's own commands run. Only the installer's own override may
+// be missing: a leftover entry may still name it, and the install is about to
+// write it.
 //
 // Otherwise it takes the project as best it can, for the commands that have
 // to keep working on whatever an install -- this version or an earlier one --
@@ -233,6 +236,11 @@ func projectFiles(composeFile, projectDir string, strict bool) ([]string, error)
 		}
 		switch {
 		case slices.Contains(files, composeFile):
+			if strict {
+				if err := checkProjectDirectory(envPath, projectDir, listed[0]); err != nil {
+					return nil, err
+				}
+			}
 			return files, nil
 		case strict:
 			return nil, fmt.Errorf("%s: COMPOSE_FILE does not list %s, the compose file given, so docker compose does not load it; pass --compose-file for the one the deployment runs", envPath, composeFile)
@@ -247,6 +255,41 @@ func projectFiles(composeFile, projectDir string, strict bool) ([]string, error)
 		return nil, fmt.Errorf("%s sets no COMPOSE_FILE, so docker compose loads %s there on its own, not %s; pass --compose-file for the file the deployment runs, or list its files in COMPOSE_FILE", envPath, base, composeFile)
 	}
 	return []string{composeFile}, nil
+}
+
+// checkProjectDirectory refuses a project that compose would load from another
+// directory than the one the installer addresses it through. Every installer
+// command runs `docker compose --project-directory <projectDir>`, where the
+// .env is; when COMPOSE_FILE lists files, compose's own project directory is
+// that of the first one (compose-go's GetWorkingDir), and it is that
+// directory relative paths in the compose files resolve against -- a bind
+// mount such as ./pgdata among them. With the project name pinned in .env
+// (COMPOSE_PROJECT_NAME) the two still reach the same containers, so nothing
+// would notice until the installer's `up -d` recreated a service with the
+// mount somewhere else: a database on an empty directory, with the operator's
+// data left where it was. first is the first name COMPOSE_FILE lists.
+func checkProjectDirectory(envPath, projectDir, first string) error {
+	if !filepath.IsAbs(first) {
+		first = filepath.Join(projectDir, first)
+	}
+	dir := filepath.Dir(first)
+	if sameDirectory(dir, projectDir) {
+		return nil
+	}
+	return fmt.Errorf("%s: COMPOSE_FILE lists %s first, so docker compose takes %s as the project directory -- the one relative paths in the compose files, bind mounts such as ./pgdata among them, resolve against -- "+
+		"but the installer runs it with --project-directory %s, where this .env is, so its `up -d` could recreate services with their data on different host paths (a database on an empty directory, say); "+
+		"it stops rather than guess. Put the .env in %s, run docker compose from there, and rerun with --project-dir %s", envPath, first, dir, projectDir, dir, dir)
+}
+
+// sameDirectory reports whether a and b are the same directory: spelled alike,
+// or the one directory reached in two ways (a symbolic link).
+func sameDirectory(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
 }
 
 // checkComposeEnvironment refuses what the installer's own environment would
