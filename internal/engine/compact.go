@@ -401,11 +401,21 @@ func segmentsAfter(current, captured []*snapshot.Segment) (tail []*snapshot.Segm
 // though nothing this compaction did could ever be the write such a retry
 // would be looking for).
 //
-// Publishing carries no segments forward when the tail is empty (the
-// overwhelmingly common case: nothing else was appended during the fold),
-// producing a bare NewView(folded) rather than an overlay View wrapping one
-// pointlessly empty merged segment.
-func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment, folded *snapshot.Snapshot) bool {
+// pending is the fold's own carry-over (snapshot.FoldWithPendingEdges): the
+// captured delta edges whose endpoint no write had delivered yet, which the
+// folded base cannot hold. It goes beneath the tail -- it is older than
+// everything the tail holds, so a tail record for the same edge wins, as it
+// would have in the uncompacted stack -- and the two are published as one
+// merged segment. Without it, an endpoint arriving in the tail (or in any
+// later write) would find its edge gone for good, although PostgreSQL has
+// it.
+//
+// Publishing carries no segments forward when both are empty (the
+// overwhelmingly common case: nothing else was appended during the fold, and
+// no captured edge was waiting on an endpoint), producing a bare
+// NewView(folded) rather than an overlay View wrapping one pointlessly empty
+// merged segment.
+func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment, folded *snapshot.Snapshot, pending *snapshot.Segment) bool {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 
@@ -422,13 +432,17 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 		return false
 	}
 
+	carried := tail
+	if pending != nil {
+		carried = append([]*snapshot.Segment{pending}, tail...)
+	}
 	newView := snapshot.NewView(folded)
-	if len(tail) > 0 {
-		newView = newView.WithSegment(snapshot.MergeSegments(tail))
+	if len(carried) > 0 {
+		newView = newView.WithSegment(snapshot.MergeSegments(carried))
 	}
 	// A fold produces a NEW base snapshot, so its indexes are built here
-	// rather than by the next query -- see Snapshot.Warm. When a tail was
-	// appended during the fold the published View is an overlay again, and
+	// rather than by the next query -- see Snapshot.Warm. When a tail or
+	// pending edges are carried the published View is an overlay again, and
 	// its own projections are built here for the same reason (View.Warm).
 	newView.Base().Warm()
 	newView.Warm()
@@ -575,7 +589,7 @@ func (e *Engine) foldAndAdoptCompaction(capturedBase *snapshot.Snapshot, capture
 		return nil, false
 	}
 
-	folded, err := snapshot.Fold(capturedBase, capturedSegs)
+	folded, pending, err := snapshot.FoldWithPendingEdges(capturedBase, capturedSegs)
 	if err != nil {
 		e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: compaction failed", slog.Any("error", err))
 		return nil, false
@@ -586,7 +600,7 @@ func (e *Engine) foldAndAdoptCompaction(capturedBase *snapshot.Snapshot, capture
 		return nil, false
 	}
 
-	if !e.adoptCompaction(capturedBase, capturedSegs, folded) {
+	if !e.adoptCompaction(capturedBase, capturedSegs, folded, pending) {
 		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded",
 			slog.String("reason", "base or segment stack changed while folding"),
 			slog.Duration("duration", time.Since(start)),

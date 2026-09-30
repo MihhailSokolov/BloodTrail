@@ -66,10 +66,10 @@ func requireKindID(t *testing.T, pool *pgxpool.Pool, name string, want int) {
 	}
 }
 
-// requireMaxKindOracleRows fails the test unless PostgreSQL answers query
+// requireOracleRowTotal fails the test unless PostgreSQL answers query
 // with exactly want rows, so a served comparison over it cannot pass by both
 // sides returning nothing.
-func requireMaxKindOracleRows(t *testing.T, pgDriver *pg.Driver, query string, want int) {
+func requireOracleRowTotal(t *testing.T, pgDriver *pg.Driver, query string, want int) {
 	t.Helper()
 	var (
 		rows     []string
@@ -151,7 +151,7 @@ func TestRebuildServesTheLargestSmallserialKindID(t *testing.T) {
 
 			tc.seed(t, pgDriver, pool)
 			requireKindID(t, pool, tc.maxKind, largestSmallserialKindID)
-			requireMaxKindOracleRows(t, pgDriver, tc.query, 1)
+			requireOracleRowTotal(t, pgDriver, tc.query, 1)
 
 			eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
 			t.Cleanup(eng.Stop)
@@ -207,7 +207,7 @@ func TestCompactionFoldsTheLargestSmallserialKindID(t *testing.T) {
 	eng.Apply(ctx, scope)
 
 	cases := []typedCase{{`MATCH (n:MaxIDLateKind) RETURN n`, true}}
-	requireMaxKindOracleRows(t, pgDriver, cases[0].query, 1)
+	requireOracleRowTotal(t, pgDriver, cases[0].query, 1)
 	t.Run("overlay", func(t *testing.T) {
 		assertTypedCasesMatchOracle(t, pgDriver, eng, cases)
 	})
