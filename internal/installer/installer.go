@@ -237,7 +237,7 @@ func projectFiles(composeFile, projectDir string, strict bool) ([]string, error)
 		switch {
 		case slices.Contains(files, composeFile):
 			if strict {
-				if err := checkProjectDirectory(envPath, projectDir, listed[0]); err != nil {
+				if err := checkProjectDirectory(envPath, projectDir, listed[0], false); err != nil {
 					return nil, err
 				}
 			}
@@ -254,6 +254,13 @@ func projectFiles(composeFile, projectDir string, strict bool) ([]string, error)
 	case base != composeFile && base != "" && strict:
 		return nil, fmt.Errorf("%s sets no COMPOSE_FILE, so docker compose loads %s there on its own, not %s; pass --compose-file for the file the deployment runs, or list its files in COMPOSE_FILE", envPath, base, composeFile)
 	}
+	if strict {
+		// Install is about to create the entry, and it lists the compose file
+		// first: the project directory compose takes from it is that file's.
+		if err := checkProjectDirectory(envPath, projectDir, composeFile, true); err != nil {
+			return nil, err
+		}
+	}
 	return []string{composeFile}, nil
 }
 
@@ -267,14 +274,25 @@ func projectFiles(composeFile, projectDir string, strict bool) ([]string, error)
 // (COMPOSE_PROJECT_NAME) the two still reach the same containers, so nothing
 // would notice until the installer's `up -d` recreated a service with the
 // mount somewhere else: a database on an empty directory, with the operator's
-// data left where it was. first is the first name COMPOSE_FILE lists.
-func checkProjectDirectory(envPath, projectDir, first string) error {
+// data left where it was.
+//
+// first is the first name COMPOSE_FILE lists. Where there is no entry,
+// created is true and first is the compose file the entry the install writes
+// will list first: writing it moves compose's project directory to that
+// file's directory, so the same holds for the project the install leaves.
+func checkProjectDirectory(envPath, projectDir, first string, created bool) error {
 	if !filepath.IsAbs(first) {
 		first = filepath.Join(projectDir, first)
 	}
 	dir := filepath.Dir(first)
 	if sameDirectory(dir, projectDir) {
 		return nil
+	}
+	if created {
+		return fmt.Errorf("%s sets no COMPOSE_FILE, and the compose file given, %s, is not in the project directory %s: the entry this install writes lists it first, so docker compose would take %s as the project directory -- "+
+			"the one relative paths in the compose files, bind mounts such as ./pgdata among them, resolve against -- while the installer runs it with --project-directory %s, where this .env is, "+
+			"so its `up -d` and the operator's own `docker compose up -d` could put services' data on different host paths (a database on an empty directory, say); it stops rather than guess. "+
+			"Put the .env in %s next to the compose file, run docker compose from there, and rerun with --compose-file %s -- its directory is then the project directory", envPath, first, projectDir, dir, projectDir, dir, first)
 	}
 	return fmt.Errorf("%s: COMPOSE_FILE lists %s first, so docker compose takes %s as the project directory -- the one relative paths in the compose files, bind mounts such as ./pgdata among them, resolve against -- "+
 		"but the installer runs it with --project-directory %s, where this .env is, so its `up -d` could recreate services with their data on different host paths (a database on an empty directory, say); "+

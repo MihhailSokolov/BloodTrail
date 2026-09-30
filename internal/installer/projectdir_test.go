@@ -27,6 +27,12 @@ import (
 // --project-directory <the .env's directory>. With the project name pinned in
 // .env the two reach the same containers, so the install went ahead and its
 // `up -d` could recreate the operator's database on a directory that is empty.
+//
+// The entry the install creates, where there is none, is the same thing: it
+// lists the compose file first, so once written it moves compose's project
+// directory to the compose file's directory -- a layout the refusal above
+// rejects on the next run, and that the operator's own plain `docker compose
+// up -d` resolves differently from the installer's commands.
 func TestInstallStopsWhenComposeLoadsTheProjectFromAnotherDirectory(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -49,6 +55,10 @@ func TestInstallStopsWhenComposeLoadsTheProjectFromAnotherDirectory(t *testing.T
 			writeProjectFile(t, root, "extra.yml")
 			return filepath.Dir(file), "COMPOSE_FILE=../extra.yml:docker-compose.yml\n", file, root
 		}},
+		{"no entry, and the compose file is in a subdirectory", func(t *testing.T, root string) (string, string, string, string) {
+			file := writeProjectFile(t, root, "docker/compose.yml")
+			return root, "COMPOSE_PROJECT_NAME=bh\n", file, filepath.Dir(file)
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			projectDir, env, composeFile, composeDir := c.layout(t, t.TempDir())
@@ -66,7 +76,7 @@ func TestInstallStopsWhenComposeLoadsTheProjectFromAnotherDirectory(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			fake := scriptPGInstall(&dockerx.FakeRunner{}, strings.Join(forgiving.Args(), " ")+" ", filepath.Join(projectDir, "docker-compose.bloodtrail.yml"), image)
+			fake := scriptPGInstall(&dockerx.FakeRunner{}, "docker "+strings.Join(forgiving.Args(), " ")+" ", filepath.Join(projectDir, "docker-compose.bloodtrail.yml"), image)
 			opts := Options{ComposeFile: composeFile, ProjectDir: projectDir, Image: image, APIURL: api.URL, Yes: true,
 				VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 			err = Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
@@ -75,7 +85,11 @@ func TestInstallStopsWhenComposeLoadsTheProjectFromAnotherDirectory(t *testing.T
 			}
 			// Moving the .env moves what its relative names are relative to, and
 			// the installer then has to be told where the compose file is.
-			for _, want := range []string{"relative COMPOSE_FILE names", "--compose-file"} {
+			hints := []string{"relative COMPOSE_FILE names", "--compose-file"}
+			if !strings.Contains(env, "COMPOSE_FILE") {
+				hints = []string{"--compose-file"} // there are no names to rewrite
+			}
+			for _, want := range hints {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the refusal does not say %q:\n%v", want, err)
 				}
@@ -184,6 +198,70 @@ func TestInstallAcceptsAProjectOnlyWhereComposeAgreesOnItsDirectory(t *testing.T
 	}
 }
 
+// TestInstallDoesNotCreateAnEntryThatMovesComposesProjectDirectory asks docker
+// compose itself about the project an install leaves when it creates the
+// COMPOSE_FILE entry: with no entry, the .env in the project directory and the
+// compose file in a subdirectory of it, the entry lists that file first, and
+// the operator's plain `docker compose config` then takes the subdirectory as
+// the project directory -- where the installer, addressing the project
+// through --project-directory <the .env's directory>, saw the parent. The
+// install must not go ahead where the project it leaves is one the operator's
+// commands resolve differently from its own; where the compose file is beside
+// the .env it must.
+func TestInstallDoesNotCreateAnEntryThatMovesComposesProjectDirectory(t *testing.T) {
+	requireComposeOracle(t)
+	requireFirstFileDirectoryIsTheProjectDirectory(t)
+	for _, c := range []struct {
+		name, composeFile string // the compose file, by its name in the project
+	}{
+		{"the compose file beside the .env", "docker-compose.yml"},
+		{"the compose file in a subdirectory", "docker/compose.yml"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			composeFile := writeProjectFile(t, root, c.composeFile)
+			envPath := filepath.Join(root, ".env")
+			if err := os.WriteFile(envPath, []byte("COMPOSE_PROJECT_NAME=bh\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h, refused := installHandle(&dockerx.FakeRunner{}, composeFile, root)
+			if refused != nil {
+				return // nothing is written, so nothing can disagree
+			}
+
+			// What the install goes on to write: the entry, and the override file
+			// it names (which compose needs to be there to load the project).
+			var baseFiles []string
+			for _, f := range append([]string{h.File}, h.ExtraFiles...) {
+				rel, _ := filepath.Rel(root, f)
+				baseFiles = append(baseFiles, rel)
+			}
+			_, updated, err := installEnv(envPath, baseFiles, installOverrideEntry(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(envPath, []byte(updated), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "docker-compose.bloodtrail.yml"), []byte("services: {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			operator, err := dockerComposeConfig(root)
+			if err != nil {
+				t.Fatalf("the operator's own command on the .env the install wrote (%q): %v", updated, err)
+			}
+			installer, err := dockerComposeConfig(root, h.WithExtraFile(filepath.Join(root, "docker-compose.bloodtrail.yml")).Args()[1:]...)
+			if err != nil {
+				t.Fatalf("the installer's command line: %v", err)
+			}
+			if a, b := pgdataSources(t, operator), pgdataSources(t, installer); a != b {
+				t.Errorf("install accepted a project whose .env it then wrote as %q: the bind mount is %s for the operator's compose, %s for the installer", updated, a, b)
+			}
+		})
+	}
+}
+
 // requireFirstFileDirectoryIsTheProjectDirectory skips the test unless this
 // docker compose takes the directory of the first file COMPOSE_FILE lists as
 // the project directory -- what the installer's refusal is built on, and what
@@ -269,7 +347,7 @@ func TestSameDirectoryTakesTheOneDirectoryReachedTwoWays(t *testing.T) {
 			t.Errorf("sameDirectory(%s, %s) = %v, want %v", c.a, c.b, got, c.want)
 		}
 	}
-	if err := checkProjectDirectory(filepath.Join(project, ".env"), project, filepath.Join(link, "docker-compose.yml")); err != nil {
+	if err := checkProjectDirectory(filepath.Join(project, ".env"), project, filepath.Join(link, "docker-compose.yml"), false); err != nil {
 		t.Errorf("a first file listed through a link to the project directory was refused: %v", err)
 	}
 }
