@@ -227,20 +227,42 @@ func insertedSinceFile(stamp snapshot.Stamp, at *startState) bool {
 		(at.nodeSeq != stamp.NodeIDSeq || at.edgeSeq != stamp.EdgeIDSeq)
 }
 
+// counterBehindFile reports whether PostgreSQL's watermark counter, when this
+// process started, was behind the value a snapshot file is stamped with.
+// Within one lineage the counter only ever advances, so that is PostgreSQL
+// gone back in time -- a backup restored without ending the lineage, whose
+// rows predate some of the writes the file holds. No sequence of BloodTrail
+// writes produces it, and none can repair it: this process's own boot writes
+// carry the counter back up past the stamp, and at the value the file
+// claims they are different writes from the file's. The boot gap cover
+// cannot tell those apart once the counter has caught up (a boot write
+// bumped, not yet applied, reads as a quiet restart), so the file is
+// refused on the start state alone, before any counter is weighed.
+//
+// A nil at -- nothing captured -- reports false, like insertedSinceFile: the
+// boot gap cover's own contradiction check (bootGapCoveredAt) is what is
+// left then.
+func counterBehindFile(stamp snapshot.Stamp, at *startState) bool {
+	return at != nil && at.counter < stamp.Watermark
+}
+
 // Snapshot-file refusals fileRefusal can name, each a "reason" on the
 // "bloodtrail: snapshot file rejected" line.
 const (
 	reasonLineageChanged        = "watermark lineage changed since the file was written"
+	reasonCounterBehindFile     = "the watermark counter was behind the file's stamp when this process started"
 	reasonInsertedBehindCounter = "rows were inserted since the file was written by a writer that did not advance the watermark"
 )
 
 // fileRefusal is why a snapshot file must be refused before its counters
 // are weighed at all, or "" when nothing about its lineage or stamp rules it
 // out: a file from another lineage than the one PostgreSQL is in (pgLineage;
-// watermarkLineageDDL), or one whose stamp shows rows inserted behind the
-// counter's back (insertedSinceFile). The boot asks it twice: of the file's
-// unverified header, to spare the read of a file it would refuse anyway, and
-// of what ReadSnapshotFile verified, which is the answer adoption rests on.
+// watermarkLineageDDL); one stamped ahead of where the counter stood when
+// this process started (counterBehindFile); or one whose stamp shows rows
+// inserted behind the counter's back (insertedSinceFile). The boot asks it
+// twice: of the file's unverified header, to spare the read of a file it
+// would refuse anyway, and of what ReadSnapshotFile verified, which is the
+// answer adoption rests on.
 func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgLineage snapshot.Lineage) (reason string, attrs []any) {
 	if lineage.IsZero() || lineage != pgLineage {
 		return reasonLineageChanged, []any{
@@ -249,7 +271,14 @@ func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgL
 			slog.Uint64("file_watermark", stamp.Watermark),
 		}
 	}
-	if at := e.atStart.Load(); insertedSinceFile(stamp, at) {
+	at := e.atStart.Load()
+	if counterBehindFile(stamp, at) {
+		return reasonCounterBehindFile, []any{
+			slog.Uint64("file_watermark", stamp.Watermark),
+			slog.Uint64("start_watermark", at.counter),
+		}
+	}
+	if insertedSinceFile(stamp, at) {
 		return reasonInsertedBehindCounter, []any{
 			slog.Uint64("file_watermark", stamp.Watermark),
 			slog.Int64("file_node_id_seq", stamp.NodeIDSeq),

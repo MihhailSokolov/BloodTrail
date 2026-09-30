@@ -627,10 +627,11 @@ const (
 // the file: it has to belong to the watermark lineage PostgreSQL is in,
 // read in the same statement as the frozen target -- the counter
 // comparisons below prove nothing across lineages (watermarkLineageDDL) --
-// and its stamp must not show rows inserted behind the counter since it was
-// written (insertedSinceFile). Either rejects at once: no write this boot
-// could observe will ever make such a file right, so there is nothing to
-// wait for.
+// its stamp must not be ahead of where the counter stood when this process
+// started (counterBehindFile), and it must not show rows inserted behind
+// the counter since it was written (insertedSinceFile). Each rejects at
+// once: no write this boot could observe will ever make such a file right,
+// so there is nothing to wait for.
 //
 // The proof each attempt demands, evaluated under applyMu so no Apply can
 // move anything mid-attempt:
@@ -654,9 +655,10 @@ const (
 //     target are exactly the file's counter through the target, with no
 //     hole and nothing the buffer could not faithfully replay (a poisoned
 //     buffer rejects immediately -- poison never heals, so there is
-//     nothing to wait for). The attempt PEEKS for this check and only the
-//     covered attempt take()s, so the buffer keeps observing the very
-//     Applies the wait is waiting for.
+//     nothing to wait for -- and so do counters that contradict the file,
+//     bootGapContradiction, for the same reason). The attempt PEEKS for
+//     this check and only the covered attempt take()s, so the buffer keeps
+//     observing the very Applies the wait is waiting for.
 //
 // The replay itself is Apply's own machinery, reused verbatim per buffered
 // write -- readBack for pg's post-commit truth on every key the ChangeSet
@@ -767,7 +769,15 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 	for i, entry := range peeked {
 		counters[i] = entry.counter
 	}
-	if !bootGapCoveredAt(fileWatermark, pgSnapshot, counters) {
+	switch verdict, why := bootGapCoveredAt(fileWatermark, pgSnapshot, counters); verdict {
+	case bootGapContradiction:
+		reject("boot write buffer contradicts the file: "+why,
+			slog.Uint64("file_watermark", fileWatermark),
+			slog.Uint64("pg_watermark", pgSnapshot),
+			slog.Int("buffered_writes", len(peeked)),
+		)
+		return 0, adoptAttemptRejected, 0
+	case bootGapHole:
 		return 0, adoptAttemptNotYetCovered, len(peeked)
 	}
 

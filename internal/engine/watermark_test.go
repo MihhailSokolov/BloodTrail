@@ -716,7 +716,7 @@ func TestInsertedSinceFile(t *testing.T) {
 		{"edge ids drawn behind the counter", &startState{counter: 7, nodeSeq: 100, edgeSeq: 51}, true},
 		{"a sequence reset behind the counter", &startState{counter: 7, nodeSeq: 0, edgeSeq: 50}, true},
 		{"counted writes since the file", &startState{counter: 9, nodeSeq: 140, edgeSeq: 90}, false},
-		{"counter behind the file", &startState{counter: 5, nodeSeq: 140, edgeSeq: 90}, false},
+		{"counter behind the file (counterBehindFile's case)", &startState{counter: 5, nodeSeq: 140, edgeSeq: 90}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -727,16 +727,44 @@ func TestInsertedSinceFile(t *testing.T) {
 	}
 }
 
+// TestCounterBehindFile pins when the counter at start shows PostgreSQL gone
+// back past a snapshot file's stamp: strictly behind it. Level is a quiet
+// restart, ahead is BloodTrail's own writes since, and nothing captured
+// means no check.
+func TestCounterBehindFile(t *testing.T) {
+	stamp := snapshot.Stamp{Watermark: 7}
+	cases := []struct {
+		name string
+		at   *startState
+		want bool
+	}{
+		{"nothing captured", nil, false},
+		{"level with the stamp", &startState{counter: 7}, false},
+		{"ahead of the stamp", &startState{counter: 9}, false},
+		{"behind the stamp", &startState{counter: 6}, true},
+		{"reset to zero", &startState{counter: 0}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := counterBehindFile(stamp, tc.at); got != tc.want {
+				t.Fatalf("counterBehindFile(%+v, %+v) = %v, want %v", stamp, tc.at, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestFileRefusal pins the order and the reasons of the refusals that come
 // before any counter is weighed: a file from another lineage is refused for
-// that whatever its stamp says, and one from PostgreSQL's own lineage only
-// when rows were inserted behind the counter since it was written.
+// that whatever its stamp says, and one from PostgreSQL's own lineage when
+// the counter at start was behind its stamp or rows were inserted behind the
+// counter since it was written.
 func TestFileRefusal(t *testing.T) {
 	lineage := snapshot.Lineage{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	other := snapshot.Lineage{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
 	stamp := snapshot.Stamp{Watermark: 7, NodeIDSeq: 100, EdgeIDSeq: 50}
 	quiet := &startState{counter: 7, nodeSeq: 100, edgeSeq: 50}
 	inserted := &startState{counter: 7, nodeSeq: 101, edgeSeq: 50}
+	restored := &startState{counter: 5, nodeSeq: 90, edgeSeq: 50}
 
 	cases := []struct {
 		name        string
@@ -747,8 +775,10 @@ func TestFileRefusal(t *testing.T) {
 		{"same lineage, nothing inserted", lineage, quiet, ""},
 		{"same lineage, nothing captured", lineage, nil, ""},
 		{"same lineage, rows inserted", lineage, inserted, reasonInsertedBehindCounter},
+		{"same lineage, counter behind the stamp", lineage, restored, reasonCounterBehindFile},
 		{"another lineage", other, quiet, reasonLineageChanged},
 		{"another lineage and rows inserted", other, inserted, reasonLineageChanged},
+		{"another lineage and counter behind the stamp", other, restored, reasonLineageChanged},
 		{"no lineage at all", snapshot.Lineage{}, quiet, reasonLineageChanged},
 	}
 	for _, tc := range cases {
