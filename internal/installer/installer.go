@@ -394,6 +394,29 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return err
 	}
+	// An entry the install writes, where there was none, replaces compose's
+	// own file discovery, so it has to name what discovery found and the
+	// installer has been addressing since: the base file and, when there is
+	// one, the override beside it. Listing only the base file would drop that
+	// override out of the operator's own `docker compose` commands from here
+	// on.
+	var baseFiles []string
+	for _, f := range append([]string{c.File}, c.ExtraFiles...) {
+		rel, _ := filepath.Rel(opts.ProjectDir, f)
+		baseFiles = append(baseFiles, rel)
+	}
+	// The install rewrites .env near its end, after the backup, the manifest
+	// and the migration. A .env it cannot rewrite would stop it there, with the
+	// manifest saved -- which makes the next install refuse until a rollback --
+	// over something known from the start, so whether it can is settled first.
+	envPath := filepath.Join(opts.ProjectDir, ".env")
+	if current, updated, err := installEnv(envPath, baseFiles); err != nil {
+		return err
+	} else if updated != current {
+		if err := checkEnvWritable(envPath); err != nil {
+			return fmt.Errorf("the install has to add its override to COMPOSE_FILE in %s and cannot rewrite it: %w; let this user write it (or run bloodtrail as the file's owner) and rerun; nothing has been changed", envPath, err)
+		}
+	}
 	say("==> Inventory")
 	inv, store, err := takeInventory(ctx, c)
 	if err != nil {
@@ -477,18 +500,9 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf(".env: %w", err)
 	}
 	envComposeFileCreated := len(probed) == 0
-	// An entry the install writes, where there was none, replaces compose's
-	// own file discovery, so it has to name what discovery found and the
-	// installer has been addressing since: the base file and, when there is
-	// one, the override beside it. Listing only the base file would drop that
-	// override out of the operator's own `docker compose` commands from here
-	// on. The manifest records the list, so rollback can tell whether the
-	// line still names just that.
-	var baseFiles, envComposeFileWritten []string
-	for _, f := range append([]string{c.File}, c.ExtraFiles...) {
-		rel, _ := filepath.Rel(opts.ProjectDir, f)
-		baseFiles = append(baseFiles, rel)
-	}
+	// The manifest records the list the entry it creates is written with, so
+	// rollback can tell whether the line still names just that.
+	var envComposeFileWritten []string
 	if envComposeFileCreated {
 		envComposeFileWritten = append(append([]string(nil), baseFiles...), compose.OverrideFileName)
 	}
@@ -584,17 +598,17 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err := os.WriteFile(overridePath, []byte(override.Render()), 0o644); err != nil {
 		return fmt.Errorf("writing override: %w; %s", err, rollbackHint)
 	}
-	envPath := filepath.Join(opts.ProjectDir, ".env")
-	envData, err := os.ReadFile(envPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("reading .env: %w; %s", err, rollbackHint)
-	}
-	newEnv, err := compose.AddComposeFile(string(envData), baseFiles, compose.OverrideFileName)
+	// Read again, not taken from the check at the start: the migration in
+	// between can take hours, and whatever the operator changed in .env
+	// meanwhile is not to be written over.
+	current, updated, err := installEnv(envPath, baseFiles)
 	if err != nil {
-		return fmt.Errorf(".env: %w; %s", err, rollbackHint)
+		return fmt.Errorf("%w; %s", err, rollbackHint)
 	}
-	if err := writeEnvFile(envPath, []byte(newEnv)); err != nil {
-		return fmt.Errorf("writing .env: %w; %s", err, rollbackHint)
+	if updated != current {
+		if err := writeEnvFile(envPath, []byte(updated)); err != nil {
+			return fmt.Errorf("writing .env: %w; %s", err, rollbackHint)
+		}
 	}
 	if err := store.Set(ctx, driverName); err != nil {
 		return fmt.Errorf("setting database_switch: %w; %s", err, rollbackHint)
@@ -620,6 +634,22 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf("the image and driver switch completed, but verification failed: %w; run `bloodtrail rollback` to revert if needed", err)
 	}
 	return nil
+}
+
+// installEnv reads the project's .env (none is the same as an empty one) and
+// works out what it becomes once the override is in COMPOSE_FILE: baseFiles
+// is what a new entry names first (compose.AddComposeFile). It changes
+// nothing; the two texts are equal when there is nothing to write.
+func installEnv(envPath string, baseFiles []string) (current, updated string, err error) {
+	data, err := os.ReadFile(envPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", fmt.Errorf("reading .env: %w", err)
+	}
+	updated, err = compose.AddComposeFile(string(data), baseFiles, compose.OverrideFileName)
+	if err != nil {
+		return "", "", fmt.Errorf(".env: %w", err)
+	}
+	return string(data), updated, nil
 }
 
 // migratorFailureMarkers are the phrases BloodHound's migrator logs when it
@@ -811,6 +841,20 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 	store := dbswitch.Store{Compose: c, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 
+	// What rollback makes of .env, and whether it can write it, is settled
+	// before anything is changed: found out later, it would leave the driver
+	// row restored and the override file deleted while COMPOSE_FILE still
+	// names it -- a deployment docker compose cannot load -- and, for an .env
+	// that needs no change at all, fail every rerun the same way.
+	envPath := filepath.Join(m.ProjectDir, ".env")
+	if current, restored, _, exists, err := envRestore(envPath, m); err != nil {
+		return err
+	} else if exists && restored != current {
+		if err := checkEnvWritable(envPath); err != nil {
+			return fmt.Errorf("rollback has to take its override out of COMPOSE_FILE in %s and cannot rewrite it: %w; let this user write it (or run bloodtrail as the file's owner) and rerun; nothing has been changed", envPath, err)
+		}
+	}
+
 	say("==> Restoring the graph driver setting")
 	if m.OriginalDriverRow != nil {
 		if err := store.Set(ctx, *m.OriginalDriverRow); err != nil {
@@ -824,21 +868,20 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	if err := os.Remove(m.OverrideFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	envPath := filepath.Join(m.ProjectDir, ".env")
-	envData, err := os.ReadFile(envPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("reading .env: %w", err)
+	// Read again rather than taken from the check above, so that what is
+	// written is worked out from the file as it is now.
+	current, restoredEnv, note, exists, err := envRestore(envPath, m)
+	if err != nil {
+		return err
 	}
-	if err == nil {
-		restoredEnv, note, err := restoreComposeFileEntry(string(envData), m)
-		if err != nil {
-			return fmt.Errorf(".env: %w", err)
-		}
+	if exists {
 		if note != "" {
 			say("    %s", note)
 		}
-		if err := writeEnvFile(envPath, []byte(restoredEnv)); err != nil {
-			return fmt.Errorf("writing .env: %w", err)
+		if restoredEnv != current {
+			if err := writeEnvFile(envPath, []byte(restoredEnv)); err != nil {
+				return fmt.Errorf("writing .env: %w", err)
+			}
 		}
 	}
 
@@ -881,6 +924,26 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	}
 	say("    rolled back; backups kept in %s", m.BackupDir)
 	return nil
+}
+
+// envRestore reads the project's .env and works out what rollback of the
+// install m records makes of it (restoreComposeFileEntry), with what to tell
+// the operator about it. exists is false when there is no .env, which has
+// nothing to restore. It changes nothing; current and restored are equal when
+// there is nothing to write.
+func envRestore(envPath string, m manifest.Manifest) (current, restored, note string, exists bool, err error) {
+	data, err := os.ReadFile(envPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", "", "", false, nil
+	}
+	if err != nil {
+		return "", "", "", false, fmt.Errorf("reading .env: %w", err)
+	}
+	restored, note, err = restoreComposeFileEntry(string(data), m)
+	if err != nil {
+		return "", "", "", false, fmt.Errorf(".env: %w", err)
+	}
+	return string(data), restored, note, true, nil
 }
 
 // restoreComposeFileEntry undoes what the install m records did to the .env

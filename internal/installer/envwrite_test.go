@@ -5,6 +5,7 @@ package installer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/dockerx"
+	"github.com/MihhailSokolov/BloodTrail/internal/manifest"
 )
 
 // requireEnvSwapped checks that the .env in dir now holds want and that it got
@@ -363,5 +365,158 @@ func TestWriteEnvFileNeverShowsAReaderAHalfWrittenFile(t *testing.T) {
 	close(done)
 	if msg := <-problem; msg != "" {
 		t.Fatal(msg)
+	}
+}
+
+// installOn runs Install on the project in dir with the fake it scripts for a
+// deployment already on PostgreSQL, and returns the fake and what it failed
+// with.
+func installOn(t *testing.T, dir, composeFile string) (*dockerx.FakeRunner, error) {
+	t.Helper()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"data":{}}`)) }))
+	t.Cleanup(api.Close)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake := scriptPGInstall(&dockerx.FakeRunner{}, base, filepath.Join(dir, "docker-compose.bloodtrail.yml"), image)
+	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
+		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	return fake, Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts)
+}
+
+// TestInstallStopsBeforeChangingAnythingWhenEnvCannotBeRewritten covers an
+// .env this user cannot write (read-only, or root's in a directory the
+// operator owns). The install rewrites it only after the backup, the manifest,
+// the migration and the override file, and a manifest left there makes the
+// next install refuse until a rollback: the operator ended up with a
+// half-installed deployment because of a file mode that was known from the
+// start. It is now checked before anything is done.
+func TestInstallStopsBeforeChangingAnythingWhenEnvCannotBeRewritten(t *testing.T) {
+	skipAsRoot(t)
+	dir, composeFile := setupProject(t)
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("BLOODHOUND_TAG=9.6.0\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	fake, err := installOn(t, dir, composeFile)
+	if err == nil || !strings.Contains(err.Error(), envPath) || !strings.Contains(err.Error(), "cannot be written by this user") ||
+		!strings.Contains(err.Error(), "nothing has been changed") {
+		t.Fatalf("want a refusal naming .env, why, and that nothing changed, got %v", err)
+	}
+	if len(fake.Calls) != 0 {
+		t.Fatalf("install ran commands before refusing:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	if manifest.Exists(dir) {
+		t.Fatal("a refused install saved a manifest, which would make the next install refuse too")
+	}
+	for _, name := range []string{"docker-compose.bloodtrail.yml", ".bloodtrail"} {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("a refused install left %s behind (stat: %v)", name, statErr)
+		}
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != "BLOODHOUND_TAG=9.6.0\n" {
+		t.Fatalf(".env = %q", got)
+	}
+}
+
+// TestInstallLeavesAnEnvThatNeedsNoChangeAlone: a leftover entry that already
+// names the installer's override needs no write, so an .env that could not
+// be written is no reason to stop.
+func TestInstallLeavesAnEnvThatNeedsNoChangeAlone(t *testing.T) {
+	skipAsRoot(t)
+	dir, composeFile := setupProject(t)
+	envPath := filepath.Join(dir, ".env")
+	entry := "COMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\n"
+	if err := os.WriteFile(envPath, []byte(entry), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installOn(t, dir, composeFile); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != entry {
+		t.Fatalf(".env = %q", got)
+	}
+}
+
+// TestRollbackDoesNotRewriteAnEnvThatNeedsNoChange covers the manifest an
+// install leaves when it stopped before its .env write: there is nothing in
+// .env to take out, but rollback wrote the file anyway -- and on a .env it
+// could not write it failed, after it had restored the driver row and deleted
+// the override file, and failed the same way on every rerun.
+func TestRollbackDoesNotRewriteAnEnvThatNeedsNoChange(t *testing.T) {
+	skipAsRoot(t)
+	dir, composeFile := setupProject(t)
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("BLOODHOUND_TAG=9.6.0\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	override := filepath.Join(dir, "docker-compose.bloodtrail.yml")
+	if err := os.WriteFile(override, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	row := "pg"
+	_ = manifest.Manifest{ProjectDir: dir, ComposeFile: composeFile, ProjectName: "bh", OriginalImage: upstreamImage, OriginalDriverRow: &row,
+		OverrideFile: override, PGUser: "bloodhound", PGDatabase: "bloodhound",
+		EnvComposeFileCreated: true, EnvComposeFileWritten: []string{"docker-compose.yml", "docker-compose.bloodtrail.yml"}}.Save(dir)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer api.Close()
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	restoreRow := "create table if not exists database_switch (driver text not null, primary key(driver)); delete from database_switch; insert into database_switch (driver) values ('pg')"
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc " + restoreRow: []byte("INSERT 0 1\n"),
+		base + "up -d": nil,
+	}}
+	scriptLineageEnd(fake, base+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc ")
+	if err := Rollback(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}},
+		Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if manifest.Exists(dir) {
+		t.Fatal("rollback did not finish")
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != "BLOODHOUND_TAG=9.6.0\n" {
+		t.Fatalf(".env = %q", got)
+	}
+}
+
+// TestRollbackStopsBeforeChangingAnythingWhenEnvCannotBeRewritten covers an
+// .env that does have to change but cannot be written: rollback used to
+// restore the driver row and delete the override file first, so the
+// deployment was left half rolled back -- COMPOSE_FILE naming a file that was
+// gone. Now it says so first, changing nothing, and the rerun after the
+// operator has fixed the mode completes.
+func TestRollbackStopsBeforeChangingAnythingWhenEnvCannotBeRewritten(t *testing.T) {
+	skipAsRoot(t)
+	dir, composeFile, fake, api := rollbackFixture(t)
+	envPath := filepath.Join(dir, ".env")
+	if err := os.Chmod(envPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	deps := Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}
+	opts := Options{ComposeFile: composeFile, Yes: true, APIURL: api.URL, VerifyTimeout: time.Second}
+
+	err := Rollback(context.Background(), deps, opts)
+	if err == nil || !strings.Contains(err.Error(), envPath) || !strings.Contains(err.Error(), "cannot be written by this user") ||
+		!strings.Contains(err.Error(), "nothing has been changed") {
+		t.Fatalf("want a refusal naming .env, why, and that nothing changed, got %v", err)
+	}
+	if len(fake.Calls) != 0 {
+		t.Fatalf("rollback changed the deployment before refusing:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "docker-compose.bloodtrail.yml")); statErr != nil {
+		t.Fatalf("the override file is gone after a refused rollback: %v", statErr)
+	}
+	if !manifest.Exists(dir) {
+		t.Fatal("a refused rollback removed the manifest")
+	}
+
+	if err := os.Chmod(envPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Rollback(context.Background(), deps, opts); err != nil {
+		t.Fatalf("rollback after the mode was fixed: %v", err)
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != "COMPOSE_FILE=docker-compose.yml\n" {
+		t.Fatalf(".env = %q", got)
 	}
 }
