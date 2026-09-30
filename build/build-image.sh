@@ -77,11 +77,11 @@ DAWGS="github.com/specterops/dawgs"
 # dawgs of the two. An upstream release that pins an older dawgs than the driver
 # was built against therefore ships a dawgs that release's own tests never ran
 # with, and nothing said so: v9.6.0 pins v0.7.0 and its image carried v0.8.0.
-# The build now names both versions and stops unless the exact pair is listed
-# here, each with the reason it is acceptable. Where upstream pins the same
-# version as the image resolves (v9.7.0 and v9.7.1 today), nothing needs
-# listing; ci.yml's dawgs job runs the suites against every version the
-# supported releases resolve to.
+# The build now names both versions and stops unless the exact pair is listed in
+# dawgs_shift_reason below, with the reason it is acceptable. Where upstream pins
+# the same version as the image resolves (v9.7.0 and v9.7.1 today) nothing needs
+# listing there, but the version must still be one the suites have run against:
+# see dawgs_tested_versions.
 #
 # Argument: "<upstream tag> <pinned by upstream> <resolved>". Prints the reason,
 # or nothing when the pair is not listed.
@@ -92,28 +92,65 @@ dawgs_shift_reason() {
   esac
 }
 
-# check_dawgs compares UPSTREAM_DAWGS and RESOLVED_DAWGS and fails the build on a
-# difference that dawgs_shift_reason does not list.
+# The dawgs versions the unit and integration suites have been run against, on
+# top of the one this repository's own go.mod names (which ci.yml's test job runs
+# them against on every change and which is always accepted). An image is built
+# only on one of these. The release workflow and the weekly alias build run this
+# script for every supported upstream release and run no suite themselves, so
+# without this list a new release that pins a dawgs nobody has tried (a v9.8.0
+# pinning v0.9.0, say) would publish an image before any suite ran on it, which
+# is how v9.7.1's image shipped v0.8.1 untested. It fails here instead, and so
+# does ci.yml's dawgs job, which resolves every supported release the same way,
+# until the version is listed. List it in the change whose dawgs job then runs the
+# suites against it (for every supported release that resolves to it), and merge
+# that only if they pass.
+#
+#   v0.8.0  what go.mod names; ci.yml's test job.
+#   v0.8.1  ci.yml's dawgs job, for the releases that pin it (v9.7.1). Checked when
+#           it was listed: the unit and integration suites pass unchanged under
+#           it (4,191 runs, 0 failures); it only changes the PostgreSQL edge schema.
+dawgs_tested_versions() { echo "v0.8.0 v0.8.1"; }
+
+# check_dawgs fails the build unless UPSTREAM_DAWGS and RESOLVED_DAWGS are equal or
+# the pair is listed in dawgs_shift_reason, and RESOLVED_DAWGS is this repository's
+# own dawgs or one of dawgs_tested_versions.
 check_dawgs() {
-  local reason
+  local reason own
   echo "==> dawgs: upstream $TAG pins ${UPSTREAM_DAWGS:-nothing}; the image resolves ${RESOLVED_DAWGS:-nothing}"
   if [[ -z "$UPSTREAM_DAWGS" || -z "$RESOLVED_DAWGS" ]]; then
     echo "error: could not read the version of $DAWGS from $TAG's go.mod before and after the driver is wired in; refusing to guess" >&2
     exit 1
   fi
-  if [[ "$UPSTREAM_DAWGS" == "$RESOLVED_DAWGS" ]]; then return 0; fi
-  reason="$(dawgs_shift_reason "$TAG $UPSTREAM_DAWGS $RESOLVED_DAWGS")"
-  if [[ -z "$reason" ]]; then
+  if [[ "$UPSTREAM_DAWGS" != "$RESOLVED_DAWGS" ]]; then
+    reason="$(dawgs_shift_reason "$TAG $UPSTREAM_DAWGS $RESOLVED_DAWGS")"
+    if [[ -z "$reason" ]]; then
+      {
+        echo "error: the image would ship dawgs $RESOLVED_DAWGS, but upstream $TAG pins $UPSTREAM_DAWGS."
+        echo "  Minimum version selection took the higher of upstream's dawgs and the one the driver is built against,"
+        echo "  so BloodHound would run on a library its own release never ran with. Run the unit and integration"
+        echo "  suites against $RESOLVED_DAWGS, then list \"$TAG $UPSTREAM_DAWGS $RESOLVED_DAWGS\" and the reason in"
+        echo "  dawgs_shift_reason in build/build-image.sh."
+      } >&2
+      exit 1
+    fi
+    echo "    accepted, listed in build/build-image.sh: $reason"
+  fi
+  own="$(awk -v m="$DAWGS" '$1 == m { print $2; exit } $1 == "require" && $2 == m { print $3; exit }' "$REPO_ROOT/go.mod")"
+  if [[ -z "$own" ]]; then
+    echo "error: could not read the version of $DAWGS from $REPO_ROOT/go.mod; refusing to guess" >&2
+    exit 1
+  fi
+  if [[ "$RESOLVED_DAWGS" != "$own" && " $(dawgs_tested_versions) " != *" $RESOLVED_DAWGS "* ]]; then
     {
-      echo "error: the image would ship dawgs $RESOLVED_DAWGS, but upstream $TAG pins $UPSTREAM_DAWGS."
-      echo "  Minimum version selection took the higher of upstream's dawgs and the one the driver is built against,"
-      echo "  so BloodHound would run on a library its own release never ran with. Run the unit and integration"
-      echo "  suites against $RESOLVED_DAWGS, then list \"$TAG $UPSTREAM_DAWGS $RESOLVED_DAWGS\" and the reason in"
-      echo "  dawgs_shift_reason in build/build-image.sh."
+      echo "error: the image would ship dawgs $RESOLVED_DAWGS (upstream $TAG pins $UPSTREAM_DAWGS), which the suites have never been run against."
+      echo "  The unit and integration suites run against $own, the version go.mod names, and against the versions in"
+      echo "  dawgs_tested_versions in build/build-image.sh ($(dawgs_tested_versions)). Nothing that builds an image runs a suite,"
+      echo "  so a build on any other dawgs would ship a library BloodTrail's tests never saw. Add $RESOLVED_DAWGS to"
+      echo "  dawgs_tested_versions in build/build-image.sh: ci.yml's dawgs job then runs the suites against it for every"
+      echo "  supported release that resolves to it, and the change should merge only if they pass."
     } >&2
     exit 1
   fi
-  echo "    accepted, listed in build/build-image.sh: $reason"
 }
 
 echo "==> Upstream checkout $TAG"

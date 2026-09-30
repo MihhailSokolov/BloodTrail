@@ -26,13 +26,14 @@ logged() { grep -q -- "$1" "$ROOT/log"; }       # the shims logged a command mat
 not_logged() { ! logged "$1"; }
 printed() { grep -q -- "$2" "$1"; }             # file $1 contains $2
 
-# fake_repo prints a fresh stand-in repository root holding a copy of the script
-# under test, the files build-image.sh vendors, and the shims.
+# fake_repo [DAWGS_VERSION] prints a fresh stand-in repository root holding a copy
+# of the script under test, the files build-image.sh vendors, and the shims. Its
+# go.mod names DAWGS_VERSION (default v0.8.0) for dawgs, as the real one does.
 fake_repo() {
-  local root; root="$(mktemp -d "$tmp/repo.XXXXXX")"
+  local root own="${1:-v0.8.0}"; root="$(mktemp -d "$tmp/repo.XXXXXX")"
   mkdir -p "$root/build" "$root/internal/engine" "$root/patches" "$root/shims" "$root/state"
   cp "$BUILD_IMAGE" "$root/build/build-image.sh"
-  printf 'module github.com/MihhailSokolov/BloodTrail\n\ngo 1.26\n' > "$root/go.mod"
+  printf 'module github.com/MihhailSokolov/BloodTrail\n\ngo 1.26\n\nrequire (\n\tgithub.com/jackc/pgx/v5 v5.10.0\n\tgithub.com/specterops/dawgs %s\n\tgolang.org/x/sync v0.22.0\n)\n' "$own" > "$root/go.mod"
   : > "$root/go.sum"
   printf 'package bloodtrail\n\nvar Version = "dev"\n' > "$root/driver.go"
   printf 'package engine\n' > "$root/internal/engine/engine.go"
@@ -51,14 +52,20 @@ SHIM
   cat > "$root/shims/go" <<'SHIM'
 #!/bin/sh
 echo "go $*" >> "$FAKE_LOG"
+here="$(basename "$PWD")"
 case "$1 $2" in
   "mod edit") exit 0 ;;
-  "mod tidy") : > "$FAKE_STATE/tidied"; exit 0 ;;
+  "mod tidy") : > "$FAKE_STATE/tidied-$here"; exit 0 ;;
   "list -m")
     if [ -n "${FAKE_LIST_FAILS:-}" ]; then echo "go: module is not a known dependency" >&2; exit 1; fi
-    if [ -e "$FAKE_STATE/tidied" ]; then printf '%s\n' "$FAKE_RESOLVED"; else printf '%s\n' "$FAKE_PIN"; fi
+    case "$PWD" in
+      */.build/upstream-*)   # an upstream checkout: what it pins, then what it resolves once tidied
+        if [ -e "$FAKE_STATE/tidied-$here" ]; then printf '%s\n' "$FAKE_RESOLVED"; else printf '%s\n' "$FAKE_PIN"; fi ;;
+      *) printf '%s\n' "${FAKE_OWN:-v0.8.0}" ;;   # this repository
+    esac
     exit 0 ;;
 esac
+if [ "$1" = test ] && [ -n "${FAKE_TEST_FAILS:-}" ]; then exit 1; fi
 if [ "$1" = build ]; then : > bhapi; fi
 exit 0
 SHIM
@@ -74,9 +81,10 @@ SHIM
 
 # run_build TAG PINNED RESOLVED [build-image.sh flags...] runs the script and
 # leaves ROOT, CODE, and the files $ROOT/out (stdout), $ROOT/err and $ROOT/log.
+# OWN_DAWGS=vX.Y.Z run_build ... makes the repository's own go.mod name that dawgs.
 run_build() {
   local tag="$1" pinned="$2" resolved="$3"; shift 3
-  ROOT="$(fake_repo)"
+  ROOT="$(fake_repo "${OWN_DAWGS:-v0.8.0}")"
   ( cd "$ROOT" && PATH="$ROOT/shims:$PATH" FAKE_LOG="$ROOT/log" FAKE_STATE="$ROOT/state" FAKE_PIN="$pinned" FAKE_RESOLVED="$resolved" \
       bash build/build-image.sh "$tag" 0.0.0-test "$@" > "$ROOT/out" 2> "$ROOT/err" )
   CODE=$?
@@ -108,6 +116,23 @@ echo "build-image.sh, a listed tag with another pair (v9.6.0: v0.7.0 -> v0.8.1)"
 run_build v9.6.0 v0.7.0 v0.8.1
 expect "the build fails (the allow-list is per pair, not per tag)" test "$CODE" -ne 0
 
+echo "build-image.sh, a new release pins a dawgs no suite has run against (v9.8.0: pins and resolves v0.9.0)"
+run_build v9.8.0 v0.9.0 v0.9.0
+expect "the build fails" test "$CODE" -ne 0
+expect "the error names the version and the release" printed "$ROOT/err" "would ship dawgs v0.9.0 (upstream v9.8.0 pins v0.9.0)"
+expect "the error says where to list it" printed "$ROOT/err" "dawgs_tested_versions in build/build-image.sh"
+expect "no Go build ran" not_logged "go build"
+expect "no image was built" not_logged "docker buildx build"
+
+echo "build-image.sh, the repository's own dawgs needs no listing (its go.mod names v0.9.0)"
+OWN_DAWGS=v0.9.0 run_build v9.8.0 v0.9.0 v0.9.0
+expect "the build goes ahead" test "$CODE" -eq 0
+expect "the image build ran" logged "docker buildx build"
+
+echo "build-image.sh, a listed shift onto a version no suite has run against (v9.6.0: v0.7.0 -> v0.9.0)"
+OWN_DAWGS=v0.8.0 run_build v9.6.0 v0.7.0 v0.9.0
+expect "the build fails" test "$CODE" -ne 0
+
 echo "build-image.sh, the version cannot be read"
 ROOT="$(fake_repo)"
 ( cd "$ROOT" && PATH="$ROOT/shims:$PATH" FAKE_LOG="$ROOT/log" FAKE_STATE="$ROOT/state" FAKE_LIST_FAILS=1 \
@@ -125,6 +150,9 @@ expect "no Go build ran" not_logged "go build"
 expect "Docker was not asked" not_logged "docker"
 run_build v9.7.0 v0.8.0 v0.8.1 --dawgs-only
 expect "an unlisted shift fails" test "$CODE" -ne 0
+expect "and prints no version" test ! -s "$ROOT/out"
+run_build v9.8.0 v0.9.0 v0.9.0 --dawgs-only
+expect "a dawgs no suite has run against fails" test "$CODE" -ne 0
 expect "and prints no version" test ! -s "$ROOT/out"
 
 # run_suites TAGS_JSON [NAME=value...] runs dawgs-suites.sh in a stand-in repository
@@ -197,6 +225,30 @@ run_suites "$ALL_TAGS" FAKE_RESOLVED_v9_6_0=v0.8.0 FAKE_RESOLVED_v9_7_1=v0.8.1
 expect "it fails" test "$CODE" -ne 0
 expect "build-image.sh's message reaches the log" printed "$ROOT/err" "nobody listed"
 expect "no suite ran" test "$(count '^go test ')" -eq 0
+
+# run_suites_for_real TAGS_JSON PINNED RESOLVED runs dawgs-suites.sh together with the
+# real build-image.sh (both under test), every release pinning PINNED and resolving RESOLVED.
+run_suites_for_real() {
+  local tags="$1" pinned="$2" resolved="$3"
+  ROOT="$(fake_repo v0.8.0)"
+  cp "$DAWGS_SUITES" "$ROOT/build/dawgs-suites.sh"
+  ( cd "$ROOT" && PATH="$ROOT/shims:$PATH" FAKE_LOG="$ROOT/log" FAKE_STATE="$ROOT/state" FAKE_OWN=v0.8.0 FAKE_PIN="$pinned" FAKE_RESOLVED="$resolved" \
+      bash build/dawgs-suites.sh "$tags" > "$ROOT/out" 2> "$ROOT/err" )
+  CODE=$?
+  touch "$ROOT/log"
+}
+
+echo "dawgs-suites.sh with the real build-image.sh, a new release pins a dawgs no suite has run against (v9.8.0: v0.9.0)"
+run_suites_for_real '["v9.8.0"]' v0.9.0 v0.9.0
+expect "the job fails" test "$CODE" -ne 0
+expect "the reason reaches the log" printed "$ROOT/err" "would ship dawgs v0.9.0 (upstream v9.8.0 pins v0.9.0)"
+expect "no suite ran" test "$(count '^go test ')" -eq 0
+
+echo "dawgs-suites.sh with the real build-image.sh, a release that pins a listed dawgs (v9.7.1: v0.8.1)"
+run_suites_for_real '["v9.7.1"]' v0.8.1 v0.8.1
+expect "the job succeeds" test "$CODE" -eq 0
+expect "it runs the suites against v0.8.1" logged "^go get github.com/specterops/dawgs@v0.8.1$"
+expect "and restores go.mod" logged "^git checkout -- go.mod go.sum$"
 
 echo "dawgs-suites.sh, a suite fails"
 run_suites "$ALL_TAGS" FAKE_RESOLVED_v9_6_0=v0.8.0 FAKE_RESOLVED_v9_7_0=v0.8.0 FAKE_RESOLVED_v9_7_1=v0.8.1 FAKE_TEST_FAILS=1

@@ -10,8 +10,11 @@
 # An image ships whatever dawgs build/build-image.sh resolves for its upstream
 # release: upstream's own pin, or the driver's when that is higher. v9.7.1 pins
 # v0.8.1 while go.mod says v0.8.0, so its image shipped a dawgs no suite had ever
-# run against. build-image.sh --dawgs-only also fails here for a release whose
-# resolved dawgs differs from its own pin without being listed in that script.
+# run against. build-image.sh --dawgs-only fails here, and so does this script,
+# for a release that resolves a dawgs that is neither go.mod's nor listed in that
+# script's dawgs_tested_versions (a new upstream release pinning a dawgs nobody
+# has tried), or whose resolved dawgs differs from its own pin without being
+# listed in dawgs_shift_reason. What it accepts, it runs the suites against.
 #
 # Needs jq and Go, network access to GitHub and the Go module proxy, and
 # BLOODTRAIL_TEST_PG for the integration suite. It edits go.mod and go.sum while

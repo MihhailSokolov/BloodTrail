@@ -80,8 +80,11 @@ jobs:
   # higher. `test` runs the suites against the version go.mod names; v9.7.1 pins
   # a newer one, and its image shipped a dawgs no suite had ever run against.
   # This job runs them against every OTHER version the supported releases
-  # resolve to, and fails for a release whose resolved dawgs differs from its
-  # own pin without build-image.sh listing why (see build/README.md).
+  # resolve to. It fails for a release that resolves a dawgs that is neither
+  # go.mod's nor in dawgs_tested_versions in build/build-image.sh (the rule that
+  # also stops the release and weekly image builds, which run no suite of their
+  # own), and for one whose resolved dawgs differs from its own pin without
+  # dawgs_shift_reason listing why (see build/README.md).
   dawgs:
     needs: upstreams
     runs-on: ubuntu-latest
