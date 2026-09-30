@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -107,7 +108,9 @@ const (
 //     grown past cfg.CompactEntries/CompactBytes (maintainAfterPublish).
 //
 // Safe for concurrent use. A caller that has no ctx of its own may pass
-// context.Background(); ctx bounds the read-back queries only.
+// context.Background(); ctx bounds the read-back queries only. A panic
+// anywhere in the sequence enters fallback instead of reaching the caller
+// (fallBackOnApplyPanic).
 //
 // Watermark bookkeeping (watermark.go) is folded into this same sequence,
 // deliberately unconditional on everything below: both of its steps run on
@@ -139,6 +142,9 @@ const (
 func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
+	// Deferred after the unlock, so it runs first, still under applyMu, as
+	// enterFallback's callers must.
+	defer e.fallBackOnApplyPanic(ctx)
 
 	if scope != nil {
 		if counter, bumped := scope.Watermark(); bumped {
@@ -266,6 +272,25 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 	// compaction -- see compact.go's maintainAfterPublish for why both need
 	// to run inside this same critical section.
 	e.maintainAfterPublish(ctx, newView)
+}
+
+// fallBackOnApplyPanic, deferred by Apply, turns a panic anywhere in Apply
+// into a fallback. Apply runs after its write has committed, so a panic
+// there -- necessarily an engine bug -- cannot be allowed to leave the
+// engine serving a replica the write never reached, and must not reach the
+// caller either: the write's own outcome is success, and a caller told
+// otherwise could retry it. The panic is logged at Error with its stack,
+// and the fallback's rebuild reloads what PostgreSQL holds.
+func (e *Engine) fallBackOnApplyPanic(ctx context.Context) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	e.cfg.Log.ErrorContext(ctx, "bloodtrail: write-through apply panicked",
+		slog.Any("panic", r),
+		slog.String("stack", string(debug.Stack())),
+	)
+	e.enterFallback(ctx, fmt.Sprintf("apply panicked: %v", r))
 }
 
 // buildApplySegment turns one read-back result into the delta Segment Apply

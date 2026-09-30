@@ -4,6 +4,8 @@ package engine
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"reflect"
 	"sort"
 	"testing"
@@ -430,6 +432,36 @@ func TestApplyBumpsEpochBeforeAnyEarlyReturn(t *testing.T) {
 	}
 	if e.state.Load() != stateServing {
 		t.Fatalf("Apply with no snapshot adopted entered fallback, want it to stay serving")
+	}
+}
+
+// TestApplyPanicEntersFallback: a panic part-way through Apply -- here from
+// read-back, since this engine has no PostgreSQL driver at all -- must not
+// leave the engine serving a replica that never received the committed
+// write, and must not reach Apply's caller either: the write has already
+// committed, so its caller must not be told otherwise.
+//
+// The rebuild-loop gate is held for the test, as nothing here could run a
+// real recovery load.
+func TestApplyPanicEntersFallback(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	e.snap.Store(buildApplyView(t))
+	e.fallbackRebuilding.Store(true)
+
+	scope := NewWriteScope()
+	scope.Changes().RecordNodeID(7)
+
+	var escaped any
+	func() {
+		defer func() { escaped = recover() }()
+		e.Apply(context.Background(), scope)
+	}()
+
+	if _, serving := e.serveState(); serving {
+		t.Fatalf("engine still serving after Apply panicked before replaying the write (panic: %v)", escaped)
+	}
+	if escaped != nil {
+		t.Fatalf("Apply's panic reached its caller, whose write had already committed: %v", escaped)
 	}
 }
 
