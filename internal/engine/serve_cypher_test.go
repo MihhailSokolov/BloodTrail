@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/specterops/dawgs/cypher/frontend"
@@ -457,6 +458,76 @@ func TestProjectionValueKindsReturnCount(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestServedTextColumnsAreNotDecoded: dawgs' pg driver decodes only jsonb and
+// json columns (decodeJSONValues), so a column PostgreSQL types text comes
+// back exactly as stored, even when its text looks like JSON. type(r) is
+// `kind_name(..)::text`, and a string constant carried through WITH stays
+// text however it is projected or renamed (`select '[1]' as i0`). Each query
+// here would return a decoded list, object or unquoted string if the served
+// result double-decoded the column.
+func TestServedTextColumnsAreNotDecoded(t *testing.T) {
+	snap := buildCypherTestSnapshot(t,
+		map[snapshot.KindID]string{1: "User", 2: `"RevQuoted"`, 3: `[7]`, 4: `{"rev":1}`},
+		[]cypherTestNode{
+			{id: 1, kinds: []snapshot.KindID{1}, props: map[string]any{"name": "a"}},
+			{id: 2, kinds: []snapshot.KindID{1}, props: map[string]any{"name": "b"}},
+		},
+		[]cypherTestEdge{
+			{id: 101, start: 1, end: 2, kind: 2},
+			{id: 102, start: 1, end: 2, kind: 3},
+			{id: 103, start: 1, end: 2, kind: 4},
+		},
+	)
+	view := snapshot.NewView(snap)
+
+	for _, tc := range []struct {
+		query string
+		want  []any // every row, in engine order
+	}{
+		{`MATCH (a:User)-[r]->(b:User) RETURN type(r) AS t`, []any{`"RevQuoted"`, `[7]`, `{"rev":1}`}},
+		{`MATCH (a:User)-[r]->(b:User) WITH r, a RETURN type(r) AS t, a.name`, []any{`"RevQuoted"`, "a", `[7]`, "a", `{"rev":1}`, "a"}},
+		{`WITH '[1]' AS s MATCH (m:User) RETURN s`, []any{`[1]`, `[1]`}},
+		{`WITH '"q"' AS s MATCH (m:User) RETURN s, m.name`, []any{`"q"`, "a", `"q"`, "b"}},
+		{`MATCH (n:User) WITH n, '{"a":1}' AS s RETURN n.name, s`, []any{"a", `{"a":1}`, "b", `{"a":1}`}},
+		{`MATCH (n:User) WITH n, '[1,2]' AS s RETURN s AS t`, []any{`[1,2]`, `[1,2]`}},
+		{`MATCH (n:User) WITH n, ' {"a":1}' AS s RETURN (s)`, []any{` {"a":1}`, ` {"a":1}`}},
+		{`MATCH (n:User) WITH n, '[1,2]' AS s RETURN DISTINCT s`, []any{`[1,2]`}},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			rq, err := frontend.ParseCypher(frontend.NewContext(), tc.query)
+			if err != nil {
+				t.Fatalf("ParseCypher: %v", err)
+			}
+			q, ok := interpret.Plan(rq, view)
+			if !ok {
+				t.Fatalf("Plan declined a shape this test serves")
+			}
+			rs, err := interpret.Execute(&interpret.Env{Snap: view}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			result := newCypherRowsResult(view, rs, projectionValueKinds(q), nil)
+			var got []any
+			for result.Next() {
+				got = append(got, result.Values()...)
+			}
+			sortServedValues(got)
+			want := append([]any(nil), tc.want...)
+			sortServedValues(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("served %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+// sortServedValues orders a flat list of string values so a comparison does
+// not depend on the engine's row order.
+func sortServedValues(values []any) {
+	sort.Slice(values, func(i, j int) bool { return fmt.Sprint(values[i]) < fmt.Sprint(values[j]) })
 }
 
 // TestProjectionValueKindsCoalesceInt8: dawgs casts a coalesce() with an

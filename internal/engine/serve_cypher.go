@@ -430,10 +430,11 @@ const (
 	// arithmetic over a property, labels(), split(), and the like.
 	valueDefault valueKind = iota
 	// valueText applies to a projection PostgreSQL renders as a `text`
-	// column rather than jsonb -- toLower()/toUpper()/coalesce() and a bare
-	// string literal (projectsTextColumn). It carries no numeric
-	// conversion; what it changes is that the scalar double-decode is NOT
-	// applied, matching dawgs' own decode-by-column-type rule.
+	// column rather than jsonb -- toLower()/toUpper()/coalesce()/type(), a
+	// bare string literal (projectsTextColumn), and a bare reference to a
+	// WITH-carried string constant (projectionValueKinds). It carries no
+	// numeric conversion; what it changes is that the scalar double-decode
+	// is NOT applied, matching dawgs' own decode-by-column-type rule.
 	valueText
 	// valueInt64 applies to id(), to a coalesce() dawgs types int8
 	// (interpret.CoalesceIsInt8), and to any bare reference (renamed or not)
@@ -467,8 +468,15 @@ const (
 // item renames the column via AS. The executor stores every count as
 // float64 (interpret's applyAggregate and runKindCount alike); pg types
 // count() as int8, which is the int64 materializeScalar converts it to.
+//
+// A WITH-carried string constant (`WITH '[1]' AS s`) is the same kind of
+// carry-over: PostgreSQL keeps it a text column (`select '[1]' as i0`), so a
+// RETURN item that is a bare reference to one, however parenthesized or
+// renamed, is valueText and must not be decoded even when its text looks
+// like JSON.
 func projectionValueKinds(q *interpret.Query) []valueKind {
 	countAliases := map[string]bool{}
+	textConstAliases := map[string]bool{}
 	groups := make([]*interpret.WithClause, 0, len(q.Parts)+1)
 	for i := range q.Parts {
 		groups = append(groups, q.Parts[i].With)
@@ -483,6 +491,11 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 				countAliases[agg.Alias] = true
 			}
 		}
+		for _, constant := range wc.Constants {
+			if _, isString := constant.Value.(string); isString {
+				textConstAliases[constant.Alias] = true
+			}
+		}
 	}
 
 	kinds := make([]valueKind, len(q.Returning.Items))
@@ -495,9 +508,15 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 			kinds[i] = valueInt32
 			continue
 		}
-		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil && countAliases[v.Symbol] {
-			kinds[i] = valueInt64
-			continue
+		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil {
+			if countAliases[v.Symbol] {
+				kinds[i] = valueInt64
+				continue
+			}
+			if textConstAliases[v.Symbol] {
+				kinds[i] = valueText
+				continue
+			}
 		}
 		// `coalesce(n.x, 0)` is `coalesce(...::int8, 0)::int8` in pg: an
 		// int8 column, not the text one projectsTextColumn assumes for
@@ -529,9 +548,12 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 //
 // The shapes listed here are the ones dawgs' translator explicitly casts to
 // text (toLower/toUpper render as `lower(...)::text`, coalesce sets
-// CastType Text) plus a bare string literal, which PostgreSQL never types
-// as jsonb. Everything else keeps the decode, which is what a bare property
-// lookup -- the jsonb column the rule exists for -- needs.
+// CastType Text, type() is `kind_name(...)::text`) plus a bare string
+// literal, which PostgreSQL never types as jsonb. Everything else keeps the
+// decode, which is what a bare property lookup -- the jsonb column the rule
+// exists for -- needs. A reference to a WITH-carried string constant is text
+// too, but only the query knows which aliases are constants, so
+// projectionValueKinds handles that one.
 func projectsTextColumn(expr cypher.Expression) bool {
 	switch e := unwrapParens(expr).(type) {
 	case *cypher.FunctionInvocation:
@@ -539,7 +561,7 @@ func projectsTextColumn(expr cypher.Expression) bool {
 			return false
 		}
 		switch strings.ToLower(e.Name) {
-		case "tolower", "toupper", "coalesce":
+		case cypher.ToLowerFunction, cypher.ToUpperFunction, cypher.CoalesceFunction, cypher.EdgeTypeFunction:
 			return true
 		}
 	case *cypher.Literal:
