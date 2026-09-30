@@ -578,15 +578,12 @@ func TestTryNodeQueriesNilIDsUnconstrained(t *testing.T) {
 // Kind ids used by this file's relationship-spec fixture
 // (buildRelSpecSnapshot): sharing kindUser/kindComputer/kindGroup above for
 // node kinds and adding three edge kinds here, contiguous with them (4, 5,
-// 6) rather than leaving a gap -- a real KindMapper (dawgs' pg.SchemaManager
-// and InMemoryKindMapper alike) hands out ids sequentially from 1 with no
-// gaps, out of one shared space for both node labels and relationship
-// types, and selectKindIDs (serve_builder.go) resolves every id up to
-// snap.MaxKindID for a step projection regardless of which kinds actually
-// appear in this fixture's data -- a gapped, non-sequential choice of
-// constants here would make fakeResolver fail on an id no real KindMapper
-// would ever have left unassigned, which is not the failure mode this
-// file's tests are for.
+// 6), out of one shared id space for both node labels and relationship
+// types, as a real KindMapper hands them out. The contiguity is only this
+// fixture's convenience: a real kind table can have gaps (a burned sequence
+// value), and selectKindIDs (serve_builder.go) resolves only the ids the
+// snapshot's kind table names, which buildRelSpecSnapshot fills in.
+// TestTryRelQueriesResolveOnlyExistingKindIDs covers a gapped table.
 const (
 	kindMemberOf   snapshot.KindID = 4
 	kindAdminTo    snapshot.KindID = 5
@@ -652,6 +649,14 @@ func buildRelSpecSnapshot(t *testing.T) *snapshot.Snapshot {
 	t.Helper()
 
 	b := snapshot.NewBuilder(1)
+	// The kind table names every kind, as a loaded snapshot's does
+	// (LoadSnapshot reads the whole kind table): the listings that resolve
+	// kind names up front resolve exactly the ids this table holds.
+	kindTable := make(map[snapshot.KindID]string, len(relSpecKindNames()))
+	for id, kind := range relSpecKindNames() {
+		kindTable[id] = kind.String()
+	}
+	b.SetKinds(kindTable)
 	nodes := []struct {
 		id    uint64
 		kinds []snapshot.KindID
@@ -1362,5 +1367,126 @@ func TestBuilderServingDeclinesInFallback(t *testing.T) {
 	relEngine.state.Store(stateServing)
 	if _, ok := relEngine.TryRelCount(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}); !ok {
 		t.Fatalf("TryRelCount after leaving fallback: ok = false, want true")
+	}
+}
+
+// TestTryRelQueriesResolveOnlyExistingKindIDs: the kind table's ids are not
+// contiguous once a sequence value has been burned (insert_or_get_kind's ON
+// CONFLICT DO NOTHING draws one, and so does a rolled-back insert). A
+// relationship kinds listing without a kind filter and a step projection
+// resolve kind names up front, and must ask the resolver only for ids the
+// snapshot's kind table holds: dawgs' MapKindIDs fails, after refetching the
+// whole kind table under its lock, on an id that does not exist, which used
+// to make both shapes decline on every call.
+func TestTryRelQueriesResolveOnlyExistingKindIDs(t *testing.T) {
+	const (
+		gapUser    snapshot.KindID = 1
+		gapAdminTo snapshot.KindID = 4 // ids 2 and 3 were never assigned
+	)
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(map[snapshot.KindID]string{gapUser: "User", gapAdminTo: "AdminTo"})
+	for _, id := range []uint64{1, 2} {
+		if err := b.AddNode(id, []snapshot.KindID{gapUser}, nil); err != nil {
+			t.Fatalf("AddNode(%d): %v", id, err)
+		}
+	}
+	b.AddEdge(101, 1, 2, gapAdminTo)
+	snap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if snap.MaxKindID != gapAdminTo {
+		t.Fatalf("snapshot MaxKindID = %d, want %d", snap.MaxKindID, gapAdminTo)
+	}
+
+	e := New(nil, nil, Config{Enabled: true})
+	e.mapKind = fakeKindMapper(map[string]snapshot.KindID{"User": gapUser, "AdminTo": gapAdminTo})
+	var resolved []snapshot.KindID
+	e.mapKindNames = func(_ context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
+		resolved = append(resolved, ids...)
+		names := map[snapshot.KindID]string{gapUser: "User", gapAdminTo: "AdminTo"}
+		kinds := make(graph.Kinds, len(ids))
+		for i, id := range ids {
+			name, ok := names[id]
+			if !ok {
+				return nil, fmt.Errorf("unable to map kind ids: [%d]", id)
+			}
+			kinds[i] = graph.StringKind(name)
+		}
+		return kinds, nil
+	}
+	e.snap.Store(snapshot.NewView(snap))
+	ctx := context.Background()
+
+	cursor, ok := e.TryRelFetchKinds(ctx, recognize.RelSpec{})
+	if !ok {
+		t.Fatalf("TryRelFetchKinds across a kind id gap: ok = false, want true")
+	}
+	rows := drainRelKinds(t, cursor)
+	if len(rows) != 1 || uint64(rows[0].ID) != 101 || rows[0].Kind == nil || rows[0].Kind.String() != "AdminTo" {
+		t.Fatalf("TryRelFetchKinds rows = %+v, want one AdminTo edge 101", rows)
+	}
+
+	result, ok := e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStepOutbound, false)
+	if !ok {
+		t.Fatalf("TryRelQueryRows step projection across a kind id gap: ok = false, want true")
+	}
+	defer result.Close()
+	var (
+		farID    graph.ID
+		farKinds graph.Kinds
+		relID    graph.ID
+		relKind  graph.Kind
+	)
+	if !result.Next() {
+		t.Fatalf("step projection: no row")
+	}
+	if err := result.Scan(&farID, &farKinds, &relID, &relKind); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if farID != 2 || len(farKinds) != 1 || farKinds[0].String() != "User" || relID != 101 || relKind.String() != "AdminTo" {
+		t.Fatalf("step row = (%d, %v, %d, %v), want (2, [User], 101, AdminTo)", farID, farKinds, relID, relKind)
+	}
+
+	// Each call resolved exactly the ids the kind table holds.
+	want := []snapshot.KindID{gapUser, gapAdminTo, gapUser, gapAdminTo}
+	if fmt.Sprint(resolved) != fmt.Sprint(want) {
+		t.Fatalf("resolver was asked for ids %v, want %v", resolved, want)
+	}
+}
+
+// TestTryRelQueriesDeclineWhenKindTableLacksMaxKindID: resolving only the ids
+// the kind table holds relies on the table naming every kind the rows carry.
+// A table that does not even name the highest carried id (one older than the
+// rows it describes) is inconsistent, and the two listings that resolve kind
+// names up front must decline it (reasonError) rather than return kinds with
+// no name -- the way resolving every id in the range used to fail.
+func TestTryRelQueriesDeclineWhenKindTableLacksMaxKindID(t *testing.T) {
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(map[snapshot.KindID]string{1: "User"}) // the edge below carries kind 4
+	for _, id := range []uint64{1, 2} {
+		if err := b.AddNode(id, []snapshot.KindID{1}, nil); err != nil {
+			t.Fatalf("AddNode(%d): %v", id, err)
+		}
+	}
+	b.AddEdge(101, 1, 2, 4)
+	snap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	e := newRelSpecEngine(t, snap)
+	ctx := context.Background()
+
+	if _, ok := e.TryRelFetchKinds(ctx, recognize.RelSpec{}); ok {
+		t.Fatalf("TryRelFetchKinds: ok = true, want false (kind table does not name the edge's kind)")
+	}
+	if _, ok := e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStepOutbound, false); ok {
+		t.Fatalf("TryRelQueryRows: ok = true, want false (kind table does not name the edge's kind)")
+	}
+	// A bare id pair names no kinds, so it never consults the kind table.
+	if _, ok := e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStartEnd, false); !ok {
+		t.Fatalf("TryRelQueryRows(start/end): ok = false, want true")
 	}
 }

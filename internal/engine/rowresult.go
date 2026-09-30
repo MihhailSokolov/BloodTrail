@@ -126,10 +126,11 @@ type rowResult struct {
 	// relationship's kind, same two projections) to its graph.Kind name.
 	// TryRelQueryRows resolves this fully before ever calling newRowResult
 	// (see its own doc), so Values() never has anything left that could
-	// fail -- a missing entry (never expected, since every KindID up to
-	// snap.MaxKindID is resolved regardless of proj) reads as a nil
-	// graph.Kind rather than panicking. Left nil for ProjectionStartEnd,
-	// which needs no kind names at all.
+	// fail -- a missing entry (never expected, since every KindID the kind
+	// table names, up to snap.MaxKindID, is resolved regardless of proj, and
+	// every kind a row carries is named there) reads as a nil graph.Kind
+	// rather than panicking. Left nil for ProjectionStartEnd, which needs no
+	// kind names at all.
 	kindNames map[snapshot.KindID]graph.Kind
 
 	// cur/valid hold the most recent relEdge Next() advanced to, and
