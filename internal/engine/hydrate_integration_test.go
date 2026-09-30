@@ -210,7 +210,7 @@ func TestHydratePathsEdgeBatchBoundary(t *testing.T) {
 		createdIDs = ids
 
 		for _, leafID := range ids[1:] {
-			if err := b.CreateRelationshipByIDs(ids[0], leafID, edgeKind, graph.NewProperties()); err != nil {
+			if err := b.CreateRelationship(&graph.Relationship{StartID: ids[0], EndID: leafID, Kind: edgeKind, Properties: graph.NewProperties()}); err != nil {
 				return err
 			}
 		}

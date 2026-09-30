@@ -110,7 +110,7 @@ func LoadDataset(t *testing.T, d *pg.Driver, path string) opengraph.IDMap {
 	if err != nil {
 		t.Fatalf("graphtest: open %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	doc, err := opengraph.ParseDocument(f)
 	if err != nil {
@@ -222,7 +222,7 @@ func LoadRandom(t *testing.T, d *pg.Driver, seed int64) []graph.ID {
 			end := ids[rng.Intn(numNodes)]
 			kind := RandomEdgeKinds[rng.Intn(len(RandomEdgeKinds))]
 
-			if err := batch.CreateRelationshipByIDs(start, end, kind, graph.NewProperties()); err != nil {
+			if err := batch.CreateRelationship(&graph.Relationship{StartID: start, EndID: end, Kind: kind, Properties: graph.NewProperties()}); err != nil {
 				return err
 			}
 		}

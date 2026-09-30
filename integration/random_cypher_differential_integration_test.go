@@ -257,21 +257,21 @@ func loadRandomCypherFixture(t *testing.T, bt *bloodtrail.Driver, oracle *pg.Dri
 			start := ids[rng.Intn(randomCypherFixtureNodeCount)]
 			end := ids[rng.Intn(randomCypherFixtureNodeCount)]
 			kind := edgeKinds[rng.Intn(len(edgeKinds))]
-			if err := batch.CreateRelationshipByIDs(start, end, kind, graph.NewProperties()); err != nil {
+			if err := batch.CreateRelationship(&graph.Relationship{StartID: start, EndID: end, Kind: kind, Properties: graph.NewProperties()}); err != nil {
 				return err
 			}
 		}
 
 		for _, i := range []int{0, 7, 15} {
 			kind := edgeKinds[i%len(edgeKinds)]
-			if err := batch.CreateRelationshipByIDs(ids[i], ids[i], kind, graph.NewProperties()); err != nil {
+			if err := batch.CreateRelationship(&graph.Relationship{StartID: ids[i], EndID: ids[i], Kind: kind, Properties: graph.NewProperties()}); err != nil {
 				return err
 			}
 		}
 
 		for _, pair := range [][2]int{{2, 3}, {5, 6}} {
 			for _, kind := range edgeKinds {
-				if err := batch.CreateRelationshipByIDs(ids[pair[0]], ids[pair[1]], kind, graph.NewProperties()); err != nil {
+				if err := batch.CreateRelationship(&graph.Relationship{StartID: ids[pair[0]], EndID: ids[pair[1]], Kind: kind, Properties: graph.NewProperties()}); err != nil {
 					return err
 				}
 			}

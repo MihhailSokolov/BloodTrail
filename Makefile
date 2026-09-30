@@ -5,12 +5,14 @@ test:
 
 # Pinned to the version .github/workflows/ci.yml runs; bump both together. A
 # different local version can report different issues, so it is refused
-# rather than silently trusted.
+# rather than silently trusted. The integration tag is the repository's only
+# build tag and it only ever adds files, so this one run lints the untagged
+# code as well as the integration tests and fixtures the tag brings in.
 GOLANGCI_LINT_VERSION := 2.13.2
 lint:
 	@golangci-lint version 2>/dev/null | grep -q 'version $(GOLANGCI_LINT_VERSION) ' || { \
 	  echo "make lint needs golangci-lint $(GOLANGCI_LINT_VERSION), the version CI pins; found: $$(golangci-lint version 2>&1 | head -n1)"; exit 1; }
-	golangci-lint run ./...
+	golangci-lint run --build-tags integration ./...
 
 # Requires a PostgreSQL reachable at BLOODTRAIL_TEST_PG, see docker-compose.test.yml
 # Integration packages share one database, so packages must not run in parallel.
