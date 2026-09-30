@@ -13,7 +13,8 @@ import (
 // doc, changes_scope.go): the actual read-back keys (node/edge database ids,
 // or the objectid values an upsert identified its target by) and, where a
 // key can't be pinned down, the coarser operation (a kind-scoped delete
-// criteria, or a bare "this write escaped tracking" fallback) Apply
+// criteria, which Apply turns back into keys by re-reading the View rows it
+// matches, or a bare "this write escaped tracking" fallback) Apply
 // (apply.go) needs in order to replay the write's effect into the in-memory
 // engine, rather than re-deriving it from the observer call sequence itself.
 //
@@ -68,11 +69,11 @@ type EdgeTripleOIDRef struct {
 
 // NodeKindDeleteCriteria is one (include, exclude) pair RecordDeleteNodesByKinds
 // has recorded, mirroring graph.Database.DeleteNodesByKinds' own
-// includeAny/excludeAny parameters: the applier replays this as the same
-// kind-scoped criteria, rather than an enumerated id list, since a
-// kind-scoped node delete's own blast radius (every node matching the
-// criteria, whatever their ids happen to be) is exactly what these two
-// fields already describe.
+// includeAny/excludeAny parameters: a kind-scoped node delete's blast radius
+// (every node matching the criteria, whatever their ids happen to be) is
+// exactly what these two fields describe, so the applier re-reads every
+// node of the View it is applied to that matches them (viewCandidates,
+// apply.go) and tombstones only the ones PostgreSQL no longer holds.
 type NodeKindDeleteCriteria struct {
 	Include, Exclude graph.Kinds
 }
@@ -221,9 +222,12 @@ func (c *ChangeSet) RecordEdgeTripleByObjectID(startOID, endOID string, kind gra
 // Driver.DeleteNodesByKinds' own includeAny/excludeAny, and the recognized
 // (non-InIDs) shape of a criteria this package's node-delete recognizer
 // maps to a kind matcher for -- as an operation rather than an enumerated
-// id list: the applier replays "delete every node matching this criteria"
-// directly, since the criteria describes the delete's blast radius more
-// durably than any id list captured before the delete ran.
+// id list, since the criteria describes the delete's blast radius more
+// durably than any id list captured before the delete ran. The applier
+// turns it into keys when it applies the write: every node of its View
+// that matches the criteria is re-read from PostgreSQL, so a node the
+// delete never saw (committed after the DELETE's snapshot) survives however
+// late the delete itself is applied.
 //
 // Recording the same (include, exclude) pair more than once -- comparing
 // kinds by name, regardless of slice order -- has the same effect as
@@ -241,7 +245,9 @@ func (c *ChangeSet) RecordDeleteNodesByKinds(include, exclude graph.Kinds) {
 // equivalent: Driver.DeleteRelationshipsByKinds' own kinds parameter, and
 // observingRelationshipQuery.Delete's recognized-kind-matcher branch
 // (relationshipDeleteScope/edgeKindsFromCriteria), recorded as "delete
-// every relationship of these kinds" rather than an enumerated id list.
+// every relationship of these kinds" rather than an enumerated id list and
+// applied the same way: every edge of those kinds the View holds is
+// re-read.
 //
 // Recording the same kinds more than once -- by name, regardless of slice
 // order -- has the same effect as recording it once; EdgeKindCriteria()

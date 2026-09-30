@@ -193,7 +193,7 @@ func TestReadBack(t *testing.T) {
 	cs.RecordEdgeTripleByObjectID("n1-oid", "dup-oid", rbEdgeKind)
 	cs.RecordEdgeTripleByObjectID("n1-oid", "dup-oid", rbEdgeKind) // recorded twice: dedup must hold
 
-	got, err := e.readBack(ctx, cs)
+	got, err := e.readBack(ctx, e.snap.Load(), cs)
 	if err != nil {
 		t.Fatalf("readBack: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestReadBackEmptyChangeSet(t *testing.T) {
 
 	e := New(pgDriver, pool, Config{})
 
-	got, err := e.readBack(ctx, &ChangeSet{})
+	got, err := e.readBack(ctx, nil, &ChangeSet{})
 	if err != nil {
 		t.Fatalf("readBack: %v", err)
 	}
