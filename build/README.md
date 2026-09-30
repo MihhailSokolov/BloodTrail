@@ -169,3 +169,15 @@ to publish the CLI until each of those exact tags is anonymously pullable. In or
 5. On a clean host with a BloodHound CE deployment, run the documented one-liner
    (`curl -fsSL …/install.sh | sh -s -- install`) end to end, including
    `bloodtrail rollback`.
+
+## Merge gate
+
+`ci.yml` ends in a `ci-ok` job and `e2e.yml` in an `e2e-ok` job. Each runs whatever the jobs
+before it did and fails unless every job it needs succeeded, skipped and cancelled included.
+Those two names are the status checks the default branch's ruleset should require: a ruleset
+counts a skipped required job as passing, and a job is skipped when something it needs failed,
+so requiring the underlying jobs by name would let a broken upstream list through. Pair them
+with an up-to-date-branch requirement (or a merge queue; both workflows run on `merge_group`
+too), and let the ruleset's bypass apply to pull requests only, so that merging past a red
+check is a deliberate act on the pull request and a direct push to the branch is refused.
+A job added to either workflow belongs in that workflow's gate `needs`.

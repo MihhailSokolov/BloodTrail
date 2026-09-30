@@ -2,6 +2,9 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
+  # Only fires if the branch ruleset enables a merge queue, whose required
+  # checks are reported for the queued merge commit by this trigger.
+  merge_group:
 permissions:
   contents: read
 jobs:
@@ -62,3 +65,21 @@ jobs:
         run: |
           git clone --depth 1 --branch ${{ matrix.upstream }} https://github.com/SpecterOps/BloodHound.git /tmp/upstream
           git -C /tmp/upstream apply --check "$GITHUB_WORKSPACE/patches/bloodhound-driver.patch"
+  # The one check the branch ruleset should require, instead of the jobs
+  # above. It runs whatever they did (always()) and passes only if every one of
+  # them succeeded. A ruleset counts a SKIPPED required job as passing, and a
+  # job is skipped when something it needs failed, so requiring jobs by name
+  # would let a broken upstream list through; requiring this one cannot. It
+  # also survives a job being renamed or split (a matrix leg's check name is
+  # its value). Add every new job to needs below.
+  ci-ok:
+    if: always()
+    needs: [test, upstreams, patch-guard]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job this one needs succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          printf '%s\n' "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null

@@ -2,6 +2,9 @@ name: e2e
 on:
   push: { branches: [main] }
   pull_request:
+  # Only fires if the branch ruleset enables a merge queue, whose required
+  # checks are reported for the queued merge commit by this trigger.
+  merge_group:
 permissions:
   contents: read
 jobs:
@@ -21,3 +24,16 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with: { name: e2e-logs, path: e2e-logs.txt }
+  # The check the branch ruleset should require for this workflow: see ci-ok in
+  # ci.yml for why it is a job of its own that runs whatever the others did.
+  e2e-ok:
+    if: always()
+    needs: [install-and-rollback]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job this one needs succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          printf '%s\n' "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null
