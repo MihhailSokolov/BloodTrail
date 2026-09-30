@@ -218,7 +218,10 @@ func TestTryCypherListAndTextEqualityMatchOracle(t *testing.T) {
 // patterns or two MATCH clauses may reuse an edge; an undirected step past
 // a pattern's first returns the near node as a far one too, and
 // `(a)--(a)` every edge touching a; and allShortestPaths over several
-// pairs keeps only some pairs' paths. The declined shapes may not serve.
+// pairs, unless both endpoints carry a property or id condition (dawgs'
+// pair filter), keeps only the paths of the overall shortest length any
+// root reaches any terminal at -- the engine's traverse.ModeAll, chosen
+// from the translation's harness calls. The declined shapes may not serve.
 func TestTryCypherPatternShapesMatchOracle(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
@@ -272,10 +275,10 @@ func TestTryCypherPatternShapesMatchOracle(t *testing.T) {
 		{`MATCH (x:PuUser)-[:PuMember]->(g)<-[:PuMember]-(y:PuUser) RETURN x.name, y.name`, true},
 		{`MATCH (a:PuGroup)-[:PuMember]-(b) RETURN a.name, b.name`, true},
 		{`MATCH p = allShortestPaths((s:PuUser)-[:PuMember|PuAdmin*1..]->(t:PuComp)) WHERE s.name = 'u0' AND t.name = 'c0' RETURN s.name, t.name`, true},
+		{`MATCH p = allShortestPaths((s:PuUser)-[:PuMember|PuAdmin*1..]->(t:PuComp)) RETURN s.name, t.name`, true},
+		{`MATCH p = allShortestPaths((s:PuUser)-[:PuMember|PuAdmin*1..]->(t:PuComp)) WHERE s.name = 'u0' RETURN s.name, t.name`, true},
 
 		{`MATCH (a:PuUser)-[:PuMember]->(b)-[:PuMember]-(c) RETURN a.name, c.name`, false},
 		{`MATCH (a:PuGroup)-[:PuMember]-(a) RETURN a.name`, false},
-		{`MATCH p = allShortestPaths((s:PuUser)-[:PuMember|PuAdmin*1..]->(t:PuComp)) RETURN s.name, t.name`, false},
-		{`MATCH p = allShortestPaths((s:PuUser)-[:PuMember|PuAdmin*1..]->(t:PuComp)) WHERE s.name = 'u0' RETURN s.name, t.name`, false},
 	})
 }
