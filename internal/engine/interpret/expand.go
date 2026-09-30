@@ -160,8 +160,9 @@ import (
 //     traverse.SelfEndpointConflict's doc comment for the in-depth
 //     citation);
 //   - with one, an allShortestPaths answered at the overall shortest length
-//     (traverse.ModeAll), whose length a cycle back to a shared node can set
-//     (see expandShortestPathComponent).
+//     (traverse.ModeAll), whose length a cycle back to a shared node can set,
+//     and a shortestPath searched pair by pair under a pushed LIMIT, which a
+//     shared node's own pair counts toward (see expandShortestPathComponent).
 //
 // This package cannot raise pg's error or its answer itself, so it returns
 // this sentinel instead, which the engine is expected to treat as "decline,
@@ -664,6 +665,28 @@ func endpointNarrows(nc *NodeConstraint) bool {
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+// pairFilterEndpoint reports whether nc carries a condition dawgs can put into
+// a shortest-path pair filter: an id or objectid anchor, or any pushed
+// predicate that reads more than the node's kinds -- a negation included,
+// unlike endpointNarrows, because this is about which harness dawgs builds,
+// not about cost. dawgs materializes a pair filter only when both endpoints
+// have one (canMaterializeEndpointPairFilterForStep, translate/model.go), so
+// both answering true is a superset of the shapes it searches pair by pair.
+func pairFilterEndpoint(nc *NodeConstraint) bool {
+	if nc == nil {
+		return false
+	}
+	if len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil {
+		return true
+	}
+	for _, p := range nc.Predicates {
+		if !kindOnlyPredicate(p) {
+			return true
+		}
 	}
 	return false
 }
@@ -1195,6 +1218,26 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		if step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap, roots, terminals) {
 			return nil, ErrSelfEndpoint
 		}
+	}
+
+	// shortestPath under a bare LIMIT has the same self-pair problem when
+	// dawgs searches pair by pair: with a property or id condition on both
+	// endpoints it builds bidirectional_sp_harness's pair filter as the plain
+	// product of the two endpoint sets, so a shared node's own pair is in it,
+	// and pushes the LIMIT into the harness (pushDownShortestPathLimit), which
+	// resolves that pair around the node's cycle and counts it. `s <> t`
+	// drops it afterwards and PostgreSQL returns fewer rows than LIMIT.
+	// Without a pushed LIMIT the self pair's paths are simply filtered out,
+	// and the unidirectional harness never revisits a root at all, so only
+	// this combination declines. limitTargetSet covers every query dawgs
+	// pushes a LIMIT into: it is set for a single-Part query's bare LIMIT
+	// (SKIP included, which dawgs does not push -- declining it too is only
+	// conservative) and never under ORDER BY, DISTINCT or an aggregate, which
+	// dawgs does not push through either.
+	if mode == traverse.ModeOne && step.HasExplicitEndpointInequality && meter.limitTargetSet &&
+		pairFilterEndpoint(part.Nodes[step.FromSym]) && pairFilterEndpoint(part.Nodes[step.ToSym]) &&
+		endpointsIntersect(env.Snap, roots, terminals) {
+		return nil, ErrSelfEndpoint
 	}
 
 	maxDepth := 0

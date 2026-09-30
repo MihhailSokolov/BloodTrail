@@ -444,3 +444,29 @@ func TestAllShortestPathsSharedEndpointInequalityMatchesOracle(t *testing.T) {
 		g.assertNeverWrong(t, `MATCH p = allShortestPaths((s:ZUser)-[:ZEdge*1..]->(e:ZGroup)) WHERE s.name = 'a' AND s <> e RETURN p`)
 	})
 }
+
+// TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle: when both
+// endpoints carry a property or id condition, dawgs searches pair by pair
+// (bidirectional_sp_harness with a pair filter) and pushes a bare LIMIT into
+// that search. The pair filter is the plain product of the two endpoint sets,
+// so it includes (g1, g1); the harness resolves that pair around g1's cycle
+// and counts it toward the LIMIT, and `a <> b` drops it only afterwards --
+// PostgreSQL returns fewer rows than LIMIT. Without the LIMIT, with kind-only
+// endpoints (the unidirectional harness never revisits a root) or with
+// DISTINCT (no pushdown), the answers agree and must keep serving.
+func TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle(t *testing.T) {
+	g := seedPathParityGraph(t, selfCycleFixture())
+	for _, query := range []string{
+		`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p LIMIT 1`,
+		`MATCH p = shortestPath((a)-[:ZEdge*1..]->(b)) WHERE a.name = 'g1' AND b.name IN ['g1', 'g2'] AND a <> b RETURN p LIMIT 1`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+	}
+	for _, query := range []string{
+		`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p`,
+		`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN DISTINCT p LIMIT 1`,
+		`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p LIMIT 1`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertServesOracle(t, query) })
+	}
+}

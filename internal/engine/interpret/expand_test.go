@@ -1628,11 +1628,11 @@ func buildSelfCycleSnapshot(t *testing.T) *snapshot.View {
 	return buildExecSnapshot(t,
 		map[snapshot.KindID]string{kindG: "G", kindU: "U", kindE: "E"},
 		[]execNodeSpec{
-			{id: 1, kinds: []snapshot.KindID{kindG}},
-			{id: 2, kinds: []snapshot.KindID{kindU}},
-			{id: 3, kinds: []snapshot.KindID{kindU}},
-			{id: 4, kinds: []snapshot.KindID{kindU}},
-			{id: 5, kinds: []snapshot.KindID{kindG}},
+			{id: 1, kinds: []snapshot.KindID{kindG}, props: map[string]any{"name": "g1"}},
+			{id: 2, kinds: []snapshot.KindID{kindU}, props: map[string]any{"name": "u"}},
+			{id: 3, kinds: []snapshot.KindID{kindU}, props: map[string]any{"name": "x"}},
+			{id: 4, kinds: []snapshot.KindID{kindU}, props: map[string]any{"name": "y"}},
+			{id: 5, kinds: []snapshot.KindID{kindG}, props: map[string]any{"name": "g2"}},
 		},
 		[]execEdgeSpec{
 			{id: 10, start: 1, end: 2, kind: kindE},
@@ -1669,4 +1669,23 @@ func TestExpandAllShortestSharedEndpointInequalityDeclines(t *testing.T) {
 		"N:1,2,|E:10,",
 		"N:1,3,|E:12,",
 	})
+}
+
+// TestExpandShortestPairFilterLimitSharedEndpointDeclines: a shortestPath with
+// a property condition on both endpoints (which dawgs searches pair by pair,
+// over the product of the two endpoint sets), an endpoint inequality and a
+// bare LIMIT declines when the sets share a node -- the harness resolves that
+// node's own pair around its cycle and counts it toward the LIMIT -- and
+// keeps serving without the LIMIT and with kind-only endpoints.
+func TestExpandShortestPairFilterLimitSharedEndpointDeclines(t *testing.T) {
+	snap := buildSelfCycleSnapshot(t)
+
+	const pairs = `MATCH p = shortestPath((a:G)-[:E*1..]->(b:G)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p`
+	if err := execExpectErr(t, snap, pairs+` LIMIT 1`, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
+		t.Fatalf("Execute(%q LIMIT 1) error = %v, want ErrSelfEndpoint", pairs, err)
+	}
+
+	want := []string{"N:1,3,4,5,|E:12,13,14,"}
+	assertPathSigs(t, snap, pairs, 0, want)
+	assertPathSigs(t, snap, `MATCH p = shortestPath((a:G)-[:E*1..]->(b:G)) WHERE a <> b RETURN p LIMIT 1`, 0, want)
 }
