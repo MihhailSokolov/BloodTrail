@@ -930,13 +930,25 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	// names it -- a deployment docker compose cannot load -- and, for an .env
 	// that needs no change at all, fail every rerun the same way.
 	envPath := filepath.Join(m.ProjectDir, ".env")
-	if current, restored, _, exists, err := envRestore(envPath, m); err != nil {
+	before, planned, _, hasEnv, err := envRestore(envPath, m)
+	if err != nil {
 		return err
-	} else if exists && restored != current {
+	}
+	if hasEnv && planned != before {
 		if err := checkEnvWritable(envPath); err != nil {
 			return fmt.Errorf("rollback has to take its override out of COMPOSE_FILE in .env, which it cannot rewrite: %w; fix that (let this user write .env, or run bloodtrail as its owner) and rerun; nothing has been changed", err)
 		}
 	}
+	// Whether rollback can restart the project it restores is settled here as
+	// well. It runs compose with --project-directory <the .env's directory>,
+	// but docker compose takes the project directory of the operator's own
+	// commands from the restored project's first file, and relative paths in
+	// the compose files -- a bind mount such as ./pgdata -- resolve against
+	// it: where the two differ a restart from here could recreate a service
+	// with its data on another path, which is what install refuses to set up
+	// (checkProjectDirectory). Rollback then does everything else and leaves
+	// the restart to the operator.
+	first, restoreDir, elsewhere := restoredProjectDirectory(planned, m)
 
 	say("==> Restoring the graph driver setting")
 	if m.OriginalDriverRow != nil {
@@ -975,7 +987,11 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		}
 	}
 
-	say("==> Restarting with the original image %s", m.OriginalImage)
+	if elsewhere {
+		say("==> Not restarting: the restored project loads from another directory")
+	} else {
+		say("==> Restarting with the original image %s", m.OriginalImage)
+	}
 	// Everything that makes the deployment BloodTrail is undone by this point,
 	// so a failure from here on is about the deployment coming back up, not
 	// about the rollback being incomplete. Say so: the manifest is still
@@ -993,7 +1009,11 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	// otherwise find the counter exactly where the file left it. Addressed
 	// through the restored project, since the override file is gone.
 	restoredStore := dbswitch.Store{Compose: restarted, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
-	if err := restarted.Up(ctx); err != nil {
+	if elsewhere {
+		for _, line := range restartLeftToTheOperator(first, restoreDir, m.ProjectDir) {
+			say("    %s", line)
+		}
+	} else if err := restarted.Up(ctx); err != nil {
 		// A failed up can still have started the stock image -- compose
 		// reports the first service that failed, not the ones it already
 		// started -- and nothing says the operator reruns rollback before
@@ -1004,16 +1024,63 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf("restarting with the original image: %w (%s)", err, restored)
 	}
 	if err := restoredStore.EndWatermarkLineage(ctx); err != nil {
+		if elsewhere {
+			return fmt.Errorf("ending the snapshot file watermark lineage: %w (the driver row and the compose files are already restored; rerun `bloodtrail rollback` to finish)", err)
+		}
 		return fmt.Errorf("ending the snapshot file watermark lineage: %w (the original image is running again; rerun `bloodtrail rollback` to finish)", err)
 	}
-	if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
-		return fmt.Errorf("waiting for the API after the restart: %w (%s; check the %s logs)", err, restored, bloodhoundService)
+	if !elsewhere {
+		// The API of a deployment that was not restarted is the one BloodTrail
+		// still serves, which says nothing about the restored image.
+		if err := verify.WaitForAPI(ctx, deps.HTTP, opts.APIURL, opts.VerifyTimeout); err != nil {
+			return fmt.Errorf("waiting for the API after the restart: %w (%s; check the %s logs)", err, restored, bloodhoundService)
+		}
 	}
 	if err := os.Remove(manifest.Path(m.ProjectDir)); err != nil {
 		return err
 	}
-	say("    rolled back; backups kept in %s", m.BackupDir)
+	if elsewhere {
+		say("    rolled back except for the restart above; backups kept in %s", m.BackupDir)
+	} else {
+		say("    rolled back; backups kept in %s", m.BackupDir)
+	}
 	return nil
+}
+
+// restoredProjectDirectory says where docker compose takes the project
+// directory from for the project the .env env restores -- the .env of the
+// install m records, in m.ProjectDir: the directory of the first file its
+// COMPOSE_FILE lists or, with no entry (the entry an install created goes
+// with the rollback), of the compose file the install was given. first is
+// that file and dir its directory; differs reports whether dir is not
+// m.ProjectDir, the directory rollback addresses the project through.
+func restoredProjectDirectory(env string, m manifest.Manifest) (first, dir string, differs bool) {
+	first = m.ComposeFile
+	if listed, err := compose.ListedComposeFiles(env); err == nil {
+		for _, f := range listed {
+			if f != "" {
+				first = f
+				break
+			}
+		}
+	}
+	if !filepath.IsAbs(first) {
+		first = filepath.Join(m.ProjectDir, first)
+	}
+	dir = filepath.Dir(first)
+	return first, dir, !sameDirectory(dir, m.ProjectDir)
+}
+
+// restartLeftToTheOperator is what rollback tells the operator when it does
+// not restart the project it restored (restoredProjectDirectory): why, and
+// what to do.
+func restartLeftToTheOperator(first, dir, projectDir string) []string {
+	return []string{
+		fmt.Sprintf("docker compose takes %s as the project directory for the restored project (its first file is %s) and resolves relative paths in the compose files -- bind mounts such as ./pgdata among them -- against it,", dir, first),
+		fmt.Sprintf("but rollback runs compose with --project-directory %s, where the .env is: a restart from here could recreate services with their data on different host paths (a database on an empty directory, say).", projectDir),
+		"Rollback has done everything else and leaves the restart to you.",
+		"BloodTrail is still running: restart the deployment now with your own `docker compose up -d`, from the directory you usually run it in.",
+	}
 }
 
 // envRestore reads the project's .env and works out what rollback of the
