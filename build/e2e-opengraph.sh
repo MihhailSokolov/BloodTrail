@@ -56,8 +56,25 @@ bounded_curl() {
   return "$rc"
 }
 
+# login_token BODY prints a session token, or nothing if there is none to get.
+# BloodHound's rate limiter (HTTP 429) covers the login endpoint too, so a login
+# that lands just after a burst of requests waits and tries again instead of
+# failing the phase with an empty token.
+login_token() {
+  local body="$1" out code delay=1 _
+  out="$(mktemp)"
+  for _ in 1 2 3 4 5 6; do
+    code="$(bounded_curl -s -o "$out" -w '%{http_code}' -X POST "$BASE_URL/api/v2/login" -H 'Content-Type: application/json' -d "$body")" || code=000
+    [ "$code" = "429" ] || break
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+  if [ "$code" = "200" ]; then jq -r '.data.session_token // empty' "$out"; fi
+  rm -f "$out"
+}
+
 LOGIN_BODY="$(jq -n --arg p "$PASSWORD" '{login_method:"secret", username:"admin", secret:$p}')"
-TOKEN="$(bounded_curl -s -X POST "$BASE_URL/api/v2/login" -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(login_token "$LOGIN_BODY")"
 [ -n "$TOKEN" ] || fail "could not obtain a session token"
 
 # req METHOD PATH [BODY_FILE [CONTENT_TYPE [HEADER]]] makes one API call,

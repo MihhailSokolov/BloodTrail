@@ -30,6 +30,23 @@ bounded_curl() {
   return "$rc"
 }
 
+# login_token BODY prints a session token, or nothing if there is none to get.
+# BloodHound's rate limiter (HTTP 429) covers the login endpoint too, so a login
+# that lands just after a burst of requests waits and tries again instead of
+# failing the phase with an empty token.
+login_token() {
+  local body="$1" out code delay=1 _
+  out="$(mktemp)"
+  for _ in 1 2 3 4 5 6; do
+    code="$(bounded_curl -s -o "$out" -w '%{http_code}' -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$body")" || code=000
+    [ "$code" = "429" ] || break
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+  if [ "$code" = "200" ]; then jq -r '.data.session_token // empty' "$out"; fi
+  rm -f "$out"
+}
+
 # BloodHound registers GET /api/version behind auth, so an unauthenticated
 # request against a live server normally answers 401, not 200; that still
 # proves the API is up and routing, so it counts as ready here too (matching
@@ -144,7 +161,7 @@ echo "==> Querying for a node analysis itself creates, to prove analysis-phase w
 # ingest that came before it -- was replayed into the in-memory replica by
 # write-through, not merely served by the boot rebuild counted above.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(login_token "$LOGIN_BODY")"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the zero-rebuild phase" >&2; exit 1; }
 
 EVERYONE_OID="TESTLAB.LOCAL-S-1-1-0"
@@ -170,7 +187,7 @@ USER_SID="$DOMAIN_SID-500"
 GROUP_SID="$DOMAIN_SID-512"
 
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(login_token "$LOGIN_BODY")"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the engine phase" >&2; exit 1; }
 
 bh_logs
@@ -229,7 +246,7 @@ echo "==> Querying the builder engine directly"
 # The session token from the login above should still be valid (no restart
 # has happened since), but re-authenticate anyway rather than lean on that.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(login_token "$LOGIN_BODY")"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the builder phase" >&2; exit 1; }
 
 bh_logs
@@ -572,7 +589,7 @@ echo "==> Querying after the restart to confirm the engine serves correctly eith
 # is what proves it. On the SUPERSEDED path it is also the check that the
 # fallback actually recovered rather than leaving the engine unable to serve.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(login_token "$LOGIN_BODY")"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token after the restart" >&2; exit 1; }
 bh_logs
 restart_served_before="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
