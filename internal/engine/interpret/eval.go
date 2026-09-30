@@ -1161,6 +1161,11 @@ const maxExactInt = 1 << 53
 // numeric side is not a bare literal) anything that is not an integer --
 // where int8 and float8 agree -- declines.
 //
+// A stored number of magnitude 2^53 or more declines under the integer cast
+// as well: the float64 cannot say which integer was stored -- JSON
+// 9007199254740993 decodes to 9007199254740992 -- while the cast reads the
+// exact text.
+//
 // A nil (stored JSON null) passes through: it extracts to SQL NULL.
 func castPropertyForOrder(v any, floatCast bool) (any, error) {
 	switch val := v.(type) {
@@ -1170,7 +1175,7 @@ func castPropertyForOrder(v any, floatCast bool) (any, error) {
 		if floatCast {
 			return val, nil
 		}
-		if val != math.Trunc(val) || math.Abs(val) > maxExactInt {
+		if val != math.Trunc(val) || math.Abs(val) >= maxExactInt {
 			return nil, ErrRuntimeCast
 		}
 		return val, nil
@@ -1933,7 +1938,9 @@ func EvalValue(env *Env, row *Row, expr cypher.Expression) (val any, ok bool, er
 // float64 here so a literal number compares equal (via ScalarEq/PropEq's
 // jsonbEqual) to a PropStore-decoded JSON number regardless of which Go
 // numeric type produced it, matching pg's own scale-insensitive numeric
-// equality.
+// equality. An integer past 2^53 has no exact float64 -- 9007199254740993
+// would become 9007199254740992 and match that stored number, which
+// PostgreSQL's exact int8 does not -- so it declines (ErrUnsupported).
 func evalLiteralValue(lit *cypher.Literal) (any, bool, error) {
 	if lit.Null {
 		return nil, true, nil
@@ -1946,8 +1953,14 @@ func evalLiteralValue(lit *cypher.Literal) (any, bool, error) {
 		}
 		return s, true, nil
 	case int64:
+		if v > maxExactInt || v < -maxExactInt {
+			return nil, false, ErrUnsupported
+		}
 		return float64(v), true, nil
 	case uint64:
+		if v > maxExactInt {
+			return nil, false, ErrUnsupported
+		}
 		return float64(v), true, nil
 	case float64:
 		return v, true, nil
@@ -2657,9 +2670,20 @@ func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, 
 // BinaryExpression tree would carry a Text type forward once the first `+`
 // resolves to one.
 func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, bool, error) {
-	cur, curOk, err := EvalValue(env, row, ae.Left)
+	val, ok, _, err := evalArithmeticTyped(env, row, ae)
+	return val, ok, err
+}
+
+// evalArithmeticTyped is evalArithmetic, returning also the PostgreSQL type
+// of the result (sqlnum.go): each numeric step is computed with the
+// semantics of the type PostgreSQL resolves it to -- an int4 or int8 step in
+// exact integers, overflowing into the error PostgreSQL raises -- and that
+// type is what the next step, or the step this one is an operand of,
+// combines with.
+func evalArithmeticTyped(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, bool, sqlNum, error) {
+	cur, curOk, curType, err := evalOperandTyped(env, row, ae.Left)
 	if err != nil {
-		return nil, false, err
+		return nil, false, sqlNumNone, err
 	}
 	curKind := classifyAddOperand(ae.Left)
 	// Whether the value folded so far is statically a float -- what decides
@@ -2667,11 +2691,11 @@ func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, b
 	leftFloat := staticallyFloatOperand(ae.Left)
 	for i, partial := range ae.Partials {
 		if partial == nil {
-			return nil, false, ErrUnsupported
+			return nil, false, sqlNumNone, ErrUnsupported
 		}
-		rVal, rOk, err := EvalValue(env, row, partial.Right)
+		rVal, rOk, rType, err := evalOperandTyped(env, row, partial.Right)
 		if err != nil {
-			return nil, false, err
+			return nil, false, sqlNumNone, err
 		}
 		rKind := classifyAddOperand(partial.Right)
 		rightFloat := staticallyFloatOperand(partial.Right)
@@ -2688,27 +2712,60 @@ func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, b
 			if i == 0 && partial.Operator != cypher.OperatorAdd && isPlainPropertyLookup(ae.Left) && isPlainPropertyLookup(partial.Right) {
 				// `text * text`: PostgreSQL has no such operator. Plan
 				// rejects the shape (checkArithmetic); declined defensively.
-				return nil, false, ErrUnsupported
+				return nil, false, sqlNumNone, ErrUnsupported
 			}
 			if i == 0 && isPlainPropertyLookup(ae.Left) {
 				if cur, err = castPropertyForOrder(cur, rightFloat); err != nil {
-					return nil, false, err
+					return nil, false, sqlNumNone, err
 				}
+				curType = castSQLNum(rightFloat)
 			}
 			if isPlainPropertyLookup(partial.Right) {
 				if rVal, err = castPropertyForOrder(rVal, leftFloat); err != nil {
-					return nil, false, err
+					return nil, false, sqlNumNone, err
 				}
+				rType = castSQLNum(leftFloat)
 			}
 		}
-		cur, curOk, err = applyArithmetic(curKind, cur, curOk, partial.Operator, rKind, rVal, rOk)
+		cur, curOk, curType, err = applyArithmetic(curType, cur, curOk, curKind, partial.Operator, rType, rVal, rOk, rKind)
 		if err != nil {
-			return nil, false, err
+			return nil, false, sqlNumNone, err
 		}
 		curKind = nextAddKind(partial.Operator, curKind, rKind)
 		leftFloat = leftFloat || rightFloat
 	}
-	return cur, curOk, nil
+	return cur, curOk, curType, nil
+}
+
+// castSQLNum is the type castPropertyForOrder casts a property to.
+func castSQLNum(floatCast bool) sqlNum {
+	if floatCast {
+		return sqlNumFloat8
+	}
+	return sqlNumInt8
+}
+
+// evalOperandTyped evaluates one arithmetic operand together with its
+// PostgreSQL type: a nested arithmetic expression or sign carries the type
+// its own steps resolved to, a WITH alias the type of the constant it holds
+// (valueSQLNum), and anything else the type its SQL fixes (leafSQLNum) -- a
+// plain property none, since that is the cast its step gives it.
+func evalOperandTyped(env *Env, row *Row, expr cypher.Expression) (any, bool, sqlNum, error) {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.ArithmeticExpression:
+		if e != nil {
+			return evalArithmeticTyped(env, row, e)
+		}
+	case *cypher.UnaryAddOrSubtractExpression:
+		if e != nil {
+			return evalUnaryTyped(env, row, e)
+		}
+	case *cypher.Variable:
+		val, ok, err := EvalValue(env, row, expr)
+		return val, ok, valueSQLNum(val), err
+	}
+	val, ok, err := EvalValue(env, row, expr)
+	return val, ok, leafSQLNum(expr), err
 }
 
 // addOperandKind classifies one `+` operand by its STATIC AST shape --
@@ -2987,48 +3044,66 @@ func nextAddKind(op cypher.Operator, aKind, bKind addOperandKind) addOperandKind
 	return addOther
 }
 
-// applyArithmetic implements one arithmetic step over float64 operands, plus
-// `+`'s own string-concatenation disambiguation (applyAdd, below) -- every
-// other operator (-, *, /, %) has no Cypher/pg concatenation analog, so those
-// stay numeric-only exactly as before: a non-numeric operand is
-// ErrUnsupported (expected to be pre-rejected, or handled by a different
-// code path, at plan time -- checkArithmetic (plan.go) does not itself
-// type-check operands for any of these operators, mirroring this function's
-// own runtime-only dispatch). aKind/bKind (unused by every operator but `+`)
-// are the operands' static addOperandKind, per evalArithmetic's own doc.
-func applyArithmetic(aKind addOperandKind, a any, aOk bool, op cypher.Operator, bKind addOperandKind, b any, bOk bool) (any, bool, error) {
+// applyArithmetic implements one arithmetic step over operands of
+// PostgreSQL types aType and bType (sqlnum.go), returning the step's value
+// and type. A NULL operand makes any step NULL. A `+` with a text operand,
+// with two property operands, or with an untyped coalesce() is applyAdd's
+// (concatenation, or a decline). Every other step is numeric: a string
+// operand is a failed cast in PostgreSQL (ErrRuntimeCast) and any other
+// non-number declines (ErrUnsupported; checkArithmetic does not type-check
+// operands, mirroring this runtime dispatch). Integer and numeric steps are
+// computed exactly or decline (integerArithmetic); a float step in float64,
+// as PostgreSQL's float8. aKind/bKind are the operands' static
+// addOperandKind, per evalArithmetic's own doc.
+func applyArithmetic(aType sqlNum, a any, aOk bool, aKind addOperandKind, op cypher.Operator, bType sqlNum, b any, bOk bool, bKind addOperandKind) (any, bool, sqlNum, error) {
+	t := arithSQLNum(aType, bType)
 	if !aOk || !bOk || a == nil || b == nil {
-		return nil, false, nil
+		return nil, false, t, nil
 	}
-
-	if op == cypher.OperatorAdd {
-		return applyAdd(aKind, a, bKind, b)
+	if op == cypher.OperatorAdd && (aKind == addStaticText || bKind == addStaticText ||
+		(aKind == addPropertyLookup && bKind == addPropertyLookup) || aKind == addUnresolved || bKind == addUnresolved) {
+		v, ok, err := applyAdd(aKind, a, bKind, b)
+		return v, ok, sqlNumNone, err
 	}
-
+	if _, isStr := a.(string); isStr {
+		return nil, false, sqlNumNone, ErrRuntimeCast
+	}
+	if _, isStr := b.(string); isStr {
+		return nil, false, sqlNumNone, ErrRuntimeCast
+	}
 	af, aIsNum := a.(float64)
 	bf, bIsNum := b.(float64)
 	if !aIsNum || !bIsNum {
-		return nil, false, ErrUnsupported
+		return nil, false, sqlNumNone, ErrUnsupported
 	}
-
-	switch op {
-	case cypher.OperatorSubtract:
-		return af - bf, true, nil
-	case cypher.OperatorMultiply:
-		return af * bf, true, nil
-	case cypher.OperatorDivide:
-		if bf == 0 {
-			return nil, false, ErrRuntimeCast
+	switch t {
+	case sqlNumInt4, sqlNumInt8, sqlNumNumeric:
+		r, err := integerArithmetic(t, af, op, bf)
+		if err != nil {
+			return nil, false, sqlNumNone, err
 		}
-		return af / bf, true, nil
-	case cypher.OperatorModulo:
-		if bf == 0 {
-			return nil, false, ErrRuntimeCast
+		return r, true, t, nil
+	case sqlNumFloat8:
+		switch op {
+		case cypher.OperatorAdd:
+			return af + bf, true, t, nil
+		case cypher.OperatorSubtract:
+			return af - bf, true, t, nil
+		case cypher.OperatorMultiply:
+			return af * bf, true, t, nil
+		case cypher.OperatorDivide:
+			if bf == 0 {
+				return nil, false, sqlNumNone, ErrRuntimeCast
+			}
+			return af / bf, true, t, nil
+		case cypher.OperatorModulo:
+			if bf == 0 {
+				return nil, false, sqlNumNone, ErrRuntimeCast
+			}
+			return math.Mod(af, bf), true, t, nil
 		}
-		return math.Mod(af, bf), true, nil
-	default:
-		return nil, false, ErrUnsupported
 	}
+	return nil, false, sqlNumNone, ErrUnsupported
 }
 
 // applyAdd implements Cypher's `+`, which pg's own translation disambiguates
@@ -3101,22 +3176,12 @@ func applyArithmetic(aKind addOperandKind, a any, aOk bool, op cypher.Operator, 
 //     file's established convention for a plan-guaranteed-unreachable shape
 //     (e.g. evalPatternPredicate's identical defensive ErrUnsupported for a
 //     shape checkPatternPredicate already validated away).
-//   - Otherwise (NUMERIC semantics, matching pg's own "neither side is
-//     Text, and not both are untyped property lookups" fallthrough, which
-//     pg renders as an arithmetic `+` and therefore expects both sides to
-//     already be numeric): both operands present numbers add normally; a
-//     present, non-numeric operand that happens to be a runtime STRING
-//     (e.g. `1 + n.name` where n.name is a genuine string property) bails
-//     ErrRuntimeCast -- pg's own `(properties ->> 'name')::numeric`-style
-//     cast would itself raise a runtime error for that same row, so this
-//     mirrors a genuine pg failure rather than silently concatenating (the
-//     bug this rule replaces: a purely-runtime-sniffing implementation
-//     would group "not statically Text" operands with "whatever they
-//     evaluate to", so two operands that both merely *happen* to be
-//     runtime strings could fall into ordinary concatenation here even
-//     though that is not pg's rule for this shape at all). Any other
-//     present, non-numeric, non-string operand (a bool/list/map) still
-//     bails ErrUnsupported, exactly as it always has.
+//   - Otherwise the `+` is numeric -- pg's own "neither side is Text, and
+//     not both are untyped property lookups" fallthrough, which it renders
+//     as an arithmetic `+` -- and applyArithmetic computes it at its
+//     operands' PostgreSQL type instead of routing it here; a runtime
+//     STRING operand there is ErrRuntimeCast (pg's cast of it would raise
+//     an error for that row), never a concatenation.
 func applyAdd(aKind addOperandKind, a any, bKind addOperandKind, b any) (any, bool, error) {
 	switch {
 	case aKind == addStaticText || bKind == addStaticText:
@@ -3143,36 +3208,37 @@ func applyAdd(aKind addOperandKind, a any, bKind addOperandKind, b any) (any, bo
 		return nil, false, ErrUnsupported
 
 	default:
-		if _, isStr := a.(string); isStr {
-			return nil, false, ErrRuntimeCast
-		}
-		if _, isStr := b.(string); isStr {
-			return nil, false, ErrRuntimeCast
-		}
-		af, aIsNum := a.(float64)
-		bf, bIsNum := b.(float64)
-		if !aIsNum || !bIsNum {
-			return nil, false, ErrUnsupported
-		}
-		return af + bf, true, nil
+		// A numeric `+`, which applyArithmetic computes itself.
+		return nil, false, ErrUnsupported
 	}
 }
 
 // evalUnary implements unary +/- over a numeric operand.
 func evalUnary(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) (any, bool, error) {
-	val, ok, err := EvalValue(env, row, u.Right)
+	val, ok, _, err := evalUnaryTyped(env, row, u)
+	return val, ok, err
+}
+
+// evalUnaryTyped is evalUnary, returning also the operand's PostgreSQL type,
+// which a sign keeps. Negating an int4 can overflow it: -(-2147483648) is
+// "integer out of range" in PostgreSQL.
+func evalUnaryTyped(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) (any, bool, sqlNum, error) {
+	val, ok, t, err := evalOperandTyped(env, row, u.Right)
 	if err != nil {
-		return nil, false, err
+		return nil, false, sqlNumNone, err
 	}
 	if !ok || val == nil {
-		return nil, false, nil
+		return nil, false, t, nil
 	}
 	f, isNum := val.(float64)
 	if !isNum {
-		return nil, false, ErrRuntimeCast
+		return nil, false, sqlNumNone, ErrRuntimeCast
 	}
 	if u.Operator == cypher.OperatorSubtract {
-		return -f, true, nil
+		if t == sqlNumInt4 && f == minInt4 {
+			return nil, false, sqlNumNone, ErrRuntimeCast
+		}
+		return -f, true, t, nil
 	}
-	return f, true, nil
+	return f, true, t, nil
 }
