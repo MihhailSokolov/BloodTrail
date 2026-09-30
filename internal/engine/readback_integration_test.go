@@ -215,12 +215,11 @@ func TestReadBack(t *testing.T) {
 		}
 	}
 
+	// "missing-oid" matches no row, and no node of the View carries it
+	// either, so it contributes nothing at all: no node to re-read, hence no
+	// absent id beyond the fabricated one.
 	if len(got.absentNodeIDs) != 1 || got.absentNodeIDs[0] != uint64(fabricatedNodeID) {
 		t.Fatalf("absentNodeIDs = %v, want [%d]", got.absentNodeIDs, uint64(fabricatedNodeID))
-	}
-
-	if len(got.absentObjectIDs) != 1 || got.absentObjectIDs[0] != "missing-oid" {
-		t.Fatalf("absentObjectIDs = %v, want [missing-oid]", got.absentObjectIDs)
 	}
 
 	// --- edges ---
@@ -295,7 +294,7 @@ func TestReadBackEmptyChangeSet(t *testing.T) {
 		t.Fatalf("readBack: %v", err)
 	}
 
-	if len(got.nodes) != 0 || len(got.absentNodeIDs) != 0 || len(got.absentObjectIDs) != 0 {
+	if len(got.nodes) != 0 || len(got.absentNodeIDs) != 0 {
 		t.Fatalf("readBack(empty ChangeSet): non-empty node results: %+v", got)
 	}
 	if len(got.edges) != 0 || len(got.absentEdgeIDs) != 0 || len(got.absentTriples) != 0 {

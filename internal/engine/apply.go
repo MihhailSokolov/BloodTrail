@@ -88,12 +88,13 @@ const (
 //     which is the honest answer rather than a guess.
 //  4. Read back every key the ChangeSet named from PostgreSQL (readBack,
 //     readback.go): present rows are the write's post-state, absent keys are
-//     deletions. The rows a kind-scoped delete criteria could have removed
-//     are keys too -- the current View's candidates for it, re-read the same
-//     way (viewCandidates) -- so a delete never removes a row PostgreSQL
-//     kept, whichever order concurrent writes' Applies run in. A read-back
-//     error is not survivable either -- the write's effect is unknown -- so
-//     it enters fallback too.
+//     deletions. The rows a kind-scoped delete criteria could have removed,
+//     and the nodes the View knows under an objectid found on no row, are
+//     keys too -- the current View's candidates, re-read the same way
+//     (viewCandidates) -- so a write never removes a row PostgreSQL kept,
+//     whichever order concurrent writes' Applies run in. A read-back error
+//     is not survivable either -- the write's effect is unknown -- so it
+//     enters fallback too.
 //  5. Turn that read-back result into one immutable delta Segment
 //     (buildApplySegment).
 //  6. Layer the segment onto the current View and publish the result, unless
@@ -273,28 +274,27 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 // Everything it stages is PostgreSQL's own answer for one key. readBack has
 // already resolved every row the write could have touched -- the ids,
 // objectids and triples its ChangeSet names, plus the View rows a
-// kind-scoped delete criteria makes candidates (viewCandidates) -- to
-// present rows and absent keys, so nothing here is derived from the write's
-// payload or replayed as an instruction over whatever the View holds by the
-// time this runs. That is what makes the result independent of the order
-// concurrent writes' Applies run in, and of the boot gap's replay order
-// (adoptSnapshotFileView): a tombstone is only ever staged for a row
-// PostgreSQL no longer holds -- ids are never reused, so that stays true --
-// and a present row carries PostgreSQL's state as read after this write
-// committed, so a later Apply naming the same row can only restage a later
-// truth. (The one exception is an objectid read-back found on no row: the
-// nodes the View knows under it are tombstoned without being re-read.)
+// kind-scoped delete criteria or an objectid found on no row make
+// candidates (viewCandidates) -- to present rows and absent keys, so nothing
+// here is derived from the write's payload or replayed as an instruction
+// over whatever the View holds by the time this runs. That is what makes
+// the result independent of the order concurrent writes' Applies run in,
+// and of the boot gap's replay order (adoptSnapshotFileView): a tombstone
+// is only ever staged for a row PostgreSQL no longer holds -- ids are never
+// reused, so that stays true -- and a present row carries PostgreSQL's
+// state as read after this write committed, so a later Apply naming the
+// same row can only restage a later truth.
 //
 // Staging order is load-bearing, since SegmentBuilder resolves a repeated id
 // by last-call-wins (its own doc):
 //
 //  1. Newly resolved kinds (AddKind), so the segment can name the kind ids
 //     the node/edge states below carry.
-//  2. Every tombstone: node ids and objectids read-back reported absent
-//     (each cascading to the edges incident to that node in view -- deleting
-//     a node deletes its edges, and the base CSR slots for those edges would
-//     otherwise keep them visible), and edge ids and (start, end, kind)
-//     triples read-back reported absent.
+//  2. Every tombstone: node ids read-back reported absent (each cascading
+//     to the edges incident to that node in view -- deleting a node deletes
+//     its edges, and the base CSR slots for those edges would otherwise keep
+//     them visible), and edge ids and (start, end, kind) triples read-back
+//     reported absent.
 //  3. Every present node and edge state read-back returned, staged LAST so
 //     that a row read-back found wins over a cascade tombstone the View
 //     derived -- an edge found present although its endpoint, read by a
@@ -313,18 +313,6 @@ func buildApplySegment(view *snapshot.View, rb *readbackResult) (*snapshot.Segme
 
 	for _, id := range rb.absentNodeIDs {
 		tombstoneNodeWithCascade(&b, view, id)
-	}
-	for _, objectID := range rb.absentObjectIDs {
-		// An objectid that matched no row after the write: whatever nodes
-		// the View still knows under it are gone from PostgreSQL. This also
-		// covers an edge-triple-by-objectid whose endpoint is unresolvable
-		// -- read-back reports that only through this same list (its own
-		// doc), and a tombstoned endpoint already cascades to the edge.
-		if dense, ok := view.NodesByObjectID(objectID); ok {
-			for _, n := range dense {
-				tombstoneNodeWithCascade(&b, view, view.GraphID(n))
-			}
-		}
 	}
 	for _, id := range rb.absentEdgeIDs {
 		b.TombstoneEdge(id)
@@ -448,21 +436,23 @@ func tombstoneAbsentTriple(b *snapshot.SegmentBuilder, view *snapshot.View, trip
 // viewCandidates collects the rows of one View that readBack must re-read
 // from PostgreSQL because a write may have removed them without naming them
 // by key: the nodes a kind-scoped node delete matches in the View
-// (addNodeKindCriteria), and the edges a kind-scoped relationship delete
-// matches (addEdgeKindCriteria).
+// (addNodeKindCriteria), the edges a kind-scoped relationship delete matches
+// (addEdgeKindCriteria), and the nodes the View still knows under an
+// objectid read-back found on no row (addObjectID).
 //
 // The View only chooses WHICH rows to ask about; the answer is always
 // PostgreSQL's. A candidate the write did remove comes back absent and is
 // tombstoned; one PostgreSQL kept comes back present and is restaged as it
 // is now -- an edge created after the DELETE's snapshot and applied before
-// the delete's own Apply. So the set has to cover every row the write may
-// have removed that the View holds, and may safely cover more (an extra
-// candidate only costs its re-read). A row the write removed that the View
-// does not hold yet belongs to another write whose Apply is still to come,
-// and that Apply's own read-back finds it absent.
+// the delete's own Apply, a node whose objectid was only rewritten. So the
+// set has to cover every row the write may have removed that the View
+// holds, and may safely cover more (an extra candidate only costs its
+// re-read). A row the write removed that the View does not hold yet belongs
+// to another write whose Apply is still to come, and that Apply's own
+// read-back finds it absent.
 //
 // Enumeration touches only the View, in memory, once per Apply that carries
-// a criteria -- never a query's read path.
+// a criteria or an absent objectid -- never a query's read path.
 type viewCandidates struct {
 	view  *snapshot.View
 	nodes *snapshot.Bitset // dense node ids; nil until the first candidate
@@ -470,12 +460,17 @@ type viewCandidates struct {
 }
 
 // collectViewCandidates enumerates view's candidates for one write: the
-// rows cs's kind-scoped delete criteria match, resolving the criteria's
-// kind names through view's kind table and criteriaKinds
+// nodes view knows under each of absentObjectIDs (objectids read-back found
+// on no row) and the rows cs's kind-scoped delete criteria match, resolving
+// the criteria's kind names through view's kind table and criteriaKinds
 // (resolveCriteriaKinds' id->name result). Its one error is
 // addNodeKindCriteria's unresolvable exclusion.
-func collectViewCandidates(view *snapshot.View, criteriaKinds map[snapshot.KindID]string, cs *ChangeSet) (*viewCandidates, error) {
+func collectViewCandidates(view *snapshot.View, criteriaKinds map[snapshot.KindID]string, cs *ChangeSet, absentObjectIDs []string) (*viewCandidates, error) {
 	c := &viewCandidates{view: view}
+	for _, objectID := range absentObjectIDs {
+		c.addObjectID(objectID)
+	}
+
 	lookup := newKindLookup(view, criteriaKinds)
 	for _, criteria := range cs.NodeKindCriteria() {
 		if err := c.addNodeKindCriteria(lookup, criteria); err != nil {
@@ -505,6 +500,22 @@ func (c *viewCandidates) nodeIDs() []uint64 {
 		return true
 	})
 	return ids
+}
+
+// addObjectID marks every live node the View knows under objectID -- an
+// objectid read-back found on no row. That the objectid matches nothing
+// any more does not mean those nodes are gone: a node whose objectid was
+// rewritten keeps its id, its row and its edges, so each one is re-read by
+// id, and only one that is actually absent is tombstoned (with its edge
+// cascade).
+func (c *viewCandidates) addObjectID(objectID string) {
+	dense, ok := c.view.NodesByObjectID(objectID)
+	if !ok {
+		return
+	}
+	for _, n := range dense {
+		c.addNode(n)
+	}
 }
 
 // addNodeKindCriteria marks every live View node a DeleteNodesByKinds-shaped

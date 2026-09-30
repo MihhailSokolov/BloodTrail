@@ -78,13 +78,9 @@ type tripleKey struct {
 // tombstone -- the row is gone, or (for a triple) was never produced.
 //
 // absentNodeIDs and absentEdgeIDs cover the ids the ChangeSet named and the
-// View candidates readBack re-read (viewCandidates) alike.
-//
-// absentObjectIDs covers only node objectids (NodeObjectIDs) that matched
-// zero rows; an edge-triple-by-objectid whose endpoint is unresolvable is
-// deliberately NOT given its own entry anywhere on this type -- see
-// readBack's own doc for why the corresponding absentObjectIDs entry
-// already carries that information for the applier.
+// View candidates readBack re-read (viewCandidates) alike; an objectid that
+// matched no row has no entry of its own, since what it means for the
+// replica is decided by re-reading the nodes the View knew under it.
 //
 // resolvedKinds carries the name of every kind id this read-back
 // encountered (in a node's kindIDs, or an edge's kindID) that the View
@@ -94,9 +90,8 @@ type tripleKey struct {
 // applier feeds these straight into SegmentBuilder.AddKind so the delta
 // segment it builds from this result can name the kind at all.
 type readbackResult struct {
-	nodes           []nodeState
-	absentNodeIDs   []uint64
-	absentObjectIDs []string
+	nodes         []nodeState
+	absentNodeIDs []uint64
 
 	edges         []edgeState
 	absentEdgeIDs []uint64
@@ -125,7 +120,8 @@ type readbackResult struct {
 //     match is also merged into the same node result set (1) uses, keyed by
 //     its own database id -- a node named by both its id and (separately) by
 //     an objectid it happens to carry is reported exactly once. An objectid
-//     matching zero rows is reported via absentObjectIDs.
+//     matching zero rows makes the nodes view knows under it candidates for
+//     the re-read below.
 //  3. cs.EdgeIDs() by database id (readBackEdgesByID), mirroring (1).
 //  4. cs.EdgeTriples() by (start, end, kind name) -- resolveKindIDs
 //     resolves each distinct kind name to its current KindID; a name that
@@ -142,19 +138,19 @@ type readbackResult struct {
 //  5. cs.EdgeTriplesByObjectID() -- each endpoint objectid is resolved
 //     against (2)'s own result rather than queried again: a pair where
 //     either endpoint's objectid matched zero rows in (2) is reported as
-//     nothing at all here (the corresponding absentObjectIDs entry from (2)
-//     already tells the applier that endpoint -- and therefore this triple
-//     -- can't be resolved; the write either failed or the node was deleted,
-//     and both are safe to treat as absence). A pair where both endpoints
-//     resolve is expanded into every (start id, end id) combination across
-//     both endpoints' matches (deduplicated, and bounded by how many rows
-//     (2) actually returned for those two objectids) and folded into the
-//     same batch pass (4) runs.
+//     nothing at all here (the write either failed, or the endpoint is gone
+//     or re-keyed since; that objectid's re-read below settles what the View
+//     knew under it, and a deleted endpoint's cascade takes the edge with
+//     it). A pair where both endpoints resolve is expanded into every
+//     (start id, end id) combination across both endpoints' matches
+//     (deduplicated, and bounded by how many rows (2) actually returned for
+//     those two objectids) and folded into the same batch pass (4) runs.
 //
 // Then the candidates (viewCandidates): the View rows cs's write may have
 // removed without naming them by key -- every node or edge a kind-scoped
-// delete criteria (NodeKindCriteria, EdgeKindCriteria) matches in view.
-// They are re-read by id exactly like (1) and (3) (rereadByID), in the same
+// delete criteria (NodeKindCriteria, EdgeKindCriteria) matches in view, and
+// every node view still knows under an objectid (2) found on no row. They
+// are re-read by id exactly like (1) and (3) (rereadByID), in the same
 // chunks, skipping any id the lookups above already answered: a present
 // candidate joins the node or edge results -- restaged as PostgreSQL holds
 // it now -- and an absent one joins absentNodeIDs or absentEdgeIDs. This is
@@ -210,11 +206,6 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	for _, ns := range oidRows {
 		nodesByID[ns.id] = ns
 	}
-	for _, oid := range objectIDs {
-		if len(oidToIDs[oid]) == 0 {
-			result.absentObjectIDs = append(result.absentObjectIDs, oid)
-		}
-	}
 
 	edgesByID := make(map[uint64]edgeState)
 
@@ -262,9 +253,9 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	for _, t := range oidTriples {
 		startIDs, endIDs := oidToIDs[t.StartOID], oidToIDs[t.EndOID]
 		if len(startIDs) == 0 || len(endIDs) == 0 {
-			// Unresolvable endpoint: the write failed, or the node was
-			// deleted since. The corresponding absentObjectIDs entry
-			// already reports this; nothing further to record here.
+			// Unresolvable endpoint: the write failed, or the node is gone
+			// or re-keyed since. Its objectid's candidates (below) settle
+			// what the View knew under it; nothing further to record here.
 			continue
 		}
 
@@ -303,7 +294,13 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	}
 
 	if view != nil {
-		candidates, err := collectViewCandidates(view, criteriaKinds, cs)
+		var absentObjectIDs []string
+		for _, oid := range objectIDs {
+			if len(oidToIDs[oid]) == 0 {
+				absentObjectIDs = append(absentObjectIDs, oid)
+			}
+		}
+		candidates, err := collectViewCandidates(view, criteriaKinds, cs, absentObjectIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -322,7 +319,6 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 
 	result.nodes = sortedNodeStates(nodesByID)
 	sort.Slice(result.absentNodeIDs, func(i, j int) bool { return result.absentNodeIDs[i] < result.absentNodeIDs[j] })
-	sort.Strings(result.absentObjectIDs)
 	result.edges = sortedEdgeStates(edgesByID)
 	sort.Slice(result.absentEdgeIDs, func(i, j int) bool { return result.absentEdgeIDs[i] < result.absentEdgeIDs[j] })
 	result.absentTriples = sortedTripleKeys(absentTriples)

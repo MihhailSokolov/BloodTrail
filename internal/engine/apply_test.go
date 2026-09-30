@@ -145,26 +145,6 @@ func TestBuildApplySegmentUpsertsPresentStateAndTombstonesAbsent(t *testing.T) {
 	}
 }
 
-// TestBuildApplySegmentAbsentObjectIDTombstonesEveryMatch covers the
-// objectid half of read-back's absence reporting: an objectid that matched
-// no row after the write means every node the View still knows under it is
-// gone, cascade included.
-func TestBuildApplySegmentAbsentObjectIDTombstonesEveryMatch(t *testing.T) {
-	view := buildApplyView(t)
-
-	rb := &readbackResult{absentObjectIDs: []string{"oid-1"}}
-
-	seg, err := buildApplySegment(view, rb)
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	requireNodeTombstoned(t, seg, 1)
-	requireEdgeTombstoned(t, seg, 10) // out of node 1
-	requireEdgeTombstoned(t, seg, 12) // into node 1
-	requireNoEdgeRecord(t, seg, 11)   // untouched by node 1's cascade
-}
-
 // TestBuildApplySegmentAbsentTriples covers both triple cases: a triple that
 // still exists in the View is tombstoned by finding its edge id through the
 // start node's adjacency, while a triple carrying read-back's
@@ -216,13 +196,13 @@ func TestBuildApplySegmentPresentStateWinsOverCascadeTombstone(t *testing.T) {
 	}
 }
 
-// requireCandidates collects view's candidates for cs (the kind names in
-// resolved stand for what resolveCriteriaKinds found in PostgreSQL) and
-// asserts they are exactly wantNodes and wantEdges.
-func requireCandidates(t *testing.T, view *snapshot.View, resolved map[snapshot.KindID]string, cs *ChangeSet, wantNodes, wantEdges []uint64) {
+// requireCandidates collects view's candidates for cs and absentObjectIDs
+// (the kind names in resolved stand for what resolveCriteriaKinds found in
+// PostgreSQL) and asserts they are exactly wantNodes and wantEdges.
+func requireCandidates(t *testing.T, view *snapshot.View, resolved map[snapshot.KindID]string, cs *ChangeSet, absentObjectIDs []string, wantNodes, wantEdges []uint64) {
 	t.Helper()
 
-	c, err := collectViewCandidates(view, resolved, cs)
+	c, err := collectViewCandidates(view, resolved, cs, absentObjectIDs)
 	if err != nil {
 		t.Fatalf("collectViewCandidates: %v", err)
 	}
@@ -238,6 +218,16 @@ func requireCandidates(t *testing.T, view *snapshot.View, resolved map[snapshot.
 	}
 }
 
+// TestViewCandidatesAbsentObjectIDNamesEveryLiveNodeUnderIt: an objectid that
+// matched no row makes every node the View still knows under it a candidate
+// -- to re-read by id, not to tombstone: its objectid may only have been
+// rewritten.
+func TestViewCandidatesAbsentObjectIDNamesEveryLiveNodeUnderIt(t *testing.T) {
+	view := buildApplyView(t)
+
+	requireCandidates(t, view, nil, &ChangeSet{}, []string{"oid-1", "oid-unknown"}, []uint64{1}, nil)
+}
+
 // TestViewCandidatesNodeKindCriteria pins the node criteria's candidates to
 // dawgs' own DeleteNodesByKinds rule: a node matches when its kinds overlap
 // Include and do not overlap Exclude.
@@ -249,7 +239,7 @@ func TestViewCandidatesNodeKindCriteria(t *testing.T) {
 
 	// Node 1 is a User carrying no Tag; node 3 is a User but carries Tag;
 	// node 2 is no User at all.
-	requireCandidates(t, view, nil, cs, []uint64{1}, nil)
+	requireCandidates(t, view, nil, cs, nil, []uint64{1}, nil)
 }
 
 // TestViewCandidatesNodeKindCriteriaEmptyIncludeMatchesEveryNode covers
@@ -262,7 +252,7 @@ func TestViewCandidatesNodeKindCriteriaEmptyIncludeMatchesEveryNode(t *testing.T
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("Computer")})
 
-	requireCandidates(t, view, nil, cs, []uint64{1, 3}, nil)
+	requireCandidates(t, view, nil, cs, nil, []uint64{1, 3}, nil)
 }
 
 // TestViewCandidatesNodeKindCriteriaUnresolvableExcludeErrors covers the one
@@ -278,13 +268,13 @@ func TestViewCandidatesNodeKindCriteriaUnresolvableExcludeErrors(t *testing.T) {
 
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("User")}, graph.Kinds{graph.StringKind("NeverAsserted")})
-	if _, err := collectViewCandidates(view, nil, cs); err == nil {
+	if _, err := collectViewCandidates(view, nil, cs, nil); err == nil {
 		t.Fatalf("collectViewCandidates with an unresolvable exclude kind = nil error, want an error")
 	}
 
 	unknownInclude := &ChangeSet{}
 	unknownInclude.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("NeverAsserted")}, nil)
-	requireCandidates(t, view, nil, unknownInclude, nil, nil)
+	requireCandidates(t, view, nil, unknownInclude, nil, nil, nil)
 }
 
 // TestViewCandidatesNodeKindCriteriaExcludeResolvedByReadBack covers
@@ -299,7 +289,7 @@ func TestViewCandidatesNodeKindCriteriaExcludeResolvedByReadBack(t *testing.T) {
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("Tag"), graph.StringKind("RowlessSource")})
 
-	requireCandidates(t, view, map[snapshot.KindID]string{42: "RowlessSource"}, cs, []uint64{1, 2}, nil)
+	requireCandidates(t, view, map[snapshot.KindID]string{42: "RowlessSource"}, cs, nil, []uint64{1, 2}, nil)
 }
 
 // TestViewCandidatesKindCriteriaMatchByID pins why a kind only read-back
@@ -337,19 +327,19 @@ func TestViewCandidatesKindCriteriaMatchByID(t *testing.T) {
 	t.Run("exclude", func(t *testing.T) {
 		cs := &ChangeSet{}
 		cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("UnnamedNode")})
-		requireCandidates(t, view, resolved, cs, []uint64{1}, nil)
+		requireCandidates(t, view, resolved, cs, nil, []uint64{1}, nil)
 	})
 
 	t.Run("include", func(t *testing.T) {
 		cs := &ChangeSet{}
 		cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("UnnamedNode")}, nil)
-		requireCandidates(t, view, resolved, cs, []uint64{2}, nil)
+		requireCandidates(t, view, resolved, cs, nil, []uint64{2}, nil)
 	})
 
 	t.Run("relationships", func(t *testing.T) {
 		cs := &ChangeSet{}
 		cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("UnnamedEdge")})
-		requireCandidates(t, view, resolved, cs, nil, []uint64{11})
+		requireCandidates(t, view, resolved, cs, nil, nil, []uint64{11})
 	})
 }
 
@@ -363,7 +353,7 @@ func TestViewCandidatesEdgeKindCriteria(t *testing.T) {
 	cs := &ChangeSet{}
 	cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("AdminTo"), graph.StringKind("NeverAsserted")})
 
-	requireCandidates(t, view, nil, cs, nil, []uint64{10, 12})
+	requireCandidates(t, view, nil, cs, nil, nil, []uint64{10, 12})
 }
 
 // TestViewCandidatesEdgeKindCriteriaCoversEveryDeltaRecord pins the edge
@@ -387,7 +377,7 @@ func TestViewCandidatesEdgeKindCriteriaCoversEveryDeltaRecord(t *testing.T) {
 	cs := &ChangeSet{}
 	cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("AdminTo")})
 
-	requireCandidates(t, view, nil, cs, nil, []uint64{10, 20})
+	requireCandidates(t, view, nil, cs, nil, nil, []uint64{10, 20})
 }
 
 // TestEnterFallbackFlipsStateOnceAndStopsServing covers the state half of
