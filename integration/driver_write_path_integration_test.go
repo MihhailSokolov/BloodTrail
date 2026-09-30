@@ -461,3 +461,134 @@ func TestBatchCreateNodeFlushFailureStillServesTheNode(t *testing.T) {
 		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 3)
 	assertNoFallback(t, buf)
 }
+
+// writePathDelegatePanic is the value the panic tests' delegates panic
+// with; it must reach the caller unchanged.
+const writePathDelegatePanic = "writepath: delegate bug"
+
+// recoverWritePathPanic runs run and returns what it panicked with (nil if
+// it did not), standing in for the recovery middleware upstream code runs
+// under.
+func recoverWritePathPanic(run func()) (recovered any) {
+	defer func() { recovered = recover() }()
+	run()
+	return nil
+}
+
+// requireWritePathConverged requires that the engine's watermark
+// bookkeeping has caught up with PostgreSQL's counter: every bumped write
+// resolved, so a snapshot could be saved.
+func requireWritePathConverged(t *testing.T, ctx context.Context, d *bloodtrail.Driver, label string) {
+	t.Helper()
+	if counter, converged := bloodtrail.TestingEngine(d).WatermarkConverged(ctx); !converged {
+		t.Fatalf("%s: watermark not converged at counter %d: a bumped write was never resolved", label, counter)
+	}
+}
+
+// TestBatchOperationPanicAfterAFlushStillReachesTheReplica covers a batch
+// delegate that panics after a flush: the flushed rows are durable (the pg
+// batch autocommits each flush), so the replica must still learn of them,
+// and the batch's watermark bump must still be resolved, while the panic
+// itself reaches the caller unchanged.
+func TestBatchOperationPanicAfterAFlushStillReachesTheReplica(t *testing.T) {
+	d, bt, oracle, _, buf, ctx := openWritePathDriver(t)
+	kind := graph.StringKind("WritePathBatchPanicNode")
+
+	seedWritePathAnchor(t, ctx, bt, kind)
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the anchor serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+
+	recovered := recoverWritePathPanic(func() {
+		_ = bt.BatchOperation(ctx, func(b graph.Batch) error {
+			if err := b.CreateNode(graph.PrepareNode(graph.NewProperties().Set("objectid", "WRITEPATH-BATCH-PANIC-A"), kind)); err != nil {
+				return err
+			}
+			// Overflows the batch size of 1: both creates flush, durably.
+			if err := b.CreateNode(graph.PrepareNode(graph.NewProperties().Set("objectid", "WRITEPATH-BATCH-PANIC-B"), kind)); err != nil {
+				return err
+			}
+			panic(writePathDelegatePanic)
+		}, graph.WithBatchSize(1))
+	})
+	if recovered != writePathDelegatePanic {
+		t.Fatalf("recovered %v, want the delegate's own panic", recovered)
+	}
+
+	if got := nodeCountByKind(t, ctx, oracle, kind); got != 3 {
+		t.Fatalf("postgresql holds %d node(s), want 3: the flush before the panic did not land", got)
+	}
+	if got := nodeCountByKind(t, ctx, bt, kind); got != 3 {
+		t.Fatalf("WRONG ANSWER: bloodtrail counts %d node(s) after the panic, postgresql 3", got)
+	}
+	requireWritePathConverged(t, ctx, d, "after the panicked batch")
+}
+
+// TestReadTransactionPanicAfterAWriteStillReachesTheReplica is the same for
+// a ReadTransaction: a write through it autocommits, so it must reach the
+// replica even when the delegate then panics.
+func TestReadTransactionPanicAfterAWriteStillReachesTheReplica(t *testing.T) {
+	d, bt, oracle, _, buf, ctx := openWritePathDriver(t)
+	kind := graph.StringKind("WritePathReadPanicNode")
+
+	seedWritePathAnchor(t, ctx, bt, kind)
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the anchor serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+
+	recovered := recoverWritePathPanic(func() {
+		_ = bt.ReadTransaction(ctx, func(tx graph.Transaction) error {
+			if _, err := tx.CreateNode(graph.NewProperties().Set("objectid", "WRITEPATH-READ-PANIC"), kind); err != nil {
+				return err
+			}
+			panic(writePathDelegatePanic)
+		})
+	})
+	if recovered != writePathDelegatePanic {
+		t.Fatalf("recovered %v, want the delegate's own panic", recovered)
+	}
+
+	if got := nodeCountByKind(t, ctx, oracle, kind); got != 2 {
+		t.Fatalf("postgresql holds %d node(s), want 2: the write before the panic did not autocommit", got)
+	}
+	if got := nodeCountByKind(t, ctx, bt, kind); got != 2 {
+		t.Fatalf("WRONG ANSWER: bloodtrail counts %d node(s) after the panic, postgresql 2", got)
+	}
+	requireWritePathConverged(t, ctx, d, "after the panicked read transaction")
+}
+
+// TestWriteTransactionPanicResolvesItsWatermarkBump covers a
+// WriteTransaction delegate that panics after its first write: PostgreSQL
+// rolls the transaction back, but the eager watermark bump it made must
+// still be resolved, or no later write could ever let the watermark
+// converge again (and no snapshot could be saved for the rest of the
+// process).
+func TestWriteTransactionPanicResolvesItsWatermarkBump(t *testing.T) {
+	d, bt, oracle, _, buf, ctx := openWritePathDriver(t)
+	kind := graph.StringKind("WritePathWritePanicNode")
+
+	seedWritePathAnchor(t, ctx, bt, kind)
+	requireWritePathConverged(t, ctx, d, "before the panic")
+
+	recovered := recoverWritePathPanic(func() {
+		_ = bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+			if _, err := tx.CreateNode(graph.NewProperties().Set("objectid", "WRITEPATH-WRITE-PANIC"), kind); err != nil {
+				return err
+			}
+			panic(writePathDelegatePanic)
+		})
+	})
+	if recovered != writePathDelegatePanic {
+		t.Fatalf("recovered %v, want the delegate's own panic", recovered)
+	}
+
+	if got := nodeCountByKind(t, ctx, oracle, kind); got != 1 {
+		t.Fatalf("postgresql holds %d node(s), want 1: the panicked transaction was not rolled back", got)
+	}
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "the rolled-back create does not serve",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+	requireWritePathConverged(t, ctx, d, "after the panicked transaction")
+
+	// A later, ordinary write.
+	seedWritePathAnchor(t, ctx, bt, graph.StringKind("WritePathWritePanicLater"))
+	requireWritePathConverged(t, ctx, d, "after a later write")
+	assertNoFallback(t, buf)
+}
