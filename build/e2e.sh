@@ -13,12 +13,30 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$ROOT/.build/e2e"
 rm -rf "$WORK" && mkdir -p "$WORK"
 
+# Every request to the API carries a connect and a total time limit. Without
+# one, a wedged API or proxy that accepts the connection and never answers
+# holds the run until the workflow's own 60-minute cap, with nothing saying
+# where. Every call here answers in well under a second, so the limits are
+# generous; CURL_MAX_TIME overrides the total for a slow host.
+CURL_MAX_TIME="${CURL_MAX_TIME:-60}"
+bounded_curl() {
+  local rc=0 arg url=""
+  curl --connect-timeout 5 --max-time "$CURL_MAX_TIME" "$@" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Only the URL is reported: the other arguments carry the bearer token or the login body.
+    for arg in "$@"; do case "$arg" in http://* | https://*) url="$arg" ;; esac; done
+    echo "e2e: curl exited $rc (28 means it timed out) for $url" >&2
+  fi
+  return "$rc"
+}
+
 # BloodHound registers GET /api/version behind auth, so an unauthenticated
 # request against a live server normally answers 401, not 200; that still
 # proves the API is up and routing, so it counts as ready here too (matching
-# internal/verify.WaitForAPI's semantics).
+# internal/verify.WaitForAPI's semantics). Bounded tighter than the calls
+# above and silent on failure: it is polled while the API is still starting.
 api_ready() {
-  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/version)"
+  code="$(curl --connect-timeout 3 --max-time 10 -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/version)"
   [ "$code" = "200" ] || [ "$code" = "401" ]
 }
 
@@ -126,13 +144,13 @@ echo "==> Querying for a node analysis itself creates, to prove analysis-phase w
 # ingest that came before it -- was replayed into the in-memory replica by
 # write-through, not merely served by the boot rebuild counted above.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the zero-rebuild phase" >&2; exit 1; }
 
 EVERYONE_OID="TESTLAB.LOCAL-S-1-1-0"
 everyone_query="MATCH (n) WHERE n.objectid = '$EVERYONE_OID' RETURN n LIMIT 1"
 everyone_body="$(jq -n --arg q "$everyone_query" '{query:$q}')"
-everyone_code="$(curl -s -o "$WORK/everyone.json" -w '%{http_code}' \
+everyone_code="$(bounded_curl -s -o "$WORK/everyone.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "$everyone_body" http://127.0.0.1:8080/api/v2/graphs/cypher)"
 [ "$everyone_code" = "200" ] || { echo "POST /api/v2/graphs/cypher (well-known Everyone lookup) returned HTTP $everyone_code" >&2; cat "$WORK/everyone.json" >&2; exit 1; }
@@ -152,13 +170,13 @@ USER_SID="$DOMAIN_SID-500"
 GROUP_SID="$DOMAIN_SID-512"
 
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the engine phase" >&2; exit 1; }
 
 bh_logs
 served_before="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
 
-sp_code="$(curl -s -o "$WORK/shortest-path.json" -w '%{http_code}' \
+sp_code="$(bounded_curl -s -o "$WORK/shortest-path.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/v2/graphs/shortest-path?start_node=$USER_SID&end_node=$GROUP_SID")"
 [ "$sp_code" = "200" ] || { echo "GET /api/v2/graphs/shortest-path returned HTTP $sp_code" >&2; cat "$WORK/shortest-path.json" >&2; exit 1; }
@@ -184,7 +202,7 @@ served_delta=$((served_after - served_before))
 # too would double-count against that phase's delta.
 cypher="MATCH p=shortestPath((s)-[:MemberOf*1..]->(t:Group)) WHERE s.objectid = '$USER_SID' AND t.objectid ENDS WITH '-512' AND s<>t RETURN p LIMIT 10"
 CYPHER_BODY="$(jq -n --arg q "$cypher" '{query:$q}')"
-cypher_code="$(curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
+cypher_code="$(bounded_curl -s -o "$WORK/cypher.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "$CYPHER_BODY" http://127.0.0.1:8080/api/v2/graphs/cypher)"
 [ "$cypher_code" = "200" ] || { echo "POST /api/v2/graphs/cypher returned HTTP $cypher_code" >&2; cat "$WORK/cypher.json" >&2; exit 1; }
@@ -211,13 +229,13 @@ echo "==> Querying the builder engine directly"
 # The session token from the login above should still be valid (no restart
 # has happened since), but re-authenticate anyway rather than lean on that.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token for the builder phase" >&2; exit 1; }
 
 bh_logs
 served_before="$(grep -c "builder engine served" "$WORK/bloodhound-logs.txt" || true)"
 
-members_code="$(curl -s -o "$WORK/group-members.json" -w '%{http_code}' \
+members_code="$(bounded_curl -s -o "$WORK/group-members.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/v2/groups/$GROUP_SID/members")"
 [ "$members_code" = "200" ] || { echo "GET /api/v2/groups/\$GROUP_SID/members returned HTTP $members_code" >&2; cat "$WORK/group-members.json" >&2; exit 1; }
@@ -284,7 +302,7 @@ bh_logs
 served_before="$(grep -c "cypher engine served" "$WORK/bloodhound-logs.txt" || true)"
 
 match_body="$(jq -n --arg q "$CYPHER_PLAIN_MATCH" '{query:$q}')"
-match_code="$(curl -s -o "$WORK/cypher-match.json" -w '%{http_code}' \
+match_code="$(bounded_curl -s -o "$WORK/cypher-match.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "$match_body" http://127.0.0.1:8080/api/v2/graphs/cypher)"
 [ "$match_code" = "200" ] || { echo "POST /api/v2/graphs/cypher (plain property MATCH) returned HTTP $match_code" >&2; cat "$WORK/cypher-match.json" >&2; exit 1; }
@@ -292,7 +310,7 @@ match_nodes="$(jq '.data.nodes | length' "$WORK/cypher-match.json")"
 [ "$match_nodes" -gt 0 ] || { echo "POST /api/v2/graphs/cypher (plain property MATCH) returned no nodes" >&2; cat "$WORK/cypher-match.json" >&2; exit 1; }
 
 sp_body="$(jq -n --arg q "$CYPHER_SHORTEST_PATH" '{query:$q}')"
-sp_code="$(curl -s -o "$WORK/cypher-shortest-path.json" -w '%{http_code}' \
+sp_code="$(bounded_curl -s -o "$WORK/cypher-shortest-path.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "$sp_body" http://127.0.0.1:8080/api/v2/graphs/cypher)"
 [ "$sp_code" = "200" ] || { echo "POST /api/v2/graphs/cypher (shortestPath) returned HTTP $sp_code" >&2; cat "$WORK/cypher-shortest-path.json" >&2; exit 1; }
@@ -536,9 +554,9 @@ echo "==> Querying after the restart to confirm the engine serves correctly eith
 # is what proves it. On the SUPERSEDED path it is also the check that the
 # fallback actually recovered rather than leaving the engine unable to serve.
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
-TOKEN="$(curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token after the restart" >&2; exit 1; }
-restart_code="$(curl -s -o "$WORK/restart-shortest-path.json" -w '%{http_code}' \
+restart_code="$(bounded_curl -s -o "$WORK/restart-shortest-path.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/v2/graphs/shortest-path?start_node=$USER_SID&end_node=$GROUP_SID")"
 [ "$restart_code" = "200" ] || { echo "GET /api/v2/graphs/shortest-path after the restart returned HTTP $restart_code" >&2; cat "$WORK/restart-shortest-path.json" >&2; exit 1; }

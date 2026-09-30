@@ -39,8 +39,25 @@ RESPONSE="$WORK/og-response.json"
 
 fail() { echo "opengraph: $*" >&2; exit 1; }
 
+# Every request carries a connect and a total time limit. Without one, a
+# wedged API or proxy that accepts the connection and never answers holds the
+# run until the workflow's own 60-minute cap, with nothing saying where. Every
+# call here answers in well under a second, so the limits are generous;
+# CURL_MAX_TIME overrides the total for a slow host.
+CURL_MAX_TIME="${CURL_MAX_TIME:-60}"
+bounded_curl() {
+  local rc=0 arg url=""
+  curl --connect-timeout 5 --max-time "$CURL_MAX_TIME" "$@" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Only the URL is reported: the other arguments carry the bearer token or the login body.
+    for arg in "$@"; do case "$arg" in http://* | https://*) url="$arg" ;; esac; done
+    echo "opengraph: curl exited $rc (28 means it timed out) for $url" >&2
+  fi
+  return "$rc"
+}
+
 LOGIN_BODY="$(jq -n --arg p "$PASSWORD" '{login_method:"secret", username:"admin", secret:$p}')"
-TOKEN="$(curl -s -X POST "$BASE_URL/api/v2/login" -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
+TOKEN="$(bounded_curl -s -X POST "$BASE_URL/api/v2/login" -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || fail "could not obtain a session token"
 
 # req METHOD PATH [BODY_FILE [CONTENT_TYPE [HEADER]]] makes one API call,
@@ -53,7 +70,7 @@ req() {
   if [ -n "$header" ]; then args+=(-H "$header"); fi
   local code delay=1
   for _ in 1 2 3 4 5 6 7 8; do
-    code="$(curl "${args[@]}" "$BASE_URL$path")"
+    code="$(bounded_curl "${args[@]}" "$BASE_URL$path")"
     [ "$code" = "429" ] || break
     sleep "$delay"
     delay=$((delay * 2))
