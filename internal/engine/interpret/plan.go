@@ -587,6 +587,9 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 			if !ok {
 				return nil, false
 			}
+			if returnGroup != nil && !groupKeysNumbersCanonical(snap, returnGroup) {
+				return nil, false
+			}
 			if returnGroup != nil {
 				// After grouping, only the synthesized aliases survive --
 				// the same scoping an explicit WITH imposes. countAliases /
@@ -4124,6 +4127,13 @@ func (pb *partBuilder) checkPropertyLookup(pl *cypher.PropertyLookup) bool {
 	if !known || k != symNode {
 		return false
 	}
+	// A number stored in a spelling its float64 does not reproduce --
+	// 9007199254740993, which the float64 merges with 9007199254740992, or
+	// 1.0, whose text PostgreSQL's `->>` and casts read as '1.0' -- makes
+	// every comparison, grouping, rendering and cast of the property a guess.
+	if !pb.snap.NumbersCanonical(pl.Symbol) {
+		return false
+	}
 	pb.touched[v.Symbol] = true
 	return true
 }
@@ -4944,7 +4954,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 				return false
 			}
 			hasString, answered := snap.HasStringValue(propID)
-			return answered && !hasString
+			return answered && !hasString && snap.NumbersCanonical(pl.Symbol)
 		})
 	if !ok {
 		return Projection{}, nil, 0, -1, false

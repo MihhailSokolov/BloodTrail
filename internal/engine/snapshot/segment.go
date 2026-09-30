@@ -63,6 +63,11 @@ type Segment struct {
 	// whole graph's. See segmentEdgeKinds and View.EdgeKindPresent.
 	edgeKinds map[KindID]struct{}
 
+	// nonCanonicalNumberProps names every property one of this segment's
+	// live node states carries a non-canonical number in; nil when none. The
+	// Segment half of View.NumbersCanonical (valueshape.go).
+	nonCanonicalNumberProps map[string]struct{}
+
 	// approxBytes memoizes ApproxBytes' result, computed once by
 	// computeSegmentApproxBytes at construction time (SegmentBuilder.Build
 	// or MergeSegments) rather than walked afresh on every call. A Segment
@@ -168,7 +173,7 @@ func (s *Segment) decode(e propEntry) any {
 		return false
 	case propKindTrue:
 		return true
-	case propKindNumber:
+	case propKindNumber, propKindNumberNonCanonical:
 		return e.num
 	case propKindString:
 		return string(s.arena[e.ref : e.ref+e.len])
@@ -568,6 +573,7 @@ func (b *SegmentBuilder) Build() *Segment {
 	s.objectIndex = buildSegmentObjectIndex(nodeIDs, nodeStates)
 	s.selfLoopKinds = segmentSelfLoopKinds(edgeStates)
 	s.edgeKinds = segmentEdgeKinds(edgeStates)
+	s.nonCanonicalNumberProps = nonCanonicalNumberProps(nodeStates)
 	s.approxBytes = computeSegmentApproxBytes(s)
 
 	return s
@@ -694,6 +700,8 @@ func MergeSegments(segs []*Segment) *Segment {
 		objectIndex:   buildSegmentObjectIndex(nodeIDs, nodeStates),
 		selfLoopKinds: segmentSelfLoopKinds(edgeStates),
 		edgeKinds:     segmentEdgeKinds(edgeStates),
+
+		nonCanonicalNumberProps: mergedNonCanonicalNumberProps(segs),
 	}
 	merged.approxBytes = computeSegmentApproxBytes(merged)
 	return merged

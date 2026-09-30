@@ -5,7 +5,13 @@
 package engine
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
+
+	"github.com/specterops/dawgs/graph"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
 )
 
 // TestTryCypherFloat8UnderflowMatchesOracle compares the shapes that cast a
@@ -163,5 +169,138 @@ func TestTryCypherPropertyCastWidthMatchesOracle(t *testing.T) {
 		{`MATCH (n:CwNarrow) WHERE n.v > -2.5 RETURN n`, true},
 		{`WITH 2 AS d MATCH (n:CwWide) WHERE n.v > d * 1 RETURN n`, true},
 		{`MATCH (n:CwWide) WHERE n.v < datetime().epochseconds RETURN n`, true},
+	})
+}
+
+// TestTryCypherBigNumbersMatchOracle compares queries over integers past
+// 2^53 with PostgreSQL. jsonb keeps 9007199254740993 and 9007199254740992
+// apart as numerics; the replica decodes both to the float64
+// 9007199254740992, so DISTINCT and grouping merged them, a join and an
+// equality with 9007199254740992 matched both, and an ORDER BY saw a tie.
+func TestTryCypherBigNumbersMatchOracle(t *testing.T) {
+	pgDriver, eng := seedTypedGraph(t, []typedNode{
+		{"BigNum", map[string]any{"name": "x1", "big": json.Number("9007199254740993")}},
+		{"BigNum", map[string]any{"name": "x2", "big": json.Number("9007199254740992")}},
+		{"BigNum2", map[string]any{"name": "y1", "big": json.Number("9007199254740992")}},
+		{"BigSafe", map[string]any{"name": "z1", "safe": json.Number("9007199254740991")}},
+		{"BigSafe", map[string]any{"name": "z2", "safe": json.Number("12")}},
+	})
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:BigNum) RETURN DISTINCT n.big`, false},
+		{`MATCH (n:BigNum) RETURN n.big, count(n)`, false},
+		{`MATCH (a:BigNum), (b:BigNum2) WHERE a.big = b.big RETURN a.name, b.name`, false},
+		{`MATCH (a:BigNum) WITH a MATCH (b:BigNum2) WHERE a.big = b.big RETURN a.name, b.name`, false},
+		{`MATCH (n:BigNum) WHERE n.big = 9007199254740992 RETURN n.name`, false},
+		{`MATCH (n:BigNum) WHERE n.big <> 9007199254740992 RETURN n.name`, false},
+		{`MATCH (n:BigNum {big: 9007199254740992}) RETURN n.name`, false},
+		{`MATCH (n:BigNum) RETURN n.name ORDER BY n.big DESC LIMIT 1`, false},
+
+		{`MATCH (n:BigSafe) RETURN DISTINCT n.safe`, true},
+		{`MATCH (n:BigSafe) RETURN n.safe, count(n)`, true},
+		{`MATCH (n:BigSafe) WHERE n.safe = 9007199254740991 RETURN n.name`, true},
+		{`MATCH (n:BigSafe) RETURN n.name ORDER BY n.safe DESC LIMIT 1`, true},
+	})
+}
+
+// TestTryCypherNonCanonicalNumbersMatchOracle compares queries over numbers
+// stored with a spelling the float64 does not reproduce -- 1.0, 2.50, as
+// JSON written by other means, or by dawgs' own `SET n.x = 0.5 + 0.5` --
+// with PostgreSQL. Its `->>` keeps the spelling: '1.0'::int8 is an error, and
+// '2.50' is neither '2.5' nor ends in '.5'. The replica decodes both to a
+// float64 and answered from Go's rendering of it.
+func TestTryCypherNonCanonicalNumbersMatchOracle(t *testing.T) {
+	pgDriver, eng := seedTypedGraph(t, []typedNode{
+		{"NcNum", map[string]any{"name": "n1", "x": json.Number("1.0")}},
+		{"NcNum", map[string]any{"name": "n2", "x": json.Number("2.50")}},
+		{"NcList", map[string]any{"name": "l1", "xs": []any{json.Number("1.0"), json.Number("2")}}},
+		{"NcSet", map[string]any{"name": "m1", "x": 7}},
+		{"NcOk", map[string]any{"name": "k1", "y": json.Number("1.5"), "ys": []any{1, 2}}},
+	})
+	if err := pgDriver.WriteTransaction(context.Background(), func(tx graph.Transaction) error {
+		res := tx.Query(`MATCH (n:NcSet) SET n.x = 0.5 + 0.5`, map[string]any{})
+		defer res.Close()
+		for res.Next() {
+		}
+		return res.Error()
+	}); err != nil {
+		t.Fatalf("SET: %v", err)
+	}
+	if err := eng.RebuildNow(context.Background(), "manual"); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:NcSet) WHERE n.x < 5 RETURN n`, false},
+		{`MATCH (n:NcNum) WHERE n.x IN ['1', '2.5'] RETURN n`, false},
+		{`MATCH (n:NcNum) WHERE coalesce(n.x, '') = '2.5' RETURN n`, false},
+		{`MATCH (n:NcNum) WHERE coalesce(n.x, '') ENDS WITH '.50' RETURN n`, false},
+		{`MATCH (n:NcNum) WHERE n.x = 1 RETURN n`, false},
+		{`MATCH (n:NcList) WHERE '1' IN n.xs RETURN n`, false},
+		{`MATCH (n:NcList) WHERE 1 IN n.xs RETURN n`, false},
+		{`MATCH (n:NcList) WHERE n.xs = [1, 2] RETURN n`, false},
+
+		{`MATCH (n:NcOk) WHERE n.y < 5.0 RETURN n`, true},
+		{`MATCH (n:NcOk) WHERE n.y IN ['1.5'] RETURN n`, true},
+		{`MATCH (n:NcOk) WHERE '1' IN n.ys RETURN n`, true},
+	})
+}
+
+// TestTryCypherOverlayNonCanonicalNumbersMatchOracle checks the number
+// spelling fact holds over a delta: the base stores only canonical numbers,
+// and a committed write -- read back into a segment -- stores 9007199254740993
+// and 1.0. The overlay is the steady state of a live BloodHound, so a fact
+// taken from the base alone would serve the collisions above.
+func TestTryCypherOverlayNonCanonicalNumbersMatchOracle(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+
+	var written []*graph.Node
+	if err := pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		for _, props := range []map[string]any{
+			{"name": "o1", "big": 9007199254740992, "x": 1},
+			{"name": "o2", "big": 9007199254740992, "x": 2},
+			{"name": "o3", "big": 5, "x": 3},
+		} {
+			n, err := tx.CreateNode(graph.AsProperties(props), graph.StringKind("OvlNum"))
+			if err != nil {
+				return err
+			}
+			written = append(written, n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed graph: %v", err)
+	}
+	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
+	if err := eng.RebuildNow(ctx, "manual"); err != nil {
+		t.Fatalf("RebuildNow: %v", err)
+	}
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:OvlNum) RETURN DISTINCT n.big`, true},
+		{`MATCH (n:OvlNum) WHERE n.x < 5 RETURN n`, true},
+	})
+
+	n := written[0]
+	if _, err := pool.Exec(ctx, `update node set properties = properties || '{"big": 9007199254740993, "x": 1.0}'::jsonb where id = $1`, int64(n.ID)); err != nil {
+		t.Fatalf("rewrite node: %v", err)
+	}
+	scope := NewWriteScope()
+	scope.Changes().RecordNodeID(n.ID)
+	eng.Apply(ctx, scope)
+	if snap, serving := eng.serveState(); snap == nil || !snap.Overlay() || !serving {
+		t.Fatalf("the rewrite did not leave the engine serving an overlay; this test would be vacuous")
+	}
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:OvlNum) RETURN DISTINCT n.big`, false},
+		{`MATCH (n:OvlNum) RETURN n.big, count(n)`, false},
+		{`MATCH (n:OvlNum) WHERE n.big = 9007199254740992 RETURN n.name`, false},
+		{`MATCH (n:OvlNum) WHERE n.x < 5 RETURN n`, false},
+		{`MATCH (n:OvlNum) WHERE n.x IN ['1', '2'] RETURN n`, false},
+		{`MATCH (n:OvlNum) WHERE n.name = 'o3' RETURN n.name`, true},
 	})
 }

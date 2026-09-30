@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/specterops/dawgs/cypher/models/cypher"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
 // sqlnum.go models the PostgreSQL type a number has in the SQL dawgs emits,
@@ -491,4 +493,19 @@ func castPropertyAs(v any, t sqlNum) (any, error) {
 		return c, nil
 	}
 	return nil, ErrUnsupported
+}
+
+// groupKeysNumbersCanonical reports whether every property a RETURN groups by
+// holds only numbers stored in the spelling their float64 reproduces
+// (snapshot.View.NumbersCanonical): grouping merges the numbers the float64
+// cannot tell apart, as DISTINCT does. A group key is read off the row
+// without passing checkExpr, whose checkPropertyLookup asks the same of
+// every other property read.
+func groupKeysNumbersCanonical(snap *snapshot.View, group *WithClause) bool {
+	for _, c := range group.Computed {
+		if pl, ok := unwrapParens(c.Expr).(*cypher.PropertyLookup); ok && pl != nil && !snap.NumbersCanonical(pl.Symbol) {
+			return false
+		}
+	}
+	return true
 }

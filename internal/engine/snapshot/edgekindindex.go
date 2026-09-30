@@ -350,12 +350,16 @@ func (v *View) ensureDeltaEdgeKindIndex() *edgeKindIndex {
 // 200ms for one query on the benchmark graph, and paid again after every
 // snapshot rebuild and every compaction, because both produce a new base.
 //
-// Only the edge-kind index is warmed. It is bounded (one id per node per
-// relationship kind it carries an edge of), it is useful to every pattern
-// query rather than to the ones naming a particular property, and it is what
-// the anchor cost model consults for EVERY step. Property indexes stay lazy:
-// BloodHound collects dozens of properties, a deployment queries a handful,
-// and warming all of them would spend memory on the rest.
+// Only the edge-kind index is warmed, and the number-spelling facts. The
+// index is bounded (one id per node per relationship kind it carries an edge
+// of), it is useful to every pattern query rather than to the ones naming a
+// particular property, and it is what the anchor cost model consults for
+// EVERY step. The facts are one bool per property, derived in one pass over
+// the property store, and every property read asks for them
+// (View.NumbersCanonical). Property indexes stay lazy: BloodHound collects
+// dozens of properties, a deployment queries a handful, and warming all of
+// them would spend memory on the rest.
 func (s *Snapshot) Warm() {
 	s.ensureEdgeKindIndex()
+	s.Props.nonCanonicalNumberProp(0)
 }

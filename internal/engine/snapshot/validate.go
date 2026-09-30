@@ -127,7 +127,7 @@ func validatePropStore(p *PropStore, n int) error {
 			if uint64(entry.ref)+uint64(entry.len) > arenaLen {
 				return fmt.Errorf("%w: property entry %d spans arena bytes [%d,%d) of %d", ErrCorrupt, i, entry.ref, uint64(entry.ref)+uint64(entry.len), arenaLen)
 			}
-		case propKindNull, propKindFalse, propKindTrue, propKindNumber:
+		case propKindNull, propKindFalse, propKindTrue, propKindNumber, propKindNumberNonCanonical:
 			// Value kinds carried inline; no arena reference to check.
 		default:
 			return fmt.Errorf("%w: property entry %d has unknown kind %d", ErrCorrupt, i, entry.kind)
