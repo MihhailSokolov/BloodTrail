@@ -494,20 +494,34 @@ docker compose --project-directory "$WORK" -f "$WORK/docker-compose.yml" -f "$OV
 for _ in $(seq 1 90); do api_ready && break; sleep 5; done
 api_ready
 
-bh_logs
-written_after="$(grep -c "bloodtrail: snapshot file written" "$WORK/bloodhound-logs.txt" || true)"
-loaded_after="$(grep -c "bloodtrail: snapshot file loaded" "$WORK/bloodhound-logs.txt" || true)"
-rejected_after="$(grep -c "bloodtrail: snapshot file rejected" "$WORK/bloodhound-logs.txt" || true)"
-gap_after="$(grep -c "$GAP_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
-fellback_after="$(grep -c "$FALLBACK_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
-rebuilt_after="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
+# The API answers before the boot's snapshot-file attempt has necessarily
+# logged its outcome (the attempt runs in the background, and the container's
+# log reaches `docker compose logs` asynchronously), and a rejection's rebuild
+# lands later still. Reading the log once therefore failed a correct boot that
+# was merely a moment slower than the API. Read it until an outcome is
+# complete -- a load, or a rejection together with its rebuild -- for up to two
+# minutes; whatever is there after that is judged exactly as before, so "no
+# file attempt at all" is still the failure it was.
+for _ in $(seq 1 60); do
+  bh_logs
+  written_after="$(grep -c "bloodtrail: snapshot file written" "$WORK/bloodhound-logs.txt" || true)"
+  loaded_after="$(grep -c "bloodtrail: snapshot file loaded" "$WORK/bloodhound-logs.txt" || true)"
+  rejected_after="$(grep -c "bloodtrail: snapshot file rejected" "$WORK/bloodhound-logs.txt" || true)"
+  gap_after="$(grep -c "$GAP_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
+  fellback_after="$(grep -c "$FALLBACK_REJECTION" "$WORK/bloodhound-logs.txt" || true)"
+  rebuilt_after="$(grep -c "bloodtrail: snapshot rebuilt" "$WORK/bloodhound-logs.txt" || true)"
 
-written_delta=$((written_after - written_before))
-loaded_delta=$((loaded_after - loaded_before))
-rejected_delta=$((rejected_after - rejected_before))
-gap_delta=$((gap_after - gap_before))
-fellback_delta=$((fellback_after - fellback_before))
-rebuilt_delta=$((rebuilt_after - rebuilt_before))
+  written_delta=$((written_after - written_before))
+  loaded_delta=$((loaded_after - loaded_before))
+  rejected_delta=$((rejected_after - rejected_before))
+  gap_delta=$((gap_after - gap_before))
+  fellback_delta=$((fellback_after - fellback_before))
+  rebuilt_delta=$((rebuilt_after - rebuilt_before))
+
+  [ "$loaded_delta" -ge 1 ] && break
+  [ "$rejected_delta" -ge 1 ] && [ "$rebuilt_delta" -ge 1 ] && break
+  sleep 2
+done
 
 # The shutdown side is unconditional: whichever outcome the boot lands on,
 # this phase is only meaningful if the file path was genuinely exercised, and
