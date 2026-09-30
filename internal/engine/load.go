@@ -33,72 +33,105 @@ import (
 // asks for it (loadSnapshot), since only a snapshot that may end up in a
 // snapshot file needs one.
 func LoadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool) (*snapshot.Snapshot, error) {
-	snap, _, err := loadSnapshot(ctx, pgDriver, pool, false)
+	snap, _, err := loadSnapshot(ctx, pgDriver, pool, false, false)
 	return snap, err
 }
 
-// loadSnapshot is LoadSnapshot, additionally stamping the result's
-// WatermarkLineage when withLineage is set (watermark.go's
-// watermarkLineageDDL explains lineages). The lineage is read inside the
-// same repeatable-read transaction as the graph, so it is the lineage the
-// scanned rows belong to -- read in a transaction of its own, before or
-// after, it could name a lineage that ended while the load ran, or one that
-// began after the rows were read.
+// loadedWatermark is what a rebuild's load read from bloodtrail_watermark
+// inside its own repeatable-read transaction (loadSnapshot).
 //
-// It is the transaction's last statement, deliberately: on a database with
-// no lineage column the read fails, which aborts the transaction, so it can
-// only go where nothing else still has to run in it. A failed read leaves
-// the lineage zero rather than failing the load -- the graph read is sound
-// either way, and a snapshot with no lineage is simply never written to a
-// file -- and comes back as lineageErr, for the caller to say why no file
-// will be written from this snapshot.
-func loadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool, withLineage bool) (snap *snapshot.Snapshot, lineageErr, err error) {
+// counter, when counterOK, is the value the loaded rows are complete for as
+// far as this process can account: every bump at or below it had committed
+// before the transaction's snapshot was taken, so its write either had
+// committed too -- and the rows hold it -- or had not, in which case a write
+// of this process is still counted in inflightBumps and its Apply layers it
+// onto whatever view is current then. That is what lets an adoption rebase
+// the ledger to it (rebuildOnce). A write of ANOTHER process still in flight
+// at that moment is the one thing it cannot cover; see watermarkLedger.
+type loadedWatermark struct {
+	counter   uint64
+	counterOK bool
+
+	// lineageErr is why the lineage could not be read, when it was asked
+	// for; the snapshot then carries none.
+	lineageErr error
+}
+
+// loadSnapshot is LoadSnapshot, additionally reading the watermark counter
+// (withCounter) and stamping the result's WatermarkLineage (withLineage;
+// watermark.go's watermarkLineageDDL explains lineages) -- both inside the
+// same repeatable-read transaction as the graph, so they describe the moment
+// the scanned rows belong to. Read in a transaction of its own, before or
+// after, the lineage could name one that ended while the load ran, or one
+// that began after the rows were read; and the counter could vouch for
+// writes the rows do not hold, or miss ones they do.
+//
+// They are the transaction's last statements, deliberately: on a database
+// without the watermark table, or without its lineage column, the read
+// fails, which aborts the transaction, so they can only go where nothing
+// else still has to run in it. The counter is read first; the lineage only
+// after it succeeded. A failed read fails nothing else -- the graph read is
+// sound either way: a snapshot with no lineage is simply never written to a
+// file, and one with no counter never rebases the ledger -- and a failure
+// the caller asked the lineage for comes back as lineageErr, for it to say
+// why no file will be written from this snapshot.
+func loadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool, withCounter, withLineage bool) (snap *snapshot.Snapshot, loaded loadedWatermark, err error) {
 	graphModel, ok := pgDriver.DefaultGraph()
 	if !ok {
-		return nil, nil, fmt.Errorf("engine: LoadSnapshot: no default graph is set")
+		return nil, loaded, fmt.Errorf("engine: LoadSnapshot: no default graph is set")
 	}
 
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, nil, fmt.Errorf("engine: LoadSnapshot: begin transaction: %w", err)
+		return nil, loaded, fmt.Errorf("engine: LoadSnapshot: begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	builder := snapshot.NewBuilder(graphModel.ID)
 
 	if err := loadKinds(ctx, tx, builder); err != nil {
-		return nil, nil, err
+		return nil, loaded, err
 	}
 	if err := loadNodes(ctx, tx, graphModel.ID, builder); err != nil {
-		return nil, nil, err
+		return nil, loaded, err
 	}
 	if err := loadEdges(ctx, tx, graphModel.ID, builder); err != nil {
-		return nil, nil, err
+		return nil, loaded, err
 	}
 
 	multiGraph, err := probeMultiGraph(ctx, tx)
 	if err != nil {
-		return nil, nil, err
+		return nil, loaded, err
 	}
 
 	var lineage snapshot.Lineage
-	if withLineage {
-		var raw [16]byte
-		if err := tx.QueryRow(ctx, selectWatermarkLineageSQL).Scan(&raw); err != nil {
-			lineageErr = fmt.Errorf("engine: LoadSnapshot: read watermark lineage: %w", err)
+	if withCounter || withLineage {
+		if err := tx.QueryRow(ctx, selectWatermarkCounterSQL).Scan(&loaded.counter); err != nil {
+			loaded.counter = 0
+			if withLineage {
+				loaded.lineageErr = fmt.Errorf("engine: LoadSnapshot: read watermark counter: %w", err)
+			}
 		} else {
-			lineage = snapshot.Lineage(raw)
+			loaded.counterOK = true
+			if withLineage {
+				var raw [16]byte
+				if err := tx.QueryRow(ctx, selectWatermarkLineageSQL).Scan(&raw); err != nil {
+					loaded.lineageErr = fmt.Errorf("engine: LoadSnapshot: read watermark lineage: %w", err)
+				} else {
+					lineage = snapshot.Lineage(raw)
+				}
+			}
 		}
 	}
 
 	snap, err = builder.Build()
 	if err != nil {
-		return nil, nil, fmt.Errorf("engine: LoadSnapshot: build snapshot: %w", err)
+		return nil, loadedWatermark{}, fmt.Errorf("engine: LoadSnapshot: build snapshot: %w", err)
 	}
 	snap.MultiGraph = multiGraph
 	snap.WatermarkLineage = lineage
 
-	return snap, lineageErr, nil
+	return snap, loaded, nil
 }
 
 // loadKinds scans the entire `kind` table -- global, not scoped to any one

@@ -13,8 +13,8 @@ import (
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
-// TestMaxWatermark pins AdvanceWatermark's own comparison in isolation --
-// see maxWatermark's doc.
+// TestMaxWatermark pins the adoptions' resolvedDirtyGen comparison in
+// isolation -- see maxWatermark's doc.
 func TestMaxWatermark(t *testing.T) {
 	if got := maxWatermark(5, 3); got != 5 {
 		t.Fatalf("maxWatermark(5, 3) = %d, want 5 (candidate smaller than cur)", got)
@@ -83,27 +83,193 @@ func TestWatermarkTrustedForRequiresEveryCondition(t *testing.T) {
 	}
 }
 
-// TestAdvanceWatermarkMonotonicMax pins AdvanceWatermark's own max-advance
-// behavior against the live atomic field: a smaller counter arriving after
-// a larger one (the out-of-order completion concurrent bumped scopes can
-// produce -- see AdvanceWatermark's own doc) must never regress
-// appliedWatermark.
-func TestAdvanceWatermarkMonotonicMax(t *testing.T) {
+// wantLedger asserts how far l accounts for every value, and whether exactly.
+func wantLedger(t *testing.T, l *watermarkLedger, through uint64, exact bool, why string) {
+	t.Helper()
+	gotThrough, gotExact := l.resolvedThrough()
+	if gotThrough != through || gotExact != exact {
+		t.Fatalf("ledger = (through %d, exact %v), want (through %d, exact %v): %s", gotThrough, gotExact, through, exact, why)
+	}
+}
+
+// TestAdvanceWatermarkAccountsOnlyForAContiguousPrefix pins what
+// convergence rests on: a counter resolved ahead of a lower one never
+// vouches for the lower one. A highest-resolved max took the later value as
+// "caught up" and so absorbed a value this engine never resolved -- another
+// server's bump, or its own bump still on the wire.
+func TestAdvanceWatermarkAccountsOnlyForAContiguousPrefix(t *testing.T) {
 	e := New(nil, nil, Config{})
+	e.inflightBumps.Store(5)
+
+	e.AdvanceWatermark(2)
+	wantLedger(t, &e.appliedWatermark, 0, true, "2 resolved, 1 not")
+
+	e.AdvanceWatermark(1)
+	wantLedger(t, &e.appliedWatermark, 2, true, "1 fills the gap below 2")
 
 	e.AdvanceWatermark(5)
-	if got := e.appliedWatermark.Load(); got != 5 {
-		t.Fatalf("appliedWatermark = %d after AdvanceWatermark(5), want 5", got)
-	}
-
 	e.AdvanceWatermark(3)
-	if got := e.appliedWatermark.Load(); got != 5 {
-		t.Fatalf("appliedWatermark = %d after a smaller, later-resolving counter, want it to stay 5", got)
-	}
+	wantLedger(t, &e.appliedWatermark, 3, true, "4 still missing below 5")
 
-	e.AdvanceWatermark(9)
-	if got := e.appliedWatermark.Load(); got != 9 {
-		t.Fatalf("appliedWatermark = %d after AdvanceWatermark(9), want 9", got)
+	e.AdvanceWatermark(4)
+	wantLedger(t, &e.appliedWatermark, 5, true, "4 joins 3 and 5")
+	if got := e.inflightBumps.Load(); got != 0 {
+		t.Fatalf("inflightBumps = %d after five resolutions of five bumps, want 0", got)
+	}
+}
+
+// TestWatermarkLedgerMergesRunsAboveAGap pins the bookkeeping above a gap:
+// values resolved out of order coalesce into runs, and the gap closing
+// carries the prefix through all of them at once.
+func TestWatermarkLedgerMergesRunsAboveAGap(t *testing.T) {
+	var l watermarkLedger
+	for _, c := range []uint64{9, 7, 3, 8, 5, 4, 10} {
+		l.resolve(c)
+	}
+	if got, want := l.above, []counterRange{{3, 5}, {7, 10}}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("runs above the gap = %v, want %v", got, want)
+	}
+	wantLedger(t, &l, 0, true, "1, 2 and 6 unresolved")
+
+	l.resolve(6)
+	if got := l.above; len(got) != 1 || got[0] != (counterRange{3, 10}) {
+		t.Fatalf("runs = %v after 6 resolved, want [{3 10}]", got)
+	}
+	l.resolve(8)
+	if got := l.above; len(got) != 1 || got[0] != (counterRange{3, 10}) {
+		t.Fatalf("runs = %v after resolving 8 a second time, want [{3 10}] unchanged", got)
+	}
+	l.resolve(2)
+	l.resolve(1)
+	wantLedger(t, &l, 10, true, "every value up to 10 resolved")
+	if len(l.above) != 0 {
+		t.Fatalf("runs = %v once the prefix reached them, want none", l.above)
+	}
+}
+
+// TestWatermarkLedgerRebaseCoversEverythingAtOrBelowItsFloor pins what an
+// adoption does: every value up to its floor is accounted for, however it
+// got there, and values resolved above the floor still count.
+func TestWatermarkLedgerRebaseCoversEverythingAtOrBelowItsFloor(t *testing.T) {
+	var l watermarkLedger
+	l.resolve(7)
+	l.resolve(9)
+	wantLedger(t, &l, 0, true, "nothing below 7 accounted for")
+
+	l.rebase(6)
+	wantLedger(t, &l, 7, true, "the floor reaches the run starting at 7")
+
+	l.rebase(4)
+	wantLedger(t, &l, 7, true, "a lower floor takes nothing back")
+
+	l.rebase(8)
+	wantLedger(t, &l, 9, true, "the floor covers 8, and 9 was resolved")
+
+	l.resolve(8)
+	wantLedger(t, &l, 9, true, "a value the floor already covers changes nothing")
+}
+
+// TestWatermarkLedgerIsInexactPastItsRangeCap pins the memory bound: a ledger
+// whose gaps outnumber maxLedgerRanges stops keeping the runs above them,
+// reports itself inexact -- never converged -- and becomes exact again only
+// once a rebase covers every value it may have dropped.
+func TestWatermarkLedgerIsInexactPastItsRangeCap(t *testing.T) {
+	var l watermarkLedger
+	// Every other value: each resolved one is its own run above a gap.
+	for i := uint64(0); i <= maxLedgerRanges; i++ {
+		l.resolve(2 * (i + 1))
+	}
+	wantLedger(t, &l, 0, false, "past the cap")
+	if l.above != nil {
+		t.Fatalf("a lost ledger kept %d runs, want none", len(l.above))
+	}
+	highest := uint64(2 * (maxLedgerRanges + 1))
+
+	l.resolve(highest + 1)
+	l.rebase(highest)
+	wantLedger(t, &l, highest, false, "a floor below a value resolved while lost")
+
+	l.rebase(highest + 1)
+	wantLedger(t, &l, highest+1, true, "a floor covering every value ever resolved")
+
+	l.resolve(highest + 3)
+	l.resolve(highest + 2)
+	wantLedger(t, &l, highest+3, true, "exact bookkeeping resumes after the rebase")
+}
+
+// TestAdoptRebuiltViewAndRebase pins that a rebuild's ledger rebase goes
+// with its adoption and never without it: an adopted view whose load read
+// the counter rebases; a refused one (a write applied during the load), or
+// one whose load could not read the counter, leaves the ledger alone.
+func TestAdoptRebuiltViewAndRebase(t *testing.T) {
+	ctx := context.Background()
+	loaded := loadedWatermark{counter: 5, counterOK: true}
+
+	t.Run("adopted", func(t *testing.T) {
+		e := New(nil, nil, Config{})
+		if !e.adoptRebuiltViewAndRebase(ctx, snapshot.NewView(&snapshot.Snapshot{}), e.applyEpoch.Load(), 0, loaded) {
+			t.Fatalf("adoptRebuiltViewAndRebase = false with no write applied during the load, want adopted")
+		}
+		wantLedger(t, &e.appliedWatermark, 5, true, "adopted with the counter its load read")
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		e := New(nil, nil, Config{})
+		if e.adoptRebuiltViewAndRebase(ctx, snapshot.NewView(&snapshot.Snapshot{}), e.applyEpoch.Load()+1, 0, loaded) {
+			t.Fatalf("adoptRebuiltViewAndRebase = true across an applied write, want refused")
+		}
+		wantLedger(t, &e.appliedWatermark, 0, true, "a refused snapshot vouches for nothing")
+	})
+
+	t.Run("counter not read", func(t *testing.T) {
+		e := New(nil, nil, Config{})
+		if !e.adoptRebuiltViewAndRebase(ctx, snapshot.NewView(&snapshot.Snapshot{}), e.applyEpoch.Load(), 0, loadedWatermark{}) {
+			t.Fatalf("adoptRebuiltViewAndRebase = false, want adopted")
+		}
+		wantLedger(t, &e.appliedWatermark, 0, true, "no counter read, no rebase")
+	})
+
+	t.Run("a panicking adoption releases the lock", func(t *testing.T) {
+		e := New(nil, nil, Config{})
+		func() {
+			defer func() { _ = recover() }()
+			e.adoptRebuiltViewAndRebase(ctx, nil, e.applyEpoch.Load(), 0, loaded) // a nil view panics in adoptRebuiltView
+			t.Fatalf("adopting a nil view did not panic; the test needs it to")
+		}()
+		if !e.watermarkRebaseMu.TryLock() {
+			t.Fatalf("watermarkRebaseMu still held after the adoption panicked: every convergence read would block for good")
+		}
+		e.watermarkRebaseMu.Unlock()
+		wantLedger(t, &e.appliedWatermark, 0, true, "no rebase past a panicked adoption")
+	})
+}
+
+// TestWatermarkReadingConvergedAndUnaccounted pins the two verdicts a
+// convergence reading gives: converged only with nothing in flight and every
+// value up to PostgreSQL's counter accounted for; unaccounted only when a
+// value is missing that no write of this process is still carrying.
+func TestWatermarkReadingConvergedAndUnaccounted(t *testing.T) {
+	cases := []struct {
+		name                   string
+		reading                watermarkReading
+		converged, unaccounted bool
+	}{
+		{"caught up", watermarkReading{pgCounter: 5, through: 5, exact: true}, true, false},
+		{"a write of this process in flight", watermarkReading{pgCounter: 5, inflight: 1, through: 4, exact: true}, false, false},
+		{"a value nobody here resolved", watermarkReading{pgCounter: 5, through: 4, exact: true}, false, true},
+		{"resolved past the counter read", watermarkReading{pgCounter: 5, through: 6, exact: true}, false, false},
+		{"a lost ledger", watermarkReading{pgCounter: 5, through: 5}, false, true},
+		{"a lost ledger with a write in flight", watermarkReading{pgCounter: 5, inflight: 2, through: 5}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.reading.converged(); got != tc.converged {
+				t.Fatalf("converged() = %v, want %v", got, tc.converged)
+			}
+			if got := tc.reading.unaccounted(); got != tc.unaccounted {
+				t.Fatalf("unaccounted() = %v, want %v", got, tc.unaccounted)
+			}
+		})
 	}
 }
 
@@ -351,15 +517,14 @@ func TestResolveAbandonedWriteSettlesFailureAndFoldsCounter(t *testing.T) {
 
 	t.Run("bumped scope folds its counter", func(t *testing.T) {
 		e := New(nil, nil, Config{})
+		e.appliedWatermark.rebase(3)
 		scope := NewWriteScope()
 		scope.SetWatermark(4)
 		e.inflightBumps.Store(1)
 
 		e.ResolveAbandonedWrite(ctx, scope)
 
-		if got := e.appliedWatermark.Load(); got != 4 {
-			t.Fatalf("appliedWatermark = %d, want 4", got)
-		}
+		wantLedger(t, &e.appliedWatermark, 4, true, "the abandoned write's counter resolved")
 		if got := e.inflightBumps.Load(); got != 0 {
 			t.Fatalf("inflightBumps = %d, want 0", got)
 		}

@@ -815,6 +815,12 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 	// Build the derived read indexes now, on the write path, rather than
 	// leaving them for whichever query arrives first -- see Snapshot.Warm.
 	view.Base().Warm()
+	// The view accounts for every value up to the frozen target: the file
+	// through its stamp, the replay above it. The ledger learns that before
+	// the view is published -- nothing between here and the Store can refuse
+	// it, and until the Store there is no view for a save to write -- so no
+	// convergence read ever sees this view with the ledger behind it.
+	e.appliedWatermark.rebase(pgSnapshot)
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 	e.maintainAfterPublish(ctx, view)

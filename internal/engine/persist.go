@@ -111,9 +111,15 @@ func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error
 	return e.saveSnapshotCommit(ctx, path, epoch, stamp, converged, requireEmptyDelta)
 }
 
+// reasonUnresolvedWatermark is the "reason" a save refused over a counter
+// value this process never resolved logs (saveSnapshotProbe).
+const reasonUnresolvedWatermark = "the watermark counter holds values this process never resolved: " +
+	"another BloodTrail server may be writing this database, or a bump's outcome was lost"
+
 // saveSnapshotProbe is SaveSnapshot's read-only preparation, run BEFORE
 // applyMu is ever taken: it samples e.applyEpoch first, then runs the pg
-// watermark round trip (watermarkConverged) -- in that order, and
+// watermark round trip (readWatermarkConvergence, the reading
+// watermarkConverged decides on) -- in that order, and
 // deliberately, mirroring rebuildOnce's own "epoch, then the pg round trip"
 // ordering (engine.go): reading the epoch after the round trip would let an
 // Apply that ran during the round trip slip in unnoticed by the later
@@ -130,10 +136,29 @@ func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error
 // it, and the next boot would refuse the file for rows this process wrote.
 // A failed read reports not converged: a file without its positions would
 // only ever be refused.
+//
+// A counter holding a value no write of this process resolved or still
+// carries is refused like any other miss, but said out loud (Warn): it is
+// what another BloodTrail server writing the same database looks like from
+// here, a deployment the snapshot file cannot be trusted in (watermarkReading's
+// unaccounted). Only a rebuild that loads such a writer's writes lets this
+// process save again.
 func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch uint64, stamp snapshot.Stamp, converged bool) {
 	epoch = e.applyEpoch.Load()
-	stamp.Watermark, converged = e.watermarkConverged(ctx)
-	if !converged {
+	reading, err := e.readWatermarkConvergence(ctx)
+	if err != nil {
+		return epoch, stamp, false
+	}
+	stamp.Watermark = reading.pgCounter
+	if !reading.converged() {
+		if reading.unaccounted() {
+			e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
+				slog.String("reason", reasonUnresolvedWatermark),
+				slog.Uint64("pg_watermark", reading.pgCounter),
+				slog.Uint64("resolved_through", reading.through),
+				slog.Bool("resolved_exactly", reading.exact),
+			)
+		}
 		return epoch, stamp, false
 	}
 	nodeSeq, edgeSeq, err := e.readSequencePositions(ctx)
