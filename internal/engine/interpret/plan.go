@@ -583,6 +583,9 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 				// smuggle a second shortestPath past a per-Part-only check.
 				return nil, false
 			}
+			if orderByNameMisresolved(known, st.ret) {
+				return nil, false
+			}
 			ret, returnGroup, groupKnown, ok := desugarReturnAggregates(known, st.ret)
 			if !ok {
 				return nil, false
@@ -5474,6 +5477,79 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 		keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})
 	}
 	return keys, true
+}
+
+// orderByNameMisresolved reports whether ret's ORDER BY names a column that
+// dawgs resolves differently from planOrder, which sorts by whichever RETURN
+// item carries the name. dawgs' SQL (dumped per shape) resolves a bare
+// ORDER BY name the other way round:
+//
+//   - A name the MATCH or WITH scope binds -- a node, an edge, a path, or a
+//     carried COUNT, COLLECT or constant -- sorts by that binding, whatever a
+//     RETURN alias of the same name projects: `MATCH (g) RETURN g.v AS g
+//     ORDER BY g` is `order by s0.n0`, the node, and `WITH g, count(u) AS c
+//     RETURN g.v AS c ORDER BY c` sorts by the count. The engine sorted by
+//     the alias instead -- different rows under LIMIT -- and served shapes
+//     PostgreSQL rejects: `RETURN count(u) AS u ORDER BY u` (42803, u is not
+//     grouped) and `RETURN DISTINCT g.v AS g ORDER BY g` (42P10, the node is
+//     not in the select list). Both readings agree only when the RETURN item
+//     of that name is a bare reference to the binding itself, as in the
+//     common `WITH g, count(u) AS c RETURN g, c ORDER BY c`.
+//   - Any other name is emitted as the output alias, unquoted, which
+//     PostgreSQL folds to lower case before looking it up: under `RETURN n.v
+//     AS x, id(n) AS X ORDER BY X` both columns are x, and pg raises 42702
+//     (ORDER BY "x" is ambiguous).
+//
+// Either way the query declines. known is the scope the RETURN clause sees
+// BEFORE desugarReturnAggregates replaces it with the grouped aliases -- a
+// variable an aggregate folds (u in count(u)) is exactly a binding that can
+// shadow an alias.
+func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
+	if ret == nil || ret.Projection == nil || ret.Projection.Order == nil {
+		return false
+	}
+	var items []*cypher.ProjectionItem
+	for _, raw := range ret.Projection.Items {
+		if item, ok := raw.(*cypher.ProjectionItem); ok && item != nil {
+			items = append(items, item)
+		}
+	}
+	for _, sortItem := range ret.Projection.Order.Items {
+		if sortItem == nil {
+			continue
+		}
+		v, isVar := unwrapParens(sortItem.Expression).(*cypher.Variable)
+		if !isVar || v == nil {
+			continue
+		}
+		column, ok := pgColumnName(v.Symbol)
+		if !ok {
+			return true
+		}
+		_, bound := known[v.Symbol]
+		sameColumn := 0
+		for _, item := range items {
+			// The name an ORDER BY resolves against: aggregateOutputName is
+			// the one naming both planReturn (alias, else the bare variable)
+			// and the aggregate rewrite agree on.
+			name, named := aggregateOutputName(item)
+			if !named {
+				continue
+			}
+			if bound && name == v.Symbol {
+				if self, isSelf := unwrapParens(item.Expression).(*cypher.Variable); !isSelf || self == nil || self.Symbol != v.Symbol {
+					return true
+				}
+			}
+			if folded, ok := pgColumnName(name); ok && folded == column {
+				sameColumn++
+			}
+		}
+		if sameColumn > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // isStaticallyNumericScalar reports whether expr (a RETURN item's own top-

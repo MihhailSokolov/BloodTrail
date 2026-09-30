@@ -352,7 +352,10 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // contIDs is the step's continuation set, resolved ONCE by the caller via
 // varLengthWalkSetup rather than here -- see that function for why.
 func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string, contIDs []snapshot.NodeID) ([]*Row, error) {
-	root, _ := seed.Node(step.FromSym)
+	root, err := boundNode(seed, step.FromSym)
+	if err != nil {
+		return nil, err
+	}
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
 	var out []*Row
@@ -927,7 +930,10 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		return nil, errUnsupportedStep
 	}
 
-	terminal, _ := seed.Node(step.ToSym)
+	terminal, err := boundNode(seed, step.ToSym)
+	if err != nil {
+		return nil, err
+	}
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
 	// A node binds the near endpoint only if it satisfies fromNC COMPLETELY:
