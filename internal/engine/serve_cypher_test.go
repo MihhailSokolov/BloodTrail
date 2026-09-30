@@ -3,13 +3,17 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/specterops/dawgs/cypher/frontend"
 	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/interpret"
@@ -456,6 +460,76 @@ func TestProjectionValueKindsReturnCount(t *testing.T) {
 	}
 }
 
+// TestServedTextColumnsAreNotDecoded: dawgs' pg driver decodes only jsonb and
+// json columns (decodeJSONValues), so a column PostgreSQL types text comes
+// back exactly as stored, even when its text looks like JSON. type(r) is
+// `kind_name(..)::text`, and a string constant carried through WITH stays
+// text however it is projected or renamed (`select '[1]' as i0`). Each query
+// here would return a decoded list, object or unquoted string if the served
+// result double-decoded the column.
+func TestServedTextColumnsAreNotDecoded(t *testing.T) {
+	snap := buildCypherTestSnapshot(t,
+		map[snapshot.KindID]string{1: "User", 2: `"RevQuoted"`, 3: `[7]`, 4: `{"rev":1}`},
+		[]cypherTestNode{
+			{id: 1, kinds: []snapshot.KindID{1}, props: map[string]any{"name": "a"}},
+			{id: 2, kinds: []snapshot.KindID{1}, props: map[string]any{"name": "b"}},
+		},
+		[]cypherTestEdge{
+			{id: 101, start: 1, end: 2, kind: 2},
+			{id: 102, start: 1, end: 2, kind: 3},
+			{id: 103, start: 1, end: 2, kind: 4},
+		},
+	)
+	view := snapshot.NewView(snap)
+
+	for _, tc := range []struct {
+		query string
+		want  []any // every row, in engine order
+	}{
+		{`MATCH (a:User)-[r]->(b:User) RETURN type(r) AS t`, []any{`"RevQuoted"`, `[7]`, `{"rev":1}`}},
+		{`MATCH (a:User)-[r]->(b:User) WITH r, a RETURN type(r) AS t, a.name`, []any{`"RevQuoted"`, "a", `[7]`, "a", `{"rev":1}`, "a"}},
+		{`WITH '[1]' AS s MATCH (m:User) RETURN s`, []any{`[1]`, `[1]`}},
+		{`WITH '"q"' AS s MATCH (m:User) RETURN s, m.name`, []any{`"q"`, "a", `"q"`, "b"}},
+		{`MATCH (n:User) WITH n, '{"a":1}' AS s RETURN n.name, s`, []any{"a", `{"a":1}`, "b", `{"a":1}`}},
+		{`MATCH (n:User) WITH n, '[1,2]' AS s RETURN s AS t`, []any{`[1,2]`, `[1,2]`}},
+		{`MATCH (n:User) WITH n, ' {"a":1}' AS s RETURN (s)`, []any{` {"a":1}`, ` {"a":1}`}},
+		{`MATCH (n:User) WITH n, '[1,2]' AS s RETURN DISTINCT s`, []any{`[1,2]`}},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			rq, err := frontend.ParseCypher(frontend.NewContext(), tc.query)
+			if err != nil {
+				t.Fatalf("ParseCypher: %v", err)
+			}
+			q, ok := interpret.Plan(rq, view)
+			if !ok {
+				t.Fatalf("Plan declined a shape this test serves")
+			}
+			rs, err := interpret.Execute(&interpret.Env{Snap: view}, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork})
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+
+			result := newCypherRowsResult(view, rs, projectionValueKinds(q), nil)
+			var got []any
+			for result.Next() {
+				got = append(got, result.Values()...)
+			}
+			sortServedValues(got)
+			want := append([]any(nil), tc.want...)
+			sortServedValues(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("served %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+// sortServedValues orders a flat list of string values so a comparison does
+// not depend on the engine's row order.
+func sortServedValues(values []any) {
+	sort.Slice(values, func(i, j int) bool { return fmt.Sprint(values[i]) < fmt.Sprint(values[j]) })
+}
+
 // TestProjectionValueKindsCoalesceInt8: dawgs casts a coalesce() with an
 // integer default to int8 (`coalesce((properties ->> 'x')::int8, 0)::int8`),
 // so the column is an int64 in pg, not the float64 this package computes
@@ -614,6 +688,84 @@ func TestCypherRowsResultMapperDeclinesForeignTargets(t *testing.T) {
 	}
 	if v := result.Values(); v != nil {
 		t.Fatalf("Values() after exhausted = %v, want nil", v)
+	}
+}
+
+// TestCypherRowsResultMapperMapsJSONObjectsLikeDawgs pins the served mapper
+// to dawgs' own pg mapper for map[string]any column values, the decoded JSON
+// objects a property lookup yields. dawgs hands any such map to
+// pathComposite.TryMap for a *graph.Path target, and that accepts a map
+// whose "nodes"/"edges" keys (if present) are empty lists -- so
+// ops.FetchByQuery files a plain object column under Paths, not Literals --
+// while a non-list value, or a list of composites (which needs integer ids
+// no decoded JSON number can supply), is left as a literal. Every value is
+// run through both mappers for the three targets FetchByQuery tries.
+func TestCypherRowsResultMapperMapsJSONObjectsLikeDawgs(t *testing.T) {
+	dawgsMapper := pg.NewValueMapper(context.Background(), nil)
+	servedMapper := newCypherRowsResult(nil, &interpret.ResultSet{}, nil, nil).Mapper()
+
+	nodeComposite := map[string]any{"id": float64(1), "kind_ids": []any{}, "properties": map[string]any{}}
+	edgeComposite := map[string]any{"id": float64(1), "start_id": float64(1), "end_id": float64(2), "kind_id": float64(1), "properties": map[string]any{}}
+
+	values := []any{
+		map[string]any{},
+		map[string]any{"a": float64(1)},
+		map[string]any{"nodes": []any{}},
+		map[string]any{"edges": []any{}},
+		map[string]any{"nodes": []any{}, "edges": []any{}},
+		map[string]any{"nodes": []any{}, "edges": []any{}, "extra": "x"},
+		map[string]any{"nodes": "x"},
+		map[string]any{"nodes": nil},
+		map[string]any{"nodes": map[string]any{}},
+		map[string]any{"nodes": []any{}, "edges": "x"},
+		map[string]any{"nodes": []any{float64(1)}},
+		map[string]any{"nodes": []any{nodeComposite}},
+		map[string]any{"edges": []any{edgeComposite}},
+		map[string]any{"nodes": []any{}, "edges": []any{edgeComposite}},
+		nodeComposite,
+		edgeComposite,
+		[]any{},
+		[]any{map[string]any{}},
+		"text",
+		float64(1),
+		true,
+		nil,
+	}
+
+	targets := []struct {
+		name string
+		new  func() any
+	}{
+		{"*graph.Relationship", func() any { return &graph.Relationship{} }},
+		{"*graph.Node", func() any { return &graph.Node{} }},
+		{"*graph.Path", func() any { return &graph.Path{} }},
+	}
+
+	// mapWith reports the mapper's verdict and the populated target. dawgs'
+	// mapper reaches for its kind mapper (nil here) only when it accepts a
+	// node or edge composite; turn that panic into a reported difference.
+	mapWith := func(mapper graph.ValueMapper, value any, target any) (mapped bool, panicked any) {
+		defer func() { panicked = recover() }()
+		return mapper.Map(value, target), nil
+	}
+
+	for _, value := range values {
+		for _, tc := range targets {
+			t.Run(fmt.Sprintf("%#v into %s", value, tc.name), func(t *testing.T) {
+				wantTarget, gotTarget := tc.new(), tc.new()
+				want, wantPanic := mapWith(dawgsMapper, value, wantTarget)
+				got, gotPanic := mapWith(servedMapper, value, gotTarget)
+				if wantPanic != nil || gotPanic != nil {
+					t.Fatalf("mapper panicked: dawgs %v, served %v (dawgs accepted a composite from decoded JSON?)", wantPanic, gotPanic)
+				}
+				if got != want {
+					t.Fatalf("served mapper returned %v, dawgs' returns %v", got, want)
+				}
+				if !reflect.DeepEqual(gotTarget, wantTarget) {
+					t.Fatalf("served mapper filled %#v, dawgs' fills %#v", gotTarget, wantTarget)
+				}
+			})
+		}
 	}
 }
 
