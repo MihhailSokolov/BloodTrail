@@ -118,7 +118,8 @@ run against that same fixture, still installed, before rollback:
    stamped watermark), and a rejection for a corrupt or wrong-version file, a changed
    watermark lineage, rows inserted behind the watermark, a failed watermark read, the
    memory limit, or no file attempt at all still fails. One more
-   `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths.
+   `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths,
+   and that the path engine served it (a new `path engine served` line), not PostgreSQL.
 
 Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Like a
 local `build-image.sh`, it builds for the Docker daemon's own platform, so the stack runs

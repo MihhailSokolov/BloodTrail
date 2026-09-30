@@ -560,12 +560,27 @@ echo "==> Querying after the restart to confirm the engine serves correctly eith
 LOGIN_BODY="$(jq -n --arg u admin --arg p "$PASSWORD" '{login_method:"secret", username:$u, secret:$p}')"
 TOKEN="$(bounded_curl -s -X POST http://127.0.0.1:8080/api/v2/login -H 'Content-Type: application/json' -d "$LOGIN_BODY" | jq -r '.data.session_token // empty')"
 [ -n "$TOKEN" ] || { echo "could not obtain a session token after the restart" >&2; exit 1; }
+bh_logs
+restart_served_before="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
 restart_code="$(bounded_curl -s -o "$WORK/restart-shortest-path.json" -w '%{http_code}' \
   -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/v2/graphs/shortest-path?start_node=$USER_SID&end_node=$GROUP_SID")"
 [ "$restart_code" = "200" ] || { echo "GET /api/v2/graphs/shortest-path after the restart returned HTTP $restart_code" >&2; cat "$WORK/restart-shortest-path.json" >&2; exit 1; }
 restart_node_count="$(jq '.data.nodes | length' "$WORK/restart-shortest-path.json")"
 [ "$restart_node_count" -gt 0 ] || { echo "GET /api/v2/graphs/shortest-path after the restart returned no nodes" >&2; cat "$WORK/restart-shortest-path.json" >&2; exit 1; }
+# A 200 with nodes is what PostgreSQL answers too when the engine declines, so
+# the answer alone proves nothing about the replica the boot just loaded or
+# rebuilt: the same served-marker delta the first path phase asserts is
+# required here. The container's log reaches `docker compose logs`
+# asynchronously and can trail the response it belongs to, hence the poll.
+restart_served_after="$restart_served_before"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  bh_logs
+  restart_served_after="$(grep -c "path engine served" "$WORK/bloodhound-logs.txt" || true)"
+  [ "$((restart_served_after - restart_served_before))" -ge 1 ] && break
+  sleep 1
+done
+[ "$((restart_served_after - restart_served_before))" -ge 1 ] || { echo "the path engine did not serve GET /api/v2/graphs/shortest-path after the restart (\"path engine served\" count $restart_served_before -> $restart_served_after); PostgreSQL answered instead" >&2; exit 1; }
 
 echo "==> Rolling back"
 (cd "$ROOT" && go run ./cmd/bloodtrail rollback --compose-file "$WORK/docker-compose.yml" --yes)
