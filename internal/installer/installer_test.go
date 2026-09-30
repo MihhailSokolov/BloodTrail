@@ -1345,9 +1345,8 @@ func TestVerifyChecksTheDriverRow(t *testing.T) {
 			base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
 			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
 			defer api.Close()
-			logs := "BloodTrail driver active version=0.1.2 mode=engine backend=pg\n"
-			fake := &dockerx.FakeRunner{Outputs: map[string][]byte{base + "logs --no-color bloodhound": []byte(logs)}}
-			scriptRunningBloodhound(fake, base, logs, c.row)
+			fake := &dockerx.FakeRunner{}
+			scriptRunningBloodhound(fake, base, "BloodTrail driver active version=0.1.2 mode=engine backend=pg\n", c.row)
 			fake.Outputs[base+"config --format json"] = composeConfigJSON(upstreamImage, c.env)
 			var out bytes.Buffer
 			err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second})
