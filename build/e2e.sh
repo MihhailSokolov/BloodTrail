@@ -325,7 +325,11 @@ cypher_served_delta=$((served_after - served_before))
 echo "==> OpenGraph: extension schema, uploads, queries and deletes"
 # build/e2e-opengraph.sh documents the phase. Its hybrid AD-to-OpenGraph
 # edge starts at a user from the SharpHound fixture install uploaded above.
-env BASE_URL=http://127.0.0.1:8080 PASSWORD="$PASSWORD" WORK="$WORK/opengraph" \
+# CHECK_SERVED=1 is passed explicitly: this stack always runs the BloodTrail
+# driver, and a CHECK_SERVED=0 left in the caller's shell (from running the
+# phase against a PostgreSQL-driver BloodHound) would otherwise be inherited
+# and silently switch off every serve, fallback and rebuild check.
+env BASE_URL=http://127.0.0.1:8080 PASSWORD="$PASSWORD" WORK="$WORK/opengraph" CHECK_SERVED=1 \
   LOGS_CMD="docker compose --project-directory '$WORK' -f '$WORK/docker-compose.yml' logs bloodhound" \
   "$ROOT/build/e2e-opengraph.sh"
 
