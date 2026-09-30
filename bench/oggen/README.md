@@ -54,6 +54,12 @@ recorded as `DISAGREE`) that must match between the arms: `compare.py`
 prints the difference and exits 1 when a signature, a size, an error or a
 query's own repeats disagree.
 
+Requests are paced (`--pace`, 0.25 s before each) to stay under BloodHound's
+rate limiter, and one that is rate limited and retried is timed by its
+successful attempt only, never by the backoff before it. `p95_ms` is the
+nearest-rank 95th percentile, which with the default handful of repeats is the
+slowest run.
+
     python3 bench.py --port 8282 --data OGGEN_OUT --ad SHGEN_OUT --password PW --label stock-pg --delete
     python3 bench.py --port 8181 --data OGGEN_OUT --ad SHGEN_OUT --password PW --label bloodtrail --delete
     python3 ../shgen/compare.py og-bench-stock-pg.json og-bench-bloodtrail.json

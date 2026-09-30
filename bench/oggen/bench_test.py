@@ -3,8 +3,13 @@
 
     python3 -m unittest discover -s bench/oggen -p '*_test.py'
 """
+import contextlib
+import http.server
 import importlib.util
+import json
 import os
+import threading
+import time
 import unittest
 
 _spec = importlib.util.spec_from_file_location("oggen_bench", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench.py"))
@@ -79,7 +84,7 @@ class TimedTest(unittest.TestCase):
     @staticmethod
     def run_timed(answers):
         remaining = iter(answers)
-        api = bench.API(1, 60)  # fn below never touches the network
+        api = bench.API(1, 60, pace=0)  # fn below never touches the network
         return bench.timed(api, lambda: next(remaining), len(answers) - 1)
 
     def test_repeats_that_agree_report_their_signature(self):
@@ -105,6 +110,95 @@ class TimedTest(unittest.TestCase):
     def test_an_empty_answer_has_its_own_signature(self):
         self.assertEqual(self.run_timed([(404, None)] * 3)["result_signature"], "HTTP 404")
         self.assertEqual(self.run_timed([(404, None), (200, graph()), (404, None)])["result_signature"], "DISAGREE")
+
+
+@contextlib.contextmanager
+def local_api(latencies=(), limited=()):
+    """A local HTTP server standing in for BloodHound. Request number n
+    (1-based, retries included) is answered HTTP 429 if n is in `limited`, and
+    otherwise 200 after latencies[n-1] seconds (7 ms past the end of the list).
+    Yields its port."""
+    seen = {"n": 0}
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            with lock:
+                seen["n"] += 1
+                n = seen["n"]
+            if n in limited:
+                self.send_response(429)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            time.sleep(latencies[n - 1] if n - 1 < len(latencies) else 0.007)
+            body = json.dumps({"data": {"nodes": {}, "edges": [], "literals": [{"key": "c", "value": 1}]}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def cypher_call(api):
+    return lambda: (200, api.json("POST", "/api/v2/graphs/cypher", {"query": "x"}))
+
+
+class TimingTest(unittest.TestCase):
+    """What timed() reports as latency."""
+
+    def test_a_rate_limited_request_is_timed_by_its_successful_attempt(self):
+        # BloodHound's limiter answers the 4th request with HTTP 429; the client
+        # backs off for a second and retries. The second is not the engine's latency.
+        with local_api(limited={4}) as port:
+            api = bench.API(port, 60)
+            api.token = "t"
+            api.pace = 0
+            result = bench.timed(api, cypher_call(api), 5)
+        self.assertEqual(result["n"], 5)
+        self.assertLess(result["max_ms"], 500, result)
+        self.assertGreaterEqual(result["min_ms"], 7, result)
+
+    def test_requests_are_paced(self):
+        with local_api() as port:
+            api = bench.API(port, 60)
+            api.token = "t"
+            api.pace = 0.1
+            start = time.time()
+            bench.timed(api, cypher_call(api), 3)
+            elapsed = time.time() - start
+        self.assertGreaterEqual(elapsed, 4 * 0.1, "a pause before each of the 4 attempts")
+
+    def test_the_95th_percentile_of_five_samples_is_the_slowest(self):
+        # One discarded warm-up, then 10, 20, 30, 40 and 200 ms. The old "p95" was
+        # rank 4 of 5, the 40 ms one, and hid the 200 ms outlier.
+        with local_api(latencies=[0.0, 0.01, 0.02, 0.03, 0.04, 0.2]) as port:
+            api = bench.API(port, 60)
+            api.token = "t"
+            api.pace = 0
+            result = bench.timed(api, cypher_call(api), 5)
+        self.assertGreaterEqual(result["p95_ms"], 190, result)
+        self.assertEqual(result["p95_ms"], result["max_ms"])
+
+    def test_percentile_is_the_nearest_rank(self):
+        self.assertEqual(bench.percentile([7], 95), 7)
+        self.assertEqual(bench.percentile([1, 2, 3, 4, 5], 95), 5)
+        self.assertEqual(bench.percentile(list(range(1, 8)), 95), 7)
+        self.assertEqual(bench.percentile(list(range(1, 21)), 95), 19)
+        self.assertEqual(bench.percentile(list(range(1, 101)), 95), 95)
+        self.assertEqual(bench.percentile(list(range(1, 101)), 50), 50)
 
 
 if __name__ == "__main__":
