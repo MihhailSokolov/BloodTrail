@@ -3753,6 +3753,16 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 				return false
 			}
 		}
+		// Any other element that is not a literal: dawgs types the array
+		// from its literal elements and casts the rest -- `n.v IN [1, 1 +
+		// 1]` is `::int8 = any(array [1, 1 + 1]::int8[])`, `n.v IN ['5',
+		// toLower(n.w)]` a text comparison with a NULL element -- or lowers
+		// the whole test to `false` (`n.v IN [size(n.l)]`). The evaluator's
+		// In types none of that, so only a list of literals of one type
+		// (inListLiteralKind) is served.
+		if _, typed := inListLiteralKind(right); len(*l) > 0 && !typed {
+			return false
+		}
 	}
 	// The right-hand side must be an array dawgs can take `= any(...)` over:
 	// a list literal, a plain property's stored list, labels() or split(),
@@ -3774,7 +3784,7 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 	// `n.a + 'x' IN [1]` are `text = bigint`, all errors, where the evaluator
 	// compared renderings; and an array on the left (split()) is compared
 	// element-wise against a flattened list.
-	if kind, typed := literalListCastKind(right); typed && !isPlainPropertyLookup(left) {
+	if kind, typed := inListLiteralKind(right); typed && !isPlainPropertyLookup(left) {
 		switch class := pb.sqlClassOf(left); {
 		case class == classBool || class == classArray:
 			return false

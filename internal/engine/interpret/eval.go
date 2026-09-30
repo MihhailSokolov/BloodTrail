@@ -1364,7 +1364,7 @@ func evalIn(env *Env, row *Row, leftExpr, rightExpr cypher.Expression) (Tri, err
 	// `(p ->> 'p') = any(...)` exactly as the plain form is -- so it takes
 	// the same text comparison; against a numeric list it never gets this far
 	// (checkInOperands).
-	if kind, typed := literalListCastKind(rightExpr); typed &&
+	if kind, typed := inListLiteralKind(rightExpr); typed &&
 		(isPlainPropertyLookup(leftExpr) || (kind == coalesceText && parenthesisedPropertyLookup(leftExpr))) {
 		return inCastProperty(val, ok, list, kind)
 	}
@@ -1392,6 +1392,54 @@ func literalListCastKind(expr cypher.Expression) (coalesceKind, bool) {
 		kind = k
 	}
 	return kind, true
+}
+
+// inListLiteralKind is literalListCastKind for the right-hand side of IN,
+// where dawgs also takes a number literal under one sign as a literal of its
+// type: the pre-built `NOT u.pwdlastset IN [-1.0, 0.0]` is `::float8 =
+// any(array [- 1, 0]::float8[])`. Every element must be such a literal, of
+// one type -- a list with any other element is typed by dawgs from its
+// literals alone and does not reach this evaluator (checkInOperands).
+func inListLiteralKind(expr cypher.Expression) (coalesceKind, bool) {
+	list, ok := unwrapParens(expr).(*cypher.ListLiteral)
+	if !ok || list == nil || len(*list) == 0 {
+		return 0, false
+	}
+	var kind coalesceKind
+	for i, el := range *list {
+		lit, isLit := signedNumberOrLiteral(el)
+		if !isLit {
+			return 0, false
+		}
+		k, known := literalCastKind(lit)
+		if !known || k == coalesceBool || (i > 0 && k != kind) {
+			return 0, false
+		}
+		kind = k
+	}
+	return kind, true
+}
+
+// signedNumberOrLiteral returns expr's literal, parentheses aside, or the
+// number literal under a single unary sign (`-1.0`, which the frontend parses
+// as a sign over an operator-less arithmetic expression).
+func signedNumberOrLiteral(expr cypher.Expression) (*cypher.Literal, bool) {
+	if lit, ok := asLiteral(expr); ok {
+		return lit, lit != nil
+	}
+	u, ok := unwrapParens(expr).(*cypher.UnaryAddOrSubtractExpression)
+	if !ok || u == nil {
+		return nil, false
+	}
+	lit, ok := unwrapBareArithmetic(u.Right).(*cypher.Literal)
+	if !ok || lit == nil || lit.Null {
+		return nil, false
+	}
+	switch lit.Value.(type) {
+	case int64, uint64, float64:
+		return lit, true
+	}
+	return nil, false
 }
 
 // inCastProperty implements `n.p IN [<literals>]` as dawgs translates it
