@@ -53,6 +53,14 @@ var ErrBudget = errors.New("interpret: budget exceeded")
 // the package might later lift the restriction.
 var errUnsupportedStep = errors.New("interpret: unsupported step")
 
+// errUnboundSymbol reports a pattern symbol an expansion needs bound that the
+// row does not bind. Every row a walk grows was seeded on some symbol, and a
+// walk reaching for another one means the seed and the walk disagree about
+// where the component starts -- an executor inconsistency. It fails the
+// query, which then goes to PostgreSQL; reading the missing binding as the
+// zero NodeID instead expanded from whatever dense node 0 is and served that.
+var errUnboundSymbol = errors.New("interpret: pattern symbol not bound")
+
 // Budgets caps one Execute call's cost. MaxRows caps the number of rows
 // admitted into the final result (checked exactly, the moment a row would
 // exceed it); MaxWork caps a generic work-unit counter accumulated across
@@ -768,13 +776,15 @@ func runComponent(env *Env, meter *workMeter, part *Part, syms []string, stepIdx
 // runComponentTreeFrom is runComponent's own tree-walk/closing-edge
 // expansion (see its doc comment above) factored out so it can run over an
 // anchorRows chunk a caller already collected for anchor -- via scanAnchor
-// (runComponent's own use, below) or, for a future chunked LIMIT driver, via
+// (runComponent's own use, below) or, for the chunked LIMIT driver, via
 // scanAnchorVisit stopped early with errStopScan -- instead of always
 // starting a scan of its own. anchor must be the same symbol anchorRows is
-// keyed on (chooseAnchor's pick, when the caller is runComponent itself);
-// stepIdxs is the component's Steps, unfiltered -- runComponentTreeFrom
-// rediscovers which of them are "tree" vs. "closing" itself via the same
-// BFS runComponent always ran.
+// keyed on (chooseAnchor's pick when the caller is runComponent itself,
+// componentAnchorSym's when it is runComponentFrom); a walk that reaches
+// for a symbol its rows do not bind fails with errUnboundSymbol. stepIdxs is
+// the component's Steps, unfiltered -- runComponentTreeFrom rediscovers
+// which of them are "tree" vs. "closing" itself via the same BFS
+// runComponent always ran.
 func runComponentTreeFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int, anchor string, anchorRows []*Row, bindArcs bool) ([]*Row, error) {
 	rows := anchorRows
 	if len(stepIdxs) == 0 {
@@ -850,10 +860,20 @@ func runComponentTreeFrom(env *Env, meter *workMeter, part *Part, stepIdxs []int
 // runComponentFrom replays runComponent's own dispatch (see its doc comment
 // above -- every numbered branch there except #2) over anchorRows, a chunk
 // of comp's own anchor rows a caller already collected (via scanAnchor or,
-// for a future chunked LIMIT driver, scanAnchorVisit), instead of running a
-// scanAnchor of its own: the single entry point that driver needs per
-// chunk, covering all three non-shortestPath component executors
-// (fixed-length/BFS, chain, var-length) behind one call.
+// for the chunked LIMIT driver and the DISTINCT streamer, scanAnchorVisit),
+// instead of running a scanAnchor of its own: the single entry point those
+// drivers need per chunk, covering all three non-shortestPath component
+// executors (fixed-length/BFS, chain, var-length) behind one call.
+//
+// anchorRows must bind componentAnchorSym(env, part, comp) -- the symbol the
+// caller scanned. Every branch below walks from exactly that symbol, because
+// the tree walks take their root from componentAnchorSym itself and the
+// chain walks are what componentAnchorSym mirrors, so the two can never pick
+// different ends of the same component. They once did: the scan took the
+// chain end chainAnchorSym picks for any named path while the named
+// branching-chain walk below rooted at chooseAnchor's symbol, and `MATCH p =
+// (g:Group {objectid: 'G'})<-[:MemberOf]-(u)-[:AdminTo]->(c) RETURN p LIMIT
+// 10` expanded from a symbol no row bound and served nothing.
 //
 // Branch #2 (a shortestPath/allShortestPaths component) is deliberately
 // NOT reproduced here: expandShortestPathComponent resolves both pattern
@@ -890,7 +910,7 @@ func runComponentFrom(env *Env, meter *workMeter, part *Part, comp component, an
 		if !ok {
 			return nil, errUnsupportedStep
 		}
-		anchor := chooseAnchor(env, part.Nodes, comp.syms)
+		anchor := componentAnchorSym(env, part, comp)
 		if est, ok := treeRowEstimate(env, part, stepIdxs, anchor, anchorRows); ok &&
 			meter.budget.MaxRows > 0 && est > int64(meter.budget.MaxRows) {
 			// See treeRowEstimate: the degrees already settle it. Declining
@@ -904,7 +924,7 @@ func runComponentFrom(env *Env, meter *workMeter, part *Part, comp component, an
 		return bindPatternPathVal(rows, part, stepIdxs, seq, pathSym)
 	}
 
-	anchor := chooseAnchor(env, part.Nodes, comp.syms)
+	anchor := componentAnchorSym(env, part, comp)
 	return runComponentTreeFrom(env, meter, part, stepIdxs, anchor, anchorRows, false)
 }
 
@@ -2175,6 +2195,17 @@ func adjacency(env *Env, meter *workMeter, step *Step, bound snapshot.NodeID, bo
 	return out, nil
 }
 
+// boundNode returns the node r binds sym to, or errUnboundSymbol when r
+// binds none: the zero NodeID Row.Node reports for a missing binding is a
+// real node, dense node 0, and must never be walked from.
+func boundNode(r *Row, sym string) (snapshot.NodeID, error) {
+	id, ok := r.Node(sym)
+	if !ok {
+		return 0, fmt.Errorf("%w: %q", errUnboundSymbol, sym)
+	}
+	return id, nil
+}
+
 // edgeKindOK reports whether have is admitted by want (Step.EdgeKinds'
 // documented "empty = any" contract, and Cypher's OR-of-types semantics for
 // a relationship pattern's `[:A|B]` disjunction when want is non-empty).
@@ -2202,10 +2233,15 @@ func edgeKindOK(want []snapshot.KindID, have snapshot.KindID) bool {
 // recovering an anonymous fixed step's exact edge instance once the whole
 // chain has been walked; "" (every call site outside expandChainComponent)
 // skips this entirely, matching a caller with no path to assemble.
+//
+// A row that does not bind boundSym fails with errUnboundSymbol.
 func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, unboundSym string, boundIsFrom bool, unboundNC *NodeConstraint, pathArcKey string) ([]*Row, error) {
 	var out []*Row
 	for _, r := range rows {
-		boundID, _ := r.Node(boundSym)
+		boundID, err := boundNode(r, boundSym)
+		if err != nil {
+			return nil, err
+		}
 		cands, err := adjacency(env, meter, step, boundID, boundIsFrom)
 		if err != nil {
 			return nil, err
@@ -2306,11 +2342,19 @@ func expandStep(env *Env, meter *workMeter, rows []*Row, step *Step, boundSym, u
 // of those two guards, though, has anything to say about two *anonymous* (or
 // differently named) relationship patterns that just happen, for this one
 // row, to resolve to the same physical edge.
+//
+// A row that does not bind both endpoints fails with errUnboundSymbol.
 func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*Row, error) {
 	var out []*Row
 	for _, r := range rows {
-		fromID, _ := r.Node(step.FromSym)
-		toID, _ := r.Node(step.ToSym)
+		fromID, err := boundNode(r, step.FromSym)
+		if err != nil {
+			return nil, err
+		}
+		toID, err := boundNode(r, step.ToSym)
+		if err != nil {
+			return nil, err
+		}
 
 		cands, err := adjacency(env, meter, step, fromID, true)
 		if err != nil {

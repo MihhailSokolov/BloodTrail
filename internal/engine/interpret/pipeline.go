@@ -880,15 +880,25 @@ func componentPrefersReverseSeeding(env *Env, part *Part, comp component) bool {
 	return varLengthReverseEligible(env, part, step)
 }
 
-// componentAnchorSym reports the symbol runComponentFrom's own dispatch
-// (see its doc comment) treats an anchorRows chunk as bound to for comp: the
-// component's own leftmost chain symbol (part.Chains[comp.stepIdxs[0]].
-// FromSym) for a special-step (var-length/shortestPath) or named-path
-// component -- exactly the symbol expandVarLengthComponentFrom/
-// expandChainComponentFrom bind an injected chunk to -- or chooseAnchor's own
-// cost-ranked pick otherwise (the general BFS component, including a single
-// isolated node symbol, where chooseAnchor over a one-element syms list
-// trivially returns that element).
+// componentAnchorSym is the one decision of which symbol an anchorRows chunk
+// for comp binds: the chunked drivers scan it, and runComponentFrom walks
+// from it (see its doc comment). Following runComponentFrom's dispatch:
+//
+//   - a special-step (var-length) component grows forward from its own
+//     leftmost chain symbol (part.Chains[comp.stepIdxs[0]].FromSym), the
+//     symbol expandVarLengthComponentFrom and the var-length chain walk bind
+//     an injected chunk to;
+//   - a named STRICT chain is walked by expandChainComponentFrom from the end
+//     chainAnchorSym picks;
+//   - everything else -- a named chain that is not strictly left to right
+//     (converging, diverging), and the general BFS component, including a
+//     single isolated node symbol -- is a tree walk rooted at chooseAnchor's
+//     cost-ranked pick.
+//
+// The named branching chain is why this must be one function: it used to be
+// scanned at chainAnchorSym's end while runComponentFrom walked it from
+// chooseAnchor's symbol, and a walk rooted at a symbol no row bound served
+// an empty answer.
 //
 // That "leftmost chain symbol" is a property of the per-chunk TAIL this driver
 // calls, not of the unlimited path in general: the unlimited var-length
@@ -909,16 +919,15 @@ func componentPrefersReverseSeeding(env *Env, part *Part, comp component) bool {
 func componentAnchorSym(env *Env, part *Part, comp component) string {
 	stepIdxs := comp.stepIdxs
 	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
-	if pathUniform && (hasSpecialStep(part, stepIdxs) || pathSym != "") {
-		if !hasSpecialStep(part, stepIdxs) {
-			// A pure-fixed named-path chain may be walked from either end;
-			// scan whichever one expandChainComponentFrom will actually
-			// walk from (the same deterministic chainWalkReversed decision,
-			// so a chunk of these anchor rows always meets the loop that
-			// expects them).
-			return chainAnchorSym(env, part, stepIdxs)
-		}
+	switch {
+	case pathUniform && hasSpecialStep(part, stepIdxs):
 		return part.Chains[stepIdxs[0]].FromSym
+	case pathUniform && pathSym != "" && isStrictLinearChain(part, stepIdxs):
+		// A pure-fixed named-path chain may be walked from either end; scan
+		// whichever one expandChainComponentFrom will actually walk from
+		// (the same deterministic chainWalkReversed decision, so a chunk of
+		// these anchor rows always meets the loop that expects them).
+		return chainAnchorSym(env, part, stepIdxs)
 	}
 	return chooseAnchor(env, part.Nodes, comp.syms)
 }
