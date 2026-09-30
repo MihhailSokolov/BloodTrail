@@ -138,15 +138,20 @@ func (f *fakeTransaction) GraphQueryMemoryLimit() size.Size {
 var _ graph.Transaction = (*fakeTransaction)(nil)
 
 // fakeNodeQuery is a graph.NodeQuery implementing every fluent/delegating
-// method this file's tests exercise (Filter, Filterf, Delete, Update,
-// OrderBy, Offset, Limit) fully, and panicking on the rest (Query, Count,
-// First, Fetch, FetchIDs, FetchKinds) -- none of observingNodeQuery's
-// contract touches those, so reaching one here would mean a test drives
-// more of the interface than it claims to (mirrors wrapper_test.go's own
-// stub convention).
+// method this file's tests exercise (Filter, Filterf, Query, Fetch, Delete,
+// Update, OrderBy, Offset, Limit) fully, and panicking on the rest (Count,
+// First, FetchIDs, FetchKinds) -- none of observingNodeQuery's contract
+// touches those, so reaching one here would mean a test drives more of the
+// interface than it claims to (mirrors wrapper_test.go's own stub
+// convention).
 type fakeNodeQuery struct {
 	filterCalls  []graph.Criteria
 	filterfCalls int
+
+	// queryFinalCriteria and fetchFinalCriteria hold each Query/Fetch
+	// call's finalCriteria, in call order.
+	queryFinalCriteria [][]graph.Criteria
+	fetchFinalCriteria [][]graph.Criteria
 
 	deleteCalls int
 	deleteErr   error
@@ -170,8 +175,9 @@ func (f *fakeNodeQuery) Filterf(criteriaDelegate graph.CriteriaProvider) graph.N
 	return f
 }
 
-func (f *fakeNodeQuery) Query(func(graph.Result) error, ...graph.Criteria) error {
-	panic("fakeNodeQuery: Query not implemented")
+func (f *fakeNodeQuery) Query(_ func(graph.Result) error, finalCriteria ...graph.Criteria) error {
+	f.queryFinalCriteria = append(f.queryFinalCriteria, finalCriteria)
+	return nil
 }
 
 func (f *fakeNodeQuery) Delete() error {
@@ -207,8 +213,9 @@ func (f *fakeNodeQuery) First() (*graph.Node, error) {
 	panic("fakeNodeQuery: First not implemented")
 }
 
-func (f *fakeNodeQuery) Fetch(func(graph.Cursor[*graph.Node]) error, ...graph.Criteria) error {
-	panic("fakeNodeQuery: Fetch not implemented")
+func (f *fakeNodeQuery) Fetch(_ func(graph.Cursor[*graph.Node]) error, finalCriteria ...graph.Criteria) error {
+	f.fetchFinalCriteria = append(f.fetchFinalCriteria, finalCriteria)
+	return nil
 }
 
 func (f *fakeNodeQuery) FetchIDs(func(graph.Cursor[graph.ID]) error) error {
@@ -443,6 +450,40 @@ func TestCypherMutatesRecoversFromPanicByAssumingMutation(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
+// hasUpdatingClause
+// -----------------------------------------------------------------------
+
+// writePathDeleteClause is the updating clause query.Delete(query.Node())
+// builds, spelled out without a dawgs/query import.
+func writePathDeleteClause() *cypher.UpdatingClause {
+	return cypher.NewUpdatingClause(cypher.NewDelete(true, []cypher.Expression{nodeVariable()}))
+}
+
+func TestHasUpdatingClause(t *testing.T) {
+	cases := []struct {
+		name     string
+		criteria []graph.Criteria
+		want     bool
+	}{
+		{"no criteria", nil, false},
+		{"a projection and a limit", []graph.Criteria{&cypher.Return{}, cypher.NewLimit(1)}, false},
+		{"an updating clause", []graph.Criteria{writePathDeleteClause()}, true},
+		{"an updating clause after a projection", []graph.Criteria{&cypher.Return{}, writePathDeleteClause()}, true},
+		{"a list of updating clauses", []graph.Criteria{[]*cypher.UpdatingClause{writePathDeleteClause()}}, true},
+		{"an empty list of updating clauses", []graph.Criteria{[]*cypher.UpdatingClause{}}, false},
+		{"an updating clause nested in a criteria list", []graph.Criteria{[]graph.Criteria{cypher.NewLimit(1), []graph.Criteria{writePathDeleteClause()}}}, true},
+		{"a nested criteria list without one", []graph.Criteria{[]graph.Criteria{cypher.NewLimit(1)}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasUpdatingClause(tc.criteria); got != tc.want {
+				t.Fatalf("hasUpdatingClause = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------
 // relationshipKindMatcherKinds / edgeKindsFromCriteria
 // -----------------------------------------------------------------------
 
@@ -522,11 +563,42 @@ func TestEdgeKindsFromCriteria(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name: "conjunction with two relationship kind matchers unions",
+			// An edge has exactly one kind, so two ANDed matchers naming
+			// different kinds match no edge at all: PostgreSQL deletes
+			// nothing, and the recognized kind set is empty -- never the
+			// union, which would tombstone every edge of both kinds.
+			name: "conjunction of disjoint relationship kind matchers intersects to nothing",
 			criteria: cypher.NewConjunction(
 				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
 				cypher.NewKindMatcher(relVariable(), graph.Kinds{adminTo}, false),
 			),
+			wantKinds: nil,
+			wantOK:    true,
+		},
+		{
+			name: "conjunction of overlapping kind lists keeps only the shared kinds",
+			criteria: cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession, adminTo}, false),
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{adminTo}, false),
+			),
+			wantKinds: graph.Kinds{adminTo},
+			wantOK:    true,
+		},
+		{
+			name: "conjunction with an empty kind list intersects to nothing",
+			criteria: cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
+				cypher.NewKindMatcher(relVariable(), nil, false),
+			),
+			wantKinds: nil,
+			wantOK:    true,
+		},
+		{
+			// dawgs compares an edge's single kind for equality whatever
+			// IsExclusive says, so an exclusive matcher selects the same
+			// edges as an overlapping one.
+			name:      "exclusive relationship kind matcher selects the same kinds",
+			criteria:  cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession, adminTo}, true),
 			wantKinds: graph.Kinds{hasSession, adminTo},
 			wantOK:    true,
 		},
@@ -594,10 +666,22 @@ func TestRelationshipDeleteScope(t *testing.T) {
 			false,
 		},
 		{
-			"one recognized criteria with empty kinds falls back to touchAll",
+			// dawgs matches an edge's kind against an empty list as
+			// `kind_id = any('{}')`, which no edge satisfies: the delete
+			// removes nothing, exactly, so no fallback is needed.
+			"one recognized criteria with empty kinds deletes nothing",
 			[]graph.Criteria{cypher.NewKindMatcher(relVariable(), nil, false)},
 			nil,
-			true,
+			false,
+		},
+		{
+			"one criteria: conjunction of disjoint relationship kind matchers deletes nothing",
+			[]graph.Criteria{cypher.NewConjunction(
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{hasSession}, false),
+				cypher.NewKindMatcher(relVariable(), graph.Kinds{graph.StringKind("AdminTo")}, false),
+			)},
+			nil,
+			false,
 		},
 		{
 			"one unrecognized criteria",
@@ -1111,22 +1195,61 @@ func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T)
 
 // TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback pins
 // Driver.WriteTransaction's outer-commit-failure branch: the delegate
-// succeeded, so the error arose in the embedded driver's own final Commit
-// and the outcome is ambiguous -- the scope must be applied (rebuild via its
-// fallback record), never resolved as an abandoned (rolled-back) write.
+// succeeded and wrote, so the error arose in the embedded driver's own
+// final Commit and the outcome is ambiguous -- the scope must be applied
+// (rebuild via its fallback record), never resolved as an abandoned
+// (rolled-back) write. A scope that recorded nothing but was bumped is
+// ambiguous too: a mutating call reached PostgreSQL.
 func TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback(t *testing.T) {
+	scopes := map[string]func() *engine.WriteScope{
+		"a recorded write": func() *engine.WriteScope {
+			scope := engine.NewWriteScope()
+			scope.Changes().RecordNodeID(7)
+			return scope
+		},
+		"a bump without a record": func() *engine.WriteScope {
+			scope := engine.NewWriteScope()
+			scope.SetWatermark(1)
+			return scope
+		},
+	}
+	for name, newScope := range scopes {
+		t.Run(name, func(t *testing.T) {
+			eng := disabledEngine()
+			scope := newScope()
+			observer := &observingTransaction{Transaction: &fakeTransaction{}, scope: scope, eng: eng}
+
+			applyCountBefore := eng.ApplyCount()
+			resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit boom"))
+
+			if got := eng.ApplyCount(); got != applyCountBefore+1 {
+				t.Fatalf("ambiguous commit outcome did not Apply: ApplyCount = %d, want %d", got, applyCountBefore+1)
+			}
+			if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
+				t.Fatalf("ambiguous commit outcome must record a fallback before applying")
+			}
+		})
+	}
+}
+
+// TestResolveWriteTransactionFailureWithNothingWrittenSkipsApply pins
+// DRIVER-7: a transaction that neither recorded a write nor bumped the
+// watermark made no mutating call at all, so a failed final COMMIT leaves
+// nothing whose outcome is unknown -- it settles as abandoned, with no
+// fallback (which would cost a full rebuild) and no Apply.
+func TestResolveWriteTransactionFailureWithNothingWrittenSkipsApply(t *testing.T) {
 	eng := disabledEngine()
 	scope := engine.NewWriteScope()
 	observer := &observingTransaction{Transaction: &fakeTransaction{}, scope: scope, eng: eng}
 
 	applyCountBefore := eng.ApplyCount()
-	resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit boom"))
+	resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit: context canceled"))
 
-	if got := eng.ApplyCount(); got != applyCountBefore+1 {
-		t.Fatalf("ambiguous commit outcome did not Apply: ApplyCount = %d, want %d", got, applyCountBefore+1)
+	if got := eng.ApplyCount(); got != applyCountBefore {
+		t.Fatalf("a transaction that wrote nothing was applied: ApplyCount = %d, want %d", got, applyCountBefore)
 	}
-	if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
-		t.Fatalf("ambiguous commit outcome must record a fallback before applying")
+	if hasFallback, _ := scope.Changes().HasFallback(); hasFallback {
+		t.Fatalf("a transaction that wrote nothing recorded a fallback")
 	}
 }
 
@@ -1482,6 +1605,33 @@ func TestObservingRelationshipQueryDeleteRecognizedKindDelegates(t *testing.T) {
 	}
 }
 
+// TestObservingRelationshipQueryDeleteOfDisjointKindMatchersRecordsNothing:
+// Filter(And(Kind(r, A), Kind(r, B))).Delete() matches no edge in
+// PostgreSQL, so the delete still runs but nothing -- neither a kind
+// criteria nor a fallback -- reaches the change log.
+func TestObservingRelationshipQueryDeleteOfDisjointKindMatchersRecordsNothing(t *testing.T) {
+	inner := &mockRelationshipQuery{}
+	scope := engine.NewWriteScope()
+	rq := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+
+	rq.Filter(cypher.NewConjunction(
+		cypher.NewKindMatcher(relVariable(), graph.Kinds{graph.StringKind("HasSession")}, false),
+		cypher.NewKindMatcher(relVariable(), graph.Kinds{graph.StringKind("AdminTo")}, false),
+	))
+
+	if err := rq.Delete(); err != nil {
+		t.Fatalf("Delete: unexpected error: %v", err)
+	}
+	if inner.deleteCalls != 1 {
+		t.Fatalf("Delete did not delegate to the inner query")
+	}
+	if !scope.Empty() {
+		ok, reasons := scope.Changes().HasFallback()
+		t.Fatalf("scope not empty: fallback=%v %v, edge kind criteria %v -- want nothing recorded for a delete that matched no edge",
+			ok, reasons, scope.Changes().EdgeKindCriteria())
+	}
+}
+
 func TestObservingRelationshipQueryDeleteUnrecognizedRecordsFallbackAndDelegates(t *testing.T) {
 	inner := &mockRelationshipQuery{}
 	scope := engine.NewWriteScope()
@@ -1686,6 +1836,78 @@ func TestObservingRelationshipQueryLimitDeleteStaysObserved(t *testing.T) {
 	}
 }
 
+// TestObservingQueryAndFetchRecordUpdatingFinalCriteria pins the write-side
+// half of DRIVER-2: NodeQuery.Query/Fetch and RelationshipQuery.Query carry
+// an updating clause in finalCriteria straight into the SQL the pg driver
+// runs, so the observers must record a fallback for it -- and only for it:
+// a plain read through the same methods records nothing. Either way the
+// call reaches the inner query with finalCriteria unchanged.
+func TestObservingQueryAndFetchRecordUpdatingFinalCriteria(t *testing.T) {
+	calls := []struct {
+		name string
+		// call runs the method on a fresh observer over scope and returns the
+		// finalCriteria the inner query received.
+		call func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria
+	}{
+		{"NodeQuery.Query", func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria {
+			inner := &fakeNodeQuery{}
+			q := &observingNodeQuery{NodeQuery: inner, scope: scope}
+			if err := q.Query(func(graph.Result) error { return nil }, finalCriteria...); err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if len(inner.queryFinalCriteria) != 1 {
+				t.Fatalf("Query reached the inner query %d times, want 1", len(inner.queryFinalCriteria))
+			}
+			return inner.queryFinalCriteria[0]
+		}},
+		{"NodeQuery.Fetch", func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria {
+			inner := &fakeNodeQuery{}
+			q := &observingNodeQuery{NodeQuery: inner, scope: scope}
+			if err := q.Fetch(func(graph.Cursor[*graph.Node]) error { return nil }, finalCriteria...); err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if len(inner.fetchFinalCriteria) != 1 {
+				t.Fatalf("Fetch reached the inner query %d times, want 1", len(inner.fetchFinalCriteria))
+			}
+			return inner.fetchFinalCriteria[0]
+		}},
+		{"RelationshipQuery.Query", func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria {
+			inner := &mockRelationshipQuery{}
+			q := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+			if err := q.Query(func(graph.Result) error { return nil }, finalCriteria...); err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if inner.queryCalls != 1 {
+				t.Fatalf("Query reached the inner query %d times, want 1", inner.queryCalls)
+			}
+			return inner.lastQueryFinalCriteria
+		}},
+	}
+
+	for _, c := range calls {
+		t.Run(c.name+" with an updating clause", func(t *testing.T) {
+			scope := engine.NewWriteScope()
+			finalCriteria := []graph.Criteria{&cypher.Return{}, writePathDeleteClause()}
+			if got := c.call(scope, finalCriteria); !reflect.DeepEqual(got, finalCriteria) {
+				t.Fatalf("inner query received %v, want %v", got, finalCriteria)
+			}
+			if ok, _ := scope.Changes().HasFallback(); !ok {
+				t.Fatalf("HasFallback() = false, want true for a write nothing can name the rows of")
+			}
+		})
+		t.Run(c.name+" without one", func(t *testing.T) {
+			scope := engine.NewWriteScope()
+			finalCriteria := []graph.Criteria{&cypher.Return{}, cypher.NewLimit(1)}
+			if got := c.call(scope, finalCriteria); !reflect.DeepEqual(got, finalCriteria) {
+				t.Fatalf("inner query received %v, want %v", got, finalCriteria)
+			}
+			if !scope.Empty() {
+				t.Fatalf("a read recorded something on the write scope")
+			}
+		})
+	}
+}
+
 // -----------------------------------------------------------------------
 // observingBatch
 // -----------------------------------------------------------------------
@@ -1812,11 +2034,11 @@ func TestObservingBatchCreateNodeRecordsFallbackWhenNoIDOrObjectID(t *testing.T)
 	}
 }
 
-// TestObservingBatchCreateNodeErrorDoesNotRecordIdentity covers CreateNode's
-// error path: recordBatchCreateNodeIdentity must not run at all when the
-// delegate itself failed -- there is no successfully created row for any of
-// its three branches to key a read-back for.
-func TestObservingBatchCreateNodeErrorDoesNotRecordIdentity(t *testing.T) {
+// TestObservingBatchCreateNodeErrorStillRecordsIdentity pins DRIVER-6:
+// the pg batch buffers the node before the flush that failed (and the
+// failure may have been another buffer's), so a later flush can still
+// create it -- the identity is recorded whatever the delegate reports.
+func TestObservingBatchCreateNodeErrorStillRecordsIdentity(t *testing.T) {
 	wantErr := errors.New("boom")
 	inner := &fakeBatch{createNodeErr: wantErr}
 	scope := engine.NewWriteScope()
@@ -1826,8 +2048,8 @@ func TestObservingBatchCreateNodeErrorDoesNotRecordIdentity(t *testing.T) {
 	if err := b.CreateNode(node); err != wantErr {
 		t.Fatalf("CreateNode: error = %v, want %v", err, wantErr)
 	}
-	if !scope.Changes().Empty() {
-		t.Fatalf("CreateNode recorded a ChangeSet entry despite a delegate error, want untouched")
+	if got := scope.Changes().NodeIDs(); len(got) != 1 || got[0] != uint64(500) {
+		t.Fatalf("Changes().NodeIDs() = %v after a failed CreateNode, want [500]", got)
 	}
 }
 
@@ -1861,10 +2083,11 @@ func TestObservingBatchCreateNodesDelegatesAndRecordsIDs(t *testing.T) {
 	}
 }
 
-// TestObservingBatchCreateNodesErrorDoesNotRecordIDs covers the inner
-// delegate returning an error: no ids are recorded, since none were
-// actually returned by the delegate.
-func TestObservingBatchCreateNodesErrorDoesNotRecordIDs(t *testing.T) {
+// TestObservingBatchCreateNodesErrorRecordsFallback covers the inner
+// delegate returning an error: no ids came back, and the error may have
+// followed a COMMIT that made the nodes durable, so the outcome is recorded
+// as unknown -- a fallback -- rather than as nothing.
+func TestObservingBatchCreateNodesErrorRecordsFallback(t *testing.T) {
 	wantErr := errors.New("boom")
 	inner := &fakeNodeBatchCreator{fakeBatch: &fakeBatch{}, createNodesErr: wantErr}
 	scope := engine.NewWriteScope()
@@ -1875,7 +2098,10 @@ func TestObservingBatchCreateNodesErrorDoesNotRecordIDs(t *testing.T) {
 		t.Fatalf("CreateNodes: error = %v, want %v", err, wantErr)
 	}
 	if got := scope.Changes().NodeIDs(); got != nil {
-		t.Fatalf("Changes().NodeIDs() = %v, want nil (error return must not record)", got)
+		t.Fatalf("Changes().NodeIDs() = %v, want nil: the delegate returned no ids", got)
+	}
+	if ok, _ := scope.Changes().HasFallback(); !ok {
+		t.Fatalf("HasFallback() = false after a failed CreateNodes, want true")
 	}
 }
 
@@ -2399,25 +2625,47 @@ func TestObservingBatchCommitAppliesAfterTheInnerCommit(t *testing.T) {
 	}
 }
 
-// TestObservingBatchCommitAppliesEvenWhenInnerCommitFails is
-// TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails's
-// observingBatch half -- see its doc for the F2 regression this pins.
-func TestObservingBatchCommitAppliesEvenWhenInnerCommitFails(t *testing.T) {
+// TestObservingBatchCommitKeepsScopeWhenInnerCommitFails pins DRIVER-3: a
+// failed inner Commit leaves operations buffered in the pg batch, which a
+// later flush (the batch's final Commit) makes durable, so the keys
+// recorded for them must stay in the scope that later Apply reads -- the
+// same scope, not applied now (applying it twice would retire its watermark
+// bump twice) and not reset.
+func TestObservingBatchCommitKeepsScopeWhenInnerCommitFails(t *testing.T) {
 	commitErr := errors.New("commit boom")
 	inner := &fakeBatch{commitErr: commitErr}
 	eng := disabledEngine()
 	scope := engine.NewWriteScope()
 	b := &observingBatch{Batch: inner, scope: scope, eng: eng}
 
+	if err := b.CreateNode(graph.PrepareNode(graph.NewProperties().Set("objectid", "S-1-5-21-1"), graph.StringKind("User"))); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+
 	applyCountBefore := eng.ApplyCount()
 	if err := b.Commit(); !errors.Is(err, commitErr) {
 		t.Fatalf("Commit error = %v, want %v", err, commitErr)
 	}
+	if got := eng.ApplyCount(); got != applyCountBefore {
+		t.Fatalf("Commit applied after the inner Commit failed: ApplyCount = %d, want %d", got, applyCountBefore)
+	}
+	if b.scope != scope {
+		t.Fatalf("Commit replaced scope after the inner Commit failed")
+	}
+	if got := scope.Changes().NodeObjectIDs(); len(got) != 1 || got[0] != "S-1-5-21-1" {
+		t.Fatalf("NodeObjectIDs = %v after the failed Commit, want the buffered create's objectid still recorded", got)
+	}
+
+	// A later Commit that succeeds applies the kept scope, once, and resets.
+	inner.commitErr = nil
+	if err := b.Commit(); err != nil {
+		t.Fatalf("second Commit: unexpected error: %v", err)
+	}
 	if got := eng.ApplyCount(); got != applyCountBefore+1 {
-		t.Fatalf("Commit did not apply after the inner Commit failed: ApplyCount = %d, want %d", got, applyCountBefore+1)
+		t.Fatalf("ApplyCount after the successful Commit = %d, want %d", got, applyCountBefore+1)
 	}
 	if b.scope == scope || !b.scope.Empty() {
-		t.Fatalf("Commit did not reset scope after the inner Commit failed")
+		t.Fatalf("the successful Commit did not reset scope")
 	}
 }
 

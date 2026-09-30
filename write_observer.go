@@ -423,8 +423,9 @@ func applyContext(ctx context.Context) context.Context {
 }
 
 // observingNodeQuery wraps a live graph.NodeQuery so that Delete() and
-// Update() can mark scope before delegating. graph.NodeQuery is embedded, so
-// every method this file does not override (Query, Count, First, Fetch,
+// Update() -- and a Query() or Fetch() whose final criteria carry an
+// updating clause -- can mark scope before delegating. graph.NodeQuery is
+// embedded, so every method this file does not override (Count, First,
 // FetchIDs, FetchKinds) is promoted straight through to the inner query
 // unchanged.
 //
@@ -546,14 +547,33 @@ func (q *observingNodeQuery) Update(properties *graph.Properties) error {
 	return q.NodeQuery.Update(properties)
 }
 
+// Query delegates, first bumping the watermark and recording a fallback
+// when finalCriteria carry an updating clause (recordUpdatingFinalCriteria):
+// the pg driver runs that clause as part of this very query -- its own
+// Delete and Update are built exactly this way -- and nothing here can tell
+// which rows it touches.
+func (q *observingNodeQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
+	recordUpdatingFinalCriteria(q.ctx, q.eng, q.current(), "NodeQuery.Query", finalCriteria)
+	return q.NodeQuery.Query(delegate, finalCriteria...)
+}
+
+// Fetch is Query's cursor-shaped twin: the pg driver appends finalCriteria
+// to its own RETURN, so an updating clause among them writes just the same.
+func (q *observingNodeQuery) Fetch(delegate func(cursor graph.Cursor[*graph.Node]) error, finalCriteria ...graph.Criteria) error {
+	recordUpdatingFinalCriteria(q.ctx, q.eng, q.current(), "NodeQuery.Fetch", finalCriteria)
+	return q.NodeQuery.Fetch(delegate, finalCriteria...)
+}
+
 // observingRelationshipQuery wraps a live graph.RelationshipQuery, recording
 // every criteria the caller filters by (mirroring relationship_query.go's
 // read-side recordingRelationshipQuery) so a subsequent Delete() or Update()
 // has a chance to recognize a scoped target and mark (and record) only what
-// it actually affects, instead of the fully conservative fallback. graph.
-// RelationshipQuery is embedded, so every method this file does not override
-// (Count, First, Query, Fetch, FetchDirection, FetchIDs, FetchTriples,
-// FetchKinds, FetchAllShortestPaths) is promoted straight through unchanged.
+// it actually affects, instead of the fully conservative fallback -- and so a
+// Query() whose final criteria carry an updating clause is recorded too.
+// graph.RelationshipQuery is embedded, so every method this file does not
+// override (Count, First, Fetch, FetchDirection, FetchIDs, FetchTriples,
+// FetchKinds, FetchAllShortestPaths) is promoted straight through unchanged;
+// none of them takes caller criteria that could carry an updating clause.
 //
 // The zero value is not useful; construct one via observingTransaction's own
 // Relationships() or observingBatch's own Relationships().
@@ -646,9 +666,10 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 // is a kind matcher, not an InIDs target list, so "delete every relationship
 // of these kinds" is the operation this delete actually performs, and the
 // one the applier should replay -- an id list captured before the delete
-// ran could go stale by the time the applier reads it back. The
-// unrecognized branch falls back, same as every other unrecognized
-// criteria in this file.
+// ran could go stale by the time the applier reads it back. A recognized
+// shape whose kind set is empty deleted nothing in PostgreSQL, so it
+// records nothing. The unrecognized branch falls back, same as every other
+// unrecognized criteria in this file.
 //
 // Unlike every other observer in this file, the recognized entry is recorded
 // only AFTER the delete has actually succeeded. It is the one entry that is
@@ -673,7 +694,9 @@ func (r *observingRelationshipQuery) Delete() error {
 		r.current().Changes().RecordFallback("RelationshipQuery.Delete: delete failed")
 		return err
 	}
-	r.current().Changes().RecordDeleteRelationshipsByKinds(kinds)
+	if len(kinds) > 0 {
+		r.current().Changes().RecordDeleteRelationshipsByKinds(kinds)
+	}
 	return nil
 }
 
@@ -692,6 +715,12 @@ func (r *observingRelationshipQuery) Update(properties *graph.Properties) error 
 	return r.RelationshipQuery.Update(properties)
 }
 
+// Query is observingNodeQuery.Query's relationship half -- see its doc.
+func (r *observingRelationshipQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
+	recordUpdatingFinalCriteria(r.ctx, r.eng, r.current(), "RelationshipQuery.Query", finalCriteria)
+	return r.RelationshipQuery.Query(delegate, finalCriteria...)
+}
+
 // relationshipDeleteScope decides what an observingRelationshipQuery.
 // Delete() call's ChangeSet entry should be, given every criteria its
 // caller filtered by: the RecordDeleteRelationshipsByKinds entry it feeds
@@ -702,22 +731,21 @@ func (r *observingRelationshipQuery) Update(properties *graph.Properties) error 
 // edges PostgreSQL never touched.
 //
 // When exactly one criteria was recorded and edgeKindsFromCriteria
-// recognizes it with a non-empty result, kinds is that result and touchAll
-// is false: edgeKindsFromCriteria's own recognized shape (see its doc) is
-// now exactly "one or more bare relationship KindMatchers, ANDed together
-// with nothing else that could narrow the match further" -- so the
-// operation the query actually performs really is "delete every edge of
-// these kinds", which is exactly what the applier needs to replay it
-// exactly. Every other case -- zero or more than one criteria, an
-// unrecognized shape, a Conjunction carrying any conjunct that is not
-// itself a bare relationship KindMatcher, or a recognized KindMatcher whose
-// Kinds came back empty (which means "matches every kind", the opposite of
-// a narrow scope, per the KindMatcher/PathQuery.EdgeKinds convention
-// documented on recognize.PathQuery) -- reports touchAll instead, so the
-// applier falls back to a full rebuild rather than guessing.
+// recognizes it, kinds is that result and touchAll is false:
+// edgeKindsFromCriteria's own recognized shape (see its doc) is exactly
+// "one or more bare relationship KindMatchers, ANDed together with nothing
+// else that could narrow the match further", and its result is exactly the
+// kinds whose edges PostgreSQL deletes -- so the operation the query
+// performs really is "delete every edge of these kinds", which is what the
+// applier needs to replay it exactly. An empty result is exact too: that
+// delete matched no edge at all (Delete records nothing for it). Every
+// other case -- zero or more than one criteria, an unrecognized shape, or a
+// Conjunction carrying any conjunct that is not itself a bare relationship
+// KindMatcher -- reports touchAll instead, so the applier falls back to a
+// full rebuild rather than guessing.
 func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touchAll bool) {
 	if len(criteria) == 1 {
-		if ks, ok := edgeKindsFromCriteria(criteria[0]); ok && len(ks) > 0 {
+		if ks, ok := edgeKindsFromCriteria(criteria[0]); ok {
 			return ks, false
 		}
 	}
@@ -737,9 +765,15 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 // variable "r" (what dawgs' query.Kind(query.Relationship(), k)/
 // query.KindIn(query.Relationship(), ks...) builds), or a
 // *cypher.Conjunction all of whose expressions are such KindMatchers --
-// nothing else may appear alongside them. Multiple KindMatchers union their
-// kinds: a delete matching kind K1 or K2 still only touches K1 and K2's
-// edges.
+// nothing else may appear alongside them. The reported kinds are those
+// PostgreSQL actually deletes: dawgs translates an edge KindMatcher as
+// `kind_id = any(<ids>)` (IsExclusive plays no part for an edge, which has
+// exactly one kind), so one matcher selects the edges whose kind is in its
+// list -- none at all for an empty list -- and ANDed matchers select only
+// the kinds present in EVERY list: the intersection, empty whenever two
+// lists are disjoint or one is empty. An empty result means the delete
+// matched nothing. (Reporting the union instead made the applier tombstone
+// every edge of every listed kind while PostgreSQL kept them.)
 //
 // This is deliberately NOT the "ignore what you don't recognize, fall back
 // to RecordFallback" pattern this file's other recognizers use, where
@@ -769,7 +803,7 @@ func edgeKindsFromCriteria(criteria graph.Criteria) (graph.Kinds, bool) {
 		}
 
 		var kinds graph.Kinds
-		for _, expr := range typed.Expressions {
+		for i, expr := range typed.Expressions {
 			km, isKindMatcher := expr.(*cypher.KindMatcher)
 			if !isKindMatcher {
 				// A non-KindMatcher sibling narrows the match beyond the
@@ -785,13 +819,40 @@ func edgeKindsFromCriteria(criteria graph.Criteria) (graph.Kinds, bool) {
 				// just this one.
 				return nil, false
 			}
-			kinds = append(kinds, ks...)
+			if i == 0 {
+				kinds = ks
+			} else {
+				kinds = intersectKinds(kinds, ks)
+			}
 		}
 		return kinds, true
 
 	default:
 		return nil, false
 	}
+}
+
+// intersectKinds returns the kinds of a whose names also appear in b, in a's
+// order: the kinds an edge can carry and still satisfy two ANDed edge
+// KindMatchers (edgeKindsFromCriteria's doc).
+func intersectKinds(a, b graph.Kinds) graph.Kinds {
+	names := make(map[string]struct{}, len(b))
+	for _, kind := range b {
+		if kind != nil {
+			names[kind.String()] = struct{}{}
+		}
+	}
+
+	var shared graph.Kinds
+	for _, kind := range a {
+		if kind == nil {
+			continue
+		}
+		if _, ok := names[kind.String()]; ok {
+			shared = append(shared, kind)
+		}
+	}
+	return shared
 }
 
 // relationshipKindMatcherKinds reports whether km is a KindMatcher over the
@@ -950,26 +1011,34 @@ func (b *observingBatch) wrote() bool {
 	return !b.current().Empty()
 }
 
-// CreateNode delegates, then, once the delegate reports success, records a
-// ChangeSet read-back key for the write via recordBatchCreateNodeIdentity --
-// see that function's own doc for exactly which of node.ID or an "objectid"
-// property it prefers, and why a create that offers neither records a
-// fallback instead of an enumerable key.
+// CreateNode records a ChangeSet read-back key for the write via
+// recordBatchCreateNodeIdentity -- see that function's own doc for exactly
+// which of node.ID or an "objectid" property it prefers, and why a create
+// that offers neither records a fallback instead of an enumerable key --
+// then delegates.
+//
+// The key is recorded before delegating, whatever the delegate then
+// reports: the pinned dawgs v0.8.0 batch appends node to its create buffer
+// before it tries to flush (drivers/pg/batch.go's CreateNode), and the
+// error a flush reports can come from any buffer, not only this node's. The
+// node stays buffered, and a later flush -- another call's, or the batch's
+// final Commit -- creates it; recording only on success lost that create.
+// A key recorded for a create that never lands is harmless: read-back finds
+// no row for it.
 func (b *observingBatch) CreateNode(node *graph.Node) error {
 	ensureBumped(b.ctx, b.eng, b.current())
-	err := b.Batch.CreateNode(node)
-	if err == nil {
+	if node != nil {
 		recordBatchCreateNodeIdentity(b.current(), node)
 	}
-	return err
+	return b.Batch.CreateNode(node)
 }
 
 // recordBatchCreateNodeIdentity records observingBatch.CreateNode's
-// ChangeSet entry for a create the delegate has already reported success
-// for. Unlike observingTransaction.CreateNode's tx-level equivalent, a
-// batch INSERT (graph.Batch.CreateNode's own doc: reports success/failure
-// only) never returns the row's generated id, so this method must instead
-// look at what the caller itself gave node:
+// ChangeSet entry for a create it is about to delegate. Unlike
+// observingTransaction.CreateNode's tx-level equivalent, a batch INSERT
+// (graph.Batch.CreateNode's own doc: reports success/failure only) never
+// returns the row's generated id, so this method must instead look at what
+// the caller itself gave node:
 //
 //   - If node.ID is a real preset id -- neither graph.UnregisteredNodeID,
 //     the sentinel graph.PrepareNode assigns every node this codebase
@@ -1027,6 +1096,11 @@ func recordBatchCreateNodeIdentity(scope *engine.WriteScope, node *graph.Node) {
 // "returns generated IDs in input order"), but this only needs the ids
 // themselves, not that alignment, so no attempt is made to pair a specific
 // id back to a specific input node.
+//
+// An error records a fallback instead. The pinned dawgs v0.8.0 creates the
+// nodes in a transaction of its own (drivers/pg/batch.go's CreateNodes),
+// whose COMMIT can fail after PostgreSQL made it durable, and with no ids
+// returned nothing names the rows it may have created.
 func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 	creator, ok := b.Batch.(graph.NodeBatchCreator)
 	if !ok {
@@ -1041,6 +1115,7 @@ func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 
 	ids, err := creator.CreateNodes(nodes)
 	if err != nil {
+		b.current().Changes().RecordFallback(fmt.Sprintf("Batch.CreateNodes: outcome ambiguous: %v", err))
 		return ids, err
 	}
 
@@ -1239,11 +1314,12 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 
 // Commit delegates to the inner batch's own Commit FIRST -- which flushes
 // every operation still sitting in the buffer (graph.Batch's own doc on
-// Commit: "calls to commit this batch transaction right away") -- then
-// flushes scope to the engine (eng.Apply(scope)), then resets scope to a
-// fresh WriteScope for whatever this batch does next. A batch is documented
-// to support being committed mid-delegate and continuing to receive more
-// operations afterward (dawgs' pg batch implementation executes each
+// Commit: "calls to commit this batch transaction right away") -- then, if
+// that succeeded, flushes scope to the engine (eng.Apply(scope)) and resets
+// scope to a fresh WriteScope for whatever this batch does next (a failed
+// inner Commit: see below). A batch is documented to support being
+// committed mid-delegate and continuing to receive more operations
+// afterward (dawgs' pg batch implementation executes each
 // buffered operation immediately on the connection rather than inside one
 // long-lived database transaction, which is what actually makes "commit,
 // then keep writing" work at the pg level for a batch in a way it is not
@@ -1265,12 +1341,19 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // PostgreSQL at all if Apply ran first -- the inner Commit's own tryFlush is
 // what makes it exist before read-back goes looking for it.
 //
-// Apply runs unconditionally, even when the inner Commit returns an error,
-// for the same "read-back reads whatever is actually there" reasoning
-// Driver.BatchOperation's own always-apply choice documents: whatever
-// chunks did flush (including everything tryFlush(0) just pushed through
-// above) are already durable and worth reflecting, and a key that never
-// landed simply reads back as it already was.
+// A failed inner Commit applies nothing and keeps scope as it is. The pinned
+// dawgs v0.8.0 batch (drivers/pg/batch.go) flushes its buffers in turn and
+// stops at the first that fails, keeping that buffer and every later one;
+// the batch's own final Commit, once the delegate returns nil, flushes them
+// then -- as does a later mid-batch Commit that succeeds. Their keys must
+// still be in scope when that happens: resetting scope here discarded them,
+// so the writes the final flush made durable were never read back. Keeping
+// scope also covers every chunk that did flush before the failure: they
+// are read back with the rest by whichever Apply comes next -- this
+// method's own on a later successful Commit, or Driver.BatchOperation's
+// after the delegate returns, which runs whatever the delegate returned.
+// Applying now as well would apply scope twice, and Apply retires a
+// scope's watermark bump each time it runs.
 //
 // Driver.BatchOperation still calls Apply once more after the delegate
 // returns (driver.go), reporting whatever scope accumulated since this
@@ -1279,10 +1362,12 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // different *WriteScope than the one this method reset it to, exactly as
 // intended.
 func (b *observingBatch) Commit() error {
-	err := b.Batch.Commit()
+	if err := b.Batch.Commit(); err != nil {
+		return err
+	}
 	b.eng.Apply(applyContext(b.ctx), b.current())
 	*b.slotRef() = engine.NewWriteScope()
-	return err
+	return nil
 }
 
 // parseCypherFrontend is cypherMutates' parsing step, factored out into a
@@ -1376,4 +1461,43 @@ func singleQueryMutates(sq *cypher.SingleQuery) bool {
 	}
 
 	return multiPart.SinglePartQuery != nil && len(multiPart.SinglePartQuery.UpdatingClauses) > 0
+}
+
+// hasUpdatingClause reports whether criteria -- the finalCriteria a
+// NodeQuery/RelationshipQuery Query or Fetch call was given -- carry a
+// Cypher updating clause. It mirrors exactly what the pinned dawgs v0.8.0
+// query builder (query/builder.go's Builder.Apply) turns into one: a
+// *cypher.UpdatingClause (query.Delete, query.SetProperty, query.AddKind and
+// the rest), a non-empty []*cypher.UpdatingClause (query.Update,
+// query.Updatef), and either of those nested in a []graph.Criteria, which
+// Apply flattens.
+func hasUpdatingClause(criteria []graph.Criteria) bool {
+	for _, criterion := range criteria {
+		switch typed := criterion.(type) {
+		case *cypher.UpdatingClause:
+			return true
+		case []*cypher.UpdatingClause:
+			if len(typed) > 0 {
+				return true
+			}
+		case []graph.Criteria:
+			if hasUpdatingClause(typed) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordUpdatingFinalCriteria is what the observing query wrappers' Query
+// and Fetch do before delegating: when finalCriteria carry an updating
+// clause (hasUpdatingClause) the call is a write whose rows nothing here can
+// name, so it bumps the watermark (the bump precedes every write's effect)
+// and records a fallback on scope. op names the call in the fallback reason.
+func recordUpdatingFinalCriteria(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope, op string, finalCriteria []graph.Criteria) {
+	if !hasUpdatingClause(finalCriteria) {
+		return
+	}
+	ensureBumped(ctx, eng, scope)
+	scope.Changes().RecordFallback(op + ": updating clause escapes changelog tracking")
 }
