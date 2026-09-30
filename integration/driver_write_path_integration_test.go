@@ -315,3 +315,109 @@ func TestUpdatingClauseInFinalCriteriaReachesTheReplica(t *testing.T) {
 		}
 	}
 }
+
+// writePathFailProperty is the property key installWritePathInsertFailure's
+// trigger looks for.
+const writePathFailProperty = "writepath_fail"
+
+// installWritePathInsertFailure makes every node INSERT whose properties
+// carry writePathFailProperty fail until the returned function is called:
+// a stand-in for a transient flush failure (a deadlock, a lock or statement
+// timeout, a dropped connection) that the next attempt survives. The
+// trigger, its function and its flag table are dropped when the test ends.
+func installWritePathInsertFailure(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (pass func()) {
+	t.Helper()
+
+	statements := []string{
+		`create table if not exists writepath_fail_flag (id int primary key, fail boolean not null)`,
+		`insert into writepath_fail_flag values (1, true) on conflict (id) do update set fail = true`,
+		`create or replace function writepath_fail() returns trigger language plpgsql as $$
+begin
+  if new.properties ? '` + writePathFailProperty + `' and exists (select 1 from writepath_fail_flag where id = 1 and fail) then
+    raise exception 'writepath: injected insert failure';
+  end if;
+  return new;
+end $$`,
+		`drop trigger if exists writepath_fail_trg on node`,
+		`create trigger writepath_fail_trg before insert on node for each row execute function writepath_fail()`,
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		for _, statement := range []string{
+			`drop trigger if exists writepath_fail_trg on node`,
+			`drop function if exists writepath_fail()`,
+			`drop table if exists writepath_fail_flag`,
+		} {
+			if _, err := pool.Exec(cleanupCtx, statement); err != nil {
+				t.Errorf("drop injected insert failure: %s: %v", statement, err)
+			}
+		}
+	})
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatalf("install injected insert failure: %s: %v", statement, err)
+		}
+	}
+
+	return func() {
+		if _, err := pool.Exec(ctx, `update writepath_fail_flag set fail = false where id = 1`); err != nil {
+			t.Fatalf("let inserts pass again: %v", err)
+		}
+	}
+}
+
+// writePathFailingNode is a batch-create node, identified by objectID the
+// way BloodHound's ingest identifies nodes, whose INSERT
+// installWritePathInsertFailure's trigger fails.
+func writePathFailingNode(objectID string, kind graph.Kind) *graph.Node {
+	return graph.PrepareNode(graph.NewProperties().Set("objectid", objectID).Set(writePathFailProperty, true), kind)
+}
+
+// seedWritePathAnchor creates one node of kind through bt, so the kind
+// exists and serves before a test's own writes.
+func seedWritePathAnchor(t *testing.T, ctx context.Context, bt graph.Database, kind graph.Kind) {
+	t.Helper()
+	if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		_, err := tx.CreateNode(graph.NewProperties().Set("objectid", "WRITEPATH-ANCHOR-"+kind.String()), kind)
+		return err
+	}); err != nil {
+		t.Fatalf("seed anchor: %v", err)
+	}
+}
+
+// TestBatchCommitFailureKeepsTheBufferedWrites covers a mid-batch Commit
+// whose flush fails. The pg batch keeps the failed buffer, and every later
+// one, and its final Commit flushes them once the delegate returns nil --
+// so the keys recorded for those writes must survive the failed Commit for
+// the final Apply to read them back.
+func TestBatchCommitFailureKeepsTheBufferedWrites(t *testing.T) {
+	_, bt, oracle, pool, buf, ctx := openWritePathDriver(t)
+	kind := graph.StringKind("WritePathCommitRetryNode")
+
+	seedWritePathAnchor(t, ctx, bt, kind)
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the anchor serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+	passInserts := installWritePathInsertFailure(t, ctx, pool)
+
+	var commitErr error
+	if err := bt.BatchOperation(ctx, func(b graph.Batch) error {
+		if err := b.CreateNode(writePathFailingNode("WRITEPATH-COMMIT-RETRY", kind)); err != nil {
+			return err
+		}
+		commitErr = b.Commit()
+		passInserts()
+		return nil
+	}); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if commitErr == nil {
+		t.Fatalf("the mid-batch Commit succeeded: the injected failure did not fire")
+	}
+
+	if got := nodeCountByKind(t, ctx, oracle, kind); got != 2 {
+		t.Fatalf("postgresql holds %d node(s), want 2: the final Commit did not flush the retried create", got)
+	}
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "the create the final Commit flushed serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 2)
+	assertNoFallback(t, buf)
+}

@@ -1300,11 +1300,12 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 
 // Commit delegates to the inner batch's own Commit FIRST -- which flushes
 // every operation still sitting in the buffer (graph.Batch's own doc on
-// Commit: "calls to commit this batch transaction right away") -- then
-// flushes scope to the engine (eng.Apply(scope)), then resets scope to a
-// fresh WriteScope for whatever this batch does next. A batch is documented
-// to support being committed mid-delegate and continuing to receive more
-// operations afterward (dawgs' pg batch implementation executes each
+// Commit: "calls to commit this batch transaction right away") -- then, if
+// that succeeded, flushes scope to the engine (eng.Apply(scope)) and resets
+// scope to a fresh WriteScope for whatever this batch does next (a failed
+// inner Commit: see below). A batch is documented to support being
+// committed mid-delegate and continuing to receive more operations
+// afterward (dawgs' pg batch implementation executes each
 // buffered operation immediately on the connection rather than inside one
 // long-lived database transaction, which is what actually makes "commit,
 // then keep writing" work at the pg level for a batch in a way it is not
@@ -1326,12 +1327,19 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // PostgreSQL at all if Apply ran first -- the inner Commit's own tryFlush is
 // what makes it exist before read-back goes looking for it.
 //
-// Apply runs unconditionally, even when the inner Commit returns an error,
-// for the same "read-back reads whatever is actually there" reasoning
-// Driver.BatchOperation's own always-apply choice documents: whatever
-// chunks did flush (including everything tryFlush(0) just pushed through
-// above) are already durable and worth reflecting, and a key that never
-// landed simply reads back as it already was.
+// A failed inner Commit applies nothing and keeps scope as it is. The pinned
+// dawgs v0.8.0 batch (drivers/pg/batch.go) flushes its buffers in turn and
+// stops at the first that fails, keeping that buffer and every later one;
+// the batch's own final Commit, once the delegate returns nil, flushes them
+// then -- as does a later mid-batch Commit that succeeds. Their keys must
+// still be in scope when that happens: resetting scope here discarded them,
+// so the writes the final flush made durable were never read back. Keeping
+// scope also covers every chunk that did flush before the failure: they
+// are read back with the rest by whichever Apply comes next -- this
+// method's own on a later successful Commit, or Driver.BatchOperation's
+// after the delegate returns, which runs whatever the delegate returned.
+// Applying now as well would apply scope twice, and Apply retires a
+// scope's watermark bump each time it runs.
 //
 // Driver.BatchOperation still calls Apply once more after the delegate
 // returns (driver.go), reporting whatever scope accumulated since this
@@ -1340,10 +1348,12 @@ func (b *observingBatch) WithGraph(graphSchema graph.Graph) graph.Batch {
 // different *WriteScope than the one this method reset it to, exactly as
 // intended.
 func (b *observingBatch) Commit() error {
-	err := b.Batch.Commit()
+	if err := b.Batch.Commit(); err != nil {
+		return err
+	}
 	b.eng.Apply(applyContext(b.ctx), b.current())
 	*b.slotRef() = engine.NewWriteScope()
-	return err
+	return nil
 }
 
 // parseCypherFrontend is cypherMutates' parsing step, factored out into a

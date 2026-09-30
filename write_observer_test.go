@@ -2582,25 +2582,47 @@ func TestObservingBatchCommitAppliesAfterTheInnerCommit(t *testing.T) {
 	}
 }
 
-// TestObservingBatchCommitAppliesEvenWhenInnerCommitFails is
-// TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails's
-// observingBatch half -- see its doc for the F2 regression this pins.
-func TestObservingBatchCommitAppliesEvenWhenInnerCommitFails(t *testing.T) {
+// TestObservingBatchCommitKeepsScopeWhenInnerCommitFails pins DRIVER-3: a
+// failed inner Commit leaves operations buffered in the pg batch, which a
+// later flush (the batch's final Commit) makes durable, so the keys
+// recorded for them must stay in the scope that later Apply reads -- the
+// same scope, not applied now (applying it twice would retire its watermark
+// bump twice) and not reset.
+func TestObservingBatchCommitKeepsScopeWhenInnerCommitFails(t *testing.T) {
 	commitErr := errors.New("commit boom")
 	inner := &fakeBatch{commitErr: commitErr}
 	eng := disabledEngine()
 	scope := engine.NewWriteScope()
 	b := &observingBatch{Batch: inner, scope: scope, eng: eng}
 
+	if err := b.CreateNode(graph.PrepareNode(graph.NewProperties().Set("objectid", "S-1-5-21-1"), graph.StringKind("User"))); err != nil {
+		t.Fatalf("CreateNode: unexpected error: %v", err)
+	}
+
 	applyCountBefore := eng.ApplyCount()
 	if err := b.Commit(); !errors.Is(err, commitErr) {
 		t.Fatalf("Commit error = %v, want %v", err, commitErr)
 	}
+	if got := eng.ApplyCount(); got != applyCountBefore {
+		t.Fatalf("Commit applied after the inner Commit failed: ApplyCount = %d, want %d", got, applyCountBefore)
+	}
+	if b.scope != scope {
+		t.Fatalf("Commit replaced scope after the inner Commit failed")
+	}
+	if got := scope.Changes().NodeObjectIDs(); len(got) != 1 || got[0] != "S-1-5-21-1" {
+		t.Fatalf("NodeObjectIDs = %v after the failed Commit, want the buffered create's objectid still recorded", got)
+	}
+
+	// A later Commit that succeeds applies the kept scope, once, and resets.
+	inner.commitErr = nil
+	if err := b.Commit(); err != nil {
+		t.Fatalf("second Commit: unexpected error: %v", err)
+	}
 	if got := eng.ApplyCount(); got != applyCountBefore+1 {
-		t.Fatalf("Commit did not apply after the inner Commit failed: ApplyCount = %d, want %d", got, applyCountBefore+1)
+		t.Fatalf("ApplyCount after the successful Commit = %d, want %d", got, applyCountBefore+1)
 	}
 	if b.scope == scope || !b.scope.Empty() {
-		t.Fatalf("Commit did not reset scope after the inner Commit failed")
+		t.Fatalf("the successful Commit did not reset scope")
 	}
 }
 
