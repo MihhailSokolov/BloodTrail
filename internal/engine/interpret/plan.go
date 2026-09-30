@@ -854,6 +854,14 @@ type partBuilder struct {
 	// conjuncts) and RETURN-item bookkeeping use, so the whole tree only
 	// needs to be walked once per item.
 	touched map[string]bool
+
+	// laterClause is set while a WHERE conjunct written in a MATCH clause
+	// other than the Part's first -- an OPTIONAL MATCH always is one -- is
+	// checked. dawgs places a pattern predicate's subquery there inside the
+	// CTE that clause is still defining, and PostgreSQL rejects the
+	// reference to it (42P01, missing FROM-clause entry), so
+	// checkPatternPredicate declines.
+	laterClause bool
 }
 
 // planPart builds one Part from reading (that stage's ReadingClauses),
@@ -875,6 +883,10 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 	}
 
 	var whereConjuncts []cypher.Expression
+	// firstClauseWhere counts the conjuncts the Part's first MATCH clause
+	// wrote; the written ones after it come from later clauses (see
+	// partBuilder.laterClause).
+	firstClauseWhere := 0
 
 	// An OPTIONAL MATCH is split out and planned as its own Part. Only a
 	// single one, only as the LAST reading clause, and only with at least
@@ -886,7 +898,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 		return Part{}, nil, false
 	}
 
-	for _, rc := range mandatory {
+	for i, rc := range mandatory {
 		if rc == nil || rc.Unwind != nil || rc.Match == nil {
 			return Part{}, nil, false
 		}
@@ -904,15 +916,20 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 				whereConjuncts = append(whereConjuncts, flattenTopLevelConjuncts(top)...)
 			}
 		}
+		if i == 0 {
+			firstClauseWhere = len(whereConjuncts)
+		}
 	}
+	writtenWhere := len(whereConjuncts)
 
 	// Fold every inline-map-desugared equality into the same conjunct list
 	// a written-out WHERE clause would populate, so Part.Where ends up
 	// complete and sufficient by construction -- see Part's doc.
 	whereConjuncts = append(whereConjuncts, pb.desugaredEqualities...)
 
-	for _, conjunct := range whereConjuncts {
+	for i, conjunct := range whereConjuncts {
 		pb.touched = map[string]bool{}
+		pb.laterClause = i >= firstClauseWhere && i < writtenWhere
 		if !pb.checkExpr(conjunct, true) {
 			return Part{}, nil, false
 		}
@@ -920,6 +937,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 			return Part{}, nil, false
 		}
 	}
+	pb.laterClause = false
 
 	if !pb.finalizeShortestPaths(whereConjuncts) {
 		return Part{}, nil, false
@@ -1000,6 +1018,7 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 		numericScalars: numericScalars,
 		textScalars:    textScalars,
 		patternSeq:     outer.patternSeq,
+		laterClause:    true,
 	}
 
 	// nodes starts EMPTY, deliberately: it must end up holding exactly the
@@ -3977,8 +3996,18 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 //     implements nothing to resolve a fresh node's own constraints inside
 //     its pure two-endpoint adjacency check, so that broader shape stays
 //     planner-rejected rather than mis-served.
+//   - A predicate in the WHERE of any MATCH clause but the Part's first, or
+//     of an OPTIONAL MATCH (partBuilder.laterClause): again a genuine pg
+//     failure, not a scope cut -- dawgs places the subquery inside the CTE
+//     that clause is still defining, and PostgreSQL rejects the query
+//     (42P01) before reading a row.
 func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 	if pp == nil || len(pp.PatternElements) != 3 {
+		return false
+	}
+	// Only the WHERE of a Part's first MATCH clause: see
+	// partBuilder.laterClause.
+	if pb.laterClause {
 		return false
 	}
 
