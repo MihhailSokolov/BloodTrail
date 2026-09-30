@@ -35,8 +35,12 @@ const (
 	toolAPIBaseURL    = "http://bloodhound:2112"
 	driverName        = "bloodtrail"
 	migrationPoll     = 5 * time.Second
-	logMarkerAttempts = 24 // x 5s = 2 minutes
+	logMarkerAttempts = 24 // x logMarkerPoll = 2 minutes
 )
+
+// logMarkerPoll is the wait between looks for the driver's log line; a variable
+// so that a test does not have to sit through it.
+var logMarkerPoll = 5 * time.Second
 
 // Options are the user-facing knobs; zero values take the defaults above.
 type Options struct {
@@ -528,7 +532,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		// container's identity (id + start time) before starting, so a
 		// restart anywhere inside the migration window is detected instead
 		// of read as success.
-		epochBefore, err := bloodhoundContainerEpoch(ctx, deps, c)
+		epochBefore, err := bloodhoundContainerEpoch(ctx, c)
 		if err != nil {
 			return fmt.Errorf("reading the %s container's identity before the migration: %w; %s", bloodhoundService, err, rollbackHint)
 		}
@@ -536,7 +540,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		if err := client.MigrateNeoToPG(ctx, migrationPoll, opts.MigrationTimeout); err != nil {
 			return fmt.Errorf("the migration reported an error: %w; BloodHound's migrator may already have switched the active driver to pg; %s", err, rollbackHint)
 		}
-		epochAfter, err := bloodhoundContainerEpoch(ctx, deps, c)
+		epochAfter, err := bloodhoundContainerEpoch(ctx, c)
 		if err != nil {
 			return fmt.Errorf("reading the %s container's identity after the migration: %w; %s", bloodhoundService, err, rollbackHint)
 		}
@@ -675,13 +679,18 @@ func checkPostgresGraphEmpty(ctx context.Context, deps Deps, opts Options, store
 	return nil
 }
 
-// runVerification checks the cheap and decisive things first: the driver log
-// line says the right image booted with the right driver, and it appears
-// within seconds. The smoke test goes last because it ingests a fixture and
-// triggers a full analysis, which on a real graph can run for a long time —
-// there is no sense paying for it to learn what the log already said.
+// runVerification checks the cheap and decisive things first: the driver
+// setting names BloodTrail, the driver log line says the right image booted
+// with the right driver, and it appears within seconds. The smoke test goes
+// last because it ingests a fixture and triggers a full analysis, which on a
+// real graph can run for a long time -- there is no sense paying for it to
+// learn what the log already said.
 func runVerification(ctx context.Context, deps Deps, opts Options, c dockerx.Compose) error {
 	say := func(format string, a ...any) { _, _ = fmt.Fprintf(deps.Out, format+"\n", a...) }
+	if err := checkDriverSetting(ctx, c); err != nil {
+		return err
+	}
+	say("    driver setting: %s", driverName)
 	if err := waitForDriverLogLine(ctx, c); err != nil {
 		return err
 	}
@@ -700,22 +709,68 @@ func runVerification(ctx context.Context, deps Deps, opts Options, c dockerx.Com
 	return nil
 }
 
+// checkDriverSetting requires that BloodHound boots the BloodTrail driver: the
+// driver log line only says which one the current run booted, while the
+// setting decides the next -- a row switched away since, through the tool API
+// or by hand, sends the next restart back to the stock driver. The setting is
+// what BloodHound reads: the database_switch row, and without one the
+// bhe_graph_driver environment variable of the bloodhound service.
+func checkDriverSetting(ctx context.Context, c dockerx.Compose) error {
+	raw, err := c.ConfigJSON(ctx)
+	if err != nil {
+		return fmt.Errorf("reading compose config: %w", err)
+	}
+	cfg, err := compose.ParseConfig(raw)
+	if err != nil {
+		return err
+	}
+	svc, ok := cfg.Services[bloodhoundService]
+	if !ok {
+		return fmt.Errorf("compose project %q has no %q service", cfg.Name, bloodhoundService)
+	}
+	row, present, err := appDBStore(c, cfg).Read(ctx)
+	if err != nil {
+		return fmt.Errorf("reading database_switch: %w", err)
+	}
+	if active := resolveDriver(row, present, svc); active != driverName {
+		source := "the database_switch row"
+		if !present {
+			source = "the bhe_graph_driver setting of the " + bloodhoundService + " service, there being no database_switch row"
+		}
+		return fmt.Errorf("BloodHound boots the %q graph driver, not %q (%s says so), so a restart puts the stock driver back whatever image runs; "+
+			"switch the driver back to %s and restart the %s service, or run `bloodtrail rollback`", active, driverName, source, driverName, bloodhoundService)
+	}
+	return nil
+}
+
+// waitForDriverLogLine waits for the driver's marker in what the bloodhound
+// container has logged since its current run started (verify.LogsContain). A
+// service that has no running container yet, right after `up`, is waited for
+// like a marker that has not been logged yet.
 func waitForDriverLogLine(ctx context.Context, c dockerx.Compose) error {
+	var notRunning error
 	for attempt := 0; attempt < logMarkerAttempts; attempt++ {
 		ok, err := verify.LogsContain(ctx, c, bloodhoundService, verify.DriverActiveMarker)
-		if err != nil {
+		switch {
+		case errors.Is(err, dockerx.ErrNoRunningContainer):
+			notRunning = err
+		case err != nil:
 			return err
-		}
-		if ok {
+		case ok:
 			return nil
+		default:
+			notRunning = nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(logMarkerPoll):
 		}
 	}
-	return fmt.Errorf("the %s service never logged %q; the image may not contain the driver", bloodhoundService, verify.DriverActiveMarker)
+	if notRunning != nil {
+		return fmt.Errorf("the %s service never came up to log %q: %w", bloodhoundService, verify.DriverActiveMarker, notRunning)
+	}
+	return fmt.Errorf("the %s service never logged %q since its current start; the image may not contain the driver", bloodhoundService, verify.DriverActiveMarker)
 }
 
 // Rollback restores the original image and driver recorded in the manifest.
@@ -884,30 +939,12 @@ func withoutOverride(files []string) []string {
 // StartedAt; a recreate changes the id; either one invalidates anything
 // observed across the migration window (the migrator's own state lives in
 // that process and resets to idle on boot).
-func bloodhoundContainerEpoch(ctx context.Context, deps Deps, c dockerx.Compose) (string, error) {
-	out, err := c.PS(ctx, bloodhoundService)
+func bloodhoundContainerEpoch(ctx context.Context, c dockerx.Compose) (string, error) {
+	container, err := c.RunningContainer(ctx, bloodhoundService)
 	if err != nil {
-		return "", fmt.Errorf("docker compose ps %s: %w", bloodhoundService, err)
+		return "", err
 	}
-	// Same dual-shape parse as runningImage below: compose v2 prints a JSON
-	// array in recent versions and one object per line in older ones.
-	dec := json.NewDecoder(bytes.NewReader(out))
-	if tok, err := dec.Token(); err != nil {
-		return "", fmt.Errorf("parsing docker compose ps %s output: %w", bloodhoundService, err)
-	} else if delim, ok := tok.(json.Delim); !ok || delim != '[' {
-		dec = json.NewDecoder(bytes.NewReader(out))
-	}
-	var container struct {
-		ID string `json:"ID"`
-	}
-	if err := dec.Decode(&container); err != nil || container.ID == "" {
-		return "", fmt.Errorf("the %s service has no running container", bloodhoundService)
-	}
-	started, err := deps.Runner.Run(ctx, nil, "docker", "inspect", "-f", "{{.Id}} {{.State.StartedAt}}", container.ID)
-	if err != nil {
-		return "", fmt.Errorf("docker inspect %s: %w", container.ID, err)
-	}
-	return strings.TrimSpace(string(started)), nil
+	return container.ID + " " + container.StartedAt, nil
 }
 
 // runningImage reports the image of the service's container. The two answers

@@ -55,9 +55,19 @@ func WaitForAPI(ctx context.Context, client *http.Client, baseURL string, timeou
 	}
 }
 
-// LogsContain reports whether the service's logs include marker.
+// LogsContain reports whether marker is in what the service's container has
+// logged since its current run started. Docker keeps a container's log across
+// its restarts, so the whole log also holds the markers of every earlier run:
+// a container that booted one driver once and has since been restarted onto
+// another would still show the first one's marker there. It fails with
+// dockerx.ErrNoRunningContainer when the service has no running container,
+// which has no current run to ask about.
 func LogsContain(ctx context.Context, compose dockerx.Compose, service, marker string) (bool, error) {
-	logs, err := compose.Logs(ctx, service)
+	container, err := compose.RunningContainer(ctx, service)
+	if err != nil {
+		return false, err
+	}
+	logs, err := compose.LogsSince(ctx, service, container.StartedAt)
 	if err != nil {
 		return false, err
 	}

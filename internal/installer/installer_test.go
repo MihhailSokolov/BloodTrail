@@ -147,15 +147,13 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-			// Read once for migrator failures, before the override exists,
-			// and again through the whole project when verifying.
-			base + "logs --no-color bloodhound":                         []byte("BloodTrail driver active version=test\n"),
-			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
-			"docker image inspect " + image:                             []byte(""),
-			psql + setRowSQL:                                            []byte("INSERT 0 1\n"),
-			base + "-f " + overridePath + " up -d":                      nil,
-			base + neo4jNodeCount:                                       []byte("count\n10\n"),
-			base + neo4jEdgeCount:                                       []byte("count\n20\n"),
+			// Read once for migrator failures, before the override exists.
+			base + "logs --no-color bloodhound":    []byte("boot\n"),
+			"docker image inspect " + image:        []byte(""),
+			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d": nil,
+			base + neo4jNodeCount:                  []byte("count\n10\n"),
+			base + neo4jEdgeCount:                  []byte("count\n20\n"),
 			// The migration reaches the tool API through a curl container,
 			// which is fetched before anything is changed.
 			"docker pull " + toolapi.CurlImage: nil,
@@ -174,6 +172,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	}
 	scriptContainerEpoch(fake, base)
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, base+"-f "+overridePath+" ", "BloodTrail driver active version=test\n", "bloodtrail")
 	var out bytes.Buffer
 	deps := Deps{
 		Runner:  fake,
@@ -264,7 +263,7 @@ func TestInstallOnNeo4jDeployment(t *testing.T) {
 	if lineageIdx := idx(psql + endLineageSQL); lineageIdx == -1 || lineageIdx <= lastCountIdx || lineageIdx >= upIdx {
 		t.Fatalf("the watermark lineage must end after the migration and before BloodTrail starts:\n%s", strings.Join(fake.Calls, "\n"))
 	}
-	if !strings.Contains(string(fake.Calls[len(fake.Calls)-1]), "logs --no-color bloodhound") {
+	if !strings.Contains(string(fake.Calls[len(fake.Calls)-1]), "logs --no-color --since") {
 		t.Fatalf("expected verification logs call last, got %v", fake.Calls[len(fake.Calls)-1])
 	}
 }
@@ -471,7 +470,6 @@ func TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory(
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
 			base + "logs --no-color bloodhound":                             []byte(""),
-			base + "-f " + overridePath + " logs --no-color bloodhound":     []byte("BloodTrail driver active version=test\n"),
 			"docker image inspect " + image:                                 []byte(""),
 			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
@@ -505,6 +503,7 @@ func TestInstallSucceedsWhenPostgresMatchesFreshNeo4jCountsButNotStaleInventory(
 
 	scriptContainerEpoch(fake, base)
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, base+"-f "+overridePath+" ", "BloodTrail driver active version=test\n", "bloodtrail")
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -589,7 +588,6 @@ func TestInstallIgnoresAPreExistingMigratorFailureLog(t *testing.T) {
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-			base + "-f " + overridePath + " logs --no-color bloodhound":     []byte("BloodTrail driver active version=test\n"),
 			"docker image inspect " + image:                                 []byte(""),
 			"docker image inspect " + toolapi.CurlImage:                     []byte(""),
 			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
@@ -622,6 +620,7 @@ func TestInstallIgnoresAPreExistingMigratorFailureLog(t *testing.T) {
 
 	scriptContainerEpoch(fake, base)
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, base+"-f "+overridePath+" ", "BloodTrail driver active version=test\n", "bloodtrail")
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -701,17 +700,15 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 			base + "config --format json":                                   composeConfigJSON(upstreamImage, "neo4j"),
 			psql + "select driver from database_switch limit 1":             []byte(""),
 			base + "exec -T app-db pg_dump -Fc -U bloodhound -d bloodhound": []byte("PGDMP"),
-			// Read once for migrator failures, before the override exists,
-			// and again through the whole project when verifying.
-			base + "logs --no-color bloodhound":                         []byte("BloodTrail driver active version=test\n"),
-			base + "-f " + overridePath + " logs --no-color bloodhound": []byte("BloodTrail driver active version=test\n"),
-			psql + clearGraphSQL:                                        []byte("TRUNCATE TABLE\nDO\n"),
-			"docker image inspect " + image:                             []byte(""),
-			"docker image inspect " + toolapi.CurlImage:                 []byte(""),
-			psql + setRowSQL:                       []byte("INSERT 0 1\n"),
-			base + "-f " + overridePath + " up -d": nil,
-			base + neo4jNodeCount:                  []byte("count\n10\n"),
-			base + neo4jEdgeCount:                  []byte("count\n20\n"),
+			// Read once for migrator failures, before the override exists.
+			base + "logs --no-color bloodhound":         []byte("boot\n"),
+			psql + clearGraphSQL:                        []byte("TRUNCATE TABLE\nDO\n"),
+			"docker image inspect " + image:             []byte(""),
+			"docker image inspect " + toolapi.CurlImage: []byte(""),
+			psql + setRowSQL:                            []byte("INSERT 0 1\n"),
+			base + "-f " + overridePath + " up -d":      nil,
+			base + neo4jNodeCount:                       []byte("count\n10\n"),
+			base + neo4jEdgeCount:                       []byte("count\n20\n"),
 		},
 		Prefixes: map[string][]byte{
 			// Populated before the migration (which is what triggers the
@@ -741,6 +738,7 @@ func TestInstallReplacesPostgresGraphWhenAsked(t *testing.T) {
 
 	scriptContainerEpoch(fake, base)
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, base+"-f "+overridePath+" ", "BloodTrail driver active version=test\n", "bloodtrail")
 	deps := Deps{
 		Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{},
 		NewToolAPITransport: func(string) toolapi.Transport {
@@ -832,13 +830,13 @@ func TestInstallKeepsTheOperatorsComposeFiles(t *testing.T) {
 			"docker image inspect " + image:                                 []byte(""),
 			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
 			withOverride + "up -d":                                          nil,
-			withOverride + "logs --no-color bloodhound":                     []byte("BloodTrail driver active version=test\n"),
 		},
 		Prefixes: map[string][]byte{
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, withOverride, "BloodTrail driver active version=test\n", "bloodtrail")
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
@@ -910,7 +908,6 @@ func TestInstallRefusesToSubstituteTheImageAlias(t *testing.T) {
 			"docker manifest inspect " + alias:                              []byte("{}"),
 			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
 			base + "-f " + overridePath + " up -d":                          nil,
-			base + "-f " + overridePath + " logs --no-color bloodhound":     []byte("BloodTrail driver active version=test\n"),
 		},
 		Errors: map[string]error{
 			"docker image inspect " + versioned:    errors.New("no such image"),
@@ -1212,26 +1209,26 @@ func TestVerifyRunsChecks(t *testing.T) {
 	}))
 	defer api.Close()
 
-	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
-		base + "logs --no-color bloodhound": []byte("boot\nBloodTrail driver active version=0.1.0 mode=delegate backend=pg\n"),
-	}}
+	fake := &dockerx.FakeRunner{}
+	scriptRunningBloodhound(fake, base, "boot\nBloodTrail driver active version=0.1.0 mode=delegate backend=pg\n", "bloodtrail")
 	var out bytes.Buffer
 	opts := Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}
 	if err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, opts); err != nil {
 		t.Fatalf("verify failed: %v\n%s", err, out.String())
 	}
-	if apiHits == 0 || !fake.Called(base+"logs --no-color bloodhound") {
+	if apiHits == 0 || !fake.Called(base+"logs --no-color --since") {
 		t.Fatalf("both checks must run: apiHits=%d calls=%v", apiHits, fake.Calls)
 	}
-	if !strings.Contains(out.String(), "driver log line present") || !strings.Contains(out.String(), "API answers at") {
-		t.Fatalf("both checks must be reported:\n%s", out.String())
+	for _, want := range []string{"driver setting: bloodtrail", "driver log line present", "API answers at"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("every check must be reported (%q missing):\n%s", want, out.String())
+		}
 	}
 
 	// The log line is the decisive check and the cheap one, so it comes first:
 	// a missing driver must be reported without waiting on the API.
-	fake = &dockerx.FakeRunner{Outputs: map[string][]byte{
-		base + "logs --no-color bloodhound": []byte("boot\nready\n"),
-	}}
+	fake = &dockerx.FakeRunner{}
+	scriptRunningBloodhound(fake, base, "boot\nready\n", "bloodtrail")
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	unreachable := Options{ComposeFile: composeFile, APIURL: "http://127.0.0.1:1", VerifyTimeout: time.Second}
@@ -1240,6 +1237,127 @@ func TestVerifyRunsChecks(t *testing.T) {
 	}
 	if fake.Calls == nil {
 		t.Fatal("the log check must run before the API wait")
+	}
+}
+
+// scriptRunningBloodhound scripts what verification asks about the bloodhound
+// container of project (the "docker compose ..." prefix that names its
+// files): its identity, what it has logged since its current run started, the
+// project's configuration and the driver row. The whole log a container keeps
+// across restarts is not scripted here; a test that wants one adds it.
+func scriptRunningBloodhound(fake *dockerx.FakeRunner, project, sinceStart, row string) {
+	if fake.Outputs == nil {
+		fake.Outputs = map[string][]byte{}
+	}
+	fake.Outputs[project+"ps --format json bloodhound"] = []byte(`[{"ID":"cafe01","Image":"` + upstreamImage + `"}]`)
+	fake.Outputs["docker inspect -f {{.Id}} {{.State.StartedAt}} cafe01"] = []byte("cafe01 2026-09-02T00:00:00Z\n")
+	fake.Outputs[project+"logs --no-color --since 2026-09-02T00:00:00Z bloodhound"] = []byte(sinceStart)
+	fake.Outputs[project+"config --format json"] = composeConfigJSON(upstreamImage, "pg")
+	fake.Outputs[project+"exec -T app-db psql -v ON_ERROR_STOP=1 -U bloodhound -d bloodhound -tAc select driver from database_switch limit 1"] = []byte(row + "\n")
+}
+
+// shortenLogMarkerPoll makes the wait between looks for the driver's log line
+// short for the length of the test, so one that expects the line never to
+// show up does not sit out the two minutes.
+func shortenLogMarkerPoll(t *testing.T) {
+	t.Helper()
+	saved := logMarkerPoll
+	logMarkerPoll = time.Millisecond
+	t.Cleanup(func() { logMarkerPoll = saved })
+}
+
+// TestVerifyIgnoresAMarkerFromBeforeTheCurrentStart covers the log docker
+// keeps for a container across its restarts: the marker of a run that has
+// since been replaced by one on the stock driver (through the tool API's
+// /graph-db/switch/pg, say) is still in it, and verify used to find it there
+// and pass. Only what the container has logged since its current run started
+// counts. The stale whole-log answer is scripted too, so a verify that still
+// reads it is the one that passes.
+func TestVerifyIgnoresAMarkerFromBeforeTheCurrentStart(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+	defer api.Close()
+
+	fake := &dockerx.FakeRunner{Outputs: map[string][]byte{
+		base + "logs --no-color bloodhound": []byte("Connecting to graph using BloodTrail\nBloodTrail driver active version=0.1.2 mode=engine backend=pg\n" +
+			"shutting down\nConnecting to graph using PostgreSQL\nServer started\n"),
+	}}
+	scriptRunningBloodhound(fake, base, "Connecting to graph using PostgreSQL\nServer started\n", "bloodtrail")
+	shortenLogMarkerPoll(t)
+	var out bytes.Buffer
+	err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "never logged") || !strings.Contains(err.Error(), "since its current start") {
+		t.Fatalf("verify passed on a container whose current run never logged the marker (err %v):\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "driver log line present") {
+		t.Fatalf("verify reported a marker the current run did not log:\n%s", out.String())
+	}
+}
+
+// TestVerifyWaitsForTheContainerToComeUp pins that a service with no running
+// container is waited for like a marker not yet logged -- right after `up` the
+// container may not be listed yet -- and that a service that never comes up is
+// reported as that, not as a driver that is missing from the image.
+func TestVerifyWaitsForTheContainerToComeUp(t *testing.T) {
+	logs := "BloodTrail driver active version=0.1.2 mode=engine backend=pg\n"
+	t.Run("comes up", func(t *testing.T) {
+		dir, composeFile := setupProject(t)
+		base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+		defer api.Close()
+		fake := &dockerx.FakeRunner{Sequences: map[string][][]byte{base + "ps --format json bloodhound": {[]byte("[]\n"), []byte("")}}}
+		scriptRunningBloodhound(fake, base, logs, "bloodtrail")
+		shortenLogMarkerPoll(t)
+		if err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second}); err != nil {
+			t.Fatalf("verify gave up on a container that was about to come up: %v", err)
+		}
+	})
+	t.Run("never comes up", func(t *testing.T) {
+		dir, composeFile := setupProject(t)
+		base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+		fake := &dockerx.FakeRunner{}
+		scriptRunningBloodhound(fake, base, logs, "bloodtrail")
+		fake.Outputs[base+"ps --format json bloodhound"] = []byte("[]\n")
+		shortenLogMarkerPoll(t)
+		err := Verify(context.Background(), Deps{Runner: fake, Out: &bytes.Buffer{}}, Options{ComposeFile: composeFile, VerifyTimeout: time.Second})
+		if err == nil || !strings.Contains(err.Error(), "never came up") || !errors.Is(err, dockerx.ErrNoRunningContainer) {
+			t.Fatalf("expected an error saying the service never came up, got %v", err)
+		}
+	})
+}
+
+// TestVerifyChecksTheDriverRow covers a BloodTrail run whose row has been
+// switched away since it booted: the log marker is there, but the next
+// restart of the container boots the driver the row names.
+func TestVerifyChecksTheDriverRow(t *testing.T) {
+	for _, c := range []struct {
+		name, row, env string
+		ok             bool
+	}{
+		{"the bloodtrail row", "bloodtrail", "pg", true},
+		{"another driver's row", "pg", "bloodtrail", false},
+		{"no row, and the setting names bloodtrail", "", "bloodtrail", true},
+		{"no row, and the setting names another driver", "", "pg", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir, composeFile := setupProject(t)
+			base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) }))
+			defer api.Close()
+			logs := "BloodTrail driver active version=0.1.2 mode=engine backend=pg\n"
+			fake := &dockerx.FakeRunner{Outputs: map[string][]byte{base + "logs --no-color bloodhound": []byte(logs)}}
+			scriptRunningBloodhound(fake, base, logs, c.row)
+			fake.Outputs[base+"config --format json"] = composeConfigJSON(upstreamImage, c.env)
+			var out bytes.Buffer
+			err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, Options{ComposeFile: composeFile, APIURL: api.URL, VerifyTimeout: time.Second})
+			switch {
+			case c.ok && err != nil:
+				t.Fatalf("verify failed: %v\n%s", err, out.String())
+			case !c.ok && (err == nil || !strings.Contains(err.Error(), `"bloodtrail"`)):
+				t.Fatalf("verify accepted a deployment that does not boot the bloodtrail driver (err %v):\n%s", err, out.String())
+			}
+		})
 	}
 }
 
@@ -1282,13 +1400,13 @@ func TestInstallKeepsTheComposeFileDiscoveryWouldHaveLoaded(t *testing.T) {
 			"docker image inspect " + image:                                 []byte(""),
 			psql + setRowSQL:                                                []byte("INSERT 0 1\n"),
 			withOverride + "up -d":                                          nil,
-			withOverride + "logs --no-color bloodhound":                     []byte("BloodTrail driver active version=test\n"),
 		},
 		Prefixes: map[string][]byte{
 			psql + "select (select count(*) from node)": []byte("10|20\n"),
 		},
 	}
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, withOverride, "BloodTrail driver active version=test\n", "bloodtrail")
 	opts := Options{ComposeFile: composeFile, Image: image, APIURL: api.URL, Yes: true,
 		VerifyTimeout: time.Second, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
 	if err := Install(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &bytes.Buffer{}}, opts); err != nil {
@@ -1864,12 +1982,12 @@ func scriptPGInstall(fake *dockerx.FakeRunner, project, overridePath, image stri
 		"docker image inspect " + image:                                    []byte(""),
 		psql + setRowSQL:                                                   []byte("INSERT 0 1\n"),
 		withOverride + "up -d":                                             nil,
-		withOverride + "logs --no-color bloodhound":                        []byte("BloodTrail driver active version=test\n"),
 	} {
 		fake.Outputs[cmd] = out
 	}
 	fake.Prefixes[psql+"select (select count(*) from node)"] = []byte("10|20\n")
 	scriptLineageEnd(fake, psql)
+	scriptRunningBloodhound(fake, withOverride, "BloodTrail driver active version=test\n", "bloodtrail")
 	return fake
 }
 
