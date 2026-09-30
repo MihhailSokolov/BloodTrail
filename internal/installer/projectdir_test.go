@@ -117,6 +117,8 @@ func writeProjectFile(t *testing.T, root, name string) string {
 // for the two to reach the same containers at all. Skipped where there is no
 // docker compose.
 func TestInstallAcceptsAProjectOnlyWhereComposeAgreesOnItsDirectory(t *testing.T) {
+	requireComposeOracle(t)
+	requireFirstFileDirectoryIsTheProjectDirectory(t)
 	for _, c := range []struct {
 		name   string
 		layout func(t *testing.T, root string) (env, composeFile string)
@@ -146,7 +148,7 @@ func TestInstallAcceptsAProjectOnlyWhereComposeAgreesOnItsDirectory(t *testing.T
 			if err := os.WriteFile(filepath.Join(root, ".env"), []byte(env), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			operator, err := dockerComposeConfig(t, root)
+			operator, err := dockerComposeConfig(root)
 			if err != nil {
 				t.Fatalf("the operator's own command: %v", err)
 			}
@@ -158,7 +160,7 @@ func TestInstallAcceptsAProjectOnlyWhereComposeAgreesOnItsDirectory(t *testing.T
 					t.Fatal(err)
 				}
 			}
-			installer, err := dockerComposeConfig(t, root, h.Args()[1:len(h.Args())]...)
+			installer, err := dockerComposeConfig(root, h.Args()[1:]...)
 			if err != nil {
 				t.Fatalf("the installer's command line: %v", err)
 			}
@@ -172,6 +174,31 @@ func TestInstallAcceptsAProjectOnlyWhereComposeAgreesOnItsDirectory(t *testing.T
 				t.Errorf("install refused a project compose and the installer address alike (%s): %v", pgdataSources(t, operator), refused)
 			}
 		})
+	}
+}
+
+// requireFirstFileDirectoryIsTheProjectDirectory skips the test unless this
+// docker compose takes the directory of the first file COMPOSE_FILE lists as
+// the project directory -- what the installer's refusal is built on, and what
+// every compose release the installer supports does, but which the oracle
+// comparison below would misreport as an over-refusal on one that did not.
+func requireFirstFileDirectoryIsTheProjectDirectory(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	writeProjectFile(t, root, "docker/compose.yml")
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("COMPOSE_FILE=docker/compose.yml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := dockerComposeConfig(root)
+	if err != nil {
+		t.Skipf("docker compose cannot read the probe project: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(filepath.Join(root, "docker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pgdataSources(t, out); got != filepath.Join(want, "pgdata") {
+		t.Skipf("this docker compose resolves ./pgdata to %s, not against the first COMPOSE_FILE entry's directory", got)
 	}
 }
 

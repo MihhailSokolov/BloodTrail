@@ -215,15 +215,29 @@ func TestInstallThenRollbackGivesAnAbsoluteListBack(t *testing.T) {
 	}
 }
 
-// dockerComposeConfig runs `docker compose config --format json` -- which
-// reads and prints the project and starts nothing -- in cwd, with args in
-// front, and returns its standard output. It skips the test when there is no
-// docker compose to ask.
-func dockerComposeConfig(t *testing.T, cwd string, args ...string) (string, error) {
+// requireComposeOracle skips the test unless docker compose is there and can
+// read a trivial project. What the tests that call it compare the installer
+// with is compose's own answer, so where there is none -- no docker, no
+// compose plugin, nothing that can load a project -- they have nothing to say.
+// `docker compose config`, all they ever run, only reads and prints a project;
+// it starts nothing.
+func requireComposeOracle(t *testing.T) {
 	t.Helper()
 	if err := exec.Command("docker", "compose", "version").Run(); err != nil {
 		t.Skipf("no docker compose to use as the oracle: %v", err)
 	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services:\n  s:\n    image: img:x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dockerComposeConfig(dir); err != nil {
+		t.Skipf("docker compose cannot read a trivial project here: %v", err)
+	}
+}
+
+// dockerComposeConfig runs `docker compose config --format json` in cwd, with
+// args in front, and returns its standard output.
+func dockerComposeConfig(cwd string, args ...string) (string, error) {
 	cmd := exec.Command("docker", append(append([]string{"compose"}, args...), "config", "--format", "json")...)
 	cmd.Dir = cwd
 	// The oracle must read what the project says, not what this shell says:
@@ -263,6 +277,7 @@ func (e *composeOracleError) Error() string { return e.err.Error() + ": " + e.st
 // absolute one exists, and a compose that resolved relative names against the
 // project directory would make that one merely unnecessary.
 func TestOverrideEntryLoadsFromAnyDirectoryComposeIsRunFrom(t *testing.T) {
+	requireComposeOracle(t)
 	dir := t.TempDir()
 	elsewhere := t.TempDir()
 	composeFile := filepath.Join(dir, "docker-compose.yml")
@@ -294,7 +309,7 @@ func TestOverrideEntryLoadsFromAnyDirectoryComposeIsRunFrom(t *testing.T) {
 	written, _ := os.ReadFile(envPath)
 
 	for _, cwd := range []string{dir, elsewhere} {
-		out, err := dockerComposeConfig(t, cwd, "--project-directory", dir)
+		out, err := dockerComposeConfig(cwd, "--project-directory", dir)
 		if err != nil || !strings.Contains(out, `"image": "img:bt"`) {
 			t.Errorf("run from %s, with .env %q: the project does not have the override's image (err %v):\n%s", cwd, written, err, out)
 		}
@@ -304,7 +319,7 @@ func TestOverrideEntryLoadsFromAnyDirectoryComposeIsRunFrom(t *testing.T) {
 	if err := os.WriteFile(envPath, []byte(relative), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := dockerComposeConfig(t, elsewhere, "--project-directory", dir); err != nil {
+	if out, err := dockerComposeConfig(elsewhere, "--project-directory", dir); err != nil {
 		t.Logf("the relative spelling, run from another directory, fails as expected: %v", err)
 	} else {
 		t.Logf("this docker compose resolves the relative name against the project directory (override loaded: %v)", strings.Contains(out, "img:bt"))
