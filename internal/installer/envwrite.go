@@ -52,10 +52,20 @@ func planEnvReplacement(path string) (envReplacement, error) {
 	}
 	f, err := os.OpenFile(target, os.O_WRONLY, 0)
 	if err != nil {
-		return envReplacement{}, fmt.Errorf("%s cannot be written by this user: %w", target, err)
+		return envReplacement{}, fmt.Errorf("%s cannot be written by this user: %w", target, withoutPath(err))
 	}
 	_ = f.Close()
 	return envReplacement{target: target, info: info}, nil
+}
+
+// withoutPath returns the reason inside a path error, for a message that
+// names the path itself.
+func withoutPath(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	return err
 }
 
 // stage writes data into a new scratch file beside the target and returns its
@@ -73,7 +83,7 @@ func (r envReplacement) stage(data []byte) (string, error) {
 	}
 	f, err := createScratchFile(filepath.Dir(r.target), perm)
 	if err != nil {
-		return "", fmt.Errorf("cannot create a file in %s to replace .env with: %w", filepath.Dir(r.target), err)
+		return "", fmt.Errorf("cannot create a file in %s to replace .env with: %w", filepath.Dir(r.target), withoutPath(err))
 	}
 	path := f.Name()
 	if err := fillScratchFile(f, data, r.info); err != nil {

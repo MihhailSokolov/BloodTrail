@@ -458,7 +458,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 		return err
 	} else if updated != current {
 		if err := checkEnvWritable(envPath); err != nil {
-			return fmt.Errorf("the install has to add its override to COMPOSE_FILE in %s and cannot rewrite it: %w; let this user write it (or run bloodtrail as the file's owner) and rerun; nothing has been changed", envPath, err)
+			return fmt.Errorf("the install has to add its override to COMPOSE_FILE in .env, which it cannot rewrite: %w; fix that (let this user write .env, or run bloodtrail as its owner) and rerun; nothing has been changed", err)
 		}
 	}
 	say("==> Inventory")
@@ -915,7 +915,7 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		return err
 	} else if exists && restored != current {
 		if err := checkEnvWritable(envPath); err != nil {
-			return fmt.Errorf("rollback has to take its override out of COMPOSE_FILE in %s and cannot rewrite it: %w; let this user write it (or run bloodtrail as the file's owner) and rerun; nothing has been changed", envPath, err)
+			return fmt.Errorf("rollback has to take its override out of COMPOSE_FILE in .env, which it cannot rewrite: %w; fix that (let this user write .env, or run bloodtrail as its owner) and rerun; nothing has been changed", err)
 		}
 	}
 
