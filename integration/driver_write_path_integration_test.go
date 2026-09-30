@@ -143,3 +143,175 @@ func TestRelationshipDeleteByConjoinedKindMatchersMatchesPostgres(t *testing.T) 
 		})
 	}
 }
+
+// writePathQuerySource is what a graph.Transaction and a graph.Batch both
+// offer: query builders bound to the write in progress.
+type writePathQuerySource interface {
+	Nodes() graph.NodeQuery
+	Relationships() graph.RelationshipQuery
+}
+
+// TestUpdatingClauseInFinalCriteriaReachesTheReplica covers
+// NodeQuery.Query/Fetch and RelationshipQuery.Query given an updating
+// clause in finalCriteria -- exactly how the pg driver's own Delete and
+// Update run (liveQuery.exec) -- through every entry point that can write.
+// Nothing tells the replica which rows such a call touched, so it must
+// bump the watermark and fall back: the answer afterwards must match
+// PostgreSQL's, and a ReadTransaction that wrote this way must answer its
+// own later reads from PostgreSQL, not from the pre-write replica.
+func TestUpdatingClauseInFinalCriteriaReachesTheReplica(t *testing.T) {
+	var (
+		nodeKind = graph.StringKind("WritePathFinalCriteriaNode")
+		edgeKind = graph.StringKind("WritePathFinalCriteriaEdge")
+	)
+
+	type method struct {
+		name string
+		// write runs the updating call against src.
+		write func(src writePathQuerySource) error
+		// inTxCount reads the count the write changes, through the
+		// transaction that wrote it.
+		inTxCount func(src writePathQuerySource) (int64, error)
+		// count reads the same count through db.
+		count func(t *testing.T, ctx context.Context, db graph.Database) int64
+	}
+	methods := []method{
+		{
+			name: "NodeQuery.Query",
+			write: func(src writePathQuerySource) error {
+				return src.Nodes().Filter(query.Kind(query.Node(), nodeKind)).Query(func(result graph.Result) error {
+					return result.Error()
+				}, query.Delete(query.Node()))
+			},
+			inTxCount: func(src writePathQuerySource) (int64, error) {
+				return src.Nodes().Filter(query.Kind(query.Node(), nodeKind)).Count()
+			},
+			count: func(t *testing.T, ctx context.Context, db graph.Database) int64 {
+				return nodeCountByKind(t, ctx, db, nodeKind)
+			},
+		},
+		{
+			name: "NodeQuery.Fetch",
+			write: func(src writePathQuerySource) error {
+				return src.Nodes().Filter(query.Kind(query.Node(), nodeKind)).Fetch(func(cursor graph.Cursor[*graph.Node]) error {
+					for range cursor.Chan() {
+					}
+					return cursor.Error()
+				}, query.Delete(query.Node()))
+			},
+			inTxCount: func(src writePathQuerySource) (int64, error) {
+				return src.Nodes().Filter(query.Kind(query.Node(), nodeKind)).Count()
+			},
+			count: func(t *testing.T, ctx context.Context, db graph.Database) int64 {
+				return nodeCountByKind(t, ctx, db, nodeKind)
+			},
+		},
+		{
+			name: "RelationshipQuery.Query",
+			write: func(src writePathQuerySource) error {
+				return src.Relationships().Filter(query.Kind(query.Relationship(), edgeKind)).Query(func(result graph.Result) error {
+					return result.Error()
+				}, query.Delete(query.Relationship()))
+			},
+			inTxCount: func(src writePathQuerySource) (int64, error) {
+				return src.Relationships().Filter(query.Kind(query.Relationship(), edgeKind)).Count()
+			},
+			count: func(t *testing.T, ctx context.Context, db graph.Database) int64 {
+				return relCountByKind(t, ctx, db, edgeKind)
+			},
+		},
+	}
+
+	type entryPoint struct {
+		name string
+		// run performs m.write and, for a ReadTransaction, returns the count
+		// m.inTxCount read inside the same call afterwards (-1 otherwise).
+		run func(ctx context.Context, bt graph.Database, m method) (int64, error)
+	}
+	entryPoints := []entryPoint{
+		{
+			name: "WriteTransaction",
+			run: func(ctx context.Context, bt graph.Database, m method) (int64, error) {
+				return -1, bt.WriteTransaction(ctx, func(tx graph.Transaction) error { return m.write(tx) })
+			},
+		},
+		{
+			name: "ReadTransaction",
+			run: func(ctx context.Context, bt graph.Database, m method) (int64, error) {
+				inTx := int64(-1)
+				err := bt.ReadTransaction(ctx, func(tx graph.Transaction) error {
+					if err := m.write(tx); err != nil {
+						return err
+					}
+					n, err := m.inTxCount(tx)
+					inTx = n
+					return err
+				})
+				return inTx, err
+			},
+		},
+		{
+			name: "BatchOperation",
+			run: func(ctx context.Context, bt graph.Database, m method) (int64, error) {
+				return -1, bt.BatchOperation(ctx, func(b graph.Batch) error { return m.write(b) })
+			},
+		},
+	}
+
+	for _, ep := range entryPoints {
+		for _, m := range methods {
+			t.Run(ep.name+"/"+m.name, func(t *testing.T) {
+				d, bt, oracle, _, buf, ctx := openWritePathDriver(t)
+
+				if err := bt.WriteTransaction(ctx, func(tx graph.Transaction) error {
+					a, err := tx.CreateNode(graph.NewProperties(), nodeKind)
+					if err != nil {
+						return err
+					}
+					b, err := tx.CreateNode(graph.NewProperties(), nodeKind)
+					if err != nil {
+						return err
+					}
+					_, err = tx.CreateRelationshipByIDs(a.ID, b.ID, edgeKind, graph.NewProperties())
+					return err
+				}); err != nil {
+					t.Fatalf("fixture: %v", err)
+				}
+				requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the nodes serve",
+					func() int64 { return nodeCountByKind(t, ctx, bt, nodeKind) }, 2)
+
+				counterBefore, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
+				if err != nil {
+					t.Fatalf("ReadWatermark: %v", err)
+				}
+				fallbacksBefore := markerCount(buf, fallbackEnteredMarker)
+
+				inTx, err := ep.run(ctx, bt, m)
+				if err != nil {
+					t.Fatalf("write: %v", err)
+				}
+
+				if pgCount := m.count(t, ctx, oracle); pgCount != 0 {
+					t.Fatalf("postgresql still counts %d: the updating clause did not run", pgCount)
+				}
+				if inTx > 0 {
+					t.Fatalf("the writing ReadTransaction read back %d, postgresql holds 0: its own read was served from the pre-write replica", inTx)
+				}
+				wantNodes, wantEdges := nodeCountByKind(t, ctx, oracle, nodeKind), relCountByKind(t, ctx, oracle, edgeKind)
+				if gotNodes, gotEdges := nodeCountByKind(t, ctx, bt, nodeKind), relCountByKind(t, ctx, bt, edgeKind); gotNodes != wantNodes || gotEdges != wantEdges {
+					t.Fatalf("WRONG ANSWER after the write: bloodtrail nodes=%d edges=%d, postgresql nodes=%d edges=%d", gotNodes, gotEdges, wantNodes, wantEdges)
+				}
+				if delta := markerCount(buf, fallbackEnteredMarker) - fallbacksBefore; delta != 1 {
+					t.Fatalf("fallback entered %d time(s) for the write, want 1", delta)
+				}
+				counterAfter, err := bloodtrail.TestingEngine(d).ReadWatermark(ctx)
+				if err != nil {
+					t.Fatalf("ReadWatermark: %v", err)
+				}
+				if counterAfter != counterBefore+1 {
+					t.Fatalf("watermark counter %d -> %d across the write, want exactly one bump", counterBefore, counterAfter)
+				}
+			})
+		}
+	}
+}

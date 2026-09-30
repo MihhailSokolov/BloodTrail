@@ -300,6 +300,7 @@ type mockNodeQuery struct {
 	updateCalls  int
 	deleteCalls  int
 	queryCalls   int
+	fetchCalls   int
 
 	countCalls      int
 	fetchIDsCalls   int
@@ -357,7 +358,8 @@ func (m *mockNodeQuery) First() (*graph.Node, error) {
 }
 
 func (m *mockNodeQuery) Fetch(func(graph.Cursor[*graph.Node]) error, ...graph.Criteria) error {
-	panic("mockNodeQuery: Fetch not implemented")
+	m.fetchCalls++
+	return nil
 }
 
 func (m *mockNodeQuery) FetchIDs(delegate func(cursor graph.Cursor[graph.ID]) error) error {
@@ -1609,6 +1611,15 @@ func TestDriverReadTransactionAppliesWritesMadeThroughIt(t *testing.T) {
 		{"NodeQuery.Update", func(tx graph.Transaction) error { return tx.Nodes().Update(graph.NewProperties()) }},
 		{"RelationshipQuery.Delete", func(tx graph.Transaction) error { return tx.Relationships().Delete() }},
 		{"RelationshipQuery.Update", func(tx graph.Transaction) error { return tx.Relationships().Update(graph.NewProperties()) }},
+		{"NodeQuery.Query with an updating clause", func(tx graph.Transaction) error {
+			return tx.Nodes().Query(func(graph.Result) error { return nil }, query.Delete(query.Node()))
+		}},
+		{"NodeQuery.Fetch with an updating clause", func(tx graph.Transaction) error {
+			return tx.Nodes().Fetch(func(graph.Cursor[*graph.Node]) error { return nil }, query.Delete(query.Node()))
+		}},
+		{"RelationshipQuery.Query with an updating clause", func(tx graph.Transaction) error {
+			return tx.Relationships().Query(func(graph.Result) error { return nil }, query.Delete(query.Relationship()))
+		}},
 		{"write through a WithGraph child", func(tx graph.Transaction) error {
 			_, err := tx.WithGraph(graph.Graph{Name: "other"}).CreateNode(graph.NewProperties())
 			return err
@@ -1669,6 +1680,8 @@ func TestDriverReadTransactionWithoutWritesDoesNotApply(t *testing.T) {
 		_ = tx.Query("MATCH (n) WHERE n.name = $name RETURN n", map[string]any{"name": "a"})
 		_ = tx.Query("CALL db.labels()", nil)
 		_ = tx.Query("MATCH (n RETURN", nil)
+		_ = tx.Nodes().Query(func(graph.Result) error { return nil }, query.Limit(1))
+		_ = tx.Nodes().Fetch(func(graph.Cursor[*graph.Node]) error { return nil }, query.Limit(1))
 		_, err := tx.Nodes().Count()
 		return err
 	}); err != nil {

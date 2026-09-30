@@ -138,15 +138,20 @@ func (f *fakeTransaction) GraphQueryMemoryLimit() size.Size {
 var _ graph.Transaction = (*fakeTransaction)(nil)
 
 // fakeNodeQuery is a graph.NodeQuery implementing every fluent/delegating
-// method this file's tests exercise (Filter, Filterf, Delete, Update,
-// OrderBy, Offset, Limit) fully, and panicking on the rest (Query, Count,
-// First, Fetch, FetchIDs, FetchKinds) -- none of observingNodeQuery's
-// contract touches those, so reaching one here would mean a test drives
-// more of the interface than it claims to (mirrors wrapper_test.go's own
-// stub convention).
+// method this file's tests exercise (Filter, Filterf, Query, Fetch, Delete,
+// Update, OrderBy, Offset, Limit) fully, and panicking on the rest (Count,
+// First, FetchIDs, FetchKinds) -- none of observingNodeQuery's contract
+// touches those, so reaching one here would mean a test drives more of the
+// interface than it claims to (mirrors wrapper_test.go's own stub
+// convention).
 type fakeNodeQuery struct {
 	filterCalls  []graph.Criteria
 	filterfCalls int
+
+	// queryFinalCriteria and fetchFinalCriteria hold each Query/Fetch
+	// call's finalCriteria, in call order.
+	queryFinalCriteria [][]graph.Criteria
+	fetchFinalCriteria [][]graph.Criteria
 
 	deleteCalls int
 	deleteErr   error
@@ -170,8 +175,9 @@ func (f *fakeNodeQuery) Filterf(criteriaDelegate graph.CriteriaProvider) graph.N
 	return f
 }
 
-func (f *fakeNodeQuery) Query(func(graph.Result) error, ...graph.Criteria) error {
-	panic("fakeNodeQuery: Query not implemented")
+func (f *fakeNodeQuery) Query(_ func(graph.Result) error, finalCriteria ...graph.Criteria) error {
+	f.queryFinalCriteria = append(f.queryFinalCriteria, finalCriteria)
+	return nil
 }
 
 func (f *fakeNodeQuery) Delete() error {
@@ -207,8 +213,9 @@ func (f *fakeNodeQuery) First() (*graph.Node, error) {
 	panic("fakeNodeQuery: First not implemented")
 }
 
-func (f *fakeNodeQuery) Fetch(func(graph.Cursor[*graph.Node]) error, ...graph.Criteria) error {
-	panic("fakeNodeQuery: Fetch not implemented")
+func (f *fakeNodeQuery) Fetch(_ func(graph.Cursor[*graph.Node]) error, finalCriteria ...graph.Criteria) error {
+	f.fetchFinalCriteria = append(f.fetchFinalCriteria, finalCriteria)
+	return nil
 }
 
 func (f *fakeNodeQuery) FetchIDs(func(graph.Cursor[graph.ID]) error) error {
@@ -439,6 +446,40 @@ func TestCypherMutatesRecoversFromPanicByAssumingMutation(t *testing.T) {
 
 	if got := cypherMutates("MATCH (n) RETURN n"); !got {
 		t.Fatalf("cypherMutates after a parser panic = %v, want true (conservative recover)", got)
+	}
+}
+
+// -----------------------------------------------------------------------
+// hasUpdatingClause
+// -----------------------------------------------------------------------
+
+// writePathDeleteClause is the updating clause query.Delete(query.Node())
+// builds, spelled out without a dawgs/query import.
+func writePathDeleteClause() *cypher.UpdatingClause {
+	return cypher.NewUpdatingClause(cypher.NewDelete(true, []cypher.Expression{nodeVariable()}))
+}
+
+func TestHasUpdatingClause(t *testing.T) {
+	cases := []struct {
+		name     string
+		criteria []graph.Criteria
+		want     bool
+	}{
+		{"no criteria", nil, false},
+		{"a projection and a limit", []graph.Criteria{&cypher.Return{}, cypher.NewLimit(1)}, false},
+		{"an updating clause", []graph.Criteria{writePathDeleteClause()}, true},
+		{"an updating clause after a projection", []graph.Criteria{&cypher.Return{}, writePathDeleteClause()}, true},
+		{"a list of updating clauses", []graph.Criteria{[]*cypher.UpdatingClause{writePathDeleteClause()}}, true},
+		{"an empty list of updating clauses", []graph.Criteria{[]*cypher.UpdatingClause{}}, false},
+		{"an updating clause nested in a criteria list", []graph.Criteria{[]graph.Criteria{cypher.NewLimit(1), []graph.Criteria{writePathDeleteClause()}}}, true},
+		{"a nested criteria list without one", []graph.Criteria{[]graph.Criteria{cypher.NewLimit(1)}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasUpdatingClause(tc.criteria); got != tc.want {
+				t.Fatalf("hasUpdatingClause = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1753,6 +1794,78 @@ func TestObservingRelationshipQueryLimitDeleteStaysObserved(t *testing.T) {
 	}
 	if ok, _ := scope.Changes().HasFallback(); !ok {
 		t.Fatalf("HasFallback() = false, want true: no criteria was ever recognized")
+	}
+}
+
+// TestObservingQueryAndFetchRecordUpdatingFinalCriteria pins the write-side
+// half of DRIVER-2: NodeQuery.Query/Fetch and RelationshipQuery.Query carry
+// an updating clause in finalCriteria straight into the SQL the pg driver
+// runs, so the observers must record a fallback for it -- and only for it:
+// a plain read through the same methods records nothing. Either way the
+// call reaches the inner query with finalCriteria unchanged.
+func TestObservingQueryAndFetchRecordUpdatingFinalCriteria(t *testing.T) {
+	calls := []struct {
+		name string
+		// call runs the method on a fresh observer over scope and returns the
+		// finalCriteria the inner query received.
+		call func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria
+	}{
+		{"NodeQuery.Query", func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria {
+			inner := &fakeNodeQuery{}
+			q := &observingNodeQuery{NodeQuery: inner, scope: scope}
+			if err := q.Query(func(graph.Result) error { return nil }, finalCriteria...); err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if len(inner.queryFinalCriteria) != 1 {
+				t.Fatalf("Query reached the inner query %d times, want 1", len(inner.queryFinalCriteria))
+			}
+			return inner.queryFinalCriteria[0]
+		}},
+		{"NodeQuery.Fetch", func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria {
+			inner := &fakeNodeQuery{}
+			q := &observingNodeQuery{NodeQuery: inner, scope: scope}
+			if err := q.Fetch(func(graph.Cursor[*graph.Node]) error { return nil }, finalCriteria...); err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if len(inner.fetchFinalCriteria) != 1 {
+				t.Fatalf("Fetch reached the inner query %d times, want 1", len(inner.fetchFinalCriteria))
+			}
+			return inner.fetchFinalCriteria[0]
+		}},
+		{"RelationshipQuery.Query", func(scope *engine.WriteScope, finalCriteria []graph.Criteria) []graph.Criteria {
+			inner := &mockRelationshipQuery{}
+			q := &observingRelationshipQuery{RelationshipQuery: inner, scope: scope}
+			if err := q.Query(func(graph.Result) error { return nil }, finalCriteria...); err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if inner.queryCalls != 1 {
+				t.Fatalf("Query reached the inner query %d times, want 1", inner.queryCalls)
+			}
+			return inner.lastQueryFinalCriteria
+		}},
+	}
+
+	for _, c := range calls {
+		t.Run(c.name+" with an updating clause", func(t *testing.T) {
+			scope := engine.NewWriteScope()
+			finalCriteria := []graph.Criteria{&cypher.Return{}, writePathDeleteClause()}
+			if got := c.call(scope, finalCriteria); !reflect.DeepEqual(got, finalCriteria) {
+				t.Fatalf("inner query received %v, want %v", got, finalCriteria)
+			}
+			if ok, _ := scope.Changes().HasFallback(); !ok {
+				t.Fatalf("HasFallback() = false, want true for a write nothing can name the rows of")
+			}
+		})
+		t.Run(c.name+" without one", func(t *testing.T) {
+			scope := engine.NewWriteScope()
+			finalCriteria := []graph.Criteria{&cypher.Return{}, cypher.NewLimit(1)}
+			if got := c.call(scope, finalCriteria); !reflect.DeepEqual(got, finalCriteria) {
+				t.Fatalf("inner query received %v, want %v", got, finalCriteria)
+			}
+			if !scope.Empty() {
+				t.Fatalf("a read recorded something on the write scope")
+			}
+		})
 	}
 }
 

@@ -423,8 +423,9 @@ func applyContext(ctx context.Context) context.Context {
 }
 
 // observingNodeQuery wraps a live graph.NodeQuery so that Delete() and
-// Update() can mark scope before delegating. graph.NodeQuery is embedded, so
-// every method this file does not override (Query, Count, First, Fetch,
+// Update() -- and a Query() or Fetch() whose final criteria carry an
+// updating clause -- can mark scope before delegating. graph.NodeQuery is
+// embedded, so every method this file does not override (Count, First,
 // FetchIDs, FetchKinds) is promoted straight through to the inner query
 // unchanged.
 //
@@ -546,14 +547,33 @@ func (q *observingNodeQuery) Update(properties *graph.Properties) error {
 	return q.NodeQuery.Update(properties)
 }
 
+// Query delegates, first bumping the watermark and recording a fallback
+// when finalCriteria carry an updating clause (recordUpdatingFinalCriteria):
+// the pg driver runs that clause as part of this very query -- its own
+// Delete and Update are built exactly this way -- and nothing here can tell
+// which rows it touches.
+func (q *observingNodeQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
+	recordUpdatingFinalCriteria(q.ctx, q.eng, q.current(), "NodeQuery.Query", finalCriteria)
+	return q.NodeQuery.Query(delegate, finalCriteria...)
+}
+
+// Fetch is Query's cursor-shaped twin: the pg driver appends finalCriteria
+// to its own RETURN, so an updating clause among them writes just the same.
+func (q *observingNodeQuery) Fetch(delegate func(cursor graph.Cursor[*graph.Node]) error, finalCriteria ...graph.Criteria) error {
+	recordUpdatingFinalCriteria(q.ctx, q.eng, q.current(), "NodeQuery.Fetch", finalCriteria)
+	return q.NodeQuery.Fetch(delegate, finalCriteria...)
+}
+
 // observingRelationshipQuery wraps a live graph.RelationshipQuery, recording
 // every criteria the caller filters by (mirroring relationship_query.go's
 // read-side recordingRelationshipQuery) so a subsequent Delete() or Update()
 // has a chance to recognize a scoped target and mark (and record) only what
-// it actually affects, instead of the fully conservative fallback. graph.
-// RelationshipQuery is embedded, so every method this file does not override
-// (Count, First, Query, Fetch, FetchDirection, FetchIDs, FetchTriples,
-// FetchKinds, FetchAllShortestPaths) is promoted straight through unchanged.
+// it actually affects, instead of the fully conservative fallback -- and so a
+// Query() whose final criteria carry an updating clause is recorded too.
+// graph.RelationshipQuery is embedded, so every method this file does not
+// override (Count, First, Fetch, FetchDirection, FetchIDs, FetchTriples,
+// FetchKinds, FetchAllShortestPaths) is promoted straight through unchanged;
+// none of them takes caller criteria that could carry an updating clause.
 //
 // The zero value is not useful; construct one via observingTransaction's own
 // Relationships() or observingBatch's own Relationships().
@@ -693,6 +713,12 @@ func (r *observingRelationshipQuery) Update(properties *graph.Properties) error 
 		r.current().Changes().RecordFallback("RelationshipQuery.Update: unrecognized criteria")
 	}
 	return r.RelationshipQuery.Update(properties)
+}
+
+// Query is observingNodeQuery.Query's relationship half -- see its doc.
+func (r *observingRelationshipQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
+	recordUpdatingFinalCriteria(r.ctx, r.eng, r.current(), "RelationshipQuery.Query", finalCriteria)
+	return r.RelationshipQuery.Query(delegate, finalCriteria...)
 }
 
 // relationshipDeleteScope decides what an observingRelationshipQuery.
@@ -1411,4 +1437,43 @@ func singleQueryMutates(sq *cypher.SingleQuery) bool {
 	}
 
 	return multiPart.SinglePartQuery != nil && len(multiPart.SinglePartQuery.UpdatingClauses) > 0
+}
+
+// hasUpdatingClause reports whether criteria -- the finalCriteria a
+// NodeQuery/RelationshipQuery Query or Fetch call was given -- carry a
+// Cypher updating clause. It mirrors exactly what the pinned dawgs v0.8.0
+// query builder (query/builder.go's Builder.Apply) turns into one: a
+// *cypher.UpdatingClause (query.Delete, query.SetProperty, query.AddKind and
+// the rest), a non-empty []*cypher.UpdatingClause (query.Update,
+// query.Updatef), and either of those nested in a []graph.Criteria, which
+// Apply flattens.
+func hasUpdatingClause(criteria []graph.Criteria) bool {
+	for _, criterion := range criteria {
+		switch typed := criterion.(type) {
+		case *cypher.UpdatingClause:
+			return true
+		case []*cypher.UpdatingClause:
+			if len(typed) > 0 {
+				return true
+			}
+		case []graph.Criteria:
+			if hasUpdatingClause(typed) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordUpdatingFinalCriteria is what the observing query wrappers' Query
+// and Fetch do before delegating: when finalCriteria carry an updating
+// clause (hasUpdatingClause) the call is a write whose rows nothing here can
+// name, so it bumps the watermark (the bump precedes every write's effect)
+// and records a fallback on scope. op names the call in the fallback reason.
+func recordUpdatingFinalCriteria(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope, op string, finalCriteria []graph.Criteria) {
+	if !hasUpdatingClause(finalCriteria) {
+		return
+	}
+	ensureBumped(ctx, eng, scope)
+	scope.Changes().RecordFallback(op + ": updating clause escapes changelog tracking")
 }
