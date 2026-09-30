@@ -395,6 +395,15 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return err
 	}
+	// The install checks the migrated graph against a count of the Neo4j one
+	// (below), and stops if it cannot take that count. Finding out only then
+	// meant a backup, a manifest and hours of migration had gone into a graph
+	// that could not be verified, with the driver row already switched: so
+	// what the migration is checked against has to be countable before
+	// anything is asked or changed.
+	if inv.ActiveDriver == "neo4j" && inv.CountErr != nil {
+		return fmt.Errorf("counting the Neo4j graph: %w; the install checks the migrated graph against this count, so it needs cypher-shell and NEO4J_AUTH (as <user>/<password>) in the %s service; it stopped before changing anything", inv.CountErr, graphDBService)
+	}
 	// alias is the moving tag for this upstream release, named only in the
 	// error for a derived target that is missing (resolveImage's doc): an
 	// explicit --image is taken literally.

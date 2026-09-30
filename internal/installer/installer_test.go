@@ -331,11 +331,61 @@ func runMigrationInstall(t *testing.T, dir, composeFile, image string, fake *doc
 	return Install(context.Background(), deps, opts)
 }
 
+// TestInstallStopsBeforeChangingAnythingWhenNeo4jCannotBeCounted covers a
+// Neo4j deployment whose graph the installer cannot count (no cypher-shell in
+// graph-db, no NEO4J_AUTH, the service down). The count is what the migrated
+// graph is checked against afterwards, and the inventory used to shrug the
+// failure off as "unknown": the install took its backup, ran the whole
+// migration, switched the driver row to pg -- and only then found it had
+// nothing to verify against, leaving PostgreSQL filled and the deployment to
+// be rolled back. It now stops right after the inventory, before it asks
+// anything and before it changes anything.
+func TestInstallStopsBeforeChangingAnythingWhenNeo4jCannotBeCounted(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "", "")
+	delete(fake.Outputs, base+neo4jNodeCount)
+	delete(fake.Outputs, base+neo4jEdgeCount)
+
+	asked := false
+	deps := Deps{
+		Runner: fake, Out: &bytes.Buffer{},
+		Confirm: func(string) bool { asked = true; return true },
+		NewToolAPITransport: func(string) toolapi.Transport {
+			t.Fatal("the migration must not start when the Neo4j graph cannot be counted")
+			return nil
+		},
+	}
+	opts := Options{ComposeFile: composeFile, Image: image, Now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	err := Install(context.Background(), deps, opts)
+	if err == nil || !strings.Contains(err.Error(), "counting the Neo4j graph") || !strings.Contains(err.Error(), "cypher-shell") || !strings.Contains(err.Error(), "NEO4J_AUTH") {
+		t.Fatalf("expected an error naming the count and what it needs, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "before changing anything") {
+		t.Fatalf("the operator should be told nothing was changed, got %v", err)
+	}
+	if asked {
+		t.Fatal("the operator was asked to confirm an install that cannot verify its migration")
+	}
+	if fake.Called(base+"exec -T app-db pg_dump") || fake.Called("docker pull") {
+		t.Fatalf("nothing may run after the failed count:\n%s", strings.Join(fake.Calls, "\n"))
+	}
+	if manifest.Exists(dir) {
+		t.Fatal("a refused install saved a manifest")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".bloodtrail")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("a refused install left .bloodtrail behind (stat: %v)", statErr)
+	}
+}
+
 // TestInstallAbortsWhenNeo4jRecountFails pins the fail-closed verification:
 // without a usable post-migration Neo4j count there is nothing to compare
 // the migrated graph against, and the old behavior -- passing on any
 // nonzero PostgreSQL node count -- silently blessed partial migrations. A
-// failed recount is now itself the abort.
+// failed recount is now itself the abort. (The count the inventory takes
+// before anything is changed is scripted to work here; it is a separate
+// failure, see TestInstallStopsBeforeChangingAnythingWhenNeo4jCannotBeCounted.)
 func TestInstallAbortsWhenNeo4jRecountFails(t *testing.T) {
 	dir, composeFile := setupProject(t)
 	image := "ghcr.io/x/bt:v9.6.0-bt0.1.0"
@@ -343,6 +393,10 @@ func TestInstallAbortsWhenNeo4jRecountFails(t *testing.T) {
 	fake := migrationFake(dir, composeFile, image, "10", "20", "10|20", "", "")
 	delete(fake.Outputs, base+neo4jNodeCount)
 	delete(fake.Outputs, base+neo4jEdgeCount)
+	// One answer each, for the inventory; the recount after the migration
+	// finds nothing scripted and fails.
+	fake.Sequences[base+neo4jNodeCount] = [][]byte{[]byte("count\n10\n")}
+	fake.Sequences[base+neo4jEdgeCount] = [][]byte{[]byte("count\n20\n")}
 
 	err := runMigrationInstall(t, dir, composeFile, image, fake)
 	if err == nil || !strings.Contains(err.Error(), "cannot be verified against its source") || !strings.Contains(err.Error(), "rollback") {
