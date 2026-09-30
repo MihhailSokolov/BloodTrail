@@ -2530,10 +2530,12 @@ func evalSizeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, b
 	return float64(len(list)), true, nil
 }
 
-// evalSplitFunction implements split(str, sep) -> []any of string. Both
-// arguments must be present strings; an absent/null operand yields NULL
-// (matching Cypher's usual "NULL in, NULL out" for scalar functions) and any
-// other non-string operand is ErrRuntimeCast (the same reasoning as
+// evalSplitFunction implements split(str, sep) -> []any of string, as
+// PostgreSQL's string_to_array(str, sep), which is what dawgs emits. An
+// absent/null str yields NULL; an absent/null separator does NOT --
+// string_to_array(str, NULL) splits str into its characters, so `'a' IN
+// split(n.s, n.sep)` matches 'abc' when the node carries no sep. Any other
+// non-string operand is ErrRuntimeCast (the same reasoning as
 // evalCaseFunction: no local pg-text-rendering reproduction for non-string
 // JSON values).
 func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool, error) {
@@ -2548,12 +2550,22 @@ func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, 
 	if err != nil {
 		return nil, false, err
 	}
-	if !sOk || sVal == nil || !sepOk || sepVal == nil {
+	if !sOk || sVal == nil {
 		return nil, false, nil
 	}
 	s, isString := sVal.(string)
+	if !isString {
+		return nil, false, ErrRuntimeCast
+	}
+	if !sepOk || sepVal == nil {
+		out := make([]any, 0, len(s))
+		for _, r := range s {
+			out = append(out, string(r))
+		}
+		return out, true, nil
+	}
 	sep, sepIsString := sepVal.(string)
-	if !isString || !sepIsString {
+	if !sepIsString {
 		return nil, false, ErrRuntimeCast
 	}
 
