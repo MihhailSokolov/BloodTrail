@@ -278,7 +278,8 @@ func checkProjectDirectory(envPath, projectDir, first string) error {
 	}
 	return fmt.Errorf("%s: COMPOSE_FILE lists %s first, so docker compose takes %s as the project directory -- the one relative paths in the compose files, bind mounts such as ./pgdata among them, resolve against -- "+
 		"but the installer runs it with --project-directory %s, where this .env is, so its `up -d` could recreate services with their data on different host paths (a database on an empty directory, say); "+
-		"it stops rather than guess. Put the .env in %s, run docker compose from there, and rerun with --project-dir %s", envPath, first, dir, projectDir, dir, dir)
+		"it stops rather than guess. Move the .env into %s (rewriting its relative COMPOSE_FILE names for the new location, since they are relative to where compose is run), run docker compose from there, "+
+		"and rerun with --compose-file naming the compose file there -- its directory is then the project directory -- or with --project-dir %s", envPath, first, dir, projectDir, dir, dir)
 }
 
 // sameDirectory reports whether a and b are the same directory: spelled alike,
