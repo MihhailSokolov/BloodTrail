@@ -319,6 +319,15 @@ func unionBitmaps(n int, bitmaps []*snapshot.Bitset) *snapshot.Bitset {
 func (e *Engine) TryNodeCount(ctx context.Context, spec recognize.NodeSpec) (int64, bool) {
 	start := time.Now()
 
+	// The count is computed inline and never consults the request's
+	// context, so a request whose context is already done declines here:
+	// PostgreSQL answers it with the context's error, which is what the
+	// wrapper's fallback then returns.
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opNodeCount, reasonError, err)
+		return 0, false
+	}
+
 	matches, _, ok := e.resolveNodeSpec(ctx, opNodeCount, spec)
 	if !ok {
 		return 0, false
@@ -977,6 +986,12 @@ func selectKindIDs(maxKindID snapshot.KindID, allow func(snapshot.KindID) bool) 
 // nothing to stream, only a running total.
 func (e *Engine) TryRelCount(ctx context.Context, spec recognize.RelSpec) (int64, bool) {
 	start := time.Now()
+
+	// As TryNodeCount: the scan runs inline, so a done request declines.
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opRelCount, reasonError, err)
+		return 0, false
+	}
 
 	plan, ok := e.resolveRelSpec(ctx, opRelCount, spec)
 	if !ok {

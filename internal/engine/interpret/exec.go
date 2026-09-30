@@ -30,6 +30,7 @@
 package interpret
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -179,8 +180,14 @@ type ResultSet struct {
 // opposite of a cutoff), so expand.go's shortestPathLimit further excludes
 // limitTarget == 0 from ever narrowing its own cap, even when
 // limitTargetSet is true -- see that function's own doc comment.
+//
+// ctx is the request's context (Env.Ctx), nil for none; check -- run every
+// 1024 work units and once before a result is returned -- fails with its
+// error once it is done, so a cancelled request stops within a bounded
+// amount of work instead of running to its budgets.
 type workMeter struct {
 	budget         Budgets
+	ctx            context.Context
 	work           int64
 	unchecked      int64
 	limitTarget    int64
@@ -250,12 +257,25 @@ func (m *workMeter) spendProduct(left, right int) error {
 // unconditionally, regardless of the 1024-unit batching spend applies.
 // Execute calls this once, unconditionally, right before returning a
 // successful ResultSet, so a query whose total work never reaches 1024 is
-// still correctly bounded.
+// still correctly bounded. It fails first with the request context's error
+// once that context is done (see workMeter's ctx).
 func (m *workMeter) check() error {
+	if err := m.contextErr(); err != nil {
+		return err
+	}
 	if m.budget.MaxWork > 0 && m.work > m.budget.MaxWork {
 		return ErrBudget
 	}
 	return nil
+}
+
+// contextErr is the request context's error: nil while it is live, or when
+// the query runs under none.
+func (m *workMeter) contextErr() error {
+	if m.ctx == nil {
+		return nil
+	}
+	return m.ctx.Err()
 }
 
 // addFinalRow accounts for one row admitted into the query's final result
@@ -281,11 +301,22 @@ func (m *workMeter) addFinalRow() error {
 // The actual multi-part/WITH/DISTINCT/ORDER BY/SKIP/LIMIT pipeline lives in
 // pipeline.go's runQuery; this function is left as the package's
 // stable public entry point plus its own nil-defensiveness.
+//
+// env.Ctx, when set, is honoured the way the PostgreSQL read this stands in
+// for honours it: a context already done fails the call before any work,
+// and one that ends mid-query fails it at the work meter's next check (see
+// workMeter), with the context's own error in both cases. Without that a
+// cancelled request was computed in full and answered, where PostgreSQL
+// answers it with the cancellation.
 func Execute(env *Env, q *Query, b Budgets) (*ResultSet, error) {
 	if env == nil || env.Snap == nil || q == nil {
 		return nil, errUnsupportedStep
 	}
-	return runQuery(env, q, &workMeter{budget: b})
+	meter := &workMeter{budget: b, ctx: env.Ctx}
+	if err := meter.contextErr(); err != nil {
+		return nil, err
+	}
+	return runQuery(env, q, meter)
 }
 
 // --- pattern matching: components and joins -------------------------------

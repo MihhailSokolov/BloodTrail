@@ -17,6 +17,7 @@
 package interpret
 
 import (
+	"context"
 	"errors"
 	"math"
 	"regexp"
@@ -369,6 +370,12 @@ type Env struct {
 	Now  time.Time
 
 	AllShortestPerPair bool
+
+	// Ctx, when set, is the context of the request the query serves: Execute
+	// refuses to start once it is done, and a query already running stops at
+	// its next work-budget check after it is cancelled, returning its error
+	// (context.Canceled, context.DeadlineExceeded). nil means no context.
+	Ctx context.Context
 
 	regexMu    sync.Mutex
 	regexCache map[string]*RegexMatcher
