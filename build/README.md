@@ -1,9 +1,9 @@
 # Building the BloodTrail image
 
-`build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform …]` builds
+`build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform …] [--dawgs-only]` builds
 BloodHound CE at the given upstream release tag with the BloodTrail driver compiled in.
 
-The only source change to BloodHound is `patches/bloodhound-driver.patch`, which touches
+The only change to BloodHound's own source is `patches/bloodhound-driver.patch`, which touches
 two files: `cmd/api/src/bootstrap/util.go` registers the driver name, and
 `cmd/api/src/migrations/manifest.go` makes the one PostgreSQL-only graph migration
 (`Version_852_Migration`) recognise BloodTrail. Upstream detects PostgreSQL with
@@ -11,6 +11,20 @@ two files: `cmd/api/src/bootstrap/util.go` registers the driver name, and
 embeds one) does not satisfy, so without that hunk the migration is skipped and still
 recorded as done. `go.mod` is edited by the script with `go mod edit`, so upstream
 dependency bumps never conflict with the patch.
+
+That edit is not free of side effects on the dependencies. `go mod tidy` resolves upstream's
+module graph together with the driver's, and minimum version selection takes the higher
+`github.com/specterops/dawgs` of the two, so a release that pins an older dawgs than the driver
+was built against ships a newer one than its own tests ever ran with: v9.6.0 pins v0.7.0 and its
+image carries v0.8.0 (the driver's engine does not compile against v0.7.0). The script therefore
+prints the version upstream pins and the one the image resolves, and fails the build when they
+differ unless that exact pair is listed, with the reason, in `dawgs_shift_reason` in
+`build-image.sh` (v9.6.0: v0.7.0 to v0.8.0 is the only entry). `--dawgs-only` stops after that
+check and prints the resolved version. Where the two agree but differ from the version `go.mod`
+names (v9.7.1 pins v0.8.1, `go.mod` says v0.8.0), `ci.yml`'s `dawgs` job runs the unit and
+integration suites against that other version too (`build/dawgs-suites.sh`), so an image never
+ships a dawgs no suite has run against. `build/test-build-image.sh` tests both scripts against
+stand-ins for git, go and docker.
 
 Vendoring copies the driver's root Go files plus `internal/engine` -- the in-memory path
 engine -- into `packages/go/bloodtrail`, which the upstream Dockerfile's builder stage already

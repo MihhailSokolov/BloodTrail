@@ -39,6 +39,9 @@ jobs:
       # The Python benchmark harnesses have tests of their own (standard library only).
       - name: benchmark harness tests
         run: make test-bench-scripts
+      # build/build-image.sh's dawgs check and build/dawgs-suites.sh, against stand-ins for git, go and docker.
+      - name: build script tests
+        run: make test-build-scripts
   upstreams:
     runs-on: ubuntu-latest
     outputs:
@@ -72,6 +75,30 @@ jobs:
         run: |
           git clone --depth 1 --branch ${{ matrix.upstream }} https://github.com/SpecterOps/BloodHound.git /tmp/upstream
           git -C /tmp/upstream apply --check "$GITHUB_WORKSPACE/patches/bloodhound-driver.patch"
+  # The images ship whatever dawgs build/build-image.sh resolves for each
+  # supported upstream release: upstream's own pin, or the driver's when that is
+  # higher. `test` runs the suites against the version go.mod names; v9.7.1 pins
+  # a newer one, and its image shipped a dawgs no suite had ever run against.
+  # This job runs them against every OTHER version the supported releases
+  # resolve to, and fails for a release whose resolved dawgs differs from its
+  # own pin without build-image.sh listing why (see build/README.md).
+  dawgs:
+    needs: upstreams
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_USER: bloodtrail, POSTGRES_PASSWORD: bloodtrail, POSTGRES_DB: bloodtrail }
+        ports: ["55432:5432"]
+        options: --health-cmd "pg_isready -U bloodtrail" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: ./build/dawgs-suites.sh "$TAGS"
+        env:
+          TAGS: ${{ needs.upstreams.outputs.tags }}
+          BLOODTRAIL_TEST_PG: postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail
   # The one check the branch ruleset should require, instead of the jobs
   # above. It runs whatever they did (always()) and passes only if every one of
   # them succeeded. A ruleset counts a SKIPPED required job as passing, and a
@@ -81,7 +108,7 @@ jobs:
   # its value). Add every new job to needs below.
   ci-ok:
     if: always()
-    needs: [test, upstreams, patch-guard]
+    needs: [test, upstreams, patch-guard, dawgs]
     runs-on: ubuntu-latest
     steps:
       - name: Every job this one needs succeeded

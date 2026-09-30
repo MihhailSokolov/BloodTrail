@@ -3,18 +3,21 @@
 #
 # Build a BloodHound CE image with the BloodTrail driver compiled in.
 #
-#   build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform linux/amd64,linux/arm64]
+#   build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform linux/amd64,linux/arm64] [--dawgs-only]
 #
 # --platform defaults to the Docker daemon's own platform for a local build, and
-# to linux/amd64 for a --push.
+# to linux/amd64 for a --push. --dawgs-only stops once the dawgs version the
+# image would ship has been checked (see dawgs_shift_reason below) and prints
+# that version, alone, on stdout; nothing is built.
 #
 # Steps: shallow-clone upstream at the tag, apply patches/bloodhound-driver.patch,
 # vendor the driver source under packages/go/bloodtrail (the upstream Dockerfile
 # copies packages/go into the builder stage), point go.mod at it with a replace
-# directive, stamp the driver version, and run the upstream Dockerfile.
+# directive, check the dawgs version, stamp the driver version, and run the
+# upstream Dockerfile.
 set -euo pipefail
 
-usage() { sed -n '2,12p' "$0"; exit 2; }
+usage() { sed -n '2,11p' "$0"; exit 2; }
 
 TAG="${1:-}"; [[ -n "$TAG" ]] || usage; shift
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,14 +29,19 @@ if [[ -n "$DRIVER_VERSION" && "$DRIVER_VERSION" != --* ]]; then shift; else DRIV
 # The image tag and the version stamped into the driver are the same string,
 # without the "v" a git tag carries.
 DRIVER_VERSION="${DRIVER_VERSION#v}"
-PUSH=""; PLATFORM=""
+PUSH=""; PLATFORM=""; DAWGS_ONLY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --push) PUSH="--push"; shift ;;
     --platform) PLATFORM="$2"; shift 2 ;;
+    --dawgs-only) DAWGS_ONLY="1"; shift ;;
     *) usage ;;
   esac
 done
+# --dawgs-only prints one thing on stdout, the resolved version; the progress
+# lines and everything the tools write go to stderr instead (fd 3 is the real
+# stdout).
+if [[ -n "$DAWGS_ONLY" ]]; then exec 3>&1 1>&2; fi
 
 # With no --platform, a LOCAL build targets the Docker daemon's own platform.
 # It used to default to linux/amd64 unconditionally, which on an Apple Silicon
@@ -46,8 +54,9 @@ done
 #
 # A push keeps the old default: what gets published should not depend on
 # which machine happened to run the script. CI passes --platform explicitly.
+# A --dawgs-only run builds nothing, so it does not ask Docker at all.
 if [[ -z "$PLATFORM" ]]; then
-  if [[ -n "$PUSH" ]]; then
+  if [[ -n "$PUSH" || -n "$DAWGS_ONLY" ]]; then
     PLATFORM="linux/amd64"
   else
     PLATFORM="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null || echo linux/amd64)"
@@ -61,6 +70,51 @@ IMAGE="$IMAGE_REPO:$TAG-bt$DRIVER_VERSION"
 ALIAS="$IMAGE_REPO:$TAG"
 MODULE="github.com/MihhailSokolov/BloodTrail"
 VENDOR_DIR="packages/go/bloodtrail"
+DAWGS="github.com/specterops/dawgs"
+
+# `go mod tidy` below resolves the module graph of upstream's go.mod together
+# with the vendored driver's, and minimum version selection takes the HIGHER
+# dawgs of the two. An upstream release that pins an older dawgs than the driver
+# was built against therefore ships a dawgs that release's own tests never ran
+# with, and nothing said so: v9.6.0 pins v0.7.0 and its image carried v0.8.0.
+# The build now names both versions and stops unless the exact pair is listed
+# here, each with the reason it is acceptable. Where upstream pins the same
+# version as the image resolves (v9.7.0 and v9.7.1 today), nothing needs
+# listing; ci.yml's dawgs job runs the suites against every version the
+# supported releases resolve to.
+#
+# Argument: "<upstream tag> <pinned by upstream> <resolved>". Prints the reason,
+# or nothing when the pair is not listed.
+dawgs_shift_reason() {
+  case "$1" in
+    "v9.6.0 v0.7.0 v0.8.0")
+      echo "the driver's engine calls translate.TranslateWithOptions, translate.Options, translate.OptimizerEnabled and pg.OptimizedTranslationEnabled, which first exist in v0.8.0 (it does not compile against v0.7.0), and build/e2e.sh v9.6.0 validates exactly this pairing" ;;
+  esac
+}
+
+# check_dawgs compares UPSTREAM_DAWGS and RESOLVED_DAWGS and fails the build on a
+# difference that dawgs_shift_reason does not list.
+check_dawgs() {
+  local reason
+  echo "==> dawgs: upstream $TAG pins ${UPSTREAM_DAWGS:-nothing}; the image resolves ${RESOLVED_DAWGS:-nothing}"
+  if [[ -z "$UPSTREAM_DAWGS" || -z "$RESOLVED_DAWGS" ]]; then
+    echo "error: could not read the version of $DAWGS from $TAG's go.mod before and after the driver is wired in; refusing to guess" >&2
+    exit 1
+  fi
+  if [[ "$UPSTREAM_DAWGS" == "$RESOLVED_DAWGS" ]]; then return 0; fi
+  reason="$(dawgs_shift_reason "$TAG $UPSTREAM_DAWGS $RESOLVED_DAWGS")"
+  if [[ -z "$reason" ]]; then
+    {
+      echo "error: the image would ship dawgs $RESOLVED_DAWGS, but upstream $TAG pins $UPSTREAM_DAWGS."
+      echo "  Minimum version selection took the higher of upstream's dawgs and the one the driver is built against,"
+      echo "  so BloodHound would run on a library its own release never ran with. Run the unit and integration"
+      echo "  suites against $RESOLVED_DAWGS, then list \"$TAG $UPSTREAM_DAWGS $RESOLVED_DAWGS\" and the reason in"
+      echo "  dawgs_shift_reason in build/build-image.sh."
+    } >&2
+    exit 1
+  fi
+  echo "    accepted, listed in build/build-image.sh: $reason"
+}
 
 echo "==> Upstream checkout $TAG"
 if [[ ! -d "$WORK/.git" ]]; then
@@ -90,7 +144,12 @@ sed -i.bak "s|^var Version = \"dev\"|var Version = \"$DRIVER_VERSION\"|" "$WORK/
 grep -q "Version = \"$DRIVER_VERSION\"" "$WORK/$VENDOR_DIR/driver.go"
 
 echo "==> Wiring go.mod"
+# What upstream itself pins, read before the edit below can change it.
+UPSTREAM_DAWGS="$(cd "$WORK" && go list -m -f '{{.Version}}' "$DAWGS" 2>/dev/null)" || UPSTREAM_DAWGS=""
 (cd "$WORK" && go mod edit -require="$MODULE@v0.0.0" -replace="$MODULE=./$VENDOR_DIR" && go mod tidy)
+RESOLVED_DAWGS="$(cd "$WORK" && go list -m -f '{{.Version}}' "$DAWGS" 2>/dev/null)" || RESOLVED_DAWGS=""
+check_dawgs
+if [[ -n "$DAWGS_ONLY" ]]; then printf '%s\n' "$RESOLVED_DAWGS" >&3; exit 0; fi
 (cd "$WORK" && go build ./cmd/api/src/cmd/bhapi)   # fail fast before the long Docker build
 rm -f "$WORK/bhapi"
 

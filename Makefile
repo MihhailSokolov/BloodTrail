@@ -1,4 +1,4 @@
-.PHONY: test test-bench-scripts lint integration build-image tidy bench-path bench-builder bench-cypher bench-apply
+.PHONY: test test-bench-scripts test-build-scripts lint integration build-image tidy bench-path bench-builder bench-cypher bench-apply
 
 test:
 	go test ./...
@@ -9,6 +9,12 @@ test:
 test-bench-scripts:
 	python3 -m unittest discover -s bench/oggen -p '*_test.py'
 	python3 -m unittest discover -s bench/shgen -p '*_test.py'
+
+# build/build-image.sh's dawgs check and build/dawgs-suites.sh, run against
+# stand-ins for git, go and docker (nothing is cloned, compiled or built). CI
+# runs this target.
+test-build-scripts:
+	./build/test-build-image.sh
 
 # Pinned to the version .github/workflows/ci.yml runs; bump both together. A
 # different local version can report different issues, so it is refused
