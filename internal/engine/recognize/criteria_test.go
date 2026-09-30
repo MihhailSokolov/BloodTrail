@@ -140,6 +140,24 @@ func TestFromCriteria_Rejects(t *testing.T) {
 			),
 		},
 		{
+			// dawgs renders kind_id = any('{}'), which matches no edge, where
+			// an empty EdgeKinds would mean "every kind": decline instead.
+			name: "empty KindIn over the relationship matches nothing",
+			crit: query.And(
+				query.Equals(query.StartID(), graph.ID(42)),
+				query.Equals(query.EndID(), graph.ID(7)),
+				query.KindIn(query.Relationship()),
+			),
+		},
+		{
+			name: "empty-Kinds KindMatcher over the relationship declined regardless of IsExclusive",
+			crit: query.And(
+				query.Equals(query.StartID(), graph.ID(42)),
+				query.Equals(query.EndID(), graph.ID(7)),
+				&cypher.KindMatcher{Reference: query.Relationship(), Kinds: nil, IsExclusive: true},
+			),
+		},
+		{
 			name: "nil criteria",
 			crit: nil,
 		},
