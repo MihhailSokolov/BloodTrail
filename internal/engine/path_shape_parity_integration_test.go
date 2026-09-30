@@ -359,3 +359,88 @@ func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
 		t.Run(query, func(t *testing.T) { g.assertServesOracle(t, query) })
 	}
 }
+
+// selfCycleFixture puts group g1 on a 2-cycle (g1 -> u -> g1) while the only
+// other group, g2, is three hops away:
+//
+//	g1 -> u -> g1
+//	g1 -> x -> y -> g2
+func selfCycleFixture() pathParityFixture {
+	return pathParityFixture{
+		nodes: []pathParityNode{
+			{name: "g1", kinds: []string{"ZG"}},
+			{name: "u", kinds: []string{"ZU"}},
+			{name: "x", kinds: []string{"ZU"}},
+			{name: "y", kinds: []string{"ZU"}},
+			{name: "g2", kinds: []string{"ZG"}},
+		},
+		edges: []pathParityEdge{
+			{"g1", "u", "ZEdge"}, {"u", "g1", "ZEdge"},
+			{"g1", "x", "ZEdge"}, {"x", "y", "ZEdge"}, {"y", "g2", "ZEdge"},
+		},
+	}
+}
+
+// TestAllShortestPathsSharedEndpointInequalityMatchesOracle: in the
+// overall-shortest answer (unidirectional_asp_harness) PostgreSQL picks the
+// first depth at which ANY root reaches ANY terminal, and a cycle back to a
+// root that is also a terminal counts -- the harness has no visited set and
+// the endpoint inequality is only applied afterwards. So with g1 on a
+// 2-cycle, depth 2 wins, the inequality then drops g1's own paths and pg
+// returns nothing, while excluding the self pair before choosing the length
+// served g1 -> x -> y -> g2. The per-pair answer (both endpoints carrying a
+// property filter) and shortestPath are unaffected and must keep serving.
+func TestAllShortestPathsSharedEndpointInequalityMatchesOracle(t *testing.T) {
+	t.Run("two-cycle", func(t *testing.T) {
+		g := seedPathParityGraph(t, selfCycleFixture())
+		for _, query := range []string{
+			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p`,
+			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE id(a) <> id(b) RETURN p`,
+			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b AND a.name = 'g1' RETURN p`,
+			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b)) WHERE a <> b AND b.name IN ['g1', 'g2'] RETURN p`,
+		} {
+			t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+		}
+		for _, query := range []string{
+			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b AND a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] RETURN p`,
+			`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p`,
+			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZU)) WHERE a <> b RETURN p`,
+		} {
+			t.Run(query, func(t *testing.T) { g.assertServesOracle(t, query) })
+		}
+	})
+
+	t.Run("self-loop", func(t *testing.T) {
+		g := seedPathParityGraph(t, pathParityFixture{
+			nodes: []pathParityNode{
+				{name: "g1", kinds: []string{"ZG"}},
+				{name: "x", kinds: []string{"ZU"}},
+				{name: "g2", kinds: []string{"ZG"}},
+			},
+			edges: []pathParityEdge{{"g1", "g1", "ZEdge"}, {"g1", "x", "ZEdge"}, {"x", "g2", "ZEdge"}},
+		})
+		g.assertNeverWrong(t, `MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p`)
+		g.assertServesOracle(t, `MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p`)
+	})
+
+	// A node carrying both endpoint kinds: a is a User and a Group on a
+	// 2-cycle; the only other pair, c -> b, is three hops long.
+	t.Run("node with both endpoint kinds", func(t *testing.T) {
+		g := seedPathParityGraph(t, pathParityFixture{
+			nodes: []pathParityNode{
+				{name: "a", kinds: []string{"ZNode", "ZUser", "ZGroup"}},
+				{name: "m", kinds: []string{"ZNode"}},
+				{name: "c", kinds: []string{"ZNode", "ZUser"}},
+				{name: "m2", kinds: []string{"ZNode"}},
+				{name: "m3", kinds: []string{"ZNode"}},
+				{name: "b", kinds: []string{"ZNode", "ZGroup"}},
+			},
+			edges: []pathParityEdge{
+				{"a", "m", "ZEdge"}, {"m", "a", "ZEdge"},
+				{"c", "m2", "ZEdge"}, {"m2", "m3", "ZEdge"}, {"m3", "b", "ZEdge"},
+			},
+		})
+		g.assertNeverWrong(t, `MATCH p = allShortestPaths((s:ZUser)-[:ZEdge*1..]->(e:ZGroup)) WHERE s <> e RETURN p`)
+		g.assertNeverWrong(t, `MATCH p = allShortestPaths((s:ZUser)-[:ZEdge*1..]->(e:ZGroup)) WHERE s.name = 'a' AND s <> e RETURN p`)
+	})
+}

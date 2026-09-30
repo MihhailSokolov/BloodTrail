@@ -149,15 +149,24 @@ import (
 )
 
 // ErrSelfEndpoint is returned by a shortestPath()/allShortestPaths() Step
-// whose resolved root and terminal endpoint sets intersect while the owning
-// query carries no explicit endpoint inequality over that step's own two
-// endpoints (Step.HasExplicitEndpointInequality false). PostgreSQL's own
-// shortestPath implementation raises SQLSTATE 22023 for exactly this shape
-// (a root that is also a terminal aborts its recursive seed query -- see
-// traverse.SelfEndpointConflict's doc comment for the in-depth citation); this package cannot raise that error itself (there is no live
-// pg statement here to fail), so it returns this sentinel instead, which the
-// engine is expected to treat as "decline, delegate to PostgreSQL" so the
-// caller still observes the real SQLSTATE 22023 pg itself raises.
+// whose root and terminal endpoint sets share a node in a way PostgreSQL's
+// answer depends on and this package does not reproduce:
+//
+//   - without an explicit endpoint inequality over the step's own two
+//     endpoints (Step.HasExplicitEndpointInequality false), resolved sets
+//     that intersect: PostgreSQL's own shortestPath implementation raises
+//     SQLSTATE 22023 for exactly this shape (a root that is also a terminal
+//     aborts its recursive seed query -- see
+//     traverse.SelfEndpointConflict's doc comment for the in-depth
+//     citation);
+//   - with one, an allShortestPaths answered at the overall shortest length
+//     (traverse.ModeAll), whose length a cycle back to a shared node can set
+//     (see expandShortestPathComponent).
+//
+// This package cannot raise pg's error or its answer itself, so it returns
+// this sentinel instead, which the engine is expected to treat as "decline,
+// delegate to PostgreSQL" so the caller still observes whatever pg itself
+// returns.
 var ErrSelfEndpoint = errors.New("interpret: self endpoint")
 
 // --- var-length trail expansion --------------------------------------------
@@ -1173,6 +1182,18 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 				return nil, err
 			}
 			terminals, terminalsEnforced = traverse.Endpoint{IDs: ids}, true
+		}
+
+		// A node that is both a root and a terminal makes that length depend
+		// on its own cycles. PostgreSQL's harness has no visited set, so a
+		// trail back to such a root is a satisfied path like any other and
+		// can fix the depth; `s <> t` only drops the self pair's paths
+		// afterwards, leaving just the other pairs of that depth -- often
+		// none. traverse never walks a pair back to itself, so it would
+		// answer from the shortest OTHER pair's length instead. Declined
+		// rather than emulating the self pair's cycle.
+		if step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap, roots, terminals) {
+			return nil, ErrSelfEndpoint
 		}
 	}
 

@@ -1615,3 +1615,58 @@ func TestShortestPathSecondEndpointMustBeConstrained(t *testing.T) {
 		{name: "second endpoint constrained by id", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE id(t) = 2 AND s <> t RETURN p`, want: true},
 	})
 }
+
+// buildSelfCycleSnapshot: group g1 (1) sits on a 2-cycle through u (2) while
+// the only other group, g2 (5), is three hops away through x (3) and y (4).
+func buildSelfCycleSnapshot(t *testing.T) *snapshot.View {
+	t.Helper()
+	const (
+		kindG snapshot.KindID = 1
+		kindU snapshot.KindID = 2
+		kindE snapshot.KindID = 10
+	)
+	return buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindG: "G", kindU: "U", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindG}},
+			{id: 2, kinds: []snapshot.KindID{kindU}},
+			{id: 3, kinds: []snapshot.KindID{kindU}},
+			{id: 4, kinds: []snapshot.KindID{kindU}},
+			{id: 5, kinds: []snapshot.KindID{kindG}},
+		},
+		[]execEdgeSpec{
+			{id: 10, start: 1, end: 2, kind: kindE},
+			{id: 11, start: 2, end: 1, kind: kindE},
+			{id: 12, start: 1, end: 3, kind: kindE},
+			{id: 13, start: 3, end: 4, kind: kindE},
+			{id: 14, start: 4, end: 5, kind: kindE},
+		},
+	)
+}
+
+// TestExpandAllShortestSharedEndpointInequalityDeclines: answered at the
+// overall shortest length, an allShortestPaths whose root and terminal sets
+// share a node declines even with `a <> b` -- PostgreSQL's harness lets g1's
+// cycle back to itself set that length before the inequality drops it --
+// while the per-pair answer and disjoint endpoint sets keep serving.
+func TestExpandAllShortestSharedEndpointInequalityDeclines(t *testing.T) {
+	snap := buildSelfCycleSnapshot(t)
+
+	const query = `MATCH p = allShortestPaths((a:G)-[:E*1..]->(b:G)) WHERE a <> b RETURN p`
+	if err := execExpectErr(t, snap, query, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
+		t.Fatalf("Execute(%q) error = %v, want ErrSelfEndpoint", query, err)
+	}
+
+	rs, err := Execute(&Env{Snap: snap, AllShortestPerPair: true}, planQuery(t, snap, query), generousBudget)
+	if err != nil {
+		t.Fatalf("Execute(%q) per pair: %v", query, err)
+	}
+	if got, want := pathSigsAtColumn(t, snap, rs, 0), []string{"N:1,3,4,5,|E:12,13,14,"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("per-pair paths = %v, want %v", got, want)
+	}
+
+	assertPathSigs(t, snap, `MATCH p = allShortestPaths((a:G)-[:E*1..]->(b:U)) WHERE a <> b RETURN p`, 0, []string{
+		"N:1,2,|E:10,",
+		"N:1,3,|E:12,",
+	})
+}
