@@ -40,6 +40,7 @@ type pathParityFixture struct {
 type pathParityGraph struct {
 	pg    *pg.Driver
 	eng   *Engine
+	ids   map[string]graph.ID
 	names map[graph.ID]string
 }
 
@@ -85,7 +86,7 @@ func seedPathParityGraph(t *testing.T, fixture pathParityFixture) *pathParityGra
 	for name, id := range ids {
 		names[id] = name
 	}
-	return &pathParityGraph{pg: pgDriver, eng: eng, names: names}
+	return &pathParityGraph{pg: pgDriver, eng: eng, ids: ids, names: names}
 }
 
 // engineRows asks the engine to serve query, reporting whether it did and,
@@ -284,5 +285,77 @@ func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
 		`MATCH p = shortestPath((x:ZA)-[:ZE*..0]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
 	} {
 		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+	}
+}
+
+// shortestPathLevelFixture puts four roots at three distances from one
+// terminal; no root has an incoming edge of the traversed kind:
+//
+//	r0 -> i1 -> i2 -> t9   (3 hops)
+//	r4 -> i5 -> t9         (2 hops)
+//	r6 -> t9               (1 hop)
+//	r7 -> t9               (1 hop)
+//
+// Every node is a ZNode; the r* nodes are also ZRoot and t9 is ZTerm.
+func shortestPathLevelFixture() pathParityFixture {
+	var f pathParityFixture
+	for _, name := range []string{"r0", "i1", "i2", "r4", "i5", "r6", "r7", "t9"} {
+		kinds := []string{"ZNode"}
+		switch name[0] {
+		case 'r':
+			kinds = append(kinds, "ZRoot")
+		case 't':
+			kinds = append(kinds, "ZTerm")
+		}
+		f.nodes = append(f.nodes, pathParityNode{name: name, kinds: kinds})
+	}
+	f.edges = []pathParityEdge{
+		{"r0", "i1", "ZEdge"}, {"i1", "i2", "ZEdge"}, {"i2", "t9", "ZEdge"},
+		{"r4", "i5", "ZEdge"}, {"i5", "t9", "ZEdge"},
+		{"r6", "t9", "ZEdge"},
+		{"r7", "t9", "ZEdge"},
+	}
+	return f
+}
+
+// TestShortestPathUnconstrainedSecondEndpointMatchesOracle: when the
+// pattern's second-written endpoint carries no constraint, dawgs' harness
+// has no terminal filter and marks a hop satisfied by a continuation test on
+// the seed instead -- `exists (select 1 from edge where end_id =
+// e0.start_id)` for a forward pattern, `start_id = e0.end_id` for a backward
+// one. At depth 1 that asks whether the SEED has an incoming (resp.
+// outgoing) edge of any kind, so pg drops the one-hop paths of a seed
+// without one and reports the next level instead. Here only r6 has an
+// incoming edge (x0 -ZOther-> r6), and t9 has no outgoing edge at all.
+//
+// When the FIRST-written endpoint is the unconstrained one, dawgs seeds from
+// the other side and the same test degenerates to always-true, so those
+// spellings must keep serving.
+func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
+	fixture := shortestPathLevelFixture()
+	fixture.nodes = append(fixture.nodes, pathParityNode{name: "x0", kinds: []string{"ZNode"}})
+	fixture.edges = append(fixture.edges, pathParityEdge{"x0", "r6", "ZOther"})
+	g := seedPathParityGraph(t, fixture)
+
+	for _, query := range []string{
+		`MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(e)) WHERE s <> e RETURN p`,
+		`MATCH p = allShortestPaths((s:ZRoot)-[:ZEdge*1..]->(e)) WHERE s <> e RETURN p`,
+		`MATCH p = shortestPath((s:ZNode)-[:ZEdge*1..]->(e)) WHERE s.name = 'r4' AND s <> e RETURN p`,
+		fmt.Sprintf(`MATCH p = shortestPath((s)-[:ZEdge*1..]->(e)) WHERE id(s) = %d AND s <> e RETURN p`, g.ids["r4"]),
+		`MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(e)) WHERE s <> e RETURN p LIMIT 2`,
+		`MATCH p = shortestPath((e:ZTerm)<-[:ZEdge*1..]-(s)) WHERE s <> e RETURN p`,
+		`MATCH p = allShortestPaths((e:ZTerm)<-[:ZEdge*1..]-(s)) WHERE s <> e RETURN p`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+	}
+
+	for _, query := range []string{
+		`MATCH p = shortestPath((e)<-[:ZEdge*1..]-(s:ZRoot)) WHERE s <> e RETURN p`,
+		`MATCH p = allShortestPaths((e)<-[:ZEdge*1..]-(s:ZRoot)) WHERE s <> e RETURN p`,
+		`MATCH p = shortestPath((s)-[:ZEdge*1..]->(e:ZTerm)) WHERE s <> e RETURN p`,
+		`MATCH p = allShortestPaths((s)-[:ZEdge*1..]->(e:ZTerm)) WHERE s <> e RETURN p`,
+		`MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(e:ZNode)) WHERE s <> e RETURN p`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertServesOracle(t, query) })
 	}
 }

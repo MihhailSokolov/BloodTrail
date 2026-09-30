@@ -1632,8 +1632,23 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 // finalizeShortestPaths runs after every pattern and WHERE conjunct in the
 // Part has been processed: for every shortestPath/allShortestPaths Step it
 // sets HasExplicitEndpointInequality and enforces the endpoint-constraint
-// rule (see its own doc below), plus the shortest-step mixing restriction
-// (see shortestStepsAreIsolated).
+// rule (below), plus the shortest-step mixing restriction (see
+// shortestStepsAreIsolated).
+//
+// The endpoint-constraint rule is that the pattern's SECOND-written endpoint
+// must be constrained (isConstrained). Without a constraint there, dawgs'
+// harness has no terminal filter and marks a hop satisfied by a continuation
+// test on the seed instead (forwardContinuationSatisfaction, translate/
+// expansion.go): `exists (select 1 from edge where end_id = e0.start_id)`
+// for a forward pattern, `start_id = e0.end_id` for a backward one. At depth
+// 1 that asks whether the seed itself has an incoming (resp. outgoing) edge
+// of any kind, so PostgreSQL drops the one-hop paths of every seed without
+// one and reports that seed's next level instead -- an answer no search the
+// engine runs reproduces. When only the FIRST-written endpoint is
+// unconstrained, dawgs seeds from the constrained one and the same test
+// reduces to always-true, so that spelling (every shipped prebuilt with a
+// bare `(s)`, and `(e)<-[...]-(s:X)`) keeps serving. The rule subsumes the
+// older "at least one endpoint constrained" one.
 func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression) bool {
 	if !pb.shortestStepsAreIsolated() {
 		return false
@@ -1642,7 +1657,11 @@ func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression)
 		step := &pb.chains[idx]
 		step.HasExplicitEndpointInequality = hasEndpointInequality(whereConjuncts, step.FromSym, step.ToSym)
 
-		if !pb.isConstrained(step.FromSym) && !pb.isConstrained(step.ToSym) {
+		secondWritten := step.ToSym
+		if step.Reversed {
+			secondWritten = step.FromSym
+		}
+		if !pb.isConstrained(secondWritten) {
 			return false
 		}
 	}
@@ -1713,10 +1732,13 @@ func (pb *partBuilder) shortestStepsAreIsolated() bool {
 
 // isConstrained reports whether sym's NodeConstraint carries a kind label,
 // an id() anchor, an objectid anchor, or at least one pushed single-symbol
-// WHERE predicate.
+// WHERE predicate -- the same things dawgs puts into a shortest-path
+// harness's endpoint filter, so finalizeShortestPaths asks it about the
+// pattern's second-written endpoint.
 //
 // The original implementation of finalizeShortestPaths' "at least one
-// endpoint constrained" rule (see that function's doc) checked only
+// endpoint constrained" rule (since narrowed to the second-written endpoint
+// -- see that function's doc) checked only
 // Kinds/IDs/ObjectIDAnchor, a literal reading of "kind- or
 // id-constrained". Predicates was added here after that reading was found
 // to exclude a real, required corpus query for no correctness reason: agi.json's

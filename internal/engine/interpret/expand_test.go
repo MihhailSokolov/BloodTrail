@@ -1592,3 +1592,26 @@ func TestExpandConvertPathErrorsOnNoMatchingForwardEdge(t *testing.T) {
 		t.Fatalf("convertPath() error = %v, want errConvertPathEdgeNotFound", err)
 	}
 }
+
+// TestShortestPathSecondEndpointMustBeConstrained: a shortestPath whose
+// second-written endpoint carries no constraint declines -- dawgs then marks
+// a hop satisfied by whether the seed has an edge on its far side, which no
+// engine search reproduces -- while a bare FIRST-written endpoint, the shape
+// of every shipped prebuilt that has one, keeps planning.
+func TestShortestPathSecondEndpointMustBeConstrained(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "second endpoint bare", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE s <> t RETURN p`, want: false},
+		{name: "second endpoint bare, all shortest", cypher: `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t)) WHERE s <> t RETURN p`, want: false},
+		{name: "second endpoint bare, backward arrow", cypher: `MATCH p = shortestPath((t:Root)<-[:E*1..]-(s)) WHERE s <> t RETURN p`, want: false},
+		{name: "first endpoint bare", cypher: `MATCH p = shortestPath((s)-[:E*1..]->(t:Root)) WHERE s <> t RETURN p`, want: true},
+		{name: "first endpoint bare, backward arrow", cypher: `MATCH p = shortestPath((t)<-[:E*1..]-(s:Root)) WHERE s <> t RETURN p`, want: true},
+		{name: "second endpoint constrained by a predicate", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE t.name = 'x' AND s <> t RETURN p`, want: true},
+		{name: "second endpoint constrained by id", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE id(t) = 2 AND s <> t RETURN p`, want: true},
+	})
+}
