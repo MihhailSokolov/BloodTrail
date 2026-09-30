@@ -367,6 +367,47 @@ func TestOverrideEntryFollowsHowTheListNamesItsFiles(t *testing.T) {
 	}
 }
 
+// TestOverrideEntryRecognisesTheFileHoweverItIsSpelled pins that, given the
+// directory relative names are resolved against, a name is the override when
+// it means the override file: rollback would otherwise delete the file and
+// leave an entry -- ./docker-compose.bloodtrail.yml, say -- that docker compose
+// then stops on.
+func TestOverrideEntryRecognisesTheFileHoweverItIsSpelled(t *testing.T) {
+	o := OverrideEntry{Name: OverrideFileName, Path: "/srv/bh/" + OverrideFileName, Dir: "/srv/bh"}
+	for name, want := range map[string]bool{
+		"docker-compose.bloodtrail.yml":            true,
+		"/srv/bh/docker-compose.bloodtrail.yml":    true,
+		"./docker-compose.bloodtrail.yml":          true,
+		"sub/../docker-compose.bloodtrail.yml":     true,
+		"../bh/docker-compose.bloodtrail.yml":      true,
+		"/srv/bh//docker-compose.bloodtrail.yml":   true,
+		"/srv/bh/./docker-compose.bloodtrail.yml":  true,
+		"sub/docker-compose.bloodtrail.yml":        false,
+		"/srv/other/docker-compose.bloodtrail.yml": false,
+		"../docker-compose.bloodtrail.yml":         false,
+		"docker-compose.bloodtrail.yaml":           false,
+		"":                                         false,
+		"/srv/bh":                                  false,
+	} {
+		if got := o.Is(name); got != want {
+			t.Errorf("Is(%q) = %v, want %v", name, got, want)
+		}
+	}
+	// Without the directory, only the two spellings are.
+	bare := OverrideEntry{Name: OverrideFileName, Path: "/srv/bh/" + OverrideFileName}
+	if bare.Is("./docker-compose.bloodtrail.yml") || !bare.Is("docker-compose.bloodtrail.yml") {
+		t.Error("an override without a directory does not match exactly its two spellings")
+	}
+
+	env := "COMPOSE_FILE=a.yml:./docker-compose.bloodtrail.yml:b.yml\n"
+	if got, err := AddOverrideEntry(env, nil, o); err != nil || got != env {
+		t.Errorf("AddOverrideEntry added the override to a list that names it: %q, %v", got, err)
+	}
+	if got, err := RemoveOverrideEntry(env, o); err != nil || got != "COMPOSE_FILE=a.yml:b.yml\n" {
+		t.Errorf("RemoveOverrideEntry = %q, %v", got, err)
+	}
+}
+
 // TestComposeFileListComposeCannotLoad covers lists compose itself fails to
 // load: an empty name between separators, which it resolves to the project
 // directory, and spaces around a name, which it keeps as part of it. These

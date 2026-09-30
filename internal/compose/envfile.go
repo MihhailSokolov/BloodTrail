@@ -358,11 +358,26 @@ type OverrideEntry struct {
 	// relative name added to it would break exactly that. Empty when the
 	// absolute path is not known, which is the same as never wanting it.
 	Path string
+	// Dir is the directory relative names in the entry are resolved against
+	// (the project directory, for an .env compose reads from there). With it
+	// and Path, a name that means the same file is the override however it is
+	// spelled -- ./docker-compose.bloodtrail.yml, say. Empty: only the two
+	// spellings above are.
+	Dir string
 }
 
 // Is reports whether file, as written in an entry, names the override.
 func (o OverrideEntry) Is(file string) bool {
-	return file == o.Name || (o.Path != "" && file == o.Path)
+	if file == o.Name || (o.Path != "" && file == o.Path) {
+		return true
+	}
+	if o.Path == "" || o.Dir == "" || file == "" {
+		return false
+	}
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(o.Dir, file)
+	}
+	return filepath.Clean(file) == filepath.Clean(o.Path)
 }
 
 func (o OverrideEntry) listedIn(files []string) bool {
@@ -379,8 +394,8 @@ func (o OverrideEntry) listedIn(files []string) bool {
 // `docker compose up -d` keeps it. An existing entry is extended in place,
 // keeping its spelling -- including how it names files: the override goes
 // in by its absolute path (o.Path) when every name already there is absolute,
-// and by o.Name otherwise. An entry that already lists the override, by
-// either name, is left alone.
+// and by o.Name otherwise. An entry that already lists the override, however
+// it spells it (OverrideEntry.Is), is left alone.
 //
 // baseFiles is that existing project, in merge order, and is used only when
 // there is no COMPOSE_FILE entry yet: writing one turns off compose's own
@@ -426,9 +441,9 @@ func AddComposeFile(env string, baseFiles []string, overrideFile string) (string
 	return AddOverrideEntry(env, baseFiles, OverrideEntry{Name: overrideFile})
 }
 
-// RemoveOverrideEntry drops the override, by either of its names, from
-// COMPOSE_FILE, removing the whole line only if the override was the sole
-// entry. Use RemoveComposeFileLine instead when the install created the entry
+// RemoveOverrideEntry drops the override, however the entry names it
+// (OverrideEntry.Is), from COMPOSE_FILE, removing the whole line only if the
+// override was the sole entry. Use RemoveComposeFileLine instead when the install created the entry
 // itself: what has to be restored then is the absence of the line, not a line
 // naming the base file (see AddOverrideEntry for why a present line is not
 // equivalent to no line). The other names are kept exactly as written, even

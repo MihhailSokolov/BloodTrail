@@ -704,14 +704,16 @@ func installEnv(envPath string, baseFiles []string, entry compose.OverrideEntry)
 // is absolute was written to work from any directory, and gets the absolute
 // path, so that it still does.
 func installOverrideEntry(projectDir string) compose.OverrideEntry {
-	return compose.OverrideEntry{Name: compose.OverrideFileName, Path: filepath.Join(projectDir, compose.OverrideFileName)}
+	return compose.OverrideEntry{Name: compose.OverrideFileName, Path: filepath.Join(projectDir, compose.OverrideFileName), Dir: projectDir}
 }
 
 // installedOverrideEntry is the override of the install m records, as an
 // entry may name it: by the relative name the install writes into a list that
-// has one, or by the absolute path it writes into a list of absolute paths.
+// has one, or by the absolute path it writes into a list of absolute paths --
+// or by any other path to the same file, which an operator's edit may have
+// left.
 func installedOverrideEntry(m manifest.Manifest) compose.OverrideEntry {
-	return compose.OverrideEntry{Name: compose.OverrideFileName, Path: m.OverrideFile}
+	return compose.OverrideEntry{Name: compose.OverrideFileName, Path: m.OverrideFile, Dir: m.ProjectDir}
 }
 
 // migratorFailureMarkers are the phrases BloodHound's migrator logs when it
@@ -945,6 +947,13 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 				return fmt.Errorf("writing .env: %w", err)
 			}
 		}
+		// The restart below skips a listed file that is not there, so that a
+		// rollback works for the operator who deleted the override and left
+		// its entry; docker compose itself stops on such a file, which the
+		// operator finds out with their next command unless told here.
+		if gone := missingListedFiles(restoredEnv, m.ProjectDir); len(gone) > 0 {
+			say("    note: COMPOSE_FILE in .env still lists %s, which does not exist: docker compose cannot load the project from .env until it is put back or taken out of the list", strings.Join(gone, ", "))
+		}
 	}
 
 	say("==> Restarting with the original image %s", m.OriginalImage)
@@ -1008,6 +1017,30 @@ func envRestore(envPath string, m manifest.Manifest) (current, restored, note st
 	return string(data), restored, note, true, nil
 }
 
+// missingListedFiles returns the files the COMPOSE_FILE entry of env lists that
+// are not on disk (relative names resolved against projectDir), empty names
+// aside. An entry that cannot be read lists none: the commands that got this
+// far have refused it already.
+func missingListedFiles(env, projectDir string) []string {
+	listed, err := compose.ListedComposeFiles(env)
+	if err != nil {
+		return nil
+	}
+	var missing []string
+	for _, f := range listed {
+		if f == "" {
+			continue
+		}
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(projectDir, f)
+		}
+		if !isFile(f) {
+			missing = append(missing, f)
+		}
+	}
+	return missing
+}
+
 // restoreComposeFileEntry undoes what the install m records did to the .env
 // contents' COMPOSE_FILE entry, and says what the operator should know about
 // the result, if anything. prior is what the .env the install backed up said
@@ -1044,8 +1077,8 @@ func restoreComposeFileEntry(env string, m manifest.Manifest, prior priorEntry) 
 	return restored, note, err
 }
 
-// withoutOverride returns files without the installer's own override, by
-// either name.
+// withoutOverride returns files without the installer's own override, however
+// they name it (compose.OverrideEntry.Is).
 func withoutOverride(files []string, entry compose.OverrideEntry) []string {
 	var out []string
 	for _, f := range files {
