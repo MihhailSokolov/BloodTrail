@@ -1674,6 +1674,21 @@ func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression)
 	}
 	for _, idx := range pb.shortestSteps {
 		step := &pb.chains[idx]
+
+		// Nothing may follow the pattern in its query part either. dawgs
+		// hands the harness only the conditions of the pattern's own MATCH
+		// clause and applies a later clause's WHERE, labels and inline map
+		// after the harness has picked its paths (a later pattern
+		// re-mentioning an endpoint is moreover a cross join with the whole
+		// node table, and some later clauses are 42P01), while this Part's
+		// WHERE pools every clause into the endpoint constraints and into
+		// HasExplicitEndpointInequality below. Every pattern part draws the
+		// next Pattern number, so the step holding the last one drawn means
+		// nothing followed it.
+		if pb.patternSeq == nil || step.Pattern != *pb.patternSeq {
+			return false
+		}
+
 		step.HasExplicitEndpointInequality = hasEndpointInequality(whereConjuncts, step.FromSym, step.ToSym)
 
 		secondWritten := step.ToSym

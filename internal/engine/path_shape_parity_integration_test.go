@@ -512,3 +512,49 @@ func TestShortestPathAfterEarlierBindingMatchesOracle(t *testing.T) {
 
 	g.assertServesOracle(t, `MATCH p = shortestPath((s:ZRoot {name: 'r0'})-[:ZEdge*1..]->(b:ZTerm)) RETURN p`)
 }
+
+// TestShortestPathLaterPatternMatchesOracle: dawgs hands a shortest-path
+// harness only the conditions of the pattern's own MATCH clause, and applies
+// a later clause's WHERE, labels and inline map after the harness has picked
+// its paths; a later pattern re-mentioning an endpoint is a further cross
+// join. The engine pooled every clause's WHERE into the endpoint
+// constraints, so a later `t.name = 'far'` let allShortestPaths skip the
+// one-hop pair (pg: the harness answers at depth 1, the filter then leaves
+// nothing), a later `s <> t` hid pg's 22023, and a later unrelated filter is
+// itself 42P01 in pg. The same condition in the pattern's own clause must
+// keep serving.
+//
+//	a1 -ZR-> near(ZB)            (1 hop)
+//	a1 -ZR-> mid -ZR-> far(ZB,ZT) (2 hops)
+//	both(ZA,ZB) -ZQ-> far -ZQ-> both
+func TestShortestPathLaterPatternMatchesOracle(t *testing.T) {
+	g := seedPathParityGraph(t, pathParityFixture{
+		nodes: []pathParityNode{
+			{name: "a1", kinds: []string{"ZA"}},
+			{name: "near", kinds: []string{"ZB"}},
+			{name: "mid", kinds: []string{"ZM"}},
+			{name: "far", kinds: []string{"ZB", "ZT"}},
+			{name: "x", kinds: []string{"ZX"}},
+			{name: "both", kinds: []string{"ZA", "ZB"}},
+		},
+		edges: []pathParityEdge{
+			{"a1", "near", "ZR"}, {"a1", "mid", "ZR"}, {"mid", "far", "ZR"},
+			{"both", "far", "ZQ"}, {"far", "both", "ZQ"},
+		},
+	})
+
+	for _, query := range []string{
+		`MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) MATCH (x:ZX) WHERE t.name = 'far' RETURN p`,
+		`MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) MATCH (x:ZX) WHERE x.name = 'x' AND t.name = 'far' RETURN p`,
+		`MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) MATCH (t:ZT) RETURN p`,
+		`MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) MATCH (t {name: 'far'}) RETURN p`,
+		`MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)), (t:ZT) RETURN p`,
+		`MATCH p = shortestPath((s:ZA)-[:ZR*1..]->(t:ZB)), (s {name: 'a1'}) RETURN p`,
+		`MATCH p = shortestPath((s:ZA)-[:ZQ*1..]->(t:ZB)) MATCH (x:ZX) WHERE s <> t RETURN p`,
+		`MATCH p = shortestPath((s:ZA)-[:ZR*1..]->(t:ZB)) MATCH (x:ZX) WHERE x.name = 'x' RETURN p, x`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+	}
+
+	g.assertServesOracle(t, `MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) WHERE t.name = 'far' RETURN p`)
+}

@@ -1714,3 +1714,26 @@ func TestShortestPathMustBeFirstBinding(t *testing.T) {
 		{name: "first and only binding", cypher: `MATCH p = shortestPath((s:Root {name: 'r'})-[:E*1..]->(b:Term)) WHERE b.name = 't' RETURN p`, want: true},
 	})
 }
+
+// TestShortestPathMustBeLastPattern: nothing may follow a shortestPath
+// pattern in its query part -- dawgs applies a later clause's conditions
+// only after its harness has chosen the paths, where the planner would pool
+// them into the endpoint constraints -- whatever the later pattern is.
+func TestShortestPathMustBeLastPattern(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 2: "Term", 3: "Other", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2, kinds: []snapshot.KindID{2}}, {id: 3, kinds: []snapshot.KindID{3}}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	const shortest = `MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Term))`
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "later MATCH filtering an endpoint", cypher: shortest + ` MATCH (x:Other) WHERE t.name = 'far' RETURN p`, want: false},
+		{name: "later MATCH with the inequality", cypher: shortest + ` MATCH (x:Other) WHERE s <> t RETURN p`, want: false},
+		{name: "later MATCH re-labelling an endpoint", cypher: shortest + ` MATCH (t:Other) RETURN p`, want: false},
+		{name: "later comma pattern with an inline map", cypher: shortest + `, (s {name: 'a'}) RETURN p`, want: false},
+		{name: "later comma pattern, unrelated node", cypher: shortest + `, (x:Other) RETURN p, x`, want: false},
+		{name: "later comma chain", cypher: shortest + `, (x:Other)-[:E]->(y) RETURN p`, want: false},
+		{name: "own clause only", cypher: shortest + ` WHERE t.name = 'far' AND s <> t RETURN p`, want: true},
+	})
+}
