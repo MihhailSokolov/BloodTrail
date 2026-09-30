@@ -47,6 +47,11 @@ type RegexMatcher struct {
 	prefilter [][]string
 
 	fold bool
+
+	// foldsCase is set when any part of the pattern matches case-
+	// insensitively, which decides how a non-ASCII subject is matched (see
+	// MatchString).
+	foldsCase bool
 }
 
 // NewRegexMatcher compiles pattern and derives its substring plan, if any.
@@ -60,6 +65,7 @@ func NewRegexMatcher(pattern string) (*RegexMatcher, error) {
 	}
 	m := &RegexMatcher{re: re}
 	if parsed, err := syntax.Parse(pattern, syntax.Perl); err == nil {
+		m.foldsCase = foldsCase(parsed)
 		simplified := parsed.Simplify()
 		if lits, fold, ok := searchEquivalentLiterals(simplified); ok {
 			m.literals, m.fold = lits, fold
@@ -70,11 +76,53 @@ func NewRegexMatcher(pattern string) (*RegexMatcher, error) {
 	return m, nil
 }
 
-// MatchString reports whether the pattern matches anywhere in s, exactly as
-// the compiled regex would.
+// foldsCase reports whether any node of re matches case-insensitively.
+func foldsCase(re *syntax.Regexp) bool {
+	if re.Flags&syntax.FoldCase != 0 {
+		return true
+	}
+	for _, sub := range re.Sub {
+		if foldsCase(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// pgFoldSubject prepares a subject for a case-insensitive Go match that must
+// answer as PostgreSQL's does. Go folds case along Unicode's simple-fold
+// orbits, which give two ASCII letters a non-ASCII member: U+212A KELVIN
+// SIGN (k, K) and U+017F LATIN SMALL LETTER LONG S (s, S). PostgreSQL
+// compares a character only with the pattern character's own upper and lower
+// case, so for it neither rune is a letter of an ASCII pattern: `(?i)k`
+// misses the Kelvin sign, and `(?i)[^k]` matches it -- the opposite of Go on
+// both. Replacing the two with U+FFFD, which folds onto nothing and occurs in
+// no pattern PgRegexCompatible admits under (?i) (those are ASCII), makes Go
+// give PostgreSQL's answer for every subject.
+func pgFoldSubject(s string) string {
+	if !strings.ContainsRune(s, '\u212a') && !strings.ContainsRune(s, '\u017f') {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if r == '\u212a' || r == '\u017f' {
+			return '\ufffd'
+		}
+		return r
+	}, s)
+}
+
+// MatchString reports whether the pattern matches anywhere in s, as
+// PostgreSQL's `~` does for the patterns PgRegexCompatible admits: exactly
+// as the compiled regex would, except that a case-insensitive pattern
+// matches a non-ASCII subject the way PostgreSQL folds case (pgFoldSubject).
 func (m *RegexMatcher) MatchString(s string) bool {
 	if m == nil || m.re == nil {
 		return false
+	}
+	if m.foldsCase && !isASCII(s) {
+		// The substring plans below never decide a non-ASCII subject under
+		// case folding anyway; the engine answers it.
+		return m.re.MatchString(pgFoldSubject(s))
 	}
 	if len(m.literals) == 0 {
 		for _, required := range m.prefilter {
@@ -431,11 +479,27 @@ func goRegexFor(pattern string) string {
 //     meanings (`m` is newline-sensitivity there, multi-line here); Go also
 //     accepts scoped `(?i:...)` and named groups, which pg rejects. A plain
 //     non-capturing `(?:...)` means the same in both.
+//   - Under `(?i)`, nothing but ASCII. pg matches a character against the
+//     pattern character's own upper and lower case; Go against its whole
+//     Unicode fold orbit, which for σ also takes ς, for µ also μ, for the
+//     Kelvin sign also K. For an ASCII pattern the only difference is in two
+//     subject runes, which RegexMatcher.MatchString handles (pgFoldSubject).
+//   - No POSIX bracket construct -- `[:alpha:]`, `[.a.]`, `[=a=]` inside a
+//     bracket expression. pg's character classes follow the database locale
+//     (`[[:alpha:]]` matches 'é'), Go's are ASCII-only, and Go has no
+//     collating elements or equivalence classes at all.
+//   - Every bound pg would read as one, read the same way by Go (pgBoundsAgree).
 func PgRegexCompatible(pattern string) bool {
 	if strings.ContainsRune(pattern, '\\') {
 		return false
 	}
 	rest := strings.TrimPrefix(pattern, "(?i)")
+	if len(rest) != len(pattern) && !isASCII(rest) {
+		return false
+	}
+	if !pgBracketsAndBoundsAgree(rest) {
+		return false
+	}
 	for i := strings.Index(rest, "(?"); i >= 0; {
 		if i+2 >= len(rest) || rest[i+2] != ':' {
 			return false
@@ -447,4 +511,100 @@ func PgRegexCompatible(pattern string) bool {
 		i += 2 + next
 	}
 	return true
+}
+
+// pgMaxRepeat is PostgreSQL's largest repetition count (RE_DUPMAX); a bigger
+// one is "invalid repetition count(s)" there, while Go accepts up to 1000.
+const pgMaxRepeat = 255
+
+// pgBracketsAndBoundsAgree walks pattern's bracket expressions and braces
+// (no backslash can occur; PgRegexCompatible has refused those) and reports
+// whether both mean the same to PostgreSQL and Go:
+//
+//   - Inside a bracket expression, `[:`, `[.` and `[=` open a POSIX class,
+//     collating element or equivalence class in pg, none of which Go reads
+//     the same way (see PgRegexCompatible). An unterminated bracket is an
+//     error in both.
+//   - Outside one, a `{` followed by a digit is a bound in pg, which must be
+//     `{m}`, `{m,}` or `{m,n}` with counts of at most 255, or the pattern is
+//     an error there. Go reads a malformed one as literal text (`a{1`, `a{1,`,
+//     `a{2x}`), and a count with a leading zero too (`a{01}`, a bound in pg).
+//     A `{` followed by anything else is literal text in both.
+func pgBracketsAndBoundsAgree(pattern string) bool {
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '[':
+			j := i + 1
+			if j < len(pattern) && pattern[j] == '^' {
+				j++
+			}
+			if j < len(pattern) && pattern[j] == ']' {
+				j++ // a leading ']' is a member, not the end
+			}
+			for ; j < len(pattern) && pattern[j] != ']'; j++ {
+				if pattern[j] == '[' && j+1 < len(pattern) && strings.IndexByte(":.=", pattern[j+1]) >= 0 {
+					return false
+				}
+			}
+			if j >= len(pattern) {
+				return false
+			}
+			i = j
+		case '{':
+			if i+1 < len(pattern) && isDecimalDigit(pattern[i+1]) {
+				n, ok := pgBoundLength(pattern[i+1:])
+				if !ok {
+					return false
+				}
+				i += n
+			}
+		}
+	}
+	return true
+}
+
+// pgBoundLength reads the rest of a bound after its `{` -- `m}`, `m,}` or
+// `m,n}` -- and returns how many bytes it spans, or false for anything pg
+// would reject or Go would not read as the same bound.
+func pgBoundLength(s string) (int, bool) {
+	lo, i, ok := pgBoundCount(s, 0)
+	if !ok {
+		return 0, false
+	}
+	if i < len(s) && s[i] == '}' {
+		return i + 1, true
+	}
+	if i >= len(s) || s[i] != ',' {
+		return 0, false
+	}
+	i++
+	if i < len(s) && s[i] == '}' {
+		return i + 1, true
+	}
+	hi, i, ok := pgBoundCount(s, i)
+	if !ok || hi < lo || i >= len(s) || s[i] != '}' {
+		return 0, false
+	}
+	return i + 1, true
+}
+
+// pgBoundCount reads one repetition count starting at s[i]: decimal digits
+// without a leading zero (Go refuses those), at most pgMaxRepeat.
+func pgBoundCount(s string, i int) (count, next int, ok bool) {
+	start := i
+	for i < len(s) && isDecimalDigit(s[i]) {
+		count = count*10 + int(s[i]-'0')
+		if count > pgMaxRepeat {
+			return 0, 0, false
+		}
+		i++
+	}
+	if i == start || (s[start] == '0' && i-start > 1) {
+		return 0, 0, false
+	}
+	return count, i, true
+}
+
+func isDecimalDigit(c byte) bool {
+	return c >= '0' && c <= '9'
 }
