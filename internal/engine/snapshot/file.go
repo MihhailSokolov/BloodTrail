@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"time"
 )
 
@@ -87,8 +90,13 @@ type Header struct {
 // crash or an error partway through can't leave path in a half-written
 // state. This is achieved the standard way: write to a fresh temp file in
 // the SAME directory as path (so the final rename is same-filesystem and
-// therefore atomic), fsync it, close it, then os.Rename it over path. Any
-// error along the way removes the temp file rather than leaving it behind.
+// therefore atomic), fsync it, close it, os.Rename it over path, then fsync
+// the directory, so the rename itself survives a power loss -- the file's
+// own fsync covers its bytes, not the directory entry naming them. Any
+// error before the rename removes the temp file rather than leaving it
+// behind. An error syncing the directory comes after the rename: the file
+// is complete and in place, only its durability is unknown, and a caller
+// that must not leave a file behind has to treat that error accordingly.
 //
 // The temp file (and therefore the final file) is created with mode 0600 --
 // os.CreateTemp's default -- since a snapshot's payload is a full copy of
@@ -150,7 +158,71 @@ func WriteSnapshotFile(path string, s *Snapshot, stamp Stamp) (err error) {
 	}
 
 	success = true
+	if err := syncParentDir(dir); err != nil {
+		return fmt.Errorf("snapshot: WriteSnapshotFile: %w", err)
+	}
 	return nil
+}
+
+// RemoveSnapshotFile removes the snapshot file at path and then syncs its
+// directory, so the removal survives a power loss: an unlink still only in
+// the page cache when the power goes brings the file back at the next boot,
+// and a file is removed precisely when it must not come back (the engine's
+// invalidation after a watermark bump failed). removed reports whether a
+// file was there to remove. A missing file is no error, and the directory is
+// synced all the same -- an earlier removal's own unlink may not be durable
+// yet -- unless the directory is missing too, when there is nothing a power
+// loss could bring back. An error syncing comes after the unlink: the file is
+// gone, only the durability of that is unknown.
+func RemoveSnapshotFile(path string) (removed bool, err error) {
+	switch err := os.Remove(path); {
+	case err == nil:
+		removed = true
+	case errors.Is(err, fs.ErrNotExist):
+	default:
+		return false, fmt.Errorf("snapshot: RemoveSnapshotFile: %w", err)
+	}
+	if err := syncParentDir(filepath.Dir(path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return removed, fmt.Errorf("snapshot: RemoveSnapshotFile: %w", err)
+	}
+	return removed, nil
+}
+
+// syncParentDir is the directory sync WriteSnapshotFile and
+// RemoveSnapshotFile run after they change a directory entry: syncDir, held
+// in a variable only so a test can observe the calls and make one fail.
+var syncParentDir = syncDir
+
+// syncDir flushes dir's own entries -- the names in it, as renames and
+// unlinks left them -- to stable storage. A platform or filesystem that
+// cannot sync a directory at all (dirSyncUnsupported; Windows, where a
+// directory cannot be opened for it) counts as synced: there is no stronger
+// guarantee to be had there, and failing every save over it would only lose
+// the file.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("sync directory: %w", err)
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil && !dirSyncUnsupported(syncErr) {
+		return fmt.Errorf("sync directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("sync directory: close: %w", closeErr)
+	}
+	return nil
+}
+
+// dirSyncUnsupported reports whether err, from syncing a directory, means
+// the filesystem does not sync directories at all rather than that the sync
+// failed.
+func dirSyncUnsupported(err error) bool {
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
 // writeSnapshotBody writes every field of the format after the magic:

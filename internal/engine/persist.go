@@ -4,10 +4,8 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -405,25 +403,39 @@ func (e *Engine) saveSnapshotPrepare(ctx context.Context, epoch uint64, converge
 	return &pendingSnapshotSave{snap: snap, dirtyGen: dirtyGen, foldDuration: foldDuration}, nil
 }
 
+// writeSnapshotFile is the file write saveSnapshotWrite runs:
+// snapshot.WriteSnapshotFile, held in a variable only so a test can make a
+// write report an error after its file is already in place.
+var writeSnapshotFile = snapshot.WriteSnapshotFile
+
 // saveSnapshotWrite is saveSnapshotCommit's unlocked half: it writes what
 // saveSnapshotPrepare decided on, then takes the file back out of play if a
 // watermark bump failed while it was being written (saveSnapshotCommit's
 // doc says why that cannot be left to NoteWatermarkBumpFailure's own
 // removal alone).
+//
+// That check runs whether or not the write reported an error: a write that
+// failed only in syncing the directory after its rename has left a complete
+// file in place all the same (snapshot.WriteSnapshotFile's doc), and a file
+// written across a failed bump has to go whichever way its write ended.
 func (e *Engine) saveSnapshotWrite(ctx context.Context, path string, pending *pendingSnapshotSave, stamp snapshot.Stamp, start time.Time) error {
 	snap := pending.snap
 
 	writeStart := time.Now()
-	if err := snapshot.WriteSnapshotFile(path, snap, stamp); err != nil {
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "write"), slog.Any("error", err))
-		return fmt.Errorf("engine: SaveSnapshot: %w", err)
+	writeErr := writeSnapshotFile(path, snap, stamp)
+	if writeErr != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "write"), slog.Any("error", writeErr))
+		writeErr = fmt.Errorf("engine: SaveSnapshot: %w", writeErr)
 	}
 
 	if e.dirtyGen.Load() != pending.dirtyGen {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
 			slog.String("reason", "a watermark bump failed while the file was being written"))
 		e.removeSnapshotFile(ctx, path)
-		return nil
+		return writeErr
+	}
+	if writeErr != nil {
+		return writeErr
 	}
 
 	e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file written",
@@ -563,17 +575,26 @@ func (e *Engine) invalidateSnapshotFile(ctx context.Context) {
 // removeSnapshotFile is invalidateSnapshotFile's second half, split out so it
 // can be exercised against a path of the caller's choosing rather than only
 // the one a resolved default graph produces.
+//
+// The removal is made durable (snapshot.RemoveSnapshotFile syncs the
+// directory after the unlink, and even when there was nothing to unlink):
+// an unlink lost to a power loss brings back exactly the file this call
+// exists to take out of play -- one stamped with a counter an uncounted
+// write never moved, which the next boot would find current. A sync that
+// fails is logged like a removal that fails: the file is gone for now, but
+// may not stay gone.
 func (e *Engine) removeSnapshotFile(ctx context.Context, path string) {
-	switch err := os.Remove(path); {
-	case err == nil:
+	removed, err := snapshot.RemoveSnapshotFile(path)
+	switch {
+	case err != nil:
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file invalidation failed",
+			slog.String("path", path), slog.Bool("removed", removed), slog.Any("error", err))
+	case removed:
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file invalidated",
 			slog.String("path", path),
 			slog.String("reason", "a write reached PostgreSQL without advancing the watermark"))
-	case errors.Is(err, os.ErrNotExist):
+	default:
 		// Nothing saved yet, or already gone. Either way there is no file
 		// a later boot could adopt.
-	default:
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file invalidation failed",
-			slog.String("path", path), slog.Any("error", err))
 	}
 }
