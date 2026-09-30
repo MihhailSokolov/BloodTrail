@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,7 +83,11 @@ func assertSnapshotsEqual(t *testing.T, want, got *Snapshot) {
 	if got.Kinds.Len() != want.Kinds.Len() {
 		t.Fatalf("Kinds.Len() = %d, want %d", got.Kinds.Len(), want.Kinds.Len())
 	}
-	for k := KindID(0); k <= want.MaxKindID+1; k++ {
+	// One id past the ceiling as well, where KindID has one: the counter is
+	// an int because MaxKindID+1 wraps to -32768 at 32767 and skips the walk.
+	last := min(int(want.MaxKindID)+1, math.MaxInt16)
+	for i := 0; i <= last; i++ {
+		k := KindID(i)
 		wantName, wantOK := want.Kinds.Name(k)
 		gotName, gotOK := got.Kinds.Name(k)
 		if wantName != gotName || wantOK != gotOK {

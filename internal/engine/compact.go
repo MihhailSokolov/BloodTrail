@@ -462,9 +462,10 @@ func (e *Engine) adoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs [
 // action, one way or another, so a failed or discarded compaction never
 // wedges every future trigger shut -- but WHEN it clears differs by exit
 // path, deliberately. Every early return (both bgCtx checks, a Fold
-// failure, and adoptCompaction's own refusal) clears it via the deferred
-// call at the top, right there at that return, since none of those paths
-// does anything further this flag needs to keep excluded. The one path
+// failure, adoptCompaction's own refusal, and a panic recovered from any of
+// those steps -- all inside foldAndAdoptCompaction) clears it via the
+// deferred call at the top, right there at that return, since none of those
+// paths does anything further this flag needs to keep excluded. The one path
 // that reaches adoption successfully clears it EXPLICITLY, right after
 // adoptCompaction returns true and BEFORE the save below runs (the
 // deferred call at the top still fires when this goroutine actually
@@ -523,27 +524,8 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 		slog.Uint64("bytes", bytes),
 	)
 
-	if e.bgCtx.Err() != nil {
-		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded", slog.String("reason", "engine stopping"))
-		return
-	}
-
-	folded, err := snapshot.Fold(capturedBase, capturedSegs)
-	if err != nil {
-		e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: compaction failed", slog.Any("error", err))
-		return
-	}
-
-	if e.bgCtx.Err() != nil {
-		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded", slog.String("reason", "engine stopping"))
-		return
-	}
-
-	if !e.adoptCompaction(capturedBase, capturedSegs, folded) {
-		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded",
-			slog.String("reason", "base or segment stack changed while folding"),
-			slog.Duration("duration", time.Since(start)),
-		)
+	folded, adopted := e.foldAndAdoptCompaction(capturedBase, capturedSegs, start)
+	if !adopted {
 		return
 	}
 
@@ -564,4 +546,52 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 	if err := e.saveSnapshotAfterCompaction(e.bgCtx); err != nil {
 		e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: compaction snapshot save failed", slog.Any("error", err))
 	}
+}
+
+// foldAndAdoptCompaction is runCompaction's fold and publish -- everything
+// but the snapshot-file save that follows a successful adoption -- including
+// both of its bgCtx checkpoints. It returns the folded snapshot and whether
+// adoptCompaction adopted it; every way of not adopting is logged here.
+//
+// A panic anywhere in it -- the fold itself, or the tail merge and Warm
+// passes inside the adoption -- is recovered and becomes a fallback
+// (backgroundPanicked, background_panic.go) instead of ending the process:
+// runCompaction is a goroutine of its own, so nothing else could recover it.
+// The save stays outside this recover on purpose: saveSnapshotPrepare
+// (persist.go) releases applyMu explicitly rather than in a defer, so a panic
+// recovered from inside its critical section would leave the lock every
+// write takes held for good -- worse than the crash the recover exists to
+// prevent.
+func (e *Engine) foldAndAdoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment, start time.Time) (folded *snapshot.Snapshot, adopted bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			_ = e.backgroundPanicked(e.bgCtx, "compaction", r)
+			folded, adopted = nil, false
+		}
+	}()
+
+	if e.bgCtx.Err() != nil {
+		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded", slog.String("reason", "engine stopping"))
+		return nil, false
+	}
+
+	folded, err := snapshot.Fold(capturedBase, capturedSegs)
+	if err != nil {
+		e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: compaction failed", slog.Any("error", err))
+		return nil, false
+	}
+
+	if e.bgCtx.Err() != nil {
+		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded", slog.String("reason", "engine stopping"))
+		return nil, false
+	}
+
+	if !e.adoptCompaction(capturedBase, capturedSegs, folded) {
+		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded",
+			slog.String("reason", "base or segment stack changed while folding"),
+			slog.Duration("duration", time.Since(start)),
+		)
+		return nil, false
+	}
+	return folded, true
 }

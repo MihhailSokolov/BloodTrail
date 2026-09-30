@@ -371,7 +371,12 @@ func finalizeDerived(s *Snapshot) {
 	// and so a compaction that folds away a kind's last edge also clears it.
 	// Consumed by View.EdgeKindPresent, which the interpreter uses to answer
 	// a pattern naming an absent relationship kind without walking anything.
-	edgeKindSeen := make([]bool, maxKind+1)
+	//
+	// The length is computed in int, not KindID: KindID is an int16, and
+	// 32767 -- the last id `kind.id smallserial` can issue -- plus one wraps
+	// to -32768, a negative length that panics the build (NewKindTable sizes
+	// its own slice the same way for the same reason).
+	edgeKindSeen := make([]bool, int(maxKind)+1)
 	for _, k := range s.OutKinds {
 		if k >= 0 {
 			edgeKindSeen[k] = true
