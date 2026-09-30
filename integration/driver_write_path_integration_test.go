@@ -7,9 +7,9 @@
 // (transaction.go) and the Driver entry points themselves (driver.go) --
 // through shapes whose effect on PostgreSQL is easy to get wrong: criteria
 // the change log must record exactly, writes hidden in a query's final
-// criteria, flushes that fail and are retried, and delegates that panic.
-// Every test compares the replica's answer with PostgreSQL's own, read
-// through the plain pg driver.
+// criteria, flushes that fail and are retried, delegates that panic, and a
+// COMMIT that fails after nothing was written. The replica's answers are
+// checked against PostgreSQL's own, read through the plain pg driver.
 
 package integration
 
@@ -591,4 +591,41 @@ func TestWriteTransactionPanicResolvesItsWatermarkBump(t *testing.T) {
 	seedWritePathAnchor(t, ctx, bt, graph.StringKind("WritePathWritePanicLater"))
 	requireWritePathConverged(t, ctx, d, "after a later write")
 	assertNoFallback(t, buf)
+}
+
+// TestReadOnlyWriteTransactionCommitFailureNeedsNoRebuild covers a
+// WriteTransaction whose delegate only read and whose final COMMIT then
+// failed -- here because the caller's context was cancelled, as when a
+// client goes away. Nothing was written, so there is nothing whose outcome
+// is unknown: the engine must go on serving, with no fallback and no
+// rebuild.
+func TestReadOnlyWriteTransactionCommitFailureNeedsNoRebuild(t *testing.T) {
+	d, bt, _, _, buf, ctx := openWritePathDriver(t)
+	kind := graph.StringKind("WritePathReadOnlyCommitNode")
+
+	seedWritePathAnchor(t, ctx, bt, kind)
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the anchor serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+	rebuildsBefore := bloodtrail.TestingEngine(d).RebuildCount()
+	fallbacksBefore := markerCount(buf, fallbackEnteredMarker)
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	err := bt.WriteTransaction(cancelCtx, func(tx graph.Transaction) error {
+		_, err := tx.Nodes().Filter(query.Kind(query.Node(), kind)).Count()
+		cancel() // the client goes away after the read
+		return err
+	})
+	cancel()
+	if err == nil {
+		t.Fatalf("the COMMIT succeeded: the cancelled context did not fail it")
+	}
+
+	if delta := markerCount(buf, fallbackEnteredMarker) - fallbacksBefore; delta != 0 {
+		t.Fatalf("fallback entered %d time(s) for a transaction that wrote nothing (commit error: %v)", delta, err)
+	}
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "the engine still serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+	if got := bloodtrail.TestingEngine(d).RebuildCount(); got != rebuildsBefore {
+		t.Fatalf("RebuildCount %d -> %d for a transaction that wrote nothing", rebuildsBefore, got)
+	}
 }

@@ -1195,22 +1195,61 @@ func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T)
 
 // TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback pins
 // Driver.WriteTransaction's outer-commit-failure branch: the delegate
-// succeeded, so the error arose in the embedded driver's own final Commit
-// and the outcome is ambiguous -- the scope must be applied (rebuild via its
-// fallback record), never resolved as an abandoned (rolled-back) write.
+// succeeded and wrote, so the error arose in the embedded driver's own
+// final Commit and the outcome is ambiguous -- the scope must be applied
+// (rebuild via its fallback record), never resolved as an abandoned
+// (rolled-back) write. A scope that recorded nothing but was bumped is
+// ambiguous too: a mutating call reached PostgreSQL.
 func TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback(t *testing.T) {
+	scopes := map[string]func() *engine.WriteScope{
+		"a recorded write": func() *engine.WriteScope {
+			scope := engine.NewWriteScope()
+			scope.Changes().RecordNodeID(7)
+			return scope
+		},
+		"a bump without a record": func() *engine.WriteScope {
+			scope := engine.NewWriteScope()
+			scope.SetWatermark(1)
+			return scope
+		},
+	}
+	for name, newScope := range scopes {
+		t.Run(name, func(t *testing.T) {
+			eng := disabledEngine()
+			scope := newScope()
+			observer := &observingTransaction{Transaction: &fakeTransaction{}, scope: scope, eng: eng}
+
+			applyCountBefore := eng.ApplyCount()
+			resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit boom"))
+
+			if got := eng.ApplyCount(); got != applyCountBefore+1 {
+				t.Fatalf("ambiguous commit outcome did not Apply: ApplyCount = %d, want %d", got, applyCountBefore+1)
+			}
+			if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
+				t.Fatalf("ambiguous commit outcome must record a fallback before applying")
+			}
+		})
+	}
+}
+
+// TestResolveWriteTransactionFailureWithNothingWrittenSkipsApply pins
+// DRIVER-7: a transaction that neither recorded a write nor bumped the
+// watermark made no mutating call at all, so a failed final COMMIT leaves
+// nothing whose outcome is unknown -- it settles as abandoned, with no
+// fallback (which would cost a full rebuild) and no Apply.
+func TestResolveWriteTransactionFailureWithNothingWrittenSkipsApply(t *testing.T) {
 	eng := disabledEngine()
 	scope := engine.NewWriteScope()
 	observer := &observingTransaction{Transaction: &fakeTransaction{}, scope: scope, eng: eng}
 
 	applyCountBefore := eng.ApplyCount()
-	resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit boom"))
+	resolveWriteTransactionFailure(context.Background(), eng, observer, nil, errors.New("commit: context canceled"))
 
-	if got := eng.ApplyCount(); got != applyCountBefore+1 {
-		t.Fatalf("ambiguous commit outcome did not Apply: ApplyCount = %d, want %d", got, applyCountBefore+1)
+	if got := eng.ApplyCount(); got != applyCountBefore {
+		t.Fatalf("a transaction that wrote nothing was applied: ApplyCount = %d, want %d", got, applyCountBefore)
 	}
-	if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
-		t.Fatalf("ambiguous commit outcome must record a fallback before applying")
+	if hasFallback, _ := scope.Changes().HasFallback(); hasFallback {
+		t.Fatalf("a transaction that wrote nothing recorded a fallback")
 	}
 }
 

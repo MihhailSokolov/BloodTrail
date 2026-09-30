@@ -295,10 +295,10 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // committed effect for a read-back to replay. But an error with a
 // SUCCESSFUL delegate arose in the embedded driver's own final Commit, whose
 // outcome is ambiguous (the write may be durable); that branch records a
-// fallback and Applies instead -- see its in-body comment. observer can be
-// nil here only if d.Driver.WriteTransaction's own delegate closure never
-// ran at all (never observed in the pinned pg driver, but checked
-// defensively).
+// fallback and Applies instead -- unless the transaction wrote nothing at
+// all, see resolveWriteTransactionFailure's doc. observer can be nil here
+// only if d.Driver.WriteTransaction's own delegate closure never ran at all
+// (never observed in the pinned pg driver, but checked defensively).
 //
 // observer is declared once, outside the delegate closure below, then
 // reconstructed fresh inside it on every invocation -- matching
@@ -435,11 +435,20 @@ func settleWriteTransactionPanic(ctx context.Context, eng *engine.Engine, observ
 //     observingTransaction.Commit's own failed-commit branch, which covers a
 //     DELEGATE-issued commit; this covers the embedded driver's final one,
 //     which no wrapper ever sees).
+//
+// Except when the scope is empty and was never bumped: every mutating call
+// an observer makes bumps first (ensureBumped), and a bump that fails
+// records a fallback, so such a scope means no write reached PostgreSQL
+// since the transaction began (or since a delegate-issued Commit applied
+// and replaced the scope). There is nothing whose outcome is unknown, so it
+// resolves as abandoned -- a read-only transaction whose COMMIT failed (a
+// client that went away, say) no longer costs a fallback and a full
+// rebuild.
 func resolveWriteTransactionFailure(ctx context.Context, eng *engine.Engine, observer *observingTransaction, delegateErr, outerErr error) {
 	if observer == nil {
 		return
 	}
-	if delegateErr == nil {
+	if _, bumped := observer.scope.Watermark(); delegateErr == nil && (bumped || !observer.scope.Empty()) {
 		observer.scope.Changes().RecordFallback(fmt.Sprintf("WriteTransaction: commit outcome ambiguous: %v", outerErr))
 		eng.Apply(ctx, observer.scope)
 		return
