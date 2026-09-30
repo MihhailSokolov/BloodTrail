@@ -2387,6 +2387,12 @@ func verifyClosingStep(env *Env, meter *workMeter, rows []*Row, step *Step) ([]*
 				return nil, err
 			}
 			out = append(out, nr)
+			// Parallel qualifying edges (one per kind between the pair) fan a
+			// row out here exactly as a tree step's adjacency does, so the
+			// rows are charged the same way.
+			if err := meter.observeRows(len(out)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return out, nil
