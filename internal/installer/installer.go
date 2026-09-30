@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -251,14 +252,32 @@ func projectFiles(composeFile, projectDir string, strict bool) ([]string, error)
 // -d` from this shell ignores the entry the install writes to .env -- and
 // boots the upstream image against the `bloodtrail` driver setting -- while a
 // separator other than ':' splits that entry into names that do not exist.
-// The installer's own commands name every file with -f, which compose honours
-// over both, so they would never show it.
+// COMPOSE_ENV_FILES (when not empty) and a true COMPOSE_DISABLE_ENV_FILE make
+// compose leave the project's .env unread altogether, which has the same
+// effect on the entry. The installer's own commands name every file with -f,
+// which compose honours over all of them, so they would never show it.
+//
+// Compose reads COMPOSE_DISABLE_ENV_FILE with strconv.ParseBool and stops on a
+// value that is not a boolean, empty included; so does every command the
+// installer would run, and it says why here instead.
 func checkComposeEnvironment() error {
 	if _, ok := os.LookupEnv("COMPOSE_FILE"); ok {
 		return errors.New("COMPOSE_FILE is set in this shell's environment, where docker compose takes it over the COMPOSE_FILE entry in .env: a plain `docker compose up -d` from here would not load the override this install adds there; unset it (moving the setting into .env if the project needs it) and rerun")
 	}
 	if sep, ok := os.LookupEnv("COMPOSE_PATH_SEPARATOR"); ok && sep != "" && sep != ":" {
 		return fmt.Errorf("COMPOSE_PATH_SEPARATOR is set in this shell's environment to %q, so docker compose would split COMPOSE_FILE on it rather than on the ':' this installer writes; unset it and rerun", sep)
+	}
+	if files := os.Getenv("COMPOSE_ENV_FILES"); files != "" {
+		return fmt.Errorf("COMPOSE_ENV_FILES is set in this shell's environment to %q, so docker compose reads those env files instead of the project's .env: a plain `docker compose up -d` from here would not see the COMPOSE_FILE entry this install adds there, and would boot the upstream image against the `bloodtrail` driver setting; unset it and rerun", files)
+	}
+	if v, ok := os.LookupEnv("COMPOSE_DISABLE_ENV_FILE"); ok {
+		disabled, err := strconv.ParseBool(v)
+		switch {
+		case err != nil:
+			return fmt.Errorf("COMPOSE_DISABLE_ENV_FILE is set in this shell's environment to %q, which docker compose does not accept as a boolean -- it stops with an error on it, and would on every command this installer runs; unset it (or set it to false) and rerun", v)
+		case disabled:
+			return fmt.Errorf("COMPOSE_DISABLE_ENV_FILE is set in this shell's environment to %q, so docker compose skips the project's .env: a plain `docker compose up -d` from here would not see the COMPOSE_FILE entry this install adds there, and would boot the upstream image against the `bloodtrail` driver setting; unset it (or set it to false) and rerun", v)
+		}
 	}
 	return nil
 }

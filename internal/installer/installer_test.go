@@ -23,11 +23,12 @@ import (
 const upstreamImage = "docker.io/specterops/bloodhound:v9.6.0"
 
 // TestMain keeps the environment the tests run in out of Install's check on
-// COMPOSE_FILE and COMPOSE_PATH_SEPARATOR (see
+// the variables that change how docker compose reads the project (see
 // TestInstallStopsWhenTheShellSetsComposeFile).
 func TestMain(m *testing.M) {
-	_ = os.Unsetenv("COMPOSE_FILE")
-	_ = os.Unsetenv("COMPOSE_PATH_SEPARATOR")
+	for _, key := range []string{"COMPOSE_FILE", "COMPOSE_PATH_SEPARATOR", "COMPOSE_ENV_FILES", "COMPOSE_DISABLE_ENV_FILE"} {
+		_ = os.Unsetenv(key)
+	}
 	os.Exit(m.Run())
 }
 
@@ -1704,14 +1705,18 @@ func TestInstallStopsOnAListedFileThatIsMissing(t *testing.T) {
 	}
 }
 
-// TestInstallStopsWhenTheShellSetsComposeFile covers COMPOSE_FILE -- or a
-// COMPOSE_PATH_SEPARATOR other than compose's default ':' -- set in the
-// environment the installer runs in. Compose takes both from the shell over
-// .env, so a plain `docker compose up -d` from that shell ignores the entry
-// the install writes to .env (booting the upstream image against the
-// `bloodtrail` driver setting the install leaves behind), or splits it into
-// names that do not exist. The installer's own commands name every file with
-// -f, which compose honours over either, so nothing used to notice.
+// TestInstallStopsWhenTheShellSetsComposeFile covers what the environment the
+// installer runs in can change about how docker compose reads the project.
+// Compose takes COMPOSE_FILE from the shell over .env, so a plain `docker
+// compose up -d` from that shell ignores the entry the install writes to .env
+// (booting the upstream image against the `bloodtrail` driver setting the
+// install leaves behind); a COMPOSE_PATH_SEPARATOR other than ':' splits that
+// entry into names that do not exist; and COMPOSE_ENV_FILES, or a true
+// COMPOSE_DISABLE_ENV_FILE, makes compose skip the project's .env altogether.
+// The installer's own commands name every file with -f, which compose honours
+// over all of them, so nothing used to notice. Compose reads
+// COMPOSE_DISABLE_ENV_FILE with strconv.ParseBool and stops on a value that
+// is not a boolean; an empty COMPOSE_ENV_FILES selects nothing.
 func TestInstallStopsWhenTheShellSetsComposeFile(t *testing.T) {
 	for _, c := range []struct {
 		key, value string
@@ -1721,6 +1726,18 @@ func TestInstallStopsWhenTheShellSetsComposeFile(t *testing.T) {
 		{"COMPOSE_FILE", "", true},
 		{"COMPOSE_PATH_SEPARATOR", ";", true},
 		{"COMPOSE_PATH_SEPARATOR", ":", false},
+		{"COMPOSE_ENV_FILES", "/etc/bloodhound/prod.env", true},
+		{"COMPOSE_ENV_FILES", "a.env,b.env", true},
+		{"COMPOSE_ENV_FILES", "", false},
+		{"COMPOSE_DISABLE_ENV_FILE", "1", true},
+		{"COMPOSE_DISABLE_ENV_FILE", "true", true},
+		{"COMPOSE_DISABLE_ENV_FILE", "T", true},
+		{"COMPOSE_DISABLE_ENV_FILE", "0", false},
+		{"COMPOSE_DISABLE_ENV_FILE", "False", false},
+		// Not a boolean: compose stops on it, and so would every command the
+		// installer runs, so it is refused up front with the reason.
+		{"COMPOSE_DISABLE_ENV_FILE", "yes", true},
+		{"COMPOSE_DISABLE_ENV_FILE", "", true},
 	} {
 		t.Run(c.key+"="+c.value, func(t *testing.T) {
 			t.Setenv(c.key, c.value)
