@@ -1096,15 +1096,19 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 	}
 	// A bare property against a numeric operand (the only property shape
 	// relationalComparisonSafe admits) is `(properties ->> 'x')::int8 < ...`
-	// in pg -- a CAST of the property's text, not a jsonb comparison. See
-	// castPropertyForOrder.
+	// in pg -- a CAST of the property's text, not a jsonb comparison, to the
+	// type dawgs infers for the other side: `::int` next to size(),
+	// `::float8` next to a float literal, `::numeric` next to datetime().
+	// See castPropertyAs.
 	leftProp, rightProp := isBarePropertyLookup(leftExpr), isBarePropertyLookup(rightExpr)
 	if leftProp && !rightProp {
-		if aVal, err = castPropertyForOrder(aVal, isFloatLiteral(rightExpr)); err != nil {
+		_, h := operandTyping(rightExpr)
+		if aVal, _, err = castPropertyForPartner(aVal, h); err != nil {
 			return TriNull, err
 		}
 	} else if rightProp && !leftProp {
-		if bVal, err = castPropertyForOrder(bVal, isFloatLiteral(leftExpr)); err != nil {
+		_, h := operandTyping(leftExpr)
+		if bVal, _, err = castPropertyForPartner(bVal, h); err != nil {
 			return TriNull, err
 		}
 	}
@@ -1129,19 +1133,6 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 	default:
 		return TriNull, ErrUnsupported
 	}
-}
-
-// isFloatLiteral reports whether expr is a bare float literal -- the one
-// numeric operand whose type (float8) this package knows dawgs casts the
-// other side to. An integer literal is int8; any other numeric expression
-// is left undecided, and castPropertyForOrder is conservative about it.
-func isFloatLiteral(expr cypher.Expression) bool {
-	lit, ok := asLiteral(expr)
-	if !ok || lit == nil {
-		return false
-	}
-	_, isFloat := lit.Value.(float64)
-	return isFloat
 }
 
 // maxExactInt is the largest integer magnitude a float64 holds exactly.
@@ -2686,9 +2677,9 @@ func evalArithmeticTyped(env *Env, row *Row, ae *cypher.ArithmeticExpression) (a
 		return nil, false, sqlNumNone, err
 	}
 	curKind := classifyAddOperand(ae.Left)
-	// Whether the value folded so far is statically a float -- what decides
-	// the type dawgs casts a property on the other side of the next step to.
-	leftFloat := staticallyFloatOperand(ae.Left)
+	// dawgs' inferred type of the value folded so far -- what it casts a
+	// property on the other side of the next step to.
+	_, curHint := operandTyping(ae.Left)
 	for i, partial := range ae.Partials {
 		if partial == nil {
 			return nil, false, sqlNumNone, ErrUnsupported
@@ -2698,51 +2689,61 @@ func evalArithmeticTyped(env *Env, row *Row, ae *cypher.ArithmeticExpression) (a
 			return nil, false, sqlNumNone, err
 		}
 		rKind := classifyAddOperand(partial.Right)
-		rightFloat := staticallyFloatOperand(partial.Right)
+		_, rHint := operandTyping(partial.Right)
 		numeric := partial.Operator != cypher.OperatorAdd ||
 			(curKind != addStaticText && rKind != addStaticText && (curKind != addPropertyLookup || rKind != addPropertyLookup))
 		if numeric {
-			// dawgs casts a plain property operand of a numeric step to its
-			// partner's type -- `n.v + 1` is `(p ->> 'v')::int8 + 1`, and
-			// float8 once a float literal is in play -- so the stored value
+			// dawgs casts a plain property operand of a numeric step to the
+			// type it infers for its partner (hintCast) -- `n.v + 1` is
+			// `(p ->> 'v')::int8 + 1`, `n.v + size(n.l)` `(p ->> 'v')::int
+			// + ...`, float8 next to a float literal -- so the stored value
 			// is cast as PostgreSQL casts it: the string '5' is 5, and 5.5
-			// under int8 is a pg error that declines here rather than
-			// quietly computing 6.5. A concatenation keeps the text, and so
-			// does `+` of two properties, which dawgs concatenates.
+			// under int8 (or 3000000000 under int) is a pg error that
+			// declines here rather than quietly computing. A concatenation
+			// keeps the text, and so does `+` of two properties, which dawgs
+			// concatenates.
 			if i == 0 && partial.Operator != cypher.OperatorAdd && isPlainPropertyLookup(ae.Left) && isPlainPropertyLookup(partial.Right) {
 				// `text * text`: PostgreSQL has no such operator. Plan
 				// rejects the shape (checkArithmetic); declined defensively.
 				return nil, false, sqlNumNone, ErrUnsupported
 			}
 			if i == 0 && isPlainPropertyLookup(ae.Left) {
-				if cur, err = castPropertyForOrder(cur, rightFloat); err != nil {
+				if cur, curType, err = castPropertyForPartner(cur, rHint); err != nil {
 					return nil, false, sqlNumNone, err
 				}
-				curType = castSQLNum(rightFloat)
+				curHint = rHint
 			}
 			if isPlainPropertyLookup(partial.Right) {
-				if rVal, err = castPropertyForOrder(rVal, leftFloat); err != nil {
+				if rVal, rType, err = castPropertyForPartner(rVal, curHint); err != nil {
 					return nil, false, sqlNumNone, err
 				}
-				rType = castSQLNum(leftFloat)
+				rHint = curHint
 			}
+			curHint = combineHints(curHint, rHint)
+		} else {
+			curHint = hintOther
 		}
 		cur, curOk, curType, err = applyArithmetic(curType, cur, curOk, curKind, partial.Operator, rType, rVal, rOk, rKind)
 		if err != nil {
 			return nil, false, sqlNumNone, err
 		}
 		curKind = nextAddKind(partial.Operator, curKind, rKind)
-		leftFloat = leftFloat || rightFloat
 	}
 	return cur, curOk, curType, nil
 }
 
-// castSQLNum is the type castPropertyForOrder casts a property to.
-func castSQLNum(floatCast bool) sqlNum {
-	if floatCast {
-		return sqlNumFloat8
+// castPropertyForPartner casts a plain property operand's value the way
+// dawgs casts it next to a partner of hint h, returning the value and the
+// PostgreSQL type of the cast. A partner dawgs infers no type for leaves the
+// property text, which PostgreSQL cannot compute with (checkArithmetic
+// rejects the shape; declined defensively).
+func castPropertyForPartner(v any, h dawgsHint) (any, sqlNum, error) {
+	t, ok := hintCast(h)
+	if !ok {
+		return nil, sqlNumNone, ErrUnsupported
 	}
-	return sqlNumInt8
+	c, err := castPropertyAs(v, t)
+	return c, t, err
 }
 
 // evalOperandTyped evaluates one arithmetic operand together with its

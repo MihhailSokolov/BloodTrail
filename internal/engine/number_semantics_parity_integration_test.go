@@ -129,3 +129,39 @@ func TestTryCypherFloatLiteralArithmeticMatchesOracle(t *testing.T) {
 		{`MATCH (n:FltLit) RETURN 2.0 * n.f + 0.5 AS x`, true},
 	})
 }
+
+// TestTryCypherPropertyCastWidthMatchesOracle compares the shapes where
+// dawgs casts a plain property to the type it infers for the property's
+// partner with PostgreSQL. Next to size() -- `jsonb_array_length(...)::int`
+// -- that is int4, `(p ->> 'v')::int`, which raises "out of range for type
+// integer" for 3000000000; the evaluator cast every property as int8. Next
+// to a WITH alias dawgs infers nothing and leaves the property text, so `n.v
+// * d` is `text * integer`, an error, where the evaluator cast and computed.
+// Next to a signed float literal it is float8, which the evaluator's
+// bare-literal test missed (it cast int8 and declined the text '1.5').
+func TestTryCypherPropertyCastWidthMatchesOracle(t *testing.T) {
+	pgDriver, eng := seedTypedGraph(t, []typedNode{
+		{"CwWide", map[string]any{"name": "l1", "v": 3000000000, "l": []any{"a"}}},
+		{"CwNarrow", map[string]any{"name": "s1", "v": 5, "l": []any{"a"}}},
+		{"CwNarrow", map[string]any{"name": "s2", "v": "1.5", "l": []any{"a", "b"}}},
+		{"CwAlias", map[string]any{"name": "a1", "v": 5}},
+	})
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:CwWide) WHERE n.v < size(n.l) RETURN n`, false},
+		{`MATCH (n:CwWide) WHERE size(n.l) > n.v RETURN n`, false},
+		{`MATCH (n:CwWide) WHERE n.v + size(n.l) = 5 RETURN n`, false},
+		{`MATCH (n:CwWide) WHERE size(n.l) + n.v = 5 RETURN n`, false},
+		{`MATCH (n:CwWide) WHERE n.v * size(n.l) = 5 RETURN n`, false},
+		{`WITH 2 AS d MATCH (n:CwAlias) WHERE n.v * d = 10 RETURN n`, false},
+		{`WITH 2 AS d MATCH (n:CwAlias) WHERE d * n.v = 10 RETURN n`, false},
+		{`WITH 2 AS d MATCH (n:CwAlias) WHERE n.v + d = 7 RETURN n`, false},
+
+		{`MATCH (n:CwWide) WHERE n.v < size(n.l) * 2 RETURN n`, true},
+		{`MATCH (n:CwWide) WHERE n.v < id(n) RETURN n`, true},
+		{`MATCH (n:CwNarrow) WHERE n.v < -2.5 RETURN n`, true},
+		{`MATCH (n:CwNarrow) WHERE n.v > -2.5 RETURN n`, true},
+		{`WITH 2 AS d MATCH (n:CwWide) WHERE n.v > d * 1 RETURN n`, true},
+		{`MATCH (n:CwWide) WHERE n.v < datetime().epochseconds RETURN n`, true},
+	})
+}

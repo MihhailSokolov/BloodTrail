@@ -287,62 +287,208 @@ func integerArithmetic(t sqlNum, a float64, op cypher.Operator, b float64) (floa
 	return float64(r), nil
 }
 
-// planOperandSQLNum is an arithmetic operand's PostgreSQL type as far as Plan
-// can know it. A WITH alias holds an integer or a numeric whose width only
-// its value tells (valueSQLNum), but never a float8, which is all Plan asks
-// of it -- it counts as int8 here.
-func planOperandSQLNum(expr cypher.Expression) sqlNum {
+// dawgsHint is the type dawgs' translator infers for an expression
+// (translate.InferExpressionType), which is what it casts a plain property
+// operand to -- and not always PostgreSQL's own type for the expression: an
+// integer literal is hinted int8 although PostgreSQL types the printed
+// constant int4.
+type dawgsHint uint8
+
+const (
+	// hintNone is an expression with no type of its own -- a plain
+	// property, a WITH alias (a column reference), a coalesce() of
+	// properties alone. A property partnered with one stays `->>` text.
+	hintNone dawgsHint = iota
+	// hintInt is "int", PostgreSQL's int4: size()'s
+	// `jsonb_array_length(...)::int`.
+	hintInt
+	// hintInt8 is an integer literal, id() or an integer coalesce().
+	hintInt8
+	// hintFloat8 is a float literal or a float coalesce().
+	hintFloat8
+	// hintNumeric is datetime().epochseconds / .epochmillis.
+	hintNumeric
+	// hintOther is not a number (text, a boolean, a list), or a combination
+	// dawgs refuses to type (float8 with an integer fails the translation).
+	hintOther
+)
+
+// combineHints is dawgs' inferred type for an arithmetic step over hints a
+// and b (DataType.OperatorResultType, CoerceToSupertype): an operand with no
+// type takes the other's, numeric absorbs every number, int with int8 is
+// int8, and float8 with an integer is a translation error.
+func combineHints(a, b dawgsHint) dawgsHint {
+	switch {
+	case a == hintOther || b == hintOther:
+		return hintOther
+	case a == hintNone:
+		return b
+	case b == hintNone || a == b:
+		return a
+	case a == hintNumeric || b == hintNumeric:
+		return hintNumeric
+	case a != hintFloat8 && b != hintFloat8:
+		return hintInt8
+	default:
+		return hintOther
+	}
+}
+
+// hintCast is the cast dawgs gives a plain property whose partner has hint
+// h, as the PostgreSQL type it produces -- `(p ->> 'v')::int` next to
+// size(), `::int8` next to an integer, `::float8` next to a float,
+// `::numeric` next to datetime(). It is false where dawgs leaves the
+// property uncast text (hintNone: `n.v * d` is `text * integer`) or cannot
+// type the step at all (hintOther); PostgreSQL fails either way.
+func hintCast(h dawgsHint) (sqlNum, bool) {
+	switch h {
+	case hintInt:
+		return sqlNumInt4, true
+	case hintInt8:
+		return sqlNumInt8, true
+	case hintFloat8:
+		return sqlNumFloat8, true
+	case hintNumeric:
+		return sqlNumNumeric, true
+	}
+	return sqlNumNone, false
+}
+
+// leafHint is dawgs' hint for an operand that is not arithmetic or a sign.
+func leafHint(expr cypher.Expression) dawgsHint {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.Literal:
+		if e == nil || e.Null {
+			return hintOther
+		}
+		switch e.Value.(type) {
+		case int64, uint64:
+			return hintInt8
+		case float64:
+			return hintFloat8
+		}
+	case *cypher.PropertyLookup:
+		if e != nil && !propertyRead(e) {
+			return hintNumeric
+		}
+		return hintNone
+	case *cypher.Variable:
+		return hintNone
+	case *cypher.FunctionInvocation:
+		if e == nil {
+			return hintOther
+		}
+		switch strings.ToLower(e.Name) {
+		case cypher.ListSizeFunction:
+			return hintInt
+		case cypher.IdentityFunction:
+			return hintInt8
+		case cypher.CoalesceFunction:
+			if _, untyped := untypedCoalesce(e); untyped {
+				return hintNone
+			}
+			switch kind, ok := coalesceCastKind(e); {
+			case ok && kind == coalesceInt8:
+				return hintInt8
+			case ok && kind == coalesceFloat8:
+				return hintFloat8
+			}
+		}
+	}
+	return hintOther
+}
+
+// operandTyping is an arithmetic operand's PostgreSQL type and dawgs hint as
+// far as they are known before execution. A WITH alias holds an integer or
+// a numeric whose width only its value tells (valueSQLNum), but never a
+// float8, which is all Plan asks of it -- it counts as int8 here; at run time
+// evalOperandTyped types it by its value.
+func operandTyping(expr cypher.Expression) (sqlNum, dawgsHint) {
 	switch e := unwrapParens(expr).(type) {
 	case *cypher.ArithmeticExpression:
 		if e != nil {
-			t, _ := foldArithSQLNum(e, nil)
-			return t
+			if t, h, ok := foldArithTyping(e, nil); ok {
+				return t, h
+			}
+			return sqlNumNone, hintOther
 		}
 	case *cypher.UnaryAddOrSubtractExpression:
 		if e != nil {
-			return planOperandSQLNum(e.Right)
+			return operandTyping(e.Right)
 		}
 	case *cypher.Variable:
-		return sqlNumInt8
+		return sqlNumInt8, hintNone
 	}
-	return leafSQLNum(expr)
+	return leafSQLNum(expr), leafHint(expr)
 }
 
-// foldArithSQLNum folds the PostgreSQL types of ae's steps the way
-// evalArithmeticTyped computes them -- a plain property operand of a numeric
-// step takes the cast its partner gives it, a concatenation has no numeric
-// type -- calling step, when non-nil, with each numeric step's operator, type
-// and whether one of its operands is a fractional literal. It stops,
-// reporting false, at a step step refuses; otherwise it returns ae's type.
-func foldArithSQLNum(ae *cypher.ArithmeticExpression, step func(op cypher.Operator, t sqlNum, fractionalOperand bool) bool) (sqlNum, bool) {
-	cur := planOperandSQLNum(ae.Left)
+// foldArithTyping folds ae's PostgreSQL types and dawgs hints step by step
+// the way evalArithmeticTyped computes them -- a plain property operand of a
+// numeric step takes the cast its partner's hint gives it, a concatenation
+// has no numeric type -- calling step, when non-nil, with each numeric
+// step's operator, type and whether one of its operands is a fractional
+// literal. It reports false at a property dawgs leaves uncast (PostgreSQL
+// fails the step) and at a step step refuses; otherwise it returns ae's type
+// and hint.
+func foldArithTyping(ae *cypher.ArithmeticExpression, step func(op cypher.Operator, t sqlNum, fractionalOperand bool) bool) (sqlNum, dawgsHint, bool) {
+	cur, curHint := operandTyping(ae.Left)
 	curKind := classifyAddOperand(ae.Left)
-	leftFloat := staticallyFloatOperand(ae.Left)
 	for i, p := range ae.Partials {
 		if p == nil {
-			return sqlNumNone, false
+			return sqlNumNone, hintOther, false
 		}
-		r := planOperandSQLNum(p.Right)
+		r, rHint := operandTyping(p.Right)
 		rKind := classifyAddOperand(p.Right)
-		rightFloat := staticallyFloatOperand(p.Right)
 		numeric := p.Operator != cypher.OperatorAdd ||
 			(curKind != addStaticText && rKind != addStaticText && (curKind != addPropertyLookup || rKind != addPropertyLookup))
 		if numeric {
 			if i == 0 && isPlainPropertyLookup(ae.Left) {
-				cur = castSQLNum(rightFloat)
+				cast, ok := hintCast(rHint)
+				if !ok {
+					return sqlNumNone, hintOther, false
+				}
+				cur, curHint = cast, rHint
 			}
 			if isPlainPropertyLookup(p.Right) {
-				r = castSQLNum(leftFloat)
+				cast, ok := hintCast(curHint)
+				if !ok {
+					return sqlNumNone, hintOther, false
+				}
+				r, rHint = cast, curHint
 			}
-			cur = arithSQLNum(cur, r)
+			cur, curHint = arithSQLNum(cur, r), combineHints(curHint, rHint)
 			if step != nil && !step(p.Operator, cur, (i == 0 && fractionalLiteral(ae.Left)) || fractionalLiteral(p.Right)) {
-				return sqlNumNone, false
+				return sqlNumNone, hintOther, false
 			}
 		} else {
-			cur = sqlNumNone
+			cur, curHint = sqlNumNone, hintOther
 		}
 		curKind = nextAddKind(p.Operator, curKind, rKind)
-		leftFloat = leftFloat || rightFloat
 	}
-	return cur, true
+	return cur, curHint, true
+}
+
+// castPropertyAs casts a property's stored value to t, the PostgreSQL type
+// of the cast dawgs gives it (hintCast). float8 and int8 are
+// castPropertyForOrder's; a numeric cast takes int8's rules, which accept
+// only whole numbers the cast reads exactly (declining the fractions numeric
+// would accept); an int4 cast takes int8's and then int4's range, outside
+// which PostgreSQL raises "out of range for type integer".
+func castPropertyAs(v any, t sqlNum) (any, error) {
+	switch t {
+	case sqlNumFloat8:
+		return castPropertyForOrder(v, true)
+	case sqlNumInt8, sqlNumNumeric:
+		return castPropertyForOrder(v, false)
+	case sqlNumInt4:
+		c, err := castPropertyForOrder(v, false)
+		if err != nil || c == nil {
+			return c, err
+		}
+		if f, _ := c.(float64); f < minInt4 || f > maxInt4 {
+			return nil, ErrRuntimeCast
+		}
+		return c, nil
+	}
+	return nil, ErrUnsupported
 }

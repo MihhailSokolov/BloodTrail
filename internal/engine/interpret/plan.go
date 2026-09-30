@@ -4279,7 +4279,11 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	// `size(n.l) / 2.0` truncates), `%` at all (float8 has none), and
 	// numeric over a fractional literal (`0.1 + 0.2 = 0.3` is exact there).
 	// See numericStepServed.
-	if _, ok := foldArithSQLNum(ae, numericStepServed); !ok {
+	//
+	// A plain property operand is cast to the type dawgs infers for its
+	// partner (hintCast) -- `::int` next to size() -- and left text next to
+	// a WITH alias, which infers nothing: `n.v * d` is `text * integer`.
+	if _, _, ok := foldArithTyping(ae, numericStepServed); !ok {
 		return false
 	}
 	curKind := classifyAddOperand(ae.Left)
@@ -4326,43 +4330,6 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		curKind = nextAddKind(p.Operator, curKind, rKind)
 	}
 	return true
-}
-
-// staticallyFloatOperand reports whether expr carries a float literal on its
-// AST alone -- what makes dawgs cast a plain property it is combined with to
-// float8 rather than int8 (`n.v / 2.0` is `(p ->> 'v')::float8 / 2`). A
-// float literal anywhere in an operand counts, so parentheses, signs and
-// nested arithmetic are followed through. The literal itself is not a float8
-// in PostgreSQL (printedFloatSQLNum); only the property it types is.
-//
-// Everything whose type is not statically knowable here -- a property
-// lookup, a variable, a function result -- answers false.
-func staticallyFloatOperand(expr cypher.Expression) bool {
-	switch e := unwrapParens(expr).(type) {
-	case *cypher.Literal:
-		if e == nil || e.Null {
-			return false
-		}
-		_, isFloat := e.Value.(float64)
-		return isFloat
-	case *cypher.UnaryAddOrSubtractExpression:
-		return e != nil && staticallyFloatOperand(e.Right)
-	case *cypher.ArithmeticExpression:
-		if e == nil {
-			return false
-		}
-		if staticallyFloatOperand(e.Left) {
-			return true
-		}
-		for _, p := range e.Partials {
-			if p != nil && staticallyFloatOperand(p.Right) {
-				return true
-			}
-		}
-		return false
-	default:
-		return false
-	}
 }
 
 // --- WITH ------------------------------------------------------------------

@@ -156,3 +156,51 @@ func TestFloat8ArithmeticRaisesPostgresErrors(t *testing.T) {
 		t.Errorf("float8 %% error = %v, want ErrUnsupported", err)
 	}
 }
+
+// TestPropertyCastFollowsPartnerHint pins the cast dawgs gives a plain
+// property from the type it infers for the property's partner: int next to
+// size(), int8 next to an integer or id(), float8 next to a (signed) float
+// literal, numeric next to datetime(), and none next to a WITH alias or a
+// float mixed with an integer, which dawgs cannot type.
+func TestPropertyCastFollowsPartnerHint(t *testing.T) {
+	for _, tc := range []struct {
+		partner string
+		want    sqlNum
+		cast    bool
+	}{
+		{"size(n.l)", sqlNumInt4, true},
+		{"size(n.l) + size(n.l)", sqlNumInt4, true},
+		{"size(n.l) * 2", sqlNumInt8, true},
+		{"2", sqlNumInt8, true},
+		{"id(n)", sqlNumInt8, true},
+		{"-2.5", sqlNumFloat8, true},
+		{"2.0", sqlNumFloat8, true},
+		{"datetime().epochseconds - 86400", sqlNumNumeric, true},
+		{"datetime().epochseconds * 1.5", sqlNumNumeric, true},
+		{"d", sqlNumNone, false},
+		{"d * 1", sqlNumInt8, true},
+		{"1.5 * 2", sqlNumNone, false},
+		{"size(n.l) + 2.5", sqlNumNone, false},
+		{"'a'", sqlNumNone, false},
+	} {
+		expr := returnExprOf(t, "MATCH (n) RETURN "+tc.partner)
+		_, h := operandTyping(expr)
+		got, ok := hintCast(h)
+		if got != tc.want || ok != tc.cast {
+			t.Errorf("cast next to %s = %v, %v; want %v, %v", tc.partner, got, ok, tc.want, tc.cast)
+		}
+	}
+}
+
+// TestCastPropertyAsInt4Range checks the int cast dawgs puts next to size()
+// declines a value outside int4, as PostgreSQL's cast raises an error.
+func TestCastPropertyAsInt4Range(t *testing.T) {
+	for _, v := range []any{3000000000.0, "3000000000", -2147483649.0} {
+		if _, err := castPropertyAs(v, sqlNumInt4); !errors.Is(err, ErrRuntimeCast) {
+			t.Errorf("castPropertyAs(%v, int4) error = %v, want ErrRuntimeCast", v, err)
+		}
+	}
+	if got, err := castPropertyAs("2147483647", sqlNumInt4); err != nil || got != float64(2147483647) {
+		t.Errorf("castPropertyAs('2147483647', int4) = %v, %v", got, err)
+	}
+}
