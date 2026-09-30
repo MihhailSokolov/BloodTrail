@@ -593,7 +593,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	if err != nil {
 		return fmt.Errorf(".env: %w; %s", err, rollbackHint)
 	}
-	if err := os.WriteFile(envPath, []byte(newEnv), 0o644); err != nil {
+	if err := writeEnvFile(envPath, []byte(newEnv)); err != nil {
 		return fmt.Errorf("writing .env: %w; %s", err, rollbackHint)
 	}
 	if err := store.Set(ctx, driverName); err != nil {
@@ -837,8 +837,8 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		if note != "" {
 			say("    %s", note)
 		}
-		if err := os.WriteFile(envPath, []byte(restoredEnv), 0o644); err != nil {
-			return err
+		if err := writeEnvFile(envPath, []byte(restoredEnv)); err != nil {
+			return fmt.Errorf("writing .env: %w", err)
 		}
 	}
 
