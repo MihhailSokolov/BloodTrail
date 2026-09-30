@@ -386,8 +386,28 @@ func (e *Engine) Fresh() (*snapshot.View, bool) {
 // "no snapshot yet" (nil) from "in fallback" (non-nil) when choosing its
 // decline reason.
 func (e *Engine) serveState() (*snapshot.View, bool) {
-	view := e.snap.Load()
-	return view, view != nil && e.state.Load() == stateServing
+	return servableView(e.state.Load, e.snap.Load)
+}
+
+// servableView is serveState's decision over its two loads, taken as
+// functions so a test can land an adoption between them.
+//
+// The state is read BEFORE the View, and that order is the whole point.
+// The View and the state are two separate atomics, and the one transition
+// back into stateServing -- adoptRebuiltView ending a fallback -- stores the
+// rebuilt View first and flips the state second. Reading the View first
+// could therefore pair the View from before the fallback, which lacks the
+// write whose failed Apply tripped it (and whose call has already
+// returned), with the serving state the adoption has just restored. Read
+// state first, a serving answer means the adoption's View store is already
+// visible, so the View read next is that one or a later one. The other
+// transition, serving to fallback, publishes no View: a caller that read
+// serving just before it serves the View it then reads, which is
+// indistinguishable from having run just before the failing write.
+func servableView(loadState func() int32, loadView func() *snapshot.View) (*snapshot.View, bool) {
+	serving := loadState() == stateServing
+	view := loadView()
+	return view, view != nil && serving
 }
 
 // RebuildNow loads a fresh snapshot.Snapshot from PostgreSQL and, if its
@@ -576,6 +596,9 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 	// concluding (bootgap.go's deactivate doc).
 	e.bootGap.deactivate()
 
+	// Only after the View store above: serveState reads the state first and
+	// relies on a serving state never becoming visible before the View it
+	// serves (servableView).
 	if e.state.CompareAndSwap(stateFallback, stateServing) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: fallback exited")
 	}

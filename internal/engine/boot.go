@@ -617,11 +617,15 @@ const (
 // by cases: a post-freeze write whose Apply already ran (a no-op against
 // the nil snapshot) is in the buffer and rides the replay below; one whose
 // Apply is parked on applyMu lands after publish as an ordinary delta.
-// Both stage read-back truth -- pg's current committed state per key,
-// never the write's own payload -- so replay order cannot matter, the
-// same argument the replay paragraph below already makes for same-key
-// rewrites. The freeze itself therefore needs no lock: earlier bumps are
-// waited for, later ones are tolerated by construction.
+// Both stage read-back truth -- pg's current committed state per row,
+// never the write's own payload, and for a kind-scoped delete never an
+// instruction over whatever the view holds: the rows its criteria match in
+// the view being replayed onto are re-read one by one (readBack) -- so
+// replay order cannot matter, although ascending counter order is the
+// order writes STARTED, not the order they committed; the replay paragraph
+// below makes the same argument for same-key rewrites. The freeze itself
+// therefore needs no lock: earlier bumps are waited for, later ones are
+// tolerated by construction.
 //
 // Before any attempt, fileRefusal (watermark.go) must find nothing against
 // the file: it has to belong to the watermark lineage PostgreSQL is in,
@@ -788,12 +792,12 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 		if entry.cs == nil {
 			continue
 		}
-		rb, err := e.readBack(ctx, entry.cs)
+		rb, err := e.readBack(ctx, view, entry.cs)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
 			return 0, adoptAttemptRejected, 0
 		}
-		seg, err := buildApplySegment(view, rb, entry.cs)
+		seg, err := buildApplySegment(view, rb)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
 			return 0, adoptAttemptRejected, 0
