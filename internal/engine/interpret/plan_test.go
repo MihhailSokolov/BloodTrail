@@ -431,10 +431,14 @@ func TestPlanRejectMatrix(t *testing.T) {
 			cypher: `MATCH (a:X)-[:X]->(b:X), p = shortestPath((b)-[:X*1..]->(c:X)) RETURN a`,
 			want:   false,
 		},
+		// Even in a component of its own, a shortestPath after another
+		// pattern of its query part is PostgreSQL's 42P01: dawgs' harness
+		// frame projects the earlier frame without joining it
+		// (addShortestPathPart).
 		{
-			name:   "shortestPath isolated in its own component still ok",
+			name:   "shortestPath after another pattern in its part rejected",
 			cypher: `MATCH (a:X)-[:X]->(b:X), p = shortestPath((s:X)-[:X*1..]->(t:X)) WHERE s<>t RETURN a`,
-			want:   true,
+			want:   false,
 		},
 
 		// Concatenation-parity fix: pg statically types `+` between

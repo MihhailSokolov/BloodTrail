@@ -1689,3 +1689,28 @@ func TestExpandShortestPairFilterLimitSharedEndpointDeclines(t *testing.T) {
 	assertPathSigs(t, snap, pairs, 0, want)
 	assertPathSigs(t, snap, `MATCH p = shortestPath((a:G)-[:E*1..]->(b:G)) WHERE a <> b RETURN p LIMIT 1`, 0, want)
 }
+
+// TestShortestPathMustBeFirstBinding: a shortestPath/allShortestPaths
+// pattern plans only as the first thing its query part binds -- dawgs'
+// harness frame cannot see an earlier frame, so an earlier pattern in the
+// same part, an endpoint carried through a WITH and an OPTIONAL MATCH over
+// the mandatory part's symbols all decline -- while the pattern on its own,
+// inline map and WHERE included, still plans.
+func TestShortestPathMustBeFirstBinding(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 2: "Term", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2, kinds: []snapshot.KindID{2}}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "earlier MATCH clause", cypher: `MATCH (x:Term) MATCH p = shortestPath((a:Root)-[:E*1..]->(b:Term)) RETURN p, x`, want: false},
+		{name: "earlier clause binds an endpoint", cypher: `MATCH (a:Root) MATCH p = shortestPath((a)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "earlier comma pattern", cypher: `MATCH (a:Root), p = shortestPath((a)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "after WITH", cypher: `MATCH (x:Root) WITH x MATCH p = shortestPath((s:Root)-[:E*1..]->(b:Term)) WHERE s.name = x.name RETURN p`, want: false},
+		{name: "after a constant WITH", cypher: `WITH 1 AS one MATCH p = shortestPath((s:Root)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "endpoint carried through WITH", cypher: `MATCH (x:Root) WITH x MATCH p = allShortestPaths((x)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "inside OPTIONAL MATCH", cypher: `MATCH (a:Root) OPTIONAL MATCH p = shortestPath((a)-[:E*1..]->(b:Term)) RETURN a, p`, want: false},
+		{name: "first and only binding", cypher: `MATCH p = shortestPath((s:Root {name: 'r'})-[:E*1..]->(b:Term)) WHERE b.name = 't' RETURN p`, want: true},
+	})
+}

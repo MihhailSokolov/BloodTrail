@@ -1377,8 +1377,27 @@ func (pb *partBuilder) nextPattern() int {
 // hard assumption, itself mirroring real Cypher grammar -- must be exactly
 // node-relationship-node (3 elements): shortestPath cannot span more than
 // one relationship pattern.
+//
+// It must also be the first thing its query part binds. dawgs compiles the
+// pattern into a harness call whose frame projects every earlier frame's
+// bindings, but joins an earlier frame only when an endpoint is bound or a
+// condition on the seed side refers to it, and whose endpoint filters run
+// as SQL text inside plpgsql EXECUTE, where no outer CTE is visible. So an
+// earlier pattern in the same part -- another MATCH clause or a comma-
+// separated pattern, sharing a variable or not -- and an endpoint bound
+// before the pattern are PostgreSQL's 42P01 ("missing FROM-clause entry",
+// "relation does not exist"). After a WITH (or inside an OPTIONAL MATCH)
+// the harness frame joins the earlier frame only when some condition on it
+// lands on the side dawgs' selectivity model picks as the seed, so pg
+// answers some spellings and rejects near-identical ones (`s <> x` against
+// `b <> x`, or the same join with an extra condition on the far endpoint).
+// Telling them apart would mean mirroring that model, so every symbol
+// already in scope declines, carried ones included.
 func (pb *partBuilder) addShortestPathPart(part *cypher.PatternPart) bool {
 	if len(part.PatternElements) != 3 {
+		return false
+	}
+	if len(pb.known) > 0 {
 		return false
 	}
 	firstNode, isNode := part.PatternElements[0].AsNodePattern()

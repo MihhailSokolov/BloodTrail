@@ -470,3 +470,45 @@ func TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle(t *testing.T
 		t.Run(query, func(t *testing.T) { g.assertServesOracle(t, query) })
 	}
 }
+
+// TestShortestPathAfterEarlierBindingMatchesOracle: dawgs compiles a
+// shortestPath/allShortestPaths pattern into a harness call whose frame
+// projects every earlier frame's bindings but joins an earlier frame only in
+// two cases, and whose endpoint filters run as SQL text inside plpgsql
+// EXECUTE, where no outer CTE is visible. So an earlier pattern in the same
+// query part -- a separate MATCH clause or a comma-separated pattern, bound
+// to the endpoints or not -- or an endpoint carried through a WITH is 42P01
+// ("missing FROM-clause entry" / "relation does not exist"). After a WITH
+// the harness frame joins the carried frame only when a condition on it
+// lands on the side dawgs' selectivity model picks as the seed, so pg
+// answers some spellings and rejects near-identical ones (all below).
+func TestShortestPathAfterEarlierBindingMatchesOracle(t *testing.T) {
+	g := seedPathParityGraph(t, shortestPathLevelFixture())
+
+	for _, query := range []string{
+		// An earlier pattern in the same query part.
+		`MATCH (x:ZTerm) MATCH p = shortestPath((a:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) RETURN p, x`,
+		`MATCH (a:ZRoot) WHERE a.name = 'r0' MATCH p = shortestPath((a)-[:ZEdge*1..]->(b:ZTerm)) RETURN p`,
+		`MATCH (a:ZRoot), (b:ZTerm) MATCH p = shortestPath((a)-[:ZEdge*1..]->(b)) RETURN p`,
+		`MATCH (a:ZRoot), (b:ZTerm) MATCH p = allShortestPaths((a)-[:ZEdge*1..]->(b)) RETURN p`,
+		`MATCH (a:ZRoot) MATCH p = allShortestPaths((a)-[:ZEdge*1..]->(b:ZTerm)) RETURN p`,
+		`MATCH (s:ZRoot), p = shortestPath((s)-[:ZEdge*1..]->(t:ZTerm)) RETURN p`,
+		`MATCH (a:ZRoot)-[:ZEdge]->(b), p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(t:ZTerm)) WHERE s <> t RETURN a`,
+		// After a WITH.
+		`MATCH (x:ZRoot) WITH x MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) RETURN p`,
+		`MATCH (x:ZRoot) WITH count(x) AS c MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) RETURN p`,
+		`WITH 1 AS one MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) RETURN p`,
+		`MATCH (x:ZRoot) WHERE x.name = 'r0' WITH x MATCH p = shortestPath((x)-[:ZEdge*1..]->(b:ZTerm)) RETURN p`,
+		`MATCH (x:ZRoot) WITH x MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) WHERE b <> x RETURN p`,
+		`MATCH (x:ZRoot) WITH x MATCH p = shortestPath((b:ZTerm)<-[:ZEdge*1..]-(s:ZRoot)) WHERE s <> x RETURN p`,
+		`MATCH (x:ZRoot) WITH x MATCH p = allShortestPaths((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) WHERE s.name = x.name AND b.name = 't9' RETURN p`,
+		`MATCH (x:ZRoot) WITH x MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) WHERE s <> x AND (s.foo = 1 OR s.bar = 2) RETURN p`,
+		// ...and spellings pg happens to answer, declined with the rest.
+		`MATCH (x:ZRoot) WITH x MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) WHERE s.name = x.name RETURN p`,
+		`MATCH (a:ZRoot) WHERE a.name IN ['r0', 'r4'] WITH a MATCH p = allShortestPaths((s:ZRoot)-[:ZEdge*1..]->(b:ZTerm)) WHERE s.name = a.name RETURN p`,
+	} {
+		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+	}
+
+	g.assertServesOracle(t, `MATCH p = shortestPath((s:ZRoot {name: 'r0'})-[:ZEdge*1..]->(b:ZTerm)) RETURN p`)
+}
