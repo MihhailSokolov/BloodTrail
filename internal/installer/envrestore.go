@@ -135,7 +135,13 @@ func dropAppendedComposeFileLine(env string, m manifest.Manifest, lines []compos
 	if restored, err = compose.RemoveComposeFileLineAt(env, appended[0].Line); err != nil {
 		return env, "", err
 	}
-	return restored, fmt.Sprintf("removed the COMPOSE_FILE line an earlier install appended (line %d); the entry on line %d is in effect again", appended[0].Line, kept[0].Line), nil
+	// The operator's line is numbered as it is now, without the one that went:
+	// a line above it shifts it up.
+	keptNow := kept[0].Line
+	if appended[0].Line < keptNow {
+		keptNow--
+	}
+	return restored, fmt.Sprintf("removed the COMPOSE_FILE line an earlier install appended (line %d); the entry now on line %d is in effect again", appended[0].Line, keptNow), nil
 }
 
 // joinAnd writes words as "1", "1 and 2" or "1, 2 and 3".

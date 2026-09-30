@@ -170,13 +170,13 @@ func TestRollbackOfAnInstallThatDidNotRecordItsList(t *testing.T) {
 		// ("keep one"); it now takes out the line the install appended.
 		{"a line appended beside an exported entry, with the backup",
 			legacyRollback{env: "export COMPOSE_FILE=docker-compose.yml:tls.yml\nCOMPOSE_FILE=" + installed + "\n", backup: strPtr("export COMPOSE_FILE=docker-compose.yml:tls.yml\n")},
-			"export COMPOSE_FILE=docker-compose.yml:tls.yml\n", []string{"docker-compose.yml", "tls.yml"}, "removed the COMPOSE_FILE line an earlier install appended"},
+			"export COMPOSE_FILE=docker-compose.yml:tls.yml\n", []string{"docker-compose.yml", "tls.yml"}, "removed the COMPOSE_FILE line an earlier install appended (line 2); the entry now on line 1 is in effect again"},
 		{"a line appended beside an exported entry, without a backup to read",
 			legacyRollback{env: "A=b\nexport COMPOSE_FILE=docker-compose.yml:tls.yml\nC=d\nCOMPOSE_FILE=" + installed + "\n"},
-			"A=b\nexport COMPOSE_FILE=docker-compose.yml:tls.yml\nC=d\n", []string{"docker-compose.yml", "tls.yml"}, "removed the COMPOSE_FILE line an earlier install appended"},
+			"A=b\nexport COMPOSE_FILE=docker-compose.yml:tls.yml\nC=d\n", []string{"docker-compose.yml", "tls.yml"}, "removed the COMPOSE_FILE line an earlier install appended (line 4); the entry now on line 2 is in effect again"},
 		{"a line appended before an exported entry that a later edit put after it",
 			legacyRollback{env: "COMPOSE_FILE=" + installed + "\nCOMPOSE_FILE: docker-compose.yml:tls.yml\n"},
-			"COMPOSE_FILE: docker-compose.yml:tls.yml\n", []string{"docker-compose.yml", "tls.yml"}, "removed the COMPOSE_FILE line an earlier install appended"},
+			"COMPOSE_FILE: docker-compose.yml:tls.yml\n", []string{"docker-compose.yml", "tls.yml"}, "removed the COMPOSE_FILE line an earlier install appended (line 1); the entry now on line 1 is in effect again"},
 
 		// The operator's answer to that refusal -- keep their own line -- and a
 		// rerun: the manifest still says "created", and rollback used to delete
