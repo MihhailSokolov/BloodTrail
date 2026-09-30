@@ -31,7 +31,11 @@ else
   BASE="https://github.com/$REPO/releases/download/$VERSION"
 fi
 ASSET="bloodtrail_${OS}_${ARCH}.tar.gz"
-TMP="$(mktemp -d)"
+# The binary is run from here, so TMPDIR is the way out on a host whose /tmp is
+# mounted noexec. It is named in the template because a bare `mktemp -d` is
+# not the same everywhere: GNU's honours TMPDIR, but the one macOS ships uses
+# its own per-user directory and ignores it.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/bloodtrail.XXXXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading $ASSET from $BASE" >&2
@@ -66,4 +70,9 @@ set +e
 "$TMP/bloodtrail" "$@"
 rc=$?
 set -e
+# 126 is the shell saying it found the file and could not run it, which
+# bloodtrail itself never exits with: most likely $TMP is on a noexec mount.
+if [ "$rc" -eq 126 ]; then
+  echo "could not run the downloaded bloodtrail from $TMP; if that filesystem is mounted noexec, set TMPDIR to a directory that allows running programs and run this again" >&2
+fi
 exit "$rc"

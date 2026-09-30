@@ -8,10 +8,12 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -23,6 +25,8 @@ type installScriptRun struct {
 	err    error
 	ran    bool     // whether the downloaded binary was started
 	args   []string // what it was started with
+	path   string   // where it was started from
+	tmpdir string   // the TMPDIR the script was given
 }
 
 // installScriptAsset is the archive name the script asks for on this host.
@@ -41,11 +45,19 @@ func installScriptAsset(t *testing.T) string {
 // only records that it ran, and with what.
 func installScriptArchive(t *testing.T) []byte {
 	t.Helper()
-	body := []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BLOODTRAIL_TEST_MARKER\"\n")
+	return installScriptArchiveMode(t, 0o755)
+}
+
+// installScriptArchiveMode is installScriptArchive with the binary given mode,
+// which without an execute bit stands in for a temporary directory that is
+// mounted noexec: the shell cannot run what the script extracted there.
+func installScriptArchiveMode(t *testing.T, mode int64) []byte {
+	t.Helper()
+	body := []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BLOODTRAIL_TEST_MARKER\"\nprintf '%s\\n' \"$0\" > \"$BLOODTRAIL_TEST_MARKER.path\"\n")
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
-	if err := tw.WriteHeader(&tar.Header{Name: "bloodtrail", Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: "bloodtrail", Mode: mode, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tw.Write(body); err != nil {
@@ -148,10 +160,13 @@ exec $HASHER "$@"
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 
-	run := installScriptRun{stderr: stderr.String(), err: err}
+	run := installScriptRun{stderr: stderr.String(), err: err, tmpdir: filepath.Join(dir, "tmp")}
 	if data, readErr := os.ReadFile(marker); readErr == nil {
 		run.ran = true
 		run.args = strings.Fields(string(data))
+	}
+	if data, readErr := os.ReadFile(marker + ".path"); readErr == nil {
+		run.path = strings.TrimSpace(string(data))
 	}
 	return run
 }
@@ -210,5 +225,71 @@ func TestInstallScriptRunsTheBinaryOnlyWhenItsChecksumIsPublished(t *testing.T) 
 				t.Fatalf("stderr does not say %q:\n%s", c.wantError, run.stderr)
 			}
 		})
+	}
+}
+
+// TestInstallScriptSaysWhatToDoWhenTheBinaryCannotBeRun covers a temporary
+// directory mounted noexec, as hardened hosts have /tmp: the script runs the
+// binary from a directory of mktemp's, the shell cannot execute it there (exit
+// status 126), and all the operator saw was the shell's "Permission denied".
+// mktemp honours TMPDIR, so the script says to set it.
+func TestInstallScriptSaysWhatToDoWhenTheBinaryCannotBeRun(t *testing.T) {
+	asset := installScriptAsset(t)
+	archive := installScriptArchiveMode(t, 0o644)
+	run := runInstallScript(t, archive, installScriptSHA256(archive)+"  "+asset+"\n", "install", "--yes")
+	var exit *exec.ExitError
+	if !errors.As(run.err, &exit) || exit.ExitCode() != 126 {
+		t.Fatalf("the script's status = %v, want the shell's 126 passed on", run.err)
+	}
+	if !strings.Contains(run.stderr, "TMPDIR") || !strings.Contains(run.stderr, "noexec") {
+		t.Fatalf("stderr does not say what to do:\n%s", run.stderr)
+	}
+
+	// The binary's own failures are its own: a 1 is passed on without the hint.
+	failing := installScriptArchiveFailing(t, 1)
+	run = runInstallScript(t, failing, installScriptSHA256(failing)+"  "+asset+"\n", "install", "--yes")
+	if !errors.As(run.err, &exit) || exit.ExitCode() != 1 || strings.Contains(run.stderr, "TMPDIR") {
+		t.Fatalf("a binary that exits 1: err %v, stderr:\n%s", run.err, run.stderr)
+	}
+}
+
+// installScriptArchiveFailing builds a release whose binary exits with code.
+func installScriptArchiveFailing(t *testing.T, code int) []byte {
+	t.Helper()
+	body := []byte("#!/bin/sh\nexit " + strconv.Itoa(code) + "\n")
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "bloodtrail", Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestInstallScriptRunsTheBinaryFromTMPDIR pins that TMPDIR decides where the
+// script puts the binary it runs -- the way out for a /tmp mounted noexec that
+// the script's own message points to. GNU mktemp puts a bare `mktemp -d` under
+// TMPDIR, but the one macOS ships ignores it and uses its own per-user
+// directory, so there the variable did nothing.
+func TestInstallScriptRunsTheBinaryFromTMPDIR(t *testing.T) {
+	asset := installScriptAsset(t)
+	archive := installScriptArchive(t)
+	run := runInstallScript(t, archive, installScriptSHA256(archive)+"  "+asset+"\n", "install", "--yes")
+	if run.err != nil || !run.ran {
+		t.Fatalf("the script did not run the binary (err %v):\n%s", run.err, run.stderr)
+	}
+	// The script names the directory it makes by TMPDIR as it was given, so
+	// the path the binary ran from starts with it.
+	if !strings.HasPrefix(run.path, run.tmpdir+string(filepath.Separator)) {
+		t.Fatalf("the binary ran from %s, not from a directory of %s", run.path, run.tmpdir)
 	}
 }
