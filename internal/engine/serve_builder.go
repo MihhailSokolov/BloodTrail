@@ -855,11 +855,13 @@ func (it *relScanIter) advanceNear() bool {
 		}
 
 		if !it.snap.Overlay() {
+			// The row pointer past node's own is read at int(node)+1: node is a
+			// uint32, whose +1 would wrap at its top value.
 			var lo, hi uint64
 			if it.forward {
-				lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[node+1]
+				lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[int(node)+1]
 			} else {
-				lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[node+1]
+				lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[int(node)+1]
 			}
 			if lo == hi {
 				continue
@@ -981,10 +983,16 @@ func selectKindIDs(snap *snapshot.View, allow func(snapshot.KindID) bool) ([]sna
 		}
 	}
 
+	// The counter is an int, not a KindID: snapshot.KindID is an int16, and
+	// kind.id is a smallserial, so the last id the database can issue is
+	// 32767, where a KindID counter's k++ wraps to -32768, `k <= maxKindID`
+	// stays true, and the loop never ends (appending the named ids again on
+	// every lap until the process runs out of memory).
 	var ids []snapshot.KindID
-	for k := snapshot.KindID(1); k <= maxKindID; k++ {
-		if _, named := kinds.Name(k); named && allow(k) {
-			ids = append(ids, k)
+	for k := 1; k <= int(maxKindID); k++ {
+		id := snapshot.KindID(k)
+		if _, named := kinds.Name(id); named && allow(id) {
+			ids = append(ids, id)
 		}
 	}
 	return ids, nil
