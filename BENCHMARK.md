@@ -364,10 +364,15 @@ without BloodTrail.
 | Graph | a [`bench/shgen`](bench/shgen) forest (`-users 20000`) and a [`bench/oggen`](bench/oggen) organization (`-users 100000`): 190,001 OpenGraph nodes and 361,098 edges, 10,000 of them hybrid edges from AD users |
 | Harness | [`bench/oggen/bench.py`](bench/oggen/bench.py): each arm starts on an empty database, one arm at a time; per query one discarded warm-up then the median of 7; three complete runs, medians across them; datapipe interval 1 s on both arms |
 
-Every query returned the identical answer on both arms in all three runs
-(the harness compares a digest of every node, edge and literal), and
-BloodTrail served all of them from memory: its logs show no decline, no
-fallback, and no rebuild after the boot load.
+Every query returned the identical answer on both arms in all three runs,
+judged by the digest each report records of an answer's nodes (objectId and
+kinds), edges (endpoints and kind) and literals, and BloodTrail served all of
+them from memory: its logs show no decline, no fallback, and no rebuild after
+the boot load. That digest is all these runs establish: it did not cover
+properties, only the last repeat of a query was hashed, and nothing compared
+the two reports (`compare.py` now does, with properties and every repeat
+included, and exits 1 on any difference), so re-run the harness to check
+properties too.
 
 | Query | Stock (pg driver) | BloodTrail | |
 |---|---:|---:|---|

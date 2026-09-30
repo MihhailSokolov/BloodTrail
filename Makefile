@@ -1,7 +1,14 @@
-.PHONY: test lint integration build-image tidy bench-path bench-builder bench-cypher bench-apply
+.PHONY: test test-bench-scripts lint integration build-image tidy bench-path bench-builder bench-cypher bench-apply
 
 test:
 	go test ./...
+
+# The benchmark harnesses that compare two deployments (bench/oggen/bench.py,
+# bench/shgen/compare.py) are Python; their tests use only the standard
+# library. CI runs this target.
+test-bench-scripts:
+	python3 -m unittest discover -s bench/oggen -p '*_test.py'
+	python3 -m unittest discover -s bench/shgen -p '*_test.py'
 
 # Pinned to the version .github/workflows/ci.yml runs; bump both together. A
 # different local version can report different issues, so it is refused

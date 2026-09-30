@@ -48,8 +48,11 @@ times Cypher and pathfinding queries over it warm, and optionally times
 clearing the `sc_Base` source kind. Its report has the same shape as
 `bench/shgen`'s, so [`../shgen/compare.py`](../shgen/compare.py) renders two of
 them side by side, and every query also records a `result_signature` (a
-digest of the answer's nodes, edges and literals) that must match between
-the arms.
+digest of the answer's nodes, edges, literals and properties, ingest times
+excepted, over every repeat of the query; repeats that disagree are
+recorded as `DISAGREE`) that must match between the arms: `compare.py`
+prints the difference and exits 1 when a signature, a size, an error or a
+query's own repeats disagree.
 
     python3 bench.py --port 8282 --data OGGEN_OUT --ad SHGEN_OUT --password PW --label stock-pg --delete
     python3 bench.py --port 8181 --data OGGEN_OUT --ad SHGEN_OUT --password PW --label bloodtrail --delete

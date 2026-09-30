@@ -36,6 +36,9 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+      # The Python benchmark harnesses have tests of their own (standard library only).
+      - name: benchmark harness tests
+        run: make test-bench-scripts
   upstreams:
     runs-on: ubuntu-latest
     outputs:
