@@ -1568,6 +1568,16 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 		if min < 0 || max < 0 {
 			return Step{}, false
 		}
+		// An upper bound of zero (`*..0`, `*1..0`, `*0..0`) is not the
+		// empty range it reads as in PostgreSQL. dawgs' expansion primer
+		// emits every depth-1 row without consulting the bound -- only its
+		// recursive member checks `depth < max` -- so `*1..0` returns the
+		// one-hop rows and `*0..0` the zero-length rows plus the one-hop
+		// ones, while a shortestPath harness never enters its loop and
+		// returns nothing. Declined rather than reproduced.
+		if max == 0 {
+			return Step{}, false
+		}
 		rng = &Range{Min: min, Max: max}
 	}
 

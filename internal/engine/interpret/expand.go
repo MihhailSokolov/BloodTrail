@@ -34,11 +34,15 @@
 //     appending to out.
 //   - `*0..`: dawgs' translation special-cases Range.Min == 0 with a
 //     separate zero-length arm of the seed query that selects the *same*
-//     row for both pattern endpoints with an empty edge/node list, entirely
+//     row for both pattern endpoints with an empty edge list, entirely
 //     independent of the depth-1-and-up recursive member (which still only
 //     ever fires for depth >= 1). This file mirrors that structurally: the
 //     zero-length row is produced once per seed, before the trail DFS even
-//     starts, never as a "depth 0" case inside the DFS itself.
+//     starts, never as a "depth 0" case inside the DFS itself. Its path
+//     value is the one-node path of that node (ordered_edges_to_path over
+//     the root and no edges), never an empty path.
+//   - An upper bound of zero never reaches this file: buildStep declines it,
+//     because dawgs' primer emits the depth-1 rows regardless of the bound.
 //   - SELF-LOOPS force a decline. pg's recursive CTE carries an `is_cycle`
 //     guard on its SEED-side edge only (the seed arm computes `start = end`
 //     and the recursive member requires `not is_cycle`, resetting it to
@@ -361,9 +365,10 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 		nr := cloneRow(seed)
 		nr.SetNode(step.ToSym, root)
 		if pathArcKey != "" {
-			// Empty either way (the zero-length case); reversePathVal would
-			// be a no-op here regardless of step.Reversed, so it is skipped.
-			nr.SetPathVar(pathArcKey, &PathVal{})
+			// The zero-length trail is the one-node path of its start node,
+			// as PostgreSQL returns it; one node reads the same in either
+			// direction, so step.Reversed needs no flip here.
+			nr.SetPathVar(pathArcKey, &PathVal{Nodes: []snapshot.NodeID{root}})
 		}
 		if err := meter.spend(1); err != nil {
 			return nil, err
@@ -971,9 +976,10 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		nr := cloneRow(seed)
 		nr.SetNode(step.FromSym, terminal)
 		if pathArcKey != "" {
-			// Empty either way (the zero-length case), so neither the
-			// discovery-order flip below nor reversePathVal would change it.
-			nr.SetPathVar(pathArcKey, &PathVal{})
+			// The one-node path of the node both endpoints bind, exactly as
+			// the forward walker builds it; neither the discovery-order flip
+			// below nor reversePathVal would change a single node.
+			nr.SetPathVar(pathArcKey, &PathVal{Nodes: []snapshot.NodeID{terminal}})
 		}
 		if err := meter.spend(1); err != nil {
 			return nil, err

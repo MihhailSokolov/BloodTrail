@@ -125,8 +125,9 @@ type OutVal struct {
 // ResultSet/OutVal need the type; this file's assembleChainPathVal
 // constructs them for named paths in mixed fixed/variable-length chains, while
 // expand.go's expansion functions construct them for standalone
-// variable-length and shortest-path patterns. An empty PathVal (both slices nil) is the
-// eventual representation of a zero-length `*0..` path, per the design doc.
+// variable-length and shortest-path patterns. A zero-length `*0..` path is
+// the one-node path of its start node (one Nodes entry, no Edges), exactly as
+// PostgreSQL returns it.
 type PathVal struct {
 	Nodes []snapshot.NodeID
 	Edges []EdgeRef

@@ -206,9 +206,10 @@ func TestExpandVarLengthNodeRevisitViaDistinctEdges(t *testing.T) {
 	})
 }
 
-// TestExpandVarLengthZeroLengthBindsSameNode: `*0..0` binds a=b to the same
-// node with an empty PathVal (per PathVal's own doc comment: both slices
-// nil) for every root, including a root with no outgoing edges at all.
+// TestExpandVarLengthZeroLengthBindsSameNode: `*0..1` binds a=b to the same
+// node for every root's zero-length row, a root with no outgoing edges at all
+// included, and that row's path is the one-node path of the root -- what
+// PostgreSQL returns for it, never an empty path.
 func TestExpandVarLengthZeroLengthBindsSameNode(t *testing.T) {
 	const kindRoot snapshot.KindID = 1
 	const kindE snapshot.KindID = 10
@@ -224,31 +225,83 @@ func TestExpandVarLengthZeroLengthBindsSameNode(t *testing.T) {
 		},
 	)
 
-	rs := mustExec(t, snap, `MATCH p = (a:Root)-[:E*0..0]->(b) RETURN a, b, p`, generousBudget)
-	if len(rs.Rows) != 2 {
-		t.Fatalf("row count = %d, want 2\nrows: %v", len(rs.Rows), rs.Rows)
+	const query = `MATCH p = (a:Root)-[:E*0..1]->(b) RETURN a, b, p`
+	rs := mustExec(t, snap, query, generousBudget)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("row count = %d, want 3\nrows: %v", len(rs.Rows), rs.Rows)
 	}
 
-	gotRoots := make(map[uint64]bool, 2)
+	zeroLengthRoots := make(map[uint64]bool, 2)
 	for _, row := range rs.Rows {
 		a, b, p := row[0], row[1], row[2]
-		if a.Kind != OutNode || b.Kind != OutNode {
-			t.Fatalf("row = %v, want a and b both OutNode", row)
+		if a.Kind != OutNode || b.Kind != OutNode || p.Kind != OutPath {
+			t.Fatalf("row = %v, want a and b OutNode and p OutPath", row)
+		}
+		if len(p.Path.Edges) != 0 {
+			continue
 		}
 		if a.Node != b.Node {
 			t.Fatalf("row a=%v b=%v, want a == b (*0.. binds both endpoints to the same node)", a.Node, b.Node)
 		}
-		if p.Kind != OutPath {
-			t.Fatalf("row p kind = %v, want OutPath", p.Kind)
+		if len(p.Path.Nodes) != 1 || p.Path.Nodes[0] != a.Node {
+			t.Fatalf("zero-length path = %+v, want the one-node path of %v", p.Path, a.Node)
 		}
-		if len(p.Path.Nodes) != 0 || len(p.Path.Edges) != 0 {
-			t.Fatalf("zero-length PathVal = %+v, want both slices empty", p.Path)
-		}
-		gotRoots[snap.GraphID(a.Node)] = true
+		zeroLengthRoots[snap.GraphID(a.Node)] = true
 	}
-	if !gotRoots[1] || !gotRoots[2] {
-		t.Fatalf("roots seen = %v, want both database ids 1 (connected) and 2 (isolated)", gotRoots)
+	if !zeroLengthRoots[1] || !zeroLengthRoots[2] {
+		t.Fatalf("zero-length roots seen = %v, want both database ids 1 (connected) and 2 (isolated)", zeroLengthRoots)
 	}
+
+	assertPathSigs(t, snap, query, 2, []string{
+		"N:1,|E:",
+		"N:2,|E:",
+		"N:1,3,|E:30,",
+	})
+}
+
+// TestExpandVarLengthReverseZeroLengthPathIsOneNode: the backward walk binds
+// the same one-node path for a zero-length row as the forward walk does.
+func TestExpandVarLengthReverseZeroLengthPathIsOneNode(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+
+	const query = `MATCH p = (s)-[:E*0..1]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`
+	part, step := varLengthPartAndStep(t, snap, query)
+	if !varLengthReverseEligible(&Env{Snap: snap}, part, step) {
+		t.Fatalf("query %q: want the reverse route, so its zero-length arm is the one under test", query)
+	}
+
+	assertPathSigs(t, snap, query, 0, []string{
+		"N:5,|E:",
+		"N:6,|E:",
+		"N:7,5,|E:108,",
+		"N:3,6,|E:101,",
+		"N:4,6,|E:103,",
+		"N:2,6,|E:104,",
+		"N:2,6,|E:105,",
+		"N:5,6,|E:109,",
+	})
+}
+
+// TestExpandZeroUpperBoundDeclines: an explicit upper bound of zero is not
+// the empty range it reads as -- dawgs' primer emits the depth-1 rows
+// regardless of the bound, and a shortest-path harness returns nothing -- so
+// Plan declines it for plain and shortest-path patterns alike.
+func TestExpandZeroUpperBoundDeclines(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "*0..0", cypher: `MATCH p = (a:Root)-[:E*0..0]->(b) RETURN p`, want: false},
+		{name: "*1..0", cypher: `MATCH p = (a:Root)-[:E*1..0]->(b) RETURN p`, want: false},
+		{name: "*..0", cypher: `MATCH (a:Root)-[:E*..0]->(b) RETURN a, b`, want: false},
+		{name: "*0..0 inbound", cypher: `MATCH p = (b)<-[:E*0..0]-(a:Root) RETURN p`, want: false},
+		{name: "shortestPath *1..0", cypher: `MATCH p = shortestPath((a:Root)-[:E*1..0]->(b:Root)) RETURN p`, want: false},
+		{name: "allShortestPaths *..0", cypher: `MATCH p = allShortestPaths((a:Root)-[:E*..0]->(b:Root)) RETURN p`, want: false},
+		{name: "*0..1 still served", cypher: `MATCH p = (a:Root)-[:E*0..1]->(b) RETURN p`, want: true},
+	})
 }
 
 // TestExpandVarLengthRangeCapHonored: `*1..2` over a 3-edge chain must

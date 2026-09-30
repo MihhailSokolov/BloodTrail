@@ -400,16 +400,27 @@ func TestVarLengthSelfLoopHazardDeclinesBothDirections(t *testing.T) {
 func TestVarLengthReverseZeroLengthBindsSameNode(t *testing.T) {
 	snap := buildReverseEqualityFixture(t)
 
+	// `*0..1` rather than `*0..0`: an upper bound of zero declines at plan
+	// time (buildStep), so the zero-length rows are pinned alongside the
+	// one-hop rows the same seeds produce.
 	t.Run("unconstrained near endpoint admits every seed", func(t *testing.T) {
-		const query = `MATCH (s)-[:E*0..0]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		const query = `MATCH (s)-[:E*0..1]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
 		assertVarLengthDirectionsAgree(t, snap, query)
 
 		rs := mustExec(t, snap, query, generousBudget)
-		n5, _ := snap.Dense(5)
-		n6, _ := snap.Dense(6)
+		n := func(id uint64) OutVal {
+			dense, _ := snap.Dense(id)
+			return OutVal{Kind: OutNode, Node: dense}
+		}
 		assertRowSet(t, rs, []string{
-			rowKey([]OutVal{{Kind: OutNode, Node: n5}, {Kind: OutNode, Node: n5}}),
-			rowKey([]OutVal{{Kind: OutNode, Node: n6}, {Kind: OutNode, Node: n6}}),
+			rowKey([]OutVal{n(5), n(5)}),
+			rowKey([]OutVal{n(6), n(6)}),
+			rowKey([]OutVal{n(7), n(5)}),
+			rowKey([]OutVal{n(3), n(6)}),
+			rowKey([]OutVal{n(4), n(6)}),
+			rowKey([]OutVal{n(2), n(6)}),
+			rowKey([]OutVal{n(2), n(6)}),
+			rowKey([]OutVal{n(5), n(6)}),
 		})
 	})
 
@@ -424,7 +435,7 @@ func TestVarLengthReverseZeroLengthBindsSameNode(t *testing.T) {
 		// assertVarLengthDirectionsAgree) is used to additionally pin that
 		// expandVarLengthComponentReverse's own zero-length arm still checks
 		// the near endpoint's constraint correctly wherever it is invoked.
-		const query = `MATCH (s:Src)-[:E*0..0]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
+		const query = `MATCH (s:Src)-[:E*0..1]->(t:Target) WHERE t.objectid = 'T-516' RETURN s, t`
 		env := &Env{Snap: snap}
 		part, step := varLengthPartAndStep(t, snap, query)
 		if varLengthReverseEligible(env, part, step) {
@@ -433,9 +444,15 @@ func TestVarLengthReverseZeroLengthBindsSameNode(t *testing.T) {
 		assertVarLengthRowsAgree(t, snap, query)
 
 		rs := mustExec(t, snap, query, generousBudget)
-		n5, _ := snap.Dense(5)
+		n := func(id uint64) OutVal {
+			dense, _ := snap.Dense(id)
+			return OutVal{Kind: OutNode, Node: dense}
+		}
 		assertRowSet(t, rs, []string{
-			rowKey([]OutVal{{Kind: OutNode, Node: n5}, {Kind: OutNode, Node: n5}}),
+			rowKey([]OutVal{n(5), n(5)}),
+			rowKey([]OutVal{n(2), n(6)}),
+			rowKey([]OutVal{n(2), n(6)}),
+			rowKey([]OutVal{n(5), n(6)}),
 		})
 	})
 }
