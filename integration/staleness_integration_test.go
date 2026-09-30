@@ -645,9 +645,9 @@ func TestBatchUpdateNodesKindsOnlyUpsertServesImmediately(t *testing.T) {
 // pure property write (which touched no kind at all, so nothing kind-scoped
 // ever noticed it), an edge write under a query that also hydrates edge
 // properties from PostgreSQL, and a stream of writes landing while queries
-// run concurrently. TestCypherMultiGraphGuard covers the one TryCypher-only
-// decline that has nothing to do with writes at all: Snapshot.MultiGraph,
-// set by LoadSnapshot's global probeMultiGraph, so it gets its own dedicated
+// run concurrently. TestCypherMultiGraphGuard covers the decline that has
+// nothing to do with writes at all: Snapshot.MultiGraph, set by
+// LoadSnapshot's global probeMultiGraph, so it gets its own dedicated
 // database state (a second, unrelated graph) rather than reusing any
 // write-based flow above.
 
@@ -715,7 +715,8 @@ func cypherPathCount(t *testing.T, ctx context.Context, db graph.Database, text 
 // requireDecline runs query and requires that engine.decline's shared
 // "bloodtrail: path engine declined" event -- the same method
 // TryAllShortestPaths/servePathQuery and TryCypher both log through,
-// distinguished only by their "reason" attr -- fired with exactly
+// distinguished only by their "reason" attr, and declineOp's "bloodtrail:
+// builder engine declined" event carries the same attr -- fired with exactly
 // wantReason since the call began, and that the value query produced
 // (necessarily PostgreSQL's own answer: a declined TryCypher call never
 // returns a result at all) still equals want. declineReason
@@ -1106,10 +1107,11 @@ var (
 // anywhere in the database -- regardless of whether that second graph has
 // anything to do with the query being asked, since the interpreter has no
 // notion of which graph a query is scoped to at all (engine.go's own doc
-// for reasonMultiGraph). The builder-serving path carries no such guard
-// (serve_builder.go never inspects Snapshot.MultiGraph), so a builder query
-// on the very same default-graph fixture must keep serving, completely
-// unaffected -- the one place the two serving paths still differ.
+// for reasonMultiGraph). The builder-serving path carries the same guard
+// (serveGate), so a builder query on the very same default-graph fixture
+// declines too and returns PostgreSQL's answer;
+// TestBuilderServingDeclinesInMultiGraphDatabase pins the counts that would
+// otherwise come back short.
 //
 // The second graph is created directly through the raw pg driver (not the
 // wrapped bloodtrail one) via WithGraph, which dawgs' own SchemaManager.
@@ -1201,7 +1203,7 @@ func TestCypherMultiGraphGuard(t *testing.T) {
 	requireDecline(t, buf, "multi_graph", "cypher query declines with reasonMultiGraph while a second populated graph exists, and still returns the correct (PostgreSQL-delegated) value",
 		func() string { return cypherStringValue(t, ctx, bt, text) }, "solo")
 
-	requireMarkerDelta(t, buf, builderServedMarker, 1, "kind-scoped builder query still serves; the MultiGraph guard is TryCypher-only",
+	requireDecline(t, buf, "multi_graph", "kind-scoped builder query declines with reasonMultiGraph too, and still returns the correct (PostgreSQL-delegated) count",
 		func() int64 { return nodeCountByKind(t, ctx, bt, cypherMultiGraphNodeKind) }, 1)
 }
 

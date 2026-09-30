@@ -646,12 +646,14 @@ const (
 	// would just duplicate whatever error the caller's own eventual
 	// PostgreSQL round trip already surfaces.
 	reasonUnsupported = "unsupported"
-	// reasonMultiGraph is TryCypher-only: the interpreter has no notion of
-	// which graph a query is scoped to -- unlike servePathQuery, whose
-	// resolveEndpoint/traverse machinery only ever walks the one snapshot it
-	// was given -- so serving from a database snapshot.LoadSnapshot flagged
-	// as holding more than one graph (Snapshot.MultiGraph) risks silently
-	// answering across a graph boundary PostgreSQL itself would respect.
+	// reasonMultiGraph fires on every serving path -- TryCypher,
+	// servePathQuery, and every builder entry point (serveGate) -- when
+	// snapshot.LoadSnapshot flagged the database as holding nodes in more than
+	// one graph (Snapshot.MultiGraph). PostgreSQL's reads are not scoped by
+	// graph (dawgs' translator uses the graph id only for CREATE), so a count,
+	// listing or path query there spans every graph, while the replica holds
+	// only the default graph: serving from it would answer short. Declining
+	// hands the query to PostgreSQL, which sees all of them.
 	reasonMultiGraph = "multi_graph"
 	// reasonTranslateGate is TryCypher-only: translateGateOK (gate.go)
 	// reported that dawgs' own PostgreSQL translator would not also accept
@@ -932,7 +934,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 //
 // Pipeline:
 //  1. cfg.Enabled, then serveState() -- decline "disabled" / "no_snapshot" /
-//     "fallback".
+//     "fallback" -- then snap.MultiGraph() -- decline "multi_graph".
 //  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
 //     "unresolvable" on error, including a kindMapper.MapKind failure for a
 //     Kinds-constrained endpoint -- see resolveKindsEndpoint's doc).
@@ -966,6 +968,11 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 			reason = reasonNoSnapshot
 		}
 		e.decline(ctx, reason, nil)
+		return nil, false
+	}
+
+	if snap.MultiGraph() {
+		e.decline(ctx, reasonMultiGraph, nil)
 		return nil, false
 	}
 

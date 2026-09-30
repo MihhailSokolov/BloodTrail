@@ -114,7 +114,11 @@ func (e *Engine) servedOp(ctx context.Context, op string, start time.Time, extra
 // siblings below. It reports cfg.Enabled (reasonDisabled), a non-nil current
 // View (reasonNoSnapshot), and the engine being in stateServing rather than
 // fallback (reasonFallback) -- exactly the same three reasons, in the same
-// order, as servePathQuery's own step 1, via the same serveState helper.
+// order, as servePathQuery's own step 1, via the same serveState helper --
+// and then a View loaded from a database holding nodes in more than one graph
+// (reasonMultiGraph): dawgs' PostgreSQL reads are not scoped by graph, so
+// every count or listing there spans all of them while the replica holds only
+// the default graph, and serving from it would answer short.
 //
 // No freshness check follows it in any caller, and none is needed: with
 // write-through (apply.go), the View this returns already reflects every
@@ -142,6 +146,10 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 	}
 	if !serving {
 		e.declineOp(ctx, op, reasonFallback, nil)
+		return nil, false
+	}
+	if snap.MultiGraph() {
+		e.declineOp(ctx, op, reasonMultiGraph, nil)
 		return nil, false
 	}
 
