@@ -768,18 +768,21 @@ func (r *cypherRowsResult) Values() []any {
 // pathResult) for a graph.Path rawValue into a *graph.Path target,
 // mapCypherNodeValue for a *graph.Node rawValue into a *graph.Node target,
 // and mapCypherRelationshipValue for a *graph.Relationship rawValue into a
-// *graph.Relationship target. Every other (rawValue, target) combination is
-// declined by all three -- including a *graph.Kinds target presented with a
-// node's own rawValue, which none of the three match -- and dawgs' own
-// defaultMapValue (graph/mapper.go), appended automatically by graph.
-// NewValueMapper, has no case at all for *graph.Node/*graph.Relationship/
-// graph.Path targets either (see mapCypherNodeValue's doc for why), so a
-// plain scalar column (int64/int32/float64/string/bool/[]any/map[string]any)
-// falls all the way through every MapFunc and reaches ops.FetchByQuery's
-// final `else` branch, which wraps it as a graph.Literal -- exactly the
-// behavior this mapper's "decline everything else" design is aimed at.
+// *graph.Relationship target, plus mapCypherJSONObjectValue for the one
+// scalar shape dawgs' own mapper files as a path (a decoded JSON object).
+// Every other (rawValue, target) combination is declined by all four --
+// including a *graph.Kinds target presented with a node's own rawValue,
+// which none of them match -- and dawgs' own defaultMapValue (graph/
+// mapper.go), appended automatically by graph.NewValueMapper, has no case at
+// all for *graph.Node/*graph.Relationship/graph.Path targets either (see
+// mapCypherNodeValue's doc for why), so a plain scalar column (int64/int32/
+// float64/string/bool/[]any, or a map[string]any dawgs would not file as a
+// path) falls all the way through every MapFunc and reaches
+// ops.FetchByQuery's final `else` branch, which wraps it as a graph.Literal
+// -- exactly the behavior this mapper's "decline everything else" design is
+// aimed at.
 func (r *cypherRowsResult) Mapper() graph.ValueMapper {
-	return graph.NewValueMapper(mapPathValue, mapCypherNodeValue, mapCypherRelationshipValue)
+	return graph.NewValueMapper(mapPathValue, mapCypherNodeValue, mapCypherRelationshipValue, mapCypherJSONObjectValue)
 }
 
 // Scan is graph.Result's deprecated convenience method, implemented via
@@ -838,5 +841,59 @@ func mapCypherRelationshipValue(rawValue, target any) bool {
 		return false
 	}
 	*relTarget = *rel
+	return true
+}
+
+// mapCypherJSONObjectValue is cypherRowsResult's MapFunc for a *graph.Path
+// target presented with a map[string]any -- a decoded JSON object, which is
+// what a property lookup yields for an object-valued property or for a
+// string property holding object text (decodeScalarString double-decodes
+// that on both sides).
+//
+// It mirrors dawgs' pg mapper (drivers/pg/mapper.go newMapFunc, types.go
+// pathComposite.FromMap), which hands ANY map[string]any to the path
+// composite: the map becomes an empty graph.Path whenever its "nodes" and
+// "edges" keys, if present, hold empty lists, so ops.FetchByQuery -- the
+// consumer behind BloodHound's cypher endpoint -- files an ordinary object
+// column under Paths, not Literals. The node and edge composites are
+// declined for such a map as they are in pg: nodeComposite.FromMap and
+// edgeComposite.FromMap both start by reading an integer-typed "id", and a
+// decoded JSON number is always a float64.
+//
+// TestCypherRowsResultMapperMapsJSONObjectsLikeDawgs runs a corpus of object
+// shapes through dawgs' own mapper and this one and compares them, so a
+// change in dawgs' rule shows up there.
+func mapCypherJSONObjectValue(rawValue, target any) bool {
+	object, isObject := rawValue.(map[string]any)
+	if !isObject {
+		return false
+	}
+
+	pathTarget, isPathTarget := target.(*graph.Path)
+	if !isPathTarget || !jsonObjectIsEmptyPathComposite(object) {
+		return false
+	}
+
+	pathTarget.Nodes = make([]*graph.Node, 0)
+	pathTarget.Edges = make([]*graph.Relationship, 0)
+	return true
+}
+
+// jsonObjectIsEmptyPathComposite reports whether dawgs' pathComposite.
+// FromMap accepts object as a path with no nodes and no edges: each of the
+// "nodes" and "edges" keys is either absent or a []any with no elements.
+// Any element would have to be a node or edge composite, which needs an
+// integer-typed "id" that decoded JSON cannot carry, so a non-empty list, or
+// a value that is not a list at all (a string, an object, null), fails.
+func jsonObjectIsEmptyPathComposite(object map[string]any) bool {
+	for _, key := range [...]string{"nodes", "edges"} {
+		raw, present := object[key]
+		if !present {
+			continue
+		}
+		if list, isList := raw.([]any); !isList || len(list) > 0 {
+			return false
+		}
+	}
 	return true
 }

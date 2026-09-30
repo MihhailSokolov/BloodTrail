@@ -3,13 +3,16 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/specterops/dawgs/cypher/frontend"
 	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/interpret"
@@ -614,6 +617,84 @@ func TestCypherRowsResultMapperDeclinesForeignTargets(t *testing.T) {
 	}
 	if v := result.Values(); v != nil {
 		t.Fatalf("Values() after exhausted = %v, want nil", v)
+	}
+}
+
+// TestCypherRowsResultMapperMapsJSONObjectsLikeDawgs pins the served mapper
+// to dawgs' own pg mapper for map[string]any column values, the decoded JSON
+// objects a property lookup yields. dawgs hands any such map to
+// pathComposite.TryMap for a *graph.Path target, and that accepts a map
+// whose "nodes"/"edges" keys (if present) are empty lists -- so
+// ops.FetchByQuery files a plain object column under Paths, not Literals --
+// while a non-list value, or a list of composites (which needs integer ids
+// no decoded JSON number can supply), is left as a literal. Every value is
+// run through both mappers for the three targets FetchByQuery tries.
+func TestCypherRowsResultMapperMapsJSONObjectsLikeDawgs(t *testing.T) {
+	dawgsMapper := pg.NewValueMapper(context.Background(), nil)
+	servedMapper := newCypherRowsResult(nil, &interpret.ResultSet{}, nil, nil).Mapper()
+
+	nodeComposite := map[string]any{"id": float64(1), "kind_ids": []any{}, "properties": map[string]any{}}
+	edgeComposite := map[string]any{"id": float64(1), "start_id": float64(1), "end_id": float64(2), "kind_id": float64(1), "properties": map[string]any{}}
+
+	values := []any{
+		map[string]any{},
+		map[string]any{"a": float64(1)},
+		map[string]any{"nodes": []any{}},
+		map[string]any{"edges": []any{}},
+		map[string]any{"nodes": []any{}, "edges": []any{}},
+		map[string]any{"nodes": []any{}, "edges": []any{}, "extra": "x"},
+		map[string]any{"nodes": "x"},
+		map[string]any{"nodes": nil},
+		map[string]any{"nodes": map[string]any{}},
+		map[string]any{"nodes": []any{}, "edges": "x"},
+		map[string]any{"nodes": []any{float64(1)}},
+		map[string]any{"nodes": []any{nodeComposite}},
+		map[string]any{"edges": []any{edgeComposite}},
+		map[string]any{"nodes": []any{}, "edges": []any{edgeComposite}},
+		nodeComposite,
+		edgeComposite,
+		[]any{},
+		[]any{map[string]any{}},
+		"text",
+		float64(1),
+		true,
+		nil,
+	}
+
+	targets := []struct {
+		name string
+		new  func() any
+	}{
+		{"*graph.Relationship", func() any { return &graph.Relationship{} }},
+		{"*graph.Node", func() any { return &graph.Node{} }},
+		{"*graph.Path", func() any { return &graph.Path{} }},
+	}
+
+	// mapWith reports the mapper's verdict and the populated target. dawgs'
+	// mapper reaches for its kind mapper (nil here) only when it accepts a
+	// node or edge composite; turn that panic into a reported difference.
+	mapWith := func(mapper graph.ValueMapper, value any, target any) (mapped bool, panicked any) {
+		defer func() { panicked = recover() }()
+		return mapper.Map(value, target), nil
+	}
+
+	for _, value := range values {
+		for _, tc := range targets {
+			t.Run(fmt.Sprintf("%#v into %s", value, tc.name), func(t *testing.T) {
+				wantTarget, gotTarget := tc.new(), tc.new()
+				want, wantPanic := mapWith(dawgsMapper, value, wantTarget)
+				got, gotPanic := mapWith(servedMapper, value, gotTarget)
+				if wantPanic != nil || gotPanic != nil {
+					t.Fatalf("mapper panicked: dawgs %v, served %v (dawgs accepted a composite from decoded JSON?)", wantPanic, gotPanic)
+				}
+				if got != want {
+					t.Fatalf("served mapper returned %v, dawgs' returns %v", got, want)
+				}
+				if !reflect.DeepEqual(gotTarget, wantTarget) {
+					t.Fatalf("served mapper filled %#v, dawgs' fills %#v", gotTarget, wantTarget)
+				}
+			})
+		}
 	}
 }
 
