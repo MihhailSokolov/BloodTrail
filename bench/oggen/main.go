@@ -310,6 +310,13 @@ func main() {
 	)
 	flag.Parse()
 
+	// The file loops below advance by chunk items: 0 never reaches the end of
+	// the data (an endless run of empty files) and a negative size slices
+	// out of range.
+	if *chunk <= 0 {
+		fatal("-chunk must be at least 1, got %d", *chunk)
+	}
+
 	cfg := Config{Users: *users, Teams: *teams, Repos: *repos, Seed: *seed}
 	if cfg.Teams == 0 {
 		cfg.Teams = max(2, cfg.Users/10)
