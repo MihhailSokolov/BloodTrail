@@ -401,12 +401,15 @@ func CheckViewsEquivalent(a, b *View) error {
 		}
 	}
 
-	// Kinds table equality over every id either side's ceiling reaches.
+	// Kinds table equality over every id either side's ceiling reaches. The
+	// counter is an int: a KindID counter wraps from 32767 (the largest id a
+	// smallserial kind table issues) to -32768 and never exits.
 	maxKind := a.MaxKindID()
 	if bmax := b.MaxKindID(); bmax > maxKind {
 		maxKind = bmax
 	}
-	for k := KindID(0); k <= maxKind; k++ {
+	for i := 0; i <= int(maxKind); i++ {
+		k := KindID(i)
 		an, aok := a.Kinds().Name(k)
 		bn, bok := b.Kinds().Name(k)
 		if aok != bok || an != bn {

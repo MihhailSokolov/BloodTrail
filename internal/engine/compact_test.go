@@ -179,7 +179,7 @@ func TestAdoptCompactionRebasesSegmentsAddedDuringFold(t *testing.T) {
 	seg2 := newNodeSegment(t, 301)
 	v2 := publishAppend(ctx, e, seg2)
 
-	if !e.adoptCompaction(capturedBase, capturedSegs, folded) {
+	if !e.adoptCompaction(capturedBase, capturedSegs, folded, nil) {
 		t.Fatal("adoptCompaction refused; want it to adopt and rebase the mid-fold segment")
 	}
 
@@ -231,7 +231,7 @@ func TestAdoptCompactionDiscardsWhenBaseSwapped(t *testing.T) {
 	e.snap.Store(rebuiltView)
 	e.applyMu.Unlock()
 
-	if e.adoptCompaction(capturedBase, capturedSegs, folded) {
+	if e.adoptCompaction(capturedBase, capturedSegs, folded, nil) {
 		t.Fatal("adoptCompaction adopted over a swapped base; want it to refuse")
 	}
 	if e.snap.Load() != rebuiltView {
@@ -289,7 +289,7 @@ func TestCompactionSurvivesLowIDTailAcrossTwoCompactions(t *testing.T) {
 	segA := newNodeSegment(t, 500)
 	publishAppend(ctx, e, segA)
 
-	if !e.adoptCompaction(capturedBase1, capturedSegs1, folded1) {
+	if !e.adoptCompaction(capturedBase1, capturedSegs1, folded1, nil) {
 		t.Fatal("adoptCompaction #1 refused; want it to adopt and rebase segA as the new tail")
 	}
 	if e.CompactionCount() != 1 {
@@ -315,7 +315,7 @@ func TestCompactionSurvivesLowIDTailAcrossTwoCompactions(t *testing.T) {
 		t.Fatalf("Fold #2 (delta-added id 500 below base max 501): %v -- this is exactly the F2 poisoning the fix must close", err)
 	}
 
-	if !e.adoptCompaction(capturedBase2, capturedSegs2, folded2) {
+	if !e.adoptCompaction(capturedBase2, capturedSegs2, folded2, nil) {
 		t.Fatal("adoptCompaction #2 refused; want it to adopt")
 	}
 	if e.CompactionCount() != 2 {
@@ -361,7 +361,7 @@ func TestAdoptCompactionDiscardsWhenNotServing(t *testing.T) {
 
 	e.state.Store(stateFallback)
 
-	if e.adoptCompaction(capturedBase, capturedSegs, folded) {
+	if e.adoptCompaction(capturedBase, capturedSegs, folded, nil) {
 		t.Fatal("adoptCompaction adopted while state == stateFallback; want it to refuse")
 	}
 	if e.snap.Load() != v1 {
@@ -402,7 +402,7 @@ func TestAdoptCompactionDiscardsWhenSegmentTailCollapsed(t *testing.T) {
 	e.snap.Store(collapsed)
 	e.applyMu.Unlock()
 
-	if e.adoptCompaction(capturedBase, capturedSegs, folded) {
+	if e.adoptCompaction(capturedBase, capturedSegs, folded, nil) {
 		t.Fatal("adoptCompaction adopted after the captured prefix was collapsed away; want it to refuse")
 	}
 	if e.snap.Load() != collapsed {

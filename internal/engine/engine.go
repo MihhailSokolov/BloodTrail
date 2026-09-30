@@ -431,7 +431,12 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
 // same reading or a genuinely new attempt. This caps log volume for a
 // sustained over-budget condition without depending on the caller's own
 // retry backoff to do it alone.
-func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) {
+//
+// A panic on the rebuild's own goroutine -- in the snapshot build, the size
+// check or the adoption -- is recovered into an error and a fallback
+// (recoverRebuildPanic, background_panic.go) rather than ending the process.
+func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool, err error) {
+	defer e.recoverRebuildPanic(ctx, trigger, &adopted, &err)
 	start := time.Now()
 	// Read BEFORE the load begins: see adoptRebuiltView for why an unchanged
 	// epoch at publish time proves this snapshot cannot be missing an applied

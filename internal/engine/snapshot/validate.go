@@ -104,7 +104,8 @@ func validateSnapshotStructure(s *Snapshot) error {
 
 // validatePropStore is the half of the structural check that guards memory
 // safety: an entry's arena slice is handed to unsafe.String, and its prop id
-// indexes the name table directly.
+// indexes the name table directly. It also checks the order property lookups
+// depend on (a node's entries ascend by property id).
 func validatePropStore(p *PropStore, n int) error {
 	if p == nil {
 		return fmt.Errorf("%w: property store missing", ErrCorrupt)
@@ -131,6 +132,22 @@ func validatePropStore(p *PropStore, n int) error {
 			// Value kinds carried inline; no arena reference to check.
 		default:
 			return fmt.Errorf("%w: property entry %d has unknown kind %d", ErrCorrupt, i, entry.kind)
+		}
+	}
+
+	// A node's entries ascend strictly by property id. PropStore.Value
+	// binary-searches them, so an entry out of order makes a property the
+	// node carries read as absent -- in every filter on it, and in the
+	// objectid index finalizeDerived builds -- and a repeated id leaves one
+	// of two values unreachable. Every writer sorts a node's entries, and a
+	// jsonb bag cannot repeat a key, so only an edited file breaks this. One
+	// sequential pass over the entries.
+	for node := 0; node < n; node++ {
+		lo, hi := p.nodeOffsets[node], p.nodeOffsets[node+1]
+		for i := lo + 1; i < hi; i++ {
+			if p.entries[i].prop <= p.entries[i-1].prop {
+				return fmt.Errorf("%w: node %d's property entries are out of property-id order (%d after %d)", ErrCorrupt, node, p.entries[i].prop, p.entries[i-1].prop)
+			}
 		}
 	}
 	return nil
