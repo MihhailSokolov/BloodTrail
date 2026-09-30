@@ -1139,8 +1139,8 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 const maxExactInt = 1 << 53
 
 // castPropertyForOrder reproduces pg's `(properties ->> 'x')::int8` (or
-// `::float8` when floatCast) for a relational comparison, over this
-// package's value model.
+// `::float8` when floatCast) over this package's value model; castPropertyAs
+// picks the cast the way dawgs does, from the other operand's type.
 //
 // The cast is what decides the row, not jsonb typing: the STRING '7' casts to
 // 7 and matches `x > 5`, where OrderCompare -- which refuses to order a
@@ -1148,9 +1148,7 @@ const maxExactInt = 1 << 53
 // rejects ('abc', true, a list, 7.5 under int8) is a PostgreSQL ERROR that
 // aborts the whole query, so it declines here (ErrRuntimeCast) rather than
 // quietly dropping the row, which was once an accepted divergence and served
-// an answer for a query pg refuses. When the cast type is undecided (the
-// numeric side is not a bare literal) anything that is not an integer --
-// where int8 and float8 agree -- declines.
+// an answer for a query pg refuses.
 //
 // A stored number of magnitude 2^53 or more declines under the integer cast
 // as well: the float64 cannot say which integer was stored -- JSON
