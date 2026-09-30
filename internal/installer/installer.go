@@ -410,7 +410,8 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	// manifest saved -- which makes the next install refuse until a rollback --
 	// over something known from the start, so whether it can is settled first.
 	envPath := filepath.Join(opts.ProjectDir, ".env")
-	if current, updated, err := installEnv(envPath, baseFiles); err != nil {
+	entry := installOverrideEntry(opts.ProjectDir)
+	if current, updated, err := installEnv(envPath, baseFiles, entry); err != nil {
 		return err
 	} else if updated != current {
 		if err := checkEnvWritable(envPath); err != nil {
@@ -601,7 +602,7 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 	// Read again, not taken from the check at the start: the migration in
 	// between can take hours, and whatever the operator changed in .env
 	// meanwhile is not to be written over.
-	current, updated, err := installEnv(envPath, baseFiles)
+	current, updated, err := installEnv(envPath, baseFiles, entry)
 	if err != nil {
 		return fmt.Errorf("%w; %s", err, rollbackHint)
 	}
@@ -638,18 +639,36 @@ func Install(ctx context.Context, deps Deps, opts Options) error {
 
 // installEnv reads the project's .env (none is the same as an empty one) and
 // works out what it becomes once the override is in COMPOSE_FILE: baseFiles
-// is what a new entry names first (compose.AddComposeFile). It changes
+// is what a new entry names first (compose.AddOverrideEntry). It changes
 // nothing; the two texts are equal when there is nothing to write.
-func installEnv(envPath string, baseFiles []string) (current, updated string, err error) {
+func installEnv(envPath string, baseFiles []string, entry compose.OverrideEntry) (current, updated string, err error) {
 	data, err := os.ReadFile(envPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", "", fmt.Errorf("reading .env: %w", err)
 	}
-	updated, err = compose.AddComposeFile(string(data), baseFiles, compose.OverrideFileName)
+	updated, err = compose.AddOverrideEntry(string(data), baseFiles, entry)
 	if err != nil {
 		return "", "", fmt.Errorf(".env: %w", err)
 	}
 	return string(data), updated, nil
+}
+
+// installOverrideEntry is the installer's override file as the install names
+// it in COMPOSE_FILE. A new entry, and a list with a relative name in it, get
+// the relative name: compose resolves relative names against the directory it
+// is run from, which for a project whose .env is read there is the project
+// directory, and that name moves with the project. A list in which every name
+// is absolute was written to work from any directory, and gets the absolute
+// path, so that it still does.
+func installOverrideEntry(projectDir string) compose.OverrideEntry {
+	return compose.OverrideEntry{Name: compose.OverrideFileName, Path: filepath.Join(projectDir, compose.OverrideFileName)}
+}
+
+// installedOverrideEntry is the override of the install m records, as an
+// entry may name it: by the relative name the install writes into a list that
+// has one, or by the absolute path it writes into a list of absolute paths.
+func installedOverrideEntry(m manifest.Manifest) compose.OverrideEntry {
+	return compose.OverrideEntry{Name: compose.OverrideFileName, Path: m.OverrideFile}
 }
 
 // migratorFailureMarkers are the phrases BloodHound's migrator logs when it
@@ -968,11 +987,12 @@ func restoreComposeFileEntry(env string, m manifest.Manifest, prior priorEntry) 
 	if err != nil || listed == nil {
 		return env, "", err
 	}
+	entry := installedOverrideEntry(m)
 	switch {
 	case !m.EnvComposeFileCreated:
-		restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName)
-	case !slices.Equal(withoutOverride(listed), withoutOverride(m.EnvComposeFileWritten)):
-		if restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
+		restored, err = compose.RemoveOverrideEntry(env, entry)
+	case !slices.Equal(withoutOverride(listed, entry), withoutOverride(m.EnvComposeFileWritten, entry)):
+		if restored, err = compose.RemoveOverrideEntry(env, entry); err == nil && restored != env {
 			note = fmt.Sprintf("COMPOSE_FILE in .env has changed since the install, so only %s came out of it", compose.OverrideFileName)
 		}
 	default:
@@ -981,11 +1001,12 @@ func restoreComposeFileEntry(env string, m manifest.Manifest, prior priorEntry) 
 	return restored, note, err
 }
 
-// withoutOverride returns files without the installer's own override.
-func withoutOverride(files []string) []string {
+// withoutOverride returns files without the installer's own override, by
+// either name.
+func withoutOverride(files []string, entry compose.OverrideEntry) []string {
 	var out []string
 	for _, f := range files {
-		if f != compose.OverrideFileName {
+		if !entry.Is(f) {
 			out = append(out, f)
 		}
 	}

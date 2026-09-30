@@ -8,7 +8,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/compose"
@@ -89,21 +88,22 @@ func restoreLegacyComposeFileEntry(env string, m manifest.Manifest, prior priorE
 	if len(lines) > 1 {
 		return dropAppendedComposeFileLine(env, m, lines)
 	}
+	entry := installedOverrideEntry(m)
 	listed := lines[0].Files
-	others := withoutOverride(listed)
+	others := withoutOverride(listed, entry)
 	switch {
 	case strings.Join(others, "") == "" && prior == priorAbsent:
 		restored, err = compose.RemoveComposeFileLine(env)
 	case strings.Join(others, "") == "":
-		if restored, err = compose.RestoreEmptyComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
+		if restored, err = compose.RestoreEmptyOverrideEntry(env, entry); err == nil && restored != env {
 			note = "put back the empty COMPOSE_FILE entry .env had before the install; docker compose does not read that as unset but fails to load the project, so delete the line to let compose find its files on its own, or list them"
 		}
 	case prior == priorPresent:
-		restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName)
-	case legacyWrote(m, others) && (prior == priorAbsent || slices.Contains(listed, compose.OverrideFileName)):
+		restored, err = compose.RemoveOverrideEntry(env, entry)
+	case legacyWrote(m, others) && (prior == priorAbsent || len(others) < len(listed)):
 		restored, err = compose.RemoveComposeFileLine(env)
 	default:
-		if restored, err = compose.RemoveComposeFile(env, compose.OverrideFileName); err == nil && restored != env {
+		if restored, err = compose.RemoveOverrideEntry(env, entry); err == nil && restored != env {
 			note = fmt.Sprintf("COMPOSE_FILE in .env lists more than this install wrote, so only %s came out of it; delete the line if docker compose should find its files on its own again", compose.OverrideFileName)
 		}
 	}
@@ -117,17 +117,18 @@ func restoreLegacyComposeFileEntry(env string, m manifest.Manifest, prior priorE
 // does not show which line that is, rollback stops before it changes anything
 // and says how to settle it.
 func dropAppendedComposeFileLine(env string, m manifest.Manifest, lines []compose.EntryLine) (restored, note string, err error) {
+	entry := installedOverrideEntry(m)
 	var appended, kept []compose.EntryLine
 	var numbers []string
 	for _, l := range lines {
 		numbers = append(numbers, fmt.Sprint(l.Line))
-		if slices.Contains(l.Files, compose.OverrideFileName) {
+		if len(withoutOverride(l.Files, entry)) < len(l.Files) {
 			appended = append(appended, l)
 		} else {
 			kept = append(kept, l)
 		}
 	}
-	if len(appended) != 1 || len(kept) != 1 || !legacyWrote(m, withoutOverride(appended[0].Files)) {
+	if len(appended) != 1 || len(kept) != 1 || !legacyWrote(m, withoutOverride(appended[0].Files, entry)) {
 		return env, "", fmt.Errorf("COMPOSE_FILE is set on lines %s, and it is not clear which was added by an earlier install: it is the one that lists %s and nothing but the files that install wrote; "+
 			"delete that line by hand (the other is the one docker compose should keep) and rerun `bloodtrail rollback`", joinAnd(numbers), compose.OverrideFileName)
 	}
