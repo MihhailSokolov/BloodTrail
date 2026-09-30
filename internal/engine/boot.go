@@ -129,10 +129,15 @@ func (e *Engine) Start(ctx context.Context) {
 // holds anything a caller needs back. Their own context checks -- at the top
 // of each retry loop, and while waiting out a backoff -- are what make exit
 // "prompt" without Stop needing to block on it.
+//
+// It also closes the write path's own pool (writePathPool), likewise without
+// waiting for a statement still running on it: a write that races the
+// shutdown past this point runs its bump and read-back on e.pool instead.
 func (e *Engine) Stop() {
 	if e.bgCancel != nil {
 		e.bgCancel()
 	}
+	e.writePool.close()
 }
 
 // runBootLoad is the boot-load goroutine body launched by Start, once

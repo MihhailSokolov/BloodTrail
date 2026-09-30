@@ -382,6 +382,10 @@ const selectWatermarkCounterSQL = `select counter from bloodtrail_watermark wher
 // handling (NoteWatermarkBumpFailure: the file removed, a fallback, the
 // rebuild whose adoption rebases the ledger) is what restores it.
 //
+// The UPDATE runs on the write path's own pool (writePathPool), never on
+// e.pool: its caller is usually inside a transaction or batch that holds
+// one of e.pool's connections already.
+//
 // AdvanceWatermark is every bumped call's matching resolution, called
 // exactly once per successful bump regardless of how the write it guarded
 // eventually turned out (Apply, for a write that committed, or
@@ -400,7 +404,7 @@ func (e *Engine) BumpWatermark(ctx context.Context) (uint64, error) {
 
 	e.inflightBumps.Add(1)
 	var counter uint64
-	if err := e.pool.QueryRow(ctx, bumpWatermarkSQL).Scan(&counter); err != nil {
+	if err := e.writePool.get(e.pool).QueryRow(ctx, bumpWatermarkSQL).Scan(&counter); err != nil {
 		e.inflightBumps.Add(-1)
 		return 0, fmt.Errorf("engine: BumpWatermark: %w", err)
 	}

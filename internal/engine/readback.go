@@ -105,8 +105,8 @@ type readbackResult struct {
 	resolvedKinds map[int16]string
 }
 
-// readBack queries PostgreSQL, on e.pool (post-commit visibility -- the same
-// connection pool hydrate.go's own queries run on, not any specific
+// readBack queries PostgreSQL, on e.writePool (writePathPool; post-commit
+// visibility -- a pool of its own, not any specific
 // transaction, so it always sees a write that has already committed), for
 // the current state of every key cs recorded. It never retries and performs
 // no I/O beyond what's described below; a caller that gets a transient error
@@ -174,8 +174,14 @@ func (e *Engine) readBack(ctx context.Context, cs *ChangeSet) (*readbackResult, 
 	result := &readbackResult{}
 	nodesByID := make(map[uint64]nodeState)
 
+	// Every read-back query runs on the write path's own pool: Apply can be
+	// running while its caller still holds one of e.pool's connections (a
+	// mid-batch Commit), and a second connection from that pool is what
+	// saturated writers waited on each other for (writePathPool).
+	pool := e.writePool.get(e.pool)
+
 	nodeIDs := cs.NodeIDs()
-	foundByID, err := readBackNodesByID(ctx, e.pool, graphID, nodeIDs)
+	foundByID, err := readBackNodesByID(ctx, pool, graphID, nodeIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +195,7 @@ func (e *Engine) readBack(ctx context.Context, cs *ChangeSet) (*readbackResult, 
 	}
 
 	objectIDs := cs.NodeObjectIDs()
-	oidRows, oidToIDs, err := readBackNodesByObjectID(ctx, e.pool, graphID, objectIDs)
+	oidRows, oidToIDs, err := readBackNodesByObjectID(ctx, pool, graphID, objectIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +215,7 @@ func (e *Engine) readBack(ctx context.Context, cs *ChangeSet) (*readbackResult, 
 	edgesByID := make(map[uint64]edgeState)
 
 	edgeIDs := cs.EdgeIDs()
-	foundEdgesByID, err := readBackEdgesByID(ctx, e.pool, graphID, edgeIDs)
+	foundEdgesByID, err := readBackEdgesByID(ctx, pool, graphID, edgeIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +284,7 @@ func (e *Engine) readBack(ctx context.Context, cs *ChangeSet) (*readbackResult, 
 		pendingKeys = append(pendingKeys, k)
 	}
 
-	foundTriples, err := readBackEdgesByTriple(ctx, e.pool, graphID, pendingKeys)
+	foundTriples, err := readBackEdgesByTriple(ctx, pool, graphID, pendingKeys)
 	if err != nil {
 		return nil, err
 	}
