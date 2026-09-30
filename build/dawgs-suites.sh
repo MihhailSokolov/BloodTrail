@@ -26,12 +26,20 @@ cd "$ROOT"
 DAWGS="github.com/specterops/dawgs"
 TAGS="${1:?usage: build/dawgs-suites.sh '<JSON array of upstream tags>'}"
 
+# Anything but a non-empty JSON array of tag strings would loop zero times below
+# and pass without having checked a single release.
+if ! tag_list="$(printf '%s' "$TAGS" | jq -er 'if type == "array" and length > 0 and all(.[]; type == "string" and length > 0) then .[] else error("not a non-empty array of tag strings") end' 2>&1)"; then
+  echo "error: the argument must be a non-empty JSON array of upstream tags, like build/upstream-tags.sh prints, got: $TAGS" >&2
+  echo "$tag_list" >&2
+  exit 2
+fi
+
 OWN="$(go list -m -f '{{.Version}}' "$DAWGS")"
 echo "==> this repository is built against dawgs $OWN"
 
 # What each supported release resolves to, and the distinct versions other than OWN.
 extra=""
-for tag in $(printf '%s' "$TAGS" | jq -r '.[]'); do
+for tag in $tag_list; do
   resolved="$(./build/build-image.sh "$tag" --dawgs-only)"
   echo "==> $tag resolves dawgs $resolved"
   if [[ "$resolved" != "$OWN" && " $extra " != *" $resolved "* ]]; then extra="$extra $resolved"; fi

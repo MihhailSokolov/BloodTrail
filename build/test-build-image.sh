@@ -250,6 +250,15 @@ expect "the job succeeds" test "$CODE" -eq 0
 expect "it runs the suites against v0.8.1" logged "^go get github.com/specterops/dawgs@v0.8.1$"
 expect "and restores go.mod" logged "^git checkout -- go.mod go.sum$"
 
+echo "dawgs-suites.sh, the tag list is not a non-empty JSON array of strings"
+for bad in 'garbage' '[]' '"v9.6.0"' '{"v9.6.0":1}' '["v9.6.0",1]' '[""]' ''; do
+  run_suites "$bad" FAKE_RESOLVED_v9_6_0=v0.8.0
+  expect "it fails on [$bad]" test "$CODE" -ne 0
+  expect "it checked no release and ran no suite on [$bad]" test "$(count '^build-image.sh\|^go get\|^go test ')" -eq 0
+done
+run_suites "$ALL_TAGS" FAKE_RESOLVED_v9_6_0=v0.8.0 FAKE_RESOLVED_v9_7_0=v0.8.0 FAKE_RESOLVED_v9_7_1=v0.8.0
+expect "a proper array still works" test "$CODE" -eq 0
+
 echo "dawgs-suites.sh, a suite fails"
 run_suites "$ALL_TAGS" FAKE_RESOLVED_v9_6_0=v0.8.0 FAKE_RESOLVED_v9_7_0=v0.8.0 FAKE_RESOLVED_v9_7_1=v0.8.1 FAKE_TEST_FAILS=1
 expect "it fails" test "$CODE" -ne 0
