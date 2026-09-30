@@ -1011,26 +1011,34 @@ func (b *observingBatch) wrote() bool {
 	return !b.current().Empty()
 }
 
-// CreateNode delegates, then, once the delegate reports success, records a
-// ChangeSet read-back key for the write via recordBatchCreateNodeIdentity --
-// see that function's own doc for exactly which of node.ID or an "objectid"
-// property it prefers, and why a create that offers neither records a
-// fallback instead of an enumerable key.
+// CreateNode records a ChangeSet read-back key for the write via
+// recordBatchCreateNodeIdentity -- see that function's own doc for exactly
+// which of node.ID or an "objectid" property it prefers, and why a create
+// that offers neither records a fallback instead of an enumerable key --
+// then delegates.
+//
+// The key is recorded before delegating, whatever the delegate then
+// reports: the pinned dawgs v0.8.0 batch appends node to its create buffer
+// before it tries to flush (drivers/pg/batch.go's CreateNode), and the
+// error a flush reports can come from any buffer, not only this node's. The
+// node stays buffered, and a later flush -- another call's, or the batch's
+// final Commit -- creates it; recording only on success lost that create.
+// A key recorded for a create that never lands is harmless: read-back finds
+// no row for it.
 func (b *observingBatch) CreateNode(node *graph.Node) error {
 	ensureBumped(b.ctx, b.eng, b.current())
-	err := b.Batch.CreateNode(node)
-	if err == nil {
+	if node != nil {
 		recordBatchCreateNodeIdentity(b.current(), node)
 	}
-	return err
+	return b.Batch.CreateNode(node)
 }
 
 // recordBatchCreateNodeIdentity records observingBatch.CreateNode's
-// ChangeSet entry for a create the delegate has already reported success
-// for. Unlike observingTransaction.CreateNode's tx-level equivalent, a
-// batch INSERT (graph.Batch.CreateNode's own doc: reports success/failure
-// only) never returns the row's generated id, so this method must instead
-// look at what the caller itself gave node:
+// ChangeSet entry for a create it is about to delegate. Unlike
+// observingTransaction.CreateNode's tx-level equivalent, a batch INSERT
+// (graph.Batch.CreateNode's own doc: reports success/failure only) never
+// returns the row's generated id, so this method must instead look at what
+// the caller itself gave node:
 //
 //   - If node.ID is a real preset id -- neither graph.UnregisteredNodeID,
 //     the sentinel graph.PrepareNode assigns every node this codebase
@@ -1088,6 +1096,11 @@ func recordBatchCreateNodeIdentity(scope *engine.WriteScope, node *graph.Node) {
 // "returns generated IDs in input order"), but this only needs the ids
 // themselves, not that alignment, so no attempt is made to pair a specific
 // id back to a specific input node.
+//
+// An error records a fallback instead. The pinned dawgs v0.8.0 creates the
+// nodes in a transaction of its own (drivers/pg/batch.go's CreateNodes),
+// whose COMMIT can fail after PostgreSQL made it durable, and with no ids
+// returned nothing names the rows it may have created.
 func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 	creator, ok := b.Batch.(graph.NodeBatchCreator)
 	if !ok {
@@ -1102,6 +1115,7 @@ func (b *observingBatch) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
 
 	ids, err := creator.CreateNodes(nodes)
 	if err != nil {
+		b.current().Changes().RecordFallback(fmt.Sprintf("Batch.CreateNodes: outcome ambiguous: %v", err))
 		return ids, err
 	}
 

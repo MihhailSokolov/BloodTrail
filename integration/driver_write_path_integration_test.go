@@ -421,3 +421,43 @@ func TestBatchCommitFailureKeepsTheBufferedWrites(t *testing.T) {
 		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 2)
 	assertNoFallback(t, buf)
 }
+
+// TestBatchCreateNodeFlushFailureStillServesTheNode covers a batch
+// CreateNode whose flush fails. The pg batch appends the node to its buffer
+// before flushing -- and the failure can come from any buffer, not only
+// this node's -- so the node stays buffered and a later flush (here the
+// batch's final Commit) creates it: it must have been recorded all the
+// same.
+func TestBatchCreateNodeFlushFailureStillServesTheNode(t *testing.T) {
+	_, bt, oracle, pool, buf, ctx := openWritePathDriver(t)
+	kind := graph.StringKind("WritePathCreateRetryNode")
+
+	seedWritePathAnchor(t, ctx, bt, kind)
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "baseline: the anchor serves",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 1)
+	passInserts := installWritePathInsertFailure(t, ctx, pool)
+
+	var createErr error
+	if err := bt.BatchOperation(ctx, func(b graph.Batch) error {
+		if err := b.CreateNode(writePathFailingNode("WRITEPATH-CREATE-RETRY-A", kind)); err != nil {
+			return err
+		}
+		// The second create overflows the batch size of 1, so this call
+		// flushes both creates, and the flush fails.
+		createErr = b.CreateNode(writePathFailingNode("WRITEPATH-CREATE-RETRY-B", kind))
+		passInserts()
+		return nil
+	}, graph.WithBatchSize(1)); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if createErr == nil {
+		t.Fatalf("the overflowing CreateNode succeeded: the injected failure did not fire")
+	}
+
+	if got := nodeCountByKind(t, ctx, oracle, kind); got != 3 {
+		t.Fatalf("postgresql holds %d node(s), want 3: the final Commit did not flush both creates", got)
+	}
+	requireMarkerDelta(t, buf, builderServedMarker, 1, "both creates the final Commit flushed serve",
+		func() int64 { return nodeCountByKind(t, ctx, bt, kind) }, 3)
+	assertNoFallback(t, buf)
+}

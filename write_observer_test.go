@@ -1995,11 +1995,11 @@ func TestObservingBatchCreateNodeRecordsFallbackWhenNoIDOrObjectID(t *testing.T)
 	}
 }
 
-// TestObservingBatchCreateNodeErrorDoesNotRecordIdentity covers CreateNode's
-// error path: recordBatchCreateNodeIdentity must not run at all when the
-// delegate itself failed -- there is no successfully created row for any of
-// its three branches to key a read-back for.
-func TestObservingBatchCreateNodeErrorDoesNotRecordIdentity(t *testing.T) {
+// TestObservingBatchCreateNodeErrorStillRecordsIdentity pins DRIVER-6:
+// the pg batch buffers the node before the flush that failed (and the
+// failure may have been another buffer's), so a later flush can still
+// create it -- the identity is recorded whatever the delegate reports.
+func TestObservingBatchCreateNodeErrorStillRecordsIdentity(t *testing.T) {
 	wantErr := errors.New("boom")
 	inner := &fakeBatch{createNodeErr: wantErr}
 	scope := engine.NewWriteScope()
@@ -2009,8 +2009,8 @@ func TestObservingBatchCreateNodeErrorDoesNotRecordIdentity(t *testing.T) {
 	if err := b.CreateNode(node); err != wantErr {
 		t.Fatalf("CreateNode: error = %v, want %v", err, wantErr)
 	}
-	if !scope.Changes().Empty() {
-		t.Fatalf("CreateNode recorded a ChangeSet entry despite a delegate error, want untouched")
+	if got := scope.Changes().NodeIDs(); len(got) != 1 || got[0] != uint64(500) {
+		t.Fatalf("Changes().NodeIDs() = %v after a failed CreateNode, want [500]", got)
 	}
 }
 
@@ -2044,10 +2044,11 @@ func TestObservingBatchCreateNodesDelegatesAndRecordsIDs(t *testing.T) {
 	}
 }
 
-// TestObservingBatchCreateNodesErrorDoesNotRecordIDs covers the inner
-// delegate returning an error: no ids are recorded, since none were
-// actually returned by the delegate.
-func TestObservingBatchCreateNodesErrorDoesNotRecordIDs(t *testing.T) {
+// TestObservingBatchCreateNodesErrorRecordsFallback covers the inner
+// delegate returning an error: no ids came back, and the error may have
+// followed a COMMIT that made the nodes durable, so the outcome is recorded
+// as unknown -- a fallback -- rather than as nothing.
+func TestObservingBatchCreateNodesErrorRecordsFallback(t *testing.T) {
 	wantErr := errors.New("boom")
 	inner := &fakeNodeBatchCreator{fakeBatch: &fakeBatch{}, createNodesErr: wantErr}
 	scope := engine.NewWriteScope()
@@ -2058,7 +2059,10 @@ func TestObservingBatchCreateNodesErrorDoesNotRecordIDs(t *testing.T) {
 		t.Fatalf("CreateNodes: error = %v, want %v", err, wantErr)
 	}
 	if got := scope.Changes().NodeIDs(); got != nil {
-		t.Fatalf("Changes().NodeIDs() = %v, want nil (error return must not record)", got)
+		t.Fatalf("Changes().NodeIDs() = %v, want nil: the delegate returned no ids", got)
+	}
+	if ok, _ := scope.Changes().HasFallback(); !ok {
+		t.Fatalf("HasFallback() = false after a failed CreateNodes, want true")
 	}
 }
 
