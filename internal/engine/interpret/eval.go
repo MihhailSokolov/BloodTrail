@@ -1183,9 +1183,9 @@ func castPropertyForOrder(v any, floatCast bool) (any, error) {
 			return float64(n), nil
 		}
 		if floatCast && pgFloat8Text.MatchString(val) {
-			f, err := strconv.ParseFloat(val, 64)
+			f, err := parseFloat8Text(val)
 			if err != nil {
-				return nil, ErrRuntimeCast
+				return nil, err
 			}
 			return f, nil
 		}
@@ -2403,6 +2403,37 @@ var (
 	pgFloat8Text = regexp.MustCompile(`^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
 )
 
+// parseFloat8Text parses a spelling pgFloat8Text admits the way PostgreSQL's
+// float8in does, failing (ErrRuntimeCast) wherever float8in raises "is out of
+// range for type double precision". strconv.ParseFloat reports an overflow,
+// but rounds an underflow to zero without an error -- '1e-400' and '2e-324'
+// both come back as 0 -- where float8in refuses any zero it did not read as a
+// zero: a mantissa with a non-zero digit. A denormal survives both ('1e-310').
+func parseFloat8Text(text string) (float64, error) {
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, ErrRuntimeCast
+	}
+	if f == 0 && nonZeroMantissa(text) {
+		return 0, ErrRuntimeCast
+	}
+	return f, nil
+}
+
+// nonZeroMantissa reports whether a decimal spelling has a non-zero digit
+// before its exponent, if any.
+func nonZeroMantissa(text string) bool {
+	for i := 0; i < len(text); i++ {
+		switch c := text[i]; {
+		case c == 'e' || c == 'E':
+			return false
+		case c >= '1' && c <= '9':
+			return true
+		}
+	}
+	return false
+}
+
 // castTextAs casts a `->>` text value to kind the way PostgreSQL's input
 // functions would, accepting only the spellings it is certain pg accepts
 // identically. Anything else is ErrRuntimeCast: pg would either raise the
@@ -2428,9 +2459,9 @@ func castTextAs(text string, kind coalesceKind) (any, error) {
 		if !pgFloat8Text.MatchString(text) {
 			return nil, ErrRuntimeCast
 		}
-		f, err := strconv.ParseFloat(text, 64)
+		f, err := parseFloat8Text(text)
 		if err != nil {
-			return nil, ErrRuntimeCast
+			return nil, err
 		}
 		return f, nil
 	case coalesceBool:
