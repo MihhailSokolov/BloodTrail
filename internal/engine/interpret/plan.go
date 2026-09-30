@@ -3786,10 +3786,15 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 	}
 	if rv, ok := unwrapParens(right).(*cypher.Variable); ok && rv != nil {
 		if pb.known[rv.Symbol] == symCollectAlias {
-			if !membershipAllowed {
+			// dawgs lowers only the bare `x IN alias` to id membership. With
+			// either operand parenthesised it is a plain comparison, which
+			// PostgreSQL rejects: `x IN (alias)` is a node against a node
+			// array (42804), `(x) IN alias` a node against bigint (42883).
+			_, bareRight := right.(*cypher.Variable)
+			if !membershipAllowed || !bareRight {
 				return false
 			}
-			lv, ok := unwrapParens(left).(*cypher.Variable)
+			lv, ok := left.(*cypher.Variable)
 			if !ok || lv == nil || !isNodeSymbol(pb.known, lv.Symbol) {
 				return false
 			}
