@@ -330,7 +330,10 @@ func shortestPathLevelFixture() pathParityFixture {
 //
 // When the FIRST-written endpoint is the unconstrained one, dawgs seeds from
 // the other side and the same test degenerates to always-true, so those
-// spellings must keep serving.
+// spellings must keep serving -- except allShortestPaths with `s <> e`,
+// where an unconstrained endpoint overlaps the other side, which the
+// overall-shortest answer declines for a reason of its own
+// (TestAllShortestPathsSharedEndpointInequalityMatchesOracle).
 func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
 	fixture := shortestPathLevelFixture()
 	fixture.nodes = append(fixture.nodes, pathParityNode{name: "x0", kinds: []string{"ZNode"}})
@@ -345,15 +348,15 @@ func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
 		`MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(e)) WHERE s <> e RETURN p LIMIT 2`,
 		`MATCH p = shortestPath((e:ZTerm)<-[:ZEdge*1..]-(s)) WHERE s <> e RETURN p`,
 		`MATCH p = allShortestPaths((e:ZTerm)<-[:ZEdge*1..]-(s)) WHERE s <> e RETURN p`,
+		`MATCH p = allShortestPaths((e)<-[:ZEdge*1..]-(s:ZRoot)) WHERE s <> e RETURN p`,
+		`MATCH p = allShortestPaths((s)-[:ZEdge*1..]->(e:ZTerm)) WHERE s <> e RETURN p`,
 	} {
 		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
 	}
 
 	for _, query := range []string{
 		`MATCH p = shortestPath((e)<-[:ZEdge*1..]-(s:ZRoot)) WHERE s <> e RETURN p`,
-		`MATCH p = allShortestPaths((e)<-[:ZEdge*1..]-(s:ZRoot)) WHERE s <> e RETURN p`,
 		`MATCH p = shortestPath((s)-[:ZEdge*1..]->(e:ZTerm)) WHERE s <> e RETURN p`,
-		`MATCH p = allShortestPaths((s)-[:ZEdge*1..]->(e:ZTerm)) WHERE s <> e RETURN p`,
 		`MATCH p = shortestPath((s:ZRoot)-[:ZEdge*1..]->(e:ZNode)) WHERE s <> e RETURN p`,
 	} {
 		t.Run(query, func(t *testing.T) { g.assertServesOracle(t, query) })
@@ -522,7 +525,9 @@ func TestShortestPathAfterEarlierBindingMatchesOracle(t *testing.T) {
 // one-hop pair (pg: the harness answers at depth 1, the filter then leaves
 // nothing), a later `s <> t` hid pg's 22023, and a later unrelated filter is
 // itself 42P01 in pg. The same condition in the pattern's own clause must
-// keep serving.
+// keep serving (with `s <> t`: without it, `both` -- ZA and ZB, with an
+// incoming edge -- could trip pg's primer self-endpoint guard, so that
+// spelling declines).
 //
 //	a1 -ZR-> near(ZB)            (1 hop)
 //	a1 -ZR-> mid -ZR-> far(ZB,ZT) (2 hops)
@@ -552,11 +557,12 @@ func TestShortestPathLaterPatternMatchesOracle(t *testing.T) {
 		`MATCH p = shortestPath((s:ZA)-[:ZR*1..]->(t:ZB)), (s {name: 'a1'}) RETURN p`,
 		`MATCH p = shortestPath((s:ZA)-[:ZQ*1..]->(t:ZB)) MATCH (x:ZX) WHERE s <> t RETURN p`,
 		`MATCH p = shortestPath((s:ZA)-[:ZR*1..]->(t:ZB)) MATCH (x:ZX) WHERE x.name = 'x' RETURN p, x`,
+		`MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) WHERE t.name = 'far' RETURN p`,
 	} {
 		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
 	}
 
-	g.assertServesOracle(t, `MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) WHERE t.name = 'far' RETURN p`)
+	g.assertServesOracle(t, `MATCH p = allShortestPaths((s:ZA)-[:ZR*1..]->(t:ZB)) WHERE t.name = 'far' AND s <> t RETURN p`)
 }
 
 // TestShortestPathKindLevelSelfEndpointMatchesOracle: without an endpoint

@@ -158,7 +158,8 @@ import (
 //     SQLSTATE 22023 for exactly this shape (a root that is also a terminal
 //     aborts its recursive seed query -- see
 //     traverse.SelfEndpointConflict's doc comment for the in-depth
-//     citation);
+//     citation) -- and, since it may check before the seed's own conditions
+//     apply, a node matching only the seed side's kinds (kindLevelSelfEndpoint);
 //   - with one, an allShortestPaths answered at the overall shortest length
 //     (traverse.ModeAll), whose length a cycle back to a shared node can set,
 //     and a shortestPath searched pair by pair under a pushed LIMIT, which a
