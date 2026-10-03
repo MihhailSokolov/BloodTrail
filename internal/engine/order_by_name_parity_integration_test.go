@@ -130,6 +130,9 @@ func TestTryCypherOrderByNameResolutionMatchesOracle(t *testing.T) {
 		// Two aliases PostgreSQL folds to one column name.
 		{`MATCH (g:OBGroup) RETURN g.v AS x, id(g) AS X ORDER BY X DESC`, false},
 		{chain + `RETURN g, count(u) AS c, count(DISTINCT u) AS C ORDER BY c DESC`, false},
+		// PostgreSQL accepts this one (c is the binding, so it is not
+		// ambiguous); declining it is a deliberate over-decline.
+		{counted + `RETURN c, g.v AS C ORDER BY c`, false},
 		// A parenthesised name: dawgs emits `order by (i0)` (42703).
 		{`MATCH (g:OBGroup) RETURN id(g) AS i ORDER BY (i)`, false},
 		{`MATCH (g:OBGroup) RETURN g, id(g) AS i ORDER BY (i) LIMIT 1`, false},

@@ -84,6 +84,11 @@ func TestPlanDeclinesOrderByNameDAWGSResolvesElsewhere(t *testing.T) {
 		`MATCH (g:Group) RETURN g.v AS x, id(g) AS X ORDER BY X DESC`,
 		`MATCH (g:Group) RETURN id(g) AS x, g.v AS X ORDER BY x DESC`,
 		chain + `RETURN g, count(u) AS c, count(DISTINCT u) AS C ORDER BY c DESC`,
+		// A deliberate over-decline: c is the carried COUNT and a bare RETURN
+		// item, so dawgs sorts by the binding and PostgreSQL accepts the
+		// query, but a second alias folds to the same output name and the
+		// plan-time check does not tell the two readings apart.
+		counted + `RETURN c, g.v AS C ORDER BY c`,
 		// A parenthesised name: dawgs rewrites only a bare identifier to the
 		// projection, so `ORDER BY (i)` is emitted as `order by (i0)`, a
 		// column that does not exist (42703).
