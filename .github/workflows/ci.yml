@@ -13,6 +13,9 @@ jobs:
   # The two long jobs are bounded at about three times their normal run: `test`
   # takes about 7 minutes; `dawgs` clones and tidies each supported release and
   # then runs the same two suites (an estimate, it had not run on GitHub yet).
+  # The short ones -- a release list, a shallow clone per release, ci-ok's own
+  # check -- get a bound of minutes, so a hung clone fails instead of holding
+  # ci-ok.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -50,6 +53,7 @@ jobs:
         run: make test-build-scripts
   upstreams:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tags: ${{ steps.list.outputs.tags }}
     steps:
@@ -69,6 +73,7 @@ jobs:
   patch-guard:
     needs: upstreams
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -120,6 +125,7 @@ jobs:
     if: always()
     needs: [test, upstreams, patch-guard, dawgs]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Every job this one needs succeeded
         env:
