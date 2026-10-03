@@ -590,6 +590,9 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 			if !ok {
 				return nil, false
 			}
+			if returnGroup != nil && !groupKeysNumbersCanonical(snap, returnGroup) {
+				return nil, false
+			}
 			if returnGroup != nil {
 				// After grouping, only the synthesized aliases survive --
 				// the same scoping an explicit WITH imposes. countAliases /
@@ -3822,6 +3825,16 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 				return false
 			}
 		}
+		// Any other element that is not a literal: dawgs types the array
+		// from its literal elements and casts the rest -- `n.v IN [1, 1 +
+		// 1]` is `::int8 = any(array [1, 1 + 1]::int8[])`, `n.v IN ['5',
+		// toLower(n.w)]` a text comparison with a NULL element -- or lowers
+		// the whole test to `false` (`n.v IN [size(n.l)]`). The evaluator's
+		// In types none of that, so only a list of literals of one type
+		// (inListLiteralKind) is served.
+		if _, typed := inListLiteralKind(right); len(*l) > 0 && !typed {
+			return false
+		}
 	}
 	// The right-hand side must be an array dawgs can take `= any(...)` over:
 	// a list literal, a plain property's stored list, labels() or split(),
@@ -3843,7 +3856,7 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 	// `n.a + 'x' IN [1]` are `text = bigint`, all errors, where the evaluator
 	// compared renderings; and an array on the left (split()) is compared
 	// element-wise against a flattened list.
-	if kind, typed := literalListCastKind(right); typed && !isPlainPropertyLookup(left) {
+	if kind, typed := inListLiteralKind(right); typed && !isPlainPropertyLookup(left) {
 		switch class := pb.sqlClassOf(left); {
 		case class == classBool || class == classArray:
 			return false
@@ -4183,6 +4196,13 @@ func (pb *partBuilder) checkPropertyLookup(pl *cypher.PropertyLookup) bool {
 	if !known || k != symNode {
 		return false
 	}
+	// A number stored in a spelling its float64 does not reproduce --
+	// 9007199254740993, which the float64 merges with 9007199254740992, or
+	// 1.0, whose text PostgreSQL's `->>` and casts read as '1.0' -- makes
+	// every comparison, grouping, rendering and cast of the property a guess.
+	if !pb.snap.NumbersCanonical(pl.Symbol) {
+		return false
+	}
 	pb.touched[v.Symbol] = true
 	return true
 }
@@ -4331,11 +4351,21 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
 	}
+	// Each numeric step is computed at the type PostgreSQL resolves it to
+	// (eval.go's evalArithmeticTyped), and some of those the evaluator
+	// cannot reproduce: `/` outside float8 (integers truncate, numeric is
+	// exact decimal -- and dawgs prints `2.0` as the int4 2, so
+	// `size(n.l) / 2.0` truncates), `%` at all (float8 has none), and
+	// numeric over a fractional literal (`0.1 + 0.2 = 0.3` is exact there).
+	// See numericStepServed.
+	//
+	// A plain property operand is cast to the type dawgs infers for its
+	// partner (hintCast) -- `::int` next to size() -- and left text next to
+	// a WITH alias, which infers nothing: `n.v * d` is `text * integer`.
+	if _, _, ok := foldArithTyping(ae, numericStepServed); !ok {
+		return false
+	}
 	curKind := classifyAddOperand(ae.Left)
-	// Tracks whether the value accumulated on the left is statically a
-	// float, which is what decides whether PostgreSQL divides in integers
-	// -- see staticallyFloatOperand and the Divide case below.
-	leftIsFloat := staticallyFloatOperand(ae.Left)
 	for i, p := range ae.Partials {
 		if p == nil {
 			return false
@@ -4349,23 +4379,6 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 			return false
 		}
 		rKind := classifyAddOperand(p.Right)
-		rightIsFloat := staticallyFloatOperand(p.Right)
-
-		// `/` and `%` are the two operators whose result depends on whether
-		// PostgreSQL is working in integers or floats, and dawgs decides
-		// that statically: it casts a property lookup to int8 unless some
-		// operand is a float, so `n.val / 2` becomes `(...)::int8 / 2` --
-		// truncating division. This evaluator has only float64 arithmetic,
-		// so it answers 3.5 where PostgreSQL answers 3, and `WHERE n.val /
-		// 2 = 1` then drops a row PostgreSQL returns. Unless some operand
-		// is statically a float (`n.val / 2.0`, where dawgs casts to
-		// float8 and both sides agree), the shape delegates.
-		if p.Operator == cypher.OperatorDivide || p.Operator == cypher.OperatorModulo {
-			if !leftIsFloat && !rightIsFloat {
-				return false
-			}
-		}
-		leftIsFloat = leftIsFloat || rightIsFloat
 
 		// A numeric step types its operands the way evalArithmetic's casts
 		// assume, and dawgs does not always: it casts only a PLAIN property
@@ -4396,44 +4409,6 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		curKind = nextAddKind(p.Operator, curKind, rKind)
 	}
 	return true
-}
-
-// staticallyFloatOperand reports whether expr is, on its AST alone, a
-// floating-point value -- the thing that decides whether dawgs' translation
-// of a `/` or `%` lands on PostgreSQL's integer or floating-point operator.
-// A float literal anywhere in an operand makes the whole operand float, so
-// parentheses, signs and nested arithmetic are followed through.
-//
-// Everything whose type is not statically knowable here -- a property
-// lookup, a variable, a function result -- answers false, which is the
-// conservative direction: it makes the caller decline rather than assume
-// PostgreSQL will agree with float64 arithmetic.
-func staticallyFloatOperand(expr cypher.Expression) bool {
-	switch e := unwrapParens(expr).(type) {
-	case *cypher.Literal:
-		if e == nil || e.Null {
-			return false
-		}
-		_, isFloat := e.Value.(float64)
-		return isFloat
-	case *cypher.UnaryAddOrSubtractExpression:
-		return e != nil && staticallyFloatOperand(e.Right)
-	case *cypher.ArithmeticExpression:
-		if e == nil {
-			return false
-		}
-		if staticallyFloatOperand(e.Left) {
-			return true
-		}
-		for _, p := range e.Partials {
-			if p != nil && staticallyFloatOperand(p.Right) {
-				return true
-			}
-		}
-		return false
-	default:
-		return false
-	}
 }
 
 // --- WITH ------------------------------------------------------------------
@@ -5048,7 +5023,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 				return false
 			}
 			hasString, answered := snap.HasStringValue(propID)
-			return answered && !hasString
+			return answered && !hasString && snap.NumbersCanonical(pl.Symbol)
 		})
 	if !ok {
 		return Projection{}, nil, 0, -1, false

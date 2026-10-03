@@ -100,7 +100,7 @@ func TestTryCypherWithAliasShapesMatchOracle(t *testing.T) {
 
 	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
 		{`WITH 1 AS x MATCH (n:WaUser) WHERE n.v > x * 1 RETURN n`, true},
-		{`WITH 2 AS x MATCH (n:WaUser) WHERE n.v IN [x, 3] RETURN n`, true},
+		{`WITH 2 AS x MATCH (n:WaUser) WHERE n.v IN [x, 3] RETURN n`, false},
 		{`MATCH (m:WaComputer) WITH m, 1 AS x MATCH (n:WaUser) WHERE n.v > x * 1 RETURN n, m`, true},
 
 		{`MATCH (m:WaComputer) WITH 0 AS x RETURN count(x)`, false},

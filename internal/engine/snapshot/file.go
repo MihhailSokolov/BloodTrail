@@ -32,7 +32,13 @@ var snapshotMagic = []byte("BTSNAP\x00")
 // version 1 file records no lineage, so nothing can prove it belongs to the
 // lineage PostgreSQL is in now; refusing it as a version mismatch is exactly
 // right, and costs an upgraded deployment one ordinary rebuild.
-const snapshotFormatVersion uint32 = 2
+//
+// Version 3 marks a number stored in a spelling its float64 does not
+// reproduce with its own entry kind (propKindNumberNonCanonical). A version
+// 2 file carries every number as propKindNumber, so the property facts read
+// from it (View.NumbersCanonical) would call such a number canonical --
+// failing open; it is refused the same way.
+const snapshotFormatVersion uint32 = 3
 
 // Sentinel errors ReadSnapshotFile wraps its failures in, so a caller (the
 // engine boot path) can tell "this file was never a snapshot" apart from
@@ -342,10 +348,10 @@ func writePropStore(bw *binWriter, p *PropStore) {
 // never observes a partially-verified snapshot: on any error the returned
 // *Snapshot is nil.
 //
-// Format v2, every multi-byte integer little-endian:
+// Format v3, every multi-byte integer little-endian:
 //
 //	magic          [7]byte  "BTSNAP\x00"                    -- NOT covered by the trailing CRC
-//	version        uint32   snapshotFormatVersion (2)
+//	version        uint32   snapshotFormatVersion (3)
 //	graphID        int32    Snapshot.GraphID
 //	watermark      uint64   Stamp.Watermark
 //	lineage        [16]byte Snapshot.WatermarkLineage

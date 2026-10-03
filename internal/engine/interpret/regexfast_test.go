@@ -19,7 +19,9 @@ import (
 // The subjects deliberately include the cases the ASCII restriction exists
 // for: U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S both fold onto
 // ASCII letters under Go's rules, so a naive ASCII-only comparison would
-// disagree on them -- the matcher hands those to the real engine.
+// disagree on them -- the matcher hands those to the real engine. Under case
+// folding it hands the engine the subject PostgreSQL's folding sees
+// (pgFoldSubject), so that is the reference for a folding pattern.
 func TestRegexMatcherAgreesWithRegexp(t *testing.T) {
 	patterns := []string{
 		// The shipped corpus shapes.
@@ -68,9 +70,13 @@ func TestRegexMatcherAgreesWithRegexp(t *testing.T) {
 				t.Fatalf("NewRegexMatcher: %v", err)
 			}
 			for _, s := range subjects {
-				if got.MatchString(s) != want.MatchString(s) {
+				ref := s
+				if got.foldsCase {
+					ref = pgFoldSubject(s)
+				}
+				if got.MatchString(s) != want.MatchString(ref) {
 					t.Fatalf("MatchString(%q) = %v, want %v (fast literals=%q fold=%v)",
-						s, got.MatchString(s), want.MatchString(s), got.literals, got.fold)
+						s, got.MatchString(s), want.MatchString(ref), got.literals, got.fold)
 				}
 			}
 		})
@@ -103,9 +109,13 @@ func TestRegexMatcherAgreesOnRandomSubjects(t *testing.T) {
 		}
 		s := b.String()
 		for k := range patterns {
-			if matchers[k].MatchString(s) != compiled[k].MatchString(s) {
+			ref := s
+			if matchers[k].foldsCase {
+				ref = pgFoldSubject(s)
+			}
+			if matchers[k].MatchString(s) != compiled[k].MatchString(ref) {
 				t.Fatalf("pattern %q, subject %q: matcher = %v, regexp = %v",
-					patterns[k], s, matchers[k].MatchString(s), compiled[k].MatchString(s))
+					patterns[k], s, matchers[k].MatchString(s), compiled[k].MatchString(ref))
 			}
 		}
 	}

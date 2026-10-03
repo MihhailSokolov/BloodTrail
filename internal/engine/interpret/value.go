@@ -500,9 +500,9 @@ func In(val any, ok bool, list []any) (Tri, error) {
 		if !present {
 			return TriNull, nil
 		}
-		n, err := strconv.ParseFloat(text, 64)
+		n, err := parseFloat8Text(text)
 		if err != nil {
-			return TriFalse, ErrRuntimeCast
+			return TriFalse, err
 		}
 		for _, el := range list {
 			if n == el.(float64) {

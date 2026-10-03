@@ -5,6 +5,8 @@ package snapshot
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // valueShape records which JSON types one property's values take, for the
@@ -137,4 +139,133 @@ func (v *View) StringListValuesOnly(name string) bool {
 		return false
 	}
 	return true
+}
+
+// NumbersCanonical reports whether every number property `name` holds -- as
+// its value, or inside a list or map value -- base and delta alike, is stored
+// in the spelling this package renders its float64 value in
+// (numberSpellingCanonical). The replica keeps a number as a float64; only
+// where that holds do its comparisons, groupings, text renderings and casts
+// of the number answer as PostgreSQL's, which keeps the stored spelling and
+// exact value. 9007199254740993 and 9007199254740992 are one float64, so
+// DISTINCT, grouping, a join and `= 9007199254740992` merge them; 1.0 is
+// the text '1.0' there, which `::int8` rejects. A caller that reads the
+// property declines when this is false. A name the view has never seen is
+// trivially true.
+//
+// The base's answer is derived once per snapshot (nonCanonicalNumberProp)
+// and a segment's once when it is built, so asking costs a lookup per
+// segment and nothing per node.
+func (v *View) NumbersCanonical(name string) bool {
+	if prop, interned := v.PropIDByName(name); interned && v.base.Props.nonCanonicalNumberProp(prop) {
+		return false
+	}
+	for _, seg := range v.segments {
+		if _, marked := seg.nonCanonicalNumberProps[name]; marked {
+			return false
+		}
+	}
+	return true
+}
+
+// nonCanonicalNumberProp reports whether any node's value of prop carries a
+// non-canonical number: a propKindNumberNonCanonical entry, or a list or map
+// whose JSON text holds one. Every property is derived in a single pass over
+// the store on first use; the store is immutable, so it never changes.
+func (p *PropStore) nonCanonicalNumberProp(prop PropID) bool {
+	if p == nil {
+		return false
+	}
+	p.numberFactsOnce.Do(func() {
+		marks := make([]bool, len(p.names))
+		for _, e := range p.entries {
+			if int(e.prop) < len(marks) && !marks[e.prop] && entryCarriesNonCanonicalNumber(e, p.arena) {
+				marks[e.prop] = true
+			}
+		}
+		p.nonCanonicalNumber = marks
+	})
+	return int(prop) < len(p.nonCanonicalNumber) && p.nonCanonicalNumber[prop]
+}
+
+// entryCarriesNonCanonicalNumber reports whether one stored value is, or
+// holds, a non-canonical number; arena is the byte arena its ref points into.
+func entryCarriesNonCanonicalNumber(e propEntry, arena []byte) bool {
+	switch e.kind {
+	case propKindNumberNonCanonical:
+		return true
+	case propKindArray, propKindObject:
+		return jsonCarriesNonCanonicalNumber(arena[e.ref : e.ref+e.len])
+	}
+	return false
+}
+
+// jsonCarriesNonCanonicalNumber reports whether raw, the JSON text of a list
+// or map as PostgreSQL rendered it, holds a number whose spelling is not
+// canonical -- what `'1' IN n.list` compares and `n.list = [1]` casts. A
+// token that does not parse counts as one.
+func jsonCarriesNonCanonicalNumber(raw []byte) bool {
+	for i := 0; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case c == '"':
+			for i++; i < len(raw) && raw[i] != '"'; i++ {
+				if raw[i] == '\\' {
+					i++
+				}
+			}
+		case c == '-' || (c >= '0' && c <= '9'):
+			j := i
+			for j < len(raw) && strings.IndexByte("+-.eE0123456789", raw[j]) >= 0 {
+				j++
+			}
+			token := raw[i:j]
+			f, err := strconv.ParseFloat(string(token), 64)
+			if err != nil || !numberSpellingCanonical(token, f) {
+				return true
+			}
+			i = j - 1
+		}
+	}
+	return false
+}
+
+// nonCanonicalNumberProps names every property a live node state in
+// nodeStates carries a non-canonical number in -- a Segment's half of
+// View.NumbersCanonical, derived once when the segment is built. nil when
+// there is none, the ordinary case.
+func nonCanonicalNumberProps(nodeStates map[uint64]NodeSegState) map[string]struct{} {
+	var out map[string]struct{}
+	for _, st := range nodeStates {
+		if st.Tombstoned || st.seg == nil {
+			continue
+		}
+		for _, e := range st.entries {
+			if !entryCarriesNonCanonicalNumber(e, st.seg.arena) {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]struct{})
+			}
+			out[st.seg.names[e.prop]] = struct{}{}
+		}
+	}
+	return out
+}
+
+// mergedNonCanonicalNumberProps unions segs' marked property names, for
+// MergeSegments: a merged segment answers for every state it carries over.
+func mergedNonCanonicalNumberProps(segs []*Segment) map[string]struct{} {
+	var out map[string]struct{}
+	for _, seg := range segs {
+		if seg == nil {
+			continue
+		}
+		for name := range seg.nonCanonicalNumberProps {
+			if out == nil {
+				out = make(map[string]struct{})
+			}
+			out[name] = struct{}{}
+		}
+	}
+	return out
 }
