@@ -484,8 +484,10 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
 // A panic on the rebuild's own goroutine -- in the snapshot build, the size
 // check or the adoption -- is recovered into an error and a fallback
 // (recoverRebuildPanic, background_panic.go) rather than ending the process.
-// The load's worker goroutines (loadNodes streams and parses rows on an
-// errgroup of its own) are not covered: a panic there still ends it.
+// The load's own worker goroutines (loadNodes streams, parses and stages
+// rows on an errgroup, which does not propagate a panic to its waiter) are
+// covered where they run instead, and arrive here as this load's error
+// (goRecovered, load.go).
 func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool, err error) {
 	defer e.recoverRebuildPanic(ctx, trigger, &adopted, &err)
 	// Cleared per attempt, exactly as overBudget is, so both describe only
