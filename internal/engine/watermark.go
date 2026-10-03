@@ -513,7 +513,7 @@ func (e *Engine) NoteWatermarkBumpFailure(ctx context.Context, scope *WriteScope
 		// slow boot (a full PostgreSQL rebuild), which is the correct
 		// trade against serving a graph that silently lacks a committed
 		// write.
-		e.invalidateSnapshotFile(ctx)
+		e.invalidateSnapshotFile(ctx, invalidateUncountedWrite)
 		return true
 	}
 	return false

@@ -60,14 +60,26 @@ func TestFileBootPanicDiscardsTheFileAndRebuilds(t *testing.T) {
 		t.Fatal("the rebuilt replica is missing a node PostgreSQL holds")
 	}
 	logged := buf.String()
-	panicLogged := false
+	var panicLine, invalidatedLine string
 	for _, line := range strings.Split(logged, "\n") {
-		if strings.Contains(line, "level=ERROR") && strings.Contains(line, `msg="bloodtrail: snapshot file boot panicked"`) {
-			panicLogged = true
+		switch {
+		case strings.Contains(line, "level=ERROR") && strings.Contains(line, `msg="bloodtrail: snapshot file boot panicked"`):
+			panicLine = line
+		case strings.Contains(line, `msg="bloodtrail: snapshot file invalidated"`):
+			invalidatedLine = line
 		}
 	}
-	if !panicLogged {
+	if panicLine == "" {
 		t.Fatalf("no ERROR \"bloodtrail: snapshot file boot panicked\" line was logged:\n%s", logged)
+	}
+	if !strings.Contains(panicLine, "path="+path) {
+		t.Errorf("the panic line does not name the file %s:\n%s", path, panicLine)
+	}
+	if invalidatedLine == "" {
+		t.Fatalf("no \"bloodtrail: snapshot file invalidated\" line was logged:\n%s", logged)
+	}
+	if !strings.Contains(invalidatedLine, "path="+path) || !strings.Contains(invalidatedLine, `reason="booting from it panicked"`) {
+		t.Errorf("the invalidation line does not name the file %s and the reason:\n%s", path, invalidatedLine)
 	}
 	if strings.Contains(logged, "bloodtrail: snapshot file loaded") {
 		t.Fatalf("the file whose boot panicked was adopted:\n%s", logged)

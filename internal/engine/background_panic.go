@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-
-	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
 // The engine's background work -- the snapshot rebuild that boot load and
@@ -78,30 +76,21 @@ func (e *Engine) bootFromSnapshotFile(ctx context.Context) (adopted bool) {
 // enters fallback (backgroundPanicked) -- a view the attempt may already
 // have published is not vouched for, and the boot loop's rebuild, which
 // runs next, replaces it -- and the attempt reports nothing adopted. The
-// file is then deleted (durably, as removeSnapshotFile does): a panic that
-// depends on the file would otherwise recur at every boot, and deleting a
-// snapshot file never costs more than one rebuild. The delete comes after
-// the fallback, which keeps any save from starting until that rebuild has
-// replaced the view.
+// file is then deleted (invalidateSnapshotFile, which removes it durably and
+// logs what it did): a panic that depends on the file would otherwise recur
+// at every boot, and deleting a snapshot file never costs more than one
+// rebuild. The delete comes after the fallback, which keeps any save from
+// starting until that rebuild has replaced the view.
 func (e *Engine) recoverSnapshotFileBootPanic(ctx context.Context, adopted *bool) {
 	r := recover()
 	if r == nil {
 		return
 	}
 	*adopted = false
-	path, ok := e.snapshotFilePath()
-	_ = e.backgroundPanicked(ctx, "snapshot file boot", r, slog.String("path", path))
-	if !ok {
-		return
+	var attrs []any
+	if path, ok := e.snapshotFilePath(); ok {
+		attrs = append(attrs, slog.String("path", path))
 	}
-	removed, err := snapshot.RemoveSnapshotFile(path)
-	switch {
-	case err != nil:
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file invalidation failed",
-			slog.String("path", path), slog.Bool("removed", removed), slog.Any("error", err))
-	case removed:
-		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file invalidated",
-			slog.String("path", path),
-			slog.String("reason", "booting from it panicked"))
-	}
+	_ = e.backgroundPanicked(ctx, "snapshot file boot", r, attrs...)
+	e.invalidateSnapshotFile(ctx, invalidateBootPanicked)
 }

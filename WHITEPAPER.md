@@ -3618,7 +3618,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
 | `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
-| `snapshot file invalidation failed` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`); delete the file by hand before the next restart |
+| `snapshot file invalidation failed` / `snapshot file not invalidated` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`), or no file path could be worked out yet, so there was nothing to delete (reason `no snapshot file path resolved yet`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
 | `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above) |
 
