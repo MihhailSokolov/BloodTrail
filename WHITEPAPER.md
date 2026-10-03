@@ -799,10 +799,14 @@ way out (`settleWriteTransactionPanic` and the deferred handlers in [`driver.go`
 `WriteTransaction` whose code panicked was rolled back by DAWGS, so it settles as "nothing
 happened", and one that panicked after its code returned settles like a failed final COMMIT; a
 batch records a fallback and applies, because the panic may have come between a write and its
-record; a read transaction applies the writes it noted. `Run`, `WipeGraph` and the other overridden
-methods have no such handling: a panic inside one of them (`WipeGraph` runs a callback its caller
-supplies) leaves its counter increment unresolved, and the process then writes no snapshot file
-until it restarts ([§13.1](#131-the-counter)).
+record; a read transaction applies the writes it noted. The overridden methods settle a panic too,
+and do not catch it either: `Run` and `WipeGraph` split it exactly as the table above splits their
+errors, because their own "reached the commit step" flag is as true for a panic as for an error,
+while `SetDefaultGraph` and the two kind deletes record a fallback and apply -- unlike an error
+from the same call, a panic is no evidence that the call had no effect, and `SetDefaultGraph`'s can
+arise after the in-process retarget it makes. Without this, a panic inside one of them (`WipeGraph`
+runs a callback its caller supplies) left its counter increment unresolved, and the process then
+wrote no snapshot file until it restarted ([§13.1](#131-the-counter)).
 
 ### 5.6 OpenGraph data
 
@@ -834,16 +838,17 @@ against the plain PostgreSQL driver ([§16.2](#162-differential-tests-against-po
   may have removed ([§12.1](#121-record-the-keys-then-read-back-the-truth)). A failed upload can
   leave behind a source kind that PostgreSQL has registered but no row carries. The replica learns
   kinds from its last full load and from the rows it reads back, so it may not know that name;
-  read-back resolves it through the driver's kind mapper, and the sourceless delete that excludes it
-  replays without a fallback.
+  read-back resolves it out of PostgreSQL's kind table ([§12.3](#123-reading-back)), and the
+  sourceless delete that excludes it replays without a fallback.
 - **What still goes to PostgreSQL**: a query naming a kind no row carries yet, such as that failed
   upload's source kind, until the replica learns the kind (declined as `unsupported`); and the same
   shapes that delegate for any other data.
 
 **Code.** [`driver.go`](driver.go): `Open`, `Driver`, `ReadTransaction`, `WriteTransaction`,
 `settleWriteTransactionPanic`, `resolveWriteTransactionFailure`, `BatchOperation`, `Run`,
-`WipeGraph`, `settleOverrideWrite`, `SetDefaultGraph`, `DeleteNodesByKinds`,
-`DeleteRelationshipsByKinds`, `settleDeleteFailure`, `Close`. [`transaction.go`](transaction.go):
+`WipeGraph`, `settleOverrideWrite`, `settleOverridePanic`, `SetDefaultGraph`,
+`DeleteNodesByKinds`, `DeleteRelationshipsByKinds`, `settleDeleteFailure`, `Close`.
+[`transaction.go`](transaction.go):
 `wrappedTransaction`, `readWrites`, `readQueryMutates`. [`node_query.go`](node_query.go),
 [`relationship_query.go`](relationship_query.go): the recording builders.
 [`write_observer.go`](write_observer.go): `observingTransaction`, `observingBatch`,

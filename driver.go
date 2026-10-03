@@ -622,11 +622,27 @@ func (d *Driver) Close(ctx context.Context) error {
 // reproduced rather than called because calling it hides WHERE an error
 // arose, and only one of the two places proves nothing committed -- see
 // settleOverrideWrite.
+//
+// A panic unwinding through this call settles the same way an error from the
+// same place would (the deferred call below), and is never recovered, so it
+// reaches the caller unchanged. Without that, the eager bump of a write that
+// panicked stayed in flight for the life of the process: the watermark never
+// converged again and no snapshot file could be written, by this shutdown or
+// any compaction before it.
 func (d *Driver) Run(ctx context.Context, query string, parameters map[string]any) error {
+	const fallbackReason = "Run: raw Cypher outside a transaction escapes changelog tracking"
+
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
 	reachedCommit := false
+	returned := false
+	defer func() {
+		if !returned {
+			settleOverrideWrite(ctx, d.engine, scope, errOverrideWritePanicked, reachedCommit, fallbackReason)
+		}
+	}()
+
 	err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
 		result := tx.Raw(query, parameters)
 		defer result.Close()
@@ -637,7 +653,8 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 		reachedCommit = true
 		return nil
 	})
-	settleOverrideWrite(ctx, d.engine, scope, err, reachedCommit, "Run: raw Cypher outside a transaction escapes changelog tracking")
+	returned = true
+	settleOverrideWrite(ctx, d.engine, scope, err, reachedCommit, fallbackReason)
 	return err
 }
 
@@ -647,14 +664,24 @@ func (d *Driver) Run(ctx context.Context, query string, parameters map[string]an
 // keep serving shortest paths through data PostgreSQL no longer has. See
 // Run's doc for why an override is needed at all, for why the scope handed
 // to Apply carries a ChangeSet fallback rather than replaying anything
-// narrowly, for why ensureBumped runs first, and for why the body is
+// narrowly, for why ensureBumped runs first, for why the body is
 // pg.Driver.WipeGraph's own (the pinned dawgs v0.8.0's, truncate then the
-// retain delegate, inside the embedded driver's WriteTransaction).
+// retain delegate, inside the embedded driver's WriteTransaction), and for
+// how a panic unwinding through it is settled.
 func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate) error {
+	const fallbackReason = "WipeGraph: full graph truncation escapes changelog tracking"
+
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
 	reachedCommit := false
+	returned := false
+	defer func() {
+		if !returned {
+			settleOverrideWrite(ctx, d.engine, scope, errOverrideWritePanicked, reachedCommit, fallbackReason)
+		}
+	}()
+
 	err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
 		result := tx.Raw("truncate table node, edge;", nil)
 
@@ -675,8 +702,33 @@ func (d *Driver) WipeGraph(ctx context.Context, retain graph.TransactionDelegate
 		reachedCommit = true
 		return nil
 	})
-	settleOverrideWrite(ctx, d.engine, scope, err, reachedCommit, "WipeGraph: full graph truncation escapes changelog tracking")
+	returned = true
+	settleOverrideWrite(ctx, d.engine, scope, err, reachedCommit, fallbackReason)
 	return err
+}
+
+// errOverrideWritePanicked stands in for the error a driver-level write would
+// have returned had it returned at all, so a panic unwinding through Run or
+// WipeGraph settles through the very same split an error does
+// (settleOverrideWrite): their reachedCommit flag already says whether the
+// statement itself was the thing that failed, and it says it just as
+// truthfully for a panic as for an error.
+var errOverrideWritePanicked = errors.New("panicked before the write returned")
+
+// settleOverridePanic settles the engine's accounting for a driver-level
+// write that a panic -- or runtime.Goexit -- is unwinding through, where the
+// panic proves nothing about whether the write took effect, even though an
+// ERROR from the same call would have: SetDefaultGraph's error branch knows
+// the retarget did not happen, and settleDeleteFailure recognizes the errors
+// dawgs produces before the delete statement is sent, but a panic carries no
+// such evidence and can have arisen after either took effect. So it records
+// reason as a ChangeSet fallback and Applies: the rebuild reloads whatever
+// PostgreSQL actually holds, and the eager bump resolves through the ordinary
+// path instead of staying in flight for the life of the process. Nothing here
+// recovers the panic, so it reaches the caller unchanged.
+func settleOverridePanic(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope, reason string) {
+	scope.Changes().RecordFallback(reason)
+	eng.Apply(ctx, scope)
 }
 
 // settleOverrideWrite settles the engine's accounting for Run or WipeGraph
@@ -737,15 +789,33 @@ func settleOverrideWrite(ctx context.Context, eng *engine.Engine, scope *engine.
 // which the pinned dawgs v0.8.0 makes only after the graph lookup succeeded
 // and immediately before its delegate returns nil -- it writes nothing to
 // PostgreSQL at all.
+//
+// A PANIC gets the fallback instead (settleOverridePanic, deferred below): it
+// can arise after that same in-process assignment -- from the embedded
+// driver's own connection release, say -- which would leave the engine
+// serving a View of the graph that was default before. Settling it as
+// abandoned, the way an error is, would keep that View. The panic is not
+// recovered, so it reaches the caller unchanged.
 func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) error {
+	const fallbackReason = "SetDefaultGraph: default graph retarget escapes changelog tracking"
+
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.backend().SetDefaultGraph(ctx, graphSchema); err != nil {
+	returned := false
+	defer func() {
+		if !returned {
+			settleOverridePanic(ctx, d.engine, scope, fallbackReason)
+		}
+	}()
+
+	err := d.backend().SetDefaultGraph(ctx, graphSchema)
+	returned = true
+	if err != nil {
 		resolveAbandonedWrite(ctx, d.engine, scope)
 		return err
 	}
-	scope.Changes().RecordFallback("SetDefaultGraph: default graph retarget escapes changelog tracking")
+	scope.Changes().RecordFallback(fallbackReason)
 	d.engine.Apply(ctx, scope)
 	return nil
 }
@@ -761,13 +831,22 @@ func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) e
 // to a deleted node, which the applier's own tombstoneNodeWithCascade
 // derives directly from the View rather than needing this call to report
 // anything about edges at all. See Run's doc for why an override is needed
-// at all and why ensureBumped runs first, and settleDeleteFailure for how an
-// error is settled.
+// at all and why ensureBumped runs first, settleDeleteFailure for how an
+// error is settled, and settleOverridePanic for a panic.
 func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.backend().DeleteNodesByKinds(ctx, includeAny, excludeAny); err != nil {
+	returned := false
+	defer func() {
+		if !returned {
+			settleOverridePanic(ctx, d.engine, scope, "DeleteNodesByKinds: panicked, outcome unknown")
+		}
+	}()
+
+	err := d.backend().DeleteNodesByKinds(ctx, includeAny, excludeAny)
+	returned = true
+	if err != nil {
 		settleDeleteFailure(ctx, d.engine, scope, "DeleteNodesByKinds", err)
 		return err
 	}
@@ -788,7 +867,16 @@ func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kin
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
 
-	if err := d.backend().DeleteRelationshipsByKinds(ctx, kinds); err != nil {
+	returned := false
+	defer func() {
+		if !returned {
+			settleOverridePanic(ctx, d.engine, scope, "DeleteRelationshipsByKinds: panicked, outcome unknown")
+		}
+	}()
+
+	err := d.backend().DeleteRelationshipsByKinds(ctx, kinds)
+	returned = true
+	if err != nil {
 		settleDeleteFailure(ctx, d.engine, scope, "DeleteRelationshipsByKinds", err)
 		return err
 	}

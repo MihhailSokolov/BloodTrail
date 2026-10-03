@@ -19,6 +19,117 @@ func panicValueOf(run func()) (recovered any) {
 	return nil
 }
 
+// driverPanicValue is what panickingPGBackend and rawPanicTransaction panic
+// with, so a test can assert the caller got that exact value back.
+const driverPanicValue = "embedded driver bug"
+
+// panickingPGBackend is a pgBackend that panics with driverPanicValue
+// instead of returning: either before it runs the delegate at all (its own
+// acquire or BEGIN) or right after the delegate returned (its own COMMIT) --
+// the two places a panic can unwind through a driver-level write, and the
+// two that differ in whether anything could be durable.
+type panickingPGBackend struct {
+	tx                 graph.Transaction
+	panicAfterDelegate bool
+}
+
+func (b *panickingPGBackend) ReadTransaction(context.Context, graph.TransactionDelegate, ...graph.TransactionOption) error {
+	panic(driverPanicValue)
+}
+
+func (b *panickingPGBackend) WriteTransaction(_ context.Context, txDelegate graph.TransactionDelegate, _ ...graph.TransactionOption) error {
+	if !b.panicAfterDelegate {
+		panic(driverPanicValue)
+	}
+	if err := txDelegate(b.tx); err != nil {
+		return err
+	}
+	panic(driverPanicValue)
+}
+
+func (b *panickingPGBackend) SetDefaultGraph(context.Context, graph.Graph) error {
+	panic(driverPanicValue)
+}
+
+func (b *panickingPGBackend) DeleteNodesByKinds(context.Context, graph.Kinds, graph.Kinds) error {
+	panic(driverPanicValue)
+}
+
+func (b *panickingPGBackend) DeleteRelationshipsByKinds(context.Context, graph.Kinds) error {
+	panic(driverPanicValue)
+}
+
+// rawPanicTransaction panics in Raw, which is how a panic reaches Run's or
+// WipeGraph's own delegate -- before it has run the statement to completion,
+// so the embedded driver's deferred Close rolls the transaction back.
+type rawPanicTransaction struct {
+	graph.Transaction
+}
+
+func (rawPanicTransaction) Raw(string, map[string]any) graph.Result {
+	panic(driverPanicValue)
+}
+
+// TestDriverCapabilityWritePanicsSettleByWhereThePanicArose is the panic
+// twin of TestDriverCapabilityWritesSettleByWhereTheErrorArose
+// (wrapper_test.go): every driver-level write bumps the watermark counter at
+// its top (ensureBumped), so a panic unwinding through one has to settle that
+// bump on its way out, or it stays in flight for the life of the process and
+// no snapshot file can ever be written again. The split is the same one the
+// error paths make: a panic that proves nothing could be durable (the
+// statement itself, rolled back) resolves without an Apply, and a panic that
+// could have followed a durable write records a fallback and Applies, so the
+// replica is rebuilt from what PostgreSQL actually holds. The panic itself is
+// never recovered: it reaches the caller unchanged.
+func TestDriverCapabilityWritePanicsSettleByWhereThePanicArose(t *testing.T) {
+	okTx := func() graph.Transaction { return &fakeTransaction{rawResult: graph.NewErrorResult(nil)} }
+
+	cases := []struct {
+		name      string
+		backend   *panickingPGBackend
+		call      func(ctx context.Context, d *Driver) error
+		wantApply bool
+	}{
+		{"Run: the statement panicked, rolled back", &panickingPGBackend{tx: rawPanicTransaction{}, panicAfterDelegate: true},
+			func(ctx context.Context, d *Driver) error { return d.Run(ctx, "MATCH (n) DELETE n", nil) }, false},
+		{"Run: never began", &panickingPGBackend{},
+			func(ctx context.Context, d *Driver) error { return d.Run(ctx, "MATCH (n) DELETE n", nil) }, false},
+		{"Run: panicked after the delegate, in the commit", &panickingPGBackend{tx: okTx(), panicAfterDelegate: true},
+			func(ctx context.Context, d *Driver) error { return d.Run(ctx, "MATCH (n) DELETE n", nil) }, true},
+		{"WipeGraph: the truncate panicked, rolled back", &panickingPGBackend{tx: rawPanicTransaction{}, panicAfterDelegate: true},
+			func(ctx context.Context, d *Driver) error { return d.WipeGraph(ctx, nil) }, false},
+		{"WipeGraph: panicked after the delegate, in the commit", &panickingPGBackend{tx: okTx(), panicAfterDelegate: true},
+			func(ctx context.Context, d *Driver) error { return d.WipeGraph(ctx, nil) }, true},
+		{"SetDefaultGraph: panicked", &panickingPGBackend{},
+			func(ctx context.Context, d *Driver) error { return d.SetDefaultGraph(ctx, graph.Graph{Name: "g"}) }, true},
+		{"DeleteNodesByKinds: panicked", &panickingPGBackend{},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteNodesByKinds(ctx, graph.Kinds{graph.StringKind("A")}, nil)
+			}, true},
+		{"DeleteRelationshipsByKinds: panicked", &panickingPGBackend{},
+			func(ctx context.Context, d *Driver) error {
+				return d.DeleteRelationshipsByKinds(ctx, graph.Kinds{graph.StringKind("A")})
+			}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := disabledEngine()
+			d := &Driver{engine: eng, pgOverride: tc.backend}
+			before := eng.ApplyCount()
+
+			recovered := panicValueOf(func() { _ = tc.call(context.Background(), d) })
+			if recovered != driverPanicValue {
+				t.Fatalf("recovered %v, want the embedded driver's own panic %q unchanged", recovered, driverPanicValue)
+			}
+
+			if applied := eng.ApplyCount() != before; applied != tc.wantApply {
+				t.Fatalf("Apply called = %v, want %v", applied, tc.wantApply)
+			}
+		})
+	}
+}
+
 // TestSettleWriteTransactionPanicSplitsByWhereThePanicArose pins
 // settleWriteTransactionPanic: a panic inside the delegate left nothing
 // durable (the embedded driver rolls back), so it settles without an
