@@ -2312,11 +2312,10 @@ kind-scoped delete races other writers: a row of the deleted kind that another w
 after the `DELETE`'s snapshot, and whose apply ran first, must survive. An earlier version carried
 the delete out against the view as an instruction ("tombstone every edge of kind K") and erased such
 rows while staying SERVING. With read-back the result no longer depends on the order in which
-concurrent writes are applied, with one exception: an objectid-keyed edge upsert whose endpoint is
-re-keyed before the upsert is applied ([§12.3](#123-reading-back)). A delete whose criteria name
-more rows than PostgreSQL deleted costs only extra re-reads. Enumerating the candidates scans the
-view's kind bitsets (or every node for an empty `include`) or the edge-kind column once, inside
-`Apply`; it never touches a query's read path, and the re-reads go 50,000 ids per round trip.
+concurrent writes are applied. A delete whose criteria name more rows than PostgreSQL deleted costs
+only extra re-reads. Enumerating the candidates scans the view's kind bitsets (or every node for an
+empty `include`) or the edge-kind column once, inside `Apply`; it never touches a query's read path,
+and the re-reads go 50,000 ids per round trip.
 
 The criteria must also name kinds the way PostgreSQL does. The replica learns kind names when its
 base is built and from the rows that writes bring back, but PostgreSQL can know more: an OpenGraph
@@ -2385,10 +2384,15 @@ matches no row any more does not mean its node is gone: a node whose objectid wa
 keeps its id, its row and its edges. So every node the view knows under such an objectid joins the
 candidates of [§12.1](#121-record-the-keys-then-read-back-the-truth) and is re-read by id, with the
 same `id = ANY($2)` query as the other candidates; only one that is really absent is tombstoned,
-with its edges. One case is not covered: an objectid-keyed edge upsert whose endpoint was re-keyed
-between the upsert and its apply. Its triple cannot be resolved, so an edge that upsert created is
-not staged until a later write names it or a reload brings it in. Objectids are identities in
-BloodHound, so this takes a re-key racing an ingest upsert.
+with its edges. A triple with such an endpoint waits for that re-read and is then resolved against
+it (`rekeyedTripleKeys`): a re-key changes no node id, so a node that comes back present under the
+old objectid is the id the upsert resolved that objectid to, and the triple is queried for it in a
+second batch pass. An endpoint that is really gone needs nothing, because its own tombstone takes
+its edges with it. One case is still not covered: an endpoint node the upsert itself created and
+another writer re-keyed inside the same window is named by neither PostgreSQL's objectid lookup nor
+the view, so that node and its edge are not staged until a later write names them or a reload brings
+them in. Objectids are identities in BloodHound, so this takes a writer re-keying a node it has
+never seen.
 
 Kind names are mapped to ids in one batch; if the batch fails, each name is looked up on its own, so
 one bad name affects only its own entries, and a cancelled request counts as a read-back error. For
@@ -2923,10 +2927,11 @@ equals its stamp" would almost never succeed. Instead:
   does not matter: read-back always returns PostgreSQL's *current* state for each key, and a
   kind-scoped delete is read back too, through the candidates the view being replayed onto holds
   ([§12.1](#121-record-the-keys-then-read-back-the-truth)); the one exception is the same as in
-  ordinary write-through, an objectid-keyed edge upsert whose endpoint is re-keyed before it is
-  applied ([§12.3](#123-reading-back)). (When kind-scoped deletes were replayed as instructions, a
-  delete that started first but committed last could erase a row written in between.) Publishing the
-  result also raises the watermark ledger to P ([§13.1](#131-the-counter)).
+  ordinary write-through, an objectid-keyed edge upsert whose endpoint node that same upsert created
+  and another writer re-keyed before it is applied ([§12.3](#123-reading-back)). (When kind-scoped
+  deletes were replayed as instructions, a delete that started first but committed last could erase
+  a row written in between.) Publishing the result also raises the watermark ledger to P
+  ([§13.1](#131-the-counter)).
 
 Any doubt rejects the file (`snapshot file rejected`, with a `reason`, or an `error` for an
 unreadable file) and falls through to a normal load: a corrupt or wrong-version file (every file
@@ -3534,9 +3539,10 @@ in the [README](README.md).
   cannot list, writes with an unknown outcome, and writes through read transactions. A reload is
   adopted only once no write lands while it runs, so under writes that never pause for that long,
   a FALLBACK lasts until they do ([Section 7](#7-loading-the-replica-from-postgresql)).
-- **One narrow write race is not followed**: an objectid-keyed edge upsert whose endpoint is
-  re-keyed before the upsert is applied leaves an edge that upsert created out of the replica
-  until a later write names it or a reload ([§12.3](#123-reading-back)).
+- **One narrow write race is not followed**: an objectid-keyed edge upsert whose endpoint node that
+  same upsert created, and another writer re-keyed before the upsert is applied, leaves that node
+  and its edge out of the replica until a later write names them or a reload
+  ([§12.3](#123-reading-back)). An endpoint that already existed is followed through the re-key.
 - **Not every query is accelerated.** Queries outside the interpreter's subset, queries that sort
   text, queries with `$parameters`, Cypher spellings whose DAWGS translation BloodTrail does not
   reproduce exactly ([§11.2](#112-matching-dawgss-semantics)), `allShortestPaths` queries whose

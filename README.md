@@ -411,9 +411,10 @@ query's conditions, `datetime()`'s epoch accessors read the BloodHound server's 
 when the query starts, where PostgreSQL reads its own `now()`; for a `shortestPath`
 without `s <> t`, whether PostgreSQL raises its shared-endpoint error can depend on its
 query plan, so on some plans PostgreSQL fails a query BloodTrail answers (where both
-answer, the answers agree); and an objectid-keyed edge upsert whose endpoint is re-keyed
-before the upsert is applied leaves the edge it created out of the replica until a later
-write names it or a reload.
+answer, the answers agree); and an objectid-keyed edge upsert whose endpoint node that
+same upsert created, and another writer re-keyed before the upsert is applied, leaves
+that node and its edge out of the replica until a later write names them or a reload (an
+endpoint that already existed is followed through the re-key).
 
 Out of scope today: interpreting mutating Cypher and arbitrary update/delete criteria
 (both trigger a fallback rebuild), cache coherence across more than one BloodTrail
