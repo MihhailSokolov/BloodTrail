@@ -122,6 +122,34 @@ func waitForBootLoad(t *testing.T, d *bloodtrail.Driver) {
 	}
 }
 
+// waitForBootRebuildCounted blocks until d's engine has counted at least one
+// PostgreSQL rebuild, which is strictly LATER than waitForBootLoad's own
+// condition and is what a test comparing against a RebuildCount baseline -- or
+// asserting a rebuild happened at all -- actually needs. what names the boot
+// being asserted about, for the failure message.
+//
+// The engine publishes the rebuilt View (flipping Fresh(), and so ending
+// waitForBootLoad) from inside adoptRebuiltView's applyMu critical section,
+// but increments the counter from a deferred call that runs only after that
+// returns and after the rebuild's own log line -- so a baseline read the
+// instant Fresh() flips can still be 0 and then grow by one on its own,
+// failing an "unchanged" assertion later in the test. The internal/engine
+// package's own waitForRebuildCounted carries the full measurement.
+func waitForBootRebuildCounted(t *testing.T, d *bloodtrail.Driver, what string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if bloodtrail.TestingEngine(d).RebuildCount() > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("RebuildCount stayed 0 for 5s %s, want at least one PostgreSQL rebuild", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // applyRelTriples fetches every relationship of kind as a triple through the
 // real driver -- the shape engine.TryRelFetchTriples may serve. It is this
 // file's own copy of a helper the bloodtrail_test-package suites also carry;
