@@ -351,7 +351,7 @@ set or BloodHound's own log level is debug.
 | `write-through applied` | Debug | A committed write was replayed into the replica |
 | `segment stack merged` | Debug | An overgrown delta stack was collapsed; bookkeeping, not a fallback |
 | `fallback entered` / `fallback exited` | Warn / Info | A write could not be followed incrementally, or engine work panicked (`reason`); every query goes to PostgreSQL until the rebuild lands |
-| `write-through apply panicked` / `snapshot rebuild panicked` / `compaction panicked` | Error | An engine bug, logged with its stack; the engine entered fallback (reason `apply panicked: ...` and so on) and keeps retrying the rebuild. Please report it |
+| `write-through apply panicked` / `snapshot rebuild panicked` / `snapshot file boot panicked` / `compaction panicked` | Error | An engine bug, logged with its stack; the engine entered fallback (reason `apply panicked: ...` and so on) and keeps retrying the rebuild. A snapshot file whose boot panicked is deleted. Please report it |
 | `snapshot rebuilt` | Info | A full load from PostgreSQL was adopted (`trigger`: `startup` or `fallback`) |
 | `snapshot rebuild not adopted: a write was applied while it loaded` | Debug | A load was discarded and will be retried |
 | `snapshot rebuild refused: exceeds memory limit` | Warn | Rate-limited |
@@ -364,7 +364,7 @@ set or BloodHound's own log level is debug.
 | `watermark failure settled by a write that produced no effect; ...` | Debug | A rebuild was requested to restore trust in the counter |
 | `snapshot file loaded` / `snapshot file rejected` | Info | The boot reused the saved file (`replayed_writes`) / declined it (`reason`, or `error` for an unreadable or older-format file) and rebuilt instead |
 | `snapshot file written` / `not written` / `skipped` / `write failed` | Info / Debug-Warn / Debug / Warn | Saving the replica on shutdown or after compaction. `not written` at Warn with reason `the watermark counter holds values this process never resolved: ...` means another BloodTrail server may be writing the same database |
-| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the saved file was deleted |
+| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, or booting from the file panicked, so the saved file was deleted |
 | `snapshot file not invalidated` / `snapshot file invalidation failed` | Warn | That delete could not happen; delete the file by hand before the next restart |
 | `no snapshot file` | Debug | Boot found no file in the snapshot directory |
 | `removed stale snapshot temp file` / `failed to remove stale snapshot temp file` | Info / Warn | A half-written file from an earlier process was (or could not be) cleaned up |

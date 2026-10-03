@@ -1241,7 +1241,8 @@ the size check, the adoption) into an error and a FALLBACK (`recoverRebuildPanic
 [`background_panic.go`](internal/engine/background_panic.go)): it logs
 `bloodtrail: snapshot rebuild panicked` at Error with the stack, and the load is retried on the
 usual backoff ([§12.5](#125-fallback)). The goroutines that stream and decode the node rows during
-the load are not covered.
+the load are not covered. The boot's attempt to start from the snapshot file is covered the same
+way, and also deletes the file ([§14.3](#143-boot)).
 
 **Memory limit.** If `BLOODTRAIL_MEMORY_LIMIT` is set and the finished snapshot's estimated size
 exceeds it, the load is refused. Whatever the engine had before stays in place (at startup, that
@@ -1252,7 +1253,7 @@ form the benchmarks use, which reads neither the counter nor the lineage), `load
 `loadKinds`, `loadNodes`, `loadEdges`, `probeMultiGraph`. [`engine.go`](internal/engine/engine.go):
 `rebuildOnce`, `adoptRebuiltView`. [`watermark.go`](internal/engine/watermark.go):
 `adoptRebuiltViewAndRebase`. [`background_panic.go`](internal/engine/background_panic.go):
-`backgroundPanicked`, `recoverRebuildPanic`.
+`backgroundPanicked`, `recoverRebuildPanic`, `bootFromSnapshotFile`, `recoverSnapshotFileBootPanic`.
 
 ---
 
@@ -2935,6 +2936,13 @@ the engine entering FALLBACK or a watermark failure settling during the load, or
 Rejecting is always safe, just slower. Because `bloodtrail install` ends the lineage right before it
 starts BloodTrail, the first boot after every install rebuilds from PostgreSQL.
 
+A panic anywhere in the attempt (reading the file, replaying the buffer, warming or publishing the
+view) does not end the process (`bootFromSnapshotFile`): it is logged as
+`bloodtrail: snapshot file boot panicked` at Error with the stack, the engine enters FALLBACK, the
+file is deleted (`snapshot file invalidated`), and the boot falls through to a normal load, whose
+adoption ends the FALLBACK. Without the delete, a panic that depends on the file would recur at
+every start.
+
 In `bench/applybench`'s boot test at about five million nodes, which reopens the driver while a
 writer keeps writing, all three restarts used the file, replaying 844, 1,765 and 943 buffered
 writes, with a median startup of 10.2 s (the slowest, with 1,765 replays, took 19.2 s). Before the
@@ -3582,7 +3590,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `segment stack merged` | Debug | More than 32 segments were merged into one |
 | `fallback entered` / `fallback exited` | Warn / Info | A write could not be followed, or engine work panicked (with `reason`) / a fresh replica was adopted |
 | `write-through apply panicked` | Error | `Apply` panicked after its write committed (with `panic` and `stack`); the engine enters FALLBACK with reason `apply panicked: …` and the write's caller sees success |
-| `snapshot rebuild panicked` / `compaction panicked` | Error | A background load or compaction panicked (with `panic` and `stack`); the engine enters FALLBACK with reason `snapshot rebuild panicked: …` / `compaction panicked: …` and keeps retrying the load |
+| `snapshot rebuild panicked` / `snapshot file boot panicked` / `compaction panicked` | Error | A background load, the boot's attempt to start from the snapshot file, or a compaction panicked (with `panic` and `stack`); the engine enters FALLBACK with reason `snapshot rebuild panicked: …` / `snapshot file boot panicked: …` / `compaction panicked: …` and keeps retrying the load. The file whose boot panicked is deleted |
 | `snapshot rebuilt` | Info | A full load from PostgreSQL was adopted; `trigger` is `startup`, `fallback` or `manual` |
 | `snapshot rebuild refused: exceeds memory limit` | Warn | Rate-limited to once per 10 minutes |
 | `boot load waiting for the default graph` | Debug | Expected on every startup |
@@ -3596,7 +3604,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
 | `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |
-| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason |
+| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
 | `snapshot file invalidation failed` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
 | `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above) |
@@ -3613,7 +3621,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | [`internal/engine/engine.go`](internal/engine/engine.go) | `Engine`, states, the serving gate, decline reasons, full-load adoption, the path and Cypher entry points |
 | [`internal/engine/load.go`](internal/engine/load.go) | `LoadSnapshot`: the full load from PostgreSQL |
 | [`internal/engine/apply.go`](internal/engine/apply.go) | `Apply`, the candidates a kind-scoped delete re-reads, segment building, fallback entry and recovery |
-| [`internal/engine/background_panic.go`](internal/engine/background_panic.go) | Recovering a panic in a background rebuild or compaction into FALLBACK |
+| [`internal/engine/background_panic.go`](internal/engine/background_panic.go) | Recovering a panic in a background rebuild, the snapshot-file boot or compaction into FALLBACK |
 | [`internal/engine/changes.go`](internal/engine/changes.go), [`changes_scope.go`](internal/engine/changes_scope.go) | `ChangeSet` and `WriteScope`: what a write touched |
 | [`internal/engine/readback.go`](internal/engine/readback.go) | Reading touched keys, and the candidates of kind-scoped deletes, back after commit |
 | [`internal/engine/writepool.go`](internal/engine/writepool.go) | The write path's own two-connection pool |

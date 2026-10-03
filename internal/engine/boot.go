@@ -270,7 +270,7 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 
 		if !fileTried {
 			fileTried = true
-			if e.snap.Load() == nil && e.tryLoadSnapshotFile(e.bgCtx) {
+			if e.snap.Load() == nil && e.bootFromSnapshotFile(e.bgCtx) {
 				e.finishFallbackRebuild()
 				return
 			}
@@ -533,7 +533,7 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 		}
 	}
 
-	snap, stamp, err := snapshot.ReadSnapshotFile(path)
+	snap, stamp, err := readSnapshotFile(path)
 	if err != nil {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
 			slog.String("path", path),
@@ -568,6 +568,11 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 	)
 	return true
 }
+
+// readSnapshotFile is tryLoadSnapshotFile's read of the whole file
+// (snapshot.ReadSnapshotFile), a variable only so that a test can make the
+// file-boot attempt panic.
+var readSnapshotFile = snapshot.ReadSnapshotFile
 
 // bootGapSettleTimeout and bootGapSettleRetryInterval pace the settle-wait
 // in adoptSnapshotFileView: how long an adoption may wait, in how fine a
