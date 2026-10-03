@@ -3414,18 +3414,22 @@ directory under `TMPDIR` ([`internal/installer`](internal/installer)):
    found and the installer has been addressing: the base file and, when there is one, the override
    Compose loads beside it (the first of `compose.override.yml`, `compose.override.yaml`,
    `docker-compose.override.yml` and `docker-compose.override.yaml`, whatever the base file is
-   called), then the installer's own file, by relative names. (A relative entry ties the project to
-   the directory Compose is run from, where `.env` is read; an operator who ran Compose with
-   `--project-directory` from elsewhere against a project with no entry must run it from the project
-   directory afterwards.) Every other line of `.env` is kept as it was, so adding the entry and
-   removing it again gives the file back as it was, except that a missing final line break is added,
-   and a `.env` the install had to create stays behind, empty. `.env` is written only when it
-   changes, and replaced atomically: a new file beside it, given the old file's mode and owner,
-   flushed and renamed over it, and the directory synced. It keeps a symbolic link, but not extended
-   attributes or ACLs; a hard link to it is lost, because the new file takes the name and the other
-   name keeps the old contents; and a `.env` that is itself a mount point cannot be replaced. Then
-   set the `database_switch` row, **end the watermark lineage** ([§13.5](#135-the-lineage)), and run
-   `docker compose up -d`. The operator's own Compose file is never edited.
+   called), then the installer's own file, by relative names. (Compose resolves a relative name in
+   `COMPOSE_FILE` against the directory it is run from, even under `--project-directory`, so the new
+   entry ties the project to that directory. An operator who ran Compose with `--project-directory`
+   from elsewhere against a project with no entry must run it from the project directory afterwards:
+   from anywhere else Compose looks for the names there, stops with an error if they are missing,
+   and loads files of the same names if it finds some. Writing the names as absolute paths by hand
+   lifts the restriction, and rollback finds its override under either spelling.) Every other line
+   of `.env` is kept as it was, so adding the entry and removing it again gives the file back as it
+   was, except that a missing final line break is added, and a `.env` the install had to create
+   stays behind, empty. `.env` is written only when it changes, and replaced atomically: a new file
+   beside it, given the old file's mode and owner, flushed and renamed over it, and the directory
+   synced. It keeps a symbolic link, but not extended attributes or ACLs; a hard link to it is lost,
+   because the new file takes the name and the other name keeps the old contents; and a `.env` that
+   is itself a mount point cannot be replaced. Then set the `database_switch` row, **end the
+   watermark lineage** ([§13.5](#135-the-lineage)), and run `docker compose up -d`. The operator's
+   own Compose file is never edited.
 5. **Verify.** Check that the driver setting BloodHound will read (the `database_switch` row, else
    the service's `bhe_graph_driver`) names `bloodtrail`, wait for the container's *current* run to
    log `BloodTrail driver active` (an earlier run's line does not count), and wait for

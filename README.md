@@ -195,14 +195,19 @@ A stalled connection then ends with a message saying what to try, not a hang.
   compose ignore `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail`
   driver setting and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or
   drop the explicit `-f` and let `.env` decide.
-- Writing that entry replaces docker compose's own file discovery, so the installer
-  writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the override file compose loads on its own (the first of
+- Writing that entry replaces docker compose's own file discovery, so the installer writes
+  out everything discovery would have found: the compose file it was given and, when one
+  sits beside it, the override file compose loads on its own (the first of
   `compose.override.yml`, `compose.override.yaml`, `docker-compose.override.yml` and
-  `docker-compose.override.yaml` that exists, whatever the compose file is called).
-  The entry it writes names its files relatively, so a project you used to run with
-  `docker compose --project-directory <dir>` from elsewhere then has to be run from its
-  own directory. Rollback removes the whole entry again when the install created it --
+  `docker-compose.override.yaml` that exists, whatever the compose file is called). The
+  entry it writes names its files relatively, and docker compose resolves a relative name
+  against the directory it is run from, even under `--project-directory`. A project you
+  used to run with `docker compose --project-directory <dir>` from another directory
+  therefore has to be run from its own directory afterwards: from anywhere else docker
+  compose looks for those names there, so it stops with an error if they are missing and
+  loads files of the same names if it finds some. To keep running it from anywhere, write
+  the entry's names as absolute paths yourself; rollback recognises its override under
+  either spelling. Rollback removes the whole entry again when the install created it --
   unless the entry has been changed since (a file added to it, say), in which case it
   takes out only its own override. With no entry, and a compose file under one of
   discovery's names in the directory, the compose file given has to be the one discovery
