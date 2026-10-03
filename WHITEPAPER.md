@@ -658,7 +658,9 @@ func init() { dawgs.Register(DriverName, Open) }
    on the first write and closed at shutdown after the snapshot file is saved, so that a write's
    counter increment and its read-back never need a second connection from BloodHound's pool
    while the write holds one
-   ([§12.3](#123-reading-back), [§13.1](#131-the-counter));
+   ([§12.3](#123-reading-back), [§13.1](#131-the-counter)). A pool that cannot be created at all
+   is logged once at Warn and those statements fall back to BloodHound's pool, which is correct
+   but restores that wait, so the log line is the only warning an operator gets;
 5. calls `engine.Start` with a background context, because the boot goroutine must outlive `Open`.
    `Start` synchronously sweeps stale snapshot temp files, creates the watermark table if it is
    missing and gives it its `lineage` column if that is missing ([Section 13](#13-the-watermark)).
@@ -3638,6 +3640,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
 | `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), or when a write was applied during the probe |
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
+| `the write path's own connection pool could not be created` | Warn | Logged once; watermark bumps and read-backs run on BloodHound's pool instead, where a write holding a connection can wait on another's ([§5.2](#52-registration-and-open)) |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
 | `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |

@@ -197,7 +197,7 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	// running while its caller still holds one of e.pool's connections (a
 	// mid-batch Commit), and a second connection from that pool is what
 	// saturated writers waited on each other for (writePathPool).
-	pool := e.writePool.get(e.pool)
+	pool := e.writePool.get(e.pool, e.cfg.Log)
 	catalog := pgKindCatalog{pool: pool}
 
 	nodeIDs := cs.NodeIDs()
