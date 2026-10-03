@@ -4,10 +4,8 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -111,9 +109,15 @@ func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error
 	return e.saveSnapshotCommit(ctx, path, epoch, stamp, converged, requireEmptyDelta)
 }
 
+// reasonUnresolvedWatermark is the "reason" a save refused over a counter
+// value this process never resolved logs (saveSnapshotProbe).
+const reasonUnresolvedWatermark = "the watermark counter holds values this process never resolved: " +
+	"another BloodTrail server may be writing this database, or a bump's outcome was lost"
+
 // saveSnapshotProbe is SaveSnapshot's read-only preparation, run BEFORE
 // applyMu is ever taken: it samples e.applyEpoch first, then runs the pg
-// watermark round trip (watermarkConverged) -- in that order, and
+// watermark round trip (readWatermarkConvergence, the reading
+// watermarkConverged decides on) -- in that order, and
 // deliberately, mirroring rebuildOnce's own "epoch, then the pg round trip"
 // ordering (engine.go): reading the epoch after the round trip would let an
 // Apply that ran during the round trip slip in unnoticed by the later
@@ -130,10 +134,29 @@ func (e *Engine) saveSnapshot(ctx context.Context, requireEmptyDelta bool) error
 // it, and the next boot would refuse the file for rows this process wrote.
 // A failed read reports not converged: a file without its positions would
 // only ever be refused.
+//
+// A counter holding a value no write of this process resolved or still
+// carries is refused like any other miss, but said out loud (Warn): it is
+// what another BloodTrail server writing the same database looks like from
+// here, a deployment the snapshot file cannot be trusted in (watermarkReading's
+// unaccounted). Only a rebuild that loads such a writer's writes lets this
+// process save again.
 func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch uint64, stamp snapshot.Stamp, converged bool) {
 	epoch = e.applyEpoch.Load()
-	stamp.Watermark, converged = e.watermarkConverged(ctx)
-	if !converged {
+	reading, err := e.readWatermarkConvergence(ctx)
+	if err != nil {
+		return epoch, stamp, false
+	}
+	stamp.Watermark = reading.pgCounter
+	if !reading.converged() {
+		if reading.unaccounted() {
+			e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
+				slog.String("reason", reasonUnresolvedWatermark),
+				slog.Uint64("pg_watermark", reading.pgCounter),
+				slog.Uint64("resolved_through", reading.through),
+				slog.Bool("resolved_exactly", reading.exact),
+			)
+		}
 		return epoch, stamp, false
 	}
 	nodeSeq, edgeSeq, err := e.readSequencePositions(ctx)
@@ -380,25 +403,39 @@ func (e *Engine) saveSnapshotPrepare(ctx context.Context, epoch uint64, converge
 	return &pendingSnapshotSave{snap: snap, dirtyGen: dirtyGen, foldDuration: foldDuration}, nil
 }
 
+// writeSnapshotFile is the file write saveSnapshotWrite runs:
+// snapshot.WriteSnapshotFile, held in a variable only so a test can make a
+// write report an error after its file is already in place.
+var writeSnapshotFile = snapshot.WriteSnapshotFile
+
 // saveSnapshotWrite is saveSnapshotCommit's unlocked half: it writes what
 // saveSnapshotPrepare decided on, then takes the file back out of play if a
 // watermark bump failed while it was being written (saveSnapshotCommit's
 // doc says why that cannot be left to NoteWatermarkBumpFailure's own
 // removal alone).
+//
+// That check runs whether or not the write reported an error: a write that
+// failed only in syncing the directory after its rename has left a complete
+// file in place all the same (snapshot.WriteSnapshotFile's doc), and a file
+// written across a failed bump has to go whichever way its write ended.
 func (e *Engine) saveSnapshotWrite(ctx context.Context, path string, pending *pendingSnapshotSave, stamp snapshot.Stamp, start time.Time) error {
 	snap := pending.snap
 
 	writeStart := time.Now()
-	if err := snapshot.WriteSnapshotFile(path, snap, stamp); err != nil {
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "write"), slog.Any("error", err))
-		return fmt.Errorf("engine: SaveSnapshot: %w", err)
+	writeErr := writeSnapshotFile(path, snap, stamp)
+	if writeErr != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "write"), slog.Any("error", writeErr))
+		writeErr = fmt.Errorf("engine: SaveSnapshot: %w", writeErr)
 	}
 
 	if e.dirtyGen.Load() != pending.dirtyGen {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
 			slog.String("reason", "a watermark bump failed while the file was being written"))
 		e.removeSnapshotFile(ctx, path)
-		return nil
+		return writeErr
+	}
+	if writeErr != nil {
+		return writeErr
 	}
 
 	e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file written",
@@ -538,17 +575,26 @@ func (e *Engine) invalidateSnapshotFile(ctx context.Context) {
 // removeSnapshotFile is invalidateSnapshotFile's second half, split out so it
 // can be exercised against a path of the caller's choosing rather than only
 // the one a resolved default graph produces.
+//
+// The removal is made durable (snapshot.RemoveSnapshotFile syncs the
+// directory after the unlink, and even when there was nothing to unlink):
+// an unlink lost to a power loss brings back exactly the file this call
+// exists to take out of play -- one stamped with a counter an uncounted
+// write never moved, which the next boot would find current. A sync that
+// fails is logged like a removal that fails: the file is gone for now, but
+// may not stay gone.
 func (e *Engine) removeSnapshotFile(ctx context.Context, path string) {
-	switch err := os.Remove(path); {
-	case err == nil:
+	removed, err := snapshot.RemoveSnapshotFile(path)
+	switch {
+	case err != nil:
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file invalidation failed",
+			slog.String("path", path), slog.Bool("removed", removed), slog.Any("error", err))
+	case removed:
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file invalidated",
 			slog.String("path", path),
 			slog.String("reason", "a write reached PostgreSQL without advancing the watermark"))
-	case errors.Is(err, os.ErrNotExist):
+	default:
 		// Nothing saved yet, or already gone. Either way there is no file
 		// a later boot could adopt.
-	default:
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file invalidation failed",
-			slog.String("path", path), slog.Any("error", err))
 	}
 }

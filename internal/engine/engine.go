@@ -208,21 +208,41 @@ type Engine struct {
 	// this rather than inferring it from timing.
 	compactionCount atomic.Uint64
 
-	// appliedWatermark is the largest pg watermark counter value any bumped
-	// WriteScope's Apply/AdvanceWatermark call has folded in so far (see
-	// watermark.go) -- a monotonic max, not a plain overwrite, since
-	// concurrent writers' bumped scopes can finish applying out of order
-	// (AdvanceWatermark's own doc).
-	appliedWatermark atomic.Uint64
+	// appliedWatermark is the ledger of pg watermark counter values this
+	// engine can account for (watermarkLedger, watermark.go): every value up
+	// to the first one nobody accounted for yet, plus the values resolved
+	// out of order above it. A value is accounted for once a bumped
+	// WriteScope's Apply/AdvanceWatermark resolved it, or once an adopted
+	// snapshot's rebase covered it. Deliberately not the highest value
+	// resolved: that absorbed values this engine never resolved (another
+	// server's bumps, a bump still on the wire) into convergence.
+	appliedWatermark watermarkLedger
 
-	// inflightBumps counts every bumped WriteScope whose write has not yet
-	// been resolved by Apply or AdvanceWatermark: incremented the instant
-	// BumpWatermark's own UPDATE commits, decremented exactly once per
-	// bumped scope by AdvanceWatermark. Zero is the value watermarkConverged
-	// requires: nonzero means some write's pg watermark counter has already
-	// advanced while that write's own effect (committed or rolled back) is
-	// not yet known to be reconciled.
+	// inflightBumps counts every bump whose write has not yet been resolved
+	// by Apply or AdvanceWatermark: incremented before BumpWatermark's own
+	// UPDATE is even sent (and decremented again when it fails), decremented
+	// exactly once per bumped scope by AdvanceWatermark. Zero is the value
+	// watermarkConverged requires: nonzero means some write's pg watermark
+	// counter may already have advanced while that write's own effect
+	// (committed or rolled back) is not yet known to be reconciled.
 	inflightBumps atomic.Int64
+
+	// writePool is the small pool the write path's own statements -- the
+	// eager watermark bump and Apply's read-back -- run on, so they never
+	// draw a second connection from e.pool while their caller holds one
+	// (writePathPool, writepool.go). Closed by Stop.
+	writePool writePathPool
+
+	// watermarkRebaseMu makes a rebuild's adoption and the ledger rebase
+	// that goes with it one step to a convergence read
+	// (readWatermarkConvergence): held for writing across adoptRebuiltView
+	// and the rebase (adoptRebuiltViewAndRebase), for reading across the
+	// in-flight and ledger loads.
+	// Without it a reading between the two could see the adopted view with
+	// the ledger not yet caught up to it -- only a needless "not converged",
+	// but one a caller cannot tell apart from a real one. Taken before
+	// applyMu, never while holding it.
+	watermarkRebaseMu sync.RWMutex
 
 	// dirtyGen, settledDirtyGen and resolvedDirtyGen are the watermark
 	// protocol's trust generations (watermark.go). Trust is COMPUTED from
@@ -488,14 +508,15 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool,
 	// Failing to read it costs nothing but that file, which is exactly why
 	// it is said out loud: SaveSnapshot skips a snapshot with no lineage at
 	// Debug, and nothing else would tell an operator why the file stopped
-	// being written.
-	snap, lineageErr, err := loadSnapshot(ctx, e.pgDriver, e.pool, e.cfg.SnapshotDir != "")
+	// being written. The counter is always read: an adoption rebases the
+	// watermark ledger to it (below).
+	snap, loaded, err := loadSnapshot(ctx, e.pgDriver, e.pool, true, e.cfg.SnapshotDir != "")
 	if err != nil {
 		return false, fmt.Errorf("engine: RebuildNow: %w", err)
 	}
-	if lineageErr != nil {
+	if loaded.lineageErr != nil {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not read the watermark lineage; no snapshot file will be written from this rebuild",
-			slog.Any("error", lineageErr),
+			slog.Any("error", loaded.lineageErr),
 			slog.String("trigger", trigger),
 		)
 	}
@@ -516,7 +537,9 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool,
 	}
 	e.overBudget.Store(false)
 
-	if !e.adoptRebuiltView(ctx, snapshot.NewView(snap), epoch, settledGen) {
+	// An adopted snapshot also rebases the watermark ledger to the counter
+	// its load read (adoptRebuiltViewAndRebase, watermark.go).
+	if !e.adoptRebuiltViewAndRebase(ctx, snapshot.NewView(snap), epoch, settledGen, loaded) {
 		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot rebuild not adopted: a write was applied while it loaded",
 			slog.String("trigger", trigger),
 			slog.Duration("duration", time.Since(start)),

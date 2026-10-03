@@ -2,7 +2,20 @@
 
 package engine
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
+)
 
 // TestSaveSnapshotPreconditionsForRequiresEveryCondition pins
 // saveSnapshotPreconditionsFor's own predicate, mirroring
@@ -43,5 +56,50 @@ func TestSaveSnapshotPreconditionsForRequiresEveryCondition(t *testing.T) {
 					tc.state, tc.dirty, tc.resolved, tc.converged, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSaveSnapshotWriteTakesBackAFileWhoseWriteReportedAnError pins that a
+// save runs its post-write check even when writing reported an error: an
+// error from syncing the directory after the rename leaves a complete file
+// in place (snapshot.WriteSnapshotFile's doc). If a watermark bump failed
+// while that file was being written -- its own removal having run before
+// the file landed -- the file vouches for a counter an uncounted write never
+// moved, and the save has to take it back exactly as it does after a write
+// that reported nothing.
+func TestSaveSnapshotWriteTakesBackAFileWhoseWriteReportedAnError(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "graph-1.btsnap")
+
+	var logged bytes.Buffer
+	e := New(nil, nil, Config{Enabled: true, SnapshotDir: dir, Log: slog.New(slog.NewTextHandler(&logged, nil))})
+	snap, err := snapshot.NewBuilder(1).Build()
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	pending := &pendingSnapshotSave{snap: snap, dirtyGen: e.dirtyGen.Load()}
+
+	syncFailure := errors.New("simulated directory sync failure")
+	prev := writeSnapshotFile
+	writeSnapshotFile = func(path string, s *snapshot.Snapshot, stamp snapshot.Stamp) error {
+		// The bump fails before the file lands, so its own removal finds
+		// nothing to take away.
+		e.NoteWatermarkBumpFailure(ctx, NewWriteScope(), errors.New("simulated bump failure"))
+		if err := prev(path, s, stamp); err != nil {
+			return err
+		}
+		return syncFailure
+	}
+	t.Cleanup(func() { writeSnapshotFile = prev })
+
+	if err := e.saveSnapshotWrite(ctx, path, pending, snapshot.Stamp{Watermark: 5}, time.Now()); !errors.Is(err, syncFailure) {
+		t.Fatalf("saveSnapshotWrite = %v, want the write's own error reported", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a file written across a failed bump was left in place because its write reported an error (stat: %v):\n%s", err, logged.String())
+	}
+	if !strings.Contains(logged.String(), "a watermark bump failed while the file was being written") {
+		t.Fatalf("the save did not say why it took its file back:\n%s", logged.String())
 	}
 }
