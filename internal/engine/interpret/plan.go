@@ -3473,13 +3473,19 @@ type sqlClass uint8
 const (
 	// classUnknown is an operand this package does not type statically: a
 	// plain property (jsonb, typed by its partner), an untyped coalesce()
-	// (the same), a node or edge variable, and anything else.
+	// (the same), and anything else.
 	classUnknown sqlClass = iota
 	classNull
 	classText
 	classNumber
 	classBool
 	classArray
+	// classNode and classEdge are a node or edge variable: a composite value
+	// in dawgs' SQL (`n0`, `e0`), which PostgreSQL compares with another of
+	// its own kind or a null and nothing else -- `n0 <> 5` has no operator
+	// (42883), and `n0 <> 'a'` reads 'a' as a composite (0A000).
+	classNode
+	classEdge
 )
 
 // sqlClassOf returns the SQL type family dawgs gives expr on its own:
@@ -3490,7 +3496,8 @@ const (
 // signed operand; boolean for a boolean literal or coalesce() and any
 // predicate; an array for a list literal, labels() and split(). A WITH
 // alias takes its constant's or aggregate's type (numericScalars,
-// textScalars, a collect alias).
+// textScalars, a collect alias), and a node or edge variable is its own
+// class.
 func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 	switch e := expr.(type) {
 	case *cypher.Parenthetical:
@@ -3574,6 +3581,10 @@ func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 			return classText
 		case pb.known[e.Symbol] == symCollectAlias:
 			return classArray
+		case isNodeSymbol(pb.known, e.Symbol):
+			return classNode
+		case isEntitySymbol(pb.known, e.Symbol): // not a node: an edge
+			return classEdge
 		}
 	case *cypher.Comparison, *cypher.Negation, *cypher.Conjunction, *cypher.Disjunction,
 		*cypher.KindMatcher, *cypher.PatternPredicate:
@@ -3587,9 +3598,16 @@ func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 // or an operand this package leaves untyped). Any other pair is an error
 // there -- `text = integer`, `bigint ~ unknown` -- or casts one side's
 // literal into the other's type, which is not the comparison the evaluator
-// makes.
+// makes. A node or edge variable is the exception to the untyped rule: it is
+// comparable with its own kind or a null only.
 func classesComparable(a, b sqlClass) bool {
-	if a == classUnknown || b == classUnknown || a == classNull || b == classNull {
+	if a == classNull || b == classNull {
+		return true
+	}
+	if a == classNode || a == classEdge || b == classNode || b == classEdge {
+		return a == b
+	}
+	if a == classUnknown || b == classUnknown {
 		return true
 	}
 	return a == b
@@ -3800,6 +3818,9 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 		case kind == coalesceText && class == classNumber:
 			return false
 		case kind != coalesceText && class == classText:
+			return false
+		case class == classNode || class == classEdge:
+			// `n IN [1, 2]` is `node = bigint`.
 			return false
 		}
 	}
