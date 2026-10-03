@@ -1276,6 +1276,12 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		MaxDepth:    maxDepth,
 		SideBudget:  sideBudget,
 		PairBudget:  pairBudget,
+		// One AllShortestPaths call is a single, potentially long step
+		// between two of the work meter's own context checks (exec.go's
+		// workMeter), so the request's context goes in with it -- otherwise
+		// a request cancelled during the traversal is still traversed in
+		// full. See traverse.Query.Ctx for where the checks sit.
+		Ctx: env.Ctx,
 	}
 
 	rowCap, memLimit, unbounded := shortestPathBudget(meter, maxDepth)

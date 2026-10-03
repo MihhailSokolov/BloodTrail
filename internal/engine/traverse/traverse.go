@@ -8,6 +8,7 @@
 package traverse
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sort"
@@ -162,6 +163,54 @@ func (b *memBudget) reset() {
 // ErrMemoryLimit is returned by enumerate when accounting a completed path
 // would exceed the memBudget's limit.
 var ErrMemoryLimit = errors.New("bloodtrail: path engine memory limit exceeded")
+
+// cancelCheckInterval is how many cheap merge-phase iterations pass between
+// two consecutive request-context checks. It matches interpret's own work
+// meter cadence (exec.go's workMeter.spend): frequent enough that a
+// cancelled request stops within a bounded amount of work, rare enough that
+// the check never shows up on a per-node walk.
+const cancelCheckInterval = 1024
+
+// cancelCheck carries a Query's own request context (Query.Ctx) into a
+// strategy's enumeration loops, so a cancelled caller gets its cancellation
+// instead of an answer -- the way the PostgreSQL read this package stands in
+// for answers that same context. A nil cancelCheck, and one over a nil
+// context, never fails: a traversal with no context runs exactly as it did
+// before this existed.
+//
+// It is deliberately NOT safe for concurrent use (unchecked is a plain
+// counter). Every cancelCheck lives inside one sequential loop; strategy B's
+// parallel BFS fan-out (bfsSmallSide) gives each worker its own.
+type cancelCheck struct {
+	ctx       context.Context
+	unchecked int
+}
+
+// err is the request context's error, checked unconditionally. Used where a
+// single iteration is itself expensive -- one pair's bidirectional search,
+// one full BFS run -- so the check's own cost is immaterial beside it.
+func (c *cancelCheck) err() error {
+	if c == nil || c.ctx == nil {
+		return nil
+	}
+	return c.ctx.Err()
+}
+
+// step charges one cheap iteration and returns the request context's error
+// once every cancelCheckInterval of them. Used in the merge phases, whose
+// loops walk one whole endpoint set -- up to every node in the snapshot --
+// doing a single distance lookup per step.
+func (c *cancelCheck) step() error {
+	if c == nil || c.ctx == nil {
+		return nil
+	}
+	c.unchecked++
+	if c.unchecked < cancelCheckInterval {
+		return nil
+	}
+	c.unchecked = 0
+	return c.ctx.Err()
+}
 
 // Budgets bounding AllShortestPaths's strategy dispatch: PairBudget caps how
 // many (root, terminal) pairs strategy A will run pairPaths over; SideBudget
@@ -418,6 +467,25 @@ type Query struct {
 	Limit            int  // 0 => unbounded
 	MemoryLimit      uint64
 
+	// Ctx, when set, is the context of the request this traversal serves:
+	// AllShortestPaths refuses to start once it is done, and a traversal
+	// already running stops at its next check, returning the context's own
+	// error (context.Canceled, context.DeadlineExceeded). nil means no
+	// context, which is exactly how every caller behaved before this field
+	// existed. Without it a cancelled request was traversed in full and
+	// answered, where the PostgreSQL shortest-path query this stands in for
+	// answers the same context with its cancellation.
+	//
+	// The checks sit once per (root, terminal) pair in strategy A, once per
+	// small-side BFS element in strategy B, and once every
+	// cancelCheckInterval iterations of a merge phase's endpoint walk --
+	// never on the per-node/per-edge path, which is the steady-state overlay
+	// read path on 5M-node graphs and must not pay for this. That bounds
+	// what a cancelled request can still spend at one full BFS (or one
+	// pair's bidirectional search plus its enumeration), the same unit
+	// PairBudget/SideBudget already dispatch on.
+	Ctx context.Context
+
 	// PairBudget/SideBudget, when positive, override this package's own
 	// PairBudget/SideBudget constants for this call's strategy dispatch
 	// only (see AllShortestPaths). Zero (the default) leaves the package
@@ -460,7 +528,15 @@ var ErrTooLarge = errors.New("bloodtrail: query too large for the path engine")
 // a pair are equal by construction, and in ModeAll across pairs too (see
 // ModeAll). Dense ascending == database-id ascending because the snapshot
 // loads nodes ordered by id.
+//
+// q.Ctx, when set, fails the call with the request context's own error --
+// before any work if it is already done, and at the next check of whichever
+// strategy ran otherwise. See Query.Ctx.
 func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
+	if err := (&cancelCheck{ctx: q.Ctx}).err(); err != nil {
+		return nil, err
+	}
+
 	n := s.NodeCount()
 
 	maxDepth := q.MaxDepth
@@ -562,6 +638,7 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	defer putScratch(scT)
 	defer putScratch(scTmp)
 	oneMore := q.Mode == ModeOne
+	cancel := &cancelCheck{ctx: q.Ctx}
 
 	var out []Path
 	var callErr error
@@ -570,6 +647,14 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
 		stopOuter := false
 		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
+			// One pair is this strategy's unit of work -- a whole
+			// bidirectional search plus its enumeration -- so the request's
+			// context is checked once per pair, unconditionally (Query.Ctx).
+			if err := cancel.err(); err != nil {
+				callErr = err
+				stopOuter = true
+				return false
+			}
 			if q.ExcludeSelf && r == t {
 				return true
 			}
@@ -635,7 +720,17 @@ type smallSideDist struct {
 // scratch buffers for the elements it is assigned, so no synchronization is
 // needed beyond the fan-out/fan-in itself: results[i] is written by exactly
 // one goroutine before g.Wait returns.
-func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int) []smallSideDist {
+//
+// ctx is the request's context (Query.Ctx), nil for none: each worker checks
+// it once per element, before starting that element's BFS, so a cancelled
+// request stops within one BFS run instead of finishing every element it was
+// assigned. One full BFS is this strategy's unit of work, which is why the
+// check sits here and not inside bfsFrom's own per-node walk (Query.Ctx).
+// The returned results slice is always complete in length and must be
+// recycled by the caller even when the error is non-nil -- an aborted worker
+// simply leaves zero-value (nil dists) entries behind, exactly as the
+// workers<1 path already did.
+func bfsSmallSide(ctx context.Context, s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int) ([]smallSideDist, error) {
 	n := s.NodeCount()
 	results := make([]smallSideDist, len(elems))
 
@@ -644,7 +739,7 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 		workers = len(elems)
 	}
 	if workers < 1 {
-		return results
+		return results, nil
 	}
 
 	chunk := (len(elems) + workers - 1) / workers
@@ -660,7 +755,13 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 			continue
 		}
 		g.Go(func() error {
+			// Its own cancelCheck: the type is not safe for concurrent use,
+			// and ctx.Err() is.
+			cancel := &cancelCheck{ctx: ctx}
 			for i := lo; i < hi; i++ {
+				if err := cancel.err(); err != nil {
+					return err
+				}
 				sc := getScratch(n)
 				bfsFrom(s, elems[i], forward, kinds, maxDepth, sc)
 				results[i] = smallSideDist{elem: elems[i], dists: sc}
@@ -668,9 +769,10 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 			return nil
 		})
 	}
-	_ = g.Wait() // bfsFrom cannot fail; no worker ever returns a non-nil error.
 
-	return results
+	// bfsFrom itself cannot fail; the only error a worker returns is the
+	// request context's own.
+	return results, g.Wait()
 }
 
 // materialize collects e's matched dense ids, in ascending order, into a
@@ -698,11 +800,13 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 
 	// small side = roots -> forward BFS (dist-from-root) per root.
 	// small side = terminals -> reverse BFS (dist-to-terminal) per terminal.
-	results := bfsSmallSide(s, elems, smallIsRoots, kinds, maxDepth)
+	results, bfsErr := bfsSmallSide(q.Ctx, s, elems, smallIsRoots, kinds, maxDepth)
 	// The merge phases below are the scratches' last readers; recycle them
 	// once whichever merge ran has returned (scratchPool's own doc). A nil
-	// dists only exists on the workers<1 path, which leaves zero-value
-	// entries behind.
+	// dists exists on the workers<1 path and wherever a worker stopped on a
+	// cancelled request, both of which leave zero-value entries behind. The
+	// defer is registered before bfsErr is inspected so the scratches a
+	// stopped fan-out did allocate are still recycled.
 	defer func() {
 		for _, res := range results {
 			if res.dists != nil {
@@ -710,6 +814,9 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 			}
 		}
 	}()
+	if bfsErr != nil {
+		return nil, bfsErr
+	}
 
 	if smallIsRoots {
 		return mergeSmallRoots(s, q, kinds, budget, results)
@@ -727,6 +834,7 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 // shortestLevel, exactly as strategyPairs does.
 func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
+	cancel := &cancelCheck{ctx: q.Ctx}
 	var out []Path
 	var callErr error
 	var level shortestLevel
@@ -735,6 +843,15 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 		r, sc := res.elem, res.dists
 		stop := false
 		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
+			// This walk covers the whole terminal side -- up to every node
+			// in the snapshot -- at one distance lookup per step, so the
+			// request's context is checked on the batched cadence rather
+			// than per terminal (Query.Ctx).
+			if err := cancel.step(); err != nil {
+				callErr = err
+				stop = true
+				return false
+			}
 			if q.ExcludeSelf && r == t {
 				return true
 			}
@@ -797,11 +914,20 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 // strategyPairs does.
 func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
+	cancel := &cancelCheck{ctx: q.Ctx}
 	var out []Path
 	var callErr error
 	var level shortestLevel
 
 	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
+		// This walk covers the whole root side -- up to every node in the
+		// snapshot -- at one distance lookup per small-side element, so the
+		// request's context is checked on the batched cadence rather than
+		// per root (Query.Ctx).
+		if err := cancel.step(); err != nil {
+			callErr = err
+			return false
+		}
 		for _, res := range results {
 			t, sc := res.elem, res.dists
 			if q.ExcludeSelf && r == t {
