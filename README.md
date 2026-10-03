@@ -299,8 +299,8 @@ a large graph. Setting `BLOODTRAIL_SNAPSHOT_DIR` lets it reuse a saved copy inst
 - Point it at a directory on a **volume or bind mount that survives container
   recreation** (a config change followed by `docker compose up -d` recreates the
   container). The directory must already exist and be writable by the container;
-  nothing creates it, and a bad path only shows up later as `snapshot file write
-  failed`.
+  nothing creates it, and a bad path only shows up later as
+  `snapshot file write failed`.
 - The file is written on a graceful shutdown and after each background compaction, and
   reused at the next boot only if BloodTrail's write counter in PostgreSQL -- and the
   **lineage** it counts in, a random id kept beside it -- prove the file is complete.
