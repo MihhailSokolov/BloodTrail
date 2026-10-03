@@ -399,11 +399,14 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 //   - observer == nil: the delegate closure never ran; nothing was bumped.
 //   - the delegate panicked: the embedded driver's deferred Close rolls the
 //     transaction back, so nothing it wrote is durable -- resolveAbandonedWrite
-//     settles the eager bump. (A delegate-issued mid-transaction Commit
-//     already applied everything before it, and replaced the scope. The one
-//     case this misreads is a panic raised inside such a Commit's own inner
-//     commit, which may come after PostgreSQL made it durable: that scope was
-//     neither applied nor replaced, and is settled here as rolled back.)
+//     settles the eager bump. A delegate-issued mid-transaction Commit has
+//     already applied everything before it and replaced the scope, so what
+//     this branch settles is only what the delegate wrote after that commit.
+//     That holds for a panic from such a Commit's own inner commit too --
+//     which may come after PostgreSQL made it durable, and so must not be
+//     read as a rollback: observingTransaction.Commit settles that scope as
+//     the unknown outcome it is, and replaces it, before the panic ever
+//     reaches here (settleCommitPanic, write_observer.go).
 //   - the delegate returned and the embedded driver panicked afterwards:
 //     settled exactly as if it had returned an error instead --
 //     resolveWriteTransactionFailure, whose delegate-error branch is a

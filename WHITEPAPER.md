@@ -777,7 +777,7 @@ and replaces the root's field with a fresh scope, and every child sees the repla
 recorded after a mid-way commit is lost. A batch `Commit` that fails applies nothing and keeps the
 scope: DAWGS's batch keeps the buffers that failed to flush and writes them at its final commit, so
 their keys must still be recorded when the batch's last apply reads them back. (A transaction
-`Commit` that fails has an unknown outcome; it records a fallback and applies.)
+`Commit` that fails, or panics, has an unknown outcome; it records a fallback and applies.)
 
 After PostgreSQL commits, the driver calls `engine.Apply` with the scope; `Apply` brings the replica
 up to date before `WriteTransaction` returns to BloodHound ([Section 12](#12-write-through)). What
@@ -800,6 +800,8 @@ caught: it reaches BloodHound unchanged, with its own stack. The driver settles 
 way out (`settleWriteTransactionPanic` and the deferred handlers in [`driver.go`](driver.go)): a
 `WriteTransaction` whose code panicked was rolled back by DAWGS, so it settles as "nothing
 happened", and one that panicked after its code returned settles like a failed final COMMIT; a
+mid-transaction `Commit` whose own commit panics is the exception, and settles itself before the
+panic unwinds any further, because that panic can land after PostgreSQL made the commit durable; a
 batch records a fallback and applies, because the panic may have come between a write and its
 record; a read transaction applies the writes it noted. The overridden methods settle a panic too,
 and do not catch it either: `Run` and `WipeGraph` split it exactly as the table above splits their
@@ -855,7 +857,7 @@ against the plain PostgreSQL driver ([§16.2](#162-differential-tests-against-po
 [`relationship_query.go`](relationship_query.go): the recording builders.
 [`write_observer.go`](write_observer.go): `observingTransaction`, `observingBatch`,
 `observingNodeQuery`, `observingRelationshipQuery`, `hasUpdatingClause`,
-`recordUpdatingFinalCriteria`, `scopeSlot`, `ensureBumped`.
+`recordUpdatingFinalCriteria`, `scopeSlot`, `ensureBumped`, `settleCommitPanic`.
 [`writepool.go`](internal/engine/writepool.go): `writePathPool`.
 
 ---

@@ -390,8 +390,26 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 // the View's rows to re-read by id (the engine's viewCandidates). A failed
 // Commit still records a fallback first (the in-body comment below), making
 // that Apply a rebuild rather than a replay.
+//
+// A PANIC from the inner Commit is settled the same way (settleCommitPanic,
+// deferred below) and is never recovered, so it reaches the caller unchanged.
+// pgx's Commit panicking would be a bug rather than an ordinary failure, but
+// it is a bug that can land after PostgreSQL made the commit durable, and
+// nothing here could tell. Without the settle, that panic unwound through the
+// delegate, so Driver.WriteTransaction's own panic settle read it as "the
+// delegate panicked" -- a rollback -- and resolved this scope as abandoned:
+// the applied watermark would advance past a committed write the replica
+// never saw, and a snapshot file could be stamped as matching PostgreSQL.
 func (t *observingTransaction) Commit() error {
+	returned := false
+	defer func() {
+		if !returned {
+			t.settleCommitPanic()
+		}
+	}()
+
 	err := t.Transaction.Commit()
+	returned = true
 	if err != nil {
 		// A Commit that returned an error has an AMBIGUOUS outcome: the
 		// error can come from PostgreSQL's own COMMIT, whose effect may or
@@ -409,6 +427,25 @@ func (t *observingTransaction) Commit() error {
 	t.eng.Apply(applyContext(t.ctx), t.current())
 	*t.slotRef() = engine.NewWriteScope()
 	return err
+}
+
+// settleCommitPanic settles the scope of a delegate-issued mid-transaction
+// Commit that a panic from the inner Commit is unwinding through: the same
+// two steps Commit's own failed-commit branch takes, for the same reason --
+// the outcome is unknown, so the scope is applied carrying a fallback (making
+// that Apply a rebuild) and replaced by a fresh one. See Commit's own doc for
+// why a panic cannot be read as a rollback.
+//
+// Replacing the scope is what keeps the settle single: the panic goes on to
+// unwind through Driver.WriteTransaction's own deferred settle, which reads
+// observer.scope -- by then the fresh, unbumped, empty one, which
+// resolveAbandonedWrite has nothing to resolve in. The reverse pairing is
+// unreachable: nothing after the inner Commit here can panic, since
+// engine.Apply recovers its own panics (Engine.fallBackOnApplyPanic).
+func (t *observingTransaction) settleCommitPanic() {
+	t.current().Changes().RecordFallback("Commit: panicked, outcome unknown")
+	t.eng.Apply(applyContext(t.ctx), t.current())
+	*t.slotRef() = engine.NewWriteScope()
 }
 
 // applyContext returns ctx, or context.Background() when ctx is nil -- the

@@ -196,6 +196,42 @@ func TestDriverWriteTransactionPanicReachesTheCallerUnchanged(t *testing.T) {
 	}
 }
 
+// TestDriverWriteTransactionMidCommitPanicIsNotClassifiedAsARollback is the
+// end-to-end half of observingTransaction.Commit's own panic settle
+// (write_observer_test.go): a delegate that commits mid-transaction, where
+// the inner commit panics. The panic unwinds through the delegate, so
+// Driver.WriteTransaction's own settle reads it as "the delegate panicked",
+// which means a rollback -- and for that scope it is not one, because pgx's
+// Commit can panic after PostgreSQL made the write durable. Settling it as a
+// rollback would advance the applied watermark past a committed write the
+// replica never saw and let a snapshot file be stamped as matching
+// PostgreSQL.
+//
+// Exactly one Apply: the Commit applies the scope it is settling and
+// replaces it, so the outer settle finds a fresh, unbumped scope and has
+// nothing of its own to resolve.
+func TestDriverWriteTransactionMidCommitPanicIsNotClassifiedAsARollback(t *testing.T) {
+	eng := disabledEngine()
+	inner := &fakeTransaction{createNodeReturn: &graph.Node{ID: 1}}
+	inner.commitHook = func() { panic(driverPanicValue) }
+	d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: inner}}
+
+	recovered := panicValueOf(func() {
+		_ = d.WriteTransaction(context.Background(), func(tx graph.Transaction) error {
+			if _, err := tx.CreateNode(graph.NewProperties()); err != nil {
+				return err
+			}
+			return tx.Commit()
+		})
+	})
+	if recovered != driverPanicValue {
+		t.Fatalf("recovered %v, want the inner commit's own panic %q unchanged", recovered, driverPanicValue)
+	}
+	if got := eng.ApplyCount(); got != 1 {
+		t.Fatalf("ApplyCount = %d after a mid-transaction commit panicked, want 1: the write may be durable", got)
+	}
+}
+
 // TestDriverReadTransactionPanicStillAppliesItsWrites: a write through a
 // ReadTransaction is durable before the delegate panics, so it must still
 // be applied, and the panic must still reach the caller unchanged.
