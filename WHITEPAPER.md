@@ -2853,18 +2853,19 @@ itself survives a power loss (an error there is reported as `snapshot file write
 complete file already in place; a filesystem that cannot sync directories at all counts as synced).
 A leftover temporary file is removed at the next startup. Loading checks every count and length
 against the bytes the file still holds before allocating anything for it, so a flipped bit in a
-count is refused without a large allocation (before this, one flipped high bit could ask for about
-a terabyte, before the checksum was even read). It then verifies the checksum, and **validates the
-structure** (array lengths, offsets that only increase, ids in range, arena references in bounds, a
-node's property entries in ascending property order): a checksum proves the bytes are the ones
-written, not that they describe a valid graph. Any failure rejects the file. The validation does not
-cover everything a reader relies on: the order of the edge-id permutation, the agreement of the
-reverse adjacency with the forward one, and the JSON text of list and object values are taken as
-written (each check is a pass over a large array or the whole arena whose cost at boot has not been
-measured), so a file edited with its checksum recomputed could still mislead. The header can also be
-read on its own, without the rest of the file. The checksum does not vouch for it until the whole
-file has been read, so the boot uses the header only to refuse a file early ([§14.3](#143-boot)),
-never to trust one.
+count is refused without a large allocation (before this, one flipped high bit could ask for about a
+terabyte, before the checksum was even read). It then verifies the checksum, and **validates the
+structure** (array lengths, offsets that only increase, database ids in strictly ascending order,
+indexes and property ids in range, arena references in bounds, and each node's property entries in
+strictly ascending property-id order, which the property lookup binary-searches): a checksum proves
+the bytes are the ones written, not that they describe a valid graph. Any failure rejects the file.
+The validation does not cover everything a reader relies on: the order of the edge-id permutation,
+the agreement of the reverse adjacency with the forward one, and the JSON text of list and object
+values are taken as written (each check is a pass over a large array or the whole arena whose cost
+at boot has not been measured), so a file edited with its checksum recomputed could still mislead.
+The header can also be read on its own, without the rest of the file. The checksum does not vouch
+for it until the whole file has been read, so the boot uses the header only to refuse a file early
+([§14.3](#143-boot)), never to trust one.
 
 At about 4.9 million nodes and 49 million edges the file is about 3.9 GiB; saving takes 27–30 s,
 reading it 8–9 s, and a startup from the file 10–14 s, against 45–51 s for a full load.
