@@ -666,9 +666,10 @@ func TestRelationshipDeleteScope(t *testing.T) {
 			false,
 		},
 		{
-			// dawgs matches an edge's kind against an empty list as
-			// `kind_id = any('{}')`, which no edge satisfies: the delete
-			// removes nothing, exactly, so no fallback is needed.
+			// dawgs matches an edge's kind against an empty array,
+			// `e0.kind_id = any (array []::int2[])`, which no edge
+			// satisfies: the delete removes nothing, exactly, so no
+			// fallback is needed.
 			"one recognized criteria with empty kinds deletes nothing",
 			[]graph.Criteria{cypher.NewKindMatcher(relVariable(), nil, false)},
 			nil,

@@ -140,8 +140,9 @@ func TestFromCriteria_Rejects(t *testing.T) {
 			),
 		},
 		{
-			// dawgs renders kind_id = any('{}'), which matches no edge, where
-			// an empty EdgeKinds would mean "every kind": decline instead.
+			// dawgs renders e0.kind_id = any (array []::int2[]), which
+			// matches no edge, where an empty EdgeKinds would mean "every
+			// kind": decline instead.
 			name: "empty KindIn over the relationship matches nothing",
 			crit: query.And(
 				query.Equals(query.StartID(), graph.ID(42)),

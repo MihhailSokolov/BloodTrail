@@ -165,10 +165,11 @@ func valueToID(value any) (graph.ID, bool) {
 // -- a KindMatcher whose reference is the bare relationship variable
 // (edgeSymbol) -- returning its kinds. A KindMatcher over any other
 // reference (notably query.Node(), nodeSymbol) fails, as does a nil km and
-// one naming no kinds: dawgs renders that as kind_id = any('{}'), which
-// matches no edge, while an empty PathQuery.EdgeKinds means "every kind", so
-// the shape cannot be represented and is declined (as FromNodeCriteria and
-// FromRelCriteria decline an empty KindMatcher).
+// one naming no kinds: dawgs renders that as an empty kind array,
+// e0.kind_id = any (array []::int2[]), which matches no edge, while an
+// empty PathQuery.EdgeKinds means "every kind", so the shape cannot be
+// represented and is declined (as FromNodeCriteria and FromRelCriteria
+// decline an empty KindMatcher).
 func matchRelationshipKinds(km *cypher.KindMatcher) (graph.Kinds, bool) {
 	if km == nil || len(km.Kinds) == 0 {
 		return nil, false

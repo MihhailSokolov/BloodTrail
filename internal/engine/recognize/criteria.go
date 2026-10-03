@@ -20,12 +20,12 @@ import (
 // The three conjuncts may appear in any order (query.And makes no ordering
 // guarantee), and the KindIn conjunct may be omitted entirely -- in that
 // case EdgeKinds comes back empty, meaning "all kinds". A KindIn that names
-// no kinds is not that omission: dawgs renders it as kind_id = any('{}'),
-// which matches no edge, so it is rejected. Any other shape -- an extra or
-// missing conjunct, a duplicate role, a KindMatcher over anything but the
-// relationship variable, or criteria that isn't a *cypher.Conjunction at
-// all -- reports ok=false. FromCriteria never panics: every AST level is
-// nil-checked before use.
+// no kinds is not that omission: dawgs renders it as an empty kind array,
+// e0.kind_id = any (array []::int2[]), which matches no edge, so it is
+// rejected. Any other shape -- an extra or missing conjunct, a duplicate
+// role, a KindMatcher over anything but the relationship variable, or
+// criteria that isn't a *cypher.Conjunction at all -- reports ok=false.
+// FromCriteria never panics: every AST level is nil-checked before use.
 //
 // On success, Mode is always ModeAll, Limit is always 0, ExcludeSelf is
 // always false, and both endpoints carry their id as a single-element IDs

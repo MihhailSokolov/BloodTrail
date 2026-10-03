@@ -78,8 +78,8 @@ underneath: a DAWGS **driver** named `bloodtrail`. The driver:
 3. sends every write to PostgreSQL first, then brings the replica up to date **before** the write
    call returns, so the replica is never stale.
 
-The few known exceptions to the second and third promises are narrow, and [Section
-19](#19-limitations) lists them.
+The few known exceptions to the second and third promises are narrow, and
+[Section 19](#19-limitations) lists them.
 
 Three independent serving paths share the replica: a shortest-path engine, a recognizer for the
 structural queries BloodHound's own code issues, and an interpreter for a large subset of the Cypher
@@ -514,8 +514,9 @@ The implementation follows seven principles, visible throughout the code:
 
 1. **PostgreSQL is the system of record.** The replica is a cache with a proof of freshness, never
    an independent store. Every write reaches PostgreSQL through the unmodified PostgreSQL driver.
-2. **Decline over guess.** The engine answers a query only when its behaviour is pinned to what the
-   PostgreSQL driver would return. Anything uncertain is **declined**: passed, unchanged, to the
+2. **Decline over guess.** The engine answers a query only when its behaviour is pinned to what
+   the PostgreSQL driver would return, with the few exceptions listed in
+   [Section 19](#19-limitations). Anything uncertain is **declined**: passed, unchanged, to the
    PostgreSQL driver. A decline costs latency, never correctness. Recognizers and the Cypher planner
    are *default-deny*: they accept an explicit list of shapes and decline everything else.
 3. **Never a partial answer.** Budgets on rows, work and memory never cut a result short; exceeding
@@ -829,13 +830,12 @@ against the plain PostgreSQL driver ([§16.2](#162-differential-tests-against-po
 - **"Clear database"** calls `DeleteRelationshipsByKinds` for the chosen edge kinds, and
   `DeleteNodesByKinds` for the chosen source kinds (those kinds included) or for sourceless data (no
   kind included, every registered source kind excluded); both node deletes also exclude BloodHound's
-  `MigrationData` kind. Each is applied by reading back, from PostgreSQL, the rows of the replica
-  it may have removed ([§12.1](#121-record-the-keys-then-read-back-the-truth)). A failed upload can
-  leave behind a
-  source kind that PostgreSQL has registered but no row carries. The replica learns kinds from its
-  last full load and from the rows it reads back, so it may not know that name; read-back resolves
-  it through the driver's kind mapper, and the sourceless delete that excludes it replays without a
-  fallback.
+  `MigrationData` kind. Each is applied by reading back, from PostgreSQL, the rows of the replica it
+  may have removed ([§12.1](#121-record-the-keys-then-read-back-the-truth)). A failed upload can
+  leave behind a source kind that PostgreSQL has registered but no row carries. The replica learns
+  kinds from its last full load and from the rows it reads back, so it may not know that name;
+  read-back resolves it through the driver's kind mapper, and the sourceless delete that excludes it
+  replays without a fallback.
 - **What still goes to PostgreSQL**: a query naming a kind no row carries yet, such as that failed
   upload's source kind, until the replica learns the kind (declined as `unsupported`); and the same
   shapes that delegate for any other data.
@@ -1002,14 +1002,15 @@ type propEntry struct {  // 24 bytes in memory, 19 on disk
   not stored twice.
 
 Properties are parsed when a node is loaded. Numbers go through Go's `encoding/json`, which reads
-every number as `float64`. PostgreSQL's `jsonb` keeps more: the exact value (9007199254740993
-stays itself, where the nearest `float64` is 9007199254740992) and the spelling (`1.0` stays
-`1.0`, and its text `'1.0'` is what a cast reads). So a number whose stored spelling is not the
-canonical spelling of its `float64` (`1.0`, `2.50`, an integer beyond 2⁵³) gets an entry kind of
-its own, `propKindNumberNonCanonical`. Its value is still the nearest `float64`; the kind exists to
-mark the property, and the Cypher planner declines any query that reads a property holding such a
-number ([§11.2](#112-matching-dawgss-semantics)). BloodHound's own ingest writes canonical numbers,
-so such properties are rare.
+every number as `float64`. PostgreSQL's `jsonb` keeps more: the exact value (9007199254740993 stays
+itself, where the nearest `float64` is 9007199254740992) and the spelling (`1.0` stays `1.0`, and
+its text `'1.0'` is what a cast reads). So a number whose stored spelling differs from its canonical
+rendering, `strconv.FormatFloat(f, 'f', -1, 64)` of its `float64` (`numberSpellingCanonical`), gets
+an entry kind of its own, `propKindNumberNonCanonical`: `1.0`, `2.50`, or an integer its `float64`
+cannot spell back, such as 9007199254740993 (beyond 2⁵³). Its value is still the nearest `float64`;
+the kind exists to mark the property, and the Cypher planner declines any query that reads a
+property holding such a number ([§11.2](#112-matching-dawgss-semantics)). BloodHound's own ingest
+writes canonical numbers, so such properties are rare.
 
 ### 6.3 Read indexes that PostgreSQL does not have
 
@@ -1391,13 +1392,13 @@ tx.Relationships().Filter(query.And(
 `recognize.FromCriteria` ([`criteria.go`](internal/engine/recognize/criteria.go)) accepts exactly
 this shape: a conjunction of `id(s) = x`, `id(e) = y` and at most one kind filter on the
 relationship. A kind filter that names no kinds is declined: DAWGS renders it as
-`kind_id = any('{}')`, which matches no edge, while the engine reads an empty kind list as "every
-kind". (BloodHound's pathfinding endpoint rejects an empty kind list itself, so this guards other
-callers.) On PostgreSQL, DAWGS renders it as an `allShortestPaths` pattern with an unbounded
-range, capped at 15 steps. Because this is always a single start/end pair, PostgreSQL's two
-`allShortestPaths` answers ([§2.6](#26-cypher-and-how-dawgs-translates-it)) coincide, and BloodTrail
-searches in the per-pair mode. A builder question with several starts or ends is not recognized and
-goes to PostgreSQL.
+`e0.kind_id = any (array []::int2[])`, an empty kind array, which matches no edge, while the engine
+reads an empty kind list as "every kind". (BloodHound's pathfinding endpoint rejects an empty kind
+list itself, so this guards other callers.) On PostgreSQL, DAWGS renders it as an `allShortestPaths`
+pattern with an unbounded range, capped at 15 steps. Because this is always a single start/end pair,
+PostgreSQL's two `allShortestPaths` answers ([§2.6](#26-cypher-and-how-dawgs-translates-it))
+coincide, and BloodTrail searches in the per-pair mode. A builder question with several starts or
+ends is not recognized and goes to PostgreSQL.
 
 ### 9.2 The serving steps
 
@@ -1406,13 +1407,15 @@ goes to PostgreSQL.
 1. **Gate** ([§8.1](#81-the-serving-gate-and-the-two-states)), including the multi-graph check.
 2. **Resolve the endpoints.** Database ids map to dense ids through `View.Dense`. An id the view
    does not know is *dropped*, which can only make the answer smaller, never larger.
-3. **Check for a shared endpoint.** PostgreSQL's shortest-path functions raise SQLSTATE 22023 when,
-   without an explicit `s <> t` (BloodHound's pathfinding request has none), a start node is also an
-   end node and the search can take a first step out of it. BloodTrail declines (`self_endpoint`)
-   whenever the two sets share a node that has an outgoing edge of *any* kind
-   (`traverse.SelfEndpointConflict`). That condition covers every case PostgreSQL rejects, so
-   BloodTrail never answers a query PostgreSQL would refuse; it may occasionally decline one
-   PostgreSQL would have answered.
+3. **Check for a shared endpoint.** PostgreSQL's shortest-path functions raise SQLSTATE 22023
+   when, without an explicit `s <> t` (BloodHound's pathfinding request has none), a start node is
+   also an end node and the search can take a first step out of it. BloodTrail declines
+   (`self_endpoint`) whenever the two sets share a node that has an outgoing edge of *any* kind
+   (`traverse.SelfEndpointConflict`). That condition covers every case PostgreSQL rejects, so on the
+   pathfinding and builder paths BloodTrail never answers a query PostgreSQL would refuse (Cypher's
+   `shortestPath`, whose PostgreSQL error depends on the query plan, is covered in
+   [§11.7](#117-executing-the-pattern)); it may occasionally decline one PostgreSQL would have
+   answered.
 4. **Build an edge-kind mask**: a bit vector over kind ids. No kind filter at all means every kind.
    The mask is sized from the view's `MaxKindID`, which includes kinds first introduced by segments.
 5. **Search** (`traverse.AllShortestPaths`, [§9.3](#93-the-search-strategies)), with BloodHound's
@@ -1836,16 +1839,14 @@ be reproduced exactly:
 | `ORDER BY x` where `x` is a word PostgreSQL reserves (`select`, `table`, `group`, `user`, `left`, …) | DAWGS writes the name unquoted: a syntax error, or for `user`, `true` or `current_date`, a sort by a constant |
 | A backquoted alias (`` AS `My Col` ``) | DAWGS passes the backquotes through, which is invalid SQL, so PostgreSQL rejects the query |
 
-One known difference remains, in `datetime()`'s epoch accessors (`epochseconds`, `epochmillis`)
-inside conditions, such as the pre-built
+One known difference in values remains, in `datetime()`'s epoch accessors (`epochseconds`,
+`epochmillis`) inside conditions, such as the pre-built
 `n.lastlogontimestamp < (datetime().epochseconds - (inactive_days * 86400))`. BloodTrail reads the
 BloodHound server's clock once, when execution starts, and uses whole seconds or milliseconds; a
 delegated query reads PostgreSQL's `now()` on the database server, with fractional seconds. The
 values can differ slightly, so a row very close to the boundary can land on different sides.
 Returning an epoch accessor as a column is declined, because PostgreSQL returns an exact decimal
-that BloodTrail does not reproduce. (A second difference, numbers stored with a decimal point but no
-fraction such as `1.0`, which BloodTrail used to answer as the number 1 where PostgreSQL's integer
-cast fails the query, is gone: such a property now declines, as described above.)
+that BloodTrail does not reproduce.
 
 ### 11.3 What the planner accepts
 
@@ -2300,9 +2301,9 @@ knowing *how* PostgreSQL got there.
 Some writes cannot be described as a list of keys, because their affected rows are not known in
 advance: `DeleteNodesByKinds(include, exclude)`, `DeleteRelationshipsByKinds(kinds)`, and a builder
 `Delete` on relationships filtered only by edge kind. These are recorded as **criteria**, and the
-criteria choose which rows of the current view to read back: every live node with any `include`
-kind (every live node if `include` is empty) and no `exclude` kind, the same rule as DAWGS's SQL,
-or every edge of the named kinds, including the delta's edges whose endpoint has not arrived yet
+criteria choose which rows of the current view to read back: every live node with any `include` kind
+(every live node if `include` is empty) and no `exclude` kind, the same rule as DAWGS's SQL, or
+every edge of the named kinds, including the delta's edges whose endpoint has not arrived yet
 ([§6.7](#67-fold)). Those rows are re-read by id like any other key (`viewCandidates`,
 `rereadByID`): a row PostgreSQL deleted comes back absent and is tombstoned (a node with all its
 edges), and a row PostgreSQL kept comes back present and is staged as it is now. The view only
@@ -2311,17 +2312,18 @@ kind-scoped delete races other writers: a row of the deleted kind that another w
 after the `DELETE`'s snapshot, and whose apply ran first, must survive. An earlier version carried
 the delete out against the view as an instruction ("tombstone every edge of kind K") and erased such
 rows while staying SERVING. With read-back the result no longer depends on the order in which
-concurrent writes are applied. A criteria that names more than PostgreSQL deleted costs only extra
-re-reads. Enumerating the candidates scans the view's kind bitsets (or every node for an empty
-`include`) or the edge-kind column once, inside `Apply`; it never touches a query's read path, and
-the re-reads go 50,000 ids per round trip.
+concurrent writes are applied, with one exception: an objectid-keyed edge upsert whose endpoint is
+re-keyed before the upsert is applied ([§12.3](#123-reading-back)). A delete whose criteria name
+more rows than PostgreSQL deleted costs only extra re-reads. Enumerating the candidates scans the
+view's kind bitsets (or every node for an empty `include`) or the edge-kind column once, inside
+`Apply`; it never touches a query's read path, and the re-reads go 50,000 ids per round trip.
 
 The criteria must also name kinds the way PostgreSQL does. The replica learns kind names when its
 base is built and from the rows that writes bring back, but PostgreSQL can know more: an OpenGraph
 upload registers its source kind before it writes any node, so a failed upload leaves a kind that
 PostgreSQL knows and no row carries, and BloodHound's "delete sourceless data" then names it as an
-`exclude` kind. So during read-back, any kind a criteria names that the view does not know is looked
-up in PostgreSQL's kind table (`resolveCriteriaKinds`), the kinds found are added to the new
+`exclude` kind. So during read-back, any kind the criteria name that the view does not know is
+looked up in PostgreSQL's kind table (`resolveCriteriaKinds`), the kinds found are added to the new
 segment, and candidates are matched by kind id. (Before this, that delete switched the engine to
 FALLBACK and a full reload, although PostgreSQL's own delete was correct.) A kind unknown to
 PostgreSQL as well behaves as it does with the plain PostgreSQL driver: as an `include` kind, or in
@@ -2329,8 +2331,8 @@ an edge-kind delete, it matches nothing, and as an `exclude` kind it makes DAWGS
 refuse the delete before sending any SQL, and a refused delete records nothing. If read-back ever
 meets an `exclude` kind it still cannot resolve, it does not guess: the engine enters FALLBACK.
 
-A criteria is recorded only after PostgreSQL reports that the delete succeeded; a delete that
-failed in a way that may have taken effect records a fallback instead ([§5.5](#55-the-write-side)).
+Criteria are recorded only after PostgreSQL reports that the delete succeeded; a delete that failed
+in a way that may have taken effect records a fallback instead ([§5.5](#55-the-write-side)).
 
 ### 12.2 What the observers record
 
@@ -2388,11 +2390,11 @@ between the upsert and its apply. Its triple cannot be resolved, so an edge that
 not staged until a later write names it or a reload brings it in. Objectids are identities in
 BloodHound, so this takes a re-key racing an ingest upsert.
 
-Kind names are mapped to ids in one batch; if the batch fails, each name is looked up on its own,
-so one bad name affects only its own entries, and a cancelled request counts as a read-back error.
-For an edge triple, a kind that cannot be mapped is treated as "no such edge", so the worst case is
-a missed new edge, never a wrong tombstone. The same lookup resolves every kind a delete criteria
-names that the view does not know ([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids
+Kind names are mapped to ids in one batch; if the batch fails, each name is looked up on its own, so
+one bad name affects only its own entries, and a cancelled request counts as a read-back error. For
+an edge triple, a kind that cannot be mapped is treated as "no such edge", so the worst case is a
+missed new edge, never a wrong tombstone. The same lookup resolves every kind a delete's criteria
+name that the view does not know ([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids
 the view has not seen before (kinds registered at runtime) are resolved and added to the segment,
 together with the kinds found for criteria. Any read-back error switches the engine to FALLBACK.
 
@@ -2416,7 +2418,7 @@ together with the kinds found for criteria. Any read-back error switches the eng
    enters FALLBACK.
 10. **Build the segment** (`buildApplySegment`) from read-back's answers alone. The order matters,
     because the segment builder keeps the last state written for each id:
-    1. newly seen kinds, including any kind a delete criteria names that the view did not know;
+    1. newly seen kinds, including any kind a delete's criteria name that the view did not know;
     2. tombstones: node ids not found, candidates included (with every incident edge in the view),
        and edge ids and triples not found;
     3. the rows that were found, last, so a row PostgreSQL holds overrides any cascade tombstone
@@ -2605,12 +2607,13 @@ A snapshot file is stamped with the counter value **N** that was current, and co
 contents were captured, and names the lineage its replica was loaded in. Every write through
 BloodTrail's driver increments the counter before it has any effect, so within one lineage any such
 write the file could be missing carries a number greater than N. At startup, BloodTrail reads
-PostgreSQL's counter **P** and its lineage together, in one statement. A file from any other lineage
-is refused before its counter is even weighed ([§13.5](#135-the-lineage)), and so is one whose
-id-sequence positions show rows inserted behind the counter
-([§13.6](#136-rows-inserted-behind-the-counter)). Otherwise, if BloodTrail can account for every
-number from N+1 to P as a write it observed itself and can replay, the file plus those replays is
-complete. If it cannot, the file is not ([§14.3](#143-boot)).
+PostgreSQL's counter **P** and its lineage together, in one statement. Three refusals come before
+the counter is even weighed (`fileRefusal`): a file from any other lineage
+([§13.5](#135-the-lineage)); one stamped ahead of where the counter stood when this process started,
+as a restored backup usually leaves it; and one whose id-sequence positions show rows inserted
+behind the counter (both [§13.6](#136-rows-inserted-behind-the-counter)). Otherwise, if BloodTrail
+can account for every number from N+1 to P as a write it observed itself and can replay, the file
+plus those replays is complete. If it cannot, the file is not ([§14.3](#143-boot)).
 
 ### 13.3 When a bump fails
 
@@ -2643,19 +2646,18 @@ a settled failure while still serving, it may start a full load on its own, at m
 
 The counter detects a *second BloodTrail-enabled server* writing to the same database: its numbers
 leave gaps this server cannot account for. A running server then refuses to save its snapshot file
-(`snapshot file not written`, Warn, with the reason `the watermark counter holds values this process
-never resolved: another BloodTrail server may be writing this database, or a bump's outcome was
-lost`, and the attributes `pg_watermark`, `resolved_through` and `resolved_exactly`) until a load it
-adopts has read the other server's writes, and a file is rejected at the next startup when the
-buffered writes cannot cover the gap ([§14.3](#143-boot)). That is the limit of what one process
-can see of another: a load covers another server's counter value even when that server's own write
-had not committed yet when the load read the database, so it is a detection, not a coherent
-cluster. Writes made
-to PostgreSQL by anything else (`psql`, the stock BloodHound image, BloodHound's migrator) never
-touch the counter. A running replica cannot see them at all; like any cache, it cannot see what
-bypasses it. What keeps them from hiding behind a *saved* file whose counter still matches is the
-lineage, which the installer ends and anything else that writes the graph must end
-([§13.5](#135-the-lineage)), and, for inserts, the id-sequence check
+(`snapshot file not written`, Warn, with a reason that begins
+`the watermark counter holds values this process never resolved`, quoted in full in
+[Appendix B](#appendix-b-log-messages), and the attributes `pg_watermark`, `resolved_through` and
+`resolved_exactly`) until a load it adopts has read the other server's writes, and a file is
+rejected at the next startup when the buffered writes cannot cover the gap ([§14.3](#143-boot)).
+That is the limit of what one process can see of another: a load covers another server's counter
+value even when that server's own write had not committed yet when the load read the database, so it
+is a detection, not a coherent cluster. Writes made to PostgreSQL by anything else (`psql`, the
+stock BloodHound image, BloodHound's migrator) never touch the counter. A running replica cannot see
+them at all; like any cache, it cannot see what bypasses it. What keeps them from hiding behind a
+*saved* file whose counter still matches is the lineage, which the installer ends and anything else
+that writes the graph must end ([§13.5](#135-the-lineage)), and, for inserts, the id-sequence check
 ([§13.6](#136-rows-inserted-behind-the-counter)). The supported deployment is **one BloodHound API
 server per database**.
 
@@ -2696,9 +2698,11 @@ before can vouch for anything after:
   earlier: when rollback leaves the restart to the operator ([§18.3](#183-the-installer)),
   BloodTrail is still running when the lineage ends. It saves nothing from then on, for the reason
   above, unless a load it adopts before the operator restarts reads the new lineage; a file saved
-  after that would name the new lineage. `bloodtrail install` ends the lineage again, so a
-  reinstall never adopts such a file, but a BloodTrail image started by hand after the stock image
-  has written the graph could.
+  after that would name the new lineage. `bloodtrail install` ends the lineage again, so a reinstall
+  never adopts such a file, but a BloodTrail image started by hand after the stock image has written
+  the graph could. So on that path rollback tells the operator to end the lineage again once the
+  original image is running, or to delete the snapshot file before starting BloodTrail any way other
+  than `bloodtrail install`.
 
 The installer's statement leaves a database without the table untouched, since BloodTrail never ran
 there; it increments the counter, which is what makes an engine from before lineages refuse its
@@ -2918,10 +2922,11 @@ equals its stamp" would almost never succeed. Instead:
   order is the order in which the writes *started*, not the order in which they committed, and it
   does not matter: read-back always returns PostgreSQL's *current* state for each key, and a
   kind-scoped delete is read back too, through the candidates the view being replayed onto holds
-  ([§12.1](#121-record-the-keys-then-read-back-the-truth)). (When kind-scoped deletes were replayed
-  as instructions, a delete that started first but committed last could erase a row written in
-  between.) Publishing the result also raises the watermark ledger to P
-  ([§13.1](#131-the-counter)).
+  ([§12.1](#121-record-the-keys-then-read-back-the-truth)); the one exception is the same as in
+  ordinary write-through, an objectid-keyed edge upsert whose endpoint is re-keyed before it is
+  applied ([§12.3](#123-reading-back)). (When kind-scoped deletes were replayed as instructions, a
+  delete that started first but committed last could erase a row written in between.) Publishing the
+  result also raises the watermark ledger to P ([§13.1](#131-the-counter)).
 
 Any doubt rejects the file (`snapshot file rejected`, with a `reason`, or an `error` for an
 unreadable file) and falls through to a normal load: a corrupt or wrong-version file (every file
@@ -3036,7 +3041,7 @@ every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite (178 tests in 67 files, behind the `integration` build tag) runs against a
+The integration suite (180 tests in 69 files, behind the `integration` build tag) runs against a
 disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
 plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
 in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
@@ -3058,7 +3063,7 @@ corpus runs on.
 | Write-through | 15 classes of write (upserts, cascading deletes, deletes by kind, partially failed batches, concurrent writers, a "delete sourceless data" whose exclusions name a kind PostgreSQL registered but no row carries, …). After each recognized write, the very next read must be answered by BloodTrail and match PostgreSQL (for five classes, whole rows including full property bags; for the rest, the values and counts the write changed), and no reload may have happened; one class deliberately forces a fallback and checks the recovery, and one stresses concurrent writers |
 | OpenGraph | BloodHound v9.6.0's OpenGraph calls, unchanged through v9.7.1, replayed through the real driver: uploads with and without a source kind, with kind registration and `RefreshKinds` inside the open batch; objectid-keyed upserts of text, number, boolean and text-list values, multi-kind and stub nodes, and an edge from an AD user, which gains the source kind; endpoints resolved by name and by property, one to nothing; a failed upload that registers its source kind and writes no row; Cypher reads, builder counts and pathfinding over an extension's traversable kinds; deletes by edge kind, of sourceless data and of a source kind. After every step, answers must equal the plain PostgreSQL driver's and be served from memory, with no fallback and no rebuild. Two kinds of read go to PostgreSQL by design and are only compared: the endpoint lookups by name or property, and one Cypher query that names a kind no row carries |
 | Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one, writers on a saturated connection pool (with and without the engine), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
-| Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context; a save racing a failed bump removes its own file. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage. Convergence: a save is refused while an earlier bump's response is still in flight (held back by a proxy after PostgreSQL committed it), and while a second engine's counter is unaccounted for, until a rebuild has loaded its write; a file stamped ahead of the counter at start is refused, and buffered boot writes that contradict the file reject it at once |
+| Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context, with the write path's pool still open; a save racing a failed bump removes its own file; a file whose boot panics is deleted and the boot rebuilds. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage. Convergence: a save is refused while an earlier bump's response is still in flight (held back by a proxy after PostgreSQL committed it), and while a second engine's counter is unaccounted for, until a rebuild has loaded its write; a file stamped ahead of the counter at start is refused, and buffered boot writes that contradict the file reject it at once |
 
 Every comparison is paired with **served-answer evidence**: the tests count BloodTrail's "served"
 log lines per call, to tell "BloodTrail answered, correctly" apart from "BloodTrail declined, and
@@ -3343,15 +3348,16 @@ and v9.7.1 at the time of writing). The same list drives:
 - a weekly workflow that builds the moving alias for any supported release that lacks one.
 
 CI also runs the unit and integration suites with the race detector, the linter over all the code
-(the integration-tagged test code included), the tests of the benchmark and build scripts,
-and the full end-to-end install-and-rollback test, OpenGraph phase included, against v9.6.0
+(the integration-tagged test code included), the tests of the benchmark and build scripts, and the
+full end-to-end install-and-rollback test, OpenGraph phase included, against v9.6.0
 ([§16.3](#163-the-blind-spot-and-the-end-to-end-test)). A `dawgs` job resolves every supported
 release with `build-image.sh --dawgs-only` and runs the unit and integration suites against each
 DAWGS version they resolve to other than the one in `go.mod` (`build/dawgs-suites.sh`; v0.8.1, for
 v9.7.1, today). Newer releases otherwise get only the patch guard on each change; their images are
-compiled, patch applied, by the release and weekly workflows, and no end-to-end run covers them.
-Each workflow ends in one aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before
-it succeeded, so that a branch rule can require those two checks by name.
+compiled, patch applied, by the release and weekly workflows, and no end-to-end run covers them. The
+two workflows that run on pull requests, `ci.yml` and `e2e.yml`, each end in one aggregate job,
+`ci-ok` and `e2e-ok`, that fails unless every job before it succeeded, so that a branch rule can
+require those two checks by name.
 
 ### 18.3 The installer
 
@@ -3483,13 +3489,16 @@ Rollback then brings the deployment back up on the original image and ends the w
 started the stock image. One case is left to the operator: when the restored project's first
 `COMPOSE_FILE` file (or, with no entry left, the compose file the install was given) is not in the
 directory of `.env`, Compose takes another project directory than rollback would address, and a
-restart from rollback could recreate a service with its data on a different host path. Rollback
-then does everything else, ending the lineage included, and tells the operator that BloodTrail is
-still running and to restart with their own `docker compose up -d`. It does not restore the database
-dump or delete the migrated PostgreSQL graph: a deployment that started on Neo4j returns to its
-untouched Neo4j graph, and anything imported while BloodTrail was active stays in PostgreSQL. That
-is why a second install refuses until `--replace-postgres-graph` is given. `bloodtrail status`
-shows the configured and the running image, which differ while an install or rollback is half done.
+restart from rollback could recreate a service with its data on a different host path. Rollback then
+does everything else, ending the lineage included, and tells the operator that BloodTrail is still
+running and to restart with their own `docker compose up -d`, and, because the lineage ended while
+BloodTrail still ran, to end it again once the original image is running (it prints the `psql`
+statement) or delete the snapshot file before starting BloodTrail any way other than
+`bloodtrail install` (`lineageLeftToTheOperator`). It does not restore the database dump or delete
+the migrated PostgreSQL graph: a deployment that started on Neo4j returns to its untouched Neo4j
+graph, and anything imported while BloodTrail was active stays in PostgreSQL. That is why a second
+install refuses until `--replace-postgres-graph` is given. `bloodtrail status` shows the configured
+and the running image, which differ while an install or rollback is half done.
 
 The operator guidance (pausing ingest during a migration, the memory limit, the snapshot directory
 and ending the lineage after writing the graph without BloodTrail, Compose commands that name files
@@ -3510,7 +3519,8 @@ in the [README](README.md).
   a file stamped ahead of the counter ([§13.6](#136-rows-inserted-behind-the-counter)). When
   rollback leaves the restart to the operator, it ends the lineage while BloodTrail still runs, and
   a load BloodTrail adopts before the restart lets it save a file that a BloodTrail started by hand,
-  not by the installer, could later adopt ([§13.5](#135-the-lineage)).
+  not by the installer, could later adopt, unless the operator ends the lineage again once the
+  original image runs or deletes the file, as rollback tells them to ([§13.5](#135-the-lineage)).
 - **The snapshot file needs the lineage column.** Its default, `gen_random_uuid()`, needs
   PostgreSQL 13. Where the column cannot be added, the counter still works but no snapshot file is
   written or adopted, and every start rebuilds from PostgreSQL ([§13.1](#131-the-counter)).
@@ -3548,7 +3558,7 @@ in the [README](README.md).
   builder's row projections do not consult it as the caller reads them; both are bounded by their
   budgets. The interpreter stops a cancelled request at its next work check, and the engine's
   PostgreSQL round trips follow the caller's context ([§5.4](#54-the-read-side)).
-- **One known difference** from PostgreSQL ([§11.2](#112-matching-dawgss-semantics)): inside a
+- **A clock difference** from PostgreSQL ([§11.2](#112-matching-dawgss-semantics)): inside a
   condition, `datetime()`'s epoch accessors use the BloodHound server's clock, in whole seconds or
   milliseconds (returned as a column, they are declined).
 - **Tied to BloodHound and DAWGS.** If BloodHound changes how it phrases queries or identifies the
