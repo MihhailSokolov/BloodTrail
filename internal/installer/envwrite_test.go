@@ -227,6 +227,35 @@ func TestWriteEnvFileFollowsALinkAndKeepsIt(t *testing.T) {
 	}
 }
 
+// TestWriteEnvFileLeavesAHardLinkWithTheOldContents pins a documented limit of
+// replacing the file instead of rewriting it: a second name for the same .env
+// (a hard link) does not follow the replacement. The name that was written to
+// holds the new contents; the other keeps pointing at the old file, so
+// whatever reads .env through it keeps seeing the old contents.
+func TestWriteEnvFileLeavesAHardLinkWithTheOldContents(t *testing.T) {
+	path := writeEnvFixture(t, "OLD=1\n", 0o600)
+	other := filepath.Join(filepath.Dir(path), "env.link")
+	if err := os.Link(path, other); err != nil {
+		t.Skipf("no hard links here: %v", err)
+	}
+
+	if err := writeEnvFile(path, []byte("NEW=2\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, _ := os.ReadFile(path); string(got) != "NEW=2\n" {
+		t.Fatalf(".env holds %q, want the new contents", got)
+	}
+	if got, _ := os.ReadFile(other); string(got) != "OLD=1\n" {
+		t.Fatalf("the other name for .env holds %q, want the old contents it keeps", got)
+	}
+	replaced, _ := os.Stat(path)
+	linked, _ := os.Stat(other)
+	if os.SameFile(replaced, linked) {
+		t.Fatal(".env is still the same file as its other name")
+	}
+}
+
 func TestWriteEnvFileRefusesWhatItCannotReplaceSafely(t *testing.T) {
 	skipAsRoot(t)
 	t.Run("a file this user cannot write", func(t *testing.T) {

@@ -19,6 +19,11 @@ import (
 // file's mode and owner and flushed to disk in a scratch file beside it, and
 // renamed over it, so what is there is always either the old file or the new
 // one, whole.
+//
+// What a replacement does not carry over is the file's identity: extended
+// attributes and ACLs, and any hard link to it, whose other name goes on
+// pointing at the old contents. A symbolic link is followed and kept, and a
+// file that is itself a mount point cannot be renamed over at all.
 
 // envReplacement is the replacement of one .env file.
 type envReplacement struct {

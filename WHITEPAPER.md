@@ -3420,9 +3420,10 @@ from a temporary directory under `TMPDIR` ([`internal/installer`](internal/insta
    and a `.env` the install had to create stays behind, empty. `.env` is written only when it
    changes, and replaced atomically: a new file beside it, given the old file's mode and owner,
    flushed and renamed over it, and the directory synced. It keeps a symbolic link, but not extended
-   attributes, ACLs or a hard link, and a `.env` that is itself a mount point cannot be replaced.
-   Then set the `database_switch` row, **end the watermark lineage** ([§13.5](#135-the-lineage)),
-   and run `docker compose up -d`. The operator's own Compose file is never edited.
+   attributes or ACLs; a hard link to it is lost, because the new file takes the name and the other
+   name keeps the old contents; and a `.env` that is itself a mount point cannot be replaced. Then
+   set the `database_switch` row, **end the watermark lineage** ([§13.5](#135-the-lineage)), and run
+   `docker compose up -d`. The operator's own Compose file is never edited.
 5. **Verify.** Check that the driver setting BloodHound will read (the `database_switch` row, else
    the service's `bhe_graph_driver`) names `bloodtrail`, wait for the container's *current* run to
    log `BloodTrail driver active` (an earlier run's line does not count), and wait for

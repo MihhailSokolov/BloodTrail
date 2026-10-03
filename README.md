@@ -222,13 +222,14 @@ temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is m
   `COMPOSE_DISABLE_ENV_FILE` (which leave `.env` unread), or a `COMPOSE_DISABLE_ENV_FILE`
   that is not a boolean (on which docker compose stops with an error); or a `.env` the
   install has to change that this user cannot write. The message names what it found, and
-  usually what to change. `.env` is replaced atomically, keeping its mode and owner (and
-  a symbolic link), but not extended attributes, ACLs or a hard link to it, and a `.env`
-  that is itself a mount point cannot be replaced. `status`, `verify` and `rollback` read
-  the project more forgivingly (with several `COMPOSE_FILE` lines, the last wins, as in
-  docker compose), so they keep working on whatever an earlier install left behind; where
-  an earlier version wrote its override into an empty `COMPOSE_FILE=` entry, rollback
-  puts the empty entry back as it was.
+  usually what to change. `.env` is replaced atomically, keeping its mode and owner (and a
+  symbolic link), but not extended attributes or ACLs. A hard link to it is lost: the new
+  file takes the name and the other name keeps the old contents. A `.env` that is itself a
+  mount point cannot be replaced. `status`, `verify` and `rollback` read the project more
+  forgivingly (with several `COMPOSE_FILE` lines, the last wins, as in docker compose), so
+  they keep working on whatever an earlier install left behind; where an earlier version
+  wrote its override into an empty `COMPOSE_FILE=` entry, rollback puts the empty entry
+  back as it was.
 - **Rollback of installs made by v0.1.0 to v0.1.2** decides what to do with the
   `COMPOSE_FILE` entry from the copy of `.env` in the backup directory, since those
   versions did not record what they wrote: an entry that was there before the install
