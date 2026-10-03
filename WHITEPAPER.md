@@ -3020,25 +3020,24 @@ project checks that in four layers.
 
 ### 16.1 Unit tests
 
-About [TODO: unit test count] unit tests in [TODO: file count] files cover every component on its
-own: the data structures (including randomized tests that compare the overlay fast paths with a
-slow, obviously correct walk, edge by edge, and folded bases with the layered views they came from),
-the search engine (bidirectional search checked against brute force, the depth ceiling, buffer
-reuse), the recognizers, the interpreter (plan shapes, value semantics, every parity refusal), the
-installer's reading of Compose projects and `.env` files against Compose's own rules, the snapshot
-file's header and version, and every observer and apply branch. CI runs them with Go's race
-detector.
+About 1,020 unit tests in 141 files cover every component on its own: the data structures (including
+randomized tests that compare the overlay fast paths with a slow, obviously correct walk, edge by
+edge, and folded bases with the layered views they came from), the search engine (bidirectional
+search checked against brute force, the depth ceiling, buffer reuse), the recognizers, the
+interpreter (plan shapes, value semantics, every parity refusal), the installer's reading of Compose
+projects and `.env` files against Compose's own rules, the snapshot file's header and version, and
+every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite ([TODO: test count] tests in [TODO: file count] files, behind the
-`integration` build tag) runs against a disposable PostgreSQL. Its central technique is
-**differential testing**: ask BloodTrail and the plain PostgreSQL driver the same question on the
-same database, and compare the answers. The suites in [`integration/`](integration) open BloodTrail
-exactly as BloodHound does, `dawgs.Open(ctx, "bloodtrail", cfg)`; the suites under `internal/engine`
-construct the engine directly; the one under `internal/dbswitch` runs the installer's own `psql`
-statements against the test database, and the one under `internal/graphtest` smoke-tests the fixture
-graph the pre-built corpus runs on.
+The integration suite (178 tests in 67 files, behind the `integration` build tag) runs against a
+disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
+plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
+in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
+`dawgs.Open(ctx, "bloodtrail", cfg)`; the suites under `internal/engine` construct the engine
+directly; the one under `internal/dbswitch` runs the installer's own `psql` statements against the
+test database, and the one under `internal/graphtest` smoke-tests the fixture graph the pre-built
+corpus runs on.
 
 | Suite | What it covers |
 |---|---|
