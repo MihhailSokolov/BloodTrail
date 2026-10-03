@@ -1422,7 +1422,8 @@ ends is not recognized and goes to PostgreSQL.
 4. **Build an edge-kind mask**: a bit vector over kind ids. No kind filter at all means every kind.
    The mask is sized from the view's `MaxKindID`, which includes kinds first introduced by segments.
 5. **Search** (`traverse.AllShortestPaths`, [§9.3](#93-the-search-strategies)), with BloodHound's
-   own per-transaction memory limit (`GraphQueryMemoryLimit`) as the output budget.
+   own per-transaction memory limit (`GraphQueryMemoryLimit`) as the memory budget, and the
+   request's context, which the search itself checks ([§9.4](#94-limits-and-engineering-details)).
 6. **Complete the answer** from PostgreSQL ([§8.4](#84-completing-the-answer)).
 
 A served call logs `bloodtrail: path engine served` at Info level.
@@ -1525,11 +1526,16 @@ reported as a path to itself, matching BloodHound's own filter.
   bumping an epoch counter: a node's entry counts only if its mark equals the current epoch. When
   the counter wraps around, the marks are cleared for real, because epoch 0 would match a fresh
   buffer's zeros.
-- **Output budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
-  memory limit; exceeding it declines the query (`memory_limit`). The charge bounds the *output*,
-  not the search buffers: strategy B holds one buffer per small-side node until its merge finishes.
-  When the overall-shortest mode discards the paths collected so far because a shorter pair turned
-  up, their charge is released too.
+- **Memory budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
+  memory limit; exceeding it declines the query (`memory_limit`). When the overall-shortest mode
+  discards the paths collected so far because a shorter pair turned up, their charge is released
+  too. Strategy B's search buffers are charged against the same limit, as a reservation taken
+  before they are allocated and kept across that release, since discarding paths does not free
+  them: it holds one buffer per small-side node, 5 bytes per node of the whole snapshot each,
+  from its parallel fan-out until its merge finishes. A query whose buffers alone do not fit
+  declines (`too_large`) rather than allocating them. Nothing accounted for that set before, and
+  a caller that raises `SideBudget` from its own work budget ([§11.9](#119-budgets)) scales it:
+  at the interpreter's default work budget, up to roughly 1.3 GB on a sparse graph.
 - **Reading adjacency.** Searches read a node's edges as array slices (`View.OutSlices` /
   `InSlices`, [§6.5](#65-the-view-a-base-plus-deltas)) rather than through a callback. A comment in
   the code records that routing the loop through a helper that took a callback made the common path
@@ -1544,7 +1550,7 @@ reported as a path to itself, matching BloodHound's own filter.
 **Code.** [`traverse.go`](internal/engine/traverse/traverse.go): `AllShortestPaths`, `Query`, `Mode`
 (`ModeOne`, `ModeAllPerPair`, `ModeAll`), `shortestLevel`, `Endpoint`, `MaxDepth`,
 `MaxRepresentableDepth`, `PairBudget`, `SideBudget`, `strategyPairs`, `strategySmallSide`,
-`cancelCheck`, `SelfEndpointConflict`, the scratch pool.
+`cancelCheck`, `memBudget`, `SelfEndpointConflict`, the scratch pool.
 [`bfs.go`](internal/engine/traverse/bfs.go): `bfsFrom`, `pairShortest`, `pairEnumerate`,
 `enumerate`. [`engine.go`](internal/engine/engine.go):
 `TryAllShortestPaths`, `servePathQuery`, `convertMode`, `resolveEndpoint`, `buildKindMask`.

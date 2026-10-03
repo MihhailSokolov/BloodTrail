@@ -62,6 +62,15 @@ func newScratch(n int) *scratch {
 	}
 }
 
+// scratchBytes is what one scratch sized for n nodes costs: a uint32 mark
+// plus an int8 distance per node. The slice headers themselves are a
+// constant few words and are ignored. Used to charge a strategy's scratch
+// set against the query's memory limit before allocating it (memBudget.
+// reserve).
+func scratchBytes(n int) uint64 {
+	return uint64(n) * 5
+}
+
 // reset invalidates every distance written since the previous reset.
 //
 // The epoch wrapping back to zero is the one value that cannot be used: a
@@ -131,29 +140,59 @@ func (s *scratch) set(v snapshot.NodeID, d int8) {
 	s.dist[v] = d
 }
 
-// memBudget tracks approximate bytes consumed by enumerate's output,
-// erroring once accounting would exceed limit. A zero limit is unbounded.
-// Guarded by mu so a single budget can be shared across strategy B's
-// parallel workers.
+// memBudget tracks approximate bytes a query holds, erroring once accounting
+// would exceed limit. A zero limit is unbounded. Guarded by mu so a single
+// budget can be shared across strategy B's parallel workers.
+//
+// Two kinds of bytes, accounted separately because they come and go on
+// different schedules:
+//
+//   - used is enumerate's OUTPUT, added per completed path and forgotten
+//     wholesale by reset when the overall-shortest mode discards the paths
+//     collected so far.
+//   - reserved is scratch a strategy holds for its whole run, whatever
+//     happens to the output -- strategy B's one distance buffer per
+//     small-side element, which bfsSmallSide allocates before the merge and
+//     releases only after it (see strategySmallSide). reset leaves it alone
+//     precisely because discarding paths does not free it.
+//
+// The limit covers their sum: both are resident at the same time.
 type memBudget struct {
-	mu          sync.Mutex
-	limit, used uint64
+	mu                    sync.Mutex
+	limit, used, reserved uint64
 }
 
-// add accounts n more bytes, returning ErrMemoryLimit without recording the
-// addition if that would exceed the budget's limit.
+// add accounts n more bytes of output, returning ErrMemoryLimit without
+// recording the addition if that would exceed the budget's limit.
 func (b *memBudget) add(n uint64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.limit > 0 && b.used+n > b.limit {
+	if b.limit > 0 && b.reserved+b.used+n > b.limit {
 		return ErrMemoryLimit
 	}
 	b.used += n
 	return nil
 }
 
-// reset forgets every byte accounted so far, for a caller that has just
-// discarded every path those bytes were charged for (shortestLevel.admit).
+// reserve accounts n bytes of scratch a strategy is about to allocate and
+// hold for its whole run, returning false without recording it if that
+// would exceed the budget's limit. The caller is expected to decline the
+// whole query rather than allocate anyway -- which is what this exists to
+// prevent, so the reservation is always taken BEFORE the allocation.
+func (b *memBudget) reserve(n uint64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit > 0 && b.reserved+b.used+n > b.limit {
+		return false
+	}
+	b.reserved += n
+	return true
+}
+
+// reset forgets every OUTPUT byte accounted so far, for a caller that has
+// just discarded every path those bytes were charged for
+// (shortestLevel.admit). Reservations survive it: the scratch they stand for
+// is still allocated.
 func (b *memBudget) reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -521,7 +560,9 @@ var ErrTooLarge = errors.New("bloodtrail: query too large for the path engine")
 //	B. one side materializes to <= SideBudget ids and the other is larger
 //	   or unconstrained: one full BFS per small-side element (parallel
 //	   across GOMAXPROCS goroutines, each with its own scratch), then
-//	   enumerate grouped by (root asc, terminal asc) until Limit.
+//	   enumerate grouped by (root asc, terminal asc) until Limit. Also
+//	   ErrTooLarge when that scratch set alone does not fit MemoryLimit --
+//	   see strategySmallSide.
 //	C. otherwise: return ErrTooLarge (caller delegates to PostgreSQL).
 //
 // Results are ordered by (root dense id, terminal dense id); depths within
@@ -791,12 +832,32 @@ func materialize(e Endpoint, s *snapshot.View) []snapshot.NodeID {
 // parallel via bfsSmallSide, then enumerates paths in a strictly ordered
 // sequential merge phase so output order (and Limit truncation) is
 // independent of goroutine scheduling.
+//
+// The scratch set this holds -- one distance buffer per small-side element,
+// live from bfsSmallSide's fan-out until the merge below has returned -- is
+// charged to the query's own memory limit (budget.reserve) BEFORE any of it
+// is allocated, and the whole query declines ErrTooLarge if it does not fit,
+// so the caller delegates to PostgreSQL instead. Nothing bounded that set
+// before: Query.SideBudget caps how many BFS runs a caller will attempt, and
+// the package default of 16 keeps the set small, but a caller that raises it
+// from its own work budget (interpret's strategyBudgetOverrides) grows the
+// set with it -- at the interpreter's default work budget, up to roughly
+// 1.3 GB on a sparse graph, since each buffer costs 5 bytes per node of the
+// WHOLE snapshot however few nodes the search reaches. No documented budget
+// was exceeded by that; nothing accounted for it either.
+//
+// strategyPairs' own three scratches are deliberately not reserved: three is
+// a constant, not something a caller's budget can scale.
 func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget, smallIsRoots bool) ([]Path, error) {
 	small := q.Terminals
 	if smallIsRoots {
 		small = q.Roots
 	}
 	elems := materialize(small, s)
+
+	if !budget.reserve(scratchBytes(s.NodeCount()) * uint64(len(elems))) {
+		return nil, ErrTooLarge
+	}
 
 	// small side = roots -> forward BFS (dist-from-root) per root.
 	// small side = terminals -> reverse BFS (dist-to-terminal) per terminal.
