@@ -52,8 +52,19 @@ type loadedWatermark struct {
 	counter   uint64
 	counterOK bool
 
+	// counterErr is why the counter could not be read. Reported whether or
+	// not the lineage was asked for: without it the ledger is not rebased
+	// (adoptRebuiltViewAndRebase), so a counter nothing else accounts for
+	// stays unaccounted and every later save is refused as if another
+	// BloodTrail server were writing (saveSnapshotProbe). That refusal's own
+	// Warn cannot name this cause, so this one does.
+	counterErr error
+
 	// lineageErr is why the lineage could not be read, when it was asked
-	// for; the snapshot then carries none.
+	// for; the snapshot then carries none. Only ever the lineage's own read:
+	// the counter is read first, inside the same transaction, so its failure
+	// aborts the transaction and is reported as counterErr rather than
+	// blamed on a lineage read that never ran.
 	lineageErr error
 }
 
@@ -72,9 +83,9 @@ type loadedWatermark struct {
 // else still has to run in it. The counter is read first; the lineage only
 // after it succeeded. A failed read fails nothing else -- the graph read is
 // sound either way: a snapshot with no lineage is simply never written to a
-// file, and one with no counter never rebases the ledger -- and a failure
-// the caller asked the lineage for comes back as lineageErr, for it to say
-// why no file will be written from this snapshot.
+// file, and one with no counter never rebases the ledger -- and each failure
+// comes back as its own error (counterErr, lineageErr) for the caller to say
+// what it costs, rather than one standing in for the other.
 func loadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool, withCounter, withLineage bool) (snap *snapshot.Snapshot, loaded loadedWatermark, err error) {
 	graphModel, ok := pgDriver.DefaultGraph()
 	if !ok {
@@ -108,9 +119,7 @@ func loadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool, 
 	if withCounter || withLineage {
 		if err := tx.QueryRow(ctx, selectWatermarkCounterSQL).Scan(&loaded.counter); err != nil {
 			loaded.counter = 0
-			if withLineage {
-				loaded.lineageErr = fmt.Errorf("engine: LoadSnapshot: read watermark counter: %w", err)
-			}
+			loaded.counterErr = fmt.Errorf("engine: LoadSnapshot: read watermark counter: %w", err)
 		} else {
 			loaded.counterOK = true
 			if withLineage {

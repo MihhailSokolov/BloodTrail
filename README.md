@@ -366,6 +366,7 @@ set or BloodHound's own log level is debug.
 | `watermark bump failed` / `watermark table DDL failed` | Warn | The write counter could not be advanced / its table created |
 | `watermark lineage DDL failed; ...` | Warn | The lineage column could not be added; no snapshot file is written or adopted until a later start adds it |
 | `could not read the watermark lineage; ...` | Warn | No snapshot file will be written from that rebuild |
+| `could not read the watermark counter during the load; ...` | Warn | That rebuild did not account for the counter, so a later save may be refused as if another server were writing |
 | `could not record where PostgreSQL stood at start; ...` | Warn | That boot adopts no snapshot file and rebuilds from PostgreSQL: the checks that compare a file against the start state cannot be made |
 | `watermark failure settled by a write that produced no effect; ...` | Debug | A rebuild was requested to restore trust in the counter |
 | `snapshot file loaded` / `snapshot file rejected` | Info | The boot reused the saved file (`replayed_writes`) / declined it (`reason`, or `error` for an unreadable or older-format file) and rebuilt instead |

@@ -1217,8 +1217,11 @@ instant of the database:
    (`select lineage from bloodtrail_watermark where id = 1`), as the transaction's last
    statements, so they describe the instant the rows belong to ([Section 13](#13-the-watermark)).
    On a database without the table or the lineage column the read fails and aborts the
-   transaction, which is why nothing follows it; the load is still used, and a load whose lineage
-   could not be read logs `could not read the watermark lineage` at Warn.
+   transaction, which is why nothing follows it; the load is still used, and each failure says so
+   at Warn under its own cause: a lineage that could not be read logs
+   `could not read the watermark lineage`, and a counter that could not be read logs
+   `could not read the watermark counter during the load`, which is what later refuses saves
+   ([§13.4](#134-one-writer)) since nothing rebased the ledger onto it.
 
 Decoding each node's JSON properties is the expensive step, so rows stream from a single cursor into
 a pool of parser goroutines (one per CPU core), while a single consumer hands parsed nodes to the
@@ -3629,6 +3632,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
+| `could not read the watermark counter during the load; this rebuild did not account for it, so a snapshot file save may be refused as if another server were writing` | Warn | An adopted load could not read the counter, so the ledger was not rebased onto it ([§13.4](#134-one-writer)) |
 | `could not record where PostgreSQL stood at start; no snapshot file will be adopted this start, and the boot will rebuild from PostgreSQL` | Warn | `Start`'s read of the counter and sequence positions failed, so the file checks that compare against it cannot be made |
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
 | `snapshot file invalidation failed` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`); delete the file by hand before the next restart |

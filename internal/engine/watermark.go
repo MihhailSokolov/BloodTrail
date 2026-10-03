@@ -1052,6 +1052,13 @@ func (e *Engine) WatermarkTrusted(ctx context.Context) bool {
 // lock is released however adoptRebuiltView returns, a panic included: held
 // past it, it would stall every convergence read -- every snapshot save with
 // it -- for good.
+//
+// An adoption whose load could not read the counter at all says so (Warn):
+// this is the one place that knows a rebuild went by without rebasing, and
+// a counter nobody rebases onto is exactly what later refuses every save
+// with saveSnapshotProbe's "another BloodTrail server may be writing"
+// reason -- a Warn that cannot name this cause, and would be the only trace
+// of it.
 func (e *Engine) adoptRebuiltViewAndRebase(ctx context.Context, view *snapshot.View, epoch, settledGen uint64, loaded loadedWatermark) bool {
 	e.watermarkRebaseMu.Lock()
 	defer e.watermarkRebaseMu.Unlock()
@@ -1061,6 +1068,10 @@ func (e *Engine) adoptRebuiltViewAndRebase(ctx context.Context, view *snapshot.V
 	}
 	if loaded.counterOK {
 		e.appliedWatermark.rebase(loaded.counter)
+	} else if loaded.counterErr != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not read the watermark counter during the load; this rebuild did not account for it, so a snapshot file save may be refused as if another server were writing",
+			slog.Any("error", loaded.counterErr),
+		)
 	}
 	return true
 }
