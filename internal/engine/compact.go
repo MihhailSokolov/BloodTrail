@@ -538,7 +538,7 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 		slog.Uint64("bytes", bytes),
 	)
 
-	folded, adopted := e.foldAndAdoptCompaction(capturedBase, capturedSegs, start)
+	folded, carriedEdges, adopted := e.foldAndAdoptCompaction(capturedBase, capturedSegs, start)
 	if !adopted {
 		return
 	}
@@ -551,9 +551,19 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 	released = true
 	e.compacting.Store(false)
 
+	// carried_edges is the one number that explains a post-compaction save
+	// that never happens: a delta edge whose endpoint has not arrived is
+	// re-carried by every compaction (adoptCompaction's pending), so the
+	// adopted View always has a segment, and a save that requires an empty
+	// delta is skipped every time (saveSnapshotAfterCompaction, persist.go).
+	// An endpoint that never arrives makes that permanent, and without this
+	// attribute nothing said so: the save's own line is at Debug and names
+	// only the segment count, and the delta that triggered this compaction
+	// looks the same from outside whether or not anything was carried.
 	e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction finished",
 		slog.Int("nodes", folded.NodeCount()),
 		slog.Int("edges", folded.EdgeCount()),
+		slog.Int("carried_edges", carriedEdges),
 		slog.Duration("duration", time.Since(start)),
 	)
 
@@ -564,8 +574,11 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 
 // foldAndAdoptCompaction is runCompaction's fold and publish -- everything
 // but the snapshot-file save that follows a successful adoption -- including
-// both of its bgCtx checkpoints. It returns the folded snapshot and whether
-// adoptCompaction adopted it; every way of not adopting is logged here.
+// both of its bgCtx checkpoints. It returns the folded snapshot, how many
+// delta edges the adoption had to carry forward because their endpoint has
+// not arrived (adoptCompaction's pending; see runCompaction's own log line
+// for why that count is worth reporting), and whether adoptCompaction
+// adopted it; every way of not adopting is logged here.
 //
 // A panic anywhere in it -- the fold itself, or the tail merge and Warm
 // passes inside the adoption -- is recovered and becomes a fallback
@@ -576,28 +589,28 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 // recovered from inside its critical section would leave the lock every
 // write takes held for good -- worse than the crash the recover exists to
 // prevent.
-func (e *Engine) foldAndAdoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment, start time.Time) (folded *snapshot.Snapshot, adopted bool) {
+func (e *Engine) foldAndAdoptCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*snapshot.Segment, start time.Time) (folded *snapshot.Snapshot, carriedEdges int, adopted bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			_ = e.backgroundPanicked(e.bgCtx, "compaction", r)
-			folded, adopted = nil, false
+			folded, carriedEdges, adopted = nil, 0, false
 		}
 	}()
 
 	if e.bgCtx.Err() != nil {
 		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded", slog.String("reason", "engine stopping"))
-		return nil, false
+		return nil, 0, false
 	}
 
 	folded, pending, err := snapshot.FoldWithPendingEdges(capturedBase, capturedSegs)
 	if err != nil {
 		e.cfg.Log.WarnContext(e.bgCtx, "bloodtrail: compaction failed", slog.Any("error", err))
-		return nil, false
+		return nil, 0, false
 	}
 
 	if e.bgCtx.Err() != nil {
 		e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction discarded", slog.String("reason", "engine stopping"))
-		return nil, false
+		return nil, 0, false
 	}
 
 	if !e.adoptCompaction(capturedBase, capturedSegs, folded, pending) {
@@ -605,7 +618,10 @@ func (e *Engine) foldAndAdoptCompaction(capturedBase *snapshot.Snapshot, capture
 			slog.String("reason", "base or segment stack changed while folding"),
 			slog.Duration("duration", time.Since(start)),
 		)
-		return nil, false
+		return nil, 0, false
 	}
-	return folded, true
+	if pending != nil {
+		carriedEdges = pending.EdgeCount()
+	}
+	return folded, carriedEdges, true
 }

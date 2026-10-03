@@ -2807,7 +2807,9 @@ total size on each new view, so they must periodically be folded back into a fre
   together with the fold's pending edges ([§6.7](#67-fold)) beneath them, and placed on the new
   base, which works because segments identify things by database id. An edge whose endpoint has
   not arrived yet thus stays in the delta, invisible, until the endpoint's write lands, instead of
-  being lost. The new view is warmed and published, and the snapshot file is written
+  being lost; how many were carried is reported as `carried_edges` on the `compaction finished`
+  line, because that is what a save skipped for a non-empty delta is otherwise silent about. The
+  new view is warmed and published, and the snapshot file is written
   ([§14.2](#142-the-snapshot-file)).
 - **A panic** while folding or adopting is recovered (`foldAndAdoptCompaction`): it logs
   `bloodtrail: compaction panicked` at Error and enters FALLBACK, instead of ending the process.
@@ -2833,7 +2835,8 @@ With `BLOODTRAIL_SNAPSHOT_DIR` set, the replica is saved to `<dir>/graph-<graphI
 - after each **adopted compaction**, unless more writes have arrived since, or the compaction
   carried an edge still waiting for its endpoint (either leaves the adopted view with a segment).
   An endpoint that never arrives therefore stops these saves until the next restart; the shutdown
-  save still writes.
+  save still writes. The `compaction finished` line's `carried_edges` is where that shows, since
+  the skipped save itself logs at Debug.
 
 A file is written only when the engine can prove the replica complete (SERVING, trusted, watermark
 converged, [§13.1](#131-the-counter)), no write was applied while the counter was being read, the
@@ -3644,7 +3647,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
 | `snapshot file invalidation failed` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
-| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above) |
+| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above). `finished` carries `carried_edges`: delta edges re-carried because their endpoint has not arrived, which is what keeps the post-compaction save from writing a file ([§14.2](#142-the-snapshot-file)) |
 
 ## Appendix C: Code map
 

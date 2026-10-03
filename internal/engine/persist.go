@@ -392,7 +392,12 @@ func (e *Engine) saveSnapshotPrepare(ctx context.Context, epoch uint64, converge
 	if requireEmptyDelta && len(segments) > 0 {
 		e.applyMu.Unlock()
 		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot file skipped",
-			slog.String("reason", "segments pending since adoption; the next compaction's own save covers it"),
+			// Not a promise: a delta edge whose endpoint never arrives is
+			// re-carried by every compaction, so for as long as one is
+			// carried this skip repeats and no file is written at all. The
+			// "compaction finished" line's carried_edges (compact.go) is
+			// what tells the two apart.
+			slog.String("reason", "segments pending since adoption; a later compaction's save covers them once nothing is left pending"),
 			slog.Int("segments", len(segments)),
 		)
 		return nil, nil
