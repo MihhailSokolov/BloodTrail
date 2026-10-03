@@ -179,6 +179,10 @@ func (b *memBudget) add(n uint64) error {
 // would exceed the budget's limit. The caller is expected to decline the
 // whole query rather than allocate anyway -- which is what this exists to
 // prevent, so the reservation is always taken BEFORE the allocation.
+//
+// There is no matching release, and none is needed: a memBudget is built per
+// AllShortestPaths call and the scratch outlives every phase charged against
+// it, so the reservation is correct for the budget's whole life.
 func (b *memBudget) reserve(n uint64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
