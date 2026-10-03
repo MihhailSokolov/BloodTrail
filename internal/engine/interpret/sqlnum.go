@@ -103,6 +103,37 @@ func printedFloatSQLNum(v float64) sqlNum {
 	return integerSQLNum(n)
 }
 
+// negatedLiteralSQLNum is the type PostgreSQL gives a minus sign over a
+// number literal, which dawgs prints as `- 2147483648` and PostgreSQL's
+// grammar folds into one constant (doNegate) before typing it: the type
+// follows the negated value, so `- 2147483648` is the int4 -2147483648 and
+// `- 2147483649` an int8, not a sign over the int8 the literal alone would
+// be. false when u is not a minus sign over a number literal (parentheses
+// aside, which fold too). A sign over a sign is not folded here: the inner
+// one is, and the outer negates its int4 -- declining at the int4 minimum,
+// where PostgreSQL's whole-chain fold would give the int8 2147483648.
+func negatedLiteralSQLNum(u *cypher.UnaryAddOrSubtractExpression) (sqlNum, bool) {
+	if u == nil || u.Operator != cypher.OperatorSubtract {
+		return sqlNumNone, false
+	}
+	lit, ok := unwrapBareArithmetic(u.Right).(*cypher.Literal)
+	if !ok || lit == nil || lit.Null {
+		return sqlNumNone, false
+	}
+	switch v := lit.Value.(type) {
+	case int64:
+		return integerSQLNum(-v), true
+	case uint64:
+		if v > 1<<63 {
+			return sqlNumNumeric, true
+		}
+		return integerSQLNum(-int64(v)), true
+	case float64:
+		return printedFloatSQLNum(-v), true
+	}
+	return sqlNumNone, false
+}
+
 // fractionalLiteral reports whether expr -- parentheses, signs and
 // operator-less arithmetic aside -- is a float literal dawgs prints with a
 // fraction, which PostgreSQL computes with as an exact numeric.
@@ -416,7 +447,11 @@ func operandTyping(expr cypher.Expression) (sqlNum, dawgsHint) {
 		}
 	case *cypher.UnaryAddOrSubtractExpression:
 		if e != nil {
-			return operandTyping(e.Right)
+			t, h := operandTyping(e.Right)
+			if folded, isLiteral := negatedLiteralSQLNum(e); isLiteral {
+				t = folded
+			}
+			return t, h
 		}
 	case *cypher.Variable:
 		return sqlNumInt8, hintNone

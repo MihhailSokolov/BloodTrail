@@ -304,3 +304,29 @@ func TestTryCypherOverlayNonCanonicalNumbersMatchOracle(t *testing.T) {
 		{`MATCH (n:OvlNum) WHERE n.name = 'o3' RETURN n.name`, true},
 	})
 }
+
+// TestTryCypherNegatedIntegerLiteralMatchesOracle compares arithmetic over a
+// negated integer literal with PostgreSQL. dawgs prints `-2147483648` as `-
+// 2147483648`, and PostgreSQL's grammar folds a sign applied to a numeric
+// constant into the constant itself (doNegate), so the result is the int4
+// -2147483648 -- not a negated int8 -- and `-2147483648 - 1` overflows int4.
+// The evaluator typed the sign by its operand, int8, and served.
+func TestTryCypherNegatedIntegerLiteralMatchesOracle(t *testing.T) {
+	pgDriver, eng := seedTypedGraph(t, []typedNode{
+		{"IntNeg", map[string]any{"name": "a", "i": 1, "l": []any{"x", "y", "z"}}},
+		{"IntNeg", map[string]any{"name": "b", "i": 2, "l": []any{"x"}}},
+	})
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:IntNeg) WHERE -2147483648 - 1 < 0 RETURN n`, false},
+		{`MATCH (n:IntNeg) WHERE n.i < -2147483648 * -1 RETURN n`, false},
+		{`MATCH (n:IntNeg) WHERE size(n.l) * -2147483648 > 0 RETURN n`, false},
+		{`MATCH (n:IntNeg) WHERE -2147483648.0 - 1 < 0 RETURN n`, false},
+		{`MATCH (n:IntNeg) WHERE -(-2147483648) > 0 RETURN n`, false},
+
+		{`MATCH (n:IntNeg) WHERE -2147483648 + 1 < 0 RETURN n`, true},
+		{`MATCH (n:IntNeg) WHERE -2147483649 - 1 < 0 RETURN n`, true},
+		{`MATCH (n:IntNeg) WHERE n.i > -2147483648 RETURN n`, true},
+		{`MATCH (n:IntNeg) WHERE -(-5) * 2 = 10 RETURN n`, true},
+	})
+}

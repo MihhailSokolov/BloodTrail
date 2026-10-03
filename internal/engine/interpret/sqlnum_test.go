@@ -204,3 +204,29 @@ func TestCastPropertyAsInt4Range(t *testing.T) {
 		t.Errorf("castPropertyAs('2147483647', int4) = %v, %v", got, err)
 	}
 }
+
+// TestNegatedLiteralTyping pins the type PostgreSQL gives a minus sign over
+// a number literal: its grammar folds the sign into the constant, so the type
+// follows the negated value. A plus sign, and a sign over anything else,
+// keeps the operand's type.
+func TestNegatedLiteralTyping(t *testing.T) {
+	for _, tc := range []struct {
+		expr string
+		want sqlNum
+	}{
+		{"-2147483648", sqlNumInt4},
+		{"-(2147483648)", sqlNumInt4},
+		{"-2147483649", sqlNumInt8},
+		{"-2147483648.0", sqlNumInt4},
+		{"-2.5", sqlNumNumeric},
+		{"-5", sqlNumInt4},
+		{"+2147483648", sqlNumInt8},
+		{"-size(n.l)", sqlNumInt4},
+		{"-id(n)", sqlNumInt8},
+	} {
+		got, _ := operandTyping(returnExprOf(t, "MATCH (n) RETURN "+tc.expr))
+		if got != tc.want {
+			t.Errorf("type of %s = %v, want %v", tc.expr, got, tc.want)
+		}
+	}
+}

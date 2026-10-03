@@ -3205,9 +3205,12 @@ func evalUnary(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) (any,
 	return val, ok, err
 }
 
-// evalUnaryTyped is evalUnary, returning also the operand's PostgreSQL type,
-// which a sign keeps. Negating an int4 can overflow it: -(-2147483648) is
-// "integer out of range" in PostgreSQL.
+// evalUnaryTyped is evalUnary, returning also the result's PostgreSQL type.
+// A sign keeps its operand's type, except a minus sign over a number literal,
+// which PostgreSQL folds into a constant of the negated value's type
+// (negatedLiteralSQLNum: `- 2147483648` is an int4). Negating an int4 can
+// overflow it: -(-2147483648) declines here, as the int4 minimum has no
+// int4 negation.
 func evalUnaryTyped(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) (any, bool, sqlNum, error) {
 	val, ok, t, err := evalOperandTyped(env, row, u.Right)
 	if err != nil {
@@ -3221,6 +3224,9 @@ func evalUnaryTyped(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) 
 		return nil, false, sqlNumNone, ErrRuntimeCast
 	}
 	if u.Operator == cypher.OperatorSubtract {
+		if folded, isLiteral := negatedLiteralSQLNum(u); isLiteral {
+			return -f, true, folded, nil
+		}
 		if t == sqlNumInt4 && f == minInt4 {
 			return nil, false, sqlNumNone, ErrRuntimeCast
 		}
