@@ -265,8 +265,16 @@ func (p *bumpStallProxy) releaseHeld() { p.releaseOnce.Do(func() { close(p.relea
 //     through the stale fallback, and the whole pool talks to PostgreSQL
 //     DIRECTLY: every statement works, nothing reaches the proxy, and the
 //     armed bump is never seen. That is what failed CI on postgres:18 while
-//     passing locally, where the DSN says sslmode=disable and so parses to no
+//     passing locally, where the DSN said sslmode=disable and so parsed to no
 //     fallback at all.
+//
+// Neither assignment is optional and neither is redundant with the other: the
+// cleared TLSConfig alone still leaves the cleartext fallback pointing at the
+// real PostgreSQL, and the cleared Fallbacks alone still leaves a TLS primary
+// the proxy cannot read. ci.yml now pins sslmode=disable in
+// BLOODTRAIL_TEST_PG, which is belt and braces -- it does not make these two
+// lines removable, since this helper must hold for any DSN a developer
+// exports.
 func bumpStallEnginePool(t *testing.T, dsn string) (*bumpStallProxy, *pgxpool.Pool) {
 	t.Helper()
 	cfg, err := pgxpool.ParseConfig(dsn)
