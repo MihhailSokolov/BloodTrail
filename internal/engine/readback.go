@@ -30,9 +30,8 @@ const readbackObjectIDChunk = 5_000
 
 // unresolvedTripleKind marks an absentTriples entry whose kind name never
 // resolved to a KindID at all -- the same sentinel dawgs' own
-// SchemaManager.MapKind returns (drivers/pg/manager.go) for a kind it
-// doesn't recognize, since no real kind_id column value can ever be
-// negative. A
+// SchemaManager.MapKind returns (drivers/pg/manager.go) for a kind it does
+// not recognize, since no real kind_id column value can ever be negative. A
 // kind pg has never heard of cannot possibly back a real edge row, so the
 // triple this marks was never actually queried against the edge table --
 // see readBack's own doc for why that's a safe shortcut, not merely an
@@ -126,12 +125,11 @@ type readbackResult struct {
 //  4. cs.EdgeTriples() by (start, end, kind name) -- resolveKindIDs
 //     resolves each distinct kind name to its current KindID, against view's
 //     own kind table and otherwise the `kind` table itself; a name that
-//     ends up unresolved (genuinely never asserted, per resolveKindIDs' own
-//     doc -- which also covers the residual ambiguity a name can be
-//     unresolved for) means the triple is reported absent (kindID
-//     unresolvedTripleKind) without ever being queried. A hard failure
-//     resolving kind ids (ctx cancellation or deadline) aborts readBack
-//     entirely instead of guessing -- see resolveKindIDs' own doc.
+//     ends up unresolved (the kind table holds no row for it, so it was
+//     never asserted -- resolveKindIDs' own doc) means the triple is
+//     reported absent (kindID unresolvedTripleKind) without ever being
+//     queried. A kind-table read that FAILS aborts readBack entirely
+//     instead of guessing -- see resolveKindIDs' own doc.
 //     Every triple whose kind does resolve is queried in one shared batch
 //     pass together with (5) below (readBackEdgesByTriple, adapted from
 //     hydrate.go's own edgeBatchQuery); a triple not found in the result is
