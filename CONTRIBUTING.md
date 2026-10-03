@@ -44,8 +44,9 @@ sufficient:
 - `e2e.yml` builds the patched image and runs `build/e2e.sh v9.6.0`, the full
   install/verify/rollback cycle against a live compose stack (needs Docker; see
   [build/README.md](build/README.md#end-to-end-test)).
-- Each workflow ends in an aggregate job, `ci-ok` and `e2e-ok`, that fails unless every
-  job before it succeeded; those two are the checks to require before merging (see
+- The two workflows that run on pull requests, `ci.yml` and `e2e.yml`, each end in an
+  aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before it succeeded;
+  those two are the checks to require before merging (see
   [build/README.md](build/README.md#merge-gate)). A job added to a workflow belongs in
   its gate's `needs`.
 

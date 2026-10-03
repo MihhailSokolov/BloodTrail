@@ -312,8 +312,9 @@ clear_database '{"deleteSourceKinds":[0]}'
 # removes nothing. The count is pinned rather than read from the engine before
 # the delete, which would make this check agree with whatever the engine
 # serves, right or wrong: 131 is the 118 nodes that BloodHound v9.6.0's ingest
-# and analysis of the SharpHound fixture leave (the synced AD user is one of
-# them) plus the 13 that graph.json adds, its 12 nodes and the stub GHX_USER_9.
+# and analysis of the SharpHound fixture leave before this phase (the synced AD
+# user is one of them) plus the 13 that graph.json adds, its 12 nodes and the
+# stub GHX_USER_9.
 # That sum agrees with the 131 BloodTrail answered in the CI e2e run on main
 # before this count was pinned (run 36621234497), which is where the number came
 # from: it is not a measurement on stock PostgreSQL, and it holds for v9.6.0's

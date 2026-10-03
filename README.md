@@ -8,11 +8,12 @@ and ordinary hardware.
 Shortest paths, the structural queries BloodHound's own code issues, and a broad surface
 of Cypher -- including every pre-built query the UI ships, and OpenGraph data -- are
 served from an in-memory replica that is kept in sync with PostgreSQL write by write.
-Anything the engine cannot answer exactly as PostgreSQL would is delegated to
-PostgreSQL, so apart from one documented detail
-([below](#what-is-accelerated-and-what-is-not)) the only difference you should see is
-latency. On a 1M-node forest, every shipped query plus a set of adversarial ones runs in
-7.9s instead of 85.6s ([BENCHMARK.md](BENCHMARK.md)).
+Anything the engine cannot answer exactly as PostgreSQL would is delegated to PostgreSQL,
+so apart from a few narrow documented cases
+([below](#what-is-accelerated-and-what-is-not);
+[WHITEPAPER.md §19](WHITEPAPER.md#19-limitations) lists them) the only difference you
+should see is latency. On a 1M-node forest, every shipped query plus a set of adversarial
+ones runs in 7.9s instead of 85.6s ([BENCHMARK.md](BENCHMARK.md)).
 
 How it works, from the background up, is in [WHITEPAPER.md](WHITEPAPER.md).
 
@@ -206,27 +207,28 @@ temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is m
   picks (`compose.yaml` wins over `docker-compose.yml` in the same directory); otherwise
   the installer stops and asks for `--compose-file` or an entry.
 - **The installer stops before changing anything when it cannot be sure which files
-  docker compose loads for you**: a `COMPOSE_FILE` entry that is empty, set twice,
-  quoted in a way it cannot follow (a quote left open on its line, text after the
-  closing quote, quotes inside an unquoted value, or the entry sharing a line with
-  another value), uses interpolation or escapes, has an empty or space-padded name, does
-  not list the compose file it was given, or lists a file that does not exist; an entry
-  whose first file is not in the directory of `.env`, or, with no entry, a compose file
-  given from another directory (docker compose takes the first file's directory as the
-  project directory and resolves relative paths such as a `./pgdata` bind mount against
-  it, while the installer addresses the directory of `.env`); a
-  `COMPOSE_PATH_SEPARATOR` line in `.env`; `COMPOSE_FILE` (or a non-empty
-  `COMPOSE_PATH_SEPARATOR` other than `:`), a non-empty `COMPOSE_ENV_FILES`, or a
-  `COMPOSE_DISABLE_ENV_FILE` that is true (or not a boolean at all) set in the shell's
-  environment, all of which make docker compose read something other than `.env`; or a
-  `.env` the install has to change that this user cannot write. The message names what it
-  found, and usually what to change. `.env` is replaced atomically, keeping its mode and
-  owner (and a symbolic link), but not extended attributes, ACLs or a hard link to it, and
-  a `.env` that is itself a mount point cannot be replaced. `status`, `verify` and
-  `rollback` read the project more forgivingly (with several `COMPOSE_FILE` lines, the
-  last wins, as in docker compose), so they keep working on whatever an earlier install
-  left behind; where an earlier version wrote its override into an empty `COMPOSE_FILE=`
-  entry, rollback puts the empty entry back as it was.
+  docker compose loads for you**: a `COMPOSE_FILE` entry that is empty, set twice, quoted
+  in a way it cannot follow (a quote left open on its line, text after the closing quote,
+  quotes inside an unquoted value, or the entry sharing a line with another value), uses
+  interpolation or escapes, has an empty or space-padded name, does not list the compose
+  file it was given, or lists a file that does not exist; an entry whose first file is
+  not in the directory of `.env`, or, with no entry, a compose file given from another
+  directory (docker compose takes the first file's directory as the project directory and
+  resolves relative paths such as a `./pgdata` bind mount against it, while the installer
+  addresses the directory of `.env`); a `COMPOSE_PATH_SEPARATOR` line in `.env`; in the
+  shell's environment, `COMPOSE_FILE` (which docker compose takes over the entry in
+  `.env`), a non-empty `COMPOSE_PATH_SEPARATOR` other than `:` (which splits that entry
+  into names that do not exist), a non-empty `COMPOSE_ENV_FILES` or a true
+  `COMPOSE_DISABLE_ENV_FILE` (which leave `.env` unread), or a `COMPOSE_DISABLE_ENV_FILE`
+  that is not a boolean (on which docker compose stops with an error); or a `.env` the
+  install has to change that this user cannot write. The message names what it found, and
+  usually what to change. `.env` is replaced atomically, keeping its mode and owner (and
+  a symbolic link), but not extended attributes, ACLs or a hard link to it, and a `.env`
+  that is itself a mount point cannot be replaced. `status`, `verify` and `rollback` read
+  the project more forgivingly (with several `COMPOSE_FILE` lines, the last wins, as in
+  docker compose), so they keep working on whatever an earlier install left behind; where
+  an earlier version wrote its override into an empty `COMPOSE_FILE=` entry, rollback
+  puts the empty entry back as it was.
 - **Rollback of installs made by v0.1.0 to v0.1.2** decides what to do with the
   `COMPOSE_FILE` entry from the copy of `.env` in the backup directory, since those
   versions did not record what they wrote: an entry that was there before the install
@@ -240,12 +242,16 @@ temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is m
 - **When rollback leaves the restart to you.** If the restored project's first
   `COMPOSE_FILE` file (or, with no entry, the compose file the install was given) is not
   in the directory of `.env`, a restart from rollback could recreate a service with its
-  data on a different host path. Rollback then does everything else and tells you that
-  BloodTrail is still running: restart with your own `docker compose up -d` from the
-  directory you usually run it in. The stock image then writes the graph without
-  BloodTrail, so the [snapshot directory](#fast-restarts-the-snapshot-directory) rule
-  applies: before starting BloodTrail any way other than `bloodtrail install`, end the
-  lineage or delete the snapshot file.
+  data on a different host path. Rollback then does everything else, ending the watermark
+  lineage among it, and tells you that BloodTrail is still running: restart with your own
+  `docker compose up -d` from the directory you usually run it in. Because the lineage
+  ended while BloodTrail still ran, a snapshot file it saves after reloading in that
+  window names the new lineage and would stay adoptable after the stock image writes the
+  graph. So once the original image is running, end the lineage again (rollback prints
+  the `psql` command; see the
+  [snapshot directory](#fast-restarts-the-snapshot-directory)), or delete the snapshot
+  file before starting BloodTrail any way other than `bloodtrail install`, which ends it
+  itself.
 - **Rollback returns the deployment to the graph it had before the install.** On a
   deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
@@ -397,12 +403,17 @@ Always answered by PostgreSQL (correct, just not faster):
 - Every query -- Cypher, builder and shortest path -- on a database that holds more than
   one graph with data.
 - Any Cypher query that reads a property holding a number stored in a spelling the
-  replica cannot reproduce, such as `1.0` or an integer beyond 2^53 (BloodHound itself
-  writes neither).
+  replica cannot reproduce, such as `1.0`, or an integer its float64 cannot spell back
+  (one beyond 2^53); BloodHound itself writes neither.
 
-One documented difference: in a served query's conditions, `datetime()`'s epoch
-accessors read the BloodHound server's clock when the query starts, where PostgreSQL
-reads its own `now()`.
+Documented differences ([WHITEPAPER.md §19](WHITEPAPER.md#19-limitations)): in a served
+query's conditions, `datetime()`'s epoch accessors read the BloodHound server's clock
+when the query starts, where PostgreSQL reads its own `now()`; for a `shortestPath`
+without `s <> t`, whether PostgreSQL raises its shared-endpoint error can depend on its
+query plan, so on some plans PostgreSQL fails a query BloodTrail answers (where both
+answer, the answers agree); and an objectid-keyed edge upsert whose endpoint is re-keyed
+before the upsert is applied leaves the edge it created out of the replica until a later
+write names it or a reload.
 
 Out of scope today: interpreting mutating Cypher and arbitrary update/delete criteria
 (both trigger a fallback rebuild), cache coherence across more than one BloodTrail

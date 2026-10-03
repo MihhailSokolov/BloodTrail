@@ -467,9 +467,10 @@ echo "==> Restarting the API container to prove the snapshot file survives it"
 # it again in place once it exits, with no config change to react to. A
 # generous --timeout keeps a slow fold+write from ever racing SIGKILL on
 # this tiny fixture graph, though the graph is small enough that this
-# should never bind in practice: the save this phase measures folds and
-# writes 118 nodes / 974 edges in about 7ms, four orders of magnitude
-# inside even the 10s default.
+# should never bind in practice: the save this phase measures folded and
+# wrote 118 nodes / 974 edges in about 7ms when it was measured (before the
+# OpenGraph phase ran ahead of it), four orders of magnitude inside even the
+# 10s default.
 #
 # The shutdown-side assertion is what earns this phase a real container
 # stop rather than a driver-level test. The save runs inside Driver.Close,
