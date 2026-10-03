@@ -1734,8 +1734,18 @@ func adjacentInDirection(env *Env, dir graph.Direction, from, to snapshot.NodeID
 // an admissible edge kind, to a node carrying every label in nodeKinds (nil
 // nodeKinds admitting any node). It stops at the first hit, so the common
 // answer on a dense graph costs one edge.
+//
+// Undirected with labels, `(a)-[:R]-(:Z)`, the neighbour must be another
+// node: dawgs joins the labelled end to either endpoint of the edge and
+// requires `(s0.n0).id <> n1.id`, so src's own self-loop is no witness. An
+// unlabelled end is a plain EXISTS over the edges there, and a directed one
+// joins the far endpoint only; both count the self-loop.
 func hasKindedNeighbor(env *Env, src snapshot.NodeID, dir graph.Direction, nodeKinds, edgeKinds []snapshot.KindID) bool {
+	otherNodeOnly := dir == graph.DirectionBoth && len(nodeKinds) > 0
 	match := func(n snapshot.NodeID, k snapshot.KindID) bool {
+		if otherNodeOnly && n == src {
+			return false
+		}
 		return edgeKindOK(edgeKinds, k) && nodeHasAllKinds(env, n, nodeKinds)
 	}
 	found := false
