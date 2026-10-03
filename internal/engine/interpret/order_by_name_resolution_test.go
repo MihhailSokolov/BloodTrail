@@ -84,6 +84,25 @@ func TestPlanDeclinesOrderByNameDAWGSResolvesElsewhere(t *testing.T) {
 		`MATCH (g:Group) RETURN g.v AS x, id(g) AS X ORDER BY X DESC`,
 		`MATCH (g:Group) RETURN id(g) AS x, g.v AS X ORDER BY x DESC`,
 		chain + `RETURN g, count(u) AS c, count(DISTINCT u) AS C ORDER BY c DESC`,
+		// A parenthesised name: dawgs rewrites only a bare identifier to the
+		// projection, so `ORDER BY (i)` is emitted as `order by (i0)`, a
+		// column that does not exist (42703).
+		`MATCH (g:Group) RETURN id(g) AS i ORDER BY (i)`,
+		`MATCH (g:Group) RETURN g, id(g) AS i ORDER BY (i) LIMIT 1`,
+		`MATCH (g:Group) RETURN g.v AS gv ORDER BY ((gv)) DESC`,
+		chain + `RETURN g, count(u) AS c ORDER BY (c)`,
+		`MATCH (g:Group) RETURN count(g) AS c ORDER BY (c)`,
+		counted + `RETURN g, c ORDER BY (c)`,
+		// A name PostgreSQL reserves, emitted unquoted: a syntax error (42601)
+		// or, for the reserved words that are SQL value functions (user,
+		// current_date, true), a constant sort key.
+		`MATCH (g:Group) RETURN id(g) AS select ORDER BY select`,
+		`MATCH (g:Group) RETURN id(g) AS table ORDER BY table`,
+		`MATCH (g:Group) RETURN id(g) AS group ORDER BY group DESC`,
+		`MATCH (g:Group) RETURN id(g) AS SELECT ORDER BY SELECT`,
+		`MATCH (g:Group) RETURN count(g) AS select ORDER BY select`,
+		`MATCH (g:Group) RETURN g.v AS user ORDER BY user`,
+		`MATCH (g:Group) RETURN g.v AS left ORDER BY left LIMIT 2`,
 	}
 	served := []string{
 		counted + `RETURN g, c ORDER BY c`,
@@ -95,6 +114,9 @@ func TestPlanDeclinesOrderByNameDAWGSResolvesElsewhere(t *testing.T) {
 		`MATCH (g:Group) RETURN g.v AS gv ORDER BY gv`,
 		`MATCH (g:Group) RETURN g.v AS g ORDER BY g.v`,
 		`MATCH (g:Group) RETURN id(g) AS i ORDER BY i DESC`,
+		// A keyword PostgreSQL does not reserve is an ordinary column name.
+		`MATCH (g:Group) RETURN id(g) AS name ORDER BY name`,
+		`MATCH (g:Group) RETURN id(g) AS value ORDER BY value DESC`,
 	}
 
 	plans := func(query string) bool {

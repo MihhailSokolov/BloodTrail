@@ -5727,18 +5727,19 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 //   - Any other name is emitted as the output alias, unquoted, which
 //     PostgreSQL folds to lower case before looking it up: under `RETURN n.v
 //     AS x, id(n) AS X ORDER BY X` both columns are x, and pg raises 42702
-//     (ORDER BY "x" is ambiguous).
+//     (ORDER BY "x" is ambiguous). A name that folds to a word PostgreSQL
+//     reserves is not a column reference there at all: `RETURN g.v AS select
+//     ORDER BY select` is a syntax error (42601), and `ORDER BY user` sorts
+//     by current_user, a constant (pgReservedWords).
+//   - dawgs rewrites only a bare identifier to the projection: a
+//     parenthesised name, `RETURN g.v AS gv ORDER BY (gv)`, is emitted as
+//     `order by (i0)`, a column that does not exist (42703).
 //
 // Either way the query declines. known is the scope the RETURN clause sees
 // BEFORE desugarReturnAggregates replaces it with the grouped aliases -- a
 // variable an aggregate folds (u in count(u)) is exactly a binding that can
-// shadow an alias.
-//
-// Not covered, and still planned although PostgreSQL rejects the SQL: a
-// parenthesised name, `RETURN g.v AS gv ORDER BY (gv)`, which dawgs emits
-// as `order by (i0)`, a column that does not exist (42703); and an alias
-// that is a PostgreSQL reserved word, `RETURN g.v AS select ORDER BY
-// select`, emitted unquoted (42601).
+// shadow an alias. A parenthesised or reserved name declines even where it
+// names a binding PostgreSQL might resolve -- a deliberate over-decline.
 func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
 	if ret == nil || ret.Projection == nil || ret.Projection.Order == nil {
 		return false
@@ -5757,8 +5758,11 @@ func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
 		if !isVar || v == nil {
 			continue
 		}
+		if _, parenthesised := sortItem.Expression.(*cypher.Parenthetical); parenthesised {
+			return true
+		}
 		column, ok := pgColumnName(v.Symbol)
-		if !ok {
+		if !ok || pgReservedWords[column] {
 			return true
 		}
 		_, bound := known[v.Symbol]
@@ -5785,6 +5789,42 @@ func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
 		}
 	}
 	return false
+}
+
+// pgReservedWords holds the key words PostgreSQL's grammar does not accept as
+// a column reference: the "reserved" and "reserved (can be function or type)"
+// categories of its SQL Key Words appendix (pg_get_keywords() catcode R and
+// T): PostgreSQL 14's list, plus system_user, reserved since PostgreSQL 16.
+// An unquoted `order by <word>` is a syntax error for most of them; the SQL
+// value functions among them (user, current_date, true, ...) parse as a
+// constant sort key instead. A non-reserved key word (name, value, ...) is
+// an ordinary column name there.
+var pgReservedWords = map[string]bool{
+	"all": true, "analyse": true, "analyze": true, "and": true, "any": true,
+	"array": true, "as": true, "asc": true, "asymmetric": true,
+	"authorization": true, "binary": true, "both": true, "case": true,
+	"cast": true, "check": true, "collate": true, "collation": true,
+	"column": true, "concurrently": true, "constraint": true, "create": true,
+	"cross": true, "current_catalog": true, "current_date": true,
+	"current_role": true, "current_schema": true, "current_time": true,
+	"current_timestamp": true, "current_user": true, "default": true,
+	"deferrable": true, "desc": true, "distinct": true, "do": true,
+	"else": true, "end": true, "except": true, "false": true, "fetch": true,
+	"for": true, "foreign": true, "freeze": true, "from": true, "full": true,
+	"grant": true, "group": true, "having": true, "ilike": true, "in": true,
+	"initially": true, "inner": true, "intersect": true, "into": true,
+	"is": true, "isnull": true, "join": true, "lateral": true,
+	"leading": true, "left": true, "like": true, "limit": true,
+	"localtime": true, "localtimestamp": true, "natural": true, "not": true,
+	"notnull": true, "null": true, "offset": true, "on": true, "only": true,
+	"or": true, "order": true, "outer": true, "overlaps": true,
+	"placing": true, "primary": true, "references": true, "returning": true,
+	"right": true, "select": true, "session_user": true, "similar": true,
+	"some": true, "symmetric": true, "system_user": true, "table": true,
+	"tablesample": true, "then": true, "to": true, "trailing": true,
+	"true": true, "union": true, "unique": true, "user": true, "using": true,
+	"variadic": true, "verbose": true, "when": true, "where": true,
+	"window": true, "with": true,
 }
 
 // isStaticallyNumericScalar reports whether expr (a RETURN item's own top-

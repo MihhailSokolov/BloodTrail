@@ -130,6 +130,19 @@ func TestTryCypherOrderByNameResolutionMatchesOracle(t *testing.T) {
 		// Two aliases PostgreSQL folds to one column name.
 		{`MATCH (g:OBGroup) RETURN g.v AS x, id(g) AS X ORDER BY X DESC`, false},
 		{chain + `RETURN g, count(u) AS c, count(DISTINCT u) AS C ORDER BY c DESC`, false},
+		// A parenthesised name: dawgs emits `order by (i0)` (42703).
+		{`MATCH (g:OBGroup) RETURN id(g) AS i ORDER BY (i)`, false},
+		{`MATCH (g:OBGroup) RETURN g, id(g) AS i ORDER BY (i) LIMIT 1`, false},
+		{chain + `RETURN g, count(u) AS c ORDER BY (c)`, false},
+		{`MATCH (g:OBGroup) RETURN count(g) AS c ORDER BY (c)`, false},
+		// A name PostgreSQL reserves, emitted unquoted: 42601, or -- user is
+		// current_user there -- a constant sort key.
+		{`MATCH (g:OBGroup) RETURN id(g) AS select ORDER BY select`, false},
+		{`MATCH (g:OBGroup) RETURN id(g) AS table ORDER BY table`, false},
+		{`MATCH (g:OBGroup) RETURN id(g) AS group ORDER BY group DESC`, false},
+		{`MATCH (g:OBGroup) RETURN count(g) AS select ORDER BY select`, false},
+		{`MATCH (g:OBGroup) RETURN g.v AS left ORDER BY left LIMIT 2`, false},
+		{`MATCH (g:OBGroup) RETURN g.v AS user ORDER BY user`, false},
 		// Alias and binding agree: still served.
 		{counted + `RETURN g, c ORDER BY c`, true},
 		{counted + `RETURN g, c ORDER BY c DESC LIMIT 2`, true},
@@ -140,6 +153,8 @@ func TestTryCypherOrderByNameResolutionMatchesOracle(t *testing.T) {
 		{`MATCH (g:OBGroup) RETURN g.v AS gv ORDER BY gv`, true},
 		{`MATCH (g:OBGroup) RETURN g.v AS g ORDER BY g.v`, true},
 		{`MATCH (g:OBGroup) RETURN id(g) AS i ORDER BY i DESC`, true},
+		{`MATCH (g:OBGroup) RETURN id(g) AS name ORDER BY name`, true},
+		{`MATCH (g:OBGroup) RETURN id(g) AS value ORDER BY value DESC`, true},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			var (

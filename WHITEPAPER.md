@@ -1830,12 +1830,9 @@ be reproduced exactly:
 | `ORDER BY` a text value | Collation |
 | `RETURN DISTINCT … ORDER BY` a key that is not returned | PostgreSQL rejects it ("for SELECT DISTINCT, ORDER BY expressions must appear in select list") |
 | `ORDER BY x` where `x` is both a `RETURN` alias and a variable the query binds (a node, relationship or path, or a carried `COUNT`, `COLLECT` or constant), unless that item is `x` itself; or where two `RETURN` aliases differ only in case | DAWGS sorts by the bound variable, not the alias (so different rows survive a `LIMIT`, and PostgreSQL rejects `RETURN count(u) AS u ORDER BY u`), and PostgreSQL folds the two aliases to one ambiguous name. A path variable is in fact sorted by the alias; declining it too is deliberate |
+| `ORDER BY (x)`, an alias in parentheses | DAWGS replaces only a bare name with the column, so `RETURN g.v AS gv ORDER BY (gv)` becomes `order by (i0)`, a column that does not exist |
+| `ORDER BY x` where `x` is a word PostgreSQL reserves (`select`, `table`, `group`, `user`, `left`, …) | DAWGS writes the name unquoted: a syntax error, or for `user`, `true` or `current_date`, a sort by a constant |
 | A backquoted alias (`` AS `My Col` ``) | DAWGS passes the backquotes through, which is invalid SQL, so PostgreSQL rejects the query |
-
-Two `ORDER BY` spellings that PostgreSQL rejects are not refused yet, and are answered from memory:
-a parenthesised alias, `RETURN g.v AS gv ORDER BY (gv)`, which DAWGS translates as
-`order by (i0)`, a column that does not exist; and an alias that is a PostgreSQL reserved word,
-`RETURN g.v AS select ORDER BY select`, which DAWGS writes unquoted.
 
 One known difference remains, in `datetime()`'s epoch accessors (`epochseconds`, `epochmillis`)
 inside conditions, such as the pre-built
@@ -3530,8 +3527,6 @@ in the [README](README.md).
   query naming a kind that no row carries yet and the replica has not learned (a failed OpenGraph
   upload's source kind, say) go to PostgreSQL: correct, but not faster. Several of these rules
   decline more than strictly necessary, by design.
-- **Two `ORDER BY` spellings PostgreSQL rejects are still served**: a parenthesised alias and an
-  alias that is a reserved word ([§11.2](#112-matching-dawgss-semantics)).
 - **A plan-dependent PostgreSQL error.** For a `shortestPath` without `s <> t`, whether PostgreSQL
   raises its shared-endpoint error can depend on its query plan, more widely than BloodTrail's
   decline rule covers; where PostgreSQL answers, the answers agree, but on some plans PostgreSQL
