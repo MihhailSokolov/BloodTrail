@@ -275,6 +275,91 @@ func (p *bumpStallProxy) releaseHeld() { p.releaseOnce.Do(func() { close(p.relea
 // BLOODTRAIL_TEST_PG, which is belt and braces -- it does not make these two
 // lines removable, since this helper must hold for any DSN a developer
 // exports.
+// pointConnConfigAtProxy makes the proxy at host:port the one address cc can
+// connect to, in cleartext: the four assignments whose necessity
+// bumpStallEnginePool's doc above explains, in one place so that
+// TestBumpStallPoolHasNoBypassForAnyDSNShape checks the same code the live
+// helper runs rather than a copy of it.
+func pointConnConfigAtProxy(cc *pgx.ConnConfig, host string, port uint16) {
+	cc.Host = host
+	cc.Port = port
+	cc.TLSConfig = nil
+	cc.Fallbacks = nil
+}
+
+// TestBumpStallPoolHasNoBypassForAnyDSNShape is the only automated cover for
+// the two assignments above, and it exists because ci.yml now pins
+// sslmode=disable in BLOODTRAIL_TEST_PG: on that one DSN shape pgx parses no
+// fallback and offers no TLS, so CI alone would stay green with both lines
+// deleted, and the bypass would come back the moment anyone ran the suite on
+// a DSN that says nothing about sslmode -- which is what README and
+// CONTRIBUTING documented until this effort, and what any PGSSLMODE-free
+// environment still produces.
+//
+// It needs no database: pgx decides the candidate addresses at ParseConfig
+// time. For each shape the candidate set -- the primary plus every fallback --
+// must collapse to exactly one entry, the proxy, with TLS off.
+//
+// sslmode=allow and sslmode=require are in the table because each is covered
+// by only one of the two assignments: allow parses to a CLEARTEXT primary and
+// a TLS fallback, so only Fallbacks = nil keeps the connection off the real
+// server, while require parses to a TLS primary and no fallback at all, so
+// only TLSConfig = nil keeps the bytes readable. Delete either assignment and
+// one of these subtests fails.
+func TestBumpStallPoolHasNoBypassForAnyDSNShape(t *testing.T) {
+	const (
+		proxyHost = "127.0.0.1"
+		proxyPort = 65000
+		realHost  = "198.51.100.7"
+		realPort  = 55432
+	)
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{"no sslmode, so pgx's default prefer", "postgresql://u:p@198.51.100.7:55432/db"},
+		{"sslmode=prefer, stated", "postgresql://u:p@198.51.100.7:55432/db?sslmode=prefer"},
+		{"sslmode=disable, what ci.yml pins", "postgresql://u:p@198.51.100.7:55432/db?sslmode=disable"},
+		{"sslmode=allow, a TLS fallback behind a cleartext primary", "postgresql://u:p@198.51.100.7:55432/db?sslmode=allow"},
+		{"sslmode=require, a TLS primary and no fallback", "postgresql://u:p@198.51.100.7:55432/db?sslmode=require"},
+		{"two hosts, so a fallback per host", "host=198.51.100.7,198.51.100.8 port=55432 user=u password=p dbname=db sslmode=disable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := pgxpool.ParseConfig(tc.dsn)
+			if err != nil {
+				t.Fatalf("parse dsn: %v", err)
+			}
+			// Proof the shape is what the case name claims, so a future pgx
+			// that stopped producing it cannot leave this subtest asserting
+			// nothing.
+			if cfg.ConnConfig.Host != realHost || cfg.ConnConfig.Port != realPort {
+				t.Fatalf("parsed primary %s:%d, want %s:%d", cfg.ConnConfig.Host, cfg.ConnConfig.Port, realHost, realPort)
+			}
+
+			pointConnConfigAtProxy(cfg.ConnConfig, proxyHost, proxyPort)
+
+			cc := cfg.ConnConfig
+			const why = "a connection that reaches PostgreSQL without passing the proxy makes " +
+				"TestSaveSnapshotRefusesWhileAnEarlierBumpIsInFlight silently stop testing anything: " +
+				"the pool works, the armed bump is never seen, and the only thing left is its 5s timeout"
+			if cc.Host != proxyHost || cc.Port != proxyPort {
+				t.Fatalf("primary candidate is %s:%d, want the proxy at %s:%d -- %s", cc.Host, cc.Port, proxyHost, proxyPort, why)
+			}
+			if cc.TLSConfig != nil {
+				t.Fatalf("the primary candidate still offers TLS, which hides the SQL text the proxy matches on -- %s", why)
+			}
+			for i, fb := range cc.Fallbacks {
+				t.Errorf("fallback candidate [%d] survived: %s:%d tls=%v -- a fallback keeps the host and port the DSN named, not the proxy's -- %s",
+					i, fb.Host, fb.Port, fb.TLSConfig != nil, why)
+			}
+			if len(cc.Fallbacks) != 0 {
+				t.FailNow()
+			}
+		})
+	}
+}
+
 func bumpStallEnginePool(t *testing.T, dsn string) (*bumpStallProxy, *pgxpool.Pool) {
 	t.Helper()
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -290,10 +375,7 @@ func bumpStallEnginePool(t *testing.T, dsn string) (*bumpStallProxy, *pgxpool.Po
 	if err != nil {
 		t.Fatalf("proxy port: %v", err)
 	}
-	cfg.ConnConfig.Host = host
-	cfg.ConnConfig.Port = uint16(port)
-	cfg.ConnConfig.TLSConfig = nil
-	cfg.ConnConfig.Fallbacks = nil
+	pointConnConfigAtProxy(cfg.ConnConfig, host, uint16(port))
 	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeDescribeExec
 	enginePool, err := pg.NewPool(cfg)
 	if err != nil {
