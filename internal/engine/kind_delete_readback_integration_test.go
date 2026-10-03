@@ -248,3 +248,99 @@ func TestBootReplayKeepsNodeCommittedAfterKindDeleteWithEarlierCounter(t *testin
 		{`MATCH (n:FileBootNode) RETURN n`, true},
 	})
 }
+
+// TestEdgeKindDeleteRemovesADanglingDeltaEdgeEndToEnd is the end-to-end form
+// of addEdgeKindCriteria's delta scan, which until now was pinned only at the
+// enumeration level (TestViewCandidatesEdgeKindCriteriaCoversEveryDeltaRecord,
+// apply_test.go, which calls collectViewCandidates and inspects the id list).
+// That test proves the right ids are named; it cannot prove the named ids are
+// what the replica goes on to serve, nor that PostgreSQL agrees.
+//
+// The full sequence, in the order the Applies actually run:
+//
+//	W1 commits a node -- and does not apply
+//	W2 commits an edge into that node, and applies: read-back stages the edge
+//	   record alone, never its endpoints, so the delta now holds an edge
+//	   pointing at a node the replica does not know. The edge is hidden.
+//	W3 deletes every edge of the kind and applies. PostgreSQL removes the base
+//	   edge and the new one; the replica has to tombstone a record it cannot
+//	   itself see.
+//	W1 applies last, and the endpoint lands.
+//
+// At that last step a delete that had skipped the invisible record is no
+// longer hidden by anything: the edge reappears in the replica while
+// PostgreSQL does not have it -- a served answer with an edge that was
+// deleted, which is the failure this whole mechanism exists to prevent.
+func TestEdgeKindDeleteRemovesADanglingDeltaEdgeEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	nodeKind := graph.StringKind("DanglingDeltaNode")
+	edgeKind := graph.StringKind("DanglingDeltaEdge")
+	eng, nodes := seedKindDeleteOrderGraph(t, ctx, nodeKind, edgeKind)
+
+	// W1 commits, and deliberately does not apply yet.
+	var late *graph.Node
+	if err := eng.pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		var err error
+		late, err = tx.CreateNode(graph.NewProperties().Set("name", "late"), nodeKind)
+		return err
+	}); err != nil {
+		t.Fatalf("W1 create node: %v", err)
+	}
+	nodeScope := NewWriteScope()
+	nodeScope.Changes().RecordNodeID(late.ID)
+
+	// W2 commits an edge into W1's node and applies.
+	var dangling *graph.Relationship
+	if err := eng.pgDriver.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		var err error
+		dangling, err = tx.CreateRelationshipByIDs(nodes["c"].ID, late.ID, edgeKind, graph.NewProperties())
+		return err
+	}); err != nil {
+		t.Fatalf("W2 create edge: %v", err)
+	}
+	edgeScope := NewWriteScope()
+	edgeScope.Changes().RecordEdgeID(dangling.ID)
+	eng.Apply(ctx, edgeScope)
+
+	// The premise, asserted rather than assumed: the record really is one the
+	// View cannot show, so the delete below really does have to reach past
+	// what OutEdges reports.
+	if _, _, _, visible := eng.snap.Load().EdgeStateByID(uint64(dangling.ID)); visible {
+		t.Fatalf("edge %d is visible although its endpoint %d has not applied; there is no dangling record here and the delete below faces nothing unusual", dangling.ID, late.ID)
+	}
+
+	// W3 deletes every edge of the kind, and applies.
+	if err := eng.pgDriver.DeleteRelationshipsByKinds(ctx, graph.Kinds{edgeKind}); err != nil {
+		t.Fatalf("W3 delete: %v", err)
+	}
+	deleteScope := NewWriteScope()
+	deleteScope.Changes().RecordDeleteRelationshipsByKinds(graph.Kinds{edgeKind})
+	eng.Apply(ctx, deleteScope)
+
+	// W1's endpoint lands last: nothing hides the record any more.
+	eng.Apply(ctx, nodeScope)
+
+	if _, known := eng.snap.Load().Dense(uint64(late.ID)); !known {
+		t.Fatalf("node %d never reached the replica, so the edge record stayed hidden for a reason this test is not about", late.ID)
+	}
+	if _, _, _, visible := eng.snap.Load().EdgeStateByID(uint64(dangling.ID)); visible {
+		t.Errorf("edge %d is back in the replica once its endpoint landed, although the kind delete removed it from PostgreSQL", dangling.ID)
+	}
+	if _, serving := eng.serveState(); !serving {
+		t.Fatalf("engine left serving; the comparisons below would be vacuous")
+	}
+
+	const (
+		edgeQuery = `MATCH (s:DanglingDeltaNode)-[:DanglingDeltaEdge]->(e:DanglingDeltaNode) RETURN s, e`
+		nodeQuery = `MATCH (n:DanglingDeltaNode) RETURN n.name`
+	)
+	// PostgreSQL's own answers, so neither comparison can agree by both sides
+	// being empty for unrelated reasons: no edge of the kind survives, and all
+	// four nodes do -- including the one whose late Apply is the whole point.
+	requireOracleRowTotal(t, eng.pgDriver, edgeQuery, 0)
+	requireOracleRowTotal(t, eng.pgDriver, nodeQuery, 4)
+	assertTypedCasesMatchOracle(t, eng.pgDriver, eng, []typedCase{
+		{edgeQuery, true},
+		{nodeQuery, true},
+	})
+}
