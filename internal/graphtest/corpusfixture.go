@@ -1217,7 +1217,7 @@ func LoadCorpusFixture(t testing.TB, d *pg.Driver) CorpusFixture {
 			if !ok {
 				return fmt.Errorf("unknown edge end key %q", e.end)
 			}
-			if err := batch.CreateRelationshipByIDs(startID, endID, e.kind, e.props); err != nil {
+			if err := batch.CreateRelationship(&graph.Relationship{StartID: startID, EndID: endID, Kind: e.kind, Properties: e.props}); err != nil {
 				return err
 			}
 		}

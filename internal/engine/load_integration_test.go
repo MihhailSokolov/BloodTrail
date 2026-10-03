@@ -27,7 +27,7 @@ func fixtureCounts(t *testing.T) (nodes, edges int) {
 	if err != nil {
 		t.Fatalf("open %s: %v", traversalShapesPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	doc, err := opengraph.ParseDocument(f)
 	if err != nil {

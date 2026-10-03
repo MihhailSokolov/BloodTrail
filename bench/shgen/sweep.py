@@ -46,6 +46,11 @@ class API:
         self.base = f"http://127.0.0.1:{port}"
         self.token = None
         self.pace = pace
+        # The most recent cypher() attempt: when it started, and how long the
+        # one that got an answer took. Timings come from these, never from a
+        # clock around cypher(), which also spans the 429 backoff.
+        self.attempt_started = 0.0
+        self.attempt_s = 0.0
 
     def call(self, method, path, body=None, ctype=None, timeout=60):
         req = urllib.request.Request(self.base + path, data=body, method=method)
@@ -73,20 +78,26 @@ class API:
         sweep of 165 queries x 4 runs each trips it easily -- without this
         every later query would 'measure' the limiter instead of the engine,
         silently turning the back half of a comparison into noise. Backoff
-        waits are NOT part of the returned timing: the caller times the
-        successful attempt only."""
+        waits are NOT part of the timing: attempt_s is the duration of the
+        attempt that got the answer (a 404 is an answer), which is what the
+        caller records."""
         body = json.dumps({"query": text, "include_properties": False}).encode()
         delay = 2.0
         for attempt in range(8):
+            self.attempt_started = time.perf_counter()
             try:
-                return self.call("POST", "/api/v2/graphs/cypher", body, "application/json", timeout=timeout)
+                result = self.call("POST", "/api/v2/graphs/cypher", body, "application/json", timeout=timeout)
             except urllib.error.HTTPError as e:
+                self.attempt_s = time.perf_counter() - self.attempt_started
                 if e.code != 429:
                     raise
                 retry_after = e.headers.get("Retry-After") if e.headers else None
                 wait = float(retry_after) if retry_after and retry_after.isdigit() else delay
                 time.sleep(wait)
                 delay = min(delay * 2, 30)
+                continue
+            self.attempt_s = time.perf_counter() - self.attempt_started
+            return result
         raise RuntimeError("rate limited after 8 attempts")
 
 
@@ -98,7 +109,6 @@ def run_one(api, query, repeats, timeout):
     samples, size, status = [], None, "ok"
     for i in range(repeats + 1):
         api.settle()
-        start = time.time()
         try:
             _, body = api.cypher(query, timeout)
             payload = json.loads(body).get("data") or {}
@@ -110,12 +120,12 @@ def run_one(api, query, repeats, timeout):
             else:
                 return {"status": f"http_{e.code}", "detail": raw}
         except Exception as e:  # timeouts land here
-            elapsed = time.time() - start
+            elapsed = time.perf_counter() - api.attempt_started
             if elapsed >= timeout * 0.9:
                 return {"status": "timeout", "timeout_s": timeout}
             return {"status": "error", "detail": str(e)[:200]}
         if i:
-            samples.append((time.time() - start) * 1000)
+            samples.append(api.attempt_s * 1000)
     samples.sort()
     return {
         "status": status,

@@ -16,6 +16,11 @@ archives:
 checksum:
   name_template: checksums.txt
 release:
+  # A tag with a semver prerelease suffix (v0.2.0-rc.1) is published as a
+  # GitHub prerelease. release.yml releases every v* tag, and without this an
+  # RC would become the "latest" release, which is what scripts/install.sh
+  # (releases/latest/download) fetches.
+  prerelease: auto
   extra_files:
     - glob: scripts/install.sh
 changelog:

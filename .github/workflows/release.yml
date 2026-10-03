@@ -20,7 +20,12 @@ jobs:
       - id: list
         env:
           GH_TOKEN: ${{ github.token }}
-        run: echo "tags=$(./build/upstream-tags.sh)" >> "$GITHUB_OUTPUT"
+        # Assigned before it is echoed: `echo "tags=$(cmd)"` reports echo's
+        # status, so a failing upstream-tags.sh used to pass this step with an
+        # empty list, and the images matrix then died on fromJson('').
+        run: |
+          tags=$(./build/upstream-tags.sh)
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
   images:
     needs: upstreams
     strategy:

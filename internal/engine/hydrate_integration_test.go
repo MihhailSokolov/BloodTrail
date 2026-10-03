@@ -185,8 +185,9 @@ func TestHydratePathsEdgeBatchBoundary(t *testing.T) {
 	edgeKind := graph.StringKind("BatchEdge")
 
 	// Relationship creation (unlike node creation) requires the kind to
-	// already be registered: CreateRelationshipByIDs maps straight through
-	// kindMapper.MapKind rather than lazily asserting like CreateNodes does.
+	// already be registered: CreateRelationship buffers the edge and the
+	// batch flush maps its kind straight through kindMapper.MapKind rather
+	// than lazily asserting like CreateNodes does.
 	if _, err := pgDriver.AssertKinds(ctx, graph.Kinds{leafKind, edgeKind}); err != nil {
 		t.Fatalf("assert batch-boundary kinds: %v", err)
 	}
@@ -210,7 +211,7 @@ func TestHydratePathsEdgeBatchBoundary(t *testing.T) {
 		createdIDs = ids
 
 		for _, leafID := range ids[1:] {
-			if err := b.CreateRelationshipByIDs(ids[0], leafID, edgeKind, graph.NewProperties()); err != nil {
+			if err := b.CreateRelationship(&graph.Relationship{StartID: ids[0], EndID: leafID, Kind: edgeKind, Properties: graph.NewProperties()}); err != nil {
 				return err
 			}
 		}
