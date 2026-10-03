@@ -274,7 +274,14 @@ func (p *bumpStallProxy) releaseHeld() { p.releaseOnce.Do(func() { close(p.relea
 // the proxy cannot read. ci.yml now pins sslmode=disable in
 // BLOODTRAIL_TEST_PG, which is belt and braces -- it does not make these two
 // lines removable, since this helper must hold for any DSN a developer
-// exports.
+// exports. Clearing TLSConfig does cost one thing: this helper cannot run
+// against a server that only accepts TLS, because sslmode=require and
+// sslmode=verify-full both collapse to a single CLEARTEXT candidate pointed
+// at the proxy, which such a server refuses outright.
+//
+// Skipped for a unix-socket DSN, whose host is an absolute path: the proxy is
+// a TCP listener, and its target would otherwise become the unusable
+// "/var/run/postgresql:5432".
 // pointConnConfigAtProxy makes the proxy at host:port the one address cc can
 // connect to, in cleartext: the four assignments whose necessity
 // bumpStallEnginePool's doc above explains, in one place so that
@@ -365,6 +372,9 @@ func bumpStallEnginePool(t *testing.T, dsn string) (*bumpStallProxy, *pgxpool.Po
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatalf("parse dsn: %v", err)
+	}
+	if strings.HasPrefix(cfg.ConnConfig.Host, "/") {
+		t.Skipf("this test proxies TCP; BLOODTRAIL_TEST_PG names the unix socket directory %q", cfg.ConnConfig.Host)
 	}
 	proxy := newBumpStallProxy(t, net.JoinHostPort(cfg.ConnConfig.Host, strconv.Itoa(int(cfg.ConnConfig.Port))), bumpWatermarkSQL)
 	host, portText, err := net.SplitHostPort(proxy.ln.Addr().String())
