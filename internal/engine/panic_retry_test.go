@@ -8,6 +8,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/specterops/dawgs/drivers/pg"
+
+	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
 )
 
 // panicRetryLogCounter is a slog.Handler that counts the records carrying
@@ -41,10 +46,15 @@ func (c *panicRetryLogCounter) count() int64 { return c.seen.Load() }
 // the engine is already serving correctly from PostgreSQL. The recovery
 // loop must back such a rebuild off to the long interval instead.
 //
-// An engine with no PostgreSQL driver panics inside the load itself, which
-// stands in for a snapshot build that panics on data it cannot represent
-// (the same fixture TestRebuildPanicEntersFallback uses).
+// The load is made to panic through loadSnapshotFn (load.go), standing in
+// for a snapshot build that panics on data it cannot represent.
 func TestADeterministicRebuildPanicLeavesTheFastRetrySchedule(t *testing.T) {
+	previousLoad := loadSnapshotFn
+	loadSnapshotFn = func(context.Context, *pg.Driver, *pgxpool.Pool, bool, bool) (*snapshot.Snapshot, loadedWatermark, error) {
+		panic("load panic injected by the test")
+	}
+	t.Cleanup(func() { loadSnapshotFn = previousLoad })
+
 	counter := &panicRetryLogCounter{message: "bloodtrail: snapshot rebuild panicked"}
 	e := New(nil, nil, Config{Enabled: true, Log: slog.New(counter)})
 	t.Cleanup(e.Stop)

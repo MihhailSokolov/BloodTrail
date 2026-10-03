@@ -526,7 +526,7 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool,
 	// Debug, and nothing else would tell an operator why the file stopped
 	// being written. The counter is always read: an adoption rebases the
 	// watermark ledger to it (below).
-	snap, loaded, err := loadSnapshot(ctx, e.pgDriver, e.pool, true, e.cfg.SnapshotDir != "")
+	snap, loaded, err := loadSnapshotFn(ctx, e.pgDriver, e.pool, true, e.cfg.SnapshotDir != "")
 	if err != nil {
 		return false, fmt.Errorf("engine: RebuildNow: %w", err)
 	}

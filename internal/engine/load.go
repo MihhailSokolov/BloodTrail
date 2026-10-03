@@ -144,6 +144,15 @@ func loadSnapshot(ctx context.Context, pgDriver *pg.Driver, pool *pgxpool.Pool, 
 	return snap, loaded, nil
 }
 
+// loadSnapshotFn is the load every rebuild runs (loadSnapshot, above,
+// called from rebuildOnce in engine.go), a variable only so that a test can
+// make that load fail or panic on demand -- the same seam, and the same
+// reason, as boot.go's readSnapshotFile. Without it a test has to provoke an
+// incidental crash instead (a nil pool's own nil-pointer dereference), which
+// a later nil guard would silently turn into a test that no longer proves
+// anything about the panic path it was written for.
+var loadSnapshotFn = loadSnapshot
+
 // loadKinds scans the entire `kind` table -- global, not scoped to any one
 // graph_id -- into builder via Builder.SetKinds. It runs before loadNodes so
 // the resulting Snapshot's Kinds table is populated regardless of which
