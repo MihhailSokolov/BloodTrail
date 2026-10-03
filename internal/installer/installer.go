@@ -814,10 +814,17 @@ func runVerification(ctx context.Context, deps Deps, opts Options, c dockerx.Com
 	say("    API answers at %s", opts.APIURL)
 	if opts.AdminPassword != "" {
 		smoke := verify.Smoke{Client: deps.HTTP, BaseURL: opts.APIURL, User: opts.AdminUser, Password: opts.AdminPassword}
-		if err := smoke.Run(ctx, opts.VerifyTimeout); err != nil {
+		switch err := smoke.Run(ctx, opts.VerifyTimeout); {
+		case errors.Is(err, verify.ErrSmokeInconclusive):
+			// Not a failure of the deployment, and not a pass either: it
+			// is reported as what it is, and never with the line above.
+			say("    WARNING: the smoke test is INCONCLUSIVE, not passed: %s", strings.TrimPrefix(err.Error(), verify.ErrSmokeInconclusive.Error()+": "))
+			say("    The checks above stand on their own; the smoke test can only give a result on a deployment whose graph does not hold the fixture yet.")
+		case err != nil:
 			return fmt.Errorf("smoke test: %w", err)
+		default:
+			say("    fixture ingested, analysed and found through the search API")
 		}
-		say("    fixture ingested, analysed and found through the search API")
 	}
 	return nil
 }
