@@ -43,6 +43,20 @@ func TestRelationshipKindListingsServeAcrossKindIDGap(t *testing.T) {
 
 	// Fresh kind names every run, so the burned id always lies below the
 	// fixture's kinds whatever an earlier run left in the database.
+	//
+	// That costs four of the kind table's smallserial ids per run -- three
+	// kinds plus the one deliberately burned below -- and the residue is
+	// deliberately NOT cleaned up, because cleaning it up would not help:
+	// deleting a kind row does not rewind the sequence, so the ids are spent
+	// either way, and the names have to differ per run for the gap to sit
+	// below the fixture at all. What bounds it is smallserial's own ceiling of
+	// 32767, i.e. roughly eight thousand runs of this one test against the
+	// same database. Past that it is PostgreSQL that refuses the next kind,
+	// not BloodTrail: the engine itself serves a kind table that has reached
+	// 32767 (internal/engine's TestRebuildServesTheLargestSmallserialKindID
+	// pins exactly that). The remedy is recreating the test database, which
+	// is also what CI does every run -- so only a long-lived local database
+	// ever gets there.
 	suffix := time.Now().UnixNano()
 	anchorKind := graph.StringKind(fmt.Sprintf("KindIDGapAnchor%d", suffix))
 	nodeKind := graph.StringKind(fmt.Sprintf("KindIDGapNode%d", suffix))
@@ -85,7 +99,14 @@ func TestRelationshipKindListingsServeAcrossKindIDGap(t *testing.T) {
 
 	criteria := query.Equals(query.StartID(), hub)
 
-	kindsRows := func(db graph.Database) []string {
+	// Both closures take the subtest's own *testing.T rather than closing
+	// over this one: they run inside t.Run below, on the subtest's goroutine,
+	// and a Fatalf on the PARENT t from there calls runtime.Goexit on the
+	// wrong goroutine -- it ends the subtest while the parent believes it is
+	// still running, so the failure is reported against the wrong test and
+	// the run can stall instead of failing.
+	kindsRows := func(t *testing.T, db graph.Database) []string {
+		t.Helper()
 		var rows []string
 		if err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
 			return tx.Relationships().Filter(criteria).FetchKinds(func(cursor graph.Cursor[graph.RelationshipKindsResult]) error {
@@ -100,7 +121,8 @@ func TestRelationshipKindListingsServeAcrossKindIDGap(t *testing.T) {
 		sort.Strings(rows)
 		return rows
 	}
-	stepRows := func(db graph.Database) []string {
+	stepRows := func(t *testing.T, db graph.Database) []string {
+		t.Helper()
 		var rows []string
 		if err := db.ReadTransaction(ctx, func(tx graph.Transaction) error {
 			return tx.Relationships().Filter(criteria).OrderBy(query.Order(query.Identity(query.Relationship()), query.Ascending())).Query(func(results graph.Result) error {
@@ -126,18 +148,18 @@ func TestRelationshipKindListingsServeAcrossKindIDGap(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		rows func(graph.Database) []string
+		rows func(*testing.T, graph.Database) []string
 	}{
 		{"kinds listing without a kind filter", kindsRows},
 		{"step projection with far-node kinds", stepRows},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			want := tc.rows(oracle)
+			want := tc.rows(t, oracle)
 			if len(want) != 3 {
 				t.Fatalf("PostgreSQL rows = %v, want 3", want)
 			}
 			before := markerCount(buf, builderServedMarker)
-			got := tc.rows(bt)
+			got := tc.rows(t, bt)
 			served := markerCount(buf, builderServedMarker) - before
 			if strings.Join(got, ",") != strings.Join(want, ",") {
 				t.Fatalf("bloodtrail rows %v, postgresql %v", got, want)

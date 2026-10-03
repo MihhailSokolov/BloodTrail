@@ -510,9 +510,16 @@ func TestServedTextColumnsAreNotDecoded(t *testing.T) {
 			}
 
 			result := newCypherRowsResult(view, rs, projectionValueKinds(q), nil)
-			var got []any
+			var (
+				got     []any
+				gotRows []string
+				width   int
+			)
 			for result.Next() {
-				got = append(got, result.Values()...)
+				values := result.Values()
+				width = len(values)
+				got = append(got, values...)
+				gotRows = append(gotRows, fmt.Sprint(values))
 			}
 			sortServedValues(got)
 			want := append([]any(nil), tc.want...)
@@ -520,6 +527,7 @@ func TestServedTextColumnsAreNotDecoded(t *testing.T) {
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("served %#v, want %#v", got, want)
 			}
+			requireServedRowPairing(t, gotRows, tc.want, width)
 		})
 	}
 }
@@ -528,6 +536,46 @@ func TestServedTextColumnsAreNotDecoded(t *testing.T) {
 // not depend on the engine's row order.
 func sortServedValues(values []any) {
 	sort.Slice(values, func(i, j int) bool { return fmt.Sprint(values[i]) < fmt.Sprint(values[j]) })
+}
+
+// requireServedRowPairing checks that the engine put each value in the column
+// and row the expectation pairs it with -- which the sortServedValues
+// comparison above cannot see, since it pours every value of every row into
+// one flat list: a result that served `("a", "q")` where `("q", "a")` was
+// expected compares equal there, and so would one that served `("q", "q")`
+// and `("a", "b")` for `("q", "a")` and `("q", "b")`.
+//
+// Decoding is what that flat comparison is for, and it is right for it (this
+// test's subject is whether a text column comes back decoded); the pairing is
+// a separate claim, asserted here. want is every row's values in engine order,
+// so grouping it by the width the result actually served reconstructs the rows
+// it stands for. Both sides are then compared as whole rows, SORTED -- row
+// order stays exactly as unpinned as it was, only the pairing within a row is
+// added.
+func requireServedRowPairing(t *testing.T, gotRows []string, want []any, width int) {
+	t.Helper()
+
+	if width <= 0 {
+		if len(want) != 0 {
+			t.Fatalf("served no rows at all, want %d value(s) %#v", len(want), want)
+		}
+		return
+	}
+	if len(want)%width != 0 {
+		t.Fatalf("served rows %d column(s) wide, which does not divide the %d expected values %#v; the expectation and the result disagree about the shape, not just the values",
+			width, len(want), want)
+	}
+
+	wantRows := make([]string, 0, len(want)/width)
+	for i := 0; i < len(want); i += width {
+		wantRows = append(wantRows, fmt.Sprint(want[i:i+width]))
+	}
+	got := append([]string(nil), gotRows...)
+	sort.Strings(got)
+	sort.Strings(wantRows)
+	if !reflect.DeepEqual(got, wantRows) {
+		t.Fatalf("served rows %v, want %v: the right values, paired into the wrong rows or columns", got, wantRows)
+	}
 }
 
 // TestProjectionValueKindsCoalesceInt8: dawgs casts a coalesce() with an
