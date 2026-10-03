@@ -12,8 +12,8 @@ import (
 	"github.com/MihhailSokolov/BloodTrail/internal/engine"
 )
 
-// panicValueOf runs run and returns what it panicked with, nil if nothing.
-func panicValueOf(run func()) (recovered any) {
+// writePathPanicValueOf runs run and returns what it panicked with, nil if nothing.
+func writePathPanicValueOf(run func()) (recovered any) {
 	defer func() { recovered = recover() }()
 	run()
 	return nil
@@ -69,7 +69,7 @@ func TestDriverWriteTransactionPanicReachesTheCallerUnchanged(t *testing.T) {
 	eng := disabledEngine()
 	d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: &fakeTransaction{createNodeReturn: &graph.Node{ID: 1}}}}
 
-	recovered := panicValueOf(func() {
+	recovered := writePathPanicValueOf(func() {
 		_ = d.WriteTransaction(context.Background(), func(tx graph.Transaction) error {
 			if _, err := tx.CreateNode(graph.NewProperties()); err != nil {
 				return err
@@ -92,7 +92,7 @@ func TestDriverReadTransactionPanicStillAppliesItsWrites(t *testing.T) {
 	eng := disabledEngine()
 	d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: &fakeTransaction{createNodeReturn: &graph.Node{ID: 1}}}}
 
-	recovered := panicValueOf(func() {
+	recovered := writePathPanicValueOf(func() {
 		_ = d.ReadTransaction(context.Background(), func(tx graph.Transaction) error {
 			if _, err := tx.CreateNode(graph.NewProperties()); err != nil {
 				return err

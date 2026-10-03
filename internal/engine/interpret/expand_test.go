@@ -1616,9 +1616,9 @@ func TestShortestPathSecondEndpointMustBeConstrained(t *testing.T) {
 	})
 }
 
-// buildSelfCycleSnapshot: group g1 (1) sits on a 2-cycle through u (2) while
+// buildShortestPathSelfCycleSnapshot: group g1 (1) sits on a 2-cycle through u (2) while
 // the only other group, g2 (5), is three hops away through x (3) and y (4).
-func buildSelfCycleSnapshot(t *testing.T) *snapshot.View {
+func buildShortestPathSelfCycleSnapshot(t *testing.T) *snapshot.View {
 	t.Helper()
 	const (
 		kindG snapshot.KindID = 1
@@ -1650,7 +1650,7 @@ func buildSelfCycleSnapshot(t *testing.T) *snapshot.View {
 // cycle back to itself set that length before the inequality drops it --
 // while the per-pair answer and disjoint endpoint sets keep serving.
 func TestExpandAllShortestSharedEndpointInequalityDeclines(t *testing.T) {
-	snap := buildSelfCycleSnapshot(t)
+	snap := buildShortestPathSelfCycleSnapshot(t)
 
 	const query = `MATCH p = allShortestPaths((a:G)-[:E*1..]->(b:G)) WHERE a <> b RETURN p`
 	if err := execExpectErr(t, snap, query, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
@@ -1678,7 +1678,7 @@ func TestExpandAllShortestSharedEndpointInequalityDeclines(t *testing.T) {
 // node's own pair around its cycle and counts it toward the LIMIT -- and
 // keeps serving without the LIMIT and with kind-only endpoints.
 func TestExpandShortestPairFilterLimitSharedEndpointDeclines(t *testing.T) {
-	snap := buildSelfCycleSnapshot(t)
+	snap := buildShortestPathSelfCycleSnapshot(t)
 
 	const pairs = `MATCH p = shortestPath((a:G)-[:E*1..]->(b:G)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p`
 	if err := execExpectErr(t, snap, pairs+` LIMIT 1`, generousBudget); !errors.Is(err, ErrSelfEndpoint) {

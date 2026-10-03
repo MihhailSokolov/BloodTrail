@@ -244,13 +244,13 @@ func (g *pathParityGraph) assertAlwaysDeclines(t *testing.T, query string) {
 	}
 }
 
-// varLengthCycleFixture is a 3-cycle with a node that carries both endpoint
-// kinds, a parallel edge of another kind and a tail:
+// pathParityVarLengthCycleFixture is a 3-cycle with a node that carries
+// both endpoint kinds, a parallel edge of another kind and a tail:
 //
 //	a(ZA) -ZE-> b(ZB) -ZE-> c(ZA,ZB) -ZE-> a
 //	a -ZF-> b
 //	c -ZE-> d(ZB)
-func varLengthCycleFixture() pathParityFixture {
+func pathParityVarLengthCycleFixture() pathParityFixture {
 	return pathParityFixture{
 		nodes: []pathParityNode{
 			{name: "a", kinds: []string{"ZA"}},
@@ -272,7 +272,7 @@ func varLengthCycleFixture() pathParityFixture {
 // empty path. Every shape must serve, forward and inbound, alone and with a
 // deeper upper bound.
 func TestVarLengthZeroLengthPathMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, varLengthCycleFixture())
+	g := seedPathParityGraph(t, pathParityVarLengthCycleFixture())
 	for _, query := range []string{
 		`MATCH p = (x:ZA)-[:ZE*0..1]->(y) RETURN p`,
 		`MATCH p = (y:ZB)<-[:ZE*0..1]-(x:ZA) RETURN p`,
@@ -292,7 +292,7 @@ func TestVarLengthZeroLengthPathMatchesOracle(t *testing.T) {
 // never runs at all. The engine may decline these shapes but must never serve
 // an answer PostgreSQL does not give.
 func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, varLengthCycleFixture())
+	g := seedPathParityGraph(t, pathParityVarLengthCycleFixture())
 	for _, query := range []string{
 		`MATCH p = (x:ZA)-[:ZE*1..0]->(y) RETURN p`,
 		`MATCH p = (x:ZA)-[:ZE*..0]->(y) RETURN p`,
@@ -306,8 +306,8 @@ func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
 	}
 }
 
-// shortestPathLevelFixture puts four roots at three distances from one
-// terminal; no root has an incoming edge of the traversed kind:
+// pathParityShortestPathLevelFixture puts four roots at three distances
+// from one terminal; no root has an incoming edge of the traversed kind:
 //
 //	r0 -> i1 -> i2 -> t9   (3 hops)
 //	r4 -> i5 -> t9         (2 hops)
@@ -315,7 +315,7 @@ func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
 //	r7 -> t9               (1 hop)
 //
 // Every node is a ZNode; the r* nodes are also ZRoot and t9 is ZTerm.
-func shortestPathLevelFixture() pathParityFixture {
+func pathParityShortestPathLevelFixture() pathParityFixture {
 	var f pathParityFixture
 	for _, name := range []string{"r0", "i1", "i2", "r4", "i5", "r6", "r7", "t9"} {
 		kinds := []string{"ZNode"}
@@ -353,7 +353,7 @@ func shortestPathLevelFixture() pathParityFixture {
 // overall-shortest answer declines for a reason of its own
 // (TestAllShortestPathsSharedEndpointInequalityMatchesOracle).
 func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
-	fixture := shortestPathLevelFixture()
+	fixture := pathParityShortestPathLevelFixture()
 	fixture.nodes = append(fixture.nodes, pathParityNode{name: "x0", kinds: []string{"ZNode"}})
 	fixture.edges = append(fixture.edges, pathParityEdge{"x0", "r6", "ZOther"})
 	g := seedPathParityGraph(t, fixture)
@@ -381,12 +381,12 @@ func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
 	}
 }
 
-// selfCycleFixture puts group g1 on a 2-cycle (g1 -> u -> g1) while the only
-// other group, g2, is three hops away:
+// pathParitySelfCycleFixture puts group g1 on a 2-cycle (g1 -> u -> g1)
+// while the only other group, g2, is three hops away:
 //
 //	g1 -> u -> g1
 //	g1 -> x -> y -> g2
-func selfCycleFixture() pathParityFixture {
+func pathParitySelfCycleFixture() pathParityFixture {
 	return pathParityFixture{
 		nodes: []pathParityNode{
 			{name: "g1", kinds: []string{"ZG"}},
@@ -413,7 +413,7 @@ func selfCycleFixture() pathParityFixture {
 // property filter) and shortestPath are unaffected and must keep serving.
 func TestAllShortestPathsSharedEndpointInequalityMatchesOracle(t *testing.T) {
 	t.Run("two-cycle", func(t *testing.T) {
-		g := seedPathParityGraph(t, selfCycleFixture())
+		g := seedPathParityGraph(t, pathParitySelfCycleFixture())
 		for _, query := range []string{
 			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p`,
 			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE id(a) <> id(b) RETURN p`,
@@ -476,7 +476,7 @@ func TestAllShortestPathsSharedEndpointInequalityMatchesOracle(t *testing.T) {
 // endpoints (the unidirectional harness never revisits a root) or with
 // DISTINCT (no pushdown), the answers agree and must keep serving.
 func TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, selfCycleFixture())
+	g := seedPathParityGraph(t, pathParitySelfCycleFixture())
 	for _, query := range []string{
 		`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p LIMIT 1`,
 		`MATCH p = shortestPath((a)-[:ZEdge*1..]->(b)) WHERE a.name = 'g1' AND b.name IN ['g1', 'g2'] AND a <> b RETURN p LIMIT 1`,
@@ -504,7 +504,7 @@ func TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle(t *testing.T
 // lands on the side dawgs' selectivity model picks as the seed, so pg
 // answers some spellings and rejects near-identical ones (all below).
 func TestShortestPathAfterEarlierBindingMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, shortestPathLevelFixture())
+	g := seedPathParityGraph(t, pathParityShortestPathLevelFixture())
 
 	for _, query := range []string{
 		// An earlier pattern in the same query part.
@@ -620,7 +620,7 @@ func TestShortestPathLaterPatternMatchesOracle(t *testing.T) {
 // comparison: there pg emits no guard, so there is nothing plan-dependent
 // left to compare against.
 func TestShortestPathKindLevelSelfEndpointMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, varLengthCycleFixture())
+	g := seedPathParityGraph(t, pathParityVarLengthCycleFixture())
 	for _, query := range []string{
 		`MATCH p = shortestPath((x:ZA)-[:ZE*1..1]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
 		`MATCH p = shortestPath((x:ZA)-[:ZE*1..2]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
