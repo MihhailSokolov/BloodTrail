@@ -23,6 +23,13 @@ import (
 // upload has been ended.
 func fakeBloodHoundForSmoke(t *testing.T, fixtureAlreadyThere bool) *httptest.Server {
 	t.Helper()
+	return fakeBloodHoundForSmokeWithJob(t, fixtureAlreadyThere, `{"data":[{"id":1,"status":2,"status_message":"","failed_files":0}]}`)
+}
+
+// fakeBloodHoundForSmokeWithJob is fakeBloodHoundForSmoke with the answer to
+// the ingest job listing of the caller's choosing, for a job that failed.
+func fakeBloodHoundForSmokeWithJob(t *testing.T, fixtureAlreadyThere bool, jobs string) *httptest.Server {
+	t.Helper()
 	var ended atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusUnauthorized) })
@@ -39,7 +46,7 @@ func fakeBloodHoundForSmoke(t *testing.T, fixtureAlreadyThere bool) *httptest.Se
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("GET /api/v2/file-upload", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":1,"status":2,"status_message":"","failed_files":0}]}`))
+		_, _ = w.Write([]byte(jobs))
 	})
 	mux.HandleFunc("GET /api/v2/datapipe/status", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":{"status":"idle"}}`))
@@ -97,5 +104,30 @@ func TestVerifyReportsASmokeTestOverAnExistingFixtureAsInconclusive(t *testing.T
 				t.Errorf("verification did not report the smoke test as passed:\n%s", said)
 			}
 		})
+	}
+}
+
+// TestVerifyFailsOnAFailedIngestJobEvenWhereTheFixtureIsAlreadyThere is the
+// other side of the inconclusive result: a deployment still holding the fixture
+// an earlier run left makes a clean run inconclusive, but an ingest job of this
+// run that failed is a failure of the deployment however the search ends. The
+// verification returns it as an error and says nothing of an inconclusive
+// smoke test, which it prints as a warning that does not fail it.
+func TestVerifyFailsOnAFailedIngestJobEvenWhereTheFixtureIsAlreadyThere(t *testing.T) {
+	dir, composeFile := setupProject(t)
+	base := "docker compose --project-directory " + dir + " -f " + composeFile + " "
+	api := fakeBloodHoundForSmokeWithJob(t, true, `{"data":[{"id":1,"status":5,"status_message":"boom","failed_files":7}]}`)
+	fake := &dockerx.FakeRunner{}
+	scriptRunningBloodhound(fake, base, "BloodTrail driver active version=0.1.2 mode=engine backend=pg\n", "bloodtrail")
+	var out bytes.Buffer
+	opts := Options{ComposeFile: composeFile, APIURL: api.URL, AdminPassword: "pw", VerifyTimeout: 5 * time.Second}
+
+	err := Verify(context.Background(), Deps{Runner: fake, HTTP: api.Client(), Out: &out}, opts)
+
+	if err == nil || !strings.Contains(err.Error(), "smoke test") || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("verify = %v, want a smoke test failure naming the job's reason\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "INCONCLUSIVE") {
+		t.Errorf("verification called a failed smoke test inconclusive:\n%s", out.String())
 	}
 }

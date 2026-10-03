@@ -59,7 +59,9 @@ func TestSmokeRunHappyPath(t *testing.T) {
 			http.Error(w, "bad q", 400)
 			return
 		}
-		if searchPolls.Add(1) < 3 {
+		// The first search is the check, before the upload, for whether the
+		// fixture is already there; the next two are the retries.
+		if searchPolls.Add(1) < 4 {
 			_, _ = w.Write([]byte(`{"data":[]}`))
 			return
 		}
@@ -75,8 +77,8 @@ func TestSmokeRunHappyPath(t *testing.T) {
 	if uploads.Load() != 7 {
 		t.Fatalf("expected 7 uploads, got %d", uploads.Load())
 	}
-	if searchPolls.Load() < 3 {
-		t.Fatalf("expected search retries, got %d polls", searchPolls.Load())
+	if got := searchPolls.Load(); got != 4 {
+		t.Fatalf("got %d searches, want 4: the check before the upload, two empty retries after it, and the one that finds the fixture", got)
 	}
 }
 
@@ -188,6 +190,13 @@ func TestSmokeWaitForJobToleratesTransientErrors(t *testing.T) {
 // the upload has been ended.
 func smokeAPI(t *testing.T, fixtureAlreadyThere bool) (srv *httptest.Server, uploads *atomic.Int32) {
 	t.Helper()
+	return smokeAPIWithJob(t, fixtureAlreadyThere, `{"data":[{"id":1,"status":2,"status_message":"","failed_files":0}]}`)
+}
+
+// smokeAPIWithJob is smokeAPI with the answer to the ingest job listing of the
+// caller's choosing, for a job that did not finish cleanly.
+func smokeAPIWithJob(t *testing.T, fixtureAlreadyThere bool, jobs string) (srv *httptest.Server, uploads *atomic.Int32) {
+	t.Helper()
 	var ended atomic.Bool
 	uploads = new(atomic.Int32)
 	mux := http.NewServeMux()
@@ -207,7 +216,7 @@ func smokeAPI(t *testing.T, fixtureAlreadyThere bool) (srv *httptest.Server, upl
 		w.WriteHeader(200)
 	})
 	mux.HandleFunc("GET /api/v2/file-upload", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[{"id":1,"status":2,"status_message":"","failed_files":0}]}`))
+		_, _ = w.Write([]byte(jobs))
 	})
 	mux.HandleFunc("GET /api/v2/datapipe/status", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":{"status":"idle"}}`))
@@ -250,6 +259,39 @@ func TestSmokeIsInconclusiveWhenTheFixtureIsAlreadyThere(t *testing.T) {
 	s = Smoke{Client: srv.Client(), BaseURL: srv.URL, User: "admin", Password: "pw", Poll: time.Millisecond}
 	if err := s.Run(context.Background(), time.Second); err != nil {
 		t.Fatalf("Run over a graph without the fixture: %v", err)
+	}
+}
+
+// TestSmokeFailsRatherThanInconclusiveWhenTheFixtureIsAlreadyThereAndTheJobFailed
+// is the other half of the inconclusive result: it is what a run reports when
+// everything it can check of its own held. Where this run's ingest job failed,
+// or finished with failed files, that is evidence of this run however the
+// search ends, so over a graph that already holds the fixture the run is a
+// failure with the job's own reason, never ErrSmokeInconclusive -- which a
+// caller may treat as acceptable.
+func TestSmokeFailsRatherThanInconclusiveWhenTheFixtureIsAlreadyThereAndTheJobFailed(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		jobs string
+		want string
+	}{
+		{"the job failed", `{"data":[{"id":1,"status":5,"status_message":"boom","failed_files":7}]}`, "boom"},
+		{"the job finished with failed files", `{"data":[{"id":1,"status":2,"status_message":"two files","failed_files":2}]}`, "2 failed files"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv, _ := smokeAPIWithJob(t, true, c.jobs)
+			s := Smoke{Client: srv.Client(), BaseURL: srv.URL, User: "admin", Password: "pw", Poll: time.Millisecond}
+			err := s.Run(context.Background(), time.Second)
+			if err == nil {
+				t.Fatal("Run passed over a failed ingest job")
+			}
+			if errors.Is(err, ErrSmokeInconclusive) {
+				t.Fatalf("Run = %v: a failed job was reported as inconclusive, which a caller may accept", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("Run = %v, want the job's failure (%q)", err, c.want)
+			}
+		})
 	}
 }
 
