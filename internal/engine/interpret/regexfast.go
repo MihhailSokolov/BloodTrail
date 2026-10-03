@@ -530,9 +530,22 @@ const pgMaxRepeat = 255
 //     an error there. Go reads a malformed one as literal text (`a{1`, `a{1,`,
 //     `a{2x}`), and a count with a leading zero too (`a{01}`, a bound in pg).
 //     A `{` followed by anything else is literal text in both.
+//   - A quantifier directly after an anchor -- `^*a`, `a|^+`, `a$?`,
+//     `^{2}a` -- has no operand to pg ("quantifier operand invalid"), while
+//     Go repeats the empty-width assertion and matches. A quantified group
+//     around one, `(^)*a`, is valid in both.
 func pgBracketsAndBoundsAgree(pattern string) bool {
 	for i := 0; i < len(pattern); i++ {
 		switch pattern[i] {
+		case '^', '$':
+			if i+1 < len(pattern) {
+				switch next := pattern[i+1]; {
+				case next == '*' || next == '+' || next == '?':
+					return false
+				case next == '{' && i+2 < len(pattern) && isDecimalDigit(pattern[i+2]):
+					return false
+				}
+			}
 		case '[':
 			j := i + 1
 			if j < len(pattern) && pattern[j] == '^' {

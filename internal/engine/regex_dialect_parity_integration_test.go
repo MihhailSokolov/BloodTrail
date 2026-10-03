@@ -67,3 +67,30 @@ func TestTryCypherRegexDialectMatchesOracle(t *testing.T) {
 		{`MATCH (n:RxPosix) WHERE n.name =~ 'a{255}' RETURN n`, true},
 	})
 }
+
+// TestTryCypherRegexQuantifiedAnchorMatchesOracle compares patterns that put
+// a quantifier directly after an anchor with PostgreSQL, which rejects them
+// ("quantifier operand invalid") while Go's RE2 repeats the empty-width
+// assertion and matches. A quantified group around an anchor is valid in both.
+func TestTryCypherRegexQuantifiedAnchorMatchesOracle(t *testing.T) {
+	pgDriver, eng := seedTypedGraph(t, []typedNode{
+		{"RxAnchor", map[string]any{"name": "a"}},
+		{"RxAnchor", map[string]any{"name": "ba"}},
+	})
+
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '^*a' RETURN n`, false},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '$*a' RETURN n`, false},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ 'a|^+' RETURN n`, false},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '^?a' RETURN n`, false},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ 'a$?' RETURN n`, false},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '^{2}a' RETURN n`, false},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '(?i)^*A' RETURN n`, false},
+
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '^a.*' RETURN n`, true},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '.*a$' RETURN n`, true},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '(^)*a' RETURN n`, true},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '[^*]a' RETURN n`, true},
+		{`MATCH (n:RxAnchor) WHERE n.name =~ '^{,2}a' RETURN n`, true},
+	})
+}

@@ -31,6 +31,12 @@ func TestPgRegexCompatibleRefusesDialectDifferences(t *testing.T) {
 		{`a{01}`, false},
 		{`a{3,2}`, false},
 		{`(?i)^JOSÉ$`, false},
+		{`^*a`, false},
+		{`$*a`, false},
+		{`a|^+`, false},
+		{`a$?`, false},
+		{`^{2}a`, false},
+		{`(?i)^*a`, false},
 		{"(?i)\u212a", false},
 
 		{`^a{255}$`, true},
@@ -47,6 +53,10 @@ func TestPgRegexCompatibleRefusesDialectDifferences(t *testing.T) {
 		{`10[.]0`, true},
 		{`[:a]`, true},
 		{`^JOSÉ$`, true},
+		{`(^)*a`, true},
+		{`[^*]a`, true},
+		{`^{,2}a`, true},
+		{`^a$`, true},
 		{`(?i).*Windows.* (2000|2003|2008|2012|xp|vista|7|8|me|nt).*`, true},
 		{`(10.0.19044|10.0.22000|6.1.7601).?.*`, true},
 	} {
