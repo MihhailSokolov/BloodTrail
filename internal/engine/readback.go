@@ -9,7 +9,6 @@ import (
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -30,9 +29,10 @@ const readbackNodeIDChunk = 50_000
 const readbackObjectIDChunk = 5_000
 
 // unresolvedTripleKind marks an absentTriples entry whose kind name never
-// resolved to a KindID at all -- reusing dawgs' own SchemaManager.MapKind
-// sentinel return value (drivers/pg/manager.go) for a kind it doesn't
-// recognize, since no real kind_id column value can ever be negative. A
+// resolved to a KindID at all -- the same sentinel dawgs' own
+// SchemaManager.MapKind returns (drivers/pg/manager.go) for a kind it
+// doesn't recognize, since no real kind_id column value can ever be
+// negative. A
 // kind pg has never heard of cannot possibly back a real edge row, so the
 // triple this marks was never actually queried against the edge table --
 // see readBack's own doc for why that's a safe shortcut, not merely an
@@ -124,7 +124,8 @@ type readbackResult struct {
 //     the re-read below.
 //  3. cs.EdgeIDs() by database id (readBackEdgesByID), mirroring (1).
 //  4. cs.EdgeTriples() by (start, end, kind name) -- resolveKindIDs
-//     resolves each distinct kind name to its current KindID; a name that
+//     resolves each distinct kind name to its current KindID, against view's
+//     own kind table and otherwise the `kind` table itself; a name that
 //     ends up unresolved (genuinely never asserted, per resolveKindIDs' own
 //     doc -- which also covers the residual ambiguity a name can be
 //     unresolved for) means the triple is reported absent (kindID
@@ -171,20 +172,23 @@ type readbackResult struct {
 //
 // Finally, every kind id encountered in a returned node or edge row is
 // checked against view (a nil view treats every kind id as unknown). Any id
-// the view doesn't recognize is resolved, in one batched call, via
-// e.pgDriver.KindMapper().MapKindIDs and recorded in resolvedKinds; a
-// mapper failure here is returned as an error rather than silently
-// producing an incomplete resolvedKinds map, since the applier has no safe
-// way to build a delta segment naming a kind it can't resolve -- its only
-// sound response is to fall back to a full resync, exactly as ChangeSet's
-// own RecordFallback path already does for other unrepresentable writes.
+// the view doesn't recognize is resolved, in one batched query of the `kind`
+// table (resolveUnknownKinds), and recorded in resolvedKinds; a read that
+// fails, or an id no kind row holds, is returned as an error rather than
+// silently producing an incomplete resolvedKinds map, since the applier has
+// no safe way to build a delta segment naming a kind it can't resolve -- its
+// only sound response is to fall back to a full resync, exactly as
+// ChangeSet's own RecordFallback path already does for other
+// unrepresentable writes.
+//
+// Every kind lookup here goes through a kindCatalog over the same write-path
+// pool, never dawgs' KindMapper: see that type's own doc.
 func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSet) (*readbackResult, error) {
 	graphModel, ok := e.pgDriver.DefaultGraph()
 	if !ok {
 		return nil, fmt.Errorf("engine: readBack: no default graph is set")
 	}
 	graphID := graphModel.ID
-	kindMapper := e.pgDriver.KindMapper()
 
 	result := &readbackResult{}
 	nodesByID := make(map[uint64]nodeState)
@@ -194,6 +198,7 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	// mid-batch Commit), and a second connection from that pool is what
 	// saturated writers waited on each other for (writePathPool).
 	pool := e.writePool.get(e.pool)
+	catalog := pgKindCatalog{pool: pool}
 
 	nodeIDs := cs.NodeIDs()
 	foundByID, err := readBackNodesByID(ctx, pool, graphID, nodeIDs)
@@ -244,7 +249,7 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	for _, t := range oidTriples {
 		kindNames = append(kindNames, t.Kind)
 	}
-	resolvedTripleKinds, err := resolveKindIDs(ctx, kindMapper, kindNames)
+	resolvedTripleKinds, err := resolveKindIDs(ctx, catalog, view, kindNames)
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +306,7 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 		}
 	}
 
-	criteriaKinds, err := resolveCriteriaKinds(ctx, kindMapper, view, cs)
+	criteriaKinds, err := resolveCriteriaKinds(ctx, catalog, view, cs)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +341,7 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	sort.Slice(result.absentEdgeIDs, func(i, j int) bool { return result.absentEdgeIDs[i] < result.absentEdgeIDs[j] })
 	result.absentTriples = sortedTripleKeys(absentTriples)
 
-	resolvedKinds, err := resolveUnknownKinds(ctx, kindMapper, view, result.nodes, result.edges)
+	resolvedKinds, err := resolveUnknownKinds(ctx, catalog, view, result.nodes, result.edges)
 	if err != nil {
 		return nil, err
 	}
@@ -395,13 +400,122 @@ func rereadByID[S any](candidates []uint64, found map[uint64]S, absent []uint64,
 	return absent, nil
 }
 
+// kindCatalog resolves kind names and kind ids against PostgreSQL's own
+// `kind` table. That table is global rather than per-graph, and append-only
+// as far as the pinned dawgs v0.8.0 is concerned (query/sql's
+// insert_or_get_kind.sql only ever adds a row; nothing there deletes or
+// renames one), so a name's id never changes under a running engine -- which
+// is what lets every caller below treat an answer the View's own kind table
+// already holds as current and skip the lookup entirely.
+//
+// It exists as a seam for two reasons, both about dawgs' pg.KindMapper --
+// the obvious resolver, and the wrong one for read-back:
+//
+//   - A cache MISS leaves the write path. MapKind/MapKinds/MapKindIDs answer
+//     from an in-process cache, but a name or id that cache lacks makes them
+//     call SchemaManager.Fetch, which re-reads the whole kind table through
+//     its own WriteTransaction -- and that acquires a connection of the MAIN
+//     pool (drivers/pg/manager.go). Read-back runs with applyMu held while
+//     the write's own caller may still be holding a main-pool connection, so
+//     at saturation that acquire waits for a connection the write itself
+//     will not release until the read-back returns: with a deadline the
+//     read-back fails and the write silently costs a fallback and a full
+//     rebuild, without one it waits for good. That is precisely the hazard
+//     the write path's own pool exists to remove (writepool.go), and a
+//     kind the View has not seen is the ordinary case this used to hit --
+//     one registered by another server, or by an OpenGraph source, since
+//     this replica's snapshot was loaded.
+//   - Its error return conflates "this kind was never asserted" with "the
+//     kind table could not be read at all" (one opaque error for both), and
+//     read-back has to tell those apart: the first is an answer, the second
+//     is a reason to fall back. Reading the table directly does.
+//
+// The unit tests' own in-memory catalog is the second reason for a seam.
+type kindCatalog interface {
+	// idsByName resolves names to their current KindIDs. A name the kind
+	// table does not hold is absent from the result rather than an error --
+	// that is an answer, and each caller decides what it means.
+	idsByName(ctx context.Context, names []string) (map[string]int16, error)
+
+	// namesByID is the opposite direction, with the same "absent, not an
+	// error" rule for an id no kind row holds.
+	namesByID(ctx context.Context, ids []int16) (map[int16]string, error)
+}
+
+// pgKindCatalog is the kindCatalog read-back uses in production: two direct
+// `kind` table queries on the write path's own pool (writePathPool), the
+// same pool every other read-back query runs on. Neither query is chunked
+// the way the node and edge read-backs are: both are bounded by how many
+// kinds exist at all, and a kind id is a smallint.
+type pgKindCatalog struct {
+	pool *pgxpool.Pool
+}
+
+func (c pgKindCatalog) idsByName(ctx context.Context, names []string) (map[string]int16, error) {
+	out := make(map[string]int16, len(names))
+
+	rows, err := c.pool.Query(ctx, "SELECT id, name FROM kind WHERE name = ANY($1::text[])", names)
+	if err != nil {
+		return nil, fmt.Errorf("engine: readBack: query kinds by name: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id   int16
+			name string
+		)
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, fmt.Errorf("engine: readBack: scan kind by name: %w", err)
+		}
+		out[name] = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("engine: readBack: kind-by-name rows: %w", err)
+	}
+
+	return out, nil
+}
+
+func (c pgKindCatalog) namesByID(ctx context.Context, ids []int16) (map[int16]string, error) {
+	out := make(map[int16]string, len(ids))
+
+	rows, err := c.pool.Query(ctx, "SELECT id, name FROM kind WHERE id = ANY($1::int2[])", ids)
+	if err != nil {
+		return nil, fmt.Errorf("engine: readBack: query kinds by id: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id   int16
+			name string
+		)
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, fmt.Errorf("engine: readBack: scan kind by id: %w", err)
+		}
+		out[id] = name
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("engine: readBack: kind-by-id rows: %w", err)
+	}
+
+	return out, nil
+}
+
 // resolveUnknownKinds collects every kind id referenced by nodes/edges that
-// view doesn't already recognize, resolves them in one batched call via
-// kindMapper.MapKindIDs, and returns the result as an id->name map (nil if
-// every kind id was already known). See readBack's own doc for why a nil
-// view treats every kind id as unknown, and why a mapper failure here is a
-// hard error rather than a partial map.
-func resolveUnknownKinds(ctx context.Context, kindMapper pg.KindMapper, view *snapshot.View, nodes []nodeState, edges []edgeState) (map[int16]string, error) {
+// view doesn't already recognize, resolves them in one batched kind-table
+// query (catalog.namesByID), and returns the result as an id->name map (nil
+// if every kind id was already known). See readBack's own doc for why a nil
+// view treats every kind id as unknown, and why a failure here is a hard
+// error rather than a partial map.
+//
+// An id the kind table holds no row for is that same hard error, not a
+// silently skipped entry: a node or edge row can only carry a kind id the
+// kind table issued, so an id with no name means the two disagree, and the
+// applier would otherwise stage a row whose kind the segment cannot name.
+// (dawgs' MapKindIDs, which this replaced, errored on such an id too.)
+func resolveUnknownKinds(ctx context.Context, catalog kindCatalog, view *snapshot.View, nodes []nodeState, edges []edgeState) (map[int16]string, error) {
 	unknown := make(map[int16]struct{})
 	for _, ns := range nodes {
 		for _, kindID := range ns.kindIDs {
@@ -424,18 +538,23 @@ func resolveUnknownKinds(ctx context.Context, kindMapper pg.KindMapper, view *sn
 	for id := range unknown {
 		ids = append(ids, id)
 	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-	kinds, err := kindMapper.MapKindIDs(ctx, ids)
+	resolved, err := catalog.namesByID(ctx, ids)
 	if err != nil {
-		return nil, fmt.Errorf("engine: readBack: map unknown kind ids: %w", err)
+		return nil, err
 	}
 
-	resolved := make(map[int16]string, len(ids))
-	for i, kind := range kinds {
-		if kind != nil {
-			resolved[ids[i]] = kind.String()
+	var unnamed []int16
+	for _, id := range ids {
+		if _, ok := resolved[id]; !ok {
+			unnamed = append(unnamed, id)
 		}
 	}
+	if len(unnamed) > 0 {
+		return nil, fmt.Errorf("engine: readBack: the kind table holds no name for kind ids: %v", unnamed)
+	}
+
 	return resolved, nil
 }
 
@@ -474,9 +593,9 @@ func kindKnownToView(view *snapshot.View, id int16) bool {
 //
 // A name that does not resolve is left out rather than reported:
 // viewCandidates decides what that means (an include kind matches nothing,
-// an exclusion fails closed). The one hard error is resolveKindIDs' own --
-// a cancelled or expired ctx.
-func resolveCriteriaKinds(ctx context.Context, kindMapper pg.KindMapper, view *snapshot.View, cs *ChangeSet) (map[int16]string, error) {
+// an exclusion fails closed). The one hard error is resolveKindIDs' own -- a
+// kind-table read that failed, a cancelled or expired ctx included.
+func resolveCriteriaKinds(ctx context.Context, catalog kindCatalog, view *snapshot.View, cs *ChangeSet) (map[int16]string, error) {
 	var unknown graph.Kinds
 	collect := func(kinds graph.Kinds) {
 		for _, kind := range kinds {
@@ -499,7 +618,7 @@ func resolveCriteriaKinds(ctx context.Context, kindMapper pg.KindMapper, view *s
 		return nil, nil
 	}
 
-	ids, err := resolveKindIDs(ctx, kindMapper, unknown)
+	ids, err := resolveKindIDs(ctx, catalog, view, unknown)
 	if err != nil {
 		return nil, err
 	}
@@ -516,74 +635,41 @@ func resolveCriteriaKinds(ctx context.Context, kindMapper pg.KindMapper, view *s
 
 // resolveKindIDs resolves every distinct kind name among kinds to its
 // current PostgreSQL KindID, deduplicating by name so a kind shared by many
-// entries costs one lookup, not one per entry. A name that ends up
-// unresolved is simply absent from the result, and each caller decides what
-// that means rather than treating it as an error: readBack reports a triple
-// of that kind absent without ever querying it ("this triple's kind was
-// never asserted, so the edge cannot exist"), and viewCandidates lets an
-// unresolved include kind match nothing while an unresolved exclusion fails
-// closed. A nil kind is absent from the result too, and never reaches the
-// mapper at all: it has no name to resolve, and dawgs formats a mapping
-// error by calling String() on every kind it was handed. The exception is a
-// hard error (see below), which resolveKindIDs itself returns rather than
-// silently folding into "unresolved".
+// entries costs one lookup, not one per entry.
 //
-// dawgs' pg.KindMapper (v0.8.0, drivers/pg/manager.go) gives MapKind and
-// MapKinds a single opaque error return that conflates two very different
-// situations: a kind name PostgreSQL has genuinely never heard of (fetched
-// the current kind table and it just isn't in there), and a Fetch failure
-// while refreshing that kind table (context cancellation, connection pool
-// exhaustion, any other transport error) -- there is no sentinel or typed
-// error to tell them apart. Treating both the same way, as earlier versions
-// of this function did, is wrong: if the write's own ctx has already been
-// cancelled or hit its deadline, that failure has nothing to do with
-// whether the kind was ever asserted, and reporting the affected entries
-// unresolved would let readBack return a confidently-wrong result instead
-// of the error the applier needs in order to fall back to a full resync
-// (see readBack's own doc).
+// view's own kind table answers first, for no round trip at all: a kind the
+// View names has the id it names (kindCatalog's own doc: the kind table is
+// append-only, so an id never moves under a running engine), and a write's
+// own kinds were necessarily asserted before anything could reference them,
+// so this is the common case for a triple's kind. Every name left --
+// typically none -- is resolved in ONE kind-table query
+// (catalog.idsByName). A nil view simply resolves everything that way, the
+// same reading resolveUnknownKinds gives one.
 //
-// So every MapKind/MapKinds error is checked against ctx.Err() before it is
-// allowed to mean "unresolved": a non-nil ctx.Err() means the error IS the
-// cancellation, and resolveKindIDs aborts immediately, returning it as a
-// hard error. Only once ctx is confirmed still live does a mapper error get
-// treated as "this kind name doesn't exist".
+// A name that ends up unresolved is simply absent from the result, and each
+// caller decides what that means rather than treating it as an error:
+// readBack reports a triple of that kind absent without ever querying it
+// ("this triple's kind was never asserted, so the edge cannot exist"), and
+// viewCandidates lets an unresolved include kind match nothing while an
+// unresolved exclusion fails closed. A nil kind is absent from the result
+// too, and is never looked up at all: it has no name to resolve.
 //
-// The resolution itself tries kindMapper.MapKinds first, as one batched,
-// all-or-nothing round trip covering every deduplicated kind at once: when
-// every one of them resolves (by far the common case -- a write's own kinds
-// were necessarily asserted before anything could reference them), that
-// single call is all this function ever does. MapKinds has no partial
-// result to return on error (mapKinds' own all-or-nothing contract, dawgs
-// manager.go), so a batch failure -- once ruled out as ctx cancellation --
-// falls back to resolving each deduplicated kind with its own MapKind call,
-// confining one bad or failing name's damage to that name's own entries
-// rather than the whole batch, exactly as a pure per-kind loop always has.
-//
-// Residual ambiguity, accepted as a dawgs v0.8.0 API limitation: a non-ctx
-// infrastructure failure mid-Fetch (ctx still live, e.g. a transient
-// connection-pool exhaustion) still can't be told apart from a genuinely
-// unasserted kind, so the per-kind fallback still misclassifies it as
-// "unresolved" rather than retrying or erroring. The blast radius is
-// bounded, not eliminated, by the per-kind fallback above: only that one
-// kind name's entries are affected. A delete criteria kind misclassified
-// this way costs no more than an unknown kind always did (an include kind
-// matches nothing, an exclusion fails closed into a fallback). A triple's
-// kind is folded into absentTriples under the unresolvedTripleKind sentinel
-// (-1) rather than a real KindID. That sentinel can never match a real
-// edge's kind id in the engine's current View -- kindKnownToView's own doc:
-// "a KindTable never registers a negative id" -- and the only way a future
-// applier can turn an absentTriples entry into a concrete tombstone is by
-// resolving it to a real edge id via the View's own adjacency first
-// (SegmentBuilder.TombstoneEdge, snapshot/segment.go, takes an edge id, not
-// a triple), so a sentinel-kinded entry can never resolve to one. The
-// observable failure mode of this residual ambiguity for a triple is
-// therefore a false negative -- a just-created edge of that kind silently
-// missing from the resulting View -- rather than a wrong tombstone of a
-// pre-existing, unrelated View edge.
-func resolveKindIDs(ctx context.Context, kindMapper pg.KindMapper, kinds []graph.Kind) (map[string]int16, error) {
-	names := make([]string, 0, len(kinds))
-	deduped := make(graph.Kinds, 0, len(kinds))
+// A FAILED kind-table read is the one hard error, returned rather than
+// folded into "unresolved" -- including a cancelled or expired ctx, which
+// is how a cancellation surfaces here now that the lookup is a query of
+// this package's own. This is the distinction dawgs' KindMapper could not
+// make (kindCatalog's doc): its one opaque error meant both "never
+// asserted" and "could not read the table", so a transient infrastructure
+// failure was misreported as an unasserted kind -- a false negative, where
+// a just-created edge of that kind went silently missing from the resulting
+// View. Reading the table directly removes that ambiguity rather than
+// bounding it: rows back means the name does not exist, an error means the
+// answer is unknown, and the applier falls back to a full resync for the
+// latter exactly as readBack's own doc describes.
+func resolveKindIDs(ctx context.Context, catalog kindCatalog, view *snapshot.View, kinds []graph.Kind) (map[string]int16, error) {
+	resolved := make(map[string]int16, len(kinds))
 	seen := make(map[string]struct{}, len(kinds))
+	missing := make([]string, 0, len(kinds))
 
 	for _, kind := range kinds {
 		if kind == nil {
@@ -594,38 +680,28 @@ func resolveKindIDs(ctx context.Context, kindMapper pg.KindMapper, kinds []graph
 			continue
 		}
 		seen[name] = struct{}{}
-		names = append(names, name)
-		deduped = append(deduped, kind)
-	}
 
-	resolved := make(map[string]int16, len(deduped))
-	if len(deduped) == 0 {
-		return resolved, nil
-	}
-
-	if ids, err := kindMapper.MapKinds(ctx, deduped); err == nil {
-		for i, id := range ids {
-			resolved[names[i]] = id
-		}
-		return resolved, nil
-	} else if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, fmt.Errorf("engine: readBack: resolve kind ids: %w", ctxErr)
-	}
-
-	// The batch call failed for a reason other than ctx cancellation --
-	// most likely at least one deduplicated name doesn't exist, but per
-	// this function's own doc that can't be told apart from an infra
-	// failure. Fall back to resolving each name on its own so only that
-	// name's entries are affected.
-	for i, kind := range deduped {
-		id, err := kindMapper.MapKind(ctx, kind)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("engine: readBack: resolve kind ids: %w", ctxErr)
+		if view != nil {
+			if id, ok := view.Kinds().ID(name); ok {
+				resolved[name] = id
+				continue
 			}
-			continue
 		}
-		resolved[names[i]] = id
+		missing = append(missing, name)
+	}
+
+	if len(missing) == 0 {
+		return resolved, nil
+	}
+
+	ids, err := catalog.idsByName(ctx, missing)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range missing {
+		if id, ok := ids[name]; ok {
+			resolved[name] = id
+		}
 	}
 
 	return resolved, nil

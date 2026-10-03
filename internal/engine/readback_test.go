@@ -8,70 +8,56 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
+	"strconv"
 	"testing"
 
 	"github.com/specterops/dawgs/graph"
 )
 
-// catalogKindMapper is a pg.KindMapper over a fixed name->id catalog that
-// keeps dawgs' own contract (drivers/pg/manager.go, v0.8.0): MapKinds is
-// all-or-nothing, MapKind fails for a name the catalog lacks, and both fail
-// once ctx is done. asked records every name either method was handed,
-// read through kind.String() exactly as dawgs formats its own mapping
-// errors -- so a nil kind reaching it panics, as it would against dawgs.
-type catalogKindMapper struct {
+// catalogKindTable is a kindCatalog over a fixed name->id catalog, keeping
+// pgKindCatalog's own contract: a name (or id) the catalog lacks is simply
+// absent from the result, the way a kind-table query returns no row for it,
+// and a read with a done ctx fails as that query would. asked records every
+// name either direction was handed, read through kind.String() -- so a nil
+// kind reaching it panics, as it would against a real query's parameter
+// list.
+type catalogKindTable struct {
 	ids   map[string]int16
 	asked []string
 }
 
-func (m *catalogKindMapper) MapKinds(ctx context.Context, kinds graph.Kinds) ([]int16, error) {
-	ids := make([]int16, 0, len(kinds))
-	var missing []string
-	for _, kind := range kinds {
-		name := kind.String()
+func (m *catalogKindTable) idsByName(ctx context.Context, names []string) (map[string]int16, error) {
+	out := make(map[string]int16, len(names))
+	for _, name := range names {
 		m.asked = append(m.asked, name)
 		if id, ok := m.ids[name]; ok {
-			ids = append(ids, id)
-		} else {
-			missing = append(missing, name)
+			out[name] = id
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("catalogKindTable: query kinds by name: %w", err)
 	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("unable to map kinds: %s", strings.Join(missing, ", "))
-	}
-	return ids, nil
+	return out, nil
 }
 
-func (m *catalogKindMapper) MapKind(ctx context.Context, kind graph.Kind) (int16, error) {
-	name := kind.String()
-	m.asked = append(m.asked, name)
+func (m *catalogKindTable) namesByID(ctx context.Context, ids []int16) (map[int16]string, error) {
+	out := make(map[int16]string, len(ids))
+	for _, id := range ids {
+		m.asked = append(m.asked, strconv.Itoa(int(id)))
+		for name, known := range m.ids {
+			if known == id {
+				out[id] = name
+			}
+		}
+	}
 	if err := ctx.Err(); err != nil {
-		return -1, err
+		return nil, fmt.Errorf("catalogKindTable: query kinds by id: %w", err)
 	}
-	if id, ok := m.ids[name]; ok {
-		return id, nil
-	}
-	return -1, fmt.Errorf("unable to map kind: %s", name)
-}
-
-func (m *catalogKindMapper) MapKindID(context.Context, int16) (graph.Kind, error) {
-	return nil, errors.New("catalogKindMapper: MapKindID is not used by name resolution")
-}
-
-func (m *catalogKindMapper) MapKindIDs(context.Context, []int16) (graph.Kinds, error) {
-	return nil, errors.New("catalogKindMapper: MapKindIDs is not used by name resolution")
-}
-
-func (m *catalogKindMapper) AssertKinds(context.Context, graph.Kinds) ([]int16, error) {
-	return nil, errors.New("catalogKindMapper: read-back never asserts kinds")
+	return out, nil
 }
 
 // askedSet returns the distinct names m was asked about, sorted.
-func (m *catalogKindMapper) askedSet() []string {
+func (m *catalogKindTable) askedSet() []string {
 	seen := make(map[string]struct{}, len(m.asked))
 	var out []string
 	for _, name := range m.asked {
@@ -100,21 +86,21 @@ func criteriaChangeSet() *ChangeSet {
 
 // rowlessCatalog is a catalog knowing every kind criteriaChangeSet names,
 // the View-known ones under the ids buildApplyView uses.
-func rowlessCatalog() *catalogKindMapper {
-	return &catalogKindMapper{ids: map[string]int16{
+func rowlessCatalog() *catalogKindTable {
+	return &catalogKindTable{ids: map[string]int16{
 		"User": applyKindUser, "Tag": applyKindTag, "AdminTo": applyKindAdminTo,
 		"RowlessA": 40, "RowlessB": 41, "RowlessEdge": 43,
 	}}
 }
 
 // TestResolveCriteriaKindsResolvesOnlyKindsTheViewLacks pins the unknown-only
-// rule: a criteria kind the View already names never reaches the mapper, and
-// every one it lacks comes back id->name, include, exclude and relationship
-// kinds alike.
+// rule: a criteria kind the View already names never reaches the kind table,
+// and every one it lacks comes back id->name, include, exclude and
+// relationship kinds alike.
 func TestResolveCriteriaKindsResolvesOnlyKindsTheViewLacks(t *testing.T) {
-	mapper := rowlessCatalog()
+	catalog := rowlessCatalog()
 
-	got, err := resolveCriteriaKinds(context.Background(), mapper, buildApplyView(t), criteriaChangeSet())
+	got, err := resolveCriteriaKinds(context.Background(), catalog, buildApplyView(t), criteriaChangeSet())
 	if err != nil {
 		t.Fatalf("resolveCriteriaKinds: %v", err)
 	}
@@ -123,8 +109,8 @@ func TestResolveCriteriaKindsResolvesOnlyKindsTheViewLacks(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resolveCriteriaKinds = %v, want %v", got, want)
 	}
-	if asked, want := mapper.askedSet(), []string{"RowlessA", "RowlessB", "RowlessEdge"}; !reflect.DeepEqual(asked, want) {
-		t.Fatalf("mapper was asked about %v, want only the kinds the view lacks: %v", asked, want)
+	if asked, want := catalog.askedSet(), []string{"RowlessA", "RowlessB", "RowlessEdge"}; !reflect.DeepEqual(asked, want) {
+		t.Fatalf("the kind table was asked about %v, want only the kinds the view lacks: %v", asked, want)
 	}
 }
 
@@ -133,9 +119,9 @@ func TestResolveCriteriaKindsResolvesOnlyKindsTheViewLacks(t *testing.T) {
 // consult, every criteria kind is resolved, as resolveUnknownKinds does for
 // row kinds.
 func TestResolveCriteriaKindsNilViewResolvesEveryKind(t *testing.T) {
-	mapper := rowlessCatalog()
+	catalog := rowlessCatalog()
 
-	got, err := resolveCriteriaKinds(context.Background(), mapper, nil, criteriaChangeSet())
+	got, err := resolveCriteriaKinds(context.Background(), catalog, nil, criteriaChangeSet())
 	if err != nil {
 		t.Fatalf("resolveCriteriaKinds: %v", err)
 	}
@@ -149,15 +135,15 @@ func TestResolveCriteriaKindsNilViewResolvesEveryKind(t *testing.T) {
 	}
 }
 
-// TestResolveCriteriaKindsLeavesUnresolvableKindsOut covers a name the
-// mapper cannot resolve: it is left out rather than reported (what that
-// means is buildApplySegment's call), and the batch failure it causes does
-// not cost the other names their resolution.
+// TestResolveCriteriaKindsLeavesUnresolvableKindsOut covers a name the kind
+// table holds no row for: it is left out rather than reported (what that
+// means is buildApplySegment's call), and costs the other names in the same
+// lookup nothing.
 func TestResolveCriteriaKindsLeavesUnresolvableKindsOut(t *testing.T) {
-	mapper := rowlessCatalog()
-	delete(mapper.ids, "RowlessB")
+	catalog := rowlessCatalog()
+	delete(catalog.ids, "RowlessB")
 
-	got, err := resolveCriteriaKinds(context.Background(), mapper, buildApplyView(t), criteriaChangeSet())
+	got, err := resolveCriteriaKinds(context.Background(), catalog, buildApplyView(t), criteriaChangeSet())
 	if err != nil {
 		t.Fatalf("resolveCriteriaKinds: %v", err)
 	}
@@ -169,9 +155,9 @@ func TestResolveCriteriaKindsLeavesUnresolvableKindsOut(t *testing.T) {
 }
 
 // TestResolveCriteriaKindsCancelledContextIsAHardError keeps resolveKindIDs'
-// ctx rule for criteria kinds: a mapper failure caused by a cancelled ctx
-// says nothing about whether the kind exists, so it is returned (and Apply
-// falls back) rather than read as "unresolved".
+// ctx rule for criteria kinds: a kind-table read that failed on a cancelled
+// ctx says nothing about whether the kind exists, so it is returned (and
+// Apply falls back) rather than read as "unresolved".
 func TestResolveCriteriaKindsCancelledContextIsAHardError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -184,35 +170,35 @@ func TestResolveCriteriaKindsCancelledContextIsAHardError(t *testing.T) {
 
 // TestResolveCriteriaKindsNothingToResolve covers the two ways there is
 // nothing to ask: no criteria at all, and criteria naming only kinds the
-// View already knows. Neither reaches the mapper.
+// View already knows. Neither reaches the kind table.
 func TestResolveCriteriaKindsNothingToResolve(t *testing.T) {
 	known := &ChangeSet{}
 	known.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("User")}, graph.Kinds{graph.StringKind("Tag")})
 	known.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("AdminTo")})
 
 	for name, cs := range map[string]*ChangeSet{"no criteria": {}, "only known kinds": known} {
-		mapper := rowlessCatalog()
+		catalog := rowlessCatalog()
 
-		got, err := resolveCriteriaKinds(context.Background(), mapper, buildApplyView(t), cs)
+		got, err := resolveCriteriaKinds(context.Background(), catalog, buildApplyView(t), cs)
 		if err != nil {
 			t.Fatalf("%s: resolveCriteriaKinds: %v", name, err)
 		}
 		if got != nil {
 			t.Fatalf("%s: resolveCriteriaKinds = %v, want nil", name, got)
 		}
-		if len(mapper.asked) != 0 {
-			t.Fatalf("%s: mapper was asked about %v, want no calls", name, mapper.asked)
+		if len(catalog.asked) != 0 {
+			t.Fatalf("%s: the kind table was asked about %v, want no lookups", name, catalog.asked)
 		}
 	}
 }
 
 // TestResolveKindIDsSkipsNilKinds pins the nil guard: a nil kind has no name
-// to resolve and must never reach the mapper, whose error formatting calls
-// String() on every kind it was handed.
+// to resolve and must never reach the kind table, whose lookup reads
+// String() off every kind it was handed.
 func TestResolveKindIDsSkipsNilKinds(t *testing.T) {
-	mapper := &catalogKindMapper{ids: map[string]int16{"Known": 7}}
+	catalog := &catalogKindTable{ids: map[string]int16{"Known": 7}}
 
-	got, err := resolveKindIDs(context.Background(), mapper, graph.Kinds{nil, graph.StringKind("Known"), nil})
+	got, err := resolveKindIDs(context.Background(), catalog, nil, graph.Kinds{nil, graph.StringKind("Known"), nil})
 	if err != nil {
 		t.Fatalf("resolveKindIDs: %v", err)
 	}
@@ -220,7 +206,7 @@ func TestResolveKindIDsSkipsNilKinds(t *testing.T) {
 		t.Fatalf("resolveKindIDs = %v, want %v", got, want)
 	}
 
-	got, err = resolveKindIDs(context.Background(), mapper, graph.Kinds{nil})
+	got, err = resolveKindIDs(context.Background(), catalog, nil, graph.Kinds{nil})
 	if err != nil {
 		t.Fatalf("resolveKindIDs(nil only): %v", err)
 	}

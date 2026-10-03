@@ -2390,13 +2390,30 @@ between the upsert and its apply. Its triple cannot be resolved, so an edge that
 not staged until a later write names it or a reload brings it in. Objectids are identities in
 BloodHound, so this takes a re-key racing an ingest upsert.
 
-Kind names are mapped to ids in one batch; if the batch fails, each name is looked up on its own, so
-one bad name affects only its own entries, and a cancelled request counts as a read-back error. For
-an edge triple, a kind that cannot be mapped is treated as "no such edge", so the worst case is a
-missed new edge, never a wrong tombstone. The same lookup resolves every kind a delete's criteria
-name that the view does not know ([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids
-the view has not seen before (kinds registered at runtime) are resolved and added to the segment,
-together with the kinds found for criteria. Any read-back error switches the engine to FALLBACK.
+Kind names and kind ids are resolved on this same pool, out of the kind table itself (`kindCatalog`,
+`pgKindCatalog`), rather than through DAWGS's kind mapper. That mapper answers from an in-process
+cache, but a name or id the cache lacks makes it re-read the whole kind table through a connection
+of BloodHound's pool -- the one thing a read-back holding `applyMu` must not ask for, since a
+saturated pool then waits for the connection the write itself is holding. The view's own kind table
+answers first and costs no query at all; a kind registered since the replica loaded takes one
+lookup:
+
+```sql
+-- kind names the view does not know
+SELECT id, name FROM kind WHERE name = ANY($1::text[])
+-- kind ids the view has not seen
+SELECT id, name FROM kind WHERE id = ANY($1::int2[])
+```
+
+A name the kind table holds no row for is unresolved, and for an edge triple that is treated as "no
+such edge", so the worst case is a missed new edge, never a wrong tombstone. The same lookup
+resolves every kind a delete's criteria name that the view does not know
+([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids the view has not seen before
+(kinds registered at runtime) are resolved and added to the segment, together with the kinds found
+for criteria; an id the kind table names no kind for is an error, not a skipped entry. A lookup that
+fails is a read-back error too: reading the table directly is what tells "never asserted" apart from
+"could not be read", which the mapper's single opaque error could not. Any read-back error switches
+the engine to FALLBACK.
 
 ### 12.4 Apply, step by step
 
@@ -2499,7 +2516,8 @@ stranded.
 [`changes.go`](internal/engine/changes.go) (`ChangeSet`),
 [`changes_scope.go`](internal/engine/changes_scope.go) (`WriteScope`),
 [`readback.go`](internal/engine/readback.go) (`readBack`, `rereadByID`, `resolveCriteriaKinds`,
-`resolveKindIDs`). [`write_observer.go`](write_observer.go): what each observer records
+`resolveKindIDs`, `resolveUnknownKinds`, `kindCatalog`, `pgKindCatalog`).
+[`write_observer.go`](write_observer.go): what each observer records
 (`recordBatchCreateNodeIdentity`, `recordNodeUpsertIdentity`, `recordRelationshipUpsertIdentity`,
 `nodeIDsFromCriteria`, `relationshipDeleteScope`, `edgeKindsFromCriteria`, `cypherMutates`).
 
@@ -3062,7 +3080,7 @@ corpus runs on.
 | Builder matrix | Every builder shape BloodTrail recognizes, on hand-made and random graphs |
 | Write-through | 15 classes of write (upserts, cascading deletes, deletes by kind, partially failed batches, concurrent writers, a "delete sourceless data" whose exclusions name a kind PostgreSQL registered but no row carries, …). After each recognized write, the very next read must be answered by BloodTrail and match PostgreSQL (for five classes, whole rows including full property bags; for the rest, the values and counts the write changed), and no reload may have happened; one class deliberately forces a fallback and checks the recovery, and one stresses concurrent writers |
 | OpenGraph | BloodHound v9.6.0's OpenGraph calls, unchanged through v9.7.1, replayed through the real driver: uploads with and without a source kind, with kind registration and `RefreshKinds` inside the open batch; objectid-keyed upserts of text, number, boolean and text-list values, multi-kind and stub nodes, and an edge from an AD user, which gains the source kind; endpoints resolved by name and by property, one to nothing; a failed upload that registers its source kind and writes no row; Cypher reads, builder counts and pathfinding over an extension's traversable kinds; deletes by edge kind, of sourceless data and of a source kind. After every step, answers must equal the plain PostgreSQL driver's and be served from memory, with no fallback and no rebuild. Two kinds of read go to PostgreSQL by design and are only compared: the endpoint lookups by name or property, and one Cypher query that names a kind no row carries |
-| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one, writers on a saturated connection pool (with and without the engine), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
+| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one, writers on a saturated connection pool (with and without the engine, and a read-back that has to resolve a kind no cache has seen), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
 | Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context, with the write path's pool still open; a save racing a failed bump removes its own file; a file whose boot panics is deleted and the boot rebuilds. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage. Convergence: a save is refused while an earlier bump's response is still in flight (held back by a proxy after PostgreSQL committed it), and while a second engine's counter is unaccounted for, until a rebuild has loaded its write; a file stamped ahead of the counter at start is refused, and buffered boot writes that contradict the file reject it at once |
 
 Every comparison is paired with **served-answer evidence**: the tests count BloodTrail's "served"
