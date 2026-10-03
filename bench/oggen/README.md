@@ -70,7 +70,8 @@ the **PostgreSQL** driver to isolate the engine.
 
 ## Measured
 
-A 190k-node organization with 10k hybrid AD edges, three runs per arm: every
-answer identical on both arms, path-shaped queries 30-70x faster with
-BloodTrail, scans and aggregates 2-8x, ingest a quarter slower. The table and
-its caveats are in [BENCHMARK.md](../../BENCHMARK.md#opengraph).
+A 190k-node organization with 10k hybrid AD edges, three runs per arm:
+path-shaped queries 30-70x faster with BloodTrail, scans and aggregates 2-8x,
+ingest a quarter slower. That the answers were identical on both arms is not
+verified: those runs predate the comparison above. The table and its caveats
+are in [BENCHMARK.md](../../BENCHMARK.md#opengraph).

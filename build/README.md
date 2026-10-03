@@ -111,15 +111,21 @@ run against that same fixture, still installed, before rollback:
    paths, `shortestPath`, both `allShortestPaths` answers, a hybrid AD-to-OpenGraph path,
    counts) and three pathfinding calls with `only_traversable=true`. Last, clear sourceless
    data, then the source kind (`POST /api/v2/clear-database`). The expected answers are
-   derived from the fixtures, never read back from the engine under test, and a graph
-   answer is compared by content: the sorted objectIds of its nodes and the sorted
-   (source objectId, target objectId, kind) triples of its edges, not their number; the
-   whole-graph count after the sourceless delete is a pinned 131 (118 nodes from the
-   SharpHound fixture and its analysis, 13 from `graph.json`), specific to v9.6.0's
-   analysis. Their sizes are what stock BloodHound v9.6.0 on PostgreSQL returns; every
-   answer must carry its `cypher engine served` or `path engine served` marker, and the
-   phase must log no `snapshot rebuilt` and no `fallback entered`. `CHECK_SERVED=0` runs
-   the same expectations against a BloodHound on the PostgreSQL driver.
+   derived from the fixtures and pinned in the script, not read back from the engine under
+   test while it runs, and a graph answer is compared by content: the sorted objectIds of
+   its nodes and the sorted (source objectId, target objectId, kind) triples of its edges,
+   not their number. Their sizes are what stock BloodHound v9.6.0 on PostgreSQL returns,
+   with one exception: the whole-graph count after the sourceless delete is a pinned 131,
+   and that number came from BloodTrail's own answer in the CI e2e run on `main` before
+   it was pinned (run 36621234497), not from stock PostgreSQL. It agrees with the 118
+   nodes the SharpHound fixture and its analysis leave (the count `build/e2e.sh` gives
+   for the snapshot phase's graph) plus the 13 that `graph.json` adds, but that is a
+   cross-check, not a measurement on stock PostgreSQL. It is specific to v9.6.0's ingest
+   and analysis and must be re-derived when the BloodHound version the e2e validates
+   changes. Every answer must carry its `cypher engine served` or `path engine served`
+   marker, and the phase must log no `snapshot rebuilt` and no `fallback entered`.
+   `CHECK_SERVED=0` runs the same expectations against a BloodHound on the PostgreSQL
+   driver.
 6. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
    directory (so the file survives the container recreate the config change itself causes),
    then `docker compose restart` the same container -- no further config change, so the

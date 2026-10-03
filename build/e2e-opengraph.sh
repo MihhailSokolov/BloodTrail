@@ -5,12 +5,16 @@
 # testdata/opengraph through BloodHound's own file-upload API, and checks
 # what BloodHound answers from the BloodTrail driver: Cypher queries, the
 # pathfinding endpoint, and "clear database" by source kind. The expected
-# answers are derived from the fixtures, never read back from the engine under
-# test, and a graph answer is compared by content: the sorted objectIds of its
-# nodes and the sorted (source objectId, target objectId, kind) triples of its
-# edges, not just how many there are. Their sizes are what stock BloodHound
-# v9.6.0 on PostgreSQL returns for the same uploads. It also checks that
-# BloodTrail served each answer from memory, with no fallback and no rebuild.
+# answers are derived from the fixtures and pinned here, not read back from the
+# engine under test while the script runs, and a graph answer is compared by
+# content: the sorted objectIds of its nodes and the sorted (source objectId,
+# target objectId, kind) triples of its edges, not just how many there are.
+# Their sizes are what stock BloodHound v9.6.0 on PostgreSQL returns for the
+# same uploads, with one exception: the whole-graph count after the sourceless
+# delete (131, below) came from BloodTrail's own answer in an earlier CI e2e
+# run, not from stock PostgreSQL, and is specific to v9.6.0. It also checks
+# that BloodTrail served each answer from memory, with no fallback and no
+# rebuild.
 #
 # It runs against any BloodHound using the BloodTrail driver:
 #
@@ -310,6 +314,11 @@ clear_database '{"deleteSourceKinds":[0]}'
 # serves, right or wrong: 131 is the 118 nodes that BloodHound v9.6.0's ingest
 # and analysis of the SharpHound fixture leave (the synced AD user is one of
 # them) plus the 13 that graph.json adds, its 12 nodes and the stub GHX_USER_9.
+# That sum agrees with the 131 BloodTrail answered in the CI e2e run on main
+# before this count was pinned (run 36621234497), which is where the number came
+# from: it is not a measurement on stock PostgreSQL, and it holds for v9.6.0's
+# ingest and analysis only, so re-derive it when the BloodHound version this
+# validates changes.
 cypher "sourceless delete keeps every node with a source kind" "MATCH (n) RETURN count(n) AS nodes" '.data.literals[0].value' "131"
 [ "$(req GET /api/v2/graphs/source-kinds)" = "200" ] || fail "graphs/source-kinds: HTTP error"
 ghx_id="$(jq -r '.data.kinds[] | select(.name == "ghx_Base") | .id' "$RESPONSE")"
