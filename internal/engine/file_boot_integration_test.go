@@ -172,7 +172,7 @@ func TestFileBootLoadsMatchingWatermarkSnapshot(t *testing.T) {
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engB.Start(ctx)
-	defer engB.Stop()
+	defer stopEngineAndCloseWritePool(engB)
 
 	waitForFresh(t, engB)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file loaded")
@@ -229,7 +229,7 @@ func TestFileBootWaitsForTheDefaultGraphToResolve(t *testing.T) {
 
 	engB, buf := newLogCapturingEngine(unresolved, pool, dir)
 	engB.Start(ctx)
-	defer engB.Stop()
+	defer stopEngineAndCloseWritePool(engB)
 
 	// Long enough for several boot-load iterations to run and find nothing
 	// they can do yet (the loop's first wait is fallbackRetryInterval, 100ms).
@@ -301,7 +301,7 @@ func TestFileBootRejectsStaleWatermarkAndRebuilds(t *testing.T) {
 
 	engC, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engC.Start(ctx)
-	defer engC.Stop()
+	defer stopEngineAndCloseWritePool(engC)
 
 	waitForFresh(t, engC)
 
@@ -347,7 +347,7 @@ func TestFileBootRejectsCorruptFileAndRebuilds(t *testing.T) {
 
 	engC, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engC.Start(ctx)
-	defer engC.Stop()
+	defer stopEngineAndCloseWritePool(engC)
 
 	waitForFresh(t, engC)
 
@@ -427,7 +427,7 @@ func TestFileBootDisabledWhenSnapshotDirEmpty(t *testing.T) {
 		t.Fatalf("SaveSnapshot with SnapshotDir empty returned an error, want a silent no-op: %v", err)
 	}
 
-	eng.Stop()
+	stopEngineAndCloseWritePool(eng)
 
 	logged := buf.String()
 	for _, marker := range []string{"snapshot file loaded", "snapshot file rejected", "snapshot file written", "no snapshot file"} {
@@ -465,7 +465,7 @@ func TestFileBootQuietlyMissesWithNoSnapshotFileYet(t *testing.T) {
 	resetWatermarkTable(t, ctx, eng)
 
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 

@@ -42,7 +42,7 @@ func TestFileBootRejectsAFileWithRowsInsertedBehindTheWatermark(t *testing.T) {
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")

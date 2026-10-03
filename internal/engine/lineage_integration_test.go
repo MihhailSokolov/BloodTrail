@@ -140,7 +140,7 @@ func TestFileBootRejectsAFileTheStockImageWroteBehind(t *testing.T) {
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
@@ -188,7 +188,7 @@ func TestFileBootRejectsAFileFromBeforeTheGraphWasReplaced(t *testing.T) {
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
@@ -260,7 +260,7 @@ func TestFileBootRejectsAFileFromAnotherLineageWithAMatchingCounter(t *testing.T
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
@@ -295,7 +295,7 @@ func TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn(t *testing.T) {
 	eng, _ := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	adoptOneRebuild(t, ctx, eng)
 	loaded := pgLineage(t, ctx, pool)
@@ -362,7 +362,7 @@ func TestSaveSnapshotRefusesAfterTheInstallerEndsTheLineage(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	adoptOneRebuild(t, ctx, eng)
 
 	endLineage(t, ctx, pool)
@@ -546,7 +546,7 @@ func TestRebuildSaysWhenItCannotReadTheLineage(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	if _, err := pool.Exec(ctx, "alter table bloodtrail_watermark drop column lineage"); err != nil {
 		t.Fatalf("drop the lineage column: %v", err)

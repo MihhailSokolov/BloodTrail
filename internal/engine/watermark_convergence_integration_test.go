@@ -280,7 +280,7 @@ func TestSaveSnapshotRefusesWhileAnEarlierBumpIsInFlight(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, enginePool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	adoptOneRebuild(t, ctx, eng)
 	path := snapshotFilePathFor(t, pgDriver, dir)
 
@@ -361,7 +361,7 @@ func TestSaveSnapshotRefusesACounterAnotherServerAdvanced(t *testing.T) {
 	engA, bufA := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, engA)
 	parkRebuildLoop(engA)
-	defer engA.Stop()
+	defer stopEngineAndCloseWritePool(engA)
 	adoptOneRebuild(t, ctx, engA)
 	path := snapshotFilePathFor(t, pgDriver, dir)
 

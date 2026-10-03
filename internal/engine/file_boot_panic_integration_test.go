@@ -45,7 +45,7 @@ func TestFileBootPanicDiscardsTheFileAndRebuilds(t *testing.T) {
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 

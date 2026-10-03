@@ -100,7 +100,7 @@ func TestSaveSnapshotRefusesWhenApplyRacesTheProbe(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	adoptOneRebuild(t, ctx, eng)
 
@@ -170,7 +170,7 @@ func TestSaveSnapshotHappyPathStillWrites(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	adoptOneRebuild(t, ctx, eng)
 	nodeID := applyOneWrite(t, ctx, eng)
@@ -253,7 +253,7 @@ func TestSaveSnapshotRemovesAFileWrittenAcrossAFailedBump(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	adoptOneRebuild(t, ctx, eng)
 	nodeID := applyOneWrite(t, ctx, eng)
@@ -294,7 +294,7 @@ func TestSaveSnapshotRemovesAFileWrittenAcrossAFailedBump(t *testing.T) {
 	// What the file would have cost: the next process serves the write.
 	engB, bufB := newLogCapturingEngine(pgDriver, pool, dir)
 	engB.Start(ctx)
-	defer engB.Stop()
+	defer stopEngineAndCloseWritePool(engB)
 	waitForFresh(t, engB)
 	if strings.Contains(bufB.String(), "bloodtrail: snapshot file loaded") {
 		t.Fatalf("the next boot adopted a snapshot file:\n%s", bufB.String())
