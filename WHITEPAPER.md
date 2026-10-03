@@ -2653,8 +2653,11 @@ leave gaps this server cannot account for. A running server then refuses to save
 (`snapshot file not written`, Warn, with a reason that begins
 `the watermark counter holds values this process never resolved`, quoted in full in
 [Appendix B](#appendix-b-log-messages), and the attributes `pg_watermark`, `resolved_through` and
-`resolved_exactly`) until a load it adopts has read the other server's writes, and a file is
-rejected at the next startup when the buffered writes cannot cover the gap ([§14.3](#143-boot)).
+`resolved_exactly`) until a load it adopts has read the other server's writes. The refusal asks for
+that load itself, through the same once-every-30-seconds request a settled bump failure uses
+([§13.3](#133-when-a-bump-fails)), since nothing else this process does would ever account for
+those values. A file is rejected at the next startup when the buffered writes cannot cover the gap
+([§14.3](#143-boot)).
 That is the limit of what one process can see of another: a load covers another server's counter
 value even when that server's own write had not committed yet when the load read the database, so it
 is a detection, not a coherent cluster. Writes made to PostgreSQL by anything else (`psql`, the

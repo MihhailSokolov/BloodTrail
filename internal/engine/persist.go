@@ -140,7 +140,19 @@ const reasonUnresolvedWatermark = "the watermark counter holds values this proce
 // what another BloodTrail server writing the same database looks like from
 // here, a deployment the snapshot file cannot be trusted in (watermarkReading's
 // unaccounted). Only a rebuild that loads such a writer's writes lets this
-// process save again.
+// process save again -- its adoption rebases the ledger onto the counter it
+// read (rebuildOnce) -- and nothing this process does on its own ever
+// accounts for that value otherwise, so the refusal asks for one through
+// requestTrustRebuild (apply.go): rate-limited, because the engine is still
+// serving correctly and only the snapshot file waits on this, and through
+// the same request path a settled bump failure uses rather than a launch of
+// its own. Without it a lost bump, a second server or the installer's
+// lineage end left every save for the rest of the process's life refused
+// with this same Warn. A request that coalesces behind a launch already
+// inside the interval can find the trust generations equal and decline to
+// launch -- the generations are not what is unresolved here -- which costs
+// only that one save: the next refusal past the interval launches
+// immediately, and saves are driven by compaction, not by a hot loop.
 func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch uint64, stamp snapshot.Stamp, converged bool) {
 	epoch = e.applyEpoch.Load()
 	reading, err := e.readWatermarkConvergence(ctx)
@@ -156,6 +168,7 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch uint64, stamp sna
 				slog.Uint64("resolved_through", reading.through),
 				slog.Bool("resolved_exactly", reading.exact),
 			)
+			e.requestTrustRebuild()
 		}
 		return epoch, stamp, false
 	}
