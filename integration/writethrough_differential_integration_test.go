@@ -296,6 +296,14 @@ func TestWriteThroughDifferential(t *testing.T) {
 	}
 
 	waitForBootLoad(t, d)
+	// Not just waitForBootLoad: the boot's own rebuild is counted after the
+	// View it publishes becomes visible, so the FIRST subtest below -- which
+	// takes its RebuildCount baseline as its very first statement -- could
+	// sample 0 and then see the count grow to 1 on its own, failing its
+	// closing assertRebuildCountUnchanged. Waited for here, in the shared
+	// setup, so every subtest's baseline is taken after the boot has finished
+	// counting (waitForBootRebuildCounted's doc has the detail).
+	waitForBootRebuildCounted(t, d, "after this suite's boot load")
 
 	// -----------------------------------------------------------------
 	// Class 1: objectid upsert creating a brand-new node (ingest).

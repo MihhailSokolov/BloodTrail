@@ -105,8 +105,19 @@ func openApplyDriver(t *testing.T) (*bloodtrail.Driver, graph.Database, *lockedB
 // waitForBootLoad blocks until eng's Start-launched boot-load goroutine has
 // adopted its first snapshot, up to a generous deadline. Start (driver.go's
 // Open) launches that goroutine asynchronously, so without this a test's own
-// "before" RebuildCount baseline could race against boot load's one and only
-// rebuild attempt landing later, inside the test's own measurement window.
+// measurement window could open before boot load's one and only rebuild had
+// published anything at all.
+//
+// It does NOT make a RebuildCount baseline safe, although an earlier version
+// of this comment claimed it did. The engine publishes the rebuilt View --
+// which is what flips Fresh() and so ends this wait -- before it increments
+// the counter, so a baseline read the instant this returns can still be 0 and
+// then grow by one on its own. A test that compares against a RebuildCount
+// baseline, or asserts a rebuild happened at all, wants
+// waitForBootRebuildCounted (below) as well. This is not a wait that can
+// simply be strengthened to cover both: tests that boot from a snapshot file
+// legitimately expect RebuildCount() == 0 and rely on this one returning
+// without any rebuild ever being counted.
 func waitForBootLoad(t *testing.T, d *bloodtrail.Driver) {
 	t.Helper()
 
@@ -134,7 +145,8 @@ func waitForBootLoad(t *testing.T, d *bloodtrail.Driver) {
 // returns and after the rebuild's own log line -- so a baseline read the
 // instant Fresh() flips can still be 0 and then grow by one on its own,
 // failing an "unchanged" assertion later in the test. The internal/engine
-// package's own waitForRebuildCounted carries the full measurement.
+// package's own waitForRebuildCounted carries the full measurement, and the
+// same caveat about which attempt's increment this can return on.
 func waitForBootRebuildCounted(t *testing.T, d *bloodtrail.Driver, what string) {
 	t.Helper()
 
