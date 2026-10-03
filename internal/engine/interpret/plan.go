@@ -1331,6 +1331,20 @@ func (pb *partBuilder) addPatternPart(part *cypher.PatternPart) bool {
 	if !isNode || firstNode == nil {
 		return false
 	}
+	// A pattern that is nothing but a node variable bound earlier -- by an
+	// earlier pattern, clause or Part, or the mandatory side of an OPTIONAL
+	// MATCH -- is not joined to that binding in dawgs' SQL: `MATCH (s)-[:R]->
+	// (t) MATCH (t)` lowers to `from s0, node n1`, a cross join with no
+	// condition on n1, so every row comes back once per node in the graph.
+	// The identity join the executor would make is not that answer, and
+	// imitating a row count that depends on the graph's size is no answer
+	// worth serving, so it declines. Inside a longer pattern the re-mention
+	// is a real join and stays served.
+	if len(part.PatternElements) == 1 && firstNode.Variable != nil && firstNode.Variable.Symbol != "" {
+		if _, bound := pb.known[firstNode.Variable.Symbol]; bound {
+			return false
+		}
+	}
 	fromSym, ok := pb.addNodePattern(firstNode)
 	if !ok {
 		return false
