@@ -2122,6 +2122,20 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 			return
 		}
 	}
+	// A parenthesised property, `(sym.prop) STARTS WITH 'a_b'`, is not a
+	// plain property to dawgs, so the needle reaches LIKE unescaped
+	// (likeNeedle): _ and % are wildcards, and narrowing on the needle
+	// itself would miss `aXb2`. Narrow on a literal run every match carries
+	// instead, as likeCoalesceAnchor does.
+	if !coalesced && match != snapshot.StringEquals && likeNeedle(left, right) {
+		lp, parsed := likeNeedlePattern(match, operand)
+		if !parsed {
+			return
+		}
+		if operand, ok = likePatternRun(lp, match); !ok {
+			return
+		}
+	}
 	// Only a bare `sym.prop = 'x'` is type-strict in pg (dawgs guards it with
 	// jsonb_typeof(...) = 'string'). Every other shape here -- STARTS WITH,
 	// ENDS WITH, CONTAINS, and anything under COALESCE -- compares the `->>`
@@ -2584,6 +2598,26 @@ func coalescePropOpLiteral(propSide, litSide cypher.Expression, sym string, matc
 // WITH, its longest for CONTAINS -- a superset the per-row LIKE then
 // filters exactly. A pattern without such a run gets no anchor.
 func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringMatch, needle string) (string, string, bool) {
+	lp, ok := likeNeedlePattern(match, needle)
+	if !ok {
+		return "", "", false
+	}
+	if raw, isStr := def.Value.(string); isStr {
+		d, err := decodeCypherStringLiteral(raw)
+		if err != nil || lp.regexp().MatchString(d) {
+			return "", "", false
+		}
+	}
+	run, ok := likePatternRun(lp, match)
+	if !ok {
+		return "", "", false
+	}
+	return name, run, true
+}
+
+// likeNeedlePattern parses the LIKE pattern dawgs builds from an unescaped
+// needle for a STARTS WITH (prefix), ENDS WITH (suffix) or CONTAINS match.
+func likeNeedlePattern(match snapshot.StringMatch, needle string) (likePattern, bool) {
 	var op StringOp
 	switch match {
 	case snapshot.StringPrefix:
@@ -2593,34 +2627,27 @@ func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringM
 	case snapshot.StringContains:
 		op = OpContains
 	default:
-		return "", "", false
+		return likePattern{}, false
 	}
 	lp, err := parseLikePattern(likePatternFor(op, needle))
 	if err != nil {
-		return "", "", false
+		return likePattern{}, false
 	}
-	if raw, isStr := def.Value.(string); isStr {
-		d, err := decodeCypherStringLiteral(raw)
-		if err != nil || lp.regexp().MatchString(d) {
-			return "", "", false
-		}
-	}
-	var (
-		run string
-		ok  bool
-	)
+	return lp, true
+}
+
+// likePatternRun returns the literal run every value lp matches carries, in
+// the shape the string index answers for match: the pattern's leading run
+// for a prefix, its trailing run for a suffix, its longest for CONTAINS.
+func likePatternRun(lp likePattern, match snapshot.StringMatch) (string, bool) {
 	switch match {
 	case snapshot.StringPrefix:
-		run, ok = lp.leadingLiteral()
+		return lp.leadingLiteral()
 	case snapshot.StringSuffix:
-		run, ok = lp.trailingLiteral()
+		return lp.trailingLiteral()
 	default:
-		run, ok = lp.longestLiteral()
+		return lp.longestLiteral()
 	}
-	if !ok {
-		return "", "", false
-	}
-	return name, run, true
 }
 
 // coalesceDefaultRejects reports whether def, the value COALESCE yields for a
