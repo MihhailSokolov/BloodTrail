@@ -758,7 +758,12 @@ func leftJoinOptional(env *Env, meter *workMeter, part *Part, rows []*Row) ([]*R
 			// as below. Keying on nodes alone can only over-decline -- when
 			// dawgs also joins on an edge column, rows differing there are
 			// not repeats to pg -- never under-decline, because every node
-			// column is in dawgs' join key.
+			// column is in dawgs' join key. That holds only because the
+			// planner makes it: dawgs carries a mandatory node into the
+			// optional CTE only when the rest of the query refers to it, and
+			// planning declines an OPTIONAL MATCH whose mandatory nodes are
+			// not all referred to (optionalJoinKeysEveryMandatoryNode,
+			// plan.go).
 			tuple := string(groupKeyBytes(env, l, tupleSyms))
 			if matchedTuples == nil {
 				matchedTuples = make(map[string]struct{})

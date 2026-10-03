@@ -379,30 +379,31 @@ func (t *observingTransaction) WithGraph(graphSchema graph.Graph) graph.Transact
 // Commit first is what makes the write visible to Apply's read-back at all.
 //
 // Apply itself runs unconditionally, even when the inner Commit returns an
-// error -- mirroring observingBatch.Commit's identical "apply regardless"
-// choice (see its doc for the full reasoning): read-back reads PostgreSQL's
-// own current committed state per key, so applying after a failed commit is
-// always safe, never wrong -- a key whose write never landed (the whole
-// transaction rolled back) simply reads back as it already was, and a key
-// whose write landed via some other path this call cannot see is reconciled
-// exactly as if this call had never run. That per-key argument does NOT
-// cover a recognized kind-scoped delete, which replays as an instruction
-// with no read-back key -- so a failed Commit first records a fallback (the
-// in-body comment below), making that Apply a rebuild rather than a replay.
+// error. (observingBatch.Commit makes the opposite choice for a batch, whose
+// failed buffers stay queued for a later flush -- see its doc.) Read-back
+// reads PostgreSQL's own current committed state per key, so applying after
+// a failed commit is always safe, never wrong -- a key whose write never
+// landed (the whole transaction rolled back) simply reads back as it already
+// was, and a key whose write landed via some other path this call cannot see
+// is reconciled exactly as if this call had never run. A recognized
+// kind-scoped delete is a read-back too: its criteria only choose which of
+// the View's rows to re-read by id (the engine's viewCandidates). A failed
+// Commit still records a fallback first (the in-body comment below), making
+// that Apply a rebuild rather than a replay.
 func (t *observingTransaction) Commit() error {
 	err := t.Transaction.Commit()
 	if err != nil {
 		// A Commit that returned an error has an AMBIGUOUS outcome: the
 		// error can come from PostgreSQL's own COMMIT, whose effect may or
 		// may not be durable. Read-back-keyed changes reconcile either way
-		// (the doc above), but a recognized kind-scoped delete is replayed
-		// as an INSTRUCTION ("tombstone every edge of these kinds"), not a
-		// read-back key -- replaying it after a commit that actually rolled
-		// back would tombstone edges PostgreSQL still holds, permanently
-		// (nothing re-reads them). Recording a fallback makes Apply take the
-		// rebuild path instead: correct for every change shape under either
-		// commit outcome, at the cost of one background rebuild on an error
-		// path that is already exceptional.
+		// (the doc above), and so does a recognized kind-scoped delete, whose
+		// candidates are re-read by id. The fallback dates from when such a
+		// delete was replayed as an instruction ("tombstone every edge of
+		// these kinds"), which a rolled-back commit would have turned into
+		// tombstones for edges PostgreSQL still holds. It is kept as the
+		// conservative answer: the rebuild is correct for every change shape
+		// under either commit outcome, at the cost of one background rebuild
+		// on an error path that is already exceptional.
 		t.current().Changes().RecordFallback(fmt.Sprintf("Commit: outcome ambiguous: %v", err))
 	}
 	t.eng.Apply(applyContext(t.ctx), t.current())
@@ -664,25 +665,24 @@ func (r *observingRelationshipQuery) Limit(limit int) graph.RelationshipQuery {
 // branch's ChangeSet entry is RecordDeleteRelationshipsByKinds(kinds), not
 // an enumerated edge id list: relationshipDeleteScope's own recognized shape
 // is a kind matcher, not an InIDs target list, so "delete every relationship
-// of these kinds" is the operation this delete actually performs, and the
-// one the applier should replay -- an id list captured before the delete
-// ran could go stale by the time the applier reads it back. A recognized
-// shape whose kind set is empty deleted nothing in PostgreSQL, so it
-// records nothing. The unrecognized branch falls back, same as every other
-// unrecognized criteria in this file.
+// of these kinds" is the operation this delete actually performs. The
+// applier turns it into a keyed read-back -- it re-reads, by id, every View
+// edge of those kinds (the engine's viewCandidates) and tombstones only the
+// ones PostgreSQL no longer holds -- where an id list captured before the
+// delete ran could miss an edge another writer created meanwhile. A
+// recognized shape whose kind set is empty deleted nothing in PostgreSQL,
+// so it records nothing. The unrecognized branch falls back, same as every
+// other unrecognized criteria in this file.
 //
 // Unlike every other observer in this file, the recognized entry is recorded
-// only AFTER the delete has actually succeeded. It is the one entry that is
-// an exact instruction to mutate the replica rather than a read-back key: a
-// kind-criteria scope issues no read-back query at all, so nothing later
-// consults PostgreSQL about it and nothing can correct it. Recorded ahead of
-// a delete that then failed (a statement timeout, a deadlock, a reset
-// connection), it would tombstone every edge of those kinds in the replica
-// while PostgreSQL still holds them, with no fallback recorded and the
-// engine still reporting itself healthy -- every memory-served query would
-// silently omit them until some unrelated rebuild. A failed delete records
-// a fallback instead, which is the honest description of what the replica
-// now knows: nothing.
+// only AFTER the delete has actually succeeded, and a failed delete (a
+// statement timeout, a deadlock, a reset connection) records a fallback
+// instead. That ordering dates from when the entry was an instruction the
+// applier carried out against the replica, which a delete that then failed
+// would have turned into tombstones for edges PostgreSQL still holds. With
+// keyed read-back such a replay would only restage those edges, so the
+// order is now merely conservative; the fallback remains the honest
+// description of what the replica knows after a failed delete: nothing.
 func (r *observingRelationshipQuery) Delete() error {
 	ensureBumped(r.ctx, r.eng, r.current())
 	kinds, touchAll := relationshipDeleteScope(r.criteria)
@@ -724,11 +724,12 @@ func (r *observingRelationshipQuery) Query(delegate func(results graph.Result) e
 // relationshipDeleteScope decides what an observingRelationshipQuery.
 // Delete() call's ChangeSet entry should be, given every criteria its
 // caller filtered by: the RecordDeleteRelationshipsByKinds entry it feeds
-// is replayed verbatim by the applier (apply.go) to decide which edges to
-// tombstone in the in-memory replica, so a reported kind set that is too
-// WIDE is unsound there -- PostgreSQL only deleted the rows also matching
-// whatever else the query narrowed by, so the applier would tombstone
-// edges PostgreSQL never touched.
+// chooses which View edges the applier re-reads by id (the engine's
+// viewCandidates), tombstoning only those PostgreSQL no longer holds. A
+// reported kind set that is too WIDE therefore costs only extra re-reads
+// (an edge PostgreSQL kept comes back present), while one that is too
+// NARROW would leave a deleted edge in the replica; the recognizer below
+// still reports the exact set PostgreSQL deletes.
 //
 // When exactly one criteria was recorded and edgeKindsFromCriteria
 // recognizes it, kinds is that result and touchAll is false:
@@ -737,7 +738,7 @@ func (r *observingRelationshipQuery) Query(delegate func(results graph.Result) e
 // else that could narrow the match further", and its result is exactly the
 // kinds whose edges PostgreSQL deletes -- so the operation the query
 // performs really is "delete every edge of these kinds", which is what the
-// applier needs to replay it exactly. An empty result is exact too: that
+// applier's read-back needs to cover it. An empty result is exact too: that
 // delete matched no edge at all (Delete records nothing for it). Every
 // other case -- zero or more than one criteria, an unrecognized shape, or a
 // Conjunction carrying any conjunct that is not itself a bare relationship
@@ -757,9 +758,9 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 // relationship-delete's criteria to scope the delete soundly for
 // relationshipDeleteScope's RecordDeleteRelationshipsByKinds ChangeSet
 // entry (see its doc), without depending on a recognizer package that
-// doesn't exist yet. That entry is replayed verbatim by the applier, so the
-// reported kinds must describe EXACTLY what the delete removes, not merely
-// a safe-to-over-invalidate approximation.
+// doesn't exist yet. The reported kinds describe exactly what the delete
+// removes. (The applier re-reads every View edge of those kinds, so a
+// superset would only cost re-reads; the exact set keeps that cost down.)
 //
 // Recognized shapes are a bare *cypher.KindMatcher over the relationship
 // variable "r" (what dawgs' query.Kind(query.Relationship(), k)/
@@ -772,21 +773,21 @@ func relationshipDeleteScope(criteria []graph.Criteria) (kinds graph.Kinds, touc
 // list -- none at all for an empty list -- and ANDed matchers select only
 // the kinds present in EVERY list: the intersection, empty whenever two
 // lists are disjoint or one is empty. An empty result means the delete
-// matched nothing. (Reporting the union instead made the applier tombstone
-// every edge of every listed kind while PostgreSQL kept them.)
+// matched nothing. (Reporting the union instead made the applier, which then
+// carried the criteria out as an instruction, tombstone every edge of every
+// listed kind while PostgreSQL kept them.)
 //
 // This is deliberately NOT the "ignore what you don't recognize, fall back
-// to RecordFallback" pattern this file's other recognizers use, where
-// over-invalidating is always safe. A Conjunction additionally narrowed by,
-// say, a property filter or an endpoint id removes only a SUBSET of the
-// named kinds' edges, which means the kinds this function would otherwise
-// report describe a SUPERSET of what the query actually deletes -- fine
-// for a plain safe-superset fallback, but unsound to hand the applier as
-// an exact tombstone criteria (it would then
-// delete edges PostgreSQL never touched). So any conjunct that is not
-// itself a bare relationship KindMatcher -- whatever kind of expression it
-// is, or a KindMatcher over the wrong variable -- fails the WHOLE
-// Conjunction closed (ok=false) instead of being silently dropped.
+// to RecordFallback" pattern this file's other recognizers use. A
+// Conjunction additionally narrowed by, say, a property filter or an
+// endpoint id removes only a SUBSET of the named kinds' edges, so the kinds
+// this function would otherwise report describe a SUPERSET of what the
+// query actually deletes. Since the applier re-reads its candidates, such a
+// superset would no longer tombstone edges PostgreSQL kept; the shape still
+// fails the WHOLE Conjunction closed (ok=false), falling back to a rebuild,
+// which is conservative: any conjunct that is not itself a bare
+// relationship KindMatcher -- whatever kind of expression it is, or a
+// KindMatcher over the wrong variable -- is never silently dropped.
 //
 // Anything else -- a nil criteria, one that isn't a Conjunction or bare
 // KindMatcher, a KindMatcher over any variable but "r", an empty

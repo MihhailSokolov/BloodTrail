@@ -120,11 +120,11 @@ const (
 // PostgreSQL has already seen, independent of what this call goes on to do
 // with the write's own effect:
 //
-//   - If scope bumped (scope.Watermark's own flag), AdvanceWatermark folds
-//     its counter into e.appliedWatermark and retires its e.inflightBumps
-//     entry. The pg counter already advanced the instant BumpWatermark's own
-//     UPDATE committed, so this scope's bump has to resolve regardless of
-//     which branch fires.
+//   - If scope bumped (scope.Watermark's own flag), AdvanceWatermark records
+//     its counter in e.appliedWatermark's ledger and retires its
+//     e.inflightBumps entry. The pg counter already advanced the instant
+//     BumpWatermark's own UPDATE committed, so this scope's bump has to
+//     resolve regardless of which branch fires.
 //   - If scope's own eager bump FAILED (settleWatermarkFailure), this call is
 //     the proof that the write it guarded has landed -- Apply is only ever
 //     called once a write has actually committed -- which is exactly what
@@ -472,9 +472,10 @@ func tombstoneAbsentTriple(b *snapshot.SegmentBuilder, view *snapshot.View, trip
 // the delete's own Apply, a node whose objectid was only rewritten. So the
 // set has to cover every row the write may have removed that the View
 // holds, and may safely cover more (an extra candidate only costs its
-// re-read). A row the write removed that the View does not hold yet belongs
-// to another write whose Apply is still to come, and that Apply's own
-// read-back finds it absent.
+// re-read). A row the write removed that the View does not hold yet -- or
+// holds with kinds the criteria do not match, because the write that gave
+// it those kinds has not been applied yet -- belongs to another write whose
+// Apply is still to come, and that Apply's own read-back finds it absent.
 //
 // Enumeration touches only the View, in memory, once per Apply that carries
 // a criteria or an absent objectid -- never a query's read path.

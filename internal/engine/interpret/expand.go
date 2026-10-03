@@ -393,6 +393,8 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 		}
 	}
 
+	// Defensive: buildStep declines an upper bound of zero, so a planned
+	// step never reaches here with maxHops <= 0.
 	if maxHops <= 0 {
 		return out, nil
 	}
@@ -1029,6 +1031,8 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		}
 	}
 
+	// Defensive: buildStep declines an upper bound of zero, so a planned
+	// step never reaches here with maxHops <= 0.
 	if maxHops <= 0 {
 		return out, nil
 	}

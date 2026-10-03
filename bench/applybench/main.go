@@ -1651,12 +1651,12 @@ func runSnapshotSave(ctx context.Context, cfg config, base *baseGraph, dir strin
 	}
 
 	// A tiny write gives every repeat's file a fresh, distinguishable
-	// watermark; small enough not to matter to the timing. It is also what
-	// makes SaveSnapshot's own convergence precondition hold on a repeat
-	// whose driver booted from the PREVIOUS repeat's file (which it now
-	// does, since the file attempt is reachable): a file-booted engine
-	// starts with appliedWatermark 0 against a nonzero pg counter, and it is
-	// this write's own resolved bump that brings the two back level.
+	// watermark; small enough not to matter to the timing. (A repeat whose
+	// driver booted from the PREVIOUS repeat's file needs nothing more for
+	// SaveSnapshot's convergence precondition: adopting the file brings the
+	// engine's watermark ledger up to the counter the file and its replayed
+	// boot writes were proven complete for, and this write's own bump then
+	// resolves on top of it.)
 	if _, err := writeIngestBatch(capCtx, db, base.hubObjectID, 10, 10, cfg.runID, "snapshot", repeat); err != nil {
 		return 0, 0, fmt.Errorf("pre-save ingest (repeat %d): %w", repeat, err)
 	}

@@ -572,6 +572,8 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 
 		if st.ret != nil {
 			if countShortestSteps(parts) > 1 {
+				// Defensive (a shortest pattern must be the only pattern of
+				// the query's first part, so this cannot fire any more):
 				// "more than one shortestPath/allShortestPaths pattern part
 				// per query" -- a conservative tightening: the corpus never
 				// needs more than one, and this planner has not verified how
@@ -1729,6 +1731,10 @@ func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression)
 // successfully only to have the executor discover the same fact after a
 // full anchor scan (runComponent's own len(stepIdxs) != 1 decline), this
 // rejects the shape at plan time.
+//
+// Defensive since a shortest pattern must be the first and only pattern of
+// its query part (addShortestPathPart, finalizeShortestPaths): no planned
+// query can now reach this with a shortest step sharing a component.
 func (pb *partBuilder) shortestStepsAreIsolated() bool {
 	if len(pb.shortestSteps) == 0 {
 		return true
@@ -5525,17 +5531,20 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 // item carries the name. dawgs' SQL (dumped per shape) resolves a bare
 // ORDER BY name the other way round:
 //
-//   - A name the MATCH or WITH scope binds -- a node, an edge, a path, or a
-//     carried COUNT, COLLECT or constant -- sorts by that binding, whatever a
-//     RETURN alias of the same name projects: `MATCH (g) RETURN g.v AS g
-//     ORDER BY g` is `order by s0.n0`, the node, and `WITH g, count(u) AS c
-//     RETURN g.v AS c ORDER BY c` sorts by the count. The engine sorted by
-//     the alias instead -- different rows under LIMIT -- and served shapes
-//     PostgreSQL rejects: `RETURN count(u) AS u ORDER BY u` (42803, u is not
-//     grouped) and `RETURN DISTINCT g.v AS g ORDER BY g` (42P10, the node is
-//     not in the select list). Both readings agree only when the RETURN item
-//     of that name is a bare reference to the binding itself, as in the
-//     common `WITH g, count(u) AS c RETURN g, c ORDER BY c`.
+//   - A name the MATCH or WITH scope binds -- a node, an edge, or a carried
+//     COUNT, COLLECT or constant -- sorts by that binding, whatever a RETURN
+//     alias of the same name projects: `MATCH (g) RETURN g.v AS g ORDER BY
+//     g` is `order by s0.n0`, the node, and `WITH g, count(u) AS c RETURN
+//     g.v AS c ORDER BY c` sorts by the count. (A path variable is not a
+//     frame column, so dawgs emits the alias for it, `order by p`, as the
+//     engine sorts; it declines anyway, a deliberate over-decline.) The
+//     engine sorted by the alias instead -- different rows under LIMIT -- and
+//     served shapes PostgreSQL rejects: `RETURN count(u) AS u ORDER BY u`
+//     (42803, u is not grouped) and `RETURN DISTINCT g.v AS g ORDER BY g`
+//     (42P10, the node is not in the select list). Both readings agree only
+//     when the RETURN item of that name is a bare reference to the binding
+//     itself, as in the common `WITH g, count(u) AS c RETURN g, c ORDER BY
+//     c`.
 //   - Any other name is emitted as the output alias, unquoted, which
 //     PostgreSQL folds to lower case before looking it up: under `RETURN n.v
 //     AS x, id(n) AS X ORDER BY X` both columns are x, and pg raises 42702
@@ -5545,6 +5554,12 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 // BEFORE desugarReturnAggregates replaces it with the grouped aliases -- a
 // variable an aggregate folds (u in count(u)) is exactly a binding that can
 // shadow an alias.
+//
+// Not covered, and still planned although PostgreSQL rejects the SQL: a
+// parenthesised name, `RETURN g.v AS gv ORDER BY (gv)`, which dawgs emits
+// as `order by (i0)`, a column that does not exist (42703); and an alias
+// that is a PostgreSQL reserved word, `RETURN g.v AS select ORDER BY
+// select`, emitted unquoted (42601).
 func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
 	if ret == nil || ret.Projection == nil || ret.Projection.Order == nil {
 		return false

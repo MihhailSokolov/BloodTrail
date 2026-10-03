@@ -475,6 +475,8 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
 // A panic on the rebuild's own goroutine -- in the snapshot build, the size
 // check or the adoption -- is recovered into an error and a fallback
 // (recoverRebuildPanic, background_panic.go) rather than ending the process.
+// The load's worker goroutines (loadNodes streams and parses rows on an
+// errgroup of its own) are not covered: a panic there still ends it.
 func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool, err error) {
 	defer e.recoverRebuildPanic(ctx, trigger, &adopted, &err)
 	start := time.Now()
@@ -500,7 +502,9 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool,
 	// (shouldLogRefusal or the InfoContext below) has already run --
 	// otherwise a test polling rebuildAttempts could race ahead of a still
 	// in-flight LoadSnapshot and observe the count before the corresponding
-	// log line (if any) was actually emitted.
+	// log line (if any) was actually emitted. One exception: on a panic,
+	// recoverRebuildPanic -- deferred earlier, so it runs later -- logs its
+	// own line after this increment.
 	defer e.rebuildAttempts.Add(1)
 
 	// The watermark lineage is read only when a snapshot file could ever be

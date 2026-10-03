@@ -272,7 +272,9 @@ func exactInteger(f float64) (int64, bool) {
 // not something to round. An operand that is not a whole number is a numeric
 // fraction, computed exactly there; it declines here. Integer `/` and `%`
 // truncate toward zero, as Go's do, and a zero divisor is PostgreSQL's
-// "division by zero"; numeric division is exact, so it declines.
+// "division by zero"; numeric division is exact, so it declines. (Plan
+// refuses `%` in every form -- numericStepServed -- so the `%` case is
+// defensive, kept with PostgreSQL's semantics.)
 func integerArithmetic(t sqlNum, a float64, op cypher.Operator, b float64) (float64, error) {
 	ai, aok := exactInteger(a)
 	bi, bok := exactInteger(b)

@@ -1105,9 +1105,9 @@ var (
 // instant LoadSnapshot's probeMultiGraph
 // (internal/engine/load.go) finds a second graph holding at least one node
 // anywhere in the database -- regardless of whether that second graph has
-// anything to do with the query being asked, since the interpreter has no
-// notion of which graph a query is scoped to at all (engine.go's own doc
-// for reasonMultiGraph). The builder-serving path carries the same guard
+// anything to do with the query being asked, since PostgreSQL's reads span
+// every graph while the replica holds only the default one (engine.go's own
+// doc for reasonMultiGraph). The builder-serving path carries the same guard
 // (serveGate), so a builder query on the very same default-graph fixture
 // declines too and returns PostgreSQL's answer;
 // TestBuilderServingDeclinesInMultiGraphDatabase pins the counts that would
