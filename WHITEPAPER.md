@@ -1729,7 +1729,10 @@ gives it from its partner (`n.p < 5` below). A step over two types takes the wid
 `numeric` over `int8` over `int4`. Integer steps are computed exactly, and a result outside
 `int4` for two `int4` operands is PostgreSQL's "integer out of range", so the query declines; so
 does any integer beyond 2⁵³, which a `float64` cannot hold exactly, in a literal, a result or a
-cast. Double-precision steps decline where PostgreSQL raises an overflow, underflow or
+cast. A cast of a stored *number* declines from 2⁵³ itself: the decode has already rounded it, so
+that `float64` could equally have been 2⁵³+1, two values PostgreSQL's cast separates. A cast of
+stored *text* is never rounded, so it serves 2⁵³ exactly and declines only past it.
+Double-precision steps decline where PostgreSQL raises an overflow, underflow or
 division-by-zero error. What the evaluator does not reproduce declines at plan time: `/` anywhere
 but in double precision (integer division truncates, exact-decimal division is exact), `%` in every
 form, and exact-decimal arithmetic over a fractional literal (`0.1 + 0.2 = 0.3` is true in
