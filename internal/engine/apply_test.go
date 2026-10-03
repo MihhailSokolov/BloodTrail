@@ -465,6 +465,54 @@ func TestApplyPanicEntersFallback(t *testing.T) {
 	}
 }
 
+// TestApplyPanicBeforeTheEpochBumpStillStopsARacedRebuild covers the one
+// window the epoch bump itself does not cover: a panic between Apply's
+// watermark bookkeeping and the bump (the AdvanceWatermark/
+// settleWatermarkFailure lines above it). The engine enters fallback, and a
+// rebuild already loading when this write committed then finds the epoch it
+// read before its load unchanged -- so it adopts a snapshot that predates
+// this write, which ends the fallback and leaves the engine serving without
+// the write, for as long as nothing else writes. fallBackOnApplyPanic bumps
+// the epoch itself, so such a rebuild is refused and retried, exactly as it
+// is for a panic anywhere later in Apply.
+//
+// fallBackOnApplyPanic is driven directly: nothing in that window takes an
+// argument or a seam a test could make panic, and the window is two
+// statements wide. The rebuild-loop gate is held, as nothing here could run
+// a real recovery load.
+func TestApplyPanicBeforeTheEpochBumpStillStopsARacedRebuild(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	applied := buildApplyView(t)
+	e.snap.Store(applied)
+	e.fallbackRebuilding.Store(true)
+
+	// What a rebuild already in flight read before it started loading.
+	epoch := e.applyEpoch.Load()
+
+	func() {
+		defer e.fallBackOnApplyPanic(context.Background())
+		panic("between the watermark bookkeeping and the epoch bump")
+	}()
+
+	if _, serving := e.serveState(); serving {
+		t.Fatalf("engine still serving after an Apply panic")
+	}
+	if got := e.applyEpoch.Load(); got == epoch {
+		t.Fatalf("applyEpoch = %d after the panic, want it bumped past %d", got, epoch)
+	}
+
+	stale := snapshot.NewView(&snapshot.Snapshot{})
+	if e.adoptRebuiltView(context.Background(), stale, epoch, e.settledDirtyGen.Load()) {
+		t.Fatalf("a rebuild whose load predates the panicking write was adopted; the write is lost")
+	}
+	if got := e.snap.Load(); got != applied {
+		t.Fatalf("the stale rebuild replaced the published view")
+	}
+	if got := e.state.Load(); got != stateFallback {
+		t.Fatalf("state = %d after refusing the stale rebuild, want it to stay stateFallback (%d)", got, stateFallback)
+	}
+}
+
 // -----------------------------------------------------------------------
 // F4: the fallback recovery goroutine must never leave the engine stranded
 // in stateFallback with nothing running to recover it.

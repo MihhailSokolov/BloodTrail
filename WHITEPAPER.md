@@ -2458,10 +2458,13 @@ round trip to PostgreSQL, applies happen strictly one at a time. The PostgreSQL 
 from concurrent callers, still run concurrently; only the replay into memory is serialized.
 
 A panic anywhere in these steps would mean a bug in the engine, after the write has already
-committed. `Apply` recovers it (`fallBackOnApplyPanic`): it logs
+committed. `Apply` recovers it (`fallBackOnApplyPanic`): it bumps `applyEpoch`, logs
 `bloodtrail: write-through apply panicked` at Error with the stack, enters FALLBACK with the reason
 `apply panicked: …`, and returns normally, so the caller is not told that a committed write
-failed (and does not retry it), and no query is served from a replica the write never reached.
+failed (and does not retry it), and no query is served from a replica the write never reached. The
+bump is what covers a panic in step 1 itself, before Apply's own bump: a load already in flight
+would otherwise still be allowed to adopt a snapshot that predates this write, and adopting ends
+the FALLBACK.
 
 **Cost.** Measured with `bench/applybench` on a graph of about five million nodes, against the same
 writes with `BLOODTRAIL_ENGINE=off`, write-through added **19–34% to write time (about 25% in the
