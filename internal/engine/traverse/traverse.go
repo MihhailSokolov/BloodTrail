@@ -177,8 +177,8 @@ func (b *memBudget) add(n uint64) error {
 // reserve accounts n bytes of scratch a strategy is about to allocate and
 // hold for its whole run, returning false without recording it if that
 // would exceed the budget's limit. The caller is expected to decline the
-// whole query rather than allocate anyway -- which is what this exists to
-// prevent, so the reservation is always taken BEFORE the allocation.
+// whole query rather than allocate the scratch anyway -- which is what this
+// exists to prevent, so the reservation is taken before that allocation.
 //
 // There is no matching release, and none is needed: a memBudget is built per
 // AllShortestPaths call and the scratch outlives every phase charged against
@@ -839,9 +839,13 @@ func materialize(e Endpoint, s *snapshot.View) []snapshot.NodeID {
 //
 // The scratch set this holds -- one distance buffer per small-side element,
 // live from bfsSmallSide's fan-out until the merge below has returned -- is
-// charged to the query's own memory limit (budget.reserve) BEFORE any of it
-// is allocated, and the whole query declines ErrTooLarge if it does not fit,
-// so the caller delegates to PostgreSQL instead. Nothing bounded that set
+// charged to the query's own memory limit (budget.reserve) before any of
+// THAT set is allocated, and the whole query declines ErrTooLarge if it does
+// not fit, so the caller delegates to PostgreSQL instead. The small-side id
+// slice materialize builds just above is deliberately left out of the
+// reservation: the reservation needs its length, and the slice is 8 bytes
+// per element against the scratch's 5*NodeCount bytes per element, so it is
+// strictly smaller than one buffer of the set it precedes. Nothing bounded that set
 // before: Query.SideBudget caps how many BFS runs a caller will attempt, and
 // the package default of 16 keeps the set small, but a caller that raises it
 // from its own work budget (interpret's strategyBudgetOverrides) grows the

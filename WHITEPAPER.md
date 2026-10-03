@@ -1536,6 +1536,15 @@ reported as a path to itself, matching BloodHound's own filter.
   declines (`too_large`) rather than allocating them. Nothing accounted for that set before, and
   a caller that raises `SideBudget` from its own work budget ([§11.9](#119-budgets)) scales it:
   at the interpreter's default work budget, up to roughly 1.3 GB on a sparse graph.
+
+  The reservation is `5 × node count × small-side size` bytes, so two numbers follow for a very
+  large graph. At the default `SideBudget` of 16 it reaches a 1 GiB `GraphQueryMemoryLimit` at
+  about 13.4M nodes, past which a pathfinding query that would have taken strategy B declines
+  (`too_large`) and goes to PostgreSQL. And because the reservation counts towards the same
+  limit as the paths, a strategy-B query's room for output is that much smaller than before —
+  at 5M nodes and `SideBudget` 16, about 380 MB of a 1 GiB limit. Both are the safe direction
+  (decline, not allocate), and both move with the limit, which is BloodHound's own per-transaction
+  setting.
 - **Reading adjacency.** Searches read a node's edges as array slices (`View.OutSlices` /
   `InSlices`, [§6.5](#65-the-view-a-base-plus-deltas)) rather than through a callback. A comment in
   the code records that routing the loop through a helper that took a callback made the common path

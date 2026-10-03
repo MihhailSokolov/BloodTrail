@@ -83,6 +83,14 @@ func TestAllShortestPathsHonoursRequestContext(t *testing.T) {
 		Roots: Endpoint{IDs: []snapshot.NodeID{0}},
 		Mode:  ModeAll,
 	}
+	// Strategy B the other way round: the terminals are the small side, so
+	// the merge is mergeSmallTerminals and the walk that carries the batched
+	// check is over the ROOT side. Its check is a separate call site from
+	// mergeSmallRoots', and needs its own row here to stay covered.
+	smallTerminals := Query{
+		Terminals: Endpoint{IDs: []snapshot.NodeID{1}},
+		Mode:      ModeAll,
+	}
 
 	// A cancellation found mid-traversal is reported alongside whatever the
 	// strategy had collected so far, exactly as ErrMemoryLimit already is:
@@ -106,10 +114,19 @@ func TestAllShortestPathsHonoursRequestContext(t *testing.T) {
 			snap, smallSide, &traverseCancelAfter{Context: context.Background(), live: 1}, context.Canceled, 0,
 		},
 		// The merge walk's check is batched, so it stops within
-		// cancelCheckInterval terminals rather than at the first one.
-		"strategy B, cancelled during the merge walk": {
+		// cancelCheckInterval steps rather than at the first one. Both merge
+		// phases are covered: the small-roots walk runs over the terminal
+		// side, the small-terminals walk over the root side.
+		"strategy B, cancelled during the small-roots merge walk": {
 			wide, smallSide, &traverseCancelAfter{Context: context.Background(), live: 2}, context.Canceled,
 			cancelCheckInterval,
+		},
+		"strategy B, cancelled during the small-terminals merge walk": {
+			wide, smallTerminals, &traverseCancelAfter{Context: context.Background(), live: 2}, context.Canceled,
+			cancelCheckInterval,
+		},
+		"strategy B (terminals pinned), cancelled before the traversal": {
+			snap, smallTerminals, cancelled, context.Canceled, 0,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -125,20 +142,30 @@ func TestAllShortestPathsHonoursRequestContext(t *testing.T) {
 		})
 	}
 
-	// A live context, and no context at all, serve the whole answer.
+	// A live context, and no context at all, serve the whole answer -- in
+	// every shape above, so none of the new checks can be inert by accident.
+	shapes := map[string]struct {
+		q    Query
+		want int
+	}{
+		"strategy A":                   {pairs, 4},
+		"strategy B, roots pinned":     {smallSide, 4},
+		"strategy B, terminals pinned": {smallTerminals, 1},
+	}
 	for name, ctx := range map[string]context.Context{
 		"live context": context.Background(),
 		"no context":   nil,
 	} {
 		t.Run(name, func(t *testing.T) {
-			for shape, q := range map[string]Query{"strategy A": pairs, "strategy B": smallSide} {
+			for shape, tc := range shapes {
+				q := tc.q
 				q.Ctx = ctx
 				paths, err := AllShortestPaths(snap, q)
 				if err != nil {
 					t.Fatalf("%s: AllShortestPaths: %v", shape, err)
 				}
-				if len(paths) != 4 {
-					t.Fatalf("%s: got %d paths, want 4 (one per terminal)", shape, len(paths))
+				if len(paths) != tc.want {
+					t.Fatalf("%s: got %d paths, want %d", shape, len(paths), tc.want)
 				}
 			}
 		})
