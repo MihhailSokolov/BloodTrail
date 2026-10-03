@@ -5,6 +5,7 @@ package verify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -93,6 +94,9 @@ func TestSmokeFailsOnFailedJob(t *testing.T) {
 	mux.HandleFunc("GET /api/v2/file-upload", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[{"id":1,"status":5,"status_message":"boom","failed_files":7}]}`))
 	})
+	mux.HandleFunc("GET /api/v2/search", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	s := Smoke{Client: srv.Client(), BaseURL: srv.URL, User: "admin", Password: "pw", Poll: time.Millisecond}
@@ -141,8 +145,12 @@ func TestSmokeWaitForJobToleratesTransientErrors(t *testing.T) {
 		w.WriteHeader(201)
 		_, _ = w.Write([]byte(`{"data":{"id":1}}`))
 	})
+	var ended atomic.Bool
 	mux.HandleFunc("POST /api/v2/file-upload/1", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(202) })
-	mux.HandleFunc("POST /api/v2/file-upload/1/end", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("POST /api/v2/file-upload/1/end", func(w http.ResponseWriter, r *http.Request) {
+		ended.Store(true)
+		w.WriteHeader(200)
+	})
 	mux.HandleFunc("GET /api/v2/file-upload", func(w http.ResponseWriter, r *http.Request) {
 		if jobPolls.Add(1) == 1 {
 			w.WriteHeader(503)
@@ -153,7 +161,13 @@ func TestSmokeWaitForJobToleratesTransientErrors(t *testing.T) {
 	mux.HandleFunc("GET /api/v2/datapipe/status", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":{"status":"idle"}}`))
 	})
+	// The fixture is in the graph once the upload has been ended, not before:
+	// a graph that already held it would make the run inconclusive.
 	mux.HandleFunc("GET /api/v2/search", func(w http.ResponseWriter, r *http.Request) {
+		if !ended.Load() {
+			_, _ = w.Write([]byte(`{"data":[]}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"data":[{"objectid":"S-1-5-21-1","type":"Domain","name":"TESTLAB.LOCAL"}]}`))
 	})
 	srv := httptest.NewServer(mux)
@@ -164,6 +178,78 @@ func TestSmokeWaitForJobToleratesTransientErrors(t *testing.T) {
 	}
 	if jobPolls.Load() < 2 {
 		t.Fatalf("expected at least 2 job polls (1 transient failure + 1 success), got %d", jobPolls.Load())
+	}
+}
+
+// smokeAPI is a stand-in BloodHound API for Smoke: it accepts the login and
+// the upload, finishes the job and the datapipe at once, and answers the
+// search with the fixture domain from the start when fixtureAlreadyThere is
+// set -- what an earlier smoke test leaves behind -- and otherwise only once
+// the upload has been ended.
+func smokeAPI(t *testing.T, fixtureAlreadyThere bool) (srv *httptest.Server, uploads *atomic.Int32) {
+	t.Helper()
+	var ended atomic.Bool
+	uploads = new(atomic.Int32)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v2/login", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"session_token":"tok"}}`))
+	})
+	mux.HandleFunc("POST /api/v2/file-upload/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(201)
+		_, _ = w.Write([]byte(`{"data":{"id":1}}`))
+	})
+	mux.HandleFunc("POST /api/v2/file-upload/1", func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.WriteHeader(202)
+	})
+	mux.HandleFunc("POST /api/v2/file-upload/1/end", func(w http.ResponseWriter, r *http.Request) {
+		ended.Store(true)
+		w.WriteHeader(200)
+	})
+	mux.HandleFunc("GET /api/v2/file-upload", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":1,"status":2,"status_message":"","failed_files":0}]}`))
+	})
+	mux.HandleFunc("GET /api/v2/datapipe/status", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"status":"idle"}}`))
+	})
+	mux.HandleFunc("GET /api/v2/search", func(w http.ResponseWriter, r *http.Request) {
+		if fixtureAlreadyThere || ended.Load() {
+			_, _ = w.Write([]byte(`{"data":[{"objectid":"S-1-5-21-1","type":"Domain","name":"TESTLAB.LOCAL"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, uploads
+}
+
+// TestSmokeIsInconclusiveWhenTheFixtureIsAlreadyThere covers a repeat of the
+// smoke test on a deployment that still holds the fixture domain an earlier
+// run left (it is left on purpose). The search at the end then finds it whether
+// or not this run's ingest reached the graph, so a pass would say nothing --
+// and used to be reported all the same. The run still uploads and waits for its
+// own job and the datapipe, which are evidence of this run and can fail it; but
+// where they are all it has, it says the result is inconclusive.
+func TestSmokeIsInconclusiveWhenTheFixtureIsAlreadyThere(t *testing.T) {
+	srv, uploads := smokeAPI(t, true)
+	s := Smoke{Client: srv.Client(), BaseURL: srv.URL, User: "admin", Password: "pw", Poll: time.Millisecond}
+	err := s.Run(context.Background(), time.Second)
+	if !errors.Is(err, ErrSmokeInconclusive) {
+		t.Fatalf("Run over a graph that already holds the fixture = %v, want ErrSmokeInconclusive", err)
+	}
+	if !strings.Contains(err.Error(), fixtureDomain) {
+		t.Errorf("the result does not name the fixture domain: %v", err)
+	}
+	if uploads.Load() != 7 {
+		t.Errorf("the fixture was uploaded %d times, want 7: the run's own evidence is still gathered", uploads.Load())
+	}
+
+	// Where the fixture is not there, finding it is a pass.
+	srv, _ = smokeAPI(t, false)
+	s = Smoke{Client: srv.Client(), BaseURL: srv.URL, User: "admin", Password: "pw", Poll: time.Millisecond}
+	if err := s.Run(context.Background(), time.Second); err != nil {
+		t.Fatalf("Run over a graph without the fixture: %v", err)
 	}
 }
 
