@@ -258,7 +258,7 @@ func (p *PropStore) entryKey(e propEntry) (string, bool) {
 		return "b0", true
 	case propKindTrue:
 		return "b1", true
-	case propKindNumber:
+	case propKindNumber, propKindNumberNonCanonical:
 		return numberKey(e.num), true
 	case propKindString:
 		return "s" + p.stringAt(e.ref, e.len), true

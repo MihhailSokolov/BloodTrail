@@ -15,8 +15,8 @@ import (
 // shape, e.g. FetchNodeIDsByKind's single KindMatcher, possibly combined with
 // an id() filter) and serve it from the in-memory engine.
 //
-// graph.NodeQuery is embedded, so every method this file does not override
-// (Fetch, First) is promoted straight through to the inner query unchanged.
+// graph.NodeQuery is embedded, so the one method this file does not override
+// (First) is promoted straight through to the inner query unchanged.
 //
 // The zero value is not useful; construct one via wrappedTransaction's own
 // Nodes().
@@ -33,14 +33,14 @@ type recordingNodeQuery struct {
 	// recordingRelationshipQuery.criteria; see relationship_query.go's doc).
 	criteria []graph.Criteria
 
-	// tainted is set by OrderBy, Offset, Limit, Update, Delete, or Query: any
-	// of these changes what Count/FetchIDs/FetchKinds would need to mean --
-	// an order/offset/limit the engine's own bitset-backed answer does not
-	// implement, a mutation that must go straight to PostgreSQL, or a
-	// caller-supplied projection (Query's delegate) the engine has no way to
-	// build -- so once set the engine must not be consulted for any of the
-	// three for the rest of this query's life (mirrors
-	// recordingRelationshipQuery.tainted).
+	// tainted is set by OrderBy, Offset, Limit, Update, Delete, Query, or
+	// Fetch: any of these changes what Count/FetchIDs/FetchKinds would need
+	// to mean -- an order/offset/limit the engine's own bitset-backed answer
+	// does not implement, a mutation that must go straight to PostgreSQL, or
+	// caller-supplied final criteria (Query's and Fetch's), which the pg
+	// driver applies to this query's builder for good -- so once set the
+	// engine must not be consulted for any of the three for the rest of this
+	// query's life (mirrors recordingRelationshipQuery.tainted).
 	tainted bool
 }
 
@@ -106,9 +106,29 @@ func (r *recordingNodeQuery) Delete() error {
 // engine service and is tainted unconditionally rather than merely being
 // left unintercepted, so that a later Count/FetchIDs/FetchKinds call on the
 // same chained query also stops consulting the engine.
+//
+// finalCriteria carrying an updating clause (hasUpdatingClause,
+// write_observer.go) make this call a write -- the pg driver's own Delete
+// and Update are built exactly this way -- so it is noted on the owning
+// transaction first (readWrites' doc, transaction.go), like Update/Delete.
 func (r *recordingNodeQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
 	r.tainted = true
+	if hasUpdatingClause(finalCriteria) {
+		r.tx.writes.note("ReadTransaction: NodeQuery.Query updating clause escapes changelog tracking")
+	}
 	return r.NodeQuery.Query(delegate, finalCriteria...)
+}
+
+// Fetch taints the query and notes a write exactly as Query does (see its
+// doc): the pg driver appends finalCriteria to Fetch's own RETURN, so they
+// stay on this query's builder, and an updating clause among them writes.
+// Fetch itself is never served from the engine.
+func (r *recordingNodeQuery) Fetch(delegate func(cursor graph.Cursor[*graph.Node]) error, finalCriteria ...graph.Criteria) error {
+	r.tainted = true
+	if hasUpdatingClause(finalCriteria) {
+		r.tx.writes.note("ReadTransaction: NodeQuery.Fetch updating clause escapes changelog tracking")
+	}
+	return r.NodeQuery.Fetch(delegate, finalCriteria...)
 }
 
 // Count attempts to serve the query from the engine when nothing has tainted

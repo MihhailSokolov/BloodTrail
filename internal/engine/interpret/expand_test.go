@@ -206,9 +206,10 @@ func TestExpandVarLengthNodeRevisitViaDistinctEdges(t *testing.T) {
 	})
 }
 
-// TestExpandVarLengthZeroLengthBindsSameNode: `*0..0` binds a=b to the same
-// node with an empty PathVal (per PathVal's own doc comment: both slices
-// nil) for every root, including a root with no outgoing edges at all.
+// TestExpandVarLengthZeroLengthBindsSameNode: `*0..1` binds a=b to the same
+// node for every root's zero-length row, a root with no outgoing edges at all
+// included, and that row's path is the one-node path of the root -- what
+// PostgreSQL returns for it, never an empty path.
 func TestExpandVarLengthZeroLengthBindsSameNode(t *testing.T) {
 	const kindRoot snapshot.KindID = 1
 	const kindE snapshot.KindID = 10
@@ -224,31 +225,83 @@ func TestExpandVarLengthZeroLengthBindsSameNode(t *testing.T) {
 		},
 	)
 
-	rs := mustExec(t, snap, `MATCH p = (a:Root)-[:E*0..0]->(b) RETURN a, b, p`, generousBudget)
-	if len(rs.Rows) != 2 {
-		t.Fatalf("row count = %d, want 2\nrows: %v", len(rs.Rows), rs.Rows)
+	const query = `MATCH p = (a:Root)-[:E*0..1]->(b) RETURN a, b, p`
+	rs := mustExec(t, snap, query, generousBudget)
+	if len(rs.Rows) != 3 {
+		t.Fatalf("row count = %d, want 3\nrows: %v", len(rs.Rows), rs.Rows)
 	}
 
-	gotRoots := make(map[uint64]bool, 2)
+	zeroLengthRoots := make(map[uint64]bool, 2)
 	for _, row := range rs.Rows {
 		a, b, p := row[0], row[1], row[2]
-		if a.Kind != OutNode || b.Kind != OutNode {
-			t.Fatalf("row = %v, want a and b both OutNode", row)
+		if a.Kind != OutNode || b.Kind != OutNode || p.Kind != OutPath {
+			t.Fatalf("row = %v, want a and b OutNode and p OutPath", row)
+		}
+		if len(p.Path.Edges) != 0 {
+			continue
 		}
 		if a.Node != b.Node {
 			t.Fatalf("row a=%v b=%v, want a == b (*0.. binds both endpoints to the same node)", a.Node, b.Node)
 		}
-		if p.Kind != OutPath {
-			t.Fatalf("row p kind = %v, want OutPath", p.Kind)
+		if len(p.Path.Nodes) != 1 || p.Path.Nodes[0] != a.Node {
+			t.Fatalf("zero-length path = %+v, want the one-node path of %v", p.Path, a.Node)
 		}
-		if len(p.Path.Nodes) != 0 || len(p.Path.Edges) != 0 {
-			t.Fatalf("zero-length PathVal = %+v, want both slices empty", p.Path)
-		}
-		gotRoots[snap.GraphID(a.Node)] = true
+		zeroLengthRoots[snap.GraphID(a.Node)] = true
 	}
-	if !gotRoots[1] || !gotRoots[2] {
-		t.Fatalf("roots seen = %v, want both database ids 1 (connected) and 2 (isolated)", gotRoots)
+	if !zeroLengthRoots[1] || !zeroLengthRoots[2] {
+		t.Fatalf("zero-length roots seen = %v, want both database ids 1 (connected) and 2 (isolated)", zeroLengthRoots)
 	}
+
+	assertPathSigs(t, snap, query, 2, []string{
+		"N:1,|E:",
+		"N:2,|E:",
+		"N:1,3,|E:30,",
+	})
+}
+
+// TestExpandVarLengthReverseZeroLengthPathIsOneNode: the backward walk binds
+// the same one-node path for a zero-length row as the forward walk does.
+func TestExpandVarLengthReverseZeroLengthPathIsOneNode(t *testing.T) {
+	snap := buildReverseEqualityFixture(t)
+
+	const query = `MATCH p = (s)-[:E*0..1]->(t:Target) WHERE t.objectid = 'T-516' RETURN p`
+	part, step := varLengthPartAndStep(t, snap, query)
+	if !varLengthReverseEligible(&Env{Snap: snap}, part, step) {
+		t.Fatalf("query %q: want the reverse route, so its zero-length arm is the one under test", query)
+	}
+
+	assertPathSigs(t, snap, query, 0, []string{
+		"N:5,|E:",
+		"N:6,|E:",
+		"N:7,5,|E:108,",
+		"N:3,6,|E:101,",
+		"N:4,6,|E:103,",
+		"N:2,6,|E:104,",
+		"N:2,6,|E:105,",
+		"N:5,6,|E:109,",
+	})
+}
+
+// TestExpandZeroUpperBoundDeclines: an explicit upper bound of zero is not
+// the empty range it reads as -- dawgs' primer emits the depth-1 rows
+// regardless of the bound, and a shortest-path harness returns nothing -- so
+// Plan declines it for plain and shortest-path patterns alike.
+func TestExpandZeroUpperBoundDeclines(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "*0..0", cypher: `MATCH p = (a:Root)-[:E*0..0]->(b) RETURN p`, want: false},
+		{name: "*1..0", cypher: `MATCH p = (a:Root)-[:E*1..0]->(b) RETURN p`, want: false},
+		{name: "*..0", cypher: `MATCH (a:Root)-[:E*..0]->(b) RETURN a, b`, want: false},
+		{name: "*0..0 inbound", cypher: `MATCH p = (b)<-[:E*0..0]-(a:Root) RETURN p`, want: false},
+		{name: "shortestPath *1..0", cypher: `MATCH p = shortestPath((a:Root)-[:E*1..0]->(b:Root)) RETURN p`, want: false},
+		{name: "allShortestPaths *..0", cypher: `MATCH p = allShortestPaths((a:Root)-[:E*..0]->(b:Root)) RETURN p`, want: false},
+		{name: "*0..1 still served", cypher: `MATCH p = (a:Root)-[:E*0..1]->(b) RETURN p`, want: true},
+	})
 }
 
 // TestExpandVarLengthRangeCapHonored: `*1..2` over a 3-edge chain must
@@ -1538,4 +1591,196 @@ func TestExpandConvertPathErrorsOnNoMatchingForwardEdge(t *testing.T) {
 	if !errors.Is(err, errConvertPathEdgeNotFound) {
 		t.Fatalf("convertPath() error = %v, want errConvertPathEdgeNotFound", err)
 	}
+}
+
+// TestShortestPathSecondEndpointMustBeConstrained: a shortestPath whose
+// second-written endpoint carries no constraint declines -- dawgs then marks
+// a hop satisfied by whether the seed has an edge on its far side, which no
+// engine search reproduces -- while a bare FIRST-written endpoint, the shape
+// of every shipped prebuilt that has one, keeps planning.
+func TestShortestPathSecondEndpointMustBeConstrained(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "second endpoint bare", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE s <> t RETURN p`, want: false},
+		{name: "second endpoint bare, all shortest", cypher: `MATCH p = allShortestPaths((s:Root)-[:E*1..]->(t)) WHERE s <> t RETURN p`, want: false},
+		{name: "second endpoint bare, backward arrow", cypher: `MATCH p = shortestPath((t:Root)<-[:E*1..]-(s)) WHERE s <> t RETURN p`, want: false},
+		{name: "first endpoint bare", cypher: `MATCH p = shortestPath((s)-[:E*1..]->(t:Root)) WHERE s <> t RETURN p`, want: true},
+		{name: "first endpoint bare, backward arrow", cypher: `MATCH p = shortestPath((t)<-[:E*1..]-(s:Root)) WHERE s <> t RETURN p`, want: true},
+		{name: "second endpoint constrained by a predicate", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE t.name = 'x' AND s <> t RETURN p`, want: true},
+		{name: "second endpoint constrained by id", cypher: `MATCH p = shortestPath((s:Root)-[:E*1..]->(t)) WHERE id(t) = 2 AND s <> t RETURN p`, want: true},
+	})
+}
+
+// buildSelfCycleSnapshot: group g1 (1) sits on a 2-cycle through u (2) while
+// the only other group, g2 (5), is three hops away through x (3) and y (4).
+func buildSelfCycleSnapshot(t *testing.T) *snapshot.View {
+	t.Helper()
+	const (
+		kindG snapshot.KindID = 1
+		kindU snapshot.KindID = 2
+		kindE snapshot.KindID = 10
+	)
+	return buildExecSnapshot(t,
+		map[snapshot.KindID]string{kindG: "G", kindU: "U", kindE: "E"},
+		[]execNodeSpec{
+			{id: 1, kinds: []snapshot.KindID{kindG}, props: map[string]any{"name": "g1"}},
+			{id: 2, kinds: []snapshot.KindID{kindU}, props: map[string]any{"name": "u"}},
+			{id: 3, kinds: []snapshot.KindID{kindU}, props: map[string]any{"name": "x"}},
+			{id: 4, kinds: []snapshot.KindID{kindU}, props: map[string]any{"name": "y"}},
+			{id: 5, kinds: []snapshot.KindID{kindG}, props: map[string]any{"name": "g2"}},
+		},
+		[]execEdgeSpec{
+			{id: 10, start: 1, end: 2, kind: kindE},
+			{id: 11, start: 2, end: 1, kind: kindE},
+			{id: 12, start: 1, end: 3, kind: kindE},
+			{id: 13, start: 3, end: 4, kind: kindE},
+			{id: 14, start: 4, end: 5, kind: kindE},
+		},
+	)
+}
+
+// TestExpandAllShortestSharedEndpointInequalityDeclines: answered at the
+// overall shortest length, an allShortestPaths whose root and terminal sets
+// share a node declines even with `a <> b` -- PostgreSQL's harness lets g1's
+// cycle back to itself set that length before the inequality drops it --
+// while the per-pair answer and disjoint endpoint sets keep serving.
+func TestExpandAllShortestSharedEndpointInequalityDeclines(t *testing.T) {
+	snap := buildSelfCycleSnapshot(t)
+
+	const query = `MATCH p = allShortestPaths((a:G)-[:E*1..]->(b:G)) WHERE a <> b RETURN p`
+	if err := execExpectErr(t, snap, query, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
+		t.Fatalf("Execute(%q) error = %v, want ErrSelfEndpoint", query, err)
+	}
+
+	rs, err := Execute(&Env{Snap: snap, AllShortestPerPair: true}, planQuery(t, snap, query), generousBudget)
+	if err != nil {
+		t.Fatalf("Execute(%q) per pair: %v", query, err)
+	}
+	if got, want := pathSigsAtColumn(t, snap, rs, 0), []string{"N:1,3,4,5,|E:12,13,14,"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("per-pair paths = %v, want %v", got, want)
+	}
+
+	assertPathSigs(t, snap, `MATCH p = allShortestPaths((a:G)-[:E*1..]->(b:U)) WHERE a <> b RETURN p`, 0, []string{
+		"N:1,2,|E:10,",
+		"N:1,3,|E:12,",
+	})
+}
+
+// TestExpandShortestPairFilterLimitSharedEndpointDeclines: a shortestPath with
+// a property condition on both endpoints (which dawgs searches pair by pair,
+// over the product of the two endpoint sets), an endpoint inequality and a
+// bare LIMIT declines when the sets share a node -- the harness resolves that
+// node's own pair around its cycle and counts it toward the LIMIT -- and
+// keeps serving without the LIMIT and with kind-only endpoints.
+func TestExpandShortestPairFilterLimitSharedEndpointDeclines(t *testing.T) {
+	snap := buildSelfCycleSnapshot(t)
+
+	const pairs = `MATCH p = shortestPath((a:G)-[:E*1..]->(b:G)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p`
+	if err := execExpectErr(t, snap, pairs+` LIMIT 1`, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
+		t.Fatalf("Execute(%q LIMIT 1) error = %v, want ErrSelfEndpoint", pairs, err)
+	}
+
+	want := []string{"N:1,3,4,5,|E:12,13,14,"}
+	assertPathSigs(t, snap, pairs, 0, want)
+	assertPathSigs(t, snap, `MATCH p = shortestPath((a:G)-[:E*1..]->(b:G)) WHERE a <> b RETURN p LIMIT 1`, 0, want)
+}
+
+// TestShortestPathMustBeFirstBinding: a shortestPath/allShortestPaths
+// pattern plans only as the first thing its query part binds -- dawgs'
+// harness frame cannot see an earlier frame, so an earlier pattern in the
+// same part, an endpoint carried through a WITH and an OPTIONAL MATCH over
+// the mandatory part's symbols all decline -- while the pattern on its own,
+// inline map and WHERE included, still plans.
+func TestShortestPathMustBeFirstBinding(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 2: "Term", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2, kinds: []snapshot.KindID{2}}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "earlier MATCH clause", cypher: `MATCH (x:Term) MATCH p = shortestPath((a:Root)-[:E*1..]->(b:Term)) RETURN p, x`, want: false},
+		{name: "earlier clause binds an endpoint", cypher: `MATCH (a:Root) MATCH p = shortestPath((a)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "earlier comma pattern", cypher: `MATCH (a:Root), p = shortestPath((a)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "after WITH", cypher: `MATCH (x:Root) WITH x MATCH p = shortestPath((s:Root)-[:E*1..]->(b:Term)) WHERE s.name = x.name RETURN p`, want: false},
+		{name: "after a constant WITH", cypher: `WITH 1 AS one MATCH p = shortestPath((s:Root)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "endpoint carried through WITH", cypher: `MATCH (x:Root) WITH x MATCH p = allShortestPaths((x)-[:E*1..]->(b:Term)) RETURN p`, want: false},
+		{name: "inside OPTIONAL MATCH", cypher: `MATCH (a:Root) OPTIONAL MATCH p = shortestPath((a)-[:E*1..]->(b:Term)) RETURN a, p`, want: false},
+		{name: "first and only binding", cypher: `MATCH p = shortestPath((s:Root {name: 'r'})-[:E*1..]->(b:Term)) WHERE b.name = 't' RETURN p`, want: true},
+	})
+}
+
+// TestShortestPathMustBeLastPattern: nothing may follow a shortestPath
+// pattern in its query part -- dawgs applies a later clause's conditions
+// only after its harness has chosen the paths, where the planner would pool
+// them into the endpoint constraints -- whatever the later pattern is.
+func TestShortestPathMustBeLastPattern(t *testing.T) {
+	snap := buildExecSnapshot(t,
+		map[snapshot.KindID]string{1: "Root", 2: "Term", 3: "Other", 10: "E"},
+		[]execNodeSpec{{id: 1, kinds: []snapshot.KindID{1}}, {id: 2, kinds: []snapshot.KindID{2}}, {id: 3, kinds: []snapshot.KindID{3}}},
+		[]execEdgeSpec{{id: 30, start: 1, end: 2, kind: 10}},
+	)
+
+	const shortest = `MATCH p = shortestPath((s:Root)-[:E*1..]->(t:Term))`
+	runPlanGolden(t, snap, []planTestCase{
+		{name: "later MATCH filtering an endpoint", cypher: shortest + ` MATCH (x:Other) WHERE t.name = 'far' RETURN p`, want: false},
+		{name: "later MATCH with the inequality", cypher: shortest + ` MATCH (x:Other) WHERE s <> t RETURN p`, want: false},
+		{name: "later MATCH re-labelling an endpoint", cypher: shortest + ` MATCH (t:Other) RETURN p`, want: false},
+		{name: "later comma pattern with an inline map", cypher: shortest + `, (s {name: 'a'}) RETURN p`, want: false},
+		{name: "later comma pattern, unrelated node", cypher: shortest + `, (x:Other) RETURN p, x`, want: false},
+		{name: "later comma chain", cypher: shortest + `, (x:Other)-[:E]->(y) RETURN p`, want: false},
+		{name: "own clause only", cypher: shortest + ` WHERE t.name = 'far' AND s <> t RETURN p`, want: true},
+	})
+}
+
+// TestShortestPathKindLevelSelfEndpointDeclines: without an endpoint
+// inequality, a node matching the seed side's kinds that lies in the other
+// side's set and has an edge the seed would walk can trip PostgreSQL's
+// primer guard even when the seed's property predicates exclude it -- here c,
+// both A and B, with an outgoing edge, while the roots narrow to a. The same
+// query with `x <> y` (no guard) and a both-kinds node without such an edge
+// keep serving.
+func TestShortestPathKindLevelSelfEndpointDeclines(t *testing.T) {
+	const (
+		kindA snapshot.KindID = 1
+		kindB snapshot.KindID = 2
+		kindE snapshot.KindID = 10
+	)
+	kinds := map[snapshot.KindID]string{kindA: "A", kindB: "B", kindE: "E"}
+	nodes := []execNodeSpec{
+		{id: 1, kinds: []snapshot.KindID{kindA}, props: map[string]any{"name": "a"}},
+		{id: 2, kinds: []snapshot.KindID{kindB}, props: map[string]any{"name": "b"}},
+		{id: 3, kinds: []snapshot.KindID{kindA, kindB}, props: map[string]any{"name": "c"}},
+		{id: 4, kinds: []snapshot.KindID{kindB}, props: map[string]any{"name": "d"}},
+	}
+	const query = `MATCH p = shortestPath((x:A)-[:E*1..]->(y:B)) WHERE x.name = 'a' RETURN p`
+
+	snap := buildExecSnapshot(t, kinds, nodes, []execEdgeSpec{
+		{id: 20, start: 1, end: 2, kind: kindE},
+		{id: 21, start: 2, end: 3, kind: kindE},
+		{id: 22, start: 3, end: 4, kind: kindE},
+	})
+	if err := execExpectErr(t, snap, query, generousBudget); !errors.Is(err, ErrSelfEndpoint) {
+		t.Fatalf("Execute(%q) error = %v, want ErrSelfEndpoint", query, err)
+	}
+	assertPathSigs(t, snap, `MATCH p = shortestPath((x:A)-[:E*1..]->(y:B)) WHERE x.name = 'a' AND x <> y RETURN p`, 0, []string{
+		"N:1,2,|E:20,",
+		"N:1,2,3,|E:20,21,",
+		"N:1,2,3,4,|E:20,21,22,",
+	})
+
+	// c now has no outgoing edge, and the roots {a} carry no B kind.
+	snap = buildExecSnapshot(t, kinds, nodes, []execEdgeSpec{
+		{id: 20, start: 1, end: 2, kind: kindE},
+		{id: 21, start: 2, end: 3, kind: kindE},
+	})
+	assertPathSigs(t, snap, query, 0, []string{
+		"N:1,2,|E:20,",
+		"N:1,2,3,|E:20,21,",
+	})
 }

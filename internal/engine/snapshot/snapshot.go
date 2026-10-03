@@ -54,11 +54,11 @@ type Snapshot struct {
 
 	// MultiGraph reports whether the source database holds more than one
 	// graph with at least one node, as of LoadSnapshot's multi-graph probe.
-	// It is informational only -- the snapshot itself always holds exactly
-	// one graph's nodes and edges (GraphID) -- flagging a database shape
-	// later Cypher work (e.g. an unscoped query) may need to reason about.
-	// Set by LoadSnapshot after Build; false on a Builder-only Snapshot
-	// (e.g. in unit tests) that never went through it.
+	// The snapshot itself always holds exactly one graph's nodes and edges
+	// (GraphID), while PostgreSQL's reads through dawgs are not scoped by
+	// graph, so the engine declines every serving path on such a snapshot
+	// (reason multi_graph). Set by LoadSnapshot after Build; false on a
+	// Builder-only Snapshot (e.g. in unit tests) that never went through it.
 	MultiGraph bool
 
 	// WatermarkLineage is the watermark lineage this snapshot's contents

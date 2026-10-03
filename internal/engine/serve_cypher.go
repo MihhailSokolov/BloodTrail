@@ -430,10 +430,11 @@ const (
 	// arithmetic over a property, labels(), split(), and the like.
 	valueDefault valueKind = iota
 	// valueText applies to a projection PostgreSQL renders as a `text`
-	// column rather than jsonb -- toLower()/toUpper()/coalesce() and a bare
-	// string literal (projectsTextColumn). It carries no numeric
-	// conversion; what it changes is that the scalar double-decode is NOT
-	// applied, matching dawgs' own decode-by-column-type rule.
+	// column rather than jsonb -- toLower()/toUpper()/coalesce()/type(), a
+	// bare string literal (projectsTextColumn), and a bare reference to a
+	// WITH-carried string constant (projectionValueKinds). It carries no
+	// numeric conversion; what it changes is that the scalar double-decode
+	// is NOT applied, matching dawgs' own decode-by-column-type rule.
 	valueText
 	// valueInt64 applies to id(), to a coalesce() dawgs types int8
 	// (interpret.CoalesceIsInt8), and to any bare reference (renamed or not)
@@ -467,8 +468,15 @@ const (
 // item renames the column via AS. The executor stores every count as
 // float64 (interpret's applyAggregate and runKindCount alike); pg types
 // count() as int8, which is the int64 materializeScalar converts it to.
+//
+// A WITH-carried string constant (`WITH '[1]' AS s`) is the same kind of
+// carry-over: PostgreSQL keeps it a text column (`select '[1]' as i0`), so a
+// RETURN item that is a bare reference to one, however parenthesized or
+// renamed, is valueText and must not be decoded even when its text looks
+// like JSON.
 func projectionValueKinds(q *interpret.Query) []valueKind {
 	countAliases := map[string]bool{}
+	textConstAliases := map[string]bool{}
 	groups := make([]*interpret.WithClause, 0, len(q.Parts)+1)
 	for i := range q.Parts {
 		groups = append(groups, q.Parts[i].With)
@@ -483,6 +491,11 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 				countAliases[agg.Alias] = true
 			}
 		}
+		for _, constant := range wc.Constants {
+			if _, isString := constant.Value.(string); isString {
+				textConstAliases[constant.Alias] = true
+			}
+		}
 	}
 
 	kinds := make([]valueKind, len(q.Returning.Items))
@@ -495,9 +508,15 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 			kinds[i] = valueInt32
 			continue
 		}
-		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil && countAliases[v.Symbol] {
-			kinds[i] = valueInt64
-			continue
+		if v, ok := unwrapParens(item.Expr).(*cypher.Variable); ok && v != nil {
+			if countAliases[v.Symbol] {
+				kinds[i] = valueInt64
+				continue
+			}
+			if textConstAliases[v.Symbol] {
+				kinds[i] = valueText
+				continue
+			}
 		}
 		// `coalesce(n.x, 0)` is `coalesce(...::int8, 0)::int8` in pg: an
 		// int8 column, not the text one projectsTextColumn assumes for
@@ -529,9 +548,12 @@ func projectionValueKinds(q *interpret.Query) []valueKind {
 //
 // The shapes listed here are the ones dawgs' translator explicitly casts to
 // text (toLower/toUpper render as `lower(...)::text`, coalesce sets
-// CastType Text) plus a bare string literal, which PostgreSQL never types
-// as jsonb. Everything else keeps the decode, which is what a bare property
-// lookup -- the jsonb column the rule exists for -- needs.
+// CastType Text, type() is `kind_name(...)::text`) plus a bare string
+// literal, which PostgreSQL never types as jsonb. Everything else keeps the
+// decode, which is what a bare property lookup -- the jsonb column the rule
+// exists for -- needs. A reference to a WITH-carried string constant is text
+// too, but only the query knows which aliases are constants, so
+// projectionValueKinds handles that one.
 func projectsTextColumn(expr cypher.Expression) bool {
 	switch e := unwrapParens(expr).(type) {
 	case *cypher.FunctionInvocation:
@@ -539,7 +561,7 @@ func projectsTextColumn(expr cypher.Expression) bool {
 			return false
 		}
 		switch strings.ToLower(e.Name) {
-		case "tolower", "toupper", "coalesce":
+		case cypher.ToLowerFunction, cypher.ToUpperFunction, cypher.CoalesceFunction, cypher.EdgeTypeFunction:
 			return true
 		}
 	case *cypher.Literal:
@@ -768,18 +790,21 @@ func (r *cypherRowsResult) Values() []any {
 // pathResult) for a graph.Path rawValue into a *graph.Path target,
 // mapCypherNodeValue for a *graph.Node rawValue into a *graph.Node target,
 // and mapCypherRelationshipValue for a *graph.Relationship rawValue into a
-// *graph.Relationship target. Every other (rawValue, target) combination is
-// declined by all three -- including a *graph.Kinds target presented with a
-// node's own rawValue, which none of the three match -- and dawgs' own
-// defaultMapValue (graph/mapper.go), appended automatically by graph.
-// NewValueMapper, has no case at all for *graph.Node/*graph.Relationship/
-// graph.Path targets either (see mapCypherNodeValue's doc for why), so a
-// plain scalar column (int64/int32/float64/string/bool/[]any/map[string]any)
-// falls all the way through every MapFunc and reaches ops.FetchByQuery's
-// final `else` branch, which wraps it as a graph.Literal -- exactly the
-// behavior this mapper's "decline everything else" design is aimed at.
+// *graph.Relationship target, plus mapCypherJSONObjectValue for the one
+// scalar shape dawgs' own mapper files as a path (a decoded JSON object).
+// Every other (rawValue, target) combination is declined by all four --
+// including a *graph.Kinds target presented with a node's own rawValue,
+// which none of them match -- and dawgs' own defaultMapValue (graph/
+// mapper.go), appended automatically by graph.NewValueMapper, has no case at
+// all for *graph.Node/*graph.Relationship/graph.Path targets either (see
+// mapCypherNodeValue's doc for why), so a plain scalar column (int64/int32/
+// float64/string/bool/[]any, or a map[string]any dawgs would not file as a
+// path) falls all the way through every MapFunc and reaches
+// ops.FetchByQuery's final `else` branch, which wraps it as a graph.Literal
+// -- exactly the behavior this mapper's "decline everything else" design is
+// aimed at.
 func (r *cypherRowsResult) Mapper() graph.ValueMapper {
-	return graph.NewValueMapper(mapPathValue, mapCypherNodeValue, mapCypherRelationshipValue)
+	return graph.NewValueMapper(mapPathValue, mapCypherNodeValue, mapCypherRelationshipValue, mapCypherJSONObjectValue)
 }
 
 // Scan is graph.Result's deprecated convenience method, implemented via
@@ -838,5 +863,59 @@ func mapCypherRelationshipValue(rawValue, target any) bool {
 		return false
 	}
 	*relTarget = *rel
+	return true
+}
+
+// mapCypherJSONObjectValue is cypherRowsResult's MapFunc for a *graph.Path
+// target presented with a map[string]any -- a decoded JSON object, which is
+// what a property lookup yields for an object-valued property or for a
+// string property holding object text (decodeScalarString double-decodes
+// that on both sides).
+//
+// It mirrors dawgs' pg mapper (drivers/pg/mapper.go newMapFunc, types.go
+// pathComposite.FromMap), which hands ANY map[string]any to the path
+// composite: the map becomes an empty graph.Path whenever its "nodes" and
+// "edges" keys, if present, hold empty lists, so ops.FetchByQuery -- the
+// consumer behind BloodHound's cypher endpoint -- files an ordinary object
+// column under Paths, not Literals. The node and edge composites are
+// declined for such a map as they are in pg: nodeComposite.FromMap and
+// edgeComposite.FromMap both start by reading an integer-typed "id", and a
+// decoded JSON number is always a float64.
+//
+// TestCypherRowsResultMapperMapsJSONObjectsLikeDawgs runs a corpus of object
+// shapes through dawgs' own mapper and this one and compares them, so a
+// change in dawgs' rule shows up there.
+func mapCypherJSONObjectValue(rawValue, target any) bool {
+	object, isObject := rawValue.(map[string]any)
+	if !isObject {
+		return false
+	}
+
+	pathTarget, isPathTarget := target.(*graph.Path)
+	if !isPathTarget || !jsonObjectIsEmptyPathComposite(object) {
+		return false
+	}
+
+	pathTarget.Nodes = make([]*graph.Node, 0)
+	pathTarget.Edges = make([]*graph.Relationship, 0)
+	return true
+}
+
+// jsonObjectIsEmptyPathComposite reports whether dawgs' pathComposite.
+// FromMap accepts object as a path with no nodes and no edges: each of the
+// "nodes" and "edges" keys is either absent or a []any with no elements.
+// Any element would have to be a node or edge composite, which needs an
+// integer-typed "id" that decoded JSON cannot carry, so a non-empty list, or
+// a value that is not a list at all (a string, an object, null), fails.
+func jsonObjectIsEmptyPathComposite(object map[string]any) bool {
+	for _, key := range [...]string{"nodes", "edges"} {
+		raw, present := object[key]
+		if !present {
+			continue
+		}
+		if list, isList := raw.([]any); !isList || len(list) > 0 {
+			return false
+		}
+	}
 	return true
 }

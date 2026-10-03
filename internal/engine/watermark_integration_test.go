@@ -30,11 +30,19 @@ func resetWatermarkTable(t *testing.T, ctx context.Context, eng *Engine) {
 	if _, err := eng.pool.Exec(ctx, "update bloodtrail_watermark set counter = 0"); err != nil {
 		t.Fatalf("resetWatermarkTable: %v", err)
 	}
-	eng.appliedWatermark.Store(0)
+	resetWatermarkLedger(&eng.appliedWatermark)
 	eng.inflightBumps.Store(0)
 	eng.dirtyGen.Store(0)
 	eng.settledDirtyGen.Store(0)
 	eng.resolvedDirtyGen.Store(0)
+}
+
+// resetWatermarkLedger empties l, as a fresh engine's ledger is: nothing
+// accounted for but 0.
+func resetWatermarkLedger(l *watermarkLedger) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.through, l.above, l.lost, l.highest = 0, nil, false, 0
 }
 
 // parkRebuildLoop claims the engine's single rebuild-loop gate
@@ -78,8 +86,8 @@ func wantTrusted(t *testing.T, ctx context.Context, eng *Engine, want bool, why 
 
 // TestWatermarkTwoWritesConverge is the sequential case: two writes bump
 // the pg counter to N and N+1 in turn; after both have been applied,
-// appliedWatermark must equal the pg counter exactly, and watermarkConverged
-// must report true.
+// appliedWatermark must account for every value up to the pg counter, and
+// watermarkConverged must report true.
 //
 // Each "write" here is exactly the sequence write_observer.go's ensureBumped
 // and driver.go's own call sites perform against the real engine primitives
@@ -113,9 +121,7 @@ func TestWatermarkTwoWritesConverge(t *testing.T) {
 		eng.Apply(ctx, scope)
 	}
 
-	if got := eng.appliedWatermark.Load(); got != lastCounter {
-		t.Fatalf("appliedWatermark = %d after two writes, want %d", got, lastCounter)
-	}
+	wantLedger(t, &eng.appliedWatermark, lastCounter, true, "two sequential writes resolved")
 
 	pgCounter, err := eng.ReadWatermark(ctx)
 	if err != nil {
@@ -215,9 +221,9 @@ func nodeCount(ctx context.Context, d interface {
 
 // TestWatermarkConcurrentBumpsConverge is the concurrent case: 10
 // goroutines each performing 10 bump+apply cycles concurrently must still
-// converge once every goroutine finishes -- the monotonic max-advance
-// (AdvanceWatermark) and the inflight counter together are what make
-// out-of-order completion safe (see their own docs).
+// converge once every goroutine finishes -- the ledger (AdvanceWatermark)
+// and the inflight counter together are what make out-of-order completion
+// safe (see their own docs).
 func TestWatermarkConcurrentBumpsConverge(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()

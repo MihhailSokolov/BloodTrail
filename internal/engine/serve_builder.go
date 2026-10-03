@@ -114,7 +114,11 @@ func (e *Engine) servedOp(ctx context.Context, op string, start time.Time, extra
 // siblings below. It reports cfg.Enabled (reasonDisabled), a non-nil current
 // View (reasonNoSnapshot), and the engine being in stateServing rather than
 // fallback (reasonFallback) -- exactly the same three reasons, in the same
-// order, as servePathQuery's own step 1, via the same serveState helper.
+// order, as servePathQuery's own step 1, via the same serveState helper --
+// and then a View loaded from a database holding nodes in more than one graph
+// (reasonMultiGraph): dawgs' PostgreSQL reads are not scoped by graph, so
+// every count or listing there spans all of them while the replica holds only
+// the default graph, and serving from it would answer short.
 //
 // No freshness check follows it in any caller, and none is needed: with
 // write-through (apply.go), the View this returns already reflects every
@@ -144,6 +148,10 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 		e.declineOp(ctx, op, reasonFallback, nil)
 		return nil, false
 	}
+	if snap.MultiGraph() {
+		e.declineOp(ctx, op, reasonMultiGraph, nil)
+		return nil, false
+	}
 
 	return snap, true
 }
@@ -151,7 +159,9 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 // resolveNodeSpec runs the shared gate (serveGate) and matching-set
 // computation behind TryNodeCount, TryNodeFetchIDs, and TryNodeFetchKinds:
 //
-//  1. serveGate: cfg.Enabled, then a non-nil snapshot.
+//  1. serveGate: cfg.Enabled, a non-nil snapshot, stateServing, and a
+//     single-graph snapshot (reasonDisabled, reasonNoSnapshot,
+//     reasonFallback, reasonMultiGraph otherwise).
 //  2. spec.Constraints non-empty (reasonNoKindConstraint otherwise).
 //  3. Every constraint's kinds mapped to a KindID via e.mapKind
 //     (reasonError on the first failure -- consistent with the path engine's
@@ -318,6 +328,15 @@ func unionBitmaps(n int, bitmaps []*snapshot.Bitset) *snapshot.Bitset {
 // bits is already O(words), via Bitset.Count, so there is nothing to stream.
 func (e *Engine) TryNodeCount(ctx context.Context, spec recognize.NodeSpec) (int64, bool) {
 	start := time.Now()
+
+	// The count is computed inline and never consults the request's
+	// context, so a request whose context is already done declines here:
+	// PostgreSQL answers it with the context's error, which is what the
+	// wrapper's fallback then returns.
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opNodeCount, reasonError, err)
+		return 0, false
+	}
 
 	matches, _, ok := e.resolveNodeSpec(ctx, opNodeCount, spec)
 	if !ok {
@@ -550,8 +569,8 @@ type relPlan struct {
 // resolveRelSpec runs the shared gate and per-query setup behind every
 // TryRel* entry point:
 //
-//  1. serveGate: cfg.Enabled, then a non-nil snapshot (same as
-//     resolveNodeSpec's step 1).
+//  1. serveGate: cfg.Enabled, a non-nil snapshot, stateServing, and a
+//     single-graph snapshot (same as resolveNodeSpec's step 1).
 //  2. spec.EdgeKinds mapped to a snapshot.KindMask via buildKindMaskSeam;
 //     spec.StartConstraints and spec.EndConstraints each mapped to a bitmap
 //     via resolveConstraintBitmaps (shared with resolveNodeSpec). Any
@@ -847,11 +866,13 @@ func (it *relScanIter) advanceNear() bool {
 		}
 
 		if !it.snap.Overlay() {
+			// The row pointer past node's own is read at int(node)+1: node is a
+			// uint32, whose +1 would wrap at its top value.
 			var lo, hi uint64
 			if it.forward {
-				lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[node+1]
+				lo, hi = it.snap.Base().OutOffsets[node], it.snap.Base().OutOffsets[int(node)+1]
 			} else {
-				lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[node+1]
+				lo, hi = it.snap.Base().InOffsets[node], it.snap.Base().InOffsets[int(node)+1]
 			}
 			if lo == hi {
 				continue
@@ -930,19 +951,32 @@ func drainRelIter(it relIterator) []relEdge {
 	}
 }
 
-// selectKindIDs returns every KindID in [1, maxKindID] for which allow
-// reports true, in ascending order -- a candidate list bounded by the
-// schema's own (typically small) total kind count, never by how much data
-// carries any given kind. TryRelFetchKinds passes kindMask.Has, resolving
-// names only for the kinds spec.EdgeKinds actually allows; TryRelQueryRows'
-// step projections pass an always-true predicate, since a far node's
-// carried kinds are never filtered by spec.EdgeKinds (that mask constrains
-// only the traversed relationship's own kind). Either way, resolving the
-// whole allowed set eagerly, once, up front costs one bounded batch resolve
-// call regardless of how many rows the scan itself goes on to produce --
-// see TryRelFetchKinds' doc for why this is preferred over collecting the
-// distinct kinds actually encountered mid-scan, which would need a second
-// pass over the same data.
+// selectKindIDs returns every KindID in [1, snap.MaxKindID()] that snap's kind
+// table names and for which allow reports true, in ascending order -- a
+// candidate list bounded by the schema's own (typically small) total kind
+// count, never by how much data carries any given kind. TryRelFetchKinds
+// passes kindMask.Has, resolving names only for the kinds spec.EdgeKinds
+// actually allows; TryRelQueryRows' step projections pass an always-true
+// predicate, since a far node's carried kinds are never filtered by
+// spec.EdgeKinds (that mask constrains only the traversed relationship's own
+// kind). Either way, resolving the whole allowed set eagerly, once, up front
+// costs one bounded batch resolve call regardless of how many rows the scan
+// itself goes on to produce -- see TryRelFetchKinds' doc for why this is
+// preferred over collecting the distinct kinds actually encountered
+// mid-scan, which would need a second pass over the same data.
+//
+// Only ids the kind table holds are selected. The database's kind ids are not
+// contiguous: insert_or_get_kind's ON CONFLICT DO NOTHING draws a sequence
+// value for a kind that already exists, and a rolled-back insert burns one
+// too, so an id inside the range may name no kind at all. dawgs' MapKindIDs
+// fails on such an id -- after refetching the whole kind table under its
+// lock -- which made every call decline. No node or edge carries an unnamed
+// id, since the table is loaded whole (LoadSnapshot) and the applier
+// registers every kind a write introduces (buildApplySegment); MaxKindID is
+// itself always a carried or registered id. So the one inconsistency this
+// can cheaply catch, a kind table that does not name MaxKindID -- one older
+// than the rows it describes -- fails the call rather than serving kinds
+// with no name, as resolving every id in the range used to.
 //
 // The range starts at 1, not 0: dawgs' pg.SchemaManager/InMemoryKindMapper
 // both hand out KindIDs starting at 1 (nextKindID: int16(1)) and never
@@ -950,17 +984,40 @@ func drainRelIter(it relIterator) []relEdge {
 // InKinds/NodeKinds either. A snapshot.KindMask's SetAll (buildKindMaskSeam,
 // for an empty spec.EdgeKinds) sets bit 0 anyway -- it is a plain 0-based bit
 // vector with no notion of which indices are real KindIDs -- so this
-// function, not kindMask.Has, is what keeps kind id 0 out of the batch and
-// out of a real e.mapKindNames call, which would otherwise fail resolving an
-// id no KindMapper ever assigned.
-func selectKindIDs(maxKindID snapshot.KindID, allow func(snapshot.KindID) bool) []snapshot.KindID {
-	var ids []snapshot.KindID
-	for k := snapshot.KindID(1); k <= maxKindID; k++ {
-		if allow(k) {
-			ids = append(ids, k)
+// function, not kindMask.Has, is what keeps kind id 0 out of the batch.
+func selectKindIDs(snap *snapshot.View, allow func(snapshot.KindID) bool) ([]snapshot.KindID, error) {
+	kinds := snap.Kinds()
+	maxKindID := snap.MaxKindID()
+	if maxKindID > 0 {
+		if _, named := kinds.Name(maxKindID); !named {
+			return nil, fmt.Errorf("engine: selectKindIDs: kind id %d, the highest the snapshot carries, is missing from its kind table", maxKindID)
 		}
 	}
-	return ids
+
+	// The counter is an int, not a KindID: snapshot.KindID is an int16, and
+	// kind.id is a smallserial, so the last id the database can issue is
+	// 32767, where a KindID counter's k++ wraps to -32768, `k <= maxKindID`
+	// stays true, and the loop never ends (appending the named ids again on
+	// every lap until the process runs out of memory).
+	var ids []snapshot.KindID
+	for k := 1; k <= int(maxKindID); k++ {
+		id := snapshot.KindID(k)
+		if _, named := kinds.Name(id); named && allow(id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// resolveSelectedKindNames resolves the names of the kinds selectKindIDs
+// selects from snap, with the same up-front, all-or-nothing contract as
+// resolveKindNameMap: TryRelFetchKinds' and TryRelQueryRows' shared step.
+func (e *Engine) resolveSelectedKindNames(ctx context.Context, snap *snapshot.View, allow func(snapshot.KindID) bool) (map[snapshot.KindID]graph.Kind, error) {
+	ids, err := selectKindIDs(snap, allow)
+	if err != nil {
+		return nil, err
+	}
+	return resolveKindNameMap(ctx, ids, e.mapKindNames)
 }
 
 // TryRelCount attempts to serve spec's matching relationship count entirely
@@ -977,6 +1034,12 @@ func selectKindIDs(maxKindID snapshot.KindID, allow func(snapshot.KindID) bool) 
 // nothing to stream, only a running total.
 func (e *Engine) TryRelCount(ctx context.Context, spec recognize.RelSpec) (int64, bool) {
 	start := time.Now()
+
+	// As TryNodeCount: the scan runs inline, so a done request declines.
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opRelCount, reasonError, err)
+		return 0, false
+	}
 
 	plan, ok := e.resolveRelSpec(ctx, opRelCount, spec)
 	if !ok {
@@ -1080,15 +1143,15 @@ func (e *Engine) TryRelFetchTriples(ctx context.Context, spec recognize.RelSpec)
 // resolve the KindIDs spec.EdgeKinds' mask allows back to their graph.Kind
 // names declines reasonError.
 //
-// Every KindID plan.kindMask allows (selectKindIDs(plan.snap.MaxKindID,
-// plan.kindMask.Has)) is resolved to its graph.Kind name via one batched
-// e.mapKindNames call, made eagerly before the cursor is even constructed --
-// not lazily as it streams, and not by collecting the distinct kinds
-// actually encountered mid-scan either, which would need a second full pass
-// over the same edges (selectKindIDs' doc). This keeps the same guarantee
-// TryNodeFetchKinds already has: a caller that gets (cursor, true) back is
-// holding a fully-determined, already error-free answer, with no possibility
-// of a resolution failure surfacing mid-stream.
+// Every KindID plan.kindMask allows that the kind table names
+// (selectKindIDs(plan.snap, plan.kindMask.Has)) is resolved to its
+// graph.Kind name via one batched e.mapKindNames call, made eagerly before
+// the cursor is even constructed -- not lazily as it streams, and not by
+// collecting the distinct kinds actually encountered mid-scan either, which
+// would need a second full pass over the same edges (selectKindIDs' doc).
+// This keeps the same guarantee TryNodeFetchKinds already has: a caller that
+// gets (cursor, true) back is holding a fully-determined, already error-free
+// answer, with no possibility of a resolution failure surfacing mid-stream.
 func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.RelationshipKindsResult], bool) {
 	start := time.Now()
 
@@ -1097,7 +1160,7 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 		return nil, false
 	}
 
-	kindNames, err := resolveKindNameMap(ctx, selectKindIDs(plan.snap.MaxKindID(), plan.kindMask.Has), e.mapKindNames)
+	kindNames, err := e.resolveSelectedKindNames(ctx, plan.snap, plan.kindMask.Has)
 	if err != nil {
 		e.declineOp(ctx, opRelKinds, reasonError, err)
 		return nil, false
@@ -1174,10 +1237,10 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 // here, before rowResult is ever constructed, rather than surfacing from
 // inside a Values() call with no clean way to report it (rowResult.Error()
 // always returns nil; see its own doc). Unlike TryRelFetchKinds, every
-// KindID 1..snap.MaxKindID is resolved regardless of plan.kindMask, since a
-// far node's own carried kinds are never filtered by spec.EdgeKinds; for
-// ProjectionStartEnd, no kind names are needed at all (the row is a bare id
-// pair), so this resolution is skipped entirely.
+// KindID the kind table names up to snap.MaxKindID() is resolved regardless
+// of plan.kindMask, since a far node's own carried kinds are never filtered
+// by spec.EdgeKinds; for ProjectionStartEnd, no kind names are needed at all
+// (the row is a bare id pair), so this resolution is skipped entirely.
 func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, proj recognize.RowProjection, orderByEdgeID bool) (graph.Result, bool) {
 	start := time.Now()
 
@@ -1206,7 +1269,7 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 
 	var kindNames map[snapshot.KindID]graph.Kind
 	if proj != recognize.ProjectionStartEnd {
-		resolved, err := resolveKindNameMap(ctx, selectKindIDs(plan.snap.MaxKindID(), func(snapshot.KindID) bool { return true }), e.mapKindNames)
+		resolved, err := e.resolveSelectedKindNames(ctx, plan.snap, func(snapshot.KindID) bool { return true })
 		if err != nil {
 			e.declineOp(ctx, opRelRows, reasonError, err)
 			return nil, false

@@ -1,9 +1,9 @@
 # Building the BloodTrail image
 
-`build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform …]` builds
+`build/build-image.sh <upstream-tag> [driver-version] [--push] [--platform …] [--dawgs-only]` builds
 BloodHound CE at the given upstream release tag with the BloodTrail driver compiled in.
 
-The only source change to BloodHound is `patches/bloodhound-driver.patch`, which touches
+The only change to BloodHound's own source is `patches/bloodhound-driver.patch`, which touches
 two files: `cmd/api/src/bootstrap/util.go` registers the driver name, and
 `cmd/api/src/migrations/manifest.go` makes the one PostgreSQL-only graph migration
 (`Version_852_Migration`) recognise BloodTrail. Upstream detects PostgreSQL with
@@ -11,6 +11,26 @@ two files: `cmd/api/src/bootstrap/util.go` registers the driver name, and
 embeds one) does not satisfy, so without that hunk the migration is skipped and still
 recorded as done. `go.mod` is edited by the script with `go mod edit`, so upstream
 dependency bumps never conflict with the patch.
+
+That edit is not free of side effects on the dependencies. `go mod tidy` resolves upstream's
+module graph together with the driver's, and minimum version selection takes the higher
+`github.com/specterops/dawgs` of the two, so a release that pins an older dawgs than the driver
+was built against ships a newer one than its own tests ever ran with: v9.6.0 pins v0.7.0 and its
+image carries v0.8.0 (the driver's engine does not compile against v0.7.0). The script therefore
+prints the version upstream pins and the one the image resolves, and fails the build when they
+differ unless that exact pair is listed, with the reason, in `dawgs_shift_reason` in
+`build-image.sh` (v9.6.0: v0.7.0 to v0.8.0 is the only entry). It also fails for a resolved
+version that is neither the one `go.mod` names nor in `dawgs_tested_versions`, the versions the
+unit and integration suites are run against (v0.8.0 and v0.8.1 today). The release and weekly
+image workflows run this script for every supported release and run no suite themselves, so a
+new upstream release that pins a dawgs nobody has tried (a v9.8.0 pinning v0.9.0, say) would
+otherwise publish an image before any suite ran on it, which is how v9.7.1's image came to ship
+v0.8.1 while `go.mod` said v0.8.0. Such a build now fails, and so does `ci.yml`'s `dawgs` job
+(`build/dawgs-suites.sh`, which resolves every supported release the same way), until the version
+is listed; that same job then runs the suites against it, as it already does against v0.8.1, and
+the change should merge only if they pass. `--dawgs-only` stops after these checks and prints the
+resolved version. `build/test-build-image.sh` tests both scripts against stand-ins for git, go and
+docker.
 
 Vendoring copies the driver's root Go files plus `internal/engine` -- the in-memory path
 engine -- into `packages/go/bloodtrail`, which the upstream Dockerfile's builder stage already
@@ -90,11 +110,22 @@ run against that same fixture, still installed, before rollback:
    fourteen Cypher queries (every value type, multi-kind and stub nodes, variable-length
    paths, `shortestPath`, both `allShortestPaths` answers, a hybrid AD-to-OpenGraph path,
    counts) and three pathfinding calls with `only_traversable=true`. Last, clear sourceless
-   data, then the source kind (`POST /api/v2/clear-database`). Every expected value is
-   what stock BloodHound v9.6.0 on PostgreSQL returns; every answer must carry its
-   `cypher engine served` or `path engine served` marker, and the phase must log no
-   `snapshot rebuilt` and no `fallback entered`. `CHECK_SERVED=0` runs the same
-   expectations against a BloodHound on the PostgreSQL driver.
+   data, then the source kind (`POST /api/v2/clear-database`). The expected answers are
+   derived from the fixtures and pinned in the script, not read back from the engine under
+   test while it runs, and a graph answer is compared by content: the sorted objectIds of
+   its nodes and the sorted (source objectId, target objectId, kind) triples of its edges,
+   not their number. Their sizes are what stock BloodHound v9.6.0 on PostgreSQL returns,
+   with one exception: the whole-graph count after the sourceless delete is a pinned 131,
+   and that number came from BloodTrail's own answer in the CI e2e run on `main` before
+   it was pinned (run 36621234497), not from stock PostgreSQL. It agrees with the
+   118 nodes that BloodHound v9.6.0's ingest and analysis of the SharpHound fixture leave
+   before the OpenGraph phase, plus the 13 that `graph.json` adds, but that is a
+   cross-check, not a measurement on stock PostgreSQL. It is specific to v9.6.0's ingest
+   and analysis and must be re-derived when the BloodHound version the e2e validates
+   changes. Every answer must carry its `cypher engine served` or `path engine served`
+   marker, and the phase must log no `snapshot rebuilt` and no `fallback entered`.
+   `CHECK_SERVED=0` runs the same expectations against a BloodHound on the PostgreSQL
+   driver.
 6. **Snapshot-file restart.** Enable `BLOODTRAIL_SNAPSHOT_DIR` with a bind-mounted host
    directory (so the file survives the container recreate the config change itself causes),
    then `docker compose restart` the same container -- no further config change, so the
@@ -112,13 +143,16 @@ run against that same fixture, still installed, before rollback:
      counter ahead of the file's, or `the engine entered fallback while the file was
      loading` for a fallback-shaped write), followed by a successful rebuild. Rare but
      correct -- the watermark protocol is refusing a file it cannot prove complete. See
-     the snapshot-file section of the top-level [README](../README.md#write-through).
+     the snapshot-file section of the top-level
+     [README](../README.md#fast-restarts-the-snapshot-directory).
 
    Either way the boot must have read the file this phase's own shutdown wrote (compared by
    stamped watermark), and a rejection for a corrupt or wrong-version file, a changed
-   watermark lineage, rows inserted behind the watermark, a failed watermark read, the
+   watermark lineage, rows inserted behind the watermark, a counter behind the file's
+   stamp, a buffered boot write that contradicts the file, a failed watermark read, the
    memory limit, or no file attempt at all still fails. One more
-   `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths.
+   `GET /api/v2/graphs/shortest-path` confirms the engine answers correctly on both paths,
+   and that the path engine served it (a new `path engine served` line), not PostgreSQL.
 
 Requires the same tools as `build-image.sh`, plus `docker compose`, `curl` and `jq`. Like a
 local `build-image.sh`, it builds for the Docker daemon's own platform, so the stack runs
@@ -139,8 +173,8 @@ regardless.
 | `snapshot rebuilt` | Info | A full PostgreSQL rebuild ran and was adopted -- `trigger` names why: `startup` (the one-shot boot load), `fallback` (recovery from the line above), or `manual`. |
 | `snapshot file written` | Info | The current replica was folded and written to `BLOODTRAIL_SNAPSHOT_DIR` -- by a clean shutdown, or by a background compaction once it had adopted its result. |
 | `snapshot file loaded` | Info | Boot trusted and loaded that file instead of rebuilding from PostgreSQL, after replaying `replayed_writes` boot-time writes onto it (0 on a quiet restart). |
-| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. The causes sharing this marker -- unreadable/corrupt/wrong-version/structurally invalid, a failed PostgreSQL watermark read, a changed watermark lineage, rows inserted behind the watermark, an over-`BLOODTRAIL_MEMORY_LIMIT` size, a watermark gap the boot's own buffered writes could not cover, a fallback-shaped boot-time write, a poisoned or overflowed boot-write buffer, and a replay failure -- are distinguished by a `reason` attribute on all but the first, which carries `error` instead. The gap, fallback and overflow shapes are the legitimate outcome of boot-time writes the replay cannot account for (or, for an overflow, cannot hold within its caps), not a fault: the file cannot be proven complete and the rebuild that follows is correct. So is `watermark lineage changed since the file was written` (with `file_lineage` and `pg_lineage`) on the first boot after `bloodtrail install`, or against a different or reset database: something that does not advance the counter may have written the graph since the file was saved (see the watermark lineage in the top-level [README](../README.md#write-through)). A version mismatch on the first boot after upgrading from a release whose files predate lineages is expected too. `rows were inserted since the file was written by a writer that did not advance the watermark` (with `file_node_id_seq`/`start_node_id_seq` and their edge counterparts: where the sequences stood when the file was saved, and when this boot started) is the same finding for a file whose lineage still matched: an id sequence moved while the counter did not, so something outside BloodTrail -- the stock image, `psql` -- inserted rows after the file was saved. |
-| `snapshot file invalidated` | Info | A write reached PostgreSQL without advancing the watermark counter (see `watermark bump failed` above), so the saved file was deleted: its stamp still matches what PostgreSQL reads, which would let a later boot declare a zero-sized gap and adopt a replica that is missing that write. Costs one slow boot (a full PostgreSQL rebuild) and nothing else. A save that was already writing its file when the bump failed deletes that file itself once it lands (`snapshot file not written`, Warn, reason `a watermark bump failed while the file was being written`). `snapshot file invalidation failed` (Warn) means the delete itself failed and a later boot may still adopt that file; `snapshot file not invalidated` (Warn) means there was no path to delete yet. |
+| `snapshot file rejected` | Info | Boot found a file but declined to trust it; it fell back to a rebuild instead. The causes sharing this marker -- unreadable/corrupt/wrong-version/structurally invalid, a failed PostgreSQL watermark read, a changed watermark lineage, rows inserted behind the watermark, a counter that was behind the file's stamp at start (`the watermark counter was behind the file's stamp when this process started`: PostgreSQL went back, as a restored backup does), a buffered boot write whose counter contradicts the file (`boot write buffer contradicts the file: …`), an over-`BLOODTRAIL_MEMORY_LIMIT` size, a watermark gap the boot's own buffered writes could not cover, a fallback-shaped boot-time write, a poisoned or overflowed boot-write buffer, and a replay failure -- are distinguished by a `reason` attribute on all but the first, which carries `error` instead. The gap, fallback and overflow shapes are the legitimate outcome of boot-time writes the replay cannot account for (or, for an overflow, cannot hold within its caps), not a fault: the file cannot be proven complete and the rebuild that follows is correct. So is `watermark lineage changed since the file was written` (with `file_lineage` and `pg_lineage`) on the first boot after `bloodtrail install`, or against a different or reset database: something that does not advance the counter may have written the graph since the file was saved (see the watermark lineage in the top-level [README](../README.md#fast-restarts-the-snapshot-directory)). A version mismatch on the first boot after an upgrade that changes the file's format is expected too. `rows were inserted since the file was written by a writer that did not advance the watermark` (with `file_node_id_seq`/`start_node_id_seq` and their edge counterparts: where the sequences stood when the file was saved, and when this boot started) is the same finding for a file whose lineage still matched: an id sequence moved while the counter did not, so something outside BloodTrail -- the stock image, `psql` -- inserted rows after the file was saved. |
+| `snapshot file invalidated` | Info | A write reached PostgreSQL without advancing the watermark counter (see `watermark bump failed` above), so the saved file was deleted: its stamp still matches what PostgreSQL reads, which would let a later boot declare a zero-sized gap and adopt a replica that is missing that write. Costs one slow boot (a full PostgreSQL rebuild) and nothing else. Also logged, with reason `booting from it panicked`, when the boot's attempt to start from the file panicked (`snapshot file boot panicked`, Error, with the stack) and the boot fell through to a rebuild. A save that was already writing its file when the bump failed deletes that file itself once it lands (`snapshot file not written`, Warn, reason `a watermark bump failed while the file was being written`). `snapshot file invalidation failed` (Warn) means the delete itself, or the directory sync that makes it durable, failed and a later boot may still adopt that file; `snapshot file not invalidated` (Warn) means there was no path to delete yet. |
 | `no snapshot file` | Debug | Boot found `BLOODTRAIL_SNAPSHOT_DIR` set but no file there yet (the ordinary first-ever boot against a given directory). The feature being disabled outright (`BLOODTRAIL_SNAPSHOT_DIR` unset) logs nothing here at all -- boot returns from the check before it would ever log. |
 | `compaction finished` | Info | A background compaction folded the write-through delta back into the base snapshot. |
 | `path engine served` / `builder engine served` / `cypher engine served` | Info / Debug / Debug | The in-memory engine, not PostgreSQL, answered a shortest-path, structural (node/relationship), or Cypher query respectively. |
@@ -169,3 +203,15 @@ to publish the CLI until each of those exact tags is anonymously pullable. In or
 5. On a clean host with a BloodHound CE deployment, run the documented one-liner
    (`curl -fsSL …/install.sh | sh -s -- install`) end to end, including
    `bloodtrail rollback`.
+
+## Merge gate
+
+`ci.yml` ends in a `ci-ok` job and `e2e.yml` in an `e2e-ok` job. Each runs whatever the jobs
+before it did and fails unless every job it needs succeeded, skipped and cancelled included.
+Those two names are the status checks the default branch's ruleset should require: a ruleset
+counts a skipped required job as passing, and a job is skipped when something it needs failed,
+so requiring the underlying jobs by name would let a broken upstream list through. Pair them
+with an up-to-date-branch requirement (or a merge queue; both workflows run on `merge_group`
+too), and let the ruleset's bypass apply to pull requests only, so that merging past a red
+check is a deliberate act on the pull request and a direct push to the branch is refused.
+A job added to either workflow belongs in that workflow's gate `needs`.

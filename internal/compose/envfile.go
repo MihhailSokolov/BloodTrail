@@ -4,6 +4,7 @@ package compose
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -56,7 +57,21 @@ func (e composeFileEntry) render(files []string) string {
 // the readers install goes by (strictComposeFile), since rollback has to
 // undo what earlier installs left in exactly those shapes.
 func findComposeFile(lines []string) (*composeFileEntry, error) {
-	var found *composeFileEntry
+	entries, err := findComposeFileEntries(lines)
+	if err != nil || len(entries) == 0 {
+		return nil, err
+	}
+	if len(entries) > 1 {
+		return nil, fmt.Errorf(".env sets %s more than once (lines %d and %d); keep one", composeFileKey, entries[0].index+1, entries[1].index+1)
+	}
+	return &entries[0], nil
+}
+
+// findComposeFileEntries is findComposeFile for every line that sets
+// COMPOSE_FILE, in order: none, one, or the several that compose reads the
+// last of.
+func findComposeFileEntries(lines []string) ([]composeFileEntry, error) {
+	var found []composeFileEntry
 	var open byte // the quote of another key's value left open by an earlier line
 	for i, raw := range lines {
 		line := strings.TrimRight(raw, "\r")
@@ -92,16 +107,13 @@ func findComposeFile(lines []string) (*composeFileEntry, error) {
 		if !hasValue {
 			return nil, fmt.Errorf(".env line %d names %s without a value", i+1, composeFileKey)
 		}
-		if found != nil {
-			return nil, fmt.Errorf(".env sets %s more than once (lines %d and %d); keep one", composeFileKey, found.index+1, i+1)
-		}
 		entry, err := parseComposeFileValue(line[:len(line)-len(value)], value)
 		if err != nil {
 			return nil, fmt.Errorf(".env line %d: %w", i+1, err)
 		}
 		entry.index = i
 		entry.suffix += cr
-		found = &entry
+		found = append(found, entry)
 	}
 	return found, nil
 }
@@ -278,19 +290,112 @@ func ComposeFiles(env string) ([]string, error) {
 // behind: rollback, status, verify. The names come back as written, empty
 // ones included, even where compose itself could not load the list; only an
 // entry that cannot be read with certainty is an error, and nil still means
-// there is no line.
+// there is no line. Where several lines set COMPOSE_FILE, which v0.1.0 and
+// v0.1.1 left beside an entry they did not recognise, it is the last that
+// counts, as for compose.
 func ListedComposeFiles(env string) ([]string, error) {
-	entry, err := findComposeFile(parseEnvFile(env).lines)
-	if err != nil || entry == nil {
+	entries, err := findComposeFileEntries(parseEnvFile(env).lines)
+	if err != nil || len(entries) == 0 {
 		return nil, err
 	}
-	return entry.files, nil
+	return entries[len(entries)-1].files, nil
 }
 
-// AddComposeFile ensures the .env contents make docker compose load the
+// EntryLine is one line of an .env that sets COMPOSE_FILE.
+type EntryLine struct {
+	Line  int      // its number, counting from 1
+	Files []string // the list as written, split on ":", empty names included
+}
+
+// ComposeFileLines returns every line of the .env contents that sets
+// COMPOSE_FILE, in order: none, one, or the several that v0.1.0 and v0.1.1
+// left when they appended their own beside an entry they did not recognise.
+// Only an entry that cannot be read with certainty is an error (see
+// ListedComposeFiles); several lines are not.
+func ComposeFileLines(env string) ([]EntryLine, error) {
+	entries, err := findComposeFileEntries(parseEnvFile(env).lines)
+	if err != nil {
+		return nil, err
+	}
+	var out []EntryLine
+	for _, e := range entries {
+		out = append(out, EntryLine{Line: e.index + 1, Files: e.files})
+	}
+	return out, nil
+}
+
+// RemoveComposeFileLineAt drops the line numbered line, which has to be one
+// of those ComposeFileLines returns, together with its line break, and leaves
+// every other byte as it was.
+func RemoveComposeFileLineAt(env string, line int) (string, error) {
+	f := parseEnvFile(env)
+	entries, err := findComposeFileEntries(f.lines)
+	if err != nil {
+		return env, err
+	}
+	for _, e := range entries {
+		if e.index == line-1 {
+			return f.removeLine(e.index).String(), nil
+		}
+	}
+	return env, fmt.Errorf(".env line %d does not set %s", line, composeFileKey)
+}
+
+// OverrideEntry is the installer's override file as COMPOSE_FILE can name it.
+//
+// Compose resolves a relative name in COMPOSE_FILE against the directory it is
+// run from -- not the project directory, not even with --project-directory --
+// so a relative entry works exactly where the operator's own commands are run
+// from (where the .env is), and an absolute one works from anywhere.
+type OverrideEntry struct {
+	// Name is the file relative to the project directory (OverrideFileName):
+	// how a new entry names it, and a list that has a relative name in it, since
+	// that list is already tied to the directory compose is run from and a
+	// relative name moves with the project.
+	Name string
+	// Path is the file's absolute path, for a list in which every name is
+	// absolute: the operator wrote it to work from any directory, and a
+	// relative name added to it would break exactly that. Empty when the
+	// absolute path is not known, which is the same as never wanting it.
+	Path string
+	// Dir is the directory relative names in the entry are resolved against
+	// (the project directory, for an .env compose reads from there). With it
+	// and Path, a name that means the same file is the override however it is
+	// spelled -- ./docker-compose.bloodtrail.yml, say. Empty: only the two
+	// spellings above are.
+	Dir string
+}
+
+// Is reports whether file, as written in an entry, names the override.
+func (o OverrideEntry) Is(file string) bool {
+	if file == o.Name || (o.Path != "" && file == o.Path) {
+		return true
+	}
+	if o.Path == "" || o.Dir == "" || file == "" {
+		return false
+	}
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(o.Dir, file)
+	}
+	return filepath.Clean(file) == filepath.Clean(o.Path)
+}
+
+func (o OverrideEntry) listedIn(files []string) bool {
+	for _, file := range files {
+		if o.Is(file) {
+			return true
+		}
+	}
+	return false
+}
+
+// AddOverrideEntry ensures the .env contents make docker compose load the
 // override after the files the project is already made of, so a plain
 // `docker compose up -d` keeps it. An existing entry is extended in place,
-// keeping its spelling.
+// keeping its spelling -- including how it names files: the override goes
+// in by its absolute path (o.Path) when every name already there is absolute,
+// and by o.Name otherwise. An entry that already lists the override, however
+// it spells it (OverrideEntry.Is), is left alone.
 //
 // baseFiles is that existing project, in merge order, and is used only when
 // there is no COMPOSE_FILE entry yet: writing one turns off compose's own
@@ -298,47 +403,79 @@ func ListedComposeFiles(env string) ([]string, error) {
 // discovery would have found -- the base file AND the override compose loads
 // beside it (DefaultOverrideFileNames). Naming only the base file would
 // silently drop the operator's docker-compose.override.yml from their own
-// commands, permanently and invisibly.
-func AddComposeFile(env string, baseFiles []string, overrideFile string) (string, error) {
+// commands, permanently and invisibly. The names of a new entry are the ones
+// baseFiles has, followed by o.Name.
+func AddOverrideEntry(env string, baseFiles []string, o OverrideEntry) (string, error) {
 	f := parseEnvFile(env)
 	entry, err := strictComposeFile(f.lines)
 	if err != nil {
 		return "", err
 	}
 	if entry == nil {
-		return f.appendLine(composeFileKey + "=" + strings.Join(append(append([]string(nil), baseFiles...), overrideFile), ":")).String(), nil
+		return f.appendLine(composeFileKey + "=" + strings.Join(append(append([]string(nil), baseFiles...), o.Name), ":")).String(), nil
 	}
-	for _, file := range entry.files {
-		if file == overrideFile {
-			return env, nil
-		}
+	if o.listedIn(entry.files) {
+		return env, nil
 	}
-	f.lines[entry.index] = entry.render(append(entry.files, overrideFile))
+	name := o.Name
+	if o.Path != "" && allAbsolute(entry.files) {
+		name = o.Path
+	}
+	f.lines[entry.index] = entry.render(append(entry.files, name))
 	return f.String(), nil
 }
 
-// RemoveComposeFile drops the override from COMPOSE_FILE, removing the whole
-// line only if the override was the sole entry. Use RemoveComposeFileLine
-// instead when the install created the entry itself: what has to be restored
-// then is the absence of the line, not a line naming the base file (see
-// AddComposeFile for why a present line is not equivalent to no line). The
-// other names are kept exactly as written, even ones compose cannot load.
-func RemoveComposeFile(env, overrideFile string) (string, error) {
-	return takeOut(env, overrideFile, false)
+// allAbsolute reports whether every one of files is an absolute path.
+func allAbsolute(files []string) bool {
+	for _, file := range files {
+		if !filepath.IsAbs(file) {
+			return false
+		}
+	}
+	return len(files) > 0
 }
 
-// RestoreEmptyComposeFile drops the override from COMPOSE_FILE like
-// RemoveComposeFile, but keeps the line when nothing else is listed, spelled
+// AddComposeFile is AddOverrideEntry for an override that is only ever named
+// overrideFile.
+func AddComposeFile(env string, baseFiles []string, overrideFile string) (string, error) {
+	return AddOverrideEntry(env, baseFiles, OverrideEntry{Name: overrideFile})
+}
+
+// RemoveOverrideEntry drops the override, however the entry names it
+// (OverrideEntry.Is), from COMPOSE_FILE, removing the whole line only if the
+// override was the sole entry. Use RemoveComposeFileLine instead when the install created the entry
+// itself: what has to be restored then is the absence of the line, not a line
+// naming the base file (see AddOverrideEntry for why a present line is not
+// equivalent to no line). The other names are kept exactly as written, even
+// ones compose cannot load.
+func RemoveOverrideEntry(env string, o OverrideEntry) (string, error) {
+	return takeOut(env, o, false)
+}
+
+// RemoveComposeFile is RemoveOverrideEntry for an override that is only ever
+// named overrideFile.
+func RemoveComposeFile(env, overrideFile string) (string, error) {
+	return RemoveOverrideEntry(env, OverrideEntry{Name: overrideFile})
+}
+
+// RestoreEmptyOverrideEntry drops the override from COMPOSE_FILE like
+// RemoveOverrideEntry, but keeps the line when nothing else is listed, spelled
 // as it was. That puts back an entry which was empty before an earlier
 // install took it for none and wrote its override into it -- as
 // `COMPOSE_FILE=docker-compose.bloodtrail.yml` in the operator's own
 // spelling, or, from before entries were parsed at all, as
 // `COMPOSE_FILE=:docker-compose.bloodtrail.yml`.
-func RestoreEmptyComposeFile(env, overrideFile string) (string, error) {
-	return takeOut(env, overrideFile, true)
+func RestoreEmptyOverrideEntry(env string, o OverrideEntry) (string, error) {
+	return takeOut(env, o, true)
 }
 
-func takeOut(env, overrideFile string, keepLine bool) (string, error) {
+// RestoreEmptyComposeFile is RestoreEmptyOverrideEntry for an override that is
+// only ever named overrideFile.
+func RestoreEmptyComposeFile(env, overrideFile string) (string, error) {
+	return RestoreEmptyOverrideEntry(env, OverrideEntry{Name: overrideFile})
+}
+
+func takeOut(env string, o OverrideEntry, keepLine bool) (string, error) {
 	f := parseEnvFile(env)
 	entry, err := findComposeFile(f.lines)
 	if err != nil || entry == nil {
@@ -346,7 +483,7 @@ func takeOut(env, overrideFile string, keepLine bool) (string, error) {
 	}
 	var kept []string
 	for _, file := range entry.files {
-		if file != overrideFile {
+		if !o.Is(file) {
 			kept = append(kept, file)
 		}
 	}

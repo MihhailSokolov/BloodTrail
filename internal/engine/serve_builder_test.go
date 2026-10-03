@@ -6,8 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"reflect"
 	"runtime"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -578,15 +581,12 @@ func TestTryNodeQueriesNilIDsUnconstrained(t *testing.T) {
 // Kind ids used by this file's relationship-spec fixture
 // (buildRelSpecSnapshot): sharing kindUser/kindComputer/kindGroup above for
 // node kinds and adding three edge kinds here, contiguous with them (4, 5,
-// 6) rather than leaving a gap -- a real KindMapper (dawgs' pg.SchemaManager
-// and InMemoryKindMapper alike) hands out ids sequentially from 1 with no
-// gaps, out of one shared space for both node labels and relationship
-// types, and selectKindIDs (serve_builder.go) resolves every id up to
-// snap.MaxKindID for a step projection regardless of which kinds actually
-// appear in this fixture's data -- a gapped, non-sequential choice of
-// constants here would make fakeResolver fail on an id no real KindMapper
-// would ever have left unassigned, which is not the failure mode this
-// file's tests are for.
+// 6), out of one shared id space for both node labels and relationship
+// types, as a real KindMapper hands them out. The contiguity is only this
+// fixture's convenience: a real kind table can have gaps (a burned sequence
+// value), and selectKindIDs (serve_builder.go) resolves only the ids the
+// snapshot's kind table names, which buildRelSpecSnapshot fills in.
+// TestTryRelQueriesResolveOnlyExistingKindIDs covers a gapped table.
 const (
 	kindMemberOf   snapshot.KindID = 4
 	kindAdminTo    snapshot.KindID = 5
@@ -652,6 +652,14 @@ func buildRelSpecSnapshot(t *testing.T) *snapshot.Snapshot {
 	t.Helper()
 
 	b := snapshot.NewBuilder(1)
+	// The kind table names every kind, as a loaded snapshot's does
+	// (LoadSnapshot reads the whole kind table): the listings that resolve
+	// kind names up front resolve exactly the ids this table holds.
+	kindTable := make(map[snapshot.KindID]string, len(relSpecKindNames()))
+	for id, kind := range relSpecKindNames() {
+		kindTable[id] = kind.String()
+	}
+	b.SetKinds(kindTable)
 	nodes := []struct {
 		id    uint64
 		kinds []snapshot.KindID
@@ -1362,5 +1370,351 @@ func TestBuilderServingDeclinesInFallback(t *testing.T) {
 	relEngine.state.Store(stateServing)
 	if _, ok := relEngine.TryRelCount(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("AdminTo")}); !ok {
 		t.Fatalf("TryRelCount after leaving fallback: ok = false, want true")
+	}
+}
+
+// TestTryRelQueriesResolveOnlyExistingKindIDs: the kind table's ids are not
+// contiguous once a sequence value has been burned (insert_or_get_kind's ON
+// CONFLICT DO NOTHING draws one, and so does a rolled-back insert). A
+// relationship kinds listing without a kind filter and a step projection
+// resolve kind names up front, and must ask the resolver only for ids the
+// snapshot's kind table holds: dawgs' MapKindIDs fails, after refetching the
+// whole kind table under its lock, on an id that does not exist, which used
+// to make both shapes decline on every call.
+func TestTryRelQueriesResolveOnlyExistingKindIDs(t *testing.T) {
+	const (
+		gapUser    snapshot.KindID = 1
+		gapAdminTo snapshot.KindID = 4 // ids 2 and 3 were never assigned
+	)
+
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(map[snapshot.KindID]string{gapUser: "User", gapAdminTo: "AdminTo"})
+	for _, id := range []uint64{1, 2} {
+		if err := b.AddNode(id, []snapshot.KindID{gapUser}, nil); err != nil {
+			t.Fatalf("AddNode(%d): %v", id, err)
+		}
+	}
+	b.AddEdge(101, 1, 2, gapAdminTo)
+	snap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if snap.MaxKindID != gapAdminTo {
+		t.Fatalf("snapshot MaxKindID = %d, want %d", snap.MaxKindID, gapAdminTo)
+	}
+
+	e := New(nil, nil, Config{Enabled: true})
+	e.mapKind = fakeKindMapper(map[string]snapshot.KindID{"User": gapUser, "AdminTo": gapAdminTo})
+	var resolved []snapshot.KindID
+	e.mapKindNames = func(_ context.Context, ids []snapshot.KindID) (graph.Kinds, error) {
+		resolved = append(resolved, ids...)
+		names := map[snapshot.KindID]string{gapUser: "User", gapAdminTo: "AdminTo"}
+		kinds := make(graph.Kinds, len(ids))
+		for i, id := range ids {
+			name, ok := names[id]
+			if !ok {
+				return nil, fmt.Errorf("unable to map kind ids: [%d]", id)
+			}
+			kinds[i] = graph.StringKind(name)
+		}
+		return kinds, nil
+	}
+	e.snap.Store(snapshot.NewView(snap))
+	ctx := context.Background()
+
+	cursor, ok := e.TryRelFetchKinds(ctx, recognize.RelSpec{})
+	if !ok {
+		t.Fatalf("TryRelFetchKinds across a kind id gap: ok = false, want true")
+	}
+	rows := drainRelKinds(t, cursor)
+	if len(rows) != 1 || uint64(rows[0].ID) != 101 || rows[0].Kind == nil || rows[0].Kind.String() != "AdminTo" {
+		t.Fatalf("TryRelFetchKinds rows = %+v, want one AdminTo edge 101", rows)
+	}
+
+	result, ok := e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStepOutbound, false)
+	if !ok {
+		t.Fatalf("TryRelQueryRows step projection across a kind id gap: ok = false, want true")
+	}
+	defer result.Close()
+	var (
+		farID    graph.ID
+		farKinds graph.Kinds
+		relID    graph.ID
+		relKind  graph.Kind
+	)
+	if !result.Next() {
+		t.Fatalf("step projection: no row")
+	}
+	if err := result.Scan(&farID, &farKinds, &relID, &relKind); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if farID != 2 || len(farKinds) != 1 || farKinds[0].String() != "User" || relID != 101 || relKind.String() != "AdminTo" {
+		t.Fatalf("step row = (%d, %v, %d, %v), want (2, [User], 101, AdminTo)", farID, farKinds, relID, relKind)
+	}
+
+	// Each call resolved exactly the ids the kind table holds.
+	want := []snapshot.KindID{gapUser, gapAdminTo, gapUser, gapAdminTo}
+	if fmt.Sprint(resolved) != fmt.Sprint(want) {
+		t.Fatalf("resolver was asked for ids %v, want %v", resolved, want)
+	}
+}
+
+// TestTryRelQueriesDeclineWhenKindTableLacksMaxKindID: resolving only the ids
+// the kind table holds relies on the table naming every kind the rows carry.
+// A table that does not even name the highest carried id (one older than the
+// rows it describes) is inconsistent, and the two listings that resolve kind
+// names up front must decline it (reasonError) rather than return kinds with
+// no name -- the way resolving every id in the range used to fail.
+func TestTryRelQueriesDeclineWhenKindTableLacksMaxKindID(t *testing.T) {
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(map[snapshot.KindID]string{1: "User"}) // the edge below carries kind 4
+	for _, id := range []uint64{1, 2} {
+		if err := b.AddNode(id, []snapshot.KindID{1}, nil); err != nil {
+			t.Fatalf("AddNode(%d): %v", id, err)
+		}
+	}
+	b.AddEdge(101, 1, 2, 4)
+	snap, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	e := newRelSpecEngine(t, snap)
+	ctx := context.Background()
+
+	if _, ok := e.TryRelFetchKinds(ctx, recognize.RelSpec{}); ok {
+		t.Fatalf("TryRelFetchKinds: ok = true, want false (kind table does not name the edge's kind)")
+	}
+	if _, ok := e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStepOutbound, false); ok {
+		t.Fatalf("TryRelQueryRows: ok = true, want false (kind table does not name the edge's kind)")
+	}
+	// A bare id pair names no kinds, so it never consults the kind table.
+	if _, ok := e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStartEnd, false); !ok {
+		t.Fatalf("TryRelQueryRows(start/end): ok = false, want true")
+	}
+}
+
+// kindIDTop is the highest kind id there is: kind.id is a smallserial, and
+// snapshot.KindID is an int16, so 32767 is both the last id the database can
+// issue and the value at which a KindID counter's increment wraps.
+const kindIDTop = snapshot.KindID(math.MaxInt16)
+
+// kindIDTopDeadline bounds every call the top-of-range tests make. A correct
+// call returns in microseconds; the bound only turns a loop that never ends
+// into a failure instead of a hung test binary.
+const kindIDTopDeadline = 5 * time.Second
+
+// kindIDTopView builds an overlay View whose kind table names exactly the
+// given ids and whose highest carried kind is kindIDTop: a base snapshot
+// naming every id but the top, and a delta segment that registers the top
+// kind and carries a node of it -- how a live database's highest id reaches
+// the replica. named must be ascending and end with kindIDTop.
+func kindIDTopView(t *testing.T, named []snapshot.KindID) *snapshot.View {
+	t.Helper()
+
+	table := make(map[snapshot.KindID]string, len(named))
+	for _, id := range named {
+		if id != kindIDTop {
+			table[id] = fmt.Sprintf("Kind%d", id)
+		}
+	}
+	b := snapshot.NewBuilder(1)
+	b.SetKinds(table)
+	if err := b.AddNode(1, []snapshot.KindID{named[0]}, []byte(`{}`)); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	base, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	var sb snapshot.SegmentBuilder
+	sb.AddKind(kindIDTop, fmt.Sprintf("Kind%d", kindIDTop))
+	if err := sb.AddNodeState(2, []snapshot.KindID{kindIDTop}, []byte(`{}`)); err != nil {
+		t.Fatalf("AddNodeState: %v", err)
+	}
+	view := snapshot.NewView(base).WithSegment(sb.Build())
+	if got := view.MaxKindID(); got != kindIDTop {
+		t.Fatalf("View.MaxKindID() = %d, want %d", got, kindIDTop)
+	}
+	return view
+}
+
+// kindIDLoopRunaway is what selectKindIDsCapped's callback panics with.
+type kindIDLoopRunaway struct{}
+
+// cappedKindIDSelection is selectKindIDsCapped's outcome: the call's own
+// results, or how it was stopped.
+type cappedKindIDSelection struct {
+	ids     []snapshot.KindID
+	err     error
+	runaway bool // allow was asked about more kinds than the table names
+	timeout bool // the call was still running at the deadline
+}
+
+// selectKindIDsCapped runs selectKindIDs(view, ...) on its own goroutine with
+// an allow callback that panics on the call past namedKinds. A correct loop
+// asks about each named kind once; one that revisits ids (a counter that
+// wrapped past its bound) is stopped on its first repeat, after appending
+// nothing beyond the kinds already named, so this never lets a runaway loop
+// spin or allocate without bound. The deadline covers a loop that never
+// reaches allow at all.
+func selectKindIDsCapped(view *snapshot.View, namedKinds int) cappedKindIDSelection {
+	var (
+		result cappedKindIDSelection
+		calls  atomic.Int64
+	)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		defer func() {
+			if r := recover(); r != nil {
+				if _, isRunaway := r.(kindIDLoopRunaway); !isRunaway {
+					panic(r)
+				}
+				result.runaway = true
+			}
+		}()
+		result.ids, result.err = selectKindIDs(view, func(snapshot.KindID) bool {
+			if calls.Add(1) > int64(namedKinds) {
+				panic(kindIDLoopRunaway{})
+			}
+			return true
+		})
+	}()
+
+	select {
+	case <-finished:
+		return result
+	case <-time.After(kindIDTopDeadline):
+		return cappedKindIDSelection{timeout: true}
+	}
+}
+
+// TestSelectKindIDsTerminatesAtTheTopOfTheKindIDRange: with the highest carried
+// kind at 32767, a `for k := KindID(1); k <= max; k++` counter wraps to
+// -32768 instead of leaving the loop, and selectKindIDs then appends the
+// named ids again on every lap without end -- an out-of-memory kill for the
+// API on a database whose kind ids have run to the top of the smallserial.
+// It must return each named id once, ascending, whether the table names a
+// few ids or all of them.
+func TestSelectKindIDsTerminatesAtTheTopOfTheKindIDRange(t *testing.T) {
+	every := make([]snapshot.KindID, 0, math.MaxInt16)
+	for id := 1; id <= math.MaxInt16; id++ {
+		every = append(every, snapshot.KindID(id))
+	}
+
+	for _, tc := range []struct {
+		name  string
+		named []snapshot.KindID
+	}{
+		{"sparse table", []snapshot.KindID{1, 4, kindIDTop}},
+		{"every id named", every},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := selectKindIDsCapped(kindIDTopView(t, tc.named), len(tc.named))
+			switch {
+			case res.timeout:
+				t.Fatalf("selectKindIDs still running after %v", kindIDTopDeadline)
+			case res.runaway:
+				t.Fatalf("selectKindIDs did not terminate: it asked about a kind again after all %d named kinds, so its counter wrapped past MaxKindID %d", len(tc.named), kindIDTop)
+			case res.err != nil:
+				t.Fatalf("selectKindIDs: %v", res.err)
+			}
+			if !reflect.DeepEqual(res.ids, tc.named) {
+				t.Fatalf("selectKindIDs returned %d ids, want the %d named ones in ascending order (first %v, last %v)", len(res.ids), len(tc.named), res.ids[:min(3, len(res.ids))], res.ids[max(0, len(res.ids)-2):])
+			}
+		})
+	}
+}
+
+// TestTryRelQueriesServeTheHighestKindID drives the two listings that
+// resolve kind names up front, through their public entry points, on a view
+// whose delta carries an edge of kind 32767. Each call is bounded by a
+// deadline, so a kind id loop that never ends fails the test rather than
+// hanging it.
+func TestTryRelQueriesServeTheHighestKindID(t *testing.T) {
+	base := buildRelSpecSnapshot(t)
+	var sb snapshot.SegmentBuilder
+	sb.AddKind(kindIDTop, "Owns")
+	sb.AddEdgeState(301, 1, 3, kindIDTop)
+	view := snapshot.NewView(base).WithSegment(sb.Build())
+	if got := view.MaxKindID(); got != kindIDTop {
+		t.Fatalf("View.MaxKindID() = %d, want %d", got, kindIDTop)
+	}
+
+	byName := relSpecKindByName()
+	byName["Owns"] = kindIDTop
+	names := relSpecKindNames()
+	names[kindIDTop] = graph.StringKind("Owns")
+	e := newOverlayTestEngine(t, view, byName, names)
+	ctx := context.Background()
+
+	// within runs call on its own goroutine, so a loop that never returns
+	// fails the test at the deadline. call records what it saw into locals;
+	// the assertions run here, on the test's goroutine.
+	within := func(what string, call func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			call()
+		}()
+		select {
+		case <-done:
+		case <-time.After(kindIDTopDeadline):
+			t.Fatalf("%s still running after %v: its kind id loop does not end at MaxKindID %d", what, kindIDTopDeadline, kindIDTop)
+		}
+	}
+
+	var (
+		kindRows   []graph.RelationshipKindsResult
+		kindServed bool
+	)
+	within("TryRelFetchKinds", func() {
+		var cursor graph.Cursor[graph.RelationshipKindsResult]
+		if cursor, kindServed = e.TryRelFetchKinds(ctx, recognize.RelSpec{EdgeKinds: edgeKinds("Owns")}); kindServed {
+			defer cursor.Close()
+			for row := range cursor.Chan() {
+				kindRows = append(kindRows, row)
+			}
+		}
+	})
+	if !kindServed {
+		t.Fatalf("TryRelFetchKinds declined at MaxKindID %d", kindIDTop)
+	}
+	if len(kindRows) != 1 || uint64(kindRows[0].ID) != 301 || uint64(kindRows[0].StartID) != 1 || uint64(kindRows[0].EndID) != 3 || kindRows[0].Kind == nil || kindRows[0].Kind.String() != "Owns" {
+		t.Fatalf("TryRelFetchKinds rows = %+v, want the one Owns edge 301 (1 -> 3)", kindRows)
+	}
+
+	var (
+		stepRows   []string
+		stepServed bool
+	)
+	within("TryRelQueryRows", func() {
+		var result graph.Result
+		if result, stepServed = e.TryRelQueryRows(ctx, recognize.RelSpec{StartIDs: []graph.ID{1}}, recognize.ProjectionStepOutbound, true); stepServed {
+			defer result.Close()
+			var (
+				farID    graph.ID
+				farKinds graph.Kinds
+				relID    graph.ID
+				relKind  graph.Kind
+			)
+			for result.Next() {
+				if err := result.Scan(&farID, &farKinds, &relID, &relKind); err != nil {
+					stepRows = append(stepRows, "scan error: "+err.Error())
+					return
+				}
+				stepRows = append(stepRows, fmt.Sprintf("%d/%v/%d/%v", farID, farKinds, relID, relKind))
+			}
+		}
+	})
+	if !stepServed {
+		t.Fatalf("TryRelQueryRows declined at MaxKindID %d", kindIDTop)
+	}
+	want := []string{"5/[Group]/101/MemberOf", "3/[Computer]/103/AdminTo", "4/[Computer]/107/AdminTo", "3/[Computer]/301/Owns"}
+	if !reflect.DeepEqual(stepRows, want) {
+		t.Fatalf("TryRelQueryRows rows = %v, want %v", stepRows, want)
 	}
 }

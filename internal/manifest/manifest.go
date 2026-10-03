@@ -43,10 +43,11 @@ type Manifest struct {
 	// still names just those files: one the operator has added since would
 	// otherwise drop out of their project, so rollback then takes only the
 	// installer's own override out of the line. Absent in manifests written
-	// before this was recorded, which makes rollback remove the line as
-	// before -- unless the line names nothing but that override: those
-	// installs took an empty entry for none and wrote their override into
-	// it, and rollback puts the empty entry back.
+	// before this was recorded (v0.1.0 to v0.1.2), which say only that the
+	// entry was created and were as likely to have taken the operator's own
+	// entry for none: rollback then goes by the .env the install copied into
+	// BackupDir -- whether it had an entry -- and by what the line lists
+	// (restoreLegacyComposeFileEntry in internal/installer).
 	EnvComposeFileWritten []string `json:"env_compose_file_written,omitempty"`
 }
 

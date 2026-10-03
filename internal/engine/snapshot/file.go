@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"time"
 )
 
@@ -29,7 +32,13 @@ var snapshotMagic = []byte("BTSNAP\x00")
 // version 1 file records no lineage, so nothing can prove it belongs to the
 // lineage PostgreSQL is in now; refusing it as a version mismatch is exactly
 // right, and costs an upgraded deployment one ordinary rebuild.
-const snapshotFormatVersion uint32 = 2
+//
+// Version 3 marks a number stored in a spelling its float64 does not
+// reproduce with its own entry kind (propKindNumberNonCanonical). A version
+// 2 file carries every number as propKindNumber, so the property facts read
+// from it (View.NumbersCanonical) would call such a number canonical --
+// failing open; it is refused the same way.
+const snapshotFormatVersion uint32 = 3
 
 // Sentinel errors ReadSnapshotFile wraps its failures in, so a caller (the
 // engine boot path) can tell "this file was never a snapshot" apart from
@@ -87,8 +96,13 @@ type Header struct {
 // crash or an error partway through can't leave path in a half-written
 // state. This is achieved the standard way: write to a fresh temp file in
 // the SAME directory as path (so the final rename is same-filesystem and
-// therefore atomic), fsync it, close it, then os.Rename it over path. Any
-// error along the way removes the temp file rather than leaving it behind.
+// therefore atomic), fsync it, close it, os.Rename it over path, then fsync
+// the directory, so the rename itself survives a power loss -- the file's
+// own fsync covers its bytes, not the directory entry naming them. Any
+// error before the rename removes the temp file rather than leaving it
+// behind. An error syncing the directory comes after the rename: the file
+// is complete and in place, only its durability is unknown, and a caller
+// that must not leave a file behind has to treat that error accordingly.
 //
 // The temp file (and therefore the final file) is created with mode 0600 --
 // os.CreateTemp's default -- since a snapshot's payload is a full copy of
@@ -150,7 +164,71 @@ func WriteSnapshotFile(path string, s *Snapshot, stamp Stamp) (err error) {
 	}
 
 	success = true
+	if err := syncParentDir(dir); err != nil {
+		return fmt.Errorf("snapshot: WriteSnapshotFile: %w", err)
+	}
 	return nil
+}
+
+// RemoveSnapshotFile removes the snapshot file at path and then syncs its
+// directory, so the removal survives a power loss: an unlink still only in
+// the page cache when the power goes brings the file back at the next boot,
+// and a file is removed precisely when it must not come back (the engine's
+// invalidation after a watermark bump failed). removed reports whether a
+// file was there to remove. A missing file is no error, and the directory is
+// synced all the same -- an earlier removal's own unlink may not be durable
+// yet -- unless the directory is missing too, when there is nothing a power
+// loss could bring back. An error syncing comes after the unlink: the file is
+// gone, only the durability of that is unknown.
+func RemoveSnapshotFile(path string) (removed bool, err error) {
+	switch err := os.Remove(path); {
+	case err == nil:
+		removed = true
+	case errors.Is(err, fs.ErrNotExist):
+	default:
+		return false, fmt.Errorf("snapshot: RemoveSnapshotFile: %w", err)
+	}
+	if err := syncParentDir(filepath.Dir(path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return removed, fmt.Errorf("snapshot: RemoveSnapshotFile: %w", err)
+	}
+	return removed, nil
+}
+
+// syncParentDir is the directory sync WriteSnapshotFile and
+// RemoveSnapshotFile run after they change a directory entry: syncDir, held
+// in a variable only so a test can observe the calls and make one fail.
+var syncParentDir = syncDir
+
+// syncDir flushes dir's own entries -- the names in it, as renames and
+// unlinks left them -- to stable storage. A platform or filesystem that
+// cannot sync a directory at all (dirSyncUnsupported; Windows, where a
+// directory cannot be opened for it) counts as synced: there is no stronger
+// guarantee to be had there, and failing every save over it would only lose
+// the file.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("sync directory: %w", err)
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil && !dirSyncUnsupported(syncErr) {
+		return fmt.Errorf("sync directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("sync directory: close: %w", closeErr)
+	}
+	return nil
+}
+
+// dirSyncUnsupported reports whether err, from syncing a directory, means
+// the filesystem does not sync directories at all rather than that the sync
+// failed.
+func dirSyncUnsupported(err error) bool {
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
 // writeSnapshotBody writes every field of the format after the magic:
@@ -270,10 +348,10 @@ func writePropStore(bw *binWriter, p *PropStore) {
 // never observes a partially-verified snapshot: on any error the returned
 // *Snapshot is nil.
 //
-// Format v2, every multi-byte integer little-endian:
+// Format v3, every multi-byte integer little-endian:
 //
 //	magic          [7]byte  "BTSNAP\x00"                    -- NOT covered by the trailing CRC
-//	version        uint32   snapshotFormatVersion (2)
+//	version        uint32   snapshotFormatVersion (3)
 //	graphID        int32    Snapshot.GraphID
 //	watermark      uint64   Stamp.Watermark
 //	lineage        [16]byte Snapshot.WatermarkLineage
@@ -310,9 +388,12 @@ func writePropStore(bw *binWriter, p *PropStore) {
 // Everything from version through edgeIDSeq is the file's Header, which
 // ReadSnapshotFileHeader reads on its own.
 //
-// ReadSnapshotFile never panics on a corrupt file: a nonsensical count
-// field (e.g. one big enough to demand an implausible allocation) is caught
-// and turned into ErrCorrupt rather than crashing the process.
+// ReadSnapshotFile never panics on a corrupt file, and never allocates for a
+// count or length field more than the file could possibly hold: every such
+// field is checked against the bytes the file has left before anything is
+// allocated for it (binReader.claim), since the CRC32 that would expose the
+// corruption can only be checked once the whole body has been read. A field
+// that does not fit is ErrCorrupt.
 func ReadSnapshotFile(path string) (snap *Snapshot, stamp Stamp, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -328,6 +409,11 @@ func ReadSnapshotFile(path string) (snap *Snapshot, stamp Stamp, err error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: stat: %w", statErr)
+	}
+
 	raw := bufio.NewReaderSize(f, 1<<20)
 	if err := readMagic(raw); err != nil {
 		return nil, Stamp{}, fmt.Errorf("snapshot: ReadSnapshotFile: %w", err)
@@ -337,10 +423,14 @@ func ReadSnapshotFile(path string) (snap *Snapshot, stamp Stamp, err error) {
 	// h as it's consumed -- one pass, matching WriteSnapshotFile's mw. The
 	// trailing CRC field itself is read straight from raw afterward,
 	// deliberately bypassing tr, so it is not part of what it's checked
-	// against.
+	// against -- nor of the body's byte budget.
 	h := crc32.NewIEEE()
 	tr := io.TeeReader(raw, h)
-	br := &binReader{r: tr}
+	br := &binReader{
+		r:         tr,
+		limited:   true,
+		remaining: info.Size() - int64(len(snapshotMagic)) - crc32.Size,
+	}
 
 	header, err := readHeader(br)
 	if err != nil {
@@ -509,6 +599,10 @@ func readKindTable(br *binReader) *KindTable {
 		br.err = fmt.Errorf("snapshot: kind table entry count %d exceeds KindID's range (max %d)", count, maxKindTableEntries)
 		return nil
 	}
+	// Each entry takes at least its int16 id and uint32 name length.
+	if !br.claim(count, 2+4, "kind table") {
+		return nil
+	}
 	pairs := make(map[KindID]string, count)
 	for i := uint64(0); i < count; i++ {
 		id := br.i16()
@@ -541,6 +635,10 @@ func readPropStore(br *binReader, n uint64) *PropStore {
 		br.err = fmt.Errorf("snapshot: property name count %d exceeds PropID's range (max %d)", nameCount, uint64(maxPropID)+1)
 		return nil
 	}
+	// Each name takes at least its uint32 length.
+	if !br.claim(nameCount, 4, "property name table") {
+		return nil
+	}
 	names := make([]string, nameCount)
 	for i := range names {
 		names[i] = br.str()
@@ -564,6 +662,11 @@ func readPropStore(br *binReader, n uint64) *PropStore {
 	// "how big this is on the wire" with "how big this is once loaded".
 	if entryCount > maxReadAlloc/bytesPerPropEntry {
 		br.err = fmt.Errorf("snapshot: refusing to allocate %d prop entries", entryCount)
+		return nil
+	}
+	// The tighter bound: the entries must fit, at their wire size, in what
+	// the file has left -- checked before the in-memory slice is allocated.
+	if !br.claim(entryCount, propEntryWireSize, "property entry table") {
 		return nil
 	}
 	entries := make([]propEntry, entryCount)
@@ -698,20 +801,55 @@ func (bw *binWriter) i16s(s []int16) {
 // heap-allocate -- at 5M-node scale a read touches tens of millions of
 // these, so one make([]byte, n) per call was showing up as significant GC
 // pressure.
+//
+// limited and remaining are the reader's byte budget (ReadSnapshotFile sets
+// them; ReadSnapshotFileHeader, which only reads fixed-size fields, does
+// not): remaining is how many body bytes the file still holds past
+// everything read so far, and every count or length field is checked
+// against it before anything is allocated for it (claim).
 type binReader struct {
 	r   io.Reader
 	err error
 	buf [8]byte
+
+	limited   bool
+	remaining int64
 }
 
 // maxReadAlloc caps any single length-prefixed read this package will
-// attempt to satisfy in one allocation. It exists solely so a corrupt count
-// field (e.g. a byte flipped inside what should have been a small number)
-// fails fast as ErrCorrupt instead of the process attempting a
-// multi-exabyte allocation -- deliberately far above any real BloodHound
-// snapshot's actual array sizes (5M nodes/tens of millions of edges is
-// still only low gigabytes per array), not a tight bound.
+// attempt to satisfy in one allocation, as a backstop to the byte budget
+// (binReader.claim) that is the actual bound on a snapshot file's reads: a
+// field can never ask for more than the file has left. Deliberately far
+// above any real BloodHound snapshot's actual array sizes (5M nodes/tens of
+// millions of edges is still only low gigabytes per array).
 const maxReadAlloc = 1 << 40
+
+// claim checks that n elements of width wire bytes each can still be read
+// from the file, BEFORE a caller allocates anything sized by n. A corrupt
+// count or length field -- one flipped high bit is enough -- would otherwise
+// drive an allocation up to maxReadAlloc long before the CRC32 trailer that
+// exposes the corruption can be checked, and on Linux an allocation that
+// large does not fail: the process is killed, on every boot, until the file
+// is deleted. On refusal it records the error (ReadSnapshotFile reports it as
+// ErrCorrupt) and returns false; it consumes nothing either way.
+func (br *binReader) claim(n, width uint64, what string) bool {
+	if br.err != nil {
+		return false
+	}
+	if !br.limited {
+		return true
+	}
+	if br.remaining < 0 || n > uint64(br.remaining)/width {
+		br.err = fmt.Errorf("snapshot: %s of %d x %d bytes does not fit in the %d bytes left in the file", what, n, width, max(br.remaining, 0))
+		return false
+	}
+	return true
+}
+
+// consumed charges n bytes just read against the byte budget.
+func (br *binReader) consumed(n int) {
+	br.remaining -= int64(n)
+}
 
 func (br *binReader) read(n int) []byte {
 	if br.err != nil {
@@ -722,6 +860,7 @@ func (br *binReader) read(n int) []byte {
 		br.err = err
 		return nil
 	}
+	br.consumed(n)
 	return buf
 }
 
@@ -744,6 +883,7 @@ func (br *binReader) readScratch(n int) []byte {
 		br.err = err
 		return nil
 	}
+	br.consumed(n)
 	return buf
 }
 
@@ -785,13 +925,17 @@ func (br *binReader) u64() uint64 {
 
 func (br *binReader) f64() float64 { return math.Float64frombits(br.u64()) }
 
-// bytes reads n raw bytes, guarded by maxReadAlloc (see its doc).
+// bytes reads n raw bytes, guarded by the byte budget (claim) and
+// maxReadAlloc.
 func (br *binReader) bytes(n uint64) []byte {
 	if br.err != nil {
 		return nil
 	}
 	if n > maxReadAlloc {
 		br.err = fmt.Errorf("snapshot: refusing to allocate %d bytes for one field", n)
+		return nil
+	}
+	if !br.claim(n, 1, "byte field") {
 		return nil
 	}
 	return br.read(int(n))
@@ -821,6 +965,9 @@ func (br *binReader) u64s(n uint64) []uint64 {
 		br.err = fmt.Errorf("snapshot: refusing to allocate %d uint64s for one array", n)
 		return nil
 	}
+	if !br.claim(n, 8, "uint64 array") {
+		return nil
+	}
 	out := make([]uint64, n)
 	if n == 0 {
 		return out
@@ -843,6 +990,9 @@ func (br *binReader) u32s(n uint64) []uint32 {
 		br.err = fmt.Errorf("snapshot: refusing to allocate %d uint32s for one array", n)
 		return nil
 	}
+	if !br.claim(n, 4, "uint32 array") {
+		return nil
+	}
 	out := make([]uint32, n)
 	if n == 0 {
 		return out
@@ -863,6 +1013,9 @@ func (br *binReader) i16s(n uint64) []int16 {
 	}
 	if n > maxReadAlloc/2 {
 		br.err = fmt.Errorf("snapshot: refusing to allocate %d int16s for one array", n)
+		return nil
+	}
+	if !br.claim(n, 2, "int16 array") {
 		return nil
 	}
 	out := make([]int16, n)

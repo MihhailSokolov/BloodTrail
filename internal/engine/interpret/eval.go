@@ -17,6 +17,7 @@
 package interpret
 
 import (
+	"context"
 	"errors"
 	"math"
 	"regexp"
@@ -369,6 +370,12 @@ type Env struct {
 	Now  time.Time
 
 	AllShortestPerPair bool
+
+	// Ctx, when set, is the context of the request the query serves: Execute
+	// refuses to start once it is done, and a query already running stops at
+	// its next work-budget check after it is cancelled, returning its error
+	// (context.Canceled, context.DeadlineExceeded). nil means no context.
+	Ctx context.Context
 
 	regexMu    sync.Mutex
 	regexCache map[string]*RegexMatcher
@@ -1096,15 +1103,19 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 	}
 	// A bare property against a numeric operand (the only property shape
 	// relationalComparisonSafe admits) is `(properties ->> 'x')::int8 < ...`
-	// in pg -- a CAST of the property's text, not a jsonb comparison. See
-	// castPropertyForOrder.
+	// in pg -- a CAST of the property's text, not a jsonb comparison, to the
+	// type dawgs infers for the other side: `::int` next to size(),
+	// `::float8` next to a float literal, `::numeric` next to datetime().
+	// See castPropertyAs.
 	leftProp, rightProp := isBarePropertyLookup(leftExpr), isBarePropertyLookup(rightExpr)
 	if leftProp && !rightProp {
-		if aVal, err = castPropertyForOrder(aVal, isFloatLiteral(rightExpr)); err != nil {
+		_, h := operandTyping(rightExpr)
+		if aVal, _, err = castPropertyForPartner(aVal, h); err != nil {
 			return TriNull, err
 		}
 	} else if rightProp && !leftProp {
-		if bVal, err = castPropertyForOrder(bVal, isFloatLiteral(leftExpr)); err != nil {
+		_, h := operandTyping(leftExpr)
+		if bVal, _, err = castPropertyForPartner(bVal, h); err != nil {
 			return TriNull, err
 		}
 	}
@@ -1131,25 +1142,12 @@ func evalOrder(env *Env, row *Row, leftExpr cypher.Expression, op cypher.Operato
 	}
 }
 
-// isFloatLiteral reports whether expr is a bare float literal -- the one
-// numeric operand whose type (float8) this package knows dawgs casts the
-// other side to. An integer literal is int8; any other numeric expression
-// is left undecided, and castPropertyForOrder is conservative about it.
-func isFloatLiteral(expr cypher.Expression) bool {
-	lit, ok := asLiteral(expr)
-	if !ok || lit == nil {
-		return false
-	}
-	_, isFloat := lit.Value.(float64)
-	return isFloat
-}
-
 // maxExactInt is the largest integer magnitude a float64 holds exactly.
 const maxExactInt = 1 << 53
 
 // castPropertyForOrder reproduces pg's `(properties ->> 'x')::int8` (or
-// `::float8` when floatCast) for a relational comparison, over this
-// package's value model.
+// `::float8` when floatCast) over this package's value model; castPropertyAs
+// picks the cast the way dawgs does, from the other operand's type.
 //
 // The cast is what decides the row, not jsonb typing: the STRING '7' casts to
 // 7 and matches `x > 5`, where OrderCompare -- which refuses to order a
@@ -1157,9 +1155,12 @@ const maxExactInt = 1 << 53
 // rejects ('abc', true, a list, 7.5 under int8) is a PostgreSQL ERROR that
 // aborts the whole query, so it declines here (ErrRuntimeCast) rather than
 // quietly dropping the row, which was once an accepted divergence and served
-// an answer for a query pg refuses. When the cast type is undecided (the
-// numeric side is not a bare literal) anything that is not an integer --
-// where int8 and float8 agree -- declines.
+// an answer for a query pg refuses.
+//
+// A stored number of magnitude 2^53 or more declines under the integer cast
+// as well: the float64 cannot say which integer was stored -- JSON
+// 9007199254740993 decodes to 9007199254740992 -- while the cast reads the
+// exact text.
 //
 // A nil (stored JSON null) passes through: it extracts to SQL NULL.
 func castPropertyForOrder(v any, floatCast bool) (any, error) {
@@ -1170,7 +1171,7 @@ func castPropertyForOrder(v any, floatCast bool) (any, error) {
 		if floatCast {
 			return val, nil
 		}
-		if val != math.Trunc(val) || math.Abs(val) > maxExactInt {
+		if val != math.Trunc(val) || math.Abs(val) >= maxExactInt {
 			return nil, ErrRuntimeCast
 		}
 		return val, nil
@@ -1183,9 +1184,9 @@ func castPropertyForOrder(v any, floatCast bool) (any, error) {
 			return float64(n), nil
 		}
 		if floatCast && pgFloat8Text.MatchString(val) {
-			f, err := strconv.ParseFloat(val, 64)
+			f, err := parseFloat8Text(val)
 			if err != nil {
-				return nil, ErrRuntimeCast
+				return nil, err
 			}
 			return f, nil
 		}
@@ -1364,7 +1365,7 @@ func evalIn(env *Env, row *Row, leftExpr, rightExpr cypher.Expression) (Tri, err
 	// `(p ->> 'p') = any(...)` exactly as the plain form is -- so it takes
 	// the same text comparison; against a numeric list it never gets this far
 	// (checkInOperands).
-	if kind, typed := literalListCastKind(rightExpr); typed &&
+	if kind, typed := inListLiteralKind(rightExpr); typed &&
 		(isPlainPropertyLookup(leftExpr) || (kind == coalesceText && parenthesisedPropertyLookup(leftExpr))) {
 		return inCastProperty(val, ok, list, kind)
 	}
@@ -1392,6 +1393,54 @@ func literalListCastKind(expr cypher.Expression) (coalesceKind, bool) {
 		kind = k
 	}
 	return kind, true
+}
+
+// inListLiteralKind is literalListCastKind for the right-hand side of IN,
+// where dawgs also takes a number literal under one sign as a literal of its
+// type: the pre-built `NOT u.pwdlastset IN [-1.0, 0.0]` is `::float8 =
+// any(array [- 1, 0]::float8[])`. Every element must be such a literal, of
+// one type -- a list with any other element is typed by dawgs from its
+// literals alone and does not reach this evaluator (checkInOperands).
+func inListLiteralKind(expr cypher.Expression) (coalesceKind, bool) {
+	list, ok := unwrapParens(expr).(*cypher.ListLiteral)
+	if !ok || list == nil || len(*list) == 0 {
+		return 0, false
+	}
+	var kind coalesceKind
+	for i, el := range *list {
+		lit, isLit := signedNumberOrLiteral(el)
+		if !isLit {
+			return 0, false
+		}
+		k, known := literalCastKind(lit)
+		if !known || k == coalesceBool || (i > 0 && k != kind) {
+			return 0, false
+		}
+		kind = k
+	}
+	return kind, true
+}
+
+// signedNumberOrLiteral returns expr's literal, parentheses aside, or the
+// number literal under a single unary sign (`-1.0`, which the frontend parses
+// as a sign over an operator-less arithmetic expression).
+func signedNumberOrLiteral(expr cypher.Expression) (*cypher.Literal, bool) {
+	if lit, ok := asLiteral(expr); ok {
+		return lit, lit != nil
+	}
+	u, ok := unwrapParens(expr).(*cypher.UnaryAddOrSubtractExpression)
+	if !ok || u == nil {
+		return nil, false
+	}
+	lit, ok := unwrapBareArithmetic(u.Right).(*cypher.Literal)
+	if !ok || lit == nil || lit.Null {
+		return nil, false
+	}
+	switch lit.Value.(type) {
+	case int64, uint64, float64:
+		return lit, true
+	}
+	return nil, false
 }
 
 // inCastProperty implements `n.p IN [<literals>]` as dawgs translates it
@@ -1734,8 +1783,18 @@ func adjacentInDirection(env *Env, dir graph.Direction, from, to snapshot.NodeID
 // an admissible edge kind, to a node carrying every label in nodeKinds (nil
 // nodeKinds admitting any node). It stops at the first hit, so the common
 // answer on a dense graph costs one edge.
+//
+// Undirected with labels, `(a)-[:R]-(:Z)`, the neighbour must be another
+// node: dawgs joins the labelled end to either endpoint of the edge and
+// requires `(s0.n0).id <> n1.id`, so src's own self-loop is no witness. An
+// unlabelled end is a plain EXISTS over the edges there, and a directed one
+// joins the far endpoint only; both count the self-loop.
 func hasKindedNeighbor(env *Env, src snapshot.NodeID, dir graph.Direction, nodeKinds, edgeKinds []snapshot.KindID) bool {
+	otherNodeOnly := dir == graph.DirectionBoth && len(nodeKinds) > 0
 	match := func(n snapshot.NodeID, k snapshot.KindID) bool {
+		if otherNodeOnly && n == src {
+			return false
+		}
 		return edgeKindOK(edgeKinds, k) && nodeHasAllKinds(env, n, nodeKinds)
 	}
 	found := false
@@ -1885,7 +1944,9 @@ func EvalValue(env *Env, row *Row, expr cypher.Expression) (val any, ok bool, er
 // float64 here so a literal number compares equal (via ScalarEq/PropEq's
 // jsonbEqual) to a PropStore-decoded JSON number regardless of which Go
 // numeric type produced it, matching pg's own scale-insensitive numeric
-// equality.
+// equality. An integer past 2^53 has no exact float64 -- 9007199254740993
+// would become 9007199254740992 and match that stored number, which
+// PostgreSQL's exact int8 does not -- so it declines (ErrUnsupported).
 func evalLiteralValue(lit *cypher.Literal) (any, bool, error) {
 	if lit.Null {
 		return nil, true, nil
@@ -1898,8 +1959,14 @@ func evalLiteralValue(lit *cypher.Literal) (any, bool, error) {
 		}
 		return s, true, nil
 	case int64:
+		if v > maxExactInt || v < -maxExactInt {
+			return nil, false, ErrUnsupported
+		}
 		return float64(v), true, nil
 	case uint64:
+		if v > maxExactInt {
+			return nil, false, ErrUnsupported
+		}
 		return float64(v), true, nil
 	case float64:
 		return v, true, nil
@@ -2403,6 +2470,37 @@ var (
 	pgFloat8Text = regexp.MustCompile(`^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
 )
 
+// parseFloat8Text parses a spelling pgFloat8Text admits the way PostgreSQL's
+// float8in does, failing (ErrRuntimeCast) wherever float8in raises "is out of
+// range for type double precision". strconv.ParseFloat reports an overflow,
+// but rounds an underflow to zero without an error -- '1e-400' and '2e-324'
+// both come back as 0 -- where float8in refuses any zero it did not read as a
+// zero: a mantissa with a non-zero digit. A denormal survives both ('1e-310').
+func parseFloat8Text(text string) (float64, error) {
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, ErrRuntimeCast
+	}
+	if f == 0 && nonZeroMantissa(text) {
+		return 0, ErrRuntimeCast
+	}
+	return f, nil
+}
+
+// nonZeroMantissa reports whether a decimal spelling has a non-zero digit
+// before its exponent, if any.
+func nonZeroMantissa(text string) bool {
+	for i := 0; i < len(text); i++ {
+		switch c := text[i]; {
+		case c == 'e' || c == 'E':
+			return false
+		case c >= '1' && c <= '9':
+			return true
+		}
+	}
+	return false
+}
+
 // castTextAs casts a `->>` text value to kind the way PostgreSQL's input
 // functions would, accepting only the spellings it is certain pg accepts
 // identically. Anything else is ErrRuntimeCast: pg would either raise the
@@ -2428,9 +2526,9 @@ func castTextAs(text string, kind coalesceKind) (any, error) {
 		if !pgFloat8Text.MatchString(text) {
 			return nil, ErrRuntimeCast
 		}
-		f, err := strconv.ParseFloat(text, 64)
+		f, err := parseFloat8Text(text)
 		if err != nil {
-			return nil, ErrRuntimeCast
+			return nil, err
 		}
 		return f, nil
 	case coalesceBool:
@@ -2499,10 +2597,12 @@ func evalSizeFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, b
 	return float64(len(list)), true, nil
 }
 
-// evalSplitFunction implements split(str, sep) -> []any of string. Both
-// arguments must be present strings; an absent/null operand yields NULL
-// (matching Cypher's usual "NULL in, NULL out" for scalar functions) and any
-// other non-string operand is ErrRuntimeCast (the same reasoning as
+// evalSplitFunction implements split(str, sep) -> []any of string, as
+// PostgreSQL's string_to_array(str, sep), which is what dawgs emits. An
+// absent/null str yields NULL; an absent/null separator does NOT --
+// string_to_array(str, NULL) splits str into its characters, so `'a' IN
+// split(n.s, n.sep)` matches 'abc' when the node carries no sep. Any other
+// non-string operand is ErrRuntimeCast (the same reasoning as
 // evalCaseFunction: no local pg-text-rendering reproduction for non-string
 // JSON values).
 func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, bool, error) {
@@ -2517,12 +2617,22 @@ func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, 
 	if err != nil {
 		return nil, false, err
 	}
-	if !sOk || sVal == nil || !sepOk || sepVal == nil {
+	if !sOk || sVal == nil {
 		return nil, false, nil
 	}
 	s, isString := sVal.(string)
+	if !isString {
+		return nil, false, ErrRuntimeCast
+	}
+	if !sepOk || sepVal == nil {
+		out := make([]any, 0, len(s))
+		for _, r := range s {
+			out = append(out, string(r))
+		}
+		return out, true, nil
+	}
 	sep, sepIsString := sepVal.(string)
-	if !isString || !sepIsString {
+	if !sepIsString {
 		return nil, false, ErrRuntimeCast
 	}
 
@@ -2566,58 +2676,112 @@ func evalSplitFunction(env *Env, row *Row, fi *cypher.FunctionInvocation) (any, 
 // BinaryExpression tree would carry a Text type forward once the first `+`
 // resolves to one.
 func evalArithmetic(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, bool, error) {
-	cur, curOk, err := EvalValue(env, row, ae.Left)
+	val, ok, _, err := evalArithmeticTyped(env, row, ae)
+	return val, ok, err
+}
+
+// evalArithmeticTyped is evalArithmetic, returning also the PostgreSQL type
+// of the result (sqlnum.go): each numeric step is computed with the
+// semantics of the type PostgreSQL resolves it to -- an int4 or int8 step in
+// exact integers, overflowing into the error PostgreSQL raises -- and that
+// type is what the next step, or the step this one is an operand of,
+// combines with.
+func evalArithmeticTyped(env *Env, row *Row, ae *cypher.ArithmeticExpression) (any, bool, sqlNum, error) {
+	cur, curOk, curType, err := evalOperandTyped(env, row, ae.Left)
 	if err != nil {
-		return nil, false, err
+		return nil, false, sqlNumNone, err
 	}
 	curKind := classifyAddOperand(ae.Left)
-	// Whether the value folded so far is statically a float -- what decides
-	// the type dawgs casts a property on the other side of the next step to.
-	leftFloat := staticallyFloatOperand(ae.Left)
+	// dawgs' inferred type of the value folded so far -- what it casts a
+	// property on the other side of the next step to.
+	_, curHint := operandTyping(ae.Left)
 	for i, partial := range ae.Partials {
 		if partial == nil {
-			return nil, false, ErrUnsupported
+			return nil, false, sqlNumNone, ErrUnsupported
 		}
-		rVal, rOk, err := EvalValue(env, row, partial.Right)
+		rVal, rOk, rType, err := evalOperandTyped(env, row, partial.Right)
 		if err != nil {
-			return nil, false, err
+			return nil, false, sqlNumNone, err
 		}
 		rKind := classifyAddOperand(partial.Right)
-		rightFloat := staticallyFloatOperand(partial.Right)
+		_, rHint := operandTyping(partial.Right)
 		numeric := partial.Operator != cypher.OperatorAdd ||
 			(curKind != addStaticText && rKind != addStaticText && (curKind != addPropertyLookup || rKind != addPropertyLookup))
 		if numeric {
-			// dawgs casts a plain property operand of a numeric step to its
-			// partner's type -- `n.v + 1` is `(p ->> 'v')::int8 + 1`, and
-			// float8 once a float literal is in play -- so the stored value
+			// dawgs casts a plain property operand of a numeric step to the
+			// type it infers for its partner (hintCast) -- `n.v + 1` is
+			// `(p ->> 'v')::int8 + 1`, `n.v + size(n.l)` `(p ->> 'v')::int
+			// + ...`, float8 next to a float literal -- so the stored value
 			// is cast as PostgreSQL casts it: the string '5' is 5, and 5.5
-			// under int8 is a pg error that declines here rather than
-			// quietly computing 6.5. A concatenation keeps the text, and so
-			// does `+` of two properties, which dawgs concatenates.
+			// under int8 (or 3000000000 under int) is a pg error that
+			// declines here rather than quietly computing. A concatenation
+			// keeps the text, and so does `+` of two properties, which dawgs
+			// concatenates.
 			if i == 0 && partial.Operator != cypher.OperatorAdd && isPlainPropertyLookup(ae.Left) && isPlainPropertyLookup(partial.Right) {
 				// `text * text`: PostgreSQL has no such operator. Plan
 				// rejects the shape (checkArithmetic); declined defensively.
-				return nil, false, ErrUnsupported
+				return nil, false, sqlNumNone, ErrUnsupported
 			}
 			if i == 0 && isPlainPropertyLookup(ae.Left) {
-				if cur, err = castPropertyForOrder(cur, rightFloat); err != nil {
-					return nil, false, err
+				if cur, curType, err = castPropertyForPartner(cur, rHint); err != nil {
+					return nil, false, sqlNumNone, err
 				}
+				curHint = rHint
 			}
 			if isPlainPropertyLookup(partial.Right) {
-				if rVal, err = castPropertyForOrder(rVal, leftFloat); err != nil {
-					return nil, false, err
+				if rVal, rType, err = castPropertyForPartner(rVal, curHint); err != nil {
+					return nil, false, sqlNumNone, err
 				}
+				rHint = curHint
 			}
+			curHint = combineHints(curHint, rHint)
+		} else {
+			curHint = hintOther
 		}
-		cur, curOk, err = applyArithmetic(curKind, cur, curOk, partial.Operator, rKind, rVal, rOk)
+		cur, curOk, curType, err = applyArithmetic(curType, cur, curOk, curKind, partial.Operator, rType, rVal, rOk, rKind)
 		if err != nil {
-			return nil, false, err
+			return nil, false, sqlNumNone, err
 		}
 		curKind = nextAddKind(partial.Operator, curKind, rKind)
-		leftFloat = leftFloat || rightFloat
 	}
-	return cur, curOk, nil
+	return cur, curOk, curType, nil
+}
+
+// castPropertyForPartner casts a plain property operand's value the way
+// dawgs casts it next to a partner of hint h, returning the value and the
+// PostgreSQL type of the cast. A partner dawgs infers no type for leaves the
+// property text, which PostgreSQL cannot compute with (checkArithmetic
+// rejects the shape; declined defensively).
+func castPropertyForPartner(v any, h dawgsHint) (any, sqlNum, error) {
+	t, ok := hintCast(h)
+	if !ok {
+		return nil, sqlNumNone, ErrUnsupported
+	}
+	c, err := castPropertyAs(v, t)
+	return c, t, err
+}
+
+// evalOperandTyped evaluates one arithmetic operand together with its
+// PostgreSQL type: a nested arithmetic expression or sign carries the type
+// its own steps resolved to, a WITH alias the type of the constant it holds
+// (valueSQLNum), and anything else the type its SQL fixes (leafSQLNum) -- a
+// plain property none, since that is the cast its step gives it.
+func evalOperandTyped(env *Env, row *Row, expr cypher.Expression) (any, bool, sqlNum, error) {
+	switch e := unwrapParens(expr).(type) {
+	case *cypher.ArithmeticExpression:
+		if e != nil {
+			return evalArithmeticTyped(env, row, e)
+		}
+	case *cypher.UnaryAddOrSubtractExpression:
+		if e != nil {
+			return evalUnaryTyped(env, row, e)
+		}
+	case *cypher.Variable:
+		val, ok, err := EvalValue(env, row, expr)
+		return val, ok, valueSQLNum(val), err
+	}
+	val, ok, err := EvalValue(env, row, expr)
+	return val, ok, leafSQLNum(expr), err
 }
 
 // addOperandKind classifies one `+` operand by its STATIC AST shape --
@@ -2896,48 +3060,53 @@ func nextAddKind(op cypher.Operator, aKind, bKind addOperandKind) addOperandKind
 	return addOther
 }
 
-// applyArithmetic implements one arithmetic step over float64 operands, plus
-// `+`'s own string-concatenation disambiguation (applyAdd, below) -- every
-// other operator (-, *, /, %) has no Cypher/pg concatenation analog, so those
-// stay numeric-only exactly as before: a non-numeric operand is
-// ErrUnsupported (expected to be pre-rejected, or handled by a different
-// code path, at plan time -- checkArithmetic (plan.go) does not itself
-// type-check operands for any of these operators, mirroring this function's
-// own runtime-only dispatch). aKind/bKind (unused by every operator but `+`)
+// applyArithmetic implements one arithmetic step over operands of
+// PostgreSQL types aType and bType (sqlnum.go), returning the step's value
+// and type. A NULL operand makes any step NULL. A `+` with a text operand,
+// with two property operands, or with an untyped coalesce() is applyAdd's
+// (concatenation, or a decline). Every other step is numeric: a string
+// operand is a failed cast in PostgreSQL (ErrRuntimeCast) and any other
+// non-number declines (ErrUnsupported; checkArithmetic does not type-check
+// operands, mirroring this runtime dispatch). Integer and numeric steps are
+// computed exactly or decline (integerArithmetic); a float8 step as
+// PostgreSQL's float8 operators compute it (float8Arithmetic). aKind/bKind
 // are the operands' static addOperandKind, per evalArithmetic's own doc.
-func applyArithmetic(aKind addOperandKind, a any, aOk bool, op cypher.Operator, bKind addOperandKind, b any, bOk bool) (any, bool, error) {
+func applyArithmetic(aType sqlNum, a any, aOk bool, aKind addOperandKind, op cypher.Operator, bType sqlNum, b any, bOk bool, bKind addOperandKind) (any, bool, sqlNum, error) {
+	t := arithSQLNum(aType, bType)
 	if !aOk || !bOk || a == nil || b == nil {
-		return nil, false, nil
+		return nil, false, t, nil
 	}
-
-	if op == cypher.OperatorAdd {
-		return applyAdd(aKind, a, bKind, b)
+	if op == cypher.OperatorAdd && (aKind == addStaticText || bKind == addStaticText ||
+		(aKind == addPropertyLookup && bKind == addPropertyLookup) || aKind == addUnresolved || bKind == addUnresolved) {
+		v, ok, err := applyAdd(aKind, a, bKind, b)
+		return v, ok, sqlNumNone, err
 	}
-
+	if _, isStr := a.(string); isStr {
+		return nil, false, sqlNumNone, ErrRuntimeCast
+	}
+	if _, isStr := b.(string); isStr {
+		return nil, false, sqlNumNone, ErrRuntimeCast
+	}
 	af, aIsNum := a.(float64)
 	bf, bIsNum := b.(float64)
 	if !aIsNum || !bIsNum {
-		return nil, false, ErrUnsupported
+		return nil, false, sqlNumNone, ErrUnsupported
 	}
-
-	switch op {
-	case cypher.OperatorSubtract:
-		return af - bf, true, nil
-	case cypher.OperatorMultiply:
-		return af * bf, true, nil
-	case cypher.OperatorDivide:
-		if bf == 0 {
-			return nil, false, ErrRuntimeCast
+	switch t {
+	case sqlNumInt4, sqlNumInt8, sqlNumNumeric:
+		r, err := integerArithmetic(t, af, op, bf)
+		if err != nil {
+			return nil, false, sqlNumNone, err
 		}
-		return af / bf, true, nil
-	case cypher.OperatorModulo:
-		if bf == 0 {
-			return nil, false, ErrRuntimeCast
+		return r, true, t, nil
+	case sqlNumFloat8:
+		r, err := float8Arithmetic(af, op, bf)
+		if err != nil {
+			return nil, false, sqlNumNone, err
 		}
-		return math.Mod(af, bf), true, nil
-	default:
-		return nil, false, ErrUnsupported
+		return r, true, t, nil
 	}
+	return nil, false, sqlNumNone, ErrUnsupported
 }
 
 // applyAdd implements Cypher's `+`, which pg's own translation disambiguates
@@ -3010,22 +3179,12 @@ func applyArithmetic(aKind addOperandKind, a any, aOk bool, op cypher.Operator, 
 //     file's established convention for a plan-guaranteed-unreachable shape
 //     (e.g. evalPatternPredicate's identical defensive ErrUnsupported for a
 //     shape checkPatternPredicate already validated away).
-//   - Otherwise (NUMERIC semantics, matching pg's own "neither side is
-//     Text, and not both are untyped property lookups" fallthrough, which
-//     pg renders as an arithmetic `+` and therefore expects both sides to
-//     already be numeric): both operands present numbers add normally; a
-//     present, non-numeric operand that happens to be a runtime STRING
-//     (e.g. `1 + n.name` where n.name is a genuine string property) bails
-//     ErrRuntimeCast -- pg's own `(properties ->> 'name')::numeric`-style
-//     cast would itself raise a runtime error for that same row, so this
-//     mirrors a genuine pg failure rather than silently concatenating (the
-//     bug this rule replaces: a purely-runtime-sniffing implementation
-//     would group "not statically Text" operands with "whatever they
-//     evaluate to", so two operands that both merely *happen* to be
-//     runtime strings could fall into ordinary concatenation here even
-//     though that is not pg's rule for this shape at all). Any other
-//     present, non-numeric, non-string operand (a bool/list/map) still
-//     bails ErrUnsupported, exactly as it always has.
+//   - Otherwise the `+` is numeric -- pg's own "neither side is Text, and
+//     not both are untyped property lookups" fallthrough, which it renders
+//     as an arithmetic `+` -- and applyArithmetic computes it at its
+//     operands' PostgreSQL type instead of routing it here; a runtime
+//     STRING operand there is ErrRuntimeCast (pg's cast of it would raise
+//     an error for that row), never a concatenation.
 func applyAdd(aKind addOperandKind, a any, bKind addOperandKind, b any) (any, bool, error) {
 	switch {
 	case aKind == addStaticText || bKind == addStaticText:
@@ -3052,36 +3211,43 @@ func applyAdd(aKind addOperandKind, a any, bKind addOperandKind, b any) (any, bo
 		return nil, false, ErrUnsupported
 
 	default:
-		if _, isStr := a.(string); isStr {
-			return nil, false, ErrRuntimeCast
-		}
-		if _, isStr := b.(string); isStr {
-			return nil, false, ErrRuntimeCast
-		}
-		af, aIsNum := a.(float64)
-		bf, bIsNum := b.(float64)
-		if !aIsNum || !bIsNum {
-			return nil, false, ErrUnsupported
-		}
-		return af + bf, true, nil
+		// A numeric `+`, which applyArithmetic computes itself.
+		return nil, false, ErrUnsupported
 	}
 }
 
 // evalUnary implements unary +/- over a numeric operand.
 func evalUnary(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) (any, bool, error) {
-	val, ok, err := EvalValue(env, row, u.Right)
+	val, ok, _, err := evalUnaryTyped(env, row, u)
+	return val, ok, err
+}
+
+// evalUnaryTyped is evalUnary, returning also the result's PostgreSQL type.
+// A sign keeps its operand's type, except a minus sign over a number literal,
+// which PostgreSQL folds into a constant of the negated value's type
+// (negatedLiteralSQLNum: `- 2147483648` is an int4). Negating an int4 can
+// overflow it: -(-2147483648) declines here, as the int4 minimum has no
+// int4 negation.
+func evalUnaryTyped(env *Env, row *Row, u *cypher.UnaryAddOrSubtractExpression) (any, bool, sqlNum, error) {
+	val, ok, t, err := evalOperandTyped(env, row, u.Right)
 	if err != nil {
-		return nil, false, err
+		return nil, false, sqlNumNone, err
 	}
 	if !ok || val == nil {
-		return nil, false, nil
+		return nil, false, t, nil
 	}
 	f, isNum := val.(float64)
 	if !isNum {
-		return nil, false, ErrRuntimeCast
+		return nil, false, sqlNumNone, ErrRuntimeCast
 	}
 	if u.Operator == cypher.OperatorSubtract {
-		return -f, true, nil
+		if folded, isLiteral := negatedLiteralSQLNum(u); isLiteral {
+			return -f, true, folded, nil
+		}
+		if t == sqlNumInt4 && f == minInt4 {
+			return nil, false, sqlNumNone, ErrRuntimeCast
+		}
+		return -f, true, t, nil
 	}
-	return f, true, nil
+	return f, true, t, nil
 }

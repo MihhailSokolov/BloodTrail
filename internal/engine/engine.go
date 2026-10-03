@@ -208,21 +208,41 @@ type Engine struct {
 	// this rather than inferring it from timing.
 	compactionCount atomic.Uint64
 
-	// appliedWatermark is the largest pg watermark counter value any bumped
-	// WriteScope's Apply/AdvanceWatermark call has folded in so far (see
-	// watermark.go) -- a monotonic max, not a plain overwrite, since
-	// concurrent writers' bumped scopes can finish applying out of order
-	// (AdvanceWatermark's own doc).
-	appliedWatermark atomic.Uint64
+	// appliedWatermark is the ledger of pg watermark counter values this
+	// engine can account for (watermarkLedger, watermark.go): every value up
+	// to the first one nobody accounted for yet, plus the values resolved
+	// out of order above it. A value is accounted for once a bumped
+	// WriteScope's Apply/AdvanceWatermark resolved it, or once an adopted
+	// snapshot's rebase covered it. Deliberately not the highest value
+	// resolved: that absorbed values this engine never resolved (another
+	// server's bumps, a bump still on the wire) into convergence.
+	appliedWatermark watermarkLedger
 
-	// inflightBumps counts every bumped WriteScope whose write has not yet
-	// been resolved by Apply or AdvanceWatermark: incremented the instant
-	// BumpWatermark's own UPDATE commits, decremented exactly once per
-	// bumped scope by AdvanceWatermark. Zero is the value watermarkConverged
-	// requires: nonzero means some write's pg watermark counter has already
-	// advanced while that write's own effect (committed or rolled back) is
-	// not yet known to be reconciled.
+	// inflightBumps counts every bump whose write has not yet been resolved
+	// by Apply or AdvanceWatermark: incremented before BumpWatermark's own
+	// UPDATE is even sent (and decremented again when it fails), decremented
+	// exactly once per bumped scope by AdvanceWatermark. Zero is the value
+	// watermarkConverged requires: nonzero means some write's pg watermark
+	// counter may already have advanced while that write's own effect
+	// (committed or rolled back) is not yet known to be reconciled.
 	inflightBumps atomic.Int64
+
+	// writePool is the small pool the write path's own statements -- the
+	// eager watermark bump and Apply's read-back -- run on, so they never
+	// draw a second connection from e.pool while their caller holds one
+	// (writePathPool, writepool.go). Closed by CloseWritePool.
+	writePool writePathPool
+
+	// watermarkRebaseMu makes a rebuild's adoption and the ledger rebase
+	// that goes with it one step to a convergence read
+	// (readWatermarkConvergence): held for writing across adoptRebuiltView
+	// and the rebase (adoptRebuiltViewAndRebase), for reading across the
+	// in-flight and ledger loads.
+	// Without it a reading between the two could see the adopted view with
+	// the ledger not yet caught up to it -- only a needless "not converged",
+	// but one a caller cannot tell apart from a real one. Taken before
+	// applyMu, never while holding it.
+	watermarkRebaseMu sync.RWMutex
 
 	// dirtyGen, settledDirtyGen and resolvedDirtyGen are the watermark
 	// protocol's trust generations (watermark.go). Trust is COMPUTED from
@@ -386,8 +406,28 @@ func (e *Engine) Fresh() (*snapshot.View, bool) {
 // "no snapshot yet" (nil) from "in fallback" (non-nil) when choosing its
 // decline reason.
 func (e *Engine) serveState() (*snapshot.View, bool) {
-	view := e.snap.Load()
-	return view, view != nil && e.state.Load() == stateServing
+	return servableView(e.state.Load, e.snap.Load)
+}
+
+// servableView is serveState's decision over its two loads, taken as
+// functions so a test can land an adoption between them.
+//
+// The state is read BEFORE the View, and that order is the whole point.
+// The View and the state are two separate atomics, and the one transition
+// back into stateServing -- adoptRebuiltView ending a fallback -- stores the
+// rebuilt View first and flips the state second. Reading the View first
+// could therefore pair the View from before the fallback, which lacks the
+// write whose failed Apply tripped it (and whose call has already
+// returned), with the serving state the adoption has just restored. Read
+// state first, a serving answer means the adoption's View store is already
+// visible, so the View read next is that one or a later one. The other
+// transition, serving to fallback, publishes no View: a caller that read
+// serving just before it serves the View it then reads, which is
+// indistinguishable from having run just before the failing write.
+func servableView(loadState func() int32, loadView func() *snapshot.View) (*snapshot.View, bool) {
+	serving := loadState() == stateServing
+	view := loadView()
+	return view, view != nil && serving
 }
 
 // RebuildNow loads a fresh snapshot.Snapshot from PostgreSQL and, if its
@@ -431,7 +471,14 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
 // same reading or a genuinely new attempt. This caps log volume for a
 // sustained over-budget condition without depending on the caller's own
 // retry backoff to do it alone.
-func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) {
+//
+// A panic on the rebuild's own goroutine -- in the snapshot build, the size
+// check or the adoption -- is recovered into an error and a fallback
+// (recoverRebuildPanic, background_panic.go) rather than ending the process.
+// The load's worker goroutines (loadNodes streams and parses rows on an
+// errgroup of its own) are not covered: a panic there still ends it.
+func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool, err error) {
+	defer e.recoverRebuildPanic(ctx, trigger, &adopted, &err)
 	start := time.Now()
 	// Read BEFORE the load begins: see adoptRebuiltView for why an unchanged
 	// epoch at publish time proves this snapshot cannot be missing an applied
@@ -455,7 +502,9 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 	// (shouldLogRefusal or the InfoContext below) has already run --
 	// otherwise a test polling rebuildAttempts could race ahead of a still
 	// in-flight LoadSnapshot and observe the count before the corresponding
-	// log line (if any) was actually emitted.
+	// log line (if any) was actually emitted. One exception: on a panic,
+	// recoverRebuildPanic -- deferred earlier, so it runs later -- logs its
+	// own line after this increment.
 	defer e.rebuildAttempts.Add(1)
 
 	// The watermark lineage is read only when a snapshot file could ever be
@@ -463,14 +512,15 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 	// Failing to read it costs nothing but that file, which is exactly why
 	// it is said out loud: SaveSnapshot skips a snapshot with no lineage at
 	// Debug, and nothing else would tell an operator why the file stopped
-	// being written.
-	snap, lineageErr, err := loadSnapshot(ctx, e.pgDriver, e.pool, e.cfg.SnapshotDir != "")
+	// being written. The counter is always read: an adoption rebases the
+	// watermark ledger to it (below).
+	snap, loaded, err := loadSnapshot(ctx, e.pgDriver, e.pool, true, e.cfg.SnapshotDir != "")
 	if err != nil {
 		return false, fmt.Errorf("engine: RebuildNow: %w", err)
 	}
-	if lineageErr != nil {
+	if loaded.lineageErr != nil {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not read the watermark lineage; no snapshot file will be written from this rebuild",
-			slog.Any("error", lineageErr),
+			slog.Any("error", loaded.lineageErr),
 			slog.String("trigger", trigger),
 		)
 	}
@@ -491,7 +541,9 @@ func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (bool, error) 
 	}
 	e.overBudget.Store(false)
 
-	if !e.adoptRebuiltView(ctx, snapshot.NewView(snap), epoch, settledGen) {
+	// An adopted snapshot also rebases the watermark ledger to the counter
+	// its load read (adoptRebuiltViewAndRebase, watermark.go).
+	if !e.adoptRebuiltViewAndRebase(ctx, snapshot.NewView(snap), epoch, settledGen, loaded) {
 		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot rebuild not adopted: a write was applied while it loaded",
 			slog.String("trigger", trigger),
 			slog.Duration("duration", time.Since(start)),
@@ -571,6 +623,9 @@ func (e *Engine) adoptRebuiltView(ctx context.Context, view *snapshot.View, epoc
 	// concluding (bootgap.go's deactivate doc).
 	e.bootGap.deactivate()
 
+	// Only after the View store above: serveState reads the state first and
+	// relies on a serving state never becoming visible before the View it
+	// serves (servableView).
 	if e.state.CompareAndSwap(stateFallback, stateServing) {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: fallback exited")
 	}
@@ -646,12 +701,14 @@ const (
 	// would just duplicate whatever error the caller's own eventual
 	// PostgreSQL round trip already surfaces.
 	reasonUnsupported = "unsupported"
-	// reasonMultiGraph is TryCypher-only: the interpreter has no notion of
-	// which graph a query is scoped to -- unlike servePathQuery, whose
-	// resolveEndpoint/traverse machinery only ever walks the one snapshot it
-	// was given -- so serving from a database snapshot.LoadSnapshot flagged
-	// as holding more than one graph (Snapshot.MultiGraph) risks silently
-	// answering across a graph boundary PostgreSQL itself would respect.
+	// reasonMultiGraph fires on every serving path -- TryCypher,
+	// servePathQuery, and every builder entry point (serveGate) -- when
+	// snapshot.LoadSnapshot flagged the database as holding nodes in more than
+	// one graph (Snapshot.MultiGraph). PostgreSQL's reads are not scoped by
+	// graph (dawgs' translator uses the graph id only for CREATE), so a count,
+	// listing or path query there spans every graph, while the replica holds
+	// only the default graph: serving from it would answer short. Declining
+	// hands the query to PostgreSQL, which sees all of them.
 	reasonMultiGraph = "multi_graph"
 	// reasonTranslateGate is TryCypher-only: translateGateOK (gate.go)
 	// reported that dawgs' own PostgreSQL translator would not also accept
@@ -887,7 +944,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 		return nil, false
 	}
 
-	env := &interpret.Env{Snap: snap, Now: time.Now(), AllShortestPerPair: perPair}
+	env := &interpret.Env{Snap: snap, Now: time.Now(), AllShortestPerPair: perPair, Ctx: ctx}
 	rs, err := safeExecuteCypher(env, q, interpret.Budgets{MaxRows: maxCypherRows, MaxWork: maxCypherWork, MaxLiveRows: maxCypherLiveRows})
 	if err != nil {
 		e.decline(ctx, cypherExecReason(err), err)
@@ -932,7 +989,7 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 //
 // Pipeline:
 //  1. cfg.Enabled, then serveState() -- decline "disabled" / "no_snapshot" /
-//     "fallback".
+//     "fallback" -- then snap.MultiGraph() -- decline "multi_graph".
 //  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
 //     "unresolvable" on error, including a kindMapper.MapKind failure for a
 //     Kinds-constrained endpoint -- see resolveKindsEndpoint's doc).
@@ -966,6 +1023,11 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 			reason = reasonNoSnapshot
 		}
 		e.decline(ctx, reason, nil)
+		return nil, false
+	}
+
+	if snap.MultiGraph() {
+		e.decline(ctx, reasonMultiGraph, nil)
 		return nil, false
 	}
 

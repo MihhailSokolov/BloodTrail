@@ -4,8 +4,8 @@
 
 Run it against stock BloodHound on PostgreSQL and against the same
 deployment with BloodTrail, each starting empty, then render the two
-reports with ../shgen/compare.py (same report format) and check that every
-query's result_signature matches between them:
+reports with ../shgen/compare.py (same report format), which also fails if
+any query's result_signature or size differs between them. The phases:
 
   * ad       -- optional: a bench/shgen forest uploaded first, so the
                 organization's sc_SyncedTo edges start at real AD users
@@ -17,7 +17,7 @@ query's result_signature matches between them:
                 until the datapipe has run it and re-analyzed
 
   python3 bench.py --port 8181 --data OGGEN_OUT --password PW --label bloodtrail \\
-      [--ad SHGEN_OUT] [--delete] [--out report.json] [--repeats 5] [--deadline 7200]
+      [--ad SHGEN_OUT] [--delete] [--out report.json] [--repeats 5] [--pace 0.25] [--deadline 7200]
 """
 import argparse, glob, hashlib, json, os, statistics, sys, time, urllib.error, urllib.request
 
@@ -25,10 +25,13 @@ EDGES = "sc_MemberOf|sc_HasRole|sc_CanWrite|sc_CanAdmin"
 
 
 class API:
-    def __init__(self, port, deadline):
+    def __init__(self, port, deadline, pace=0.25):
         self.base = f"http://127.0.0.1:{port}"
         self.end = time.time() + deadline
         self.token = None
+        self.pace = pace
+        # How long the request that got the last answer took, that request only.
+        self.attempt_s = 0.0
 
     def left(self):
         remain = self.end - time.time()
@@ -36,8 +39,16 @@ class API:
             sys.exit("bench: deadline exceeded")
         return remain
 
+    def settle(self):
+        """A small fixed pause before each timed request, keeping the run under
+        BloodHound's sustained-rate limit (HTTP 429) so the backoff in call()
+        stays a rare fallback and not the common path."""
+        time.sleep(self.pace)
+
     def call(self, method, path, body=None, ctype=None, headers=None, timeout=None):
-        """One request, riding out BloodHound's rate limiter (HTTP 429)."""
+        """One request, riding out BloodHound's rate limiter (HTTP 429). The
+        backoff sleeps are not part of attempt_s, which is the last attempt's
+        own duration: what timed() reports as latency."""
         delay = 1.0
         for _ in range(10):
             req = urllib.request.Request(self.base + path, data=body, method=method)
@@ -47,11 +58,15 @@ class API:
                 req.add_header("Authorization", "Bearer " + self.token)
             for k, v in (headers or {}).items():
                 req.add_header(k, v)
+            started = time.perf_counter()
             try:
                 with urllib.request.urlopen(req, timeout=min(timeout or 900, self.left())) as r:
-                    return r.status, r.read()
+                    data = r.read()
+                    self.attempt_s = time.perf_counter() - started
+                    return r.status, data
             except urllib.error.HTTPError as e:
                 if e.code != 429:
+                    self.attempt_s = time.perf_counter() - started  # a 404 is an answer too
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 16)
@@ -104,38 +119,71 @@ def upload(api, files, poll=1.0):
             "settle_s": round(settle_s, 1), "end_to_end_s": round(upload_s + job_s + settle_s, 1)}
 
 
+# Properties that differ between two ingests of the same data by construction:
+# BloodHound stamps the ingest time on every node and edge it writes, and each
+# arm ingests on its own.
+VOLATILE_PROPERTIES = frozenset({"lastseen"})
+
+
+def stable_properties(props):
+    """A canonical string for a node's or an edge's properties, without the
+    ingest-time stamp. Types are part of it: 1995, 1995.0 and "1995" differ."""
+    kept = {k: v for k, v in (props or {}).items() if k not in VOLATILE_PROPERTIES}
+    return json.dumps(kept, sort_keys=True, separators=(",", ":"))
+
+
 def signature(resp):
-    """A digest of a Cypher or pathfinding answer: every node's objectid and
-    kinds, every edge's endpoints and kind, and any literals."""
+    """A digest of a Cypher or pathfinding answer: every node's objectid, kinds
+    and properties, every edge's endpoints, kind and properties, and any
+    literals. Database ids, ordering and ingest times are left out, so two
+    arms that each ingested the same data digest identically."""
     data = (resp or {}).get("data") or {}
     nodes = data.get("nodes") or {}
     oid = {k: v.get("objectId") for k, v in nodes.items()}
     canon = {
-        "nodes": sorted([v.get("objectId"), sorted(v.get("kinds") or [])] for v in nodes.values()),
-        "edges": sorted([oid.get(e["source"]), oid.get(e["target"]), e.get("kind")] for e in data.get("edges") or []),
+        "nodes": sorted([v.get("objectId") or "", sorted(v.get("kinds") or []), stable_properties(v.get("properties"))] for v in nodes.values()),
+        "edges": sorted([oid.get(e["source"]) or "?", oid.get(e["target"]) or "?", e.get("kind") or "", stable_properties(e.get("properties"))] for e in data.get("edges") or []),
         "literals": data.get("literals"),
     }
     size = [len(canon["nodes"]), len(canon["edges"])]
     return size, hashlib.sha1(json.dumps(canon, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def percentile(sorted_samples, p):
+    """The nearest-rank percentile: the smallest sample that at least p percent
+    of the samples are at or below (p an integer). With few samples it is the
+    largest: five samples have no 95th percentile below their maximum."""
+    return sorted_samples[max(1, -(-p * len(sorted_samples) // 100)) - 1]
+
+
 def timed(api, fn, repeats):
     """fn repeats+1 times, the first discarded as warm-up: p50/p95/min/max in
-    milliseconds, and the last answer's size and signature."""
-    samples = []
+    milliseconds, and the answer's size and signature. Each sample is the
+    duration of the request that got the answer (api.attempt_s), so a request
+    that was rate limited and retried is timed by its last attempt, not by the
+    backoff before it; requests are paced by api.settle(). Every run's answer
+    is hashed, the warm-up's included: runs that disagree with each other are
+    reported as result_signature "DISAGREE" with each run's signature in
+    repeat_signatures, never as whichever answer came last."""
+    samples, sizes, sigs = [], [], []
     for i in range(repeats + 1):
-        t = time.time()
+        api.settle()
         try:
             code, resp = fn()
         except urllib.error.HTTPError as e:
             return {"error": f"HTTP {e.code}", "body": e.read()[:300].decode("utf-8", "replace")}
         if i:
-            samples.append((time.time() - t) * 1000)
+            samples.append(api.attempt_s * 1000)
+        size, sig = signature(resp) if code == 200 else ([0, 0], f"HTTP {code}")
+        sizes.append(size)
+        sigs.append(sig)
     samples.sort()
-    size, sig = signature(resp) if code == 200 else ([0, 0], f"HTTP {code}")
-    return {"p50_ms": round(statistics.median(samples), 1), "p95_ms": round(samples[max(0, int(len(samples) * 0.95) - 1)], 1),
-            "min_ms": round(samples[0], 1), "max_ms": round(samples[-1], 1), "n": len(samples),
-            "result_size": size, "result_signature": sig}
+    result = {"p50_ms": round(statistics.median(samples), 1), "p95_ms": round(percentile(samples, 95), 1),
+              "min_ms": round(samples[0], 1), "max_ms": round(samples[-1], 1), "n": len(samples),
+              "result_size": sizes[0], "result_signature": sigs[0]}
+    if len(set(sigs)) > 1 or any(size != sizes[0] for size in sizes):
+        result.update(result_signature="DISAGREE", repeats_disagree=True, repeat_signatures=sigs, repeat_sizes=sizes)
+    return result
 
 
 def queries(api, repeats, ad_user):
@@ -222,10 +270,11 @@ def main():
     ap.add_argument("--pid", type=int, help="the server's pid, to report its resident memory")
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--deadline", type=int, default=7200)
+    ap.add_argument("--pace", type=float, default=0.25, help="seconds to pause before each timed request, to stay under the API rate limiter")
     ap.add_argument("--out")
     args = ap.parse_args()
 
-    api = API(args.port, args.deadline)
+    api = API(args.port, args.deadline, pace=args.pace)
     api.login(args.user, args.password)
     report = {"label": args.label, "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 

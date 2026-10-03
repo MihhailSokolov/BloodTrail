@@ -285,8 +285,8 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 			comp1, anchor1, limited = limitEligibleComponent(env, meter, part1)
 		}
 
-		merged := make([]*Row, 0, len(rows))
 		if limited {
+			merged := make([]*Row, 0, len(rows))
 			for _, seed := range rows {
 				remaining := target - int64(len(merged))
 				if remaining <= 0 {
@@ -301,17 +301,13 @@ func runQuery(env *Env, q *Query, meter *workMeter) (*ResultSet, error) {
 					return nil, err
 				}
 				merged = append(merged, got...)
+				if err := meter.observeRows(len(merged)); err != nil {
+					return nil, err
+				}
 			}
 			rows = merged
 		} else {
-			for _, seed := range rows {
-				got, err := runCarriedPart(env, part1, meter, seed)
-				if err != nil {
-					return nil, err
-				}
-				merged = append(merged, got...)
-			}
-			rows, err = filterRows(env, merged, part1.Where, collectAliases)
+			rows, err = crossJoinCarried(env, meter, part1, rows, collectAliases)
 			if err != nil {
 				return nil, err
 			}
@@ -501,6 +497,50 @@ func runCarriedPart(env *Env, part *Part, meter *workMeter, seed *Row) ([]*Row, 
 		nr := cloneRow(seed)
 		mergeRowInto(nr, r)
 		out = append(out, nr)
+	}
+	return out, nil
+}
+
+// crossJoinCarried is pg's cross join of the WITH stage's carried rows
+// against the next Part's pattern, followed by that Part's WHERE: part is
+// matched once per seed (runCarriedPart) and only the merged rows the WHERE
+// keeps accumulate.
+//
+// The join's product is never held whole. It used to be -- every seed's
+// matches merged into one slice, the WHERE run over it afterwards, and
+// nothing consulting MaxLiveRows -- so `MATCH (u:User) WITH u MATCH
+// (g:Group) WHERE g.v = u.v` held all 2.25 million (u, g) pairs of 1,500
+// users and 1,500 groups (about 1.4 GB) to keep 1,500, and an unfiltered
+// product was served at any size, where the same product written as one
+// MATCH is refused by cartesianJoin. Filtering each seed's rows first keeps
+// the live set at one seed's matches plus the answer so far, and both are
+// charged to MaxLiveRows as they are built.
+//
+// A product that cannot fit MaxWork is refused as soon as the first seed
+// shows its size: part's match does not depend on the seed, and every row of
+// the product costs its seed's match at least one work unit, so the budget
+// would run out part-way through anyway.
+func crossJoinCarried(env *Env, meter *workMeter, part *Part, seeds []*Row, collectAliases []string) ([]*Row, error) {
+	var out []*Row
+	for i, seed := range seeds {
+		got, err := runCarriedPart(env, part, meter, seed)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 && meter.budget.MaxWork > 0 && float64(len(seeds))*float64(len(got)) > float64(meter.budget.MaxWork) {
+			return nil, ErrBudget
+		}
+		if err := meter.observeRows(len(got)); err != nil {
+			return nil, err
+		}
+		got, err = filterRows(env, got, part.Where, collectAliases)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, got...)
+		if err := meter.observeRows(len(out)); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -718,7 +758,12 @@ func leftJoinOptional(env *Env, meter *workMeter, part *Part, rows []*Row) ([]*R
 			// as below. Keying on nodes alone can only over-decline -- when
 			// dawgs also joins on an edge column, rows differing there are
 			// not repeats to pg -- never under-decline, because every node
-			// column is in dawgs' join key.
+			// column is in dawgs' join key. That holds only because the
+			// planner makes it: dawgs carries a mandatory node into the
+			// optional CTE only when the rest of the query refers to it, and
+			// planning declines an OPTIONAL MATCH whose mandatory nodes are
+			// not all referred to (optionalJoinKeysEveryMandatoryNode,
+			// plan.go).
 			tuple := string(groupKeyBytes(env, l, tupleSyms))
 			if matchedTuples == nil {
 				matchedTuples = make(map[string]struct{})
@@ -880,15 +925,25 @@ func componentPrefersReverseSeeding(env *Env, part *Part, comp component) bool {
 	return varLengthReverseEligible(env, part, step)
 }
 
-// componentAnchorSym reports the symbol runComponentFrom's own dispatch
-// (see its doc comment) treats an anchorRows chunk as bound to for comp: the
-// component's own leftmost chain symbol (part.Chains[comp.stepIdxs[0]].
-// FromSym) for a special-step (var-length/shortestPath) or named-path
-// component -- exactly the symbol expandVarLengthComponentFrom/
-// expandChainComponentFrom bind an injected chunk to -- or chooseAnchor's own
-// cost-ranked pick otherwise (the general BFS component, including a single
-// isolated node symbol, where chooseAnchor over a one-element syms list
-// trivially returns that element).
+// componentAnchorSym is the one decision of which symbol an anchorRows chunk
+// for comp binds: the chunked drivers scan it, and runComponentFrom walks
+// from it (see its doc comment). Following runComponentFrom's dispatch:
+//
+//   - a special-step (var-length) component grows forward from its own
+//     leftmost chain symbol (part.Chains[comp.stepIdxs[0]].FromSym), the
+//     symbol expandVarLengthComponentFrom and the var-length chain walk bind
+//     an injected chunk to;
+//   - a named STRICT chain is walked by expandChainComponentFrom from the end
+//     chainAnchorSym picks;
+//   - everything else -- a named chain that is not strictly left to right
+//     (converging, diverging), and the general BFS component, including a
+//     single isolated node symbol -- is a tree walk rooted at chooseAnchor's
+//     cost-ranked pick.
+//
+// The named branching chain is why this must be one function: it used to be
+// scanned at chainAnchorSym's end while runComponentFrom walked it from
+// chooseAnchor's symbol, and a walk rooted at a symbol no row bound served
+// an empty answer.
 //
 // That "leftmost chain symbol" is a property of the per-chunk TAIL this driver
 // calls, not of the unlimited path in general: the unlimited var-length
@@ -909,16 +964,15 @@ func componentPrefersReverseSeeding(env *Env, part *Part, comp component) bool {
 func componentAnchorSym(env *Env, part *Part, comp component) string {
 	stepIdxs := comp.stepIdxs
 	pathSym, pathUniform := uniformPathSym(part, stepIdxs)
-	if pathUniform && (hasSpecialStep(part, stepIdxs) || pathSym != "") {
-		if !hasSpecialStep(part, stepIdxs) {
-			// A pure-fixed named-path chain may be walked from either end;
-			// scan whichever one expandChainComponentFrom will actually
-			// walk from (the same deterministic chainWalkReversed decision,
-			// so a chunk of these anchor rows always meets the loop that
-			// expects them).
-			return chainAnchorSym(env, part, stepIdxs)
-		}
+	switch {
+	case pathUniform && hasSpecialStep(part, stepIdxs):
 		return part.Chains[stepIdxs[0]].FromSym
+	case pathUniform && pathSym != "" && isStrictLinearChain(part, stepIdxs):
+		// A pure-fixed named-path chain may be walked from either end; scan
+		// whichever one expandChainComponentFrom will actually walk from
+		// (the same deterministic chainWalkReversed decision, so a chunk of
+		// these anchor rows always meets the loop that expects them).
+		return chainAnchorSym(env, part, stepIdxs)
 	}
 	return chooseAnchor(env, part.Nodes, comp.syms)
 }
@@ -994,7 +1048,10 @@ func runComponentLimited(env *Env, meter *workMeter, part *Part, comp component,
 			return err
 		}
 		acc = append(acc, rows...)
-		return nil
+		// Each chunk's own expansion is charged where it is built, but what
+		// the chunks keep accumulates here: under a LIMIT larger than the
+		// answer this is the whole row set the unlimited path is refused for.
+		return meter.observeRows(len(acc))
 	}
 
 	// Same hint every other seeding path uses, so the chunked driver

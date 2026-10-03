@@ -255,13 +255,16 @@ func Open(ctx context.Context, cfg dawgs.Config) (graph.Database, error) {
 // settled after the call whatever it returned (readWrites' doc: dawgs' pg
 // ReadTransaction is not read-only, and a write through it has to reach the
 // replica like any other).
+//
+// The settle is deferred so it also runs while a panic from the delegate
+// unwinds through here: the writes it made are just as durable, and the
+// panic, which is never recovered here, reaches the caller unchanged.
 func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
 	writes := &readWrites{eng: d.engine, ctx: ctx}
-	err := d.backend().ReadTransaction(ctx, func(tx graph.Transaction) error {
+	defer writes.settle()
+	return d.backend().ReadTransaction(ctx, func(tx graph.Transaction) error {
 		return txDelegate(&wrappedTransaction{Transaction: tx, engine: d.engine, ctx: ctx, writes: writes})
 	}, options...)
-	writes.settle()
-	return err
 }
 
 // WriteTransaction runs txDelegate against the embedded PostgreSQL driver --
@@ -286,16 +289,16 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // (write_observer.go) resolves the eager bump without an Apply -- the
 // watermark protocol's own spec amendment (internal/engine/watermark.go's
 // BumpWatermark doc) requires the pg counter to advance even for a write
-// that rolled back, so that bump has to fold into e.appliedWatermark and
-// retire its e.inflightBumps entry regardless, and a bump that FAILED has to
-// settle its own trust generation -- a rolled-back transaction has no
-// committed effect for a read-back to replay. But an error with a
+// that rolled back, so that bump has to be recorded in e.appliedWatermark's
+// ledger and retire its e.inflightBumps entry regardless, and a bump that
+// FAILED has to settle its own trust generation -- a rolled-back transaction
+// has no committed effect for a read-back to replay. But an error with a
 // SUCCESSFUL delegate arose in the embedded driver's own final Commit, whose
 // outcome is ambiguous (the write may be durable); that branch records a
-// fallback and Applies instead -- see its in-body comment. observer can be
-// nil here only if d.Driver.WriteTransaction's own delegate closure never
-// ran at all (never observed in the pinned pg driver, but checked
-// defensively).
+// fallback and Applies instead -- unless the transaction wrote nothing at
+// all, see resolveWriteTransactionFailure's doc. observer can be nil here
+// only if d.Driver.WriteTransaction's own delegate closure never ran at all
+// (never observed in the pinned pg driver, but checked defensively).
 //
 // observer is declared once, outside the delegate closure below, then
 // reconstructed fresh inside it on every invocation -- matching
@@ -323,7 +326,8 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // if it landed before the retry, would never be resolved by the success or
 // error branch below at all: its e.inflightBumps entry would never be
 // retired, permanently breaking watermarkConverged (watermark.go's own
-// doc), and its counter value would never fold into e.appliedWatermark.
+// doc), and its counter value would never be recorded in e.appliedWatermark's
+// ledger.
 //
 // A second, independent consequence of the same orphaning: if attempt #1's
 // bump instead FAILED (rather than succeeded), its scope's bump-failure mark
@@ -353,21 +357,66 @@ func (d *Driver) ReadTransaction(ctx context.Context, txDelegate graph.Transacti
 // invocation (or otherwise resolve every attempt's own bump AND its own
 // bump-failure mark, not just the last attempt's) before either could be
 // trusted.
+//
+// A panic unwinding through the embedded driver's WriteTransaction -- from
+// the delegate, or from the embedded driver itself -- is settled by a
+// deferred settleWriteTransactionPanic and otherwise left alone: nothing
+// here recovers it, so it reaches the caller unchanged. Without that, the
+// eager bump of a transaction whose delegate panicked stayed in flight
+// forever.
 func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.TransactionDelegate, options ...graph.TransactionOption) error {
 	var (
-		observer    *observingTransaction
-		delegateErr error
+		observer         *observingTransaction
+		delegateErr      error
+		delegateReturned bool
+		returned         bool
 	)
-	if err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
+	defer func() {
+		if !returned {
+			settleWriteTransactionPanic(ctx, d.engine, observer, delegateReturned, delegateErr)
+		}
+	}()
+	err := d.backend().WriteTransaction(ctx, func(tx graph.Transaction) error {
 		observer = &observingTransaction{Transaction: tx, scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
+		delegateReturned = false
 		delegateErr = txDelegate(observer)
+		delegateReturned = true
 		return delegateErr
-	}, options...); err != nil {
+	}, options...)
+	returned = true
+	if err != nil {
 		resolveWriteTransactionFailure(ctx, d.engine, observer, delegateErr, err)
 		return err
 	}
 	d.engine.Apply(ctx, observer.scope)
 	return nil
+}
+
+// settleWriteTransactionPanic settles the engine's accounting for a
+// Driver.WriteTransaction call that a panic (or runtime.Goexit) is unwinding
+// through, split by where it arose:
+//
+//   - observer == nil: the delegate closure never ran; nothing was bumped.
+//   - the delegate panicked: the embedded driver's deferred Close rolls the
+//     transaction back, so nothing it wrote is durable -- resolveAbandonedWrite
+//     settles the eager bump. (A delegate-issued mid-transaction Commit
+//     already applied everything before it, and replaced the scope. The one
+//     case this misreads is a panic raised inside such a Commit's own inner
+//     commit, which may come after PostgreSQL made it durable: that scope was
+//     neither applied nor replaced, and is settled here as rolled back.)
+//   - the delegate returned and the embedded driver panicked afterwards:
+//     settled exactly as if it had returned an error instead --
+//     resolveWriteTransactionFailure, whose delegate-error branch is a
+//     rollback and whose other branch is the ambiguous final COMMIT.
+func settleWriteTransactionPanic(ctx context.Context, eng *engine.Engine, observer *observingTransaction, delegateReturned bool, delegateErr error) {
+	if observer == nil {
+		return
+	}
+	if !delegateReturned {
+		resolveAbandonedWrite(ctx, eng, observer.scope)
+		return
+	}
+	resolveWriteTransactionFailure(ctx, eng, observer, delegateErr, errors.New("panicked after the delegate returned"))
 }
 
 // resolveWriteTransactionFailure settles the engine's accounting for a
@@ -390,11 +439,20 @@ func (d *Driver) WriteTransaction(ctx context.Context, txDelegate graph.Transact
 //     observingTransaction.Commit's own failed-commit branch, which covers a
 //     DELEGATE-issued commit; this covers the embedded driver's final one,
 //     which no wrapper ever sees).
+//
+// Except when the scope is empty and was never bumped: every mutating call
+// an observer makes bumps first (ensureBumped), and a bump that fails
+// records a fallback, so such a scope means no write reached PostgreSQL
+// since the transaction began (or since a delegate-issued Commit applied
+// and replaced the scope). There is nothing whose outcome is unknown, so it
+// resolves as abandoned -- a read-only transaction whose COMMIT failed (a
+// client that went away, say) no longer costs a fallback and a full
+// rebuild.
 func resolveWriteTransactionFailure(ctx context.Context, eng *engine.Engine, observer *observingTransaction, delegateErr, outerErr error) {
 	if observer == nil {
 		return
 	}
-	if delegateErr == nil {
+	if _, bumped := observer.scope.Watermark(); delegateErr == nil && (bumped || !observer.scope.Empty()) {
 		observer.scope.Changes().RecordFallback(fmt.Sprintf("WriteTransaction: commit outcome ambiguous: %v", outerErr))
 		eng.Apply(ctx, observer.scope)
 		return
@@ -446,12 +504,28 @@ func resolveWriteTransactionFailure(ctx context.Context, eng *engine.Engine, obs
 // question above -- because read-back reads PostgreSQL's own committed
 // state per key -- a key whose write never landed simply reads back as it
 // already was (or as absent), never as the write that failed.
+//
+// The same holds when a panic unwinds through the embedded driver's
+// BatchOperation: the chunks flushed before it are durable. A deferred
+// Apply covers that path too, with a fallback recorded first -- a panic can
+// land between a write and its record (a kind-scoped delete records only
+// after it returns) -- and nothing here recovers the panic, so it reaches
+// the caller unchanged. Without that, those chunks were never applied and
+// the batch's eager bump stayed in flight forever.
 func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDelegate, options ...graph.BatchOption) error {
 	observer := &observingBatch{scope: engine.NewWriteScope(), eng: d.engine, ctx: ctx}
+	returned := false
+	defer func() {
+		if !returned {
+			observer.scope.Changes().RecordFallback("BatchOperation: panicked before the batch finished")
+			d.engine.Apply(ctx, observer.scope)
+		}
+	}()
 	err := d.Driver.BatchOperation(ctx, func(batch graph.Batch) error {
 		observer.Batch = batch
 		return batchDelegate(observer)
 	}, options...)
+	returned = true
 	d.engine.Apply(ctx, observer.scope)
 	return err
 }
@@ -460,8 +534,8 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 // recovery), then gives the engine one best-effort chance to persist its
 // current View to a snapshot file (engine.SaveSnapshot) while the embedded
 // PostgreSQL driver -- and therefore its connection pool -- is still open,
-// before finally closing that driver, so no engine goroutine outlives the
-// driver.
+// then closes the engine's write-path pool (engine.CloseWritePool) and
+// finally that driver, so no engine goroutine outlives the driver.
 //
 // SaveSnapshot's own error is deliberately ignored here, not just left
 // unlogged: it already logs (Warn) any failure itself, and a snapshot file
@@ -514,6 +588,10 @@ func (d *Driver) Close(ctx context.Context) error {
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotSaveTimeout)
 	_ = d.engine.SaveSnapshot(saveCtx)
 	cancel()
+
+	// Only now: an Apply the save waited for may have been reading back on
+	// the write path's pool (engine.Stop's doc).
+	d.engine.CloseWritePool()
 
 	return d.Driver.Close(ctx)
 }
@@ -675,14 +753,16 @@ func (d *Driver) SetDefaultGraph(ctx context.Context, graphSchema graph.Graph) e
 // DeleteNodesByKinds deletes nodes through the embedded PostgreSQL driver
 // (a raw pooled connection, not a WriteTransaction/BatchOperation call) and
 // notifies the engine of the write once it completes successfully via a
-// ChangeSet kind-scoped delete criteria, replayed by the applier
-// (apply.go's applyNodeKindCriteria) the same way it replays
-// includeAny/excludeAny against the in-memory replica -- including the
-// cascade to every edge incident to a deleted node, which the applier's own
-// tombstoneNodeWithCascade derives directly from the View rather than
-// needing this call to report anything about edges at all. See Run's doc
-// for why an override is needed at all and why ensureBumped runs first, and
-// settleDeleteFailure for how an error is settled.
+// ChangeSet kind-scoped delete criteria. The applier does not carry the
+// criteria out against the replica: it uses them to choose the View's
+// candidate nodes -- those includeAny/excludeAny match, by dawgs' own rule
+// (apply.go's viewCandidates) -- and re-reads them by id, tombstoning only
+// those PostgreSQL no longer holds, with the cascade to every edge incident
+// to a deleted node, which the applier's own tombstoneNodeWithCascade
+// derives directly from the View rather than needing this call to report
+// anything about edges at all. See Run's doc for why an override is needed
+// at all and why ensureBumped runs first, and settleDeleteFailure for how an
+// error is settled.
 func (d *Driver) DeleteNodesByKinds(ctx context.Context, includeAny graph.Kinds, excludeAny graph.Kinds) error {
 	scope := engine.NewWriteScope()
 	ensureBumped(ctx, d.engine, scope)
@@ -727,10 +807,11 @@ func (d *Driver) DeleteRelationshipsByKinds(ctx context.Context, kinds graph.Kin
 // delete. Only errors that provably arose before the statement was sent
 // resolve as abandoned (deleteNeverExecuted); every other one records a
 // fallback and Applies, so the rebuild reloads what PostgreSQL actually
-// holds. The recognized kind-scoped delete is deliberately NOT recorded on
-// that path: it replays as an instruction, not a read-back key, and
-// replaying a delete that did not happen would tombstone rows PostgreSQL
-// still has.
+// holds. The recognized kind-scoped delete is not recorded on that path:
+// the fallback's rebuild already reloads every row, so the criteria would
+// add nothing. (Recording it would be harmless too: a criteria is applied as
+// a keyed read-back of the View's candidates, so a delete that did not
+// happen only restages rows PostgreSQL still has.)
 func settleDeleteFailure(ctx context.Context, eng *engine.Engine, scope *engine.WriteScope, op string, err error) {
 	if deleteNeverExecuted(err) {
 		resolveAbandonedWrite(ctx, eng, scope)
