@@ -163,10 +163,13 @@ const startStateTimeout = 5 * time.Second
 // caller a driver to write through: every write this process makes lands
 // after the capture, every write before it was someone else's.
 //
-// A failed read leaves nothing captured, which only switches that one check
-// off: the watermark lineage and counters still stand between any file and
-// adoption, as they did before this check existed. Logged at Warn so the
-// weaker boot is visible.
+// A failed read leaves nothing captured, and both checks it feeds -- a file
+// stamped ahead of the counter (counterBehindFile) and rows inserted behind
+// the counter's back (insertedSinceFile) -- then have nothing to compare
+// against, so no snapshot file is adopted this start at all
+// (reasonStartStateUnknown, fileRefusal): the boot rebuilds from PostgreSQL
+// instead, which costs a load and risks nothing. Logged at Warn, saying
+// exactly that, so the consequence is visible rather than inferred.
 func (e *Engine) captureStartState(ctx context.Context) {
 	if e.pool == nil {
 		return
@@ -177,7 +180,7 @@ func (e *Engine) captureStartState(ctx context.Context) {
 	var s startState
 	if err := e.pool.QueryRow(readCtx, `select counter, `+sequencePositionsSQL+` from bloodtrail_watermark where id = 1`).
 		Scan(&s.counter, &s.nodeSeq, &s.edgeSeq); err != nil {
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark",
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not record where PostgreSQL stood at start; no snapshot file will be adopted this start, and the boot will rebuild from PostgreSQL",
 			slog.Any("error", err))
 		return
 	}
@@ -220,8 +223,9 @@ func (e *Engine) readSequencePositions(ctx context.Context) (nodeSeq, edgeSeq in
 // a second BloodTrail process writing while this one started -- costs a
 // rebuild, never a wrong adoption.
 //
-// A nil at -- nothing captured -- reports false: the check is then simply
-// not made (captureStartState's doc).
+// A nil at -- nothing captured -- reports false, but no file is adopted
+// then anyway: fileRefusal refuses one outright rather than let this check
+// pass vacuously (captureStartState's doc).
 func insertedSinceFile(stamp snapshot.Stamp, at *startState) bool {
 	return at != nil && at.counter == stamp.Watermark &&
 		(at.nodeSeq != stamp.NodeIDSeq || at.edgeSeq != stamp.EdgeIDSeq)
@@ -239,9 +243,9 @@ func insertedSinceFile(stamp snapshot.Stamp, at *startState) bool {
 // bumped, not yet applied, reads as a quiet restart), so the file is
 // refused on the start state alone, before any counter is weighed.
 //
-// A nil at -- nothing captured -- reports false, like insertedSinceFile: the
-// boot gap cover's own contradiction check (bootGapCoveredAt) is what is
-// left then.
+// A nil at -- nothing captured -- reports false, like insertedSinceFile,
+// and like it is never the answer a boot acts on: fileRefusal refuses the
+// file on the missing capture itself (captureStartState's doc).
 func counterBehindFile(stamp snapshot.Stamp, at *startState) bool {
 	return at != nil && at.counter < stamp.Watermark
 }
@@ -250,6 +254,7 @@ func counterBehindFile(stamp snapshot.Stamp, at *startState) bool {
 // "bloodtrail: snapshot file rejected" line.
 const (
 	reasonLineageChanged        = "watermark lineage changed since the file was written"
+	reasonStartStateUnknown     = "where PostgreSQL stood when this process started could not be read"
 	reasonCounterBehindFile     = "the watermark counter was behind the file's stamp when this process started"
 	reasonInsertedBehindCounter = "rows were inserted since the file was written by a writer that did not advance the watermark"
 )
@@ -257,12 +262,23 @@ const (
 // fileRefusal is why a snapshot file must be refused before its counters
 // are weighed at all, or "" when nothing about its lineage or stamp rules it
 // out: a file from another lineage than the one PostgreSQL is in (pgLineage;
-// watermarkLineageDDL); one stamped ahead of where the counter stood when
-// this process started (counterBehindFile); or one whose stamp shows rows
-// inserted behind the counter's back (insertedSinceFile). The boot asks it
-// twice: of the file's unverified header, to spare the read of a file it
-// would refuse anyway, and of what ReadSnapshotFile verified, which is the
-// answer adoption rests on.
+// watermarkLineageDDL); one this process cannot check at all, because the
+// start-state capture failed (reasonStartStateUnknown, below); one stamped
+// ahead of where the counter stood when this process started
+// (counterBehindFile); or one whose stamp shows rows inserted behind the
+// counter's back (insertedSinceFile). The boot asks it twice: of the file's
+// unverified header, to spare the read of a file it would refuse anyway, and
+// of what ReadSnapshotFile verified, which is the answer adoption rests on.
+//
+// Nothing captured refuses every file, rather than letting the two checks
+// that read the capture pass vacuously. Both of them are the only thing
+// standing between an adoption and a PostgreSQL that went back in time or
+// was written behind the counter's back, and with nothing to compare
+// against neither can tell a sound file from either of those. Refusing
+// costs a rebuild; adopting such a file unchecked costs a replica that
+// serves rows PostgreSQL does not hold. The capture fails only on a pg read
+// that errors or times out at start (captureStartState), so this is not a
+// cost an ordinary boot pays.
 func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgLineage snapshot.Lineage) (reason string, attrs []any) {
 	if lineage.IsZero() || lineage != pgLineage {
 		return reasonLineageChanged, []any{
@@ -272,6 +288,9 @@ func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgL
 		}
 	}
 	at := e.atStart.Load()
+	if at == nil {
+		return reasonStartStateUnknown, []any{slog.Uint64("file_watermark", stamp.Watermark)}
+	}
 	if counterBehindFile(stamp, at) {
 		return reasonCounterBehindFile, []any{
 			slog.Uint64("file_watermark", stamp.Watermark),

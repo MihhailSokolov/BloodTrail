@@ -2760,8 +2760,11 @@ sequences where they were, and only inserts made after the save read the positio
 made earlier, while the saving process was still running, is already behind them. So it does not
 replace ending the lineage. A sequence that moved for any other reason (a reset, a crash that let
 PostgreSQL skip ahead, a second BloodTrail process writing while this one started) costs a rebuild,
-never a wrong adoption. If the start positions cannot be read within 5 s, that boot skips the check
-and says so at Warn; the lineage and counter checks still apply.
+never a wrong adoption. If the start state cannot be read within 5 s, neither this check nor the
+counter one above has anything to compare against, so that boot adopts no snapshot file at all
+(`where PostgreSQL stood when this process started could not be read`) and rebuilds from
+PostgreSQL; the failed read says so at Warn. Refusing costs a load, where adopting a file neither
+check could weigh risks serving rows PostgreSQL does not hold.
 
 **Code.** [`watermark.go`](internal/engine/watermark.go): `BumpWatermark`, `ReadWatermark`,
 `AdvanceWatermark`, `ResolveAbandonedWrite`, `NoteWatermarkBumpFailure`, `WatermarkTrusted`,
@@ -2939,8 +2942,10 @@ equals its stamp" would almost never succeed. Instead:
 Any doubt rejects the file (`snapshot file rejected`, with a `reason`, or an `error` for an
 unreadable file) and falls through to a normal load: a corrupt or wrong-version file (every file
 from before version 3 among them), a file from another watermark lineage
-(`watermark lineage changed since the file was written`), a file stamped ahead of the counter
-recorded at start (`the watermark counter was behind the file's stamp when this process started`), a
+(`watermark lineage changed since the file was written`), any file at all when the start state
+could not be read (`where PostgreSQL stood when this process started could not be read`), a file
+stamped ahead of the counter recorded at start
+(`the watermark counter was behind the file's stamp when this process started`), a
 file whose id sequences moved while the counter did not
 (`rows were inserted since the file was written by a writer that did not advance the watermark`),
 buffered numbers that contradict the file (`boot write buffer contradicts the file: …`, naming which
@@ -3618,12 +3623,13 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file rejected`, reason `watermark lineage changed since the file was written` | Info | The file names another lineage than PostgreSQL's. Expected on the first boot after `bloodtrail install`, and against a different or reset database |
 | `snapshot file rejected`, reason `rows were inserted since the file was written by a writer that did not advance the watermark` | Info | The counter still reads the file's stamp but an id sequence moved |
 | `snapshot file rejected`, reason `the watermark counter was behind the file's stamp when this process started` | Info | PostgreSQL went back since the file was written, as a restored backup does (with `file_watermark`, `start_watermark`) |
+| `snapshot file rejected`, reason `where PostgreSQL stood when this process started could not be read` | Info | The start-state read failed, so the two checks it feeds cannot be made; no file is adopted this start (with `file_watermark`) |
 | `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
 | `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), or when a write was applied during the probe |
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
-| `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |
+| `could not record where PostgreSQL stood at start; no snapshot file will be adopted this start, and the boot will rebuild from PostgreSQL` | Warn | `Start`'s read of the counter and sequence positions failed, so the file checks that compare against it cannot be made |
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
 | `snapshot file invalidation failed` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |

@@ -756,8 +756,10 @@ func TestCounterBehindFile(t *testing.T) {
 // TestFileRefusal pins the order and the reasons of the refusals that come
 // before any counter is weighed: a file from another lineage is refused for
 // that whatever its stamp says, and one from PostgreSQL's own lineage when
-// the counter at start was behind its stamp or rows were inserted behind the
-// counter since it was written.
+// the counter at start was behind its stamp, when rows were inserted behind
+// the counter since it was written, or when nothing was captured at start at
+// all -- the checks the capture feeds cannot be made then, and a file is
+// refused rather than adopted unchecked.
 func TestFileRefusal(t *testing.T) {
 	lineage := snapshot.Lineage{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	other := snapshot.Lineage{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
@@ -773,10 +775,11 @@ func TestFileRefusal(t *testing.T) {
 		want        string
 	}{
 		{"same lineage, nothing inserted", lineage, quiet, ""},
-		{"same lineage, nothing captured", lineage, nil, ""},
+		{"same lineage, nothing captured", lineage, nil, reasonStartStateUnknown},
 		{"same lineage, rows inserted", lineage, inserted, reasonInsertedBehindCounter},
 		{"same lineage, counter behind the stamp", lineage, restored, reasonCounterBehindFile},
 		{"another lineage", other, quiet, reasonLineageChanged},
+		{"another lineage and nothing captured", other, nil, reasonLineageChanged},
 		{"another lineage and rows inserted", other, inserted, reasonLineageChanged},
 		{"another lineage and counter behind the stamp", other, restored, reasonLineageChanged},
 		{"no lineage at all", snapshot.Lineage{}, quiet, reasonLineageChanged},
