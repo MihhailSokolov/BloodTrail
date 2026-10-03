@@ -1245,9 +1245,13 @@ it on every restart. `rebuildOnce` now recovers a panic on its own goroutine (th
 the size check, the adoption) into an error and a FALLBACK (`recoverRebuildPanic`,
 [`background_panic.go`](internal/engine/background_panic.go)): it logs
 `bloodtrail: snapshot rebuild panicked` at Error with the stack, and the load is retried on the
-usual backoff ([§12.5](#125-fallback)). The goroutines that stream and decode the node rows during
-the load are not covered. The boot's attempt to start from the snapshot file is covered the same
-way, and also deletes the file ([§14.3](#143-boot)).
+usual backoff ([§12.5](#125-fallback)). The goroutines that stream, decode and stage the node rows
+need their own cover, because `errgroup` deliberately does not propagate a panic to the goroutine
+that waits: each of the three roles runs through `goRecovered`, which turns a panic into the load's
+own error with the stack it was raised on, and each parse job through `parseLoadedProps`, which
+recovers one job at a time so the panic arrives as that node's parse result and the consumer waiting
+on it is never stranded. The boot's attempt to start from the snapshot file is covered the same way,
+and also deletes the file ([§14.3](#143-boot)).
 
 **Memory limit.** If `BLOODTRAIL_MEMORY_LIMIT` is set and the finished snapshot's estimated size
 exceeds it, the load is refused. Whatever the engine had before stays in place (at startup, that
@@ -1255,7 +1259,8 @@ means no replica, so every query goes to PostgreSQL), and the load is retried ev
 
 **Code.** [`load.go`](internal/engine/load.go): `loadSnapshot` (and `LoadSnapshot`, the exported
 form the benchmarks use, which reads neither the counter nor the lineage), `loadedWatermark`,
-`loadKinds`, `loadNodes`, `loadEdges`, `probeMultiGraph`. [`engine.go`](internal/engine/engine.go):
+`loadKinds`, `loadNodes`, `goRecovered`, `parseLoadedProps`, `loadEdges`, `probeMultiGraph`.
+[`engine.go`](internal/engine/engine.go):
 `rebuildOnce`, `adoptRebuiltView`. [`watermark.go`](internal/engine/watermark.go):
 `adoptRebuiltViewAndRebase`. [`background_panic.go`](internal/engine/background_panic.go):
 `backgroundPanicked`, `recoverRebuildPanic`, `bootFromSnapshotFile`, `recoverSnapshotFileBootPanic`.

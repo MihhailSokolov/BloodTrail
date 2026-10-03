@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -228,6 +229,12 @@ type nodePropsParseResult struct {
 //     Builder call in this whole pipeline, so Builder's single-goroutine
 //     contract is honored exactly as it was when AddNode was called
 //     directly from this loop.
+//
+// Every one of those three roles runs through goRecovered, and each parse
+// job through parseLoadedProps, so a panic anywhere in the pipeline becomes
+// this function's error rather than the end of the process: errgroup does
+// not propagate panics, and rebuildOnce's own recover only covers its own
+// goroutine. See goRecovered for why that is safe here.
 func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.Builder) error {
 	rows, err := tx.Query(ctx, "SELECT id, kind_ids, properties FROM node WHERE graph_id = $1 ORDER BY id", graphID)
 	if err != nil {
@@ -246,7 +253,7 @@ func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error {
+	goRecovered(g, "scanning node rows", func() error {
 		defer close(jobs)
 		defer close(order)
 
@@ -284,16 +291,15 @@ func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 	})
 
 	for i := 0; i < workers; i++ {
-		g.Go(func() error {
+		goRecovered(g, "parsing node properties", func() error {
 			for p := range jobs {
-				parsed, err := snapshot.ParseProps(p.propsJSON)
-				p.result <- nodePropsParseResult{parsed: parsed, err: err}
+				p.result <- parseLoadedProps(p.propsJSON)
 			}
 			return nil
 		})
 	}
 
-	g.Go(func() error {
+	goRecovered(g, "staging nodes", func() error {
 		for p := range order {
 			res := <-p.result
 			if res.err != nil {
@@ -307,6 +313,65 @@ func loadNodes(ctx context.Context, tx pgx.Tx, graphID int32, builder *snapshot.
 	})
 
 	return g.Wait()
+}
+
+// goRecovered runs fn as a member of g, turning a panic in it into the error
+// g.Wait returns instead of letting it end the process.
+//
+// errgroup does not do this itself, and says why it will not (x/sync
+// v0.22.0, errgroup.Go's own comment: a propagated panic is delayed,
+// loses its stack, and can deadlock). For loadNodes those objections are
+// answered by where it sits: a load runs on a background goroutine of the
+// engine's own, under rebuildOnce, whose recover (recoverRebuildPanic,
+// engine.go) already turns a panic in the load into a failed rebuild that
+// retries and, for a write-driven one, a FALLBACK -- but only for a panic on
+// ITS goroutine. A panic on one of this group's goroutines bypassed that and
+// ended BloodHound. The stack is not lost: it is captured here, in the
+// panicking goroutine, and carried in the error (panicLoadError).
+//
+// Deadlock is answered by each role's own shape rather than by this wrapper:
+// fn's own defers run before this recover, so the producer still closes jobs
+// and order on its way out; an error from the consumer cancels gctx, which
+// is what the producer's sends select on; and a parse worker never panics
+// with a node's result undelivered, because its panic is recovered one job
+// at a time (parseLoadedProps) and delivered as that node's own parse error.
+// So whichever role panics, the other two still reach the end of their
+// channels and Wait returns.
+func goRecovered(g *errgroup.Group, what string, fn func() error) {
+	g.Go(func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = panicLoadError(what, r)
+			}
+		}()
+		return fn()
+	})
+}
+
+// parseLoadedProps is one parse worker's work for a single node: ParseProps,
+// with a panic in it recovered into that node's own parse result rather than
+// left to unwind the worker. The result is what keeps the pipeline from
+// deadlocking: the consumer blocks on each node's result channel, so a
+// worker that died mid-job would strand it (and the group's Wait with it)
+// even with goRecovered above. Delivered as an error, the panic reaches the
+// consumer, which returns it as this load's error exactly as a parse failure
+// does.
+func parseLoadedProps(propsJSON []byte) (res nodePropsParseResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = nodePropsParseResult{err: panicLoadError("parsing node properties", r)}
+		}
+	}()
+	res.parsed, res.err = snapshot.ParseProps(propsJSON)
+	return res
+}
+
+// panicLoadError describes a panic a load goroutine recovered, with the
+// stack of the goroutine it happened on (captured here, while that stack is
+// still live). It is an ordinary load error from there on, which is what
+// every caller already knows how to handle.
+func panicLoadError(what string, r any) error {
+	return fmt.Errorf("engine: LoadSnapshot: panic %s: %v\n%s", what, r, debug.Stack())
 }
 
 // loadEdges streams every edge of graphID into builder. Edges may arrive in
