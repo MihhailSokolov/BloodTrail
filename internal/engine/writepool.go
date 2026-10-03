@@ -38,9 +38,10 @@ const (
 // Created from the main pool's own configuration on first use, minus the
 // pg driver's connection hooks (its composite-type registration, which the
 // write path's plain SQL never reads, and whose release hook would destroy
-// every connection made before the schema exists). Closed by Stop; from
-// then on get hands out the main pool again, which is what a write racing
-// shutdown used before this pool existed.
+// every connection made before the schema exists). Closed by
+// CloseWritePool, after the shutdown save (Driver.Close); from then on get
+// hands out the main pool again, which is what a write racing shutdown used
+// before this pool existed.
 type writePathPool struct {
 	mu     sync.Mutex
 	pool   *pgxpool.Pool

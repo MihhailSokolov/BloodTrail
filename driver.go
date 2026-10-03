@@ -534,8 +534,8 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 // recovery), then gives the engine one best-effort chance to persist its
 // current View to a snapshot file (engine.SaveSnapshot) while the embedded
 // PostgreSQL driver -- and therefore its connection pool -- is still open,
-// before finally closing that driver, so no engine goroutine outlives the
-// driver.
+// then closes the engine's write-path pool (engine.CloseWritePool) and
+// finally that driver, so no engine goroutine outlives the driver.
 //
 // SaveSnapshot's own error is deliberately ignored here, not just left
 // unlogged: it already logs (Warn) any failure itself, and a snapshot file
@@ -588,6 +588,10 @@ func (d *Driver) Close(ctx context.Context) error {
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotSaveTimeout)
 	_ = d.engine.SaveSnapshot(saveCtx)
 	cancel()
+
+	// Only now: an Apply the save waited for may have been reading back on
+	// the write path's pool (engine.Stop's doc).
+	d.engine.CloseWritePool()
 
 	return d.Driver.Close(ctx)
 }

@@ -230,7 +230,7 @@ type Engine struct {
 	// writePool is the small pool the write path's own statements -- the
 	// eager watermark bump and Apply's read-back -- run on, so they never
 	// draw a second connection from e.pool while their caller holds one
-	// (writePathPool, writepool.go). Closed by Stop.
+	// (writePathPool, writepool.go). Closed by CloseWritePool.
 	writePool writePathPool
 
 	// watermarkRebaseMu makes a rebuild's adoption and the ledger rebase

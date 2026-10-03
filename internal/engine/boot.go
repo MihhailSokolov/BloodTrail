@@ -130,17 +130,26 @@ func (e *Engine) Start(ctx context.Context) {
 // of each retry loop, and while waiting out a backoff -- are what make exit
 // "prompt" without Stop needing to block on it.
 //
-// It also closes the write path's own pool (writePathPool), likewise without
-// waiting for a statement still running on it: a write that races the
-// shutdown past this point runs its bump and read-back on e.pool instead.
-// A read-back already under way on the write pool when it closes can fail
-// its next query there; that Apply then enters fallback, and the shutdown
-// save that follows Stop (Driver.Close) is skipped -- one rebuild at the
-// next boot, never a wrong file.
+// It leaves the write path's own pool (writePathPool) open: the shutdown
+// save that follows Stop (Driver.Close) waits, on applyMu, for an Apply
+// still running, and that Apply's read-back may be holding the pool. Closing
+// it here made such a read-back fail its next query, enter fallback, and so
+// cost the save its file. CloseWritePool closes it once the save is done.
 func (e *Engine) Stop() {
 	if e.bgCancel != nil {
 		e.bgCancel()
 	}
+}
+
+// CloseWritePool closes the write path's own pool (writePathPool), without
+// waiting for a statement still running on it: a write that races the
+// shutdown past this point runs its bump and read-back on the main pool
+// instead, and a read-back already under way on the write pool can fail its
+// next query there and enter fallback. Driver.Close calls it after Stop and
+// the shutdown save, so that fallback can no longer cost the file.
+// Idempotent; an engine nobody closes lets the pool's idle connections time
+// out (writePathPoolIdleTime).
+func (e *Engine) CloseWritePool() {
 	e.writePool.close()
 }
 

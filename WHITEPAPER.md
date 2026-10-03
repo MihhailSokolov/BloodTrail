@@ -654,8 +654,9 @@ func init() { dawgs.Register(DriverName, Open) }
    the raw pool (for its own queries). The one pool the engine creates itself is a small one for
    the write path (`writePathPool` in [`writepool.go`](internal/engine/writepool.go)): two
    connections, made from BloodHound's pool configuration without DAWGS's connection hooks, opened
-   on the first write and closed at shutdown, so that a write's counter increment and its
-   read-back never need a second connection from BloodHound's pool while the write holds one
+   on the first write and closed at shutdown after the snapshot file is saved, so that a write's
+   counter increment and its read-back never need a second connection from BloodHound's pool
+   while the write holds one
    ([§12.3](#123-reading-back), [§13.1](#131-the-counter));
 5. calls `engine.Start` with a background context, because the boot goroutine must outlive `Open`.
    `Start` synchronously sweeps stale snapshot temp files, creates the watermark table if it is
@@ -685,7 +686,7 @@ rest pass straight through. BloodTrail overrides nine methods:
 |---|---|
 | `ReadTransaction` | Wraps each transaction so reads can be answered from memory ([§5.4](#54-the-read-side)) |
 | `WriteTransaction`, `BatchOperation` | Wrap the transaction or batch in an *observer* that records what each write touched, then call `engine.Apply` ([§5.5](#55-the-write-side)) |
-| `Close` | Stops the engine and saves the snapshot file before closing PostgreSQL |
+| `Close` | Stops the engine and saves the snapshot file, then closes the write path's pool and PostgreSQL |
 | `Run`, `WipeGraph`, `SetDefaultGraph`, `DeleteNodesByKinds`, `DeleteRelationshipsByKinds` | These change the graph (or, for `SetDefaultGraph`, which graph the replica mirrors), but inside the PostgreSQL driver they work through its own internal methods or a raw connection, which would bypass the overrides above |
 
 The last row needs one more word of explanation. Go embedding has no "virtual dispatch": when the
