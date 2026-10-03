@@ -16,6 +16,7 @@ import (
 	"github.com/specterops/dawgs"
 	"github.com/specterops/dawgs/drivers/pg"
 	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/query"
 	"github.com/specterops/dawgs/util/size"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/graphtest"
@@ -35,8 +36,17 @@ import (
 // the same load runs through it untouched.
 
 var (
-	saturatedPoolTxKind    = graph.StringKind("SaturatedPoolTxNode")
-	saturatedPoolBatchKind = graph.StringKind("SaturatedPoolBatchNode")
+	saturatedPoolTxKind         = graph.StringKind("SaturatedPoolTxNode")
+	saturatedPoolBatchKind      = graph.StringKind("SaturatedPoolBatchNode")
+	saturatedPoolDeleteNodeKind = graph.StringKind("SaturatedPoolDeleteNode")
+
+	// saturatedPoolDeleteEdgeKinds holds one edge kind per writer, so each
+	// writer's kind delete has rows of its own to re-read however the two
+	// Applies are ordered.
+	saturatedPoolDeleteEdgeKinds = [saturatedPoolWriters]graph.Kind{
+		graph.StringKind("SaturatedPoolDeleteEdge0"),
+		graph.StringKind("SaturatedPoolDeleteEdge1"),
+	}
 )
 
 // saturatedPoolWriters is how many writers each test runs at once: exactly
@@ -47,17 +57,20 @@ const saturatedPoolWriters = 2
 
 // openSaturatablePool opens a bloodtrail driver on a pool of exactly
 // saturatedPoolWriters connections, with kinds asserted up front so no
-// write needs the pg driver's own kind-cache fetch.
-func openSaturatablePool(t *testing.T, engineSetting string) (*bloodtrail.Driver, context.Context) {
+// write needs the pg driver's own kind-cache fetch. It also returns the
+// captured log.
+func openSaturatablePool(t *testing.T, engineSetting string) (*bloodtrail.Driver, *lockedBuffer, context.Context) {
 	t.Helper()
 	dsn := graphtest.PGAvailable(t)
-	_ = installLogCapture(t)
+	buf := installLogCapture(t)
 	t.Setenv(bloodtrail.EnvEngine, engineSetting)
 	ctx := context.Background()
 
 	pgDriver, _ := graphtest.OpenPG(t, dsn)
 	graphtest.WipeGraph(t, pgDriver)
-	if _, err := pgDriver.AssertKinds(ctx, graph.Kinds{saturatedPoolTxKind, saturatedPoolBatchKind}); err != nil {
+	kinds := graph.Kinds{saturatedPoolTxKind, saturatedPoolBatchKind, saturatedPoolDeleteNodeKind}
+	kinds = append(kinds, saturatedPoolDeleteEdgeKinds[:]...)
+	if _, err := pgDriver.AssertKinds(ctx, kinds); err != nil {
 		t.Fatalf("assert kinds: %v", err)
 	}
 
@@ -87,7 +100,7 @@ func openSaturatablePool(t *testing.T, engineSetting string) (*bloodtrail.Driver
 	if engineSetting == "on" {
 		waitForBootLoad(t, d)
 	}
-	return d, ctx
+	return d, buf, ctx
 }
 
 // runSaturatingWriters runs write once per writer, concurrently, and returns
@@ -135,7 +148,7 @@ func requireWritersFinished(t *testing.T, elapsed time.Duration, errs []error) {
 func TestWriteTransactionsDoNotWaitOnEachOthersConnection(t *testing.T) {
 	for _, engineSetting := range []string{"on", "off"} {
 		t.Run("engine "+engineSetting, func(t *testing.T) {
-			d, ctx := openSaturatablePool(t, engineSetting)
+			d, _, ctx := openSaturatablePool(t, engineSetting)
 
 			elapsed, errs := runSaturatingWriters(ctx, func(wctx context.Context, i int, holding *sync.WaitGroup) error {
 				return d.WriteTransaction(wctx, func(tx graph.Transaction) error {
@@ -160,7 +173,7 @@ func TestWriteTransactionsDoNotWaitOnEachOthersConnection(t *testing.T) {
 // batch goes on. Every read-back runs while the batch's own connection is
 // still held.
 func TestMidBatchCommitsDoNotWaitOnEachOthersConnection(t *testing.T) {
-	d, ctx := openSaturatablePool(t, "on")
+	d, _, ctx := openSaturatablePool(t, "on")
 
 	elapsed, errs := runSaturatingWriters(ctx, func(wctx context.Context, i int, holding *sync.WaitGroup) error {
 		return d.BatchOperation(wctx, func(batch graph.Batch) error {
@@ -179,5 +192,65 @@ func TestMidBatchCommitsDoNotWaitOnEachOthersConnection(t *testing.T) {
 	}
 	if got := nodeCountByKind(t, ctx, d, saturatedPoolBatchKind); got != saturatedPoolWriters {
 		t.Fatalf("served node count = %d after both batches committed, want %d", got, saturatedPoolWriters)
+	}
+}
+
+// TestMidBatchKindDeletesDoNotWaitOnEachOthersConnection is the batch shape
+// with a kind-scoped delete: a kind delete names no row by key, so its
+// Apply re-reads by id every row of the kind the View holds (readBack's
+// candidate re-read) -- one more read-back query that runs while the
+// batch's own connection is still held, and so has to run on the write
+// path's pool like the keyed lookups do.
+func TestMidBatchKindDeletesDoNotWaitOnEachOthersConnection(t *testing.T) {
+	d, buf, ctx := openSaturatablePool(t, "on")
+
+	// One edge per writer's kind, applied, so each delete has a View
+	// candidate to re-read.
+	if err := d.WriteTransaction(ctx, func(tx graph.Transaction) error {
+		for i, kind := range saturatedPoolDeleteEdgeKinds {
+			start, err := tx.CreateNode(graph.NewProperties().Set("objectid", fmt.Sprintf("saturated-delete-%d-start", i)), saturatedPoolDeleteNodeKind)
+			if err != nil {
+				return err
+			}
+			end, err := tx.CreateNode(graph.NewProperties().Set("objectid", fmt.Sprintf("saturated-delete-%d-end", i)), saturatedPoolDeleteNodeKind)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.CreateRelationshipByIDs(start.ID, end.ID, kind, graph.NewProperties()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, kind := range saturatedPoolDeleteEdgeKinds {
+		if got := relCountByKind(t, ctx, d, kind); got != 1 {
+			t.Fatalf("served %s count = %d after the seed, want 1", kind, got)
+		}
+	}
+
+	elapsed, errs := runSaturatingWriters(ctx, func(wctx context.Context, i int, holding *sync.WaitGroup) error {
+		return d.BatchOperation(wctx, func(batch graph.Batch) error {
+			holding.Done()
+			holding.Wait() // every writer holds its pooled connection now
+			if err := batch.Relationships().Filter(query.Kind(query.Relationship(), saturatedPoolDeleteEdgeKinds[i])).Delete(); err != nil {
+				return err
+			}
+			return batch.Commit()
+		})
+	})
+	requireWritersFinished(t, elapsed, errs)
+	// A re-read that waited on the other batch's connection fails at the
+	// writer's deadline and Apply falls back, which the writer never sees.
+	assertNoFallback(t, buf)
+
+	if !bloodtrail.TestingEngine(d).WatermarkTrusted(ctx) {
+		t.Fatalf("WatermarkTrusted = false after the batches finished, want true")
+	}
+	for _, kind := range saturatedPoolDeleteEdgeKinds {
+		if got := relCountByKind(t, ctx, d, kind); got != 0 {
+			t.Fatalf("served %s count = %d after both kind deletes committed, want 0", kind, got)
+		}
 	}
 }

@@ -312,12 +312,12 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 		}
 
 		result.absentNodeIDs, err = rereadByID(candidates.nodeIDs(), nodesByID, result.absentNodeIDs,
-			func(ids []uint64) (map[uint64]nodeState, error) { return readBackNodesByID(ctx, e.pool, graphID, ids) })
+			func(ids []uint64) (map[uint64]nodeState, error) { return readBackNodesByID(ctx, pool, graphID, ids) })
 		if err != nil {
 			return nil, err
 		}
 		result.absentEdgeIDs, err = rereadByID(candidates.edges, edgesByID, result.absentEdgeIDs,
-			func(ids []uint64) (map[uint64]edgeState, error) { return readBackEdgesByID(ctx, e.pool, graphID, ids) })
+			func(ids []uint64) (map[uint64]edgeState, error) { return readBackEdgesByID(ctx, pool, graphID, ids) })
 		if err != nil {
 			return nil, err
 		}
