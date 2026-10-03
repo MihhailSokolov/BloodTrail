@@ -2221,10 +2221,12 @@ built, a named "V-shaped" path's fan-out is estimated from the anchor's degree, 
 kind-only scan with `ORDER BY` whose kind exceeds the row budget declines before scanning. A second
 `MATCH` after a `WITH` that shares no variable with the first stage is the same kind of product:
 it is refused as soon as its first carried row shows the product cannot fit the work budget, and
-the rows it holds while it runs are charged to the live-row budget. So are the rows the
-early-termination driver keeps across its batches, and the extra rows a step between two already
-bound nodes fans out into. (Before these were charged, a cross join after `WITH` held its whole
-product, 2.25 million rows for 1,500 × 1,500, to keep 1,500.)
+the rows it holds while it runs are charged to the live-row budget — the carried row's match
+first, before it is cloned into one merged row per match, since the two are the same size and one
+seed holds both. So are the rows the early-termination driver keeps across its batches, and the
+extra rows a step between two already bound nodes fans out into. (Before these were charged, a
+cross join after `WITH` held its whole product, 2.25 million rows for 1,500 × 1,500, to keep
+1,500.)
 
 ### 11.10 The translate gate
 
