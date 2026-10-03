@@ -141,10 +141,15 @@ type readbackResult struct {
 //     nothing at all here (the write either failed, or the endpoint is gone
 //     or re-keyed since; that objectid's re-read below settles what the View
 //     knew under it, and a deleted endpoint's cascade takes the edge with
-//     it). A pair where both endpoints resolve is expanded into every
-//     (start id, end id) combination across both endpoints' matches
-//     (deduplicated, and bounded by how many rows (2) actually returned for
-//     those two objectids) and folded into the same batch pass (4) runs.
+//     it). Not settled: an endpoint that was only re-keyed re-reads present,
+//     so an edge this upsert created is not staged here, and stays out of
+//     the replica until a later write names it or a rebuild loads it -- a
+//     re-key racing an ingest upsert, which BloodHound's use of objectids
+//     as identities makes rare. A pair where both endpoints resolve is
+//     expanded into every (start id, end id) combination across both
+//     endpoints' matches (deduplicated, and bounded by how many rows (2)
+//     actually returned for those two objectids) and folded into the same
+//     batch pass (4) runs.
 //
 // Then the candidates (viewCandidates): the View rows cs's write may have
 // removed without naming them by key -- every node or edge a kind-scoped
@@ -261,7 +266,9 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 		if len(startIDs) == 0 || len(endIDs) == 0 {
 			// Unresolvable endpoint: the write failed, or the node is gone
 			// or re-keyed since. Its objectid's candidates (below) settle
-			// what the View knew under it; nothing further to record here.
+			// what the View knew under it. For a re-keyed endpoint that
+			// leaves an edge this upsert created unstaged (the doc's
+			// residual); the triple is not resolvable from here.
 			continue
 		}
 

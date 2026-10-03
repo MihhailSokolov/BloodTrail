@@ -133,6 +133,10 @@ func (e *Engine) Start(ctx context.Context) {
 // It also closes the write path's own pool (writePathPool), likewise without
 // waiting for a statement still running on it: a write that races the
 // shutdown past this point runs its bump and read-back on e.pool instead.
+// A read-back already under way on the write pool when it closes can fail
+// its next query there; that Apply then enters fallback, and the shutdown
+// save that follows Stop (Driver.Close) is skipped -- one rebuild at the
+// next boot, never a wrong file.
 func (e *Engine) Stop() {
 	if e.bgCancel != nil {
 		e.bgCancel()
@@ -625,7 +629,7 @@ const (
 // Both stage read-back truth -- pg's current committed state per row,
 // never the write's own payload, and for a kind-scoped delete never an
 // instruction over whatever the view holds: the rows its criteria match in
-// the view being replayed onto are re-read one by one (readBack) -- so
+// the view being replayed onto are re-read by id, in batches (readBack) -- so
 // replay order cannot matter, although ascending counter order is the
 // order writes STARTED, not the order they committed; the replay paragraph
 // below makes the same argument for same-key rewrites. The freeze itself

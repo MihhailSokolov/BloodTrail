@@ -159,7 +159,9 @@ func (e *Engine) serveGate(ctx context.Context, op string) (*snapshot.View, bool
 // resolveNodeSpec runs the shared gate (serveGate) and matching-set
 // computation behind TryNodeCount, TryNodeFetchIDs, and TryNodeFetchKinds:
 //
-//  1. serveGate: cfg.Enabled, then a non-nil snapshot.
+//  1. serveGate: cfg.Enabled, a non-nil snapshot, stateServing, and a
+//     single-graph snapshot (reasonDisabled, reasonNoSnapshot,
+//     reasonFallback, reasonMultiGraph otherwise).
 //  2. spec.Constraints non-empty (reasonNoKindConstraint otherwise).
 //  3. Every constraint's kinds mapped to a KindID via e.mapKind
 //     (reasonError on the first failure -- consistent with the path engine's
@@ -567,8 +569,8 @@ type relPlan struct {
 // resolveRelSpec runs the shared gate and per-query setup behind every
 // TryRel* entry point:
 //
-//  1. serveGate: cfg.Enabled, then a non-nil snapshot (same as
-//     resolveNodeSpec's step 1).
+//  1. serveGate: cfg.Enabled, a non-nil snapshot, stateServing, and a
+//     single-graph snapshot (same as resolveNodeSpec's step 1).
 //  2. spec.EdgeKinds mapped to a snapshot.KindMask via buildKindMaskSeam;
 //     spec.StartConstraints and spec.EndConstraints each mapped to a bitmap
 //     via resolveConstraintBitmaps (shared with resolveNodeSpec). Any

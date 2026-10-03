@@ -39,15 +39,17 @@ func orderByNameFixture(t *testing.T) *snapshot.View {
 
 // TestPlanDeclinesOrderByNameDAWGSResolvesElsewhere: planOrder resolves a
 // bare ORDER BY name to the RETURN item carrying that name. dawgs does not.
-// A name the MATCH or WITH scope binds -- a node, an edge, a path, a
-// carried COUNT or constant -- sorts by that binding whatever a RETURN alias
-// of the same name projects (`RETURN g.v AS g ORDER BY g` is `order by
-// s0.n0`, the node), and any other name is emitted as the unquoted output
-// alias, which PostgreSQL folds to lower case. The engine therefore served
-// a different sort key -- different rows under LIMIT -- or served where
-// PostgreSQL rejects the SQL: a shadowed aggregate (42803), a shadowed
-// DISTINCT key (42P10), two aliases that fold together (42702). Each such
-// query must decline; the shapes where both readings agree must still plan.
+// A name the MATCH or WITH scope binds -- a node, an edge, a carried COUNT
+// or constant -- sorts by that binding whatever a RETURN alias of the same
+// name projects (`RETURN g.v AS g ORDER BY g` is `order by s0.n0`, the
+// node), and any other name is emitted as the unquoted output alias, which
+// PostgreSQL folds to lower case. (A path variable is emitted as the alias,
+// which the engine also sorts by; declining it is a deliberate
+// over-decline.) The engine therefore served a different sort key --
+// different rows under LIMIT -- or served where PostgreSQL rejects the SQL:
+// a shadowed aggregate (42803), a shadowed DISTINCT key (42P10), two
+// aliases that fold together (42702). Each such query must decline; the
+// shapes where both readings agree must still plan.
 func TestPlanDeclinesOrderByNameDAWGSResolvesElsewhere(t *testing.T) {
 	snap := orderByNameFixture(t)
 	const chain = `MATCH (u:User)-[:MemberOf]->(g:Group) `

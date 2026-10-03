@@ -182,11 +182,13 @@ func handle(runner dockerx.Runner, composeFile, projectDir string, strict bool) 
 // and `up -d` would recreate the operator's services without whatever that
 // file held; one whose first file is not in the project directory, where
 // compose then takes its project directory from instead of the one the
-// installer addresses the project through (checkProjectDirectory); and, with
-// no entry, a compose file other than the one discovery picks, which is not
-// what the operator's own commands run. Only the installer's own override may
-// be missing: a leftover entry may still name it, and the install is about to
-// write it.
+// installer addresses the project through (checkProjectDirectory); with no
+// entry, a compose file outside the project directory, which the entry the
+// install writes would list first, moving compose's project directory there
+// (checkProjectDirectory again); and, with no entry, a compose file other
+// than the one discovery picks, which is not what the operator's own
+// commands run. Only the installer's own override may be missing: a
+// leftover entry may still name it, and the install is about to write it.
 //
 // Otherwise it takes the project as best it can, for the commands that have
 // to keep working on whatever an install -- this version or an earlier one --
@@ -1009,12 +1011,20 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 		return fmt.Errorf("%w (%s)", err, restored)
 	}
 	// The stock image owns the graph from here on and writes it without the
-	// watermark counter. BloodTrail has stopped -- its last snapshot file
-	// save is behind it -- so ending the lineage now leaves any file it
-	// saved unadoptable by whatever brings BloodTrail back: a reinstall ends
-	// the lineage again anyway, but a BloodTrail started any other way would
-	// otherwise find the counter exactly where the file left it. Addressed
-	// through the restored project, since the override file is gone.
+	// watermark counter. On the restart path BloodTrail has stopped -- its
+	// last snapshot file save is behind it -- so ending the lineage now
+	// leaves any file it saved unadoptable by whatever brings BloodTrail
+	// back: a reinstall ends the lineage again anyway, but a BloodTrail
+	// started any other way would otherwise find the counter exactly where
+	// the file left it. When the restart is left to the operator
+	// (elsewhere), BloodTrail is still running as the lineage ends. The
+	// statement also advances the counter, which BloodTrail never resolves,
+	// so it saves no file from then on -- unless a rebuild it adopts before
+	// the operator restarts reads the new lineage, after which a file it
+	// saves names that lineage and stays adoptable by a BloodTrail started
+	// by hand after the stock image has written the graph (a reinstall still
+	// ends the lineage first). Addressed through the restored project, since
+	// the override file is gone.
 	restoredStore := dbswitch.Store{Compose: restarted, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 	if elsewhere {
 		for _, line := range restartLeftToTheOperator(first, restoreDir, m.ProjectDir) {

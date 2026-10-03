@@ -1163,9 +1163,11 @@ func TestObservingTransactionCommitAppliesAfterTheInnerCommit(t *testing.T) {
 // TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails is F2's
 // regression test for the "apply regardless" half of the fix: Apply must
 // still run (and scope must still reset) even when the inner Commit itself
-// returns an error, mirroring observingBatch.Commit's always-apply
-// rationale (read-back reads PostgreSQL's own current committed state, so
-// applying after a failed commit is always safe).
+// returns an error (read-back reads PostgreSQL's own current committed
+// state, so applying after a failed commit is always safe). A batch makes
+// the opposite choice: observingBatch.Commit keeps its scope and applies
+// nothing when the inner Commit fails, because the failed buffers stay
+// queued for a later flush.
 func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T) {
 	commitErr := errors.New("commit boom")
 	inner := &fakeTransaction{commitErr: commitErr}
