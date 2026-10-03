@@ -113,10 +113,12 @@ arguments you pass after `--`, and deletes it again. So every command -- `instal
 `install`. The CLI looks for `docker-compose.yml` in the current directory; pass
 `--compose-file` (and, if the project lives elsewhere, `--project-dir`) otherwise.
 
-The script refuses to run a download unless `checksums.txt` holds exactly one
-well-formed SHA-256 entry for the archive, and that entry matches. It runs the CLI from a
-temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is mounted
-`noexec`, set `TMPDIR` to a directory that allows running programs.
+The script refuses to run a download unless `checksums.txt` holds exactly one well-formed
+SHA-256 entry for the archive, and that entry matches. It runs the CLI from a temporary
+directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is mounted `noexec`, set
+`TMPDIR` to a directory that allows running programs. Each download is time-limited:
+15 seconds to connect, 10 minutes in all for the archive and 1 minute for `checksums.txt`.
+A stalled connection then ends with a message saying what to try, not a hang.
 
 - **Confirmation.** `install` and `rollback` show what they will change and ask first,
   reading the answer from the terminal; add `--yes` to run them unattended.

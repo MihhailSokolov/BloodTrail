@@ -3366,11 +3366,13 @@ require those two checks by name.
 curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
 ```
 
-The bootstrap script downloads the `bloodtrail` CLI for the platform, verifies its SHA-256 checksum
-itself (it takes the one line of `checksums.txt` for the archive, requires a 64-digit hash there,
-and compares it with the download's; no line, several lines, or a malformed hash stop it, since the
-`sha256sum -c` that recent macOS ships accepts input it cannot use), and runs `bloodtrail install`
-from a temporary directory under `TMPDIR` ([`internal/installer`](internal/installer)):
+The bootstrap script downloads the `bloodtrail` CLI for the platform (each download is time-limited:
+15 s to connect, 600 s in all for the archive and 60 s for `checksums.txt`, so a stalled connection
+ends with a message instead of a hang), verifies its SHA-256 checksum itself (it takes the one line
+of `checksums.txt` for the archive, requires a 64-digit hash there, and compares it with the
+download's; no line, several lines, or a malformed hash stop it, since the `sha256sum -c` that
+recent macOS ships accepts input it cannot use), and runs `bloodtrail install` from a temporary
+directory under `TMPDIR` ([`internal/installer`](internal/installer)):
 
 1. **Inventory.** Stop at once if `COMPOSE_FILE` is set in the shell's environment, even empty, or
    `COMPOSE_PATH_SEPARATOR` is set there to anything other than `:` or nothing: Compose takes both

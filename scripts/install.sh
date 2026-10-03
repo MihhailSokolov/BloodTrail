@@ -38,9 +38,24 @@ ASSET="bloodtrail_${OS}_${ARCH}.tar.gz"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/bloodtrail.XXXXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# curl has no time limit of its own: a connection that stalls (a proxy that
+# accepts and never answers, a server that stops sending) would hold this
+# script, run through `curl | sh`, forever with nothing said. Every download
+# has a connect limit and a total one, the total sized for its file: ten
+# minutes for the archive, so a slow link still finishes, and one for the few
+# hundred bytes of checksums.txt. A download that fails or passes its limit
+# (curl's exit status 28) stops the script here, before anything has run.
+fetch() {
+  url="$1"; out="$2"; max_time="$3"
+  curl -fsSL --connect-timeout 15 --max-time "$max_time" "$url" -o "$out" || {
+    echo "could not download $url (curl's own message is above; its exit status 28 means the download did not finish in ${max_time}s); check that this host can reach github.com, through its proxy if it needs one, and that BLOODTRAIL_VERSION, if you set it, names a published release, then run this again" >&2
+    exit 1
+  }
+}
+
 echo "Downloading $ASSET from $BASE" >&2
-curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET"
-curl -fsSL "$BASE/checksums.txt" -o "$TMP/checksums.txt"
+fetch "$BASE/$ASSET" "$TMP/$ASSET" 600
+fetch "$BASE/checksums.txt" "$TMP/checksums.txt" 60
 
 # checksums.txt has a "<sha256>  <file>" line per release asset. Take the one
 # line for this asset and compare its hash against the download here, rather
