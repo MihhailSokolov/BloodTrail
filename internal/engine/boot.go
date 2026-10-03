@@ -114,6 +114,32 @@ func (e *Engine) Start(ctx context.Context) {
 	go e.runBootLoad(ctx)
 }
 
+// loadRetryDelayAfter is the retry cadence both load loops use after one
+// rebuildOnce attempt, err being that attempt's own error: it wraps
+// fallbackRetryDelay (apply.go) with the one outcome whose cost the doubling
+// backoff was never meant to carry.
+//
+// A rebuild that ended in a recovered panic (rebuildPanicked, engine.go)
+// waits fallbackBudgetRetryInterval and leaves backoff untouched, exactly as
+// an over-budget refusal does, and for the same judgment: a panic that
+// depends on the data -- the shape this recovery exists for, since one that
+// does not is gone on the next attempt -- recurs on every attempt, so the
+// seconds-scale schedule only re-runs a whole snapshot load, and logs a
+// whole stack at Error, every 30 s for the life of the process for a result
+// already known. The engine serves correctly from PostgreSQL meanwhile
+// (that is what FALLBACK is), so there is nothing the faster cadence buys.
+// Leaving backoff untouched keeps the fast retry for whatever outcome comes
+// next, the same way the budget case does.
+//
+// Every other outcome, panic-free, is fallbackRetryDelay's own decision,
+// unchanged.
+func (e *Engine) loadRetryDelayAfter(err error, backoff time.Duration) (wait time.Duration, nextBackoff time.Duration) {
+	if e.rebuildPanicked.Load() {
+		return fallbackBudgetRetryInterval, backoff
+	}
+	return fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+}
+
 // Stop quiesces the engine's background work: it cancels the engine's own
 // background context (bgCtx, engine.go), which is what makes both the
 // boot-load goroutine below and the fallback recovery goroutine (apply.go)
@@ -299,7 +325,7 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 			return
 		}
 
-		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+		wait, next := e.loadRetryDelayAfter(err, backoff)
 		backoff = next
 
 		select {

@@ -783,7 +783,10 @@ func (e *Engine) claimRebuildLoop() bool {
 // graph shrinks, so fallbackRetryDelay backs that case off to
 // fallbackBudgetRetryInterval instead and leaves backoff itself untouched --
 // see fallbackRetryDelay's own doc for why that is what makes recovery snap
-// back to a fast retry the moment the refusal lifts.
+// back to a fast retry the moment the refusal lifts. A rebuild that ended in
+// a recovered panic is backed off the same way, and for a reason of the same
+// kind (loadRetryDelayAfter, boot.go, which is what this loop actually
+// calls).
 //
 // Only an adopted rebuild exits fallback: adopting is what makes the
 // published View both complete and current, and serving from anything less
@@ -820,7 +823,7 @@ func (e *Engine) runFallbackRebuild() {
 			return
 		}
 
-		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+		wait, next := e.loadRetryDelayAfter(err, backoff)
 		backoff = next
 
 		select {

@@ -2499,8 +2499,10 @@ end-to-end test asserts exactly one full load, at startup, across an install, an
 analysis run ([§16.3](#163-the-blind-spot-and-the-end-to-end-test)).
 
 Recovery retries after 100 ms, doubling up to 30 s between attempts; a load refused by the memory
-limit waits 10 minutes. A load that panicked is retried on the same doubling backoff, so a panic
-that depends on the data logs its stack at each attempt. The startup load and fallback recovery
+limit waits 10 minutes, and so does a load that panicked (`loadRetryDelayAfter`), because a panic
+that depends on the data recurs on every attempt and the engine serves correctly from PostgreSQL
+meanwhile. Neither case advances the doubling schedule, so the fast retry is back for whatever
+outcome comes next. The startup load and fallback recovery
 share one flag, so at most one retry-until-adopted loop runs at a time; when a loop finishes it
 re-checks the state, so a write that re-entered FALLBACK just as a load was adopted is not left
 stranded.
@@ -2985,9 +2987,9 @@ settle-wait was added, the same scenario had rejected the file three times out o
 `syncDir`, `ReadSnapshotFile`, `ReadSnapshotFileHeader`, `Stamp`, `Header`,
 `validateSnapshotStructure`, `validatePropStore`.
 [`snapshot.go`](internal/engine/snapshot/snapshot.go): `Lineage`, `WatermarkLineage`.
-[`boot.go`](internal/engine/boot.go): `Start`, `Stop`, `runBootLoad`, `tryLoadSnapshotFile`,
-`adoptSnapshotFileView`, `adoptSnapshotFileAttempt`. [`bootgap.go`](internal/engine/bootgap.go):
-`bootGapBuffer`, `bootGapCoveredAt`, `bootGapVerdict`.
+[`boot.go`](internal/engine/boot.go): `Start`, `Stop`, `runBootLoad`, `loadRetryDelayAfter`,
+`tryLoadSnapshotFile`, `adoptSnapshotFileView`, `adoptSnapshotFileAttempt`.
+[`bootgap.go`](internal/engine/bootgap.go): `bootGapBuffer`, `bootGapCoveredAt`, `bootGapVerdict`.
 
 ---
 

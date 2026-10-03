@@ -60,6 +60,10 @@ func (e *Engine) backgroundPanicked(ctx context.Context, what string, r any, att
 func (e *Engine) recoverRebuildPanic(ctx context.Context, trigger string, adopted *bool, err *error) {
 	if r := recover(); r != nil {
 		*adopted = false
+		// Recorded for the retry cadence of whichever loop is driving this
+		// rebuild (loadRetryDelayAfter, boot.go): a panic that depends on
+		// the data recurs on every attempt.
+		e.rebuildPanicked.Store(true)
 		*err = e.backgroundPanicked(ctx, "snapshot rebuild", r, slog.String("trigger", trigger))
 	}
 }

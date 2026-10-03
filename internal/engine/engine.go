@@ -185,6 +185,15 @@ type Engine struct {
 	// fallbackRetryDelay, to decide whether to back off their retry.
 	overBudget atomic.Bool
 
+	// rebuildPanicked records whether the most recent RebuildNow ended in a
+	// recovered panic (recoverRebuildPanic, background_panic.go). Boot load
+	// and the fallback recovery goroutine read it after every RebuildNow
+	// call, via loadRetryDelayAfter (boot.go), for the same reason they read
+	// overBudget: a panic that depends on the data recurs on every attempt,
+	// so retrying it on the seconds-scale backoff only re-runs a full load
+	// -- and logs a full stack -- for a result already known.
+	rebuildPanicked atomic.Bool
+
 	// refusalLastLoggedNano rate-limits RebuildNow's "snapshot rebuild
 	// refused" warning (shouldLogRefusal), stored as UnixNano so it can be
 	// read/written with a plain atomic rather than a mutex-guarded
@@ -479,6 +488,9 @@ func (e *Engine) RebuildNow(ctx context.Context, trigger string) error {
 // errgroup of its own) are not covered: a panic there still ends it.
 func (e *Engine) rebuildOnce(ctx context.Context, trigger string) (adopted bool, err error) {
 	defer e.recoverRebuildPanic(ctx, trigger, &adopted, &err)
+	// Cleared per attempt, exactly as overBudget is, so both describe only
+	// the rebuild that just ran; recoverRebuildPanic sets it on its way out.
+	e.rebuildPanicked.Store(false)
 	start := time.Now()
 	// Read BEFORE the load begins: see adoptRebuiltView for why an unchanged
 	// epoch at publish time proves this snapshot cannot be missing an applied
