@@ -2149,6 +2149,13 @@ which counts that pair toward it before `s <> t` removes it, so PostgreSQL retur
 the limit. All of these decline with reason `self_endpoint` (`ErrSelfEndpoint` in
 [`expand.go`](internal/engine/interpret/expand.go)).
 
+The overall-shortest rule is deliberately broader than the divergence it covers: the two answers
+differ only when a shared node's shortest cycle over the pattern's own edge kinds is *strictly
+shorter* than the shortest pair of two different nodes, and any shared node at all declines
+instead. Establishing the narrower condition would cost one cycle search per shared node — with one
+endpoint unconstrained, one per node of the other side, more work than the query itself — so the
+broad rule stands. Declining is always safe.
+
 The search's row and memory limits are derived from the remaining work budget; finding more paths
 than affordable declines the query rather than truncating it. When the search itself enforces every
 remaining condition, the query's own `LIMIT` is also passed into it (below).
