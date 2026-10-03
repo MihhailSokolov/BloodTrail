@@ -294,7 +294,8 @@ func checkProjectDirectory(envPath, projectDir, first string, created bool) erro
 		return fmt.Errorf("%s sets no COMPOSE_FILE, and the compose file given, %s, is not in the project directory %s: the entry this install writes lists it first, so docker compose would take %s as the project directory -- "+
 			"the one relative paths in the compose files, bind mounts such as ./pgdata among them, resolve against -- while the installer runs it with --project-directory %s, where this .env is, "+
 			"so its `up -d` and the operator's own `docker compose up -d` could put services' data on different host paths (a database on an empty directory, say); it stops rather than guess. "+
-			"Put the .env in %s next to the compose file, run docker compose from there, and rerun with --compose-file %s -- its directory is then the project directory", envPath, first, projectDir, dir, projectDir, dir, first)
+			"Put the .env in %s next to the compose file, run docker compose from there, and rerun with --compose-file %s and no --project-dir (or --project-dir %s): the compose file's directory is then the project directory, "+
+			"whereas keeping --project-dir %s refuses again", envPath, first, projectDir, dir, projectDir, dir, first, dir, projectDir)
 	}
 	return fmt.Errorf("%s: COMPOSE_FILE lists %s first, so docker compose takes %s as the project directory -- the one relative paths in the compose files, bind mounts such as ./pgdata among them, resolve against -- "+
 		"but the installer runs it with --project-directory %s, where this .env is, so its `up -d` could recreate services with their data on different host paths (a database on an empty directory, say); "+
