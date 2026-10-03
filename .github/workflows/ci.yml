@@ -8,8 +8,14 @@ on:
 permissions:
   contents: read
 jobs:
+  # Without timeout-minutes a hung step runs for GitHub's default 360 minutes,
+  # and ci-ok, which waits for every other job, cannot report until it ends.
+  # The two long jobs are bounded at about three times their normal run: `test`
+  # takes about 7 minutes; `dawgs` clones and tidies each supported release and
+  # then runs the same two suites (an estimate, it had not run on GitHub yet).
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18
@@ -88,6 +94,7 @@ jobs:
   dawgs:
     needs: upstreams
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18
