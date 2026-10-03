@@ -154,6 +154,22 @@ func TestRollbackDoesNotRestartAProjectComposeLoadsFromAnotherDirectory(t *testi
 					t.Errorf("rollback did not tell the operator (%q missing):\n%s", want, res.out)
 				}
 			}
+			// The lineage ends while BloodTrail still runs: a rebuild it adopts
+			// before the restart reads the new lineage, and a file it saves
+			// then stays adoptable after the stock image's uncounted writes.
+			// The operator must end the lineage again once the original image
+			// runs, or delete the file.
+			for _, want := range []string{
+				"ended BloodTrail's snapshot file watermark lineage",
+				"Once the original image is running, end the lineage again",
+				"`docker compose exec app-db psql -U bloodhound -d bloodhound -c 'update bloodtrail_watermark set lineage = gen_random_uuid() where id = 1'`",
+				"delete BloodTrail's snapshot file",
+				"any way other than `bloodtrail install`",
+			} {
+				if !strings.Contains(res.out, want) {
+					t.Errorf("rollback did not tell the operator what the early lineage end leaves to them (%q missing):\n%s", want, res.out)
+				}
+			}
 			// The API of a deployment that was not restarted is the old one's.
 			if res.apiHits != 0 {
 				t.Errorf("rollback waited for the API (%d requests) of a deployment it did not restart", res.apiHits)
@@ -210,6 +226,9 @@ func TestRollbackRestartsAProjectComposeLoadsFromTheEnvDirectory(t *testing.T) {
 			}
 			if strings.Contains(res.out, "your own `docker compose up -d`") {
 				t.Errorf("rollback told the operator to restart although it did:\n%s", res.out)
+			}
+			if strings.Contains(res.out, "end the lineage again") {
+				t.Errorf("rollback asked the operator to end the lineage although it ended it after the restart:\n%s", res.out)
 			}
 		})
 	}

@@ -1023,8 +1023,10 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 	// the operator restarts reads the new lineage, after which a file it
 	// saves names that lineage and stays adoptable by a BloodTrail started
 	// by hand after the stock image has written the graph (a reinstall still
-	// ends the lineage first). Addressed through the restored project, since
-	// the override file is gone.
+	// ends the lineage first). So the operator is told to end it again once
+	// the original image runs, or to delete the file
+	// (lineageLeftToTheOperator). Addressed through the restored project,
+	// since the override file is gone.
 	restoredStore := dbswitch.Store{Compose: restarted, Service: appDBService, User: m.PGUser, Database: m.PGDatabase}
 	if elsewhere {
 		for _, line := range restartLeftToTheOperator(first, restoreDir, m.ProjectDir) {
@@ -1045,6 +1047,11 @@ func Rollback(ctx context.Context, deps Deps, opts Options) error {
 			return fmt.Errorf("ending the snapshot file watermark lineage: %w (the driver row and the compose files are already restored; rerun `bloodtrail rollback` to finish)", err)
 		}
 		return fmt.Errorf("ending the snapshot file watermark lineage: %w (the original image is running again; rerun `bloodtrail rollback` to finish)", err)
+	}
+	if elsewhere {
+		for _, line := range lineageLeftToTheOperator(m.PGUser, m.PGDatabase) {
+			say("    %s", line)
+		}
 	}
 	if !elsewhere {
 		// The API of a deployment that was not restarted is the one BloodTrail
@@ -1097,6 +1104,23 @@ func restartLeftToTheOperator(first, dir, projectDir string) []string {
 		fmt.Sprintf("but rollback runs compose with --project-directory %s, where the .env is: a restart from here could recreate services with their data on different host paths (a database on an empty directory, say).", projectDir),
 		"Rollback has done everything else and leaves the restart to you.",
 		"BloodTrail is still running: restart the deployment now with your own `docker compose up -d`, from the directory you usually run it in.",
+	}
+}
+
+// lineageLeftToTheOperator is what rollback tells the operator, when it
+// leaves the restart to them, about the watermark lineage it has just ended
+// while BloodTrail still runs: a rebuild BloodTrail adopts before the
+// restart reads the new lineage, and a snapshot file it saves after that --
+// its shutdown save among them -- names it, so the file would stay
+// adoptable after the stock image's writes, which do not move the counter.
+// The statement is the lineage half of the installer's own
+// (dbswitch.Store.EndWatermarkLineage), run as the user and database the
+// install recorded.
+func lineageLeftToTheOperator(user, database string) []string {
+	return []string{
+		"Rollback has ended BloodTrail's snapshot file watermark lineage while BloodTrail is still running: with BLOODTRAIL_SNAPSHOT_DIR set, if it reloads the replica before your restart, a snapshot file it saves afterwards -- its shutdown save included -- names the new lineage and stays adoptable after the original image has written the graph.",
+		fmt.Sprintf("Once the original image is running, end the lineage again, from the directory you usually run the deployment in: `docker compose exec %s psql -U %s -d %s -c 'update bloodtrail_watermark set lineage = gen_random_uuid() where id = 1'`.", appDBService, user, database),
+		"Otherwise delete BloodTrail's snapshot file from BLOODTRAIL_SNAPSHOT_DIR before you next start BloodTrail any way other than `bloodtrail install`, which ends the lineage itself.",
 	}
 }
 
