@@ -160,6 +160,18 @@ func waitForBootMarker(t *testing.T, buf *lockedBuffer, marker string) {
 // waitForFresh's 10ms poll is replaced by a tight one -- so it is a real
 // ordering race, not a slow machine, and no larger timeout anywhere would
 // address it. Waiting on the counter itself does.
+//
+// One residual case this does not close, left open deliberately: the counter
+// counts every rebuild attempt that reached PostgreSQL, failed ones included,
+// and runBootLoad retries until one is adopted. So on a boot whose first
+// attempt fails, this can return on that failure's increment while the
+// adopting attempt's is still pending. It is strictly better than reading the
+// counter unguarded either way -- the claim every caller makes is "a pg
+// rebuild was attempted", which a failed attempt satisfies -- and no caller
+// here compares the count to an exact number. Pairing it with waitForFresh,
+// as every caller does, also means a view has already been adopted by the
+// time it is consulted. A caller that ever needs "the ADOPTING attempt's
+// increment" would have to wait for the count to stop moving instead.
 func waitForRebuildCounted(t *testing.T, eng *Engine, what string) {
 	t.Helper()
 

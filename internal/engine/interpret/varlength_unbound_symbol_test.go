@@ -80,7 +80,7 @@ func TestVarLengthTrailWalksRejectUnboundSymbol(t *testing.T) {
 			// this fixture -- so the errors above are the guards firing, not
 			// an empty graph answering.
 			seed := NewRow()
-			seed.SetNode(step.FromSym, denseNodeOf(t, snap, 3))
+			seed.SetNode(step.FromSym, varLengthDenseNodeOf(t, snap, 3))
 			rows, err := expandVarLengthTrailsForSeed(env, &workMeter{budget: generousBudget},
 				step, part.Nodes[step.ToSym], seed, "", forwardContIDs)
 			if err != nil {
@@ -93,9 +93,9 @@ func TestVarLengthTrailWalksRejectUnboundSymbol(t *testing.T) {
 	}
 }
 
-// denseNodeOf resolves database id to its dense node in snap, failing the
-// test when the fixture does not hold it.
-func denseNodeOf(t *testing.T, snap *snapshot.View, id uint64) snapshot.NodeID {
+// varLengthDenseNodeOf resolves database id to its dense node in snap,
+// failing the test when the fixture does not hold it.
+func varLengthDenseNodeOf(t *testing.T, snap *snapshot.View, id uint64) snapshot.NodeID {
 	t.Helper()
 
 	dense, ok := snap.Dense(id)
