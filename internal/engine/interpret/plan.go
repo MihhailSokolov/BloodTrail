@@ -860,6 +860,15 @@ type partBuilder struct {
 	// conjuncts) and RETURN-item bookkeeping use, so the whole tree only
 	// needs to be walked once per item.
 	touched map[string]bool
+
+	// multiClause is set while the WHERE conjuncts of a Part with more than
+	// one reading clause -- several MATCH clauses, or an OPTIONAL MATCH --
+	// are checked, and for an OPTIONAL MATCH's own WHERE. dawgs places every
+	// pattern predicate of such a Part, the first clause's included, inside
+	// the CTE its last clause is still defining, and the subquery refers to
+	// that CTE by name, which PostgreSQL rejects (42P01, missing FROM-clause
+	// entry), so checkPatternPredicate declines.
+	multiClause bool
 }
 
 // planPart builds one Part from reading (that stage's ReadingClauses),
@@ -917,6 +926,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 	// complete and sufficient by construction -- see Part's doc.
 	whereConjuncts = append(whereConjuncts, pb.desugaredEqualities...)
 
+	pb.multiClause = len(mandatory) > 1 || optionalClause != nil
 	for _, conjunct := range whereConjuncts {
 		pb.touched = map[string]bool{}
 		if !pb.checkExpr(conjunct, true) {
@@ -926,6 +936,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 			return Part{}, nil, false
 		}
 	}
+	pb.multiClause = false
 
 	if !pb.finalizeShortestPaths(whereConjuncts) {
 		return Part{}, nil, false
@@ -1006,6 +1017,11 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 		numericScalars: numericScalars,
 		textScalars:    textScalars,
 		patternSeq:     outer.patternSeq,
+		multiClause:    true,
+		// Anonymous nodes go on numbering from the mandatory side's: a
+		// counter restarted here named the optional `(:G)` like the
+		// mandatory `()`, and the two were joined as one node.
+		anon: outer.anon,
 	}
 
 	// nodes starts EMPTY, deliberately: it must end up holding exactly the
@@ -1018,6 +1034,28 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 		if !pb.addPatternPart(pp) {
 			return Part{}, nil, false
 		}
+	}
+
+	// The left join the executor computes -- every mandatory row once per
+	// optional match, or once null-padded -- is dawgs' answer for one
+	// pattern of one step only. dawgs builds the optional side hop by hop
+	// and pattern by pattern and left-joins only the LAST hop: every
+	// earlier one is an inner join, so a row whose first hop fails is
+	// dropped, and one whose first hop succeeds keeps it with only the last
+	// hop null-padded. A shortest-path step is not that left join either.
+	if len(rc.Match.Pattern) != 1 || len(pb.chains) != 1 || pb.chains[0].Shortest != ShortestNone {
+		return Part{}, nil, false
+	}
+	// A fixed-length step between two nodes the mandatory side bound joins
+	// the edge to the first and then the node table again for the second --
+	// `join node n1 on (s1.n1).id = e0.end_id`, a condition that never
+	// mentions n1 -- so each match comes back once per node in the graph.
+	// (A variable-length step is lowered differently and agrees.)
+	step := pb.chains[0]
+	_, fromBound := outer.known[step.FromSym]
+	_, toBound := outer.known[step.ToSym]
+	if step.Range == nil && fromBound && toBound {
+		return Part{}, nil, false
 	}
 
 	// Now that the pattern's own symbols are known, narrow the shared ones
@@ -1094,6 +1132,11 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 //
 // Everything this refuses is delegated and answered correctly by PostgreSQL.
 func admitOptionalProjection(parts []Part, group *WithClause, proj *Projection, order []OrderKey) bool {
+	for i := range parts {
+		if !optionalJoinKeysEveryMandatoryNode(&parts[i], group, proj) {
+			return false
+		}
+	}
 	optional := optionalOnlySymbols(parts)
 	if len(optional) == 0 {
 		return true
@@ -1120,6 +1163,65 @@ func admitOptionalProjection(parts []Part, group *WithClause, proj *Projection, 
 		}
 		if optional[v.Symbol] {
 			proj.Items[i].Optional = true
+		}
+	}
+	return true
+}
+
+// optionalJoinKeysEveryMandatoryNode reports whether dawgs keys the left
+// join of part's OPTIONAL MATCH on every node of the mandatory pattern, as
+// leftJoinOptional's repeated-row decline assumes. dawgs builds the
+// optional CTE FROM the mandatory one and left-joins the two ON its
+// columns, so k copies of one mandatory row with m optional matches come
+// back k*k*m times, and the engine declines a repeat it sees. But dawgs
+// carries a mandatory node into that CTE only when the rest of the query
+// refers to it: `MATCH (u)-[:M]->(x) OPTIONAL MATCH (u)-[:M]->(g) RETURN u,
+// g` drops x, so two rows that differ only in x are a repeat to dawgs and
+// not to the engine, which answered k*m. Counted as referred to here: a
+// node the optional pattern shares (the join key), and one the projection
+// after the Part -- its WITH, or the RETURN for the last Part -- names as a
+// bare variable, a grouping key or an aggregate's argument. A node
+// mentioned only in a WHERE or through a property is not counted, which
+// can only over-decline. A RETURN DISTINCT without aggregates is exempt: it
+// removes the repeats either way.
+func optionalJoinKeysEveryMandatoryNode(part *Part, group *WithClause, proj *Projection) bool {
+	if part.Optional == nil {
+		return true
+	}
+	referred := map[string]bool{}
+	for _, sym := range part.OptionalShared {
+		referred[sym] = true
+	}
+	referClause := func(wc *WithClause) {
+		for _, key := range wc.GroupKeys {
+			referred[key] = true
+		}
+		for _, agg := range wc.Aggregates {
+			switch {
+			case agg.Count != nil:
+				referred[agg.Count.Sym] = true
+			case agg.Collect != nil:
+				referred[agg.Collect.Sym] = true
+			}
+		}
+	}
+	switch {
+	case part.With != nil:
+		referClause(part.With)
+	case group != nil:
+		referClause(group)
+	case proj.Distinct:
+		return true
+	default:
+		for _, item := range proj.Items {
+			if v, isVar := unwrapParens(item.Expr).(*cypher.Variable); isVar && v != nil {
+				referred[v.Symbol] = true
+			}
+		}
+	}
+	for sym := range part.Nodes {
+		if !referred[sym] {
+			return false
 		}
 	}
 	return true
@@ -1317,6 +1419,20 @@ func (pb *partBuilder) addPatternPart(part *cypher.PatternPart) bool {
 	firstNode, isNode := part.PatternElements[0].AsNodePattern()
 	if !isNode || firstNode == nil {
 		return false
+	}
+	// A pattern that is nothing but a node variable bound earlier -- by an
+	// earlier pattern, clause or Part, or the mandatory side of an OPTIONAL
+	// MATCH -- is not joined to that binding in dawgs' SQL: `MATCH (s)-[:R]->
+	// (t) MATCH (t)` lowers to `from s0, node n1`, a cross join with no
+	// condition on n1, so every row comes back once per node in the graph.
+	// The identity join the executor would make is not that answer, and
+	// imitating a row count that depends on the graph's size is no answer
+	// worth serving, so it declines. Inside a longer pattern the re-mention
+	// is a real join and stays served.
+	if len(part.PatternElements) == 1 && firstNode.Variable != nil && firstNode.Variable.Symbol != "" {
+		if _, bound := pb.known[firstNode.Variable.Symbol]; bound {
+			return false
+		}
 	}
 	fromSym, ok := pb.addNodePattern(firstNode)
 	if !ok {
@@ -2071,6 +2187,20 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 			return
 		}
 	}
+	// A parenthesised property, `(sym.prop) STARTS WITH 'a_b'`, is not a
+	// plain property to dawgs, so the needle reaches LIKE unescaped
+	// (likeNeedle): _ and % are wildcards, and narrowing on the needle
+	// itself would miss `aXb2`. Narrow on a literal run every match carries
+	// instead, as likeCoalesceAnchor does.
+	if !coalesced && match != snapshot.StringEquals && likeNeedle(left, right) {
+		lp, parsed := likeNeedlePattern(match, operand)
+		if !parsed {
+			return
+		}
+		if operand, ok = likePatternRun(lp, match); !ok {
+			return
+		}
+	}
 	// Only a bare `sym.prop = 'x'` is type-strict in pg (dawgs guards it with
 	// jsonb_typeof(...) = 'string'). Every other shape here -- STARTS WITH,
 	// ENDS WITH, CONTAINS, and anything under COALESCE -- compares the `->>`
@@ -2533,6 +2663,26 @@ func coalescePropOpLiteral(propSide, litSide cypher.Expression, sym string, matc
 // WITH, its longest for CONTAINS -- a superset the per-row LIKE then
 // filters exactly. A pattern without such a run gets no anchor.
 func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringMatch, needle string) (string, string, bool) {
+	lp, ok := likeNeedlePattern(match, needle)
+	if !ok {
+		return "", "", false
+	}
+	if raw, isStr := def.Value.(string); isStr {
+		d, err := decodeCypherStringLiteral(raw)
+		if err != nil || lp.regexp().MatchString(d) {
+			return "", "", false
+		}
+	}
+	run, ok := likePatternRun(lp, match)
+	if !ok {
+		return "", "", false
+	}
+	return name, run, true
+}
+
+// likeNeedlePattern parses the LIKE pattern dawgs builds from an unescaped
+// needle for a STARTS WITH (prefix), ENDS WITH (suffix) or CONTAINS match.
+func likeNeedlePattern(match snapshot.StringMatch, needle string) (likePattern, bool) {
 	var op StringOp
 	switch match {
 	case snapshot.StringPrefix:
@@ -2542,34 +2692,27 @@ func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringM
 	case snapshot.StringContains:
 		op = OpContains
 	default:
-		return "", "", false
+		return likePattern{}, false
 	}
 	lp, err := parseLikePattern(likePatternFor(op, needle))
 	if err != nil {
-		return "", "", false
+		return likePattern{}, false
 	}
-	if raw, isStr := def.Value.(string); isStr {
-		d, err := decodeCypherStringLiteral(raw)
-		if err != nil || lp.regexp().MatchString(d) {
-			return "", "", false
-		}
-	}
-	var (
-		run string
-		ok  bool
-	)
+	return lp, true
+}
+
+// likePatternRun returns the literal run every value lp matches carries, in
+// the shape the string index answers for match: the pattern's leading run
+// for a prefix, its trailing run for a suffix, its longest for CONTAINS.
+func likePatternRun(lp likePattern, match snapshot.StringMatch) (string, bool) {
 	switch match {
 	case snapshot.StringPrefix:
-		run, ok = lp.leadingLiteral()
+		return lp.leadingLiteral()
 	case snapshot.StringSuffix:
-		run, ok = lp.trailingLiteral()
+		return lp.trailingLiteral()
 	default:
-		run, ok = lp.longestLiteral()
+		return lp.longestLiteral()
 	}
-	if !ok {
-		return "", "", false
-	}
-	return name, run, true
 }
 
 // coalesceDefaultRejects reports whether def, the value COALESCE yields for a
@@ -3526,13 +3669,19 @@ type sqlClass uint8
 const (
 	// classUnknown is an operand this package does not type statically: a
 	// plain property (jsonb, typed by its partner), an untyped coalesce()
-	// (the same), a node or edge variable, and anything else.
+	// (the same), and anything else.
 	classUnknown sqlClass = iota
 	classNull
 	classText
 	classNumber
 	classBool
 	classArray
+	// classNode and classEdge are a node or edge variable: a composite value
+	// in dawgs' SQL (`n0`, `e0`), which PostgreSQL compares with another of
+	// its own kind or a null and nothing else -- `n0 <> 5` has no operator
+	// (42883), and `n0 <> 'a'` reads 'a' as a composite (0A000).
+	classNode
+	classEdge
 )
 
 // sqlClassOf returns the SQL type family dawgs gives expr on its own:
@@ -3543,7 +3692,8 @@ const (
 // signed operand; boolean for a boolean literal or coalesce() and any
 // predicate; an array for a list literal, labels() and split(). A WITH
 // alias takes its constant's or aggregate's type (numericScalars,
-// textScalars, a collect alias).
+// textScalars, a collect alias), and a node or edge variable is its own
+// class.
 func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 	switch e := expr.(type) {
 	case *cypher.Parenthetical:
@@ -3627,6 +3777,10 @@ func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 			return classText
 		case pb.known[e.Symbol] == symCollectAlias:
 			return classArray
+		case isNodeSymbol(pb.known, e.Symbol):
+			return classNode
+		case isEntitySymbol(pb.known, e.Symbol): // not a node: an edge
+			return classEdge
 		}
 	case *cypher.Comparison, *cypher.Negation, *cypher.Conjunction, *cypher.Disjunction,
 		*cypher.KindMatcher, *cypher.PatternPredicate:
@@ -3640,9 +3794,16 @@ func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 // or an operand this package leaves untyped). Any other pair is an error
 // there -- `text = integer`, `bigint ~ unknown` -- or casts one side's
 // literal into the other's type, which is not the comparison the evaluator
-// makes.
+// makes. A node or edge variable is the exception to the untyped rule: it is
+// comparable with its own kind or a null only.
 func classesComparable(a, b sqlClass) bool {
-	if a == classUnknown || b == classUnknown || a == classNull || b == classNull {
+	if a == classNull || b == classNull {
+		return true
+	}
+	if a == classNode || a == classEdge || b == classNode || b == classEdge {
+		return a == b
+	}
+	if a == classUnknown || b == classUnknown {
 		return true
 	}
 	return a == b
@@ -3864,14 +4025,22 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 			return false
 		case kind != coalesceText && class == classText:
 			return false
+		case class == classNode || class == classEdge:
+			// `n IN [1, 2]` is `node = bigint`.
+			return false
 		}
 	}
 	if rv, ok := unwrapParens(right).(*cypher.Variable); ok && rv != nil {
 		if pb.known[rv.Symbol] == symCollectAlias {
-			if !membershipAllowed {
+			// dawgs lowers only the bare `x IN alias` to id membership. With
+			// either operand parenthesised it is a plain comparison, which
+			// PostgreSQL rejects: `x IN (alias)` is a node against a node
+			// array (42804), `(x) IN alias` a node against bigint (42883).
+			_, bareRight := right.(*cypher.Variable)
+			if !membershipAllowed || !bareRight {
 				return false
 			}
-			lv, ok := unwrapParens(left).(*cypher.Variable)
+			lv, ok := left.(*cypher.Variable)
 			if !ok || lv == nil || !isNodeSymbol(pb.known, lv.Symbol) {
 				return false
 			}
@@ -4054,8 +4223,18 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 //     implements nothing to resolve a fresh node's own constraints inside
 //     its pure two-endpoint adjacency check, so that broader shape stays
 //     planner-rejected rather than mis-served.
+//   - A predicate in a Part with more than one reading clause -- several
+//     MATCH clauses or an OPTIONAL MATCH, in any of their WHEREs, the first
+//     clause's included (partBuilder.multiClause): again a genuine pg
+//     failure, not a scope cut -- dawgs places the subquery inside the CTE
+//     the last clause is still defining, and PostgreSQL rejects the query
+//     (42P01) before reading a row.
 func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 	if pp == nil || len(pp.PatternElements) != 3 {
+		return false
+	}
+	// Only in a Part of a single MATCH clause: see partBuilder.multiClause.
+	if pb.multiClause {
 		return false
 	}
 
