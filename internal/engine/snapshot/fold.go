@@ -27,9 +27,16 @@ import "fmt"
 // exactly the lineage base was loaded from.
 //
 // Fold drops a delta edge whose endpoint is still pending (see
-// FoldWithPendingEdges), which only a caller that knows no write is left to
-// deliver that endpoint may do; the compactor is not such a caller and uses
-// FoldWithPendingEdges instead.
+// FoldWithPendingEdges), silently -- it cannot report what it dropped, which
+// is the whole difference between the two. No caller outside this package's
+// own tests uses it any more, and that is deliberate rather than
+// circumstantial: both engine callers need to know. The compactor carries
+// the pending edges forward onto its new base, and the snapshot save refuses
+// to write a file at all rather than one the fold shortened without saying
+// so (../persist.go's reasonFoldWouldDropPendingEdges), because the file's
+// stamp cannot record that it is short. A new caller that genuinely knows no
+// write is left to deliver an endpoint may use this; one that merely assumes
+// it should not.
 func Fold(base *Snapshot, segments []*Segment) (*Snapshot, error) {
 	folded, _, err := FoldWithPendingEdges(base, segments)
 	return folded, err

@@ -1185,9 +1185,12 @@ them, and keeps that segment on top of the new base until the endpoint lands
 ([§14.1](#141-compaction)). (PostgreSQL has no foreign key from an edge to its nodes, so an
 endpoint may also never arrive; the edge then stays pending, invisible, as it is in the view, and
 every later fold carries it again — which the post-compaction save recognizes as a delta that can
-never empty, [§14.2](#142-the-snapshot-file).) Plain `Fold`, used by the shutdown save, still drops
-them: a save happens only when every counted write has been applied
-([§14.2](#142-the-snapshot-file)), so no endpoint write is still on its way.
+never empty, [§14.2](#142-the-snapshot-file).) The shutdown save uses `FoldWithPendingEdges` too,
+for the opposite reason: a save happens only when every counted write has been applied, so no
+endpoint write is still on its way and dropping such an edge is very probably right — but the file
+cannot record that it is short, so a fold that reports anything pending refuses the save instead
+([§14.2](#142-the-snapshot-file)). Plain `Fold`, which drops them silently, now has no caller
+outside this package's tests.
 
 A randomized property test (`TestFoldMatchesStackedOverlay`) checks that a folded base and the
 layered view it came from are equivalent, compared by database id.
@@ -2976,7 +2979,16 @@ With `BLOODTRAIL_SNAPSHOT_DIR` set, the replica is saved to `<dir>/graph-<graphI
 - on a **clean shutdown**, where `Close` folds the current view and writes it. BloodHound hands
   `Close` a context that is already cancelled, so the save runs on a detached context, with a 5 s
   limit on its database reads (the counter, then the id-sequence positions it stamps the file with);
-  before that was fixed, every shutdown save silently failed;
+  before that was fixed, every shutdown save silently failed. A live BloodHound always has a delta,
+  so this fold is the ordinary case, not an exception — but a fold that reports a *pending* edge
+  (endpoint in neither the base nor any segment, [§6.7](#67-fold)) refuses the save and writes
+  nothing, logging `snapshot file not written` at Warn. The file would otherwise be short of that
+  edge while its stamp is the converged counter that already counts the edge's write, so the next
+  boot would find it exactly current and adopt it. Dropping the edge is very probably right —
+  PostgreSQL matches no pattern through it either — but where it is not, the row is missing from
+  every boot that adopts the file, which is the one outcome this feature exists to rule out, and
+  nothing in memory tells the two apart. The cost is one full load at the next boot, and only in
+  that already-anomalous case;
 - after each **adopted compaction**, unless more writes have arrived since, or the compaction
   carried an edge still waiting for its endpoint (either leaves the adopted view with a segment).
 
@@ -3237,7 +3249,7 @@ every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite (200 tests in 80 files, behind the `integration` build tag) runs against a
+The integration suite (202 tests in 81 files, behind the `integration` build tag) runs against a
 disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
 plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
 in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
@@ -3828,7 +3840,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file rejected`, reason `where PostgreSQL stood when this process started could not be read` | Info | The start-state read failed, so the two checks it feeds cannot be made; no file is adopted this start (with `file_watermark`) |
 | `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
 | `snapshot file rejected`, reason `boot write replay cannot be expressed as a delta: …` | Info | A buffered boot write's read-back met the one key it cannot resolve ([§12.3](#123-reading-back)); the view would otherwise be published missing a row |
-| `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), when a write was applied during the probe, or when a post-compaction save's delta holds only edges whose endpoints cannot be resolved (reason `the delta holds only edges whose endpoints PostgreSQL has not delivered and no applied write will: no later compaction can empty it, so a rebuild was requested`, with `segments`) |
+| `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), when a write was applied during the probe, when a post-compaction save's delta holds only edges whose endpoints cannot be resolved (reason `the delta holds only edges whose endpoints PostgreSQL has not delivered and no applied write will: no later compaction can empty it, so a rebuild was requested`, with `segments`), or when folding the delta would drop a pending edge (reason `folding the delta would drop a delta edge whose endpoint PostgreSQL has not delivered, and the file cannot record that it is short`, with `pending_edges` and `segments`) |
 | `snapshot file skipped` | Debug | A post-compaction save found writes layered on since the adoption; the next compaction's save covers them ([§14.2](#142-the-snapshot-file)) |
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
 | `the write path's own connection pool could not be created` | Warn | Logged once; watermark bumps and read-backs run on BloodHound's pool instead, where a write holding a connection can wait on another's ([§5.2](#52-registration-and-open)) |
