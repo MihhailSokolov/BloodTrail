@@ -16,7 +16,11 @@ import (
 // applyMu, so a second connection is all it takes for neither to wait on
 // the other -- closed after a minute idle, since an engine a caller never
 // stops (every test that builds one directly) would otherwise keep them
-// open for the life of the process.
+// open for the life of the process. Never reduce it to 1: an acquire here uses
+// the caller's context, and TestSaveSnapshotRefusesWhileAnEarlierBumpIsInFlight
+// holds one connection on a stalled bump while a later write needs another, so
+// a single connection makes that test hang to the package timeout rather than
+// fail.
 const (
 	writePathPoolConns    = 2
 	writePathPoolIdleTime = time.Minute

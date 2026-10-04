@@ -487,11 +487,13 @@ Everything below assumes the Go toolchain version from [go.mod](go.mod).
     make tidy          # go mod tidy
 
 The integration suite (every `*_integration_test.go`, behind the `integration` build
-tag) runs against a disposable PostgreSQL, pointed at by `BLOODTRAIL_TEST_PG`:
+tag) runs against a disposable PostgreSQL, pointed at by `BLOODTRAIL_TEST_PG` -- with the
+`sslmode=disable` CI uses, since that server runs with TLS off:
 
 ```sh
 docker compose -f docker-compose.test.yml up -d
-BLOODTRAIL_TEST_PG='postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail' make integration
+BLOODTRAIL_TEST_PG='postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail?sslmode=disable' \
+    make integration
 ```
 
 The suite wipes and reseeds that database freely -- never point it at data you care

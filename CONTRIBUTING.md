@@ -6,10 +6,11 @@ the notes below are what keep it that way.
 ## Development setup
 
 - Go: the version pinned in [go.mod](go.mod).
-- The integration suite needs a disposable PostgreSQL:
+- The integration suite needs a disposable PostgreSQL, reached with the
+  `sslmode=disable` CI uses, since that server runs with TLS off:
 
       docker compose -f docker-compose.test.yml up -d
-      export BLOODTRAIL_TEST_PG='postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail'
+      export BLOODTRAIL_TEST_PG='postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail?sslmode=disable'
 
   The suite wipes and reseeds that database freely.
 
