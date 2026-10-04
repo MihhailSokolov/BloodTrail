@@ -71,7 +71,7 @@ func TestDriverLevelWritePanicSettlesItsWatermarkBump(t *testing.T) {
 	}
 
 	d.pgOverride = &panickingPGBackend{tx: rawPanicTransaction{}, panicAfterDelegate: true}
-	recovered := panicValueOf(func() { _ = d.Run(ctx, "MATCH (n) DELETE n", nil) })
+	recovered := writePathPanicValueOf(func() { _ = d.Run(ctx, "MATCH (n) DELETE n", nil) })
 	if recovered != driverPanicValue {
 		t.Fatalf("recovered %v, want the embedded driver's own panic %q unchanged", recovered, driverPanicValue)
 	}

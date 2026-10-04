@@ -118,7 +118,7 @@ func TestDriverCapabilityWritePanicsSettleByWhereThePanicArose(t *testing.T) {
 			d := &Driver{engine: eng, pgOverride: tc.backend}
 			before := eng.ApplyCount()
 
-			recovered := panicValueOf(func() { _ = tc.call(context.Background(), d) })
+			recovered := writePathPanicValueOf(func() { _ = tc.call(context.Background(), d) })
 			if recovered != driverPanicValue {
 				t.Fatalf("recovered %v, want the embedded driver's own panic %q unchanged", recovered, driverPanicValue)
 			}
@@ -216,7 +216,7 @@ func TestDriverWriteTransactionMidCommitPanicIsNotClassifiedAsARollback(t *testi
 	inner.commitHook = func() { panic(driverPanicValue) }
 	d := &Driver{engine: eng, pgOverride: &fakePGBackend{tx: inner}}
 
-	recovered := panicValueOf(func() {
+	recovered := writePathPanicValueOf(func() {
 		_ = d.WriteTransaction(context.Background(), func(tx graph.Transaction) error {
 			if _, err := tx.CreateNode(graph.NewProperties()); err != nil {
 				return err
