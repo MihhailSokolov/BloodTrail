@@ -52,8 +52,21 @@ func Fold(base *Snapshot, segments []*Segment) (*Snapshot, error) {
 // to meet. The caller layers the returned segment on the folded base beneath
 // everything published after segments, which keeps every such edge exactly
 // as the overlay had it -- including one whose endpoint never arrives
-// (PostgreSQL does not require an edge's endpoints to exist), which stays as
-// invisible as it was.
+// (PostgreSQL does not require an edge's endpoints to exist: its edge table
+// names them by id with no foreign key to node), which stays as invisible as
+// it was.
+//
+// An endpoint that never arrives means this segment is handed back, in full,
+// by every subsequent fold too, so the compactor's View never loses its
+// delta. That is correct here and has a cost elsewhere, which this function
+// is deliberately not the place to pay: the engine's post-compaction
+// snapshot save only writes a file when the delta is empty, so a carry that
+// never ends used to stop it writing one ever again. The save recognizes
+// that delta itself -- View.DeltaHoldsOnlyUnresolvableEdges, which is
+// exactly "the next fold would carry all of this again" -- and asks for a
+// rebuild rather than this function guessing at a fold count past which an
+// endpoint is presumed never to come (../persist.go's
+// noteSkippedCompactionSave).
 //
 // An edge with an endpoint that is GONE -- tombstoned by the segments -- is
 // dropped, as Fold always did: node ids are never reused, so nothing can

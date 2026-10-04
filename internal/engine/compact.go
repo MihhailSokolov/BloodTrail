@@ -551,15 +551,22 @@ func (e *Engine) runCompaction(capturedBase *snapshot.Snapshot, capturedSegs []*
 	released = true
 	e.compacting.Store(false)
 
-	// carried_edges is the one number that explains a post-compaction save
-	// that never happens: a delta edge whose endpoint has not arrived is
-	// re-carried by every compaction (adoptCompaction's pending), so the
+	// carried_edges is what explains a post-compaction save that is skipped
+	// although nothing is wrong: a delta edge whose endpoint has not arrived
+	// is re-carried by every compaction (adoptCompaction's pending), so the
 	// adopted View always has a segment, and a save that requires an empty
-	// delta is skipped every time (saveSnapshotAfterCompaction, persist.go).
-	// An endpoint that never arrives makes that permanent, and without this
-	// attribute nothing said so: the save's own line is at Debug and names
-	// only the segment count, and the delta that triggered this compaction
-	// looks the same from outside whether or not anything was carried.
+	// delta is skipped (saveSnapshotAfterCompaction, persist.go). The delta
+	// that triggered this compaction looks the same from outside whether or
+	// not anything was carried, so without this attribute the two cases are
+	// indistinguishable in the log.
+	//
+	// It is no longer what distinguishes a skip that repeats forever: the
+	// save itself now recognizes a delta of nothing but unresolvable edges
+	// -- the one a fold carries forward in full however often it runs -- and
+	// says so at Warn, asking for the rebuild that clears it
+	// (noteSkippedCompactionSave, persist.go). This number still says how
+	// much is being carried while that is in flight, and across the
+	// ordinary, transient carry it reports on every fold.
 	e.cfg.Log.InfoContext(e.bgCtx, "bloodtrail: compaction finished",
 		slog.Int("nodes", folded.NodeCount()),
 		slog.Int("edges", folded.EdgeCount()),
