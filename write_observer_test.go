@@ -1187,10 +1187,14 @@ func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T)
 		t.Fatalf("Commit did not reset scope after the inner Commit failed")
 	}
 	// The commit's outcome is ambiguous (the error can be pg's own COMMIT
-	// failing after a durable write, or a rollback), and a recognized
-	// kind-scoped delete replays as an instruction with no read-back key --
-	// so the applied scope must carry a fallback record, making that Apply a
-	// rebuild rather than a replay.
+	// failing after a durable write, or a rollback), so the applied scope must
+	// carry a fallback record, making that Apply a rebuild rather than a
+	// replay. Every change shape is keyed now -- a recognized kind-scoped
+	// delete is a read-back too, its criteria only choosing which of the View's
+	// rows to re-read by id -- so the fallback is no longer what makes the
+	// ambiguous outcome safe. It is kept as the conservative answer, correct
+	// under either outcome for the price of one background rebuild on a path
+	// that is already exceptional (observingTransaction.Commit's own doc).
 	if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
 		t.Fatalf("a failed Commit must record a fallback on the scope it applies (ambiguous outcome)")
 	}

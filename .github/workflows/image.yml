@@ -15,8 +15,18 @@ permissions:
   contents: read
   packages: write
 jobs:
+  # Without timeout-minutes a hung step runs for GitHub's default 360 minutes.
+  # It matters more here than anywhere: release.yml calls this workflow, and a
+  # job calling a reusable workflow may not set a bound of its own, so these
+  # two are what stop a hung image build from holding a release open. The
+  # bounds come from past runs of this workflow -- `discover` queries the
+  # registry and has never reached a minute, `build` builds a multi-arch image
+  # per upstream tag and has taken at most 8 minutes (about 6 typically) --
+  # and leave several times that, since a bound that trips on a slow registry
+  # or a new upstream with more layers would fail a legitimate release.
   discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
@@ -51,6 +61,7 @@ jobs:
     needs: discover
     if: needs.discover.outputs.tags != '[]'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       # One tag's transient failure (a flaky registry or sumdb fetch) must
       # not cancel the other tags' builds -- each tag publishes on its own.
