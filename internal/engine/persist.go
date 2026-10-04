@@ -57,8 +57,9 @@ import (
 // uses for adoptRebuiltView's own epoch check -- without either method
 // needing a production-only synchronization hook.
 //
-// Three cases are a no-op, returning nil rather than an error, because
-// there is genuinely nothing to save, not because anything went wrong:
+// Four cases are a no-op, returning nil rather than an error, because
+// there is genuinely nothing to save, or nothing that could be saved
+// honestly, not because anything went wrong:
 //
 //   - The snapshot-file feature is disabled (cfg.SnapshotDir == "");
 //     snapshotFilePath reports this without ever touching the filesystem.
@@ -71,6 +72,10 @@ import (
 //     mismatch actually costs differs by caller -- see the Warn log's own
 //     doc in saveSnapshotCommit for why this is worded caller-neutrally
 //     rather than assuming the shutdown caller's stakes.
+//   - Folding the delta would drop a delta edge whose endpoint has not been
+//     delivered, which would write a file shorter than its own stamp claims
+//     (reasonFoldWouldDropPendingEdges, below). An ordinary non-empty delta
+//     leaves nothing pending and is folded and written as always.
 //
 // A failure past that point -- Fold, or WriteSnapshotFile itself -- is
 // logged at Warn and returned as an error. Driver.Close logs nothing
@@ -88,6 +93,19 @@ func (e *Engine) SaveSnapshot(ctx context.Context) error {
 // explains exactly what that changes and why a caller running against live
 // traffic -- rather than after Stop, SaveSnapshot's own guarantee -- needs
 // it.
+//
+// Requiring an empty delta makes this save's success conditional on
+// something this call does not control: that a later compaction empties the
+// delta. For ordinary Apply traffic it does, and the skip is a short wait.
+// For a delta of nothing but edges whose endpoints cannot be resolved it
+// never does -- a fold carries exactly those forward, in full, every time
+// (snapshot.FoldWithPendingEdges) -- and this call used to leave the engine
+// there for good: no snapshot file written again for the rest of the
+// process's life, and a full PostgreSQL rebuild at every restart. That case
+// is recognized and resolved by noteSkippedCompactionSave, below, which asks
+// for one rebuild now instead of one at every restart; see its doc for why a
+// rebuild rather than dropping the edges, and for what makes "those
+// endpoints are not coming" a fact at this point rather than a guess.
 func (e *Engine) saveSnapshotAfterCompaction(ctx context.Context) error {
 	return e.saveSnapshot(ctx, true)
 }
@@ -271,14 +289,19 @@ func (e *Engine) saveSnapshotProbe(ctx context.Context) (epoch uint64, stamp sna
 // under this same lock, immediately after the precondition check) --
 // nothing layered on since whatever last cleared the delta -- in which case
 // snap is already just view.Base() and no Fold call happens AT ALL, empty
-// or not (see the code below); a non-empty delta is left entirely alone,
-// logged at Debug, and NOT written this time -- the next compaction's own
-// save attempt gets another chance once ITS OWN adoption has cleared the
-// delta again. When requireEmptyDelta is false (SaveSnapshot, the shutdown
-// caller), the original behavior is unchanged: Fold runs inside the lock
-// whenever the delta is non-empty, because for THAT caller specifically the
-// "no live traffic" premise above still holds, and a shutdown gets exactly
-// one attempt to persist whatever delta exists, empty or not.
+// or not (see the code below); a non-empty delta is left entirely alone and
+// NOT written this time (noteSkippedCompactionSave, below, which logs it and
+// -- for the one delta no later compaction can empty -- asks for the rebuild
+// that clears it) -- the next compaction's own save attempt gets another
+// chance once ITS OWN adoption has cleared the delta again. When
+// requireEmptyDelta is false (SaveSnapshot, the shutdown caller), the fold
+// still runs inside the lock whenever the delta is non-empty, because for
+// THAT caller specifically the "no live traffic" premise above still holds,
+// and a shutdown gets exactly one attempt to persist whatever delta exists.
+// What that attempt may not do is persist LESS than the delta it folded:
+// the fold reports the delta edges it could not place, and a fold that
+// reports any refuses the save instead of writing a file shorter than its
+// own stamp claims (reasonFoldWouldDropPendingEdges, below).
 //
 // The file WRITE, once a snap is decided (folded or bare base), never runs
 // inside the lock either way: applyMu is released before WriteSnapshotFile's
@@ -399,24 +422,25 @@ func (e *Engine) saveSnapshotPrepare(ctx context.Context, epoch uint64, converge
 	segments := view.Segments()
 	if requireEmptyDelta && len(segments) > 0 {
 		e.applyMu.Unlock()
-		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot file skipped",
-			// Not a promise: a delta edge whose endpoint never arrives is
-			// re-carried by every compaction, so for as long as one is
-			// carried this skip repeats and no file is written at all. The
-			// "compaction finished" line's carried_edges (compact.go) is
-			// what tells the two apart.
-			slog.String("reason", "segments pending since adoption; a later compaction's save covers them once nothing is left pending"),
-			slog.Int("segments", len(segments)),
-		)
+		e.noteSkippedCompactionSave(ctx, view, len(segments))
 		return nil, nil
 	}
 
 	foldStart := time.Now()
 	base := view.Base()
 	snap := base
-	var foldErr error
+	var (
+		pendingEdges *snapshot.Segment
+		foldErr      error
+	)
 	if len(segments) > 0 {
-		snap, foldErr = snapshot.Fold(base, segments)
+		// FoldWithPendingEdges, not Fold, for the pending segment rather
+		// than the fold itself: Fold IS this call with that segment thrown
+		// away, and throwing it away is exactly what must not happen here
+		// (see the refusal below). Asking the fold rather than classifying
+		// the delta separately is what keeps this caller and the compactor
+		// on one definition of "pending".
+		snap, pendingEdges, foldErr = snapshot.FoldWithPendingEdges(base, segments)
 	}
 	foldDuration := time.Since(foldStart)
 
@@ -426,7 +450,156 @@ func (e *Engine) saveSnapshotPrepare(ctx context.Context, epoch uint64, converge
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file write failed", slog.String("step", "fold"), slog.Any("error", foldErr))
 		return nil, fmt.Errorf("engine: SaveSnapshot: fold: %w", foldErr)
 	}
+	if pendingEdges != nil {
+		// A file is refused, never written short -- see
+		// reasonFoldWouldDropPendingEdges' own doc for the whole argument.
+		// Nothing is requested or repaired from here: this caller runs after
+		// Stop (SaveSnapshot's own contract), so there is no rebuild left to
+		// ask for; the next boot's own PostgreSQL load is the repair.
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
+			slog.String("reason", reasonFoldWouldDropPendingEdges),
+			slog.Int("pending_edges", pendingEdges.EdgeCount()),
+			slog.Int("segments", len(segments)),
+		)
+		return nil, nil
+	}
 	return &pendingSnapshotSave{snap: snap, dirtyGen: dirtyGen, foldDuration: foldDuration}, nil
+}
+
+// reasonFoldWouldDropPendingEdges is the "reason" a save refused because
+// folding its delta would drop a pending edge logs (saveSnapshotPrepare).
+//
+// Only the shutdown caller can reach it. The compaction caller requires an
+// empty delta, and an empty delta runs no fold at all, so it never has a
+// pending segment to find.
+//
+// What it refuses, and why that is the only safe answer:
+// snapshot.FoldWithPendingEdges hands back the delta edges whose endpoint is
+// in neither the base nor any segment, and plain Fold is that same call with
+// that segment discarded -- which is to say, with those edges dropped from
+// the snapshot. For a shutdown save, dropping them is very probably correct:
+// the preconditions above include a converged counter and the epoch guard
+// has proven no Apply raced the probe, so every write PostgreSQL accepted has
+// been applied, and an endpoint still missing is one PostgreSQL has no node
+// row for (see noteSkippedCompactionSave's own doc). PostgreSQL matches no
+// pattern through such an edge either, so a file without it serves the same
+// answers.
+//
+// "Very probably" is the problem, and the file has no way to say it. Its
+// stamp is the converged counter, which already counts the dropped edge's
+// own write, so the next boot's gap check finds the file exactly current
+// (bootGapCoveredAt, boot.go) and adopts it without question. In the one
+// case where dropping is NOT right -- the endpoint is a row PostgreSQL does
+// hold that some applied write's own ChangeSet never named, so the carried
+// edge is what would have healed when a later write named that node -- the
+// adopted replica is short a row PostgreSQL has, every boot, for as long as
+// the file is regenerated from the same state. That is the one outcome this
+// whole feature exists to rule out, and nothing in memory can tell the two
+// cases apart (only PostgreSQL can, which is what the live caller's rebuild
+// request asks).
+//
+// So the file is refused rather than written short. The cost is the one a
+// refused save always has -- the next boot falls back to a full PostgreSQL
+// load, correct but slower -- and it is paid only when something is already
+// anomalous: an ordinary non-empty delta, which a live BloodHound always
+// has, leaves nothing pending and is still folded and written exactly as
+// before (TestShutdownSaveWritesANonEmptyDeltaWithNothingPending pins that
+// half, and TestShutdownSaveRefusesToWriteAFileTheFoldWouldShorten the
+// other).
+//
+// Whatever file an earlier successful save left behind is deliberately left
+// in place, like every other refusal here: it carries an older counter, and
+// the writes made since belong to this process, so no later boot's own
+// buffer can account for the gap and the file can only be refused -- never
+// adopted as current. A file that is unprovable rather than merely out of
+// date is a different matter and is removed (invalidateSnapshotFile).
+const reasonFoldWouldDropPendingEdges = "folding the delta would drop a delta edge whose endpoint PostgreSQL has not delivered, " +
+	"and the file cannot record that it is short"
+
+// reasonUnresolvableDelta is the "reason" a post-compaction save refused
+// over a delta that can never empty logs (noteSkippedCompactionSave).
+const reasonUnresolvableDelta = "the delta holds only edges whose endpoints PostgreSQL has not delivered and no applied write will: " +
+	"no later compaction can empty it, so a rebuild was requested"
+
+// noteSkippedCompactionSave logs a post-compaction save that was skipped for
+// a non-empty delta, and -- for the one such delta that can NEVER empty --
+// asks for the rebuild that is the only thing which can clear it.
+//
+// Called with applyMu already released: view is immutable once published
+// (snapshot/view.go's package doc), so the classification below reads a
+// fixed object, and it must not be the thing that holds every write's lock
+// for a pass over a delta of arbitrary size -- the very cost
+// requireEmptyDelta exists to avoid.
+//
+// The ordinary skip is a wait, and a short one: whatever Apply traffic piled
+// onto the View since the adoption is folded into the base by the NEXT
+// compaction, which empties the delta and whose own save then writes the
+// file. It is logged at Debug because nothing is wrong.
+//
+// The skip that is not a wait is a delta holding nothing but edge records
+// whose endpoints cannot be resolved (View.DeltaHoldsOnlyUnresolvableEdges):
+// a fold carries exactly those forward, in full, every time -- that is
+// deliberate, because an endpoint still on its way has to find its edge
+// waiting (FoldWithPendingEdges) -- so for as long as one is carried this
+// skip repeats, and before this branch existed no snapshot file was written
+// again for the rest of the process's life. Every subsequent restart then
+// rebuilt the whole replica from PostgreSQL, which is strictly worse than the
+// one rebuild requested here.
+//
+// Reaching this branch at all is what makes "no applied write will deliver
+// those endpoints" a fact rather than a guess, and it is the reason this
+// decision lives in the save path rather than in the compactor: the
+// preconditions already checked above (saveSnapshotPreconditionsFor) include
+// a CONVERGED watermark counter, and saveSnapshotCommit's epoch guard has
+// proven no Apply call ran across the whole window from that counter read to
+// this moment. Converged means nothing bumped is still in flight and every
+// counted value has resolved -- so every write PostgreSQL has accepted has
+// already had its Apply. An endpoint missing here is therefore not a write
+// this engine is waiting on; it is an id PostgreSQL has no node row for in
+// this graph (its edge table names endpoints with no foreign key to node --
+// dawgs v0.8.0's schema_up.sql), or one some applied write's own ChangeSet
+// never named. The transient case this must not misfire on -- an edge whose
+// endpoint write committed and has not applied -- cannot reach here at all:
+// that write's bump is still in flight, so converged is false and the save
+// was already refused above, by the precondition check, without consulting
+// the delta.
+//
+// A rebuild, not a drop, and deliberately: those two explanations need
+// OPPOSITE handling. If PostgreSQL has no such node row, the edge is
+// unservable there too and dropping it would be right; if PostgreSQL does
+// have the row, the replica is already missing it, the carried edge is what
+// heals the moment some later write names that node, and dropping it would
+// turn a recoverable gap into a permanently missing served row. Nothing in
+// memory distinguishes them. A rebuild asks PostgreSQL, and is correct either
+// way: it republishes the replica from PostgreSQL itself, with an empty delta
+// (adoptRebuiltView publishes a bare NewView), so saves resume and no served
+// row can be wrong. Its cost when it was not needed -- the endpoint turns up
+// in some later write after all -- is one snapshot load, rate-limited to one
+// per trustRebuildMinInterval by requestTrustRebuild, which is the same
+// limiter the identical "every save refused for the rest of the process's
+// life" case already goes through (saveSnapshotProbe's unresolved counter,
+// above).
+//
+// Not while shutting down, for saveSnapshotProbe's own reason: Driver.Close
+// calls Stop before its save, so a rebuild requested here could only find
+// its context already cancelled, and would say so on an otherwise quiet
+// path. Nothing is lost -- the next start reads PostgreSQL fresh regardless.
+func (e *Engine) noteSkippedCompactionSave(ctx context.Context, view *snapshot.View, segments int) {
+	if !view.DeltaHoldsOnlyUnresolvableEdges() {
+		e.cfg.Log.DebugContext(ctx, "bloodtrail: snapshot file skipped",
+			slog.String("reason", "segments pending since adoption; a later compaction's save covers them once nothing is left pending"),
+			slog.Int("segments", segments),
+		)
+		return
+	}
+
+	e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
+		slog.String("reason", reasonUnresolvableDelta),
+		slog.Int("segments", segments),
+	)
+	if e.bgCtx.Err() == nil {
+		e.requestTrustRebuild()
+	}
 }
 
 // writeSnapshotFile is the file write saveSnapshotWrite runs:

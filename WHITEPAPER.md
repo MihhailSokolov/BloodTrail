@@ -1183,10 +1183,14 @@ and the view shows the edge as soon as the node arrives. Compaction therefore us
 `FoldWithPendingEdges`, which returns such edges in a small edge-only segment instead of dropping
 them, and keeps that segment on top of the new base until the endpoint lands
 ([§14.1](#141-compaction)). (PostgreSQL has no foreign key from an edge to its nodes, so an
-endpoint may also never arrive; the edge then stays pending, invisible, as it is in the view.)
-Plain `Fold`, used by the shutdown save, still drops them: a save happens only when every counted
-write has been applied ([§14.2](#142-the-snapshot-file)), so no endpoint write is still on its
-way.
+endpoint may also never arrive; the edge then stays pending, invisible, as it is in the view, and
+every later fold carries it again — which the post-compaction save recognizes as a delta that can
+never empty, [§14.2](#142-the-snapshot-file).) The shutdown save uses `FoldWithPendingEdges` too,
+for the opposite reason: a save happens only when every counted write has been applied, so no
+endpoint write is still on its way and dropping such an edge is very probably right — but the file
+cannot record that it is short, so a fold that reports anything pending refuses the save instead
+([§14.2](#142-the-snapshot-file)). Plain `Fold`, which drops them silently, now has no caller
+outside this package's tests.
 
 A randomized property test (`TestFoldMatchesStackedOverlay`) checks that a folded base and the
 layered view it came from are equivalent, compared by database id.
@@ -2985,9 +2989,11 @@ total size on each new view, so they must periodically be folded back into a fre
   base, which works because segments identify things by database id. An edge whose endpoint has
   not arrived yet thus stays in the delta, invisible, until the endpoint's write lands, instead of
   being lost; how many were carried is reported as `carried_edges` on the `compaction finished`
-  line, because that is what a save skipped for a non-empty delta is otherwise silent about. The
-  new view is warmed and published, and the snapshot file is written
-  ([§14.2](#142-the-snapshot-file)).
+  line, because the delta that triggered the fold looks the same from outside whether or not
+  anything was carried. An endpoint that *never* arrives is carried by every fold, so the delta
+  never empties on its own; the save that follows recognizes that delta and asks for one rebuild
+  rather than leaving it there ([§14.2](#142-the-snapshot-file)). The new view is warmed and
+  published, and the snapshot file is written ([§14.2](#142-the-snapshot-file)).
 - **A panic** while folding or adopting is recovered (`foldAndAdoptCompaction`): it logs
   `bloodtrail: compaction panicked` at Error and enters FALLBACK, instead of ending the process.
   The snapshot save that follows an adoption is outside that recovery on purpose: it releases the
@@ -3008,12 +3014,42 @@ With `BLOODTRAIL_SNAPSHOT_DIR` set, the replica is saved to `<dir>/graph-<graphI
 - on a **clean shutdown**, where `Close` folds the current view and writes it. BloodHound hands
   `Close` a context that is already cancelled, so the save runs on a detached context, with a 5 s
   limit on its database reads (the counter, then the id-sequence positions it stamps the file with);
-  before that was fixed, every shutdown save silently failed;
+  before that was fixed, every shutdown save silently failed. A live BloodHound always has a delta,
+  so this fold is the ordinary case, not an exception — but a fold that reports a *pending* edge
+  (endpoint in neither the base nor any segment, [§6.7](#67-fold)) refuses the save and writes
+  nothing, logging `snapshot file not written` at Warn. The file would otherwise be short of that
+  edge while its stamp is the converged counter that already counts the edge's write, so the next
+  boot would find it exactly current and adopt it. Dropping the edge is very probably right —
+  PostgreSQL matches no pattern through it either — but where it is not, the row is missing from
+  every boot that adopts the file, which is the one outcome this feature exists to rule out, and
+  nothing in memory tells the two apart. The cost is one full load at the next boot, and only in
+  that already-anomalous case;
 - after each **adopted compaction**, unless more writes have arrived since, or the compaction
   carried an edge still waiting for its endpoint (either leaves the adopted view with a segment).
-  An endpoint that never arrives therefore stops these saves until the next restart; the shutdown
-  save still writes. The `compaction finished` line's `carried_edges` is where that shows, since
-  the skipped save itself logs at Debug.
+
+For the first of those, the skip is a short wait, logged at Debug: the next compaction folds those
+writes into the base and its own save writes the file. For the second it is only a wait while the
+endpoint is still coming. An endpoint that never arrives is carried by every fold, so the delta
+never empties, and the skip used to repeat for the rest of the process's life — no file written
+again, and a full PostgreSQL load at every restart. The save therefore checks whether the delta
+holds *nothing but* edges whose endpoints cannot be resolved, which is exactly the delta a fold
+hands back unchanged however often it runs, and in that one case logs `snapshot file not written`
+at Warn and asks for a rebuild (rate-limited to one per 30 s, the same limiter a save refused over
+an unaccounted counter goes through, [§13.4](#134-one-writer)). A rebuild loads the replica from
+PostgreSQL with an empty delta, so saves resume.
+
+That it asks PostgreSQL, rather than dropping the edges, is the point. A save is only ever
+attempted at an instant where the counter has converged and no write was applied during the probe
+(below), which proves every write PostgreSQL has accepted has already been applied — so an
+endpoint missing *there* is not a write still on its way. It is an id PostgreSQL has no node row
+for (its edge table has no foreign key to `node`), in which case PostgreSQL serves no path through
+that edge either and dropping it would be right; or it is a row PostgreSQL does hold that some
+applied write's own change set never named, in which case the replica is already missing it, the
+carried edge is what heals when a later write names that node, and dropping it would make a missing
+row permanent. Nothing held in memory tells the two apart. A rebuild is correct for both, and its
+cost when it was not needed is one load instead of one per restart. The edge whose endpoint arrives
+late is untouched: its write's bump is still in flight, so the counter has not converged and the
+save is refused before the delta is ever examined.
 
 A file is written only when the engine can prove the replica complete (SERVING, trusted, watermark
 converged, [§13.1](#131-the-counter)), no write was applied while the counter was being read, the
@@ -3238,7 +3274,7 @@ project checks that in four layers.
 
 ### 16.1 Unit tests
 
-About 1,050 unit tests in 152 files cover every component on its own: the data structures (including
+About 1,060 unit tests in 153 files cover every component on its own: the data structures (including
 randomized tests that compare the overlay fast paths with a slow, obviously correct walk, edge by
 edge, and folded bases with the layered views they came from), the search engine (bidirectional
 search checked against brute force, the depth ceiling, buffer reuse), the recognizers, the
@@ -3248,7 +3284,7 @@ every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite (197 tests in 79 files, behind the `integration` build tag) runs against a
+The integration suite (202 tests in 81 files, behind the `integration` build tag) runs against a
 disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
 plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
 in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
@@ -3847,7 +3883,8 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file rejected`, reason `where PostgreSQL stood when this process started could not be read` | Info | The start-state read failed, so the two checks it feeds cannot be made; no file is adopted this start (with `file_watermark`) |
 | `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
 | `snapshot file rejected`, reason `boot write replay cannot be expressed as a delta: …` | Info | A buffered boot write's read-back met the one key it cannot resolve ([§12.3](#123-reading-back)); the view would otherwise be published missing a row |
-| `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), or when a write was applied during the probe |
+| `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), when a write was applied during the probe, when a post-compaction save's delta holds only edges whose endpoints cannot be resolved (reason `the delta holds only edges whose endpoints PostgreSQL has not delivered and no applied write will: no later compaction can empty it, so a rebuild was requested`, with `segments`), or when folding the delta would drop a pending edge (reason `folding the delta would drop a delta edge whose endpoint PostgreSQL has not delivered, and the file cannot record that it is short`, with `pending_edges` and `segments`) |
+| `snapshot file skipped` | Debug | A post-compaction save found writes layered on since the adoption; the next compaction's save covers them ([§14.2](#142-the-snapshot-file)) |
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
 | `the write path's own connection pool could not be created` | Warn | Logged once; watermark bumps and read-backs run on BloodHound's pool instead, where a write holding a connection can wait on another's ([§5.2](#52-registration-and-open)) |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
@@ -3857,7 +3894,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
 | `snapshot file invalidation failed` / `snapshot file not invalidated` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`), or no file path could be worked out yet, so there was nothing to delete (reason `no snapshot file path resolved yet`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
-| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above). `finished` carries `carried_edges`: delta edges re-carried because their endpoint has not arrived, which is what keeps the post-compaction save from writing a file ([§14.2](#142-the-snapshot-file)) |
+| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above). `finished` carries `carried_edges`: delta edges re-carried because their endpoint has not arrived, which is what leaves the post-compaction save with a non-empty delta and no file to write ([§14.2](#142-the-snapshot-file)) |
 
 ## Appendix C: Code map
 
