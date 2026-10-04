@@ -2387,7 +2387,8 @@ after the `DELETE`'s snapshot, and whose apply ran first, must survive. An earli
 the delete out against the view as an instruction ("tombstone every edge of kind K") and erased such
 rows while staying SERVING. With read-back the result no longer depends on the order in which
 concurrent writes are applied, and the one key a read-back cannot resolve -- an objectid-keyed edge
-endpoint named by neither PostgreSQL nor the view -- is a reload rather than a missing row
+BOTH of whose endpoints are named by neither PostgreSQL nor the view, so that neither one can
+anchor a lookup of the edge -- is a reload rather than a missing row
 ([§12.3](#123-reading-back)). A delete whose criteria name
 more rows than PostgreSQL deleted costs only extra re-reads. Enumerating the candidates scans the
 view's kind bitsets (or every node for an empty `include`) or the edge-kind column once, inside
@@ -2438,9 +2439,9 @@ runs it as a transaction of its own whose `COMMIT` can fail after PostgreSQL mad
 A batch that returned an error also has that fact recorded alongside its keys
 (`settleBatchOutcome`, `ChangeSet.RecordWriteIncomplete`), which asks for nothing by itself and is
 not a fallback. It exists for the one key shape where "PostgreSQL has no such row" is ambiguous
-rather than benign -- an objectid-keyed edge endpoint that matches nothing
-([§12.3](#123-reading-back)) -- since what that means depends entirely on whether the write that
-recorded it got as far as creating the row.
+rather than benign -- an objectid-keyed edge whose endpoints match nothing and whose edge therefore
+cannot be looked up either ([§12.3](#123-reading-back)) -- since what that means depends entirely
+on whether the write that recorded it got as far as creating the row.
 
 ### 12.3 Reading back
 
@@ -3755,12 +3756,10 @@ in the [README](README.md).
   stages what comes back together with the endpoint the row names by id, and so needs neither a
   reload nor a guess, whatever the write reported ([§12.3](#123-reading-back)). Two cases are left,
   both of which cost a reload for a write that returned cleanly and are skipped for one that
-  returned an error:
-  - **Neither endpoint can be named** -- both objectids re-keyed, or both endpoints belonging to
-    writes not yet applied -- so there is nothing to anchor a query on.
-  - **The nameable endpoint is a hub**, carrying more than 5,000 edges of that kind, which is more
-    than one read-back query will scan while it holds the publishing mutex.
-
+  returned an error: *neither* endpoint can be named (both objectids re-keyed, or both endpoints
+  belonging to writes not yet applied), so there is nothing to anchor a query on; or the nameable
+  endpoint is a hub, carrying more than 5,000 edges of that kind, which is more than one read-back
+  query will scan while it holds the publishing mutex.
   The skip for a write that returned an error is deliberate: an unresolvable objectid is then the
   ordinary outcome of a node that was never created, and a fallback would rebuild the replica after
   every failed ingest batch carrying relationship upserts. So an upsert of one of those two shapes
