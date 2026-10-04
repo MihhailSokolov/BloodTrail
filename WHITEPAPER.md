@@ -2186,9 +2186,24 @@ instead. Establishing the narrower condition would cost one cycle search per sha
 endpoint unconstrained, one per node of the other side, more work than the query itself — so the
 broad rule stands. Declining is always safe.
 
-The search's row and memory limits are derived from the remaining work budget; finding more paths
-than affordable declines the query rather than truncating it. When the search itself enforces every
-remaining condition, the query's own `LIMIT` is also passed into it (below).
+The search's row and memory limits are derived from the remaining work budget, capped by the
+live-row budget ([§11.9](#119-budgets)); finding more paths than affordable declines the query
+rather than truncating it. When the search itself enforces every remaining condition, the query's
+own `LIMIT` is also passed into it (below).
+
+The live-row cap is what keeps those two limits honest. The set of paths the search returns is
+converted row by row, and that conversion refuses any set larger than `maxCypherLiveRows`, so a
+component with more paths than that declines whatever the search was allowed to collect — but it
+declines only after the search has already built the whole set. Derived from the remaining work
+alone, the limits allowed about 268 million paths and roughly 60 GiB before anything refused; a
+path was measured to cost about 472–482 bytes of resident memory, so a query could have reached
+tens of gigabytes resident in a process that already holds the whole graph in memory. Capping both
+limits at the live-row budget moves the same refusal in front of that work: about 2 million paths
+and 458 MiB at the default maximum depth, a reduction of about 134 times. Nothing that served
+before stops serving, because the cap is exactly the largest set the conversion would have
+accepted. The byte cap still scales with the query's own resolved depth, so a query carrying an
+explicit deep range keeps its proportional room — a flat ceiling tight enough to matter at depth
+15 would have refused one that works today.
 
 None of the pre-built queries in BloodHound v9.6.0 uses `allShortestPaths` (the shortest-path
 entries all use `shortestPath`), and the pathfinding page always asks about one pair, so the two

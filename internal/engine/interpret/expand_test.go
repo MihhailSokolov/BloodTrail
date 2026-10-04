@@ -1246,6 +1246,29 @@ func TestExpandShortestPathBudget(t *testing.T) {
 			wantBound:  true,
 			wantRowCap: 0,
 		},
+		{
+			// MaxLiveRows is the ceiling the conversion loop enforces via
+			// observeRows, so it, not the remaining work, caps the dense set
+			// traverse is allowed to materialize.
+			name:       "MaxLiveRows below the remaining work caps rowCap",
+			budget:     Budgets{MaxWork: 1_000_000, MaxLiveRows: 500},
+			wantBound:  true,
+			wantRowCap: 500,
+		},
+		{
+			name:       "MaxLiveRows above the remaining work leaves rowCap alone",
+			budget:     Budgets{MaxWork: 100, MaxLiveRows: 500},
+			work:       30,
+			wantBound:  true,
+			wantRowCap: 70,
+		},
+		{
+			name:       "MaxLiveRows unset leaves rowCap at the remaining work",
+			budget:     Budgets{MaxWork: 100},
+			work:       30,
+			wantBound:  true,
+			wantRowCap: 70,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1264,6 +1287,54 @@ func TestExpandShortestPathBudget(t *testing.T) {
 				t.Fatalf("memLimit = 0, want a positive byte cap for a bounded query")
 			}
 		})
+	}
+}
+
+// TestExpandShortestPathBudgetBoundsTheHazardAtProductionConstants pins the
+// byte cap at the values the engine actually runs with (serve_cypher.go's
+// maxCypherWork and maxCypherLiveRows, mirrored here as literals since they
+// live in the engine package). It is a regression guard on a measured
+// hazard, not a style preference: derived from the remaining work alone, the
+// cap admitted about 32 GiB of accounted dense paths -- roughly 127 GB
+// resident at the 472-482 bytes of real peak heap a dense path was measured
+// to cost -- in a process that already holds the whole graph in memory.
+//
+// The cap must also stay depth-scaled. A query carrying an explicit deep
+// range resolves to a larger bytesPerPath and is entitled to a
+// proportionally larger byte cap for the same number of paths; a flat
+// ceiling tight enough to matter at depth 15 would refuse it.
+func TestExpandShortestPathBudgetBoundsTheHazardAtProductionConstants(t *testing.T) {
+	const (
+		maxCypherWork     = 1 << 28
+		maxCypherLiveRows = 2_000_000
+	)
+	meter := &workMeter{budget: Budgets{MaxWork: maxCypherWork, MaxLiveRows: maxCypherLiveRows}}
+
+	rowCap, memLimit, unbounded := shortestPathBudget(meter, traverse.MaxDepth)
+	if unbounded {
+		t.Fatalf("unbounded = true, want a bounded cap at the production constants")
+	}
+	if rowCap != maxCypherLiveRows {
+		t.Fatalf("rowCap = %d, want MaxLiveRows (%d): the conversion loop refuses anything larger, so materializing more is pure waste",
+			rowCap, maxCypherLiveRows)
+	}
+
+	// (depth+1)*12 + 48, the per-path cost traverse's own memBudget applies.
+	const bytesPerPath = uint64(traverse.MaxDepth+1)*12 + 48
+	if want := uint64(maxCypherLiveRows+1) * bytesPerPath; memLimit != want {
+		t.Fatalf("memLimit = %d, want %d", memLimit, want)
+	}
+
+	// The whole point: far below what the remaining work alone would allow.
+	if wasted := uint64(maxCypherWork+1) * bytesPerPath; memLimit >= wasted/100 {
+		t.Fatalf("memLimit = %d is not a material reduction on the work-derived cap %d", memLimit, wasted)
+	}
+
+	// Depth-scaled, so a deep explicit range keeps its proportional room.
+	_, deepLimit, _ := shortestPathBudget(meter, traverse.MaxRepresentableDepth)
+	if deepLimit <= memLimit {
+		t.Fatalf("deeper query's memLimit = %d, want more than the depth-%d cap %d: the bound must scale with depth",
+			deepLimit, traverse.MaxDepth, memLimit)
 	}
 }
 

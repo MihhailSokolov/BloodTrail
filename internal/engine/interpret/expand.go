@@ -1466,6 +1466,35 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 	}
 	rowCap = int(remaining)
 
+	// MaxLiveRows, not the remaining work, is the real ceiling on a dense set
+	// this component can hand onward: the conversion loop below calls
+	// meter.observeRows as `out` grows, and observeRows refuses any set
+	// larger than MaxLiveRows (exec.go). A component with more paths than
+	// that therefore declines ErrBudget whatever this function returns -- but
+	// only AFTER traverse has materialized the whole []Path, since that loop
+	// runs once AllShortestPaths has already returned. Capping here moves the
+	// same decline in front of that materialization.
+	//
+	// Measured, because the reason this was parked was the absence of numbers:
+	// a dense path costs about 472-482 bytes of real peak heap (a 302-node,
+	// 20,200-edge fixture yielding 1,000,000 paths peaked at 450 MiB and was
+	// then declined). Left at the remaining work, MaxWork's 2^28 admits about
+	// 32 GiB accounted and roughly 127 GB resident before anything refuses;
+	// at MaxLiveRows the same arithmetic gives about 458 MiB accounted, a
+	// 134x reduction. Nothing that serves today stops serving: the cap equals
+	// the largest set the conversion loop will accept, so every component at
+	// or below it is unaffected and every component above it already failed.
+	//
+	// A flat byte ceiling would not do: bytesPerPath scales with the query's
+	// own resolved depth, so any fixed value tight enough to matter at depth
+	// 15 would refuse a query carrying an explicit deep range (`*1..127`)
+	// that works today. Deriving both caps from MaxLiveRows keeps them
+	// consistent by construction -- and makes maxCypherLiveRows, not this
+	// function, the single constant that governs the hazard.
+	if live := meter.budget.MaxLiveRows; live > 0 && live < rowCap {
+		rowCap = live
+	}
+
 	depth := maxDepth
 	if depth <= 0 {
 		depth = traverse.MaxDepth
