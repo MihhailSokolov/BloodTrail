@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -61,5 +62,13 @@ func TestLoadNodesTurnsAStagingPanicIntoALoadError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "panic") {
 		t.Fatalf("loadNodes error %q does not name the panic it recovered", err)
+	}
+	// And it carries the type the retry cadence recognizes, so a load that
+	// panics this way is backed off like one that panicked on the rebuild's
+	// own goroutine rather than retried every few seconds
+	// (loadRetryDelayAfter, boot.go).
+	var loadPanic *loadPanicError
+	if !errors.As(err, &loadPanic) {
+		t.Fatalf("loadNodes error %T is not a *loadPanicError", err)
 	}
 }

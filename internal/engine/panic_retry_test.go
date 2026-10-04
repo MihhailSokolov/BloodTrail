@@ -80,3 +80,41 @@ func TestADeterministicRebuildPanicLeavesTheFastRetrySchedule(t *testing.T) {
 		t.Fatalf("a deterministic rebuild panic logged %d stacks in 800ms; want the recovery loop on the long interval after its first attempt", n)
 	}
 }
+
+// TestARecoveredLoadPanicAlsoLeavesTheFastRetrySchedule is the same claim
+// for the OTHER half of a panicking load: a panic on one of the load's own
+// errgroup goroutines (loadNodes' row scan, ParseProps, AddParsedNode) is
+// recovered where it happens and returned as an ordinary load error
+// (goRecovered, load.go), so it never reaches recoverRebuildPanic and
+// nothing marks the engine. That error is the most likely instance of a
+// data-dependent panic -- the whole class goRecovered was written for -- and
+// it must get the same long interval, or the recovery loop re-runs the
+// entire load, stack log and all, every 30 s for the life of the process.
+func TestARecoveredLoadPanicAlsoLeavesTheFastRetrySchedule(t *testing.T) {
+	previousLoad := loadSnapshotFn
+	loadSnapshotFn = func(context.Context, *pg.Driver, *pgxpool.Pool, bool, bool) (*snapshot.Snapshot, loadedWatermark, error) {
+		// Exactly what loadNodes returns once goRecovered has turned a
+		// panic on one of its goroutines into this load's error.
+		return nil, loadedWatermark{}, panicLoadError("staging nodes", "AddParsedNode blew up")
+	}
+	t.Cleanup(func() { loadSnapshotFn = previousLoad })
+
+	counter := &panicRetryLogCounter{message: "bloodtrail: fallback rebuild failed"}
+	e := New(nil, nil, Config{Enabled: true, Log: slog.New(counter)})
+	t.Cleanup(e.Stop)
+	e.snap.Store(buildApplyView(t))
+
+	e.startFallbackRebuild()
+
+	// Long enough for the doubling schedule (from fallbackRetryInterval,
+	// 100ms) to have retried several times over.
+	time.Sleep(800 * time.Millisecond)
+
+	n := counter.count()
+	if n == 0 {
+		t.Fatalf("the load never failed; this fixture is meant to return a recovered panic")
+	}
+	if n > 2 {
+		t.Fatalf("a recovered load panic was retried %d times in 800ms; want the recovery loop on the long interval after its first attempt", n)
+	}
+}

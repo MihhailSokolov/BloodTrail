@@ -1245,13 +1245,16 @@ it on every restart. `rebuildOnce` now recovers a panic on its own goroutine (th
 the size check, the adoption) into an error and a FALLBACK (`recoverRebuildPanic`,
 [`background_panic.go`](internal/engine/background_panic.go)): it logs
 `bloodtrail: snapshot rebuild panicked` at Error with the stack, and the load is retried on the
-usual backoff ([§12.5](#125-fallback)). The goroutines that stream, decode and stage the node rows
-need their own cover, because `errgroup` deliberately does not propagate a panic to the goroutine
-that waits: each of the three roles runs through `goRecovered`, which turns a panic into the load's
-own error with the stack it was raised on, and each parse job through `parseLoadedProps`, which
-recovers one job at a time so the panic arrives as that node's parse result and the consumer waiting
-on it is never stranded. The boot's attempt to start from the snapshot file is covered the same way,
-and also deletes the file ([§14.3](#143-boot)).
+long interval a panic gets ([§12.5](#125-fallback)). The goroutines that stream, decode and stage
+the node rows need their own cover, because `errgroup` deliberately does not propagate a panic to
+the goroutine that waits: each of the three roles runs through `goRecovered`, which turns a panic
+into the load's own error with the stack it was raised on, and each parse job through
+`parseLoadedProps`, which recovers one job at a time so the panic arrives as that node's parse
+result and the consumer waiting on it is never stranded. Such an error never passes through
+`rebuildOnce`'s own recover, so it carries a type (`loadPanicError`) the retry cadence recognizes
+instead, and gets that same long interval rather than the seconds-scale one a transient failure
+gets. The boot's attempt to start from the snapshot file is covered the same way, and also deletes
+the file ([§14.3](#143-boot)).
 
 **Memory limit.** If `BLOODTRAIL_MEMORY_LIMIT` is set and the finished snapshot's estimated size
 exceeds it, the load is refused. Whatever the engine had before stays in place (at startup, that
@@ -1259,7 +1262,8 @@ means no replica, so every query goes to PostgreSQL), and the load is retried ev
 
 **Code.** [`load.go`](internal/engine/load.go): `loadSnapshot` (and `LoadSnapshot`, the exported
 form the benchmarks use, which reads neither the counter nor the lineage), `loadedWatermark`,
-`loadKinds`, `loadNodes`, `goRecovered`, `parseLoadedProps`, `loadEdges`, `probeMultiGraph`.
+`loadKinds`, `loadNodes`, `goRecovered`, `parseLoadedProps`, `loadPanicError`, `loadEdges`,
+`probeMultiGraph`.
 [`engine.go`](internal/engine/engine.go):
 `rebuildOnce`, `adoptRebuiltView`. [`watermark.go`](internal/engine/watermark.go):
 `adoptRebuiltViewAndRebase`. [`background_panic.go`](internal/engine/background_panic.go):
@@ -2501,8 +2505,11 @@ analysis run ([§16.3](#163-the-blind-spot-and-the-end-to-end-test)).
 Recovery retries after 100 ms, doubling up to 30 s between attempts; a load refused by the memory
 limit waits 10 minutes, and so does a load that panicked (`loadRetryDelayAfter`), because a panic
 that depends on the data recurs on every attempt and the engine serves correctly from PostgreSQL
-meanwhile. Neither case advances the doubling schedule, so the fast retry is back for whatever
-outcome comes next. The startup load and fallback recovery
+meanwhile. Both shapes of such a panic count: one on the rebuild's own goroutine, which its recover
+records, and one on a load goroutine, which is recovered there and returned as an error of its own
+type ([Section 7](#7-loading-the-replica-from-postgresql)) -- the likelier of the two, since
+parsing and staging are where the data is touched. Neither case advances the doubling schedule, so
+the fast retry is back for whatever outcome comes next. The startup load and fallback recovery
 share one flag, so at most one retry-until-adopted loop runs at a time; when a loop finishes it
 re-checks the state, so a write that re-entered FALLBACK just as a load was adopted is not left
 stranded.

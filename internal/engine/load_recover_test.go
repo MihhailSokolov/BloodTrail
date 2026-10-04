@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -33,6 +34,13 @@ func TestGoRecoveredReportsAPanicAsTheGroupsError(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("Wait error %q does not mention %q", err, want)
 		}
+	}
+	// The type is what the retry cadence recognizes it by
+	// (loadRetryDelayAfter, boot.go); a plain error would read as a
+	// transient failure and go back on the seconds-scale schedule.
+	var loadPanic *loadPanicError
+	if !errors.As(err, &loadPanic) {
+		t.Fatalf("Wait error %T is not a *loadPanicError", err)
 	}
 	select {
 	case <-ran:

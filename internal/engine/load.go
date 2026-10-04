@@ -375,12 +375,39 @@ func parseLoadedProps(propsJSON []byte) (res nodePropsParseResult) {
 	return res
 }
 
+// loadPanicError is what a panic a load goroutine recovered becomes
+// (panicLoadError): an ordinary load error for every caller that only
+// reports or wraps it, and a DISTINGUISHABLE one for the retry cadence,
+// which must not treat it as the transient failure it otherwise looks like.
+//
+// A panic recovered here never reaches recoverRebuildPanic (engine.go) --
+// that is the point: it is returned, not re-raised -- so nothing sets
+// Engine.rebuildPanicked for it, and without a type to test on
+// loadRetryDelayAfter (boot.go) would put the most likely data-dependent
+// panic of all, one in ParseProps or AddParsedNode, back on the doubling
+// schedule: a whole snapshot load and a whole stack log every 30 s for the
+// life of the process, which is exactly what that interval exists to stop.
+// Callers wrap this with %w (loadSnapshot's own returns, rebuildOnce's
+// "engine: RebuildNow: %w"), so errors.As finds it however deep it sits.
+type loadPanicError struct {
+	what  string
+	value any
+	stack []byte
+}
+
+// Error keeps the message panicLoadError always produced: what panicked, the
+// panic value, and the stack of the goroutine it happened on.
+func (e *loadPanicError) Error() string {
+	return fmt.Sprintf("engine: LoadSnapshot: panic %s: %v\n%s", e.what, e.value, e.stack)
+}
+
 // panicLoadError describes a panic a load goroutine recovered, with the
 // stack of the goroutine it happened on (captured here, while that stack is
 // still live). It is an ordinary load error from there on, which is what
-// every caller already knows how to handle.
+// every caller already knows how to handle -- see loadPanicError for the one
+// caller that needs to know more than that.
 func panicLoadError(what string, r any) error {
-	return fmt.Errorf("engine: LoadSnapshot: panic %s: %v\n%s", what, r, debug.Stack())
+	return &loadPanicError{what: what, value: r, stack: debug.Stack()}
 }
 
 // loadEdges streams every edge of graphID into builder. Edges may arrive in
