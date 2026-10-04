@@ -59,12 +59,26 @@ const (
 // hands out the main pool again, which is what a write racing shutdown used
 // before this pool existed.
 //
-// An engine nobody closes -- every test that builds one directly, and
-// nothing in production, where Driver.Close always runs CloseWritePool --
-// leaks this pool: its idle connections time out after writePathPoolIdleTime,
-// but pgxpool's own background health-check goroutine runs until the pool is
-// closed. Which is why such a test should close it (CloseWritePool) rather
-// than only Stop the engine.
+// CloseWritePool is the only thing that closes it, and no point in the
+// engine's own lifecycle can: Stop must leave it open for the save (above),
+// and an Engine has no later event of its own. So an engine nobody closes
+// keeps this pool -- and with it pgxpool's own background health-check
+// goroutine -- until the process exits; the idle connections do time out
+// after writePathPoolIdleTime, that goroutine does not.
+//
+// Production closes it on every path out of a driver, so that exposure was
+// always a test's: Driver.Close runs Stop, the save and then CloseWritePool,
+// and Open has no path that builds an engine and abandons it. Tests build
+// Engines directly and drop them, and used to leak one pool each: one
+// measured run of this package's integration suite created 69 and left 51 of
+// them, and their goroutines, running. They no longer can. The pools created
+// while a test runs are closed when it ends, from the fixture every test
+// here that touches PostgreSQL already goes through, rather than by a
+// convention each test has to remember -- graphtest.PGAvailable's hook,
+// installed in write_pool_leak_guard_integration_test.go and measured by
+// TestWritePathPoolDoesNotOutliveTheTestThatCreatedIt. A test whose engine
+// is done before the test is should still close the pool itself, in
+// Driver.Close's order (stopEngineAndCloseWritePool); closing twice is safe.
 type writePathPool struct {
 	mu     sync.Mutex
 	pool   *pgxpool.Pool

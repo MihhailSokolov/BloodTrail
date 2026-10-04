@@ -188,8 +188,13 @@ func (e *Engine) Stop() {
 // instead, and a read-back already under way on the write pool can fail its
 // next query there and enter fallback. Driver.Close calls it after Stop and
 // the shutdown save, so that fallback can no longer cost the file.
-// Idempotent; an engine nobody closes lets the pool's idle connections time
-// out (writePathPoolIdleTime).
+// Idempotent. An engine nobody closes keeps the pool, and pgxpool's own
+// background goroutine with it, until the process exits: the idle
+// connections time out (writePathPoolIdleTime) but the pool does not close
+// itself, and no point in the engine's own lifecycle can close it for the
+// reason above. Production always reaches this call, through Driver.Close;
+// in this package's tests the cleanup graphtest.PGAvailable installs closes
+// them instead (write_pool_leak_guard_integration_test.go), not this call.
 func (e *Engine) CloseWritePool() {
 	e.writePool.close()
 }
