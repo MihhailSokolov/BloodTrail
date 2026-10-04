@@ -394,11 +394,17 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 // deletes its edges, and the cascade of its own tombstone (buildApplySegment)
 // takes the edge with it. So does an objectid view never knew anything
 // under, which is what a write that never landed looks like from here -- and
-// also the one residual this leaves: an endpoint node the upsert itself
-// created and another writer re-keyed within the same window is unknown to
-// both pg's objectid lookup and the View, so neither it nor its edge can be
-// resolved here. That costs a false negative (a missing row), never a wrong
-// one, and needs a writer to re-key a node it has never seen.
+// also the one residual this leaves. The condition for it is exactly
+// "named by neither pg's objectid lookup nor the View": an endpoint node
+// this process has not applied yet, whose objectid another writer has
+// already re-keyed. The upsert's own newly created endpoint is one way to
+// be in that state; so is an endpoint another write of this process created
+// whose Apply has not run (applies run in the order their calls finish, not
+// the order their writes committed -- the same premise that makes a pending
+// delta edge possible at all, snapshot.FoldWithPendingEdges). Either way
+// neither the node nor its edge can be resolved from here, which costs a
+// false negative (a missing row), never a wrong one, and takes a re-key
+// racing a node this replica has never seen.
 //
 // Keys already queried in the first pass (pending) are skipped; a triple
 // whose kind never resolved to a KindID joins absentTriples under the

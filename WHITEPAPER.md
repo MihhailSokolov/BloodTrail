@@ -2324,10 +2324,12 @@ kind-scoped delete races other writers: a row of the deleted kind that another w
 after the `DELETE`'s snapshot, and whose apply ran first, must survive. An earlier version carried
 the delete out against the view as an instruction ("tombstone every edge of kind K") and erased such
 rows while staying SERVING. With read-back the result no longer depends on the order in which
-concurrent writes are applied. A delete whose criteria name more rows than PostgreSQL deleted costs
-only extra re-reads. Enumerating the candidates scans the view's kind bitsets (or every node for an
-empty `include`) or the edge-kind column once, inside `Apply`; it never touches a query's read path,
-and the re-reads go 50,000 ids per round trip.
+concurrent writes are applied, with one surviving exception, narrower than it was: an
+objectid-keyed edge upsert whose endpoint node the replica has not applied yet and another writer
+re-keys before the upsert is applied ([§12.3](#123-reading-back)). A delete whose criteria name
+more rows than PostgreSQL deleted costs only extra re-reads. Enumerating the candidates scans the
+view's kind bitsets (or every node for an empty `include`) or the edge-kind column once, inside
+`Apply`; it never touches a query's read path, and the re-reads go 50,000 ids per round trip.
 
 The criteria must also name kinds the way PostgreSQL does. The replica learns kind names when its
 base is built and from the rows that writes bring back, but PostgreSQL can know more: an OpenGraph
@@ -2400,11 +2402,14 @@ with its edges. A triple with such an endpoint waits for that re-read and is the
 it (`rekeyedTripleKeys`): a re-key changes no node id, so a node that comes back present under the
 old objectid is the id the upsert resolved that objectid to, and the triple is queried for it in a
 second batch pass. An endpoint that is really gone needs nothing, because its own tombstone takes
-its edges with it. One case is still not covered: an endpoint node the upsert itself created and
-another writer re-keyed inside the same window is named by neither PostgreSQL's objectid lookup nor
-the view, so that node and its edge are not staged until a later write names them or a reload brings
-them in. Objectids are identities in BloodHound, so this takes a writer re-keying a node it has
-never seen.
+its edges with it. One case is still not covered: an endpoint node the replica has not applied yet,
+whose objectid another writer has already re-keyed, is named by neither PostgreSQL's objectid lookup
+nor the view, so that node and its edge are not staged until a later write names them or a reload
+brings them in. The upsert's own new endpoint is one way to be in that state, and so is an endpoint
+another write created whose apply has not run yet, since applies run in the order their calls
+finish, not the order their writes committed
+([§12.1](#121-record-the-keys-then-read-back-the-truth)). Objectids are identities in BloodHound,
+so either way this takes a re-key racing a node the replica has never seen.
 
 Kind names are mapped to ids in one batch; if the batch fails, each name is looked up on its own, so
 one bad name affects only its own entries, and a cancelled request counts as a read-back error. For
@@ -2673,8 +2678,10 @@ leave gaps this server cannot account for. A running server then refuses to save
 `resolved_exactly`) until a load it adopts has read the other server's writes. The refusal asks for
 that load itself, through the same once-every-30-seconds request a settled bump failure uses
 ([§13.3](#133-when-a-bump-fails)), since nothing else this process does would ever account for
-those values. A file is rejected at the next startup when the buffered writes cannot cover the gap
-([§14.3](#143-boot)).
+those values. That is not free in this deployment: each refused save can start a full load, so a
+database two servers keep writing pays one extra in-memory copy of the graph per 30 s at worst,
+where the refusals alone used to cost nothing. A file is rejected at the next startup when the
+buffered writes cannot cover the gap ([§14.3](#143-boot)).
 That is the limit of what one process can see of another: a load covers another server's counter
 value even when that server's own write had not committed yet when the load read the database, so it
 is a detection, not a coherent cluster. Writes made to PostgreSQL by anything else (`psql`, the
@@ -2954,10 +2961,10 @@ equals its stamp" would almost never succeed. Instead:
   does not matter: read-back always returns PostgreSQL's *current* state for each key, and a
   kind-scoped delete is read back too, through the candidates the view being replayed onto holds
   ([§12.1](#121-record-the-keys-then-read-back-the-truth)); the one exception is the same as in
-  ordinary write-through, an objectid-keyed edge upsert whose endpoint node that same upsert created
-  and another writer re-keyed before it is applied ([§12.3](#123-reading-back)). (When kind-scoped
-  deletes were replayed as instructions, a delete that started first but committed last could erase
-  a row written in between.) Publishing the result also raises the watermark ledger to P
+  ordinary write-through, an objectid-keyed edge upsert whose endpoint node the replica has not
+  applied yet and another writer re-keyed before it is applied ([§12.3](#123-reading-back)). (When
+  kind-scoped deletes were replayed as instructions, a delete that started first but committed last
+  could erase a row written in between.) Publishing the result also raises the watermark ledger to P
   ([§13.1](#131-the-counter)).
 
 Any doubt rejects the file (`snapshot file rejected`, with a `reason`, or an `error` for an
@@ -3568,10 +3575,12 @@ in the [README](README.md).
   cannot list, writes with an unknown outcome, and writes through read transactions. A reload is
   adopted only once no write lands while it runs, so under writes that never pause for that long,
   a FALLBACK lasts until they do ([Section 7](#7-loading-the-replica-from-postgresql)).
-- **One narrow write race is not followed**: an objectid-keyed edge upsert whose endpoint node that
-  same upsert created, and another writer re-keyed before the upsert is applied, leaves that node
-  and its edge out of the replica until a later write names them or a reload
-  ([§12.3](#123-reading-back)). An endpoint that already existed is followed through the re-key.
+- **One narrow write race is not followed**: an objectid-keyed edge upsert whose endpoint node the
+  replica has not applied yet (the upsert's own new endpoint, or one another write created whose
+  apply has not run), and whose objectid another writer re-keys before the upsert is applied, leaves
+  that node and its edge out of the replica until a later write names them or a reload
+  ([§12.3](#123-reading-back)). An endpoint the replica already holds is followed through the
+  re-key.
 - **Not every query is accelerated.** Queries outside the interpreter's subset, queries that sort
   text, queries with `$parameters`, Cypher spellings whose DAWGS translation BloodTrail does not
   reproduce exactly ([§11.2](#112-matching-dawgss-semantics)), `allShortestPaths` queries whose
