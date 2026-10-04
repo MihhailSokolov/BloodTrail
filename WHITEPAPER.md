@@ -3140,7 +3140,7 @@ project checks that in four layers.
 
 ### 16.1 Unit tests
 
-About 1,020 unit tests in 141 files cover every component on its own: the data structures (including
+About 1,050 unit tests in 152 files cover every component on its own: the data structures (including
 randomized tests that compare the overlay fast paths with a slow, obviously correct walk, edge by
 edge, and folded bases with the layered views they came from), the search engine (bidirectional
 search checked against brute force, the depth ceiling, buffer reuse), the recognizers, the
@@ -3150,7 +3150,7 @@ every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite (181 tests in 70 files, behind the `integration` build tag) runs against a
+The integration suite (190 tests in 76 files, behind the `integration` build tag) runs against a
 disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
 plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
 in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
