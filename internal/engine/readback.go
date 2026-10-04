@@ -545,7 +545,13 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 			edgesByID[es.id] = es
 			discoveredEndpoints = append(discoveredEndpoints, es.start, es.end)
 		}
-		result.absentNodeIDs, err = rereadByID(discoveredEndpoints, nodesByID, result.absentNodeIDs,
+		// Deduplicated before the re-read, as every other candidate list
+		// handed to rereadByID is (viewCandidates' bitset and its
+		// each-id-once edge list): a fan-out's rows all share their anchored
+		// endpoint, and two fan-outs of different kinds can return edges
+		// sharing the unanchored one, so the raw list repeats ids -- which
+		// would otherwise repeat them in absentNodeIDs too.
+		result.absentNodeIDs, err = rereadByID(dedupeUint64s(discoveredEndpoints), nodesByID, result.absentNodeIDs,
 			func(ids []uint64) (map[uint64]nodeState, error) { return readBackNodesByID(ctx, pool, graphID, ids) })
 		if err != nil {
 			return nil, err
