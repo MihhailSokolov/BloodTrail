@@ -308,17 +308,17 @@ type shortestLevel struct {
 
 // admit reports whether a pair whose shortest path is d hops long belongs in
 // the result. A pair strictly shorter than every one before it starts the
-// result over: out is emptied and budget cleared of the discarded paths'
+// result over: sink is emptied and budget cleared of the discarded paths'
 // bytes, so a Limit already reached at a longer length never keeps a
 // shorter pair out. d < 1 (no path, or the zero-length self pair no
 // strategy ever emits) is never admitted.
-func (l *shortestLevel) admit(d int, out *[]Path, budget *memBudget) bool {
+func (l *shortestLevel) admit(d int, sink *pathSink, budget *memBudget) bool {
 	switch {
 	case d < 1:
 		return false
 	case l.best == 0 || d < l.best:
 		l.best = d
-		*out = (*out)[:0]
+		sink.reset()
 		budget.reset()
 		return true
 	default:
@@ -644,14 +644,14 @@ func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
 // should stop iterating entirely — no further calls for any remaining
 // pair/root/terminal).
 //
-// pairEnumerate and enumerate's shared stop condition is len(out) == cap,
-// checked against out's cumulative length across every pair or BFS element
-// a strategy merges — not a per-call counter. So cap must be an absolute
-// target ("stop once total output reaches N"), never a delta relative to
-// this call ("N more from here"): a delta compared against a cumulative
-// counter either overruns (the delta is counted from 0 while out already
-// holds prior pairs' paths) or, once have exceeds limit/2, never fires at
-// all, letting a call run unbounded.
+// pairEnumerate and enumerate's shared stop condition is sink.n == cap,
+// checked against the sink's cumulative path count across every pair or BFS
+// element a strategy merges — not a per-call counter. So cap must be an
+// absolute target ("stop once total output reaches N"), never a delta
+// relative to this call ("N more from here"): a delta compared against a
+// cumulative counter either overruns (the delta is counted from 0 while the
+// sink already holds prior pairs' paths) or, once have exceeds limit/2,
+// never fires at all, letting a call run unbounded.
 //
 // limit<=0 means the query has no Limit. oneMore restricts the upcoming
 // call to contribute at most one additional path — ModeOne's "one path per
@@ -685,7 +685,7 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	oneMore := q.Mode == ModeOne
 	cancel := &cancelCheck{ctx: q.Ctx}
 
-	var out []Path
+	sink := &pathSink{}
 	var callErr error
 	var level shortestLevel
 
@@ -711,31 +711,27 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 					depth = level.best
 				}
 				D := pairShortest(s, r, t, kinds, depth, scF, scT, scTmp)
-				if !level.admit(D, &out, budget) {
+				if !level.admit(D, sink, budget) {
 					return true
 				}
-				cap, done := pathCap(q.Limit, len(out), false)
+				cap, done := pathCap(q.Limit, sink.n, false)
 				if done {
 					stopOuter = level.final()
 					return !stopOuter
 				}
-				var err error
-				out, err = pairEnumerate(s, r, t, D, kinds, cap, budget, scF, scT, out)
-				if err != nil {
+				if err := pairEnumerate(s, r, t, D, kinds, cap, budget, scF, scT, sink); err != nil {
 					callErr = err
 					stopOuter = true
 					return false
 				}
 				return true
 			}
-			cap, done := pathCap(q.Limit, len(out), oneMore)
+			cap, done := pathCap(q.Limit, sink.n, oneMore)
 			if done {
 				stopOuter = true
 				return false
 			}
-			var err error
-			out, err = pairPaths(s, r, t, kinds, maxDepth, cap, budget, scF, scT, scTmp, out)
-			if err != nil {
+			if err := pairPaths(s, r, t, kinds, maxDepth, cap, budget, scF, scT, scTmp, sink); err != nil {
 				callErr = err
 				stopOuter = true
 				return false
@@ -746,9 +742,9 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	})
 
 	if callErr != nil {
-		return out, callErr
+		return sink.paths(), callErr
 	}
-	return out, nil
+	return sink.paths(), nil
 }
 
 // smallSideDist is one small-side element's BFS result: dists holds either
@@ -904,7 +900,7 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
 	cancel := &cancelCheck{ctx: q.Ctx}
-	var out []Path
+	sink := &pathSink{}
 	var callErr error
 	var level shortestLevel
 
@@ -929,31 +925,27 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 				return true
 			}
 			if q.Mode == ModeAll {
-				if !level.admit(int(d), &out, budget) {
+				if !level.admit(int(d), sink, budget) {
 					return true
 				}
-				cap, done := pathCap(q.Limit, len(out), false)
+				cap, done := pathCap(q.Limit, sink.n, false)
 				if done {
 					stop = level.final()
 					return !stop
 				}
-				var err error
-				out, err = enumerate(s, t, sc, kinds, cap, budget, out, false)
-				if err != nil {
+				if err := enumerate(s, t, sc, kinds, cap, budget, sink, false); err != nil {
 					callErr = err
 					stop = true
 					return false
 				}
 				return true
 			}
-			cap, done := pathCap(q.Limit, len(out), oneMore)
+			cap, done := pathCap(q.Limit, sink.n, oneMore)
 			if done {
 				stop = true
 				return false
 			}
-			var err error
-			out, err = enumerate(s, t, sc, kinds, cap, budget, out, false)
-			if err != nil {
+			if err := enumerate(s, t, sc, kinds, cap, budget, sink, false); err != nil {
 				callErr = err
 				stop = true
 				return false
@@ -966,9 +958,9 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 	}
 
 	if callErr != nil {
-		return out, callErr
+		return sink.paths(), callErr
 	}
-	return out, nil
+	return sink.paths(), nil
 }
 
 // mergeSmallTerminals merges strategy B's per-terminal BFS results (small
@@ -984,7 +976,7 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
 	cancel := &cancelCheck{ctx: q.Ctx}
-	var out []Path
+	sink := &pathSink{}
 	var callErr error
 	var level shortestLevel
 
@@ -1007,31 +999,27 @@ func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, bu
 				continue
 			}
 			if q.Mode == ModeAll {
-				if !level.admit(int(d), &out, budget) {
+				if !level.admit(int(d), sink, budget) {
 					continue
 				}
-				cap, done := pathCap(q.Limit, len(out), false)
+				cap, done := pathCap(q.Limit, sink.n, false)
 				if done {
 					if level.final() {
 						return false
 					}
 					continue
 				}
-				var err error
-				out, err = enumerate(s, r, sc, kinds, cap, budget, out, true)
-				if err != nil {
+				if err := enumerate(s, r, sc, kinds, cap, budget, sink, true); err != nil {
 					callErr = err
 					return false
 				}
 				continue
 			}
-			cap, done := pathCap(q.Limit, len(out), oneMore)
+			cap, done := pathCap(q.Limit, sink.n, oneMore)
 			if done {
 				return false
 			}
-			var err error
-			out, err = enumerate(s, r, sc, kinds, cap, budget, out, true)
-			if err != nil {
+			if err := enumerate(s, r, sc, kinds, cap, budget, sink, true); err != nil {
 				callErr = err
 				return false
 			}
@@ -1040,7 +1028,7 @@ func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, bu
 	})
 
 	if callErr != nil {
-		return out, callErr
+		return sink.paths(), callErr
 	}
-	return out, nil
+	return sink.paths(), nil
 }

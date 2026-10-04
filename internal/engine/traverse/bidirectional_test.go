@@ -112,7 +112,9 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, budget, scF, scT, scTmp, nil)
+		sink := &pathSink{}
+		err := pairPaths(s, 0, 6, kinds, MaxDepth, 0, budget, scF, scT, scTmp, sink)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -134,7 +136,9 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 6, kinds, MaxDepth, 1, budget, scF, scT, scTmp, nil)
+		sink := &pathSink{}
+		err := pairPaths(s, 0, 6, kinds, MaxDepth, 1, budget, scF, scT, scTmp, sink)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -168,7 +172,9 @@ func TestPairPaths(t *testing.T) {
 		scF, scT, scTmp := newScratch(s.NodeCount()), newScratch(s.NodeCount()), newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		out, err := pairPaths(s, 0, 9, kinds, MaxDepth, 0, budget, scF, scT, scTmp, nil)
+		sink := &pathSink{}
+		err := pairPaths(s, 0, 9, kinds, MaxDepth, 0, budget, scF, scT, scTmp, sink)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("pairPaths: %v", err)
 		}
@@ -204,18 +210,20 @@ func TestPairPathsCrossCheck(t *testing.T) {
 		scTmp := newScratch(s.NodeCount())
 		budget := &memBudget{}
 
-		got, err := pairPaths(s, r, tgt, kinds, MaxDepth, 0, budget, scF, scT, scTmp, nil)
-		if err != nil {
+		sink := &pathSink{}
+		if err := pairPaths(s, r, tgt, kinds, MaxDepth, 0, budget, scF, scT, scTmp, sink); err != nil {
 			t.Fatalf("seed %d: pairPaths: %v", seed, err)
 		}
+		got := sink.paths()
 
 		refSc := newScratch(s.NodeCount())
 		bfsFrom(s, tgt, false, kinds, MaxDepth, refSc)
 		refBudget := &memBudget{}
-		want, err := enumerate(s, r, refSc, kinds, 0, refBudget, nil, true)
-		if err != nil {
+		refSink := &pathSink{}
+		if err := enumerate(s, r, refSc, kinds, 0, refBudget, refSink, true); err != nil {
 			t.Fatalf("seed %d: enumerate (reference): %v", seed, err)
 		}
+		want := refSink.paths()
 
 		if len(got) != len(want) {
 			t.Fatalf("seed %d (r=%d, t=%d): pairPaths returned %d paths, reference returned %d\npairPaths: %+v\nreference: %+v", seed, r, tgt, len(got), len(want), got, want)

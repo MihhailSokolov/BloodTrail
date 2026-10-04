@@ -1295,9 +1295,11 @@ func TestExpandShortestPathBudget(t *testing.T) {
 // maxCypherWork and maxCypherLiveRows, mirrored here as literals since they
 // live in the engine package). It is a regression guard on a measured
 // hazard, not a style preference: derived from the remaining work alone, the
-// cap admitted about 32 GiB of accounted dense paths -- roughly 127 GB
-// resident at the 472-482 bytes of real peak heap a dense path was measured
-// to cost -- in a process that already holds the whole graph in memory.
+// cap admitted about 32 GiB of accounted dense paths -- and well over a
+// hundred GB resident, at the 465 bytes of real peak heap a dense path plus
+// the row this package converts it into was measured to cost
+// (shortestPathBudget's own doc) -- in a process that already holds the
+// whole graph in memory.
 //
 // The cap must also stay depth-scaled. A query carrying an explicit deep
 // range resolves to a larger bytesPerPath and is entitled to a
