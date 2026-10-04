@@ -1162,6 +1162,23 @@ const maxExactInt = 1 << 53
 // 9007199254740993 decodes to 9007199254740992 -- while the cast reads the
 // exact text.
 //
+// The two branches below therefore bound 2^53 differently, deliberately: a
+// stored NUMBER declines at >= 2^53, a stored STRING only at > 2^53, so the
+// string "9007199254740992" is served where the number 9007199254740992 is
+// not. The asymmetry is the difference in what each branch knows, not an
+// oversight. jsonb keeps an integer exactly and `->>` hands PostgreSQL its
+// exact text either way (confirmed against the server), but this package
+// only ever sees a stored number AFTER json.Unmarshal has rounded it to a
+// float64 -- at exactly 2^53 that float could have come from the text
+// 9007199254740992 or 9007199254740993, two values PostgreSQL's cast
+// separates and this one cannot, so serving it risks the wrong answer. A
+// stored string is never rounded: its exact text is still here, 2^53 parses
+// into a float64 exactly, and only 2^53+1 and beyond lose a digit -- which
+// is what the string branch declines. Widening the number branch to match
+// the string one would turn a safe decline into a wrong serve; narrowing
+// the string branch to match the number one would decline a row PostgreSQL
+// answers, for no reason. Pinned by TestCastPropertyForOrderBoundsAtTwoPow53.
+//
 // A nil (stored JSON null) passes through: it extracts to SQL NULL.
 func castPropertyForOrder(v any, floatCast bool) (any, error) {
 	switch val := v.(type) {

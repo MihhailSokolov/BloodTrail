@@ -484,12 +484,25 @@ func filterRows(env *Env, rows []*Row, expr cypher.Expression, collectAliases []
 // final row (see runQuery's addFinalRow call). Charging it again here, for
 // every merged row regardless of whether WHERE or a later stage keeps it,
 // would double-count against that single canonical charge.
+//
+// The match's own SIZE is observed before the clone loop runs, though. The
+// clone set is the same size as the match, so one seed holds both at once,
+// and matchPart does not itself observe every shape it can return (a single
+// node pattern with no steps comes straight out of scanAnchorHinted, which
+// collects without observing). crossJoinCarried's own observeRows call, on
+// the slice this function returns, therefore ran only after a match already
+// past the cap had been doubled in memory -- the exact allocation
+// MaxLiveRows exists to refuse while it is still small enough to refuse
+// (see workMeter.observeRows).
 func runCarriedPart(env *Env, part *Part, meter *workMeter, seed *Row) ([]*Row, error) {
 	if len(part.Nodes) == 0 {
 		return []*Row{cloneRow(seed)}, nil
 	}
 	rows, err := matchPart(env, part, meter)
 	if err != nil {
+		return nil, err
+	}
+	if err := meter.observeRows(len(rows)); err != nil {
 		return nil, err
 	}
 	out := make([]*Row, 0, len(rows))

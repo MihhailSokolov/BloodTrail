@@ -988,6 +988,15 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 // on the false path).
 //
 // Pipeline:
+//  0. ctx.Err() -- decline "error" for a request that is already cancelled
+//     or past its deadline, before any work, and thread ctx into the
+//     traversal (traverse.Query.Ctx) so one cancelled part-way through
+//     stops at the traversal's next check. Without this a cancelled request
+//     was traversed and hydrated in full and answered, where the PostgreSQL
+//     shortest-path query this stands in for answers the same context with
+//     its cancellation -- which is what the wrapper's fallback then
+//     returns. Checked first, mirroring TryNodeCount/TryRelCount
+//     (serve_builder.go).
 //  1. cfg.Enabled, then serveState() -- decline "disabled" / "no_snapshot" /
 //     "fallback" -- then snap.MultiGraph() -- decline "multi_graph".
 //  2. Resolve pq.Start/pq.End into traverse.Endpoint values (decline
@@ -1011,6 +1020,11 @@ func (e *Engine) TryCypher(ctx context.Context, tx graph.Transaction, text strin
 // query's. The retired generation re-check existed because a snapshot could
 // silently fall behind PostgreSQL mid-query; with write-through it cannot.
 func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq recognize.PathQuery) (graph.PathSet, bool) {
+	if err := ctx.Err(); err != nil {
+		e.decline(ctx, reasonError, err)
+		return nil, false
+	}
+
 	if !e.cfg.Enabled {
 		e.decline(ctx, reasonDisabled, nil)
 		return nil, false
@@ -1063,6 +1077,7 @@ func (e *Engine) servePathQuery(ctx context.Context, tx graph.Transaction, pq re
 		ExcludeSelf: pq.ExcludeSelf,
 		Limit:       pq.Limit,
 		MemoryLimit: uint64(tx.GraphQueryMemoryLimit()),
+		Ctx:         ctx,
 	}
 
 	dense, err := traverse.AllShortestPaths(snap, tq)

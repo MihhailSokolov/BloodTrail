@@ -731,13 +731,16 @@ not to serve.
 **Context.** Engine-served reads run under the context BloodHound passed to `ReadTransaction`. In
 production that context comes from BloodHound's `DatabaseSwitch` and is cancelled with the request,
 so a cancelled request also cancels the engine's own PostgreSQL round trips (such as fetching edge
-properties). The Cypher interpreter honours it too: it declines a request whose context is already
-done, and a request cancelled while it runs stops at the interpreter's next work check, at most
-1,024 units of work later ([§11.9](#119-budgets)). The builder counts decline a done context on
-entry. Either way the query goes to PostgreSQL, which returns the context's own error. Two served
-paths still ignore a cancellation: the shortest-path search
-([§9.4](#94-limits-and-engineering-details)), and the builder's row projections, whose rows are
-produced as the caller reads them.
+properties). Every served read honours it too. The Cypher interpreter declines a request whose
+context is already done, and a request cancelled while it runs stops at the interpreter's next work
+check, at most 1,024 units of work later ([§11.9](#119-budgets)). Every builder entry point and the
+shortest-path pipeline decline a done context on entry. A request cancelled after that stops at the
+next check of whatever was running: the shortest-path search's own
+([§9.4](#94-limits-and-engineering-details)), `channels.Submit` for a cursor-returning builder read,
+and a 1,024-row check inside the builder's row projections, whose rows are produced as the caller
+reads them. Either way the query goes to PostgreSQL, which returns the context's own error. The one
+case nothing reports is a cancellation that arrives when fewer rows than those cadences are left to
+deliver, which is also when PostgreSQL has already sent them.
 
 **Writes made through a read transaction.** DAWGS's PostgreSQL `ReadTransaction` does not actually
 open a database transaction: it runs each statement on its own, committing immediately. So a write
@@ -1428,7 +1431,8 @@ ends is not recognized and goes to PostgreSQL.
 4. **Build an edge-kind mask**: a bit vector over kind ids. No kind filter at all means every kind.
    The mask is sized from the view's `MaxKindID`, which includes kinds first introduced by segments.
 5. **Search** (`traverse.AllShortestPaths`, [§9.3](#93-the-search-strategies)), with BloodHound's
-   own per-transaction memory limit (`GraphQueryMemoryLimit`) as the output budget.
+   own per-transaction memory limit (`GraphQueryMemoryLimit`) as the memory budget, and the
+   request's context, which the search itself checks ([§9.4](#94-limits-and-engineering-details)).
 6. **Complete the answer** from PostgreSQL ([§8.4](#84-completing-the-answer)).
 
 A served call logs `bloodtrail: path engine served` at Info level.
@@ -1531,23 +1535,42 @@ reported as a path to itself, matching BloodHound's own filter.
   bumping an epoch counter: a node's entry counts only if its mark equals the current epoch. When
   the counter wraps around, the marks are cleared for real, because epoch 0 would match a fresh
   buffer's zeros.
-- **Output budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
-  memory limit; exceeding it declines the query (`memory_limit`). The charge bounds the *output*,
-  not the search buffers: strategy B holds one buffer per small-side node until its merge finishes.
-  When the overall-shortest mode discards the paths collected so far because a shorter pair turned
-  up, their charge is released too.
+- **Memory budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
+  memory limit; exceeding it declines the query (`memory_limit`). When the overall-shortest mode
+  discards the paths collected so far because a shorter pair turned up, their charge is released
+  too. Strategy B's search buffers are charged against the same limit, as a reservation taken
+  before they are allocated and kept across that release, since discarding paths does not free
+  them: it holds one buffer per small-side node, 5 bytes per node of the whole snapshot each,
+  from its parallel fan-out until its merge finishes. A query whose buffers alone do not fit
+  declines (`too_large`) rather than allocating them. Nothing accounted for that set before, and
+  a caller that raises `SideBudget` from its own work budget ([§11.9](#119-budgets)) scales it:
+  at the interpreter's default work budget, up to roughly 1.3 GB on a sparse graph.
+
+  The reservation is `5 × node count × small-side size` bytes, so two numbers follow for a very
+  large graph. At the default `SideBudget` of 16 it reaches a 1 GiB `GraphQueryMemoryLimit` at
+  about 13.4M nodes, past which a pathfinding query that would have taken strategy B declines
+  (`too_large`) and goes to PostgreSQL. And because the reservation counts towards the same
+  limit as the paths, a strategy-B query's room for output is that much smaller than before —
+  at 5M nodes and `SideBudget` 16, about 380 MB of a 1 GiB limit. Both are the safe direction
+  (decline, not allocate), and both move with the limit, which is BloodHound's own per-transaction
+  setting.
 - **Reading adjacency.** Searches read a node's edges as array slices (`View.OutSlices` /
   `InSlices`, [§6.5](#65-the-view-a-base-plus-deltas)) rather than through a callback. A comment in
   the code records that routing the loop through a helper that took a callback made the common path
   40% slower (37 ms → 52 ms on the same pre-built query).
-- **No cancellation inside the search.** `traverse` takes no context; it is bounded by its depth,
-  strategy and output budgets instead.
+- **Cancellation inside the search.** `Query.Ctx` carries the request's context into the search:
+  `AllShortestPaths` refuses to start once it is done, and a search already running stops at its
+  next check — once per (root, terminal) pair in strategy A, once per small-side BFS run in strategy
+  B, and every 1,024 steps of a merge phase's walk over an endpoint set. There is deliberately no
+  check per node or per edge: that is the steady-state overlay read path, so the granularity bounds
+  a cancelled search at one full BFS instead.
 
 **Code.** [`traverse.go`](internal/engine/traverse/traverse.go): `AllShortestPaths`, `Query`, `Mode`
 (`ModeOne`, `ModeAllPerPair`, `ModeAll`), `shortestLevel`, `Endpoint`, `MaxDepth`,
 `MaxRepresentableDepth`, `PairBudget`, `SideBudget`, `strategyPairs`, `strategySmallSide`,
-`SelfEndpointConflict`, the scratch pool. [`bfs.go`](internal/engine/traverse/bfs.go): `bfsFrom`,
-`pairShortest`, `pairEnumerate`, `enumerate`. [`engine.go`](internal/engine/engine.go):
+`cancelCheck`, `memBudget`, `SelfEndpointConflict`, the scratch pool.
+[`bfs.go`](internal/engine/traverse/bfs.go): `bfsFrom`, `pairShortest`, `pairEnumerate`,
+`enumerate`. [`engine.go`](internal/engine/engine.go):
 `TryAllShortestPaths`, `servePathQuery`, `convertMode`, `resolveEndpoint`, `buildKindMask`.
 [`hydrate.go`](internal/engine/hydrate.go): `hydratePaths`.
 
@@ -1601,8 +1624,11 @@ otherwise), because an unanchored ordered scan could be the whole edge set.
 ### 10.2 Execution
 
 Every builder entry point first passes the gate of [§8.1](#81-the-serving-gate-and-the-two-states)
-(`serveGate`), the multi-graph check included. `TryNodeCount` and `TryRelCount` also decline a
-request whose context is already done, since they compute their answer without consulting it.
+(`serveGate`), the multi-graph check included. Every entry point also declines a request whose
+context is already done, so the question goes to PostgreSQL and the caller gets PostgreSQL's own
+error; the counts compute their answer inline without consulting it again, while the
+cursor-returning reads stop mid-stream through `channels.Submit` and the row projections at a
+1,024-row check of their own ([§5.4](#54-the-read-side)).
 
 Node questions become **bitset arithmetic** on the per-kind bitsets
 ([`serve_builder.go`](internal/engine/serve_builder.go)): union for "any of", intersection for "all
@@ -1727,7 +1753,10 @@ gives it from its partner (`n.p < 5` below). A step over two types takes the wid
 `numeric` over `int8` over `int4`. Integer steps are computed exactly, and a result outside
 `int4` for two `int4` operands is PostgreSQL's "integer out of range", so the query declines; so
 does any integer beyond 2⁵³, which a `float64` cannot hold exactly, in a literal, a result or a
-cast. Double-precision steps decline where PostgreSQL raises an overflow, underflow or
+cast. A cast of a stored *number* declines from 2⁵³ itself: the decode has already rounded it, so
+that `float64` could equally have been 2⁵³+1, two values PostgreSQL's cast separates. A cast of
+stored *text* is never rounded, so it serves 2⁵³ exactly and declines only past it.
+Double-precision steps decline where PostgreSQL raises an overflow, underflow or
 division-by-zero error. What the evaluator does not reproduce declines at plan time: `/` anywhere
 but in double precision (integer division truncates, exact-decimal division is exact), `%` in every
 form, and exact-decimal arithmetic over a fractional literal (`0.1 + 0.2 = 0.3` is true in
@@ -2138,6 +2167,13 @@ which counts that pair toward it before `s <> t` removes it, so PostgreSQL retur
 the limit. All of these decline with reason `self_endpoint` (`ErrSelfEndpoint` in
 [`expand.go`](internal/engine/interpret/expand.go)).
 
+The overall-shortest rule is deliberately broader than the divergence it covers: the two answers
+differ only when a shared node's shortest cycle over the pattern's own edge kinds is *strictly
+shorter* than the shortest pair of two different nodes, and any shared node at all declines
+instead. Establishing the narrower condition would cost one cycle search per shared node — with one
+endpoint unconstrained, one per node of the other side, more work than the query itself — so the
+broad rule stands. Declining is always safe.
+
 The search's row and memory limits are derived from the remaining work budget; finding more paths
 than affordable declines the query rather than truncating it. When the search itself enforces every
 remaining condition, the query's own `LIMIT` is also passed into it (below).
@@ -2219,10 +2255,12 @@ built, a named "V-shaped" path's fan-out is estimated from the anchor's degree, 
 kind-only scan with `ORDER BY` whose kind exceeds the row budget declines before scanning. A second
 `MATCH` after a `WITH` that shares no variable with the first stage is the same kind of product:
 it is refused as soon as its first carried row shows the product cannot fit the work budget, and
-the rows it holds while it runs are charged to the live-row budget. So are the rows the
-early-termination driver keeps across its batches, and the extra rows a step between two already
-bound nodes fans out into. (Before these were charged, a cross join after `WITH` held its whole
-product, 2.25 million rows for 1,500 × 1,500, to keep 1,500.)
+the rows it holds while it runs are charged to the live-row budget — the carried row's match
+first, before it is cloned into one merged row per match, since the two are the same size and one
+seed holds both. So are the rows the early-termination driver keeps across its batches, and the
+extra rows a step between two already bound nodes fans out into. (Before these were charged, a
+cross join after `WITH` held its whole product, 2.25 million rows for 1,500 × 1,500, to keep
+1,500.)
 
 ### 11.10 The translate gate
 
@@ -3592,10 +3630,11 @@ in the [README](README.md).
   trip to fetch them; pathfinding answers fetch nodes too. That round trip takes a second connection
   from BloodHound's pool while the caller's read transaction holds one
   ([§8.4](#84-completing-the-answer)).
-- **No cancellation inside the path search.** The shortest-path search takes no context, and the
-  builder's row projections do not consult it as the caller reads them; both are bounded by their
-  budgets. The interpreter stops a cancelled request at its next work check, and the engine's
-  PostgreSQL round trips follow the caller's context ([§5.4](#54-the-read-side)).
+- **Cancellation is checked in batches, not per row.** Every served read declines a request whose
+  context is already done, and one cancelled while it runs stops at the next check of whatever was
+  running — the interpreter's 1,024-unit work check, the path search's per-pair or per-BFS check, or
+  a cursor's own. So a cancellation arriving with less than one batch of work left is not reported,
+  which is also when PostgreSQL has already delivered that work ([§5.4](#54-the-read-side)).
 - **A clock difference** from PostgreSQL ([§11.2](#112-matching-dawgss-semantics)): inside a
   condition, `datetime()`'s epoch accessors use the BloodHound server's clock, in whole seconds or
   milliseconds (returned as a column, they are declined).

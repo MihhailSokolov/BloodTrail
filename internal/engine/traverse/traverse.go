@@ -8,6 +8,7 @@
 package traverse
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sort"
@@ -59,6 +60,15 @@ func newScratch(n int) *scratch {
 		mark: make([]uint32, n),
 		dist: make([]int8, n),
 	}
+}
+
+// scratchBytes is what one scratch sized for n nodes costs: a uint32 mark
+// plus an int8 distance per node. The slice headers themselves are a
+// constant few words and are ignored. Used to charge a strategy's scratch
+// set against the query's memory limit before allocating it (memBudget.
+// reserve).
+func scratchBytes(n int) uint64 {
+	return uint64(n) * 5
 }
 
 // reset invalidates every distance written since the previous reset.
@@ -130,29 +140,63 @@ func (s *scratch) set(v snapshot.NodeID, d int8) {
 	s.dist[v] = d
 }
 
-// memBudget tracks approximate bytes consumed by enumerate's output,
-// erroring once accounting would exceed limit. A zero limit is unbounded.
-// Guarded by mu so a single budget can be shared across strategy B's
-// parallel workers.
+// memBudget tracks approximate bytes a query holds, erroring once accounting
+// would exceed limit. A zero limit is unbounded. Guarded by mu so a single
+// budget can be shared across strategy B's parallel workers.
+//
+// Two kinds of bytes, accounted separately because they come and go on
+// different schedules:
+//
+//   - used is enumerate's OUTPUT, added per completed path and forgotten
+//     wholesale by reset when the overall-shortest mode discards the paths
+//     collected so far.
+//   - reserved is scratch a strategy holds for its whole run, whatever
+//     happens to the output -- strategy B's one distance buffer per
+//     small-side element, which bfsSmallSide allocates before the merge and
+//     releases only after it (see strategySmallSide). reset leaves it alone
+//     precisely because discarding paths does not free it.
+//
+// The limit covers their sum: both are resident at the same time.
 type memBudget struct {
-	mu          sync.Mutex
-	limit, used uint64
+	mu                    sync.Mutex
+	limit, used, reserved uint64
 }
 
-// add accounts n more bytes, returning ErrMemoryLimit without recording the
-// addition if that would exceed the budget's limit.
+// add accounts n more bytes of output, returning ErrMemoryLimit without
+// recording the addition if that would exceed the budget's limit.
 func (b *memBudget) add(n uint64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.limit > 0 && b.used+n > b.limit {
+	if b.limit > 0 && b.reserved+b.used+n > b.limit {
 		return ErrMemoryLimit
 	}
 	b.used += n
 	return nil
 }
 
-// reset forgets every byte accounted so far, for a caller that has just
-// discarded every path those bytes were charged for (shortestLevel.admit).
+// reserve accounts n bytes of scratch a strategy is about to allocate and
+// hold for its whole run, returning false without recording it if that
+// would exceed the budget's limit. The caller is expected to decline the
+// whole query rather than allocate the scratch anyway -- which is what this
+// exists to prevent, so the reservation is taken before that allocation.
+//
+// There is no matching release, and none is needed: a memBudget is built per
+// AllShortestPaths call and the scratch outlives every phase charged against
+// it, so the reservation is correct for the budget's whole life.
+func (b *memBudget) reserve(n uint64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit > 0 && b.reserved+b.used+n > b.limit {
+		return false
+	}
+	b.reserved += n
+	return true
+}
+
+// reset forgets every OUTPUT byte accounted so far, for a caller that has
+// just discarded every path those bytes were charged for
+// (shortestLevel.admit). Reservations survive it: the scratch they stand for
+// is still allocated.
 func (b *memBudget) reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -162,6 +206,54 @@ func (b *memBudget) reset() {
 // ErrMemoryLimit is returned by enumerate when accounting a completed path
 // would exceed the memBudget's limit.
 var ErrMemoryLimit = errors.New("bloodtrail: path engine memory limit exceeded")
+
+// cancelCheckInterval is how many cheap merge-phase iterations pass between
+// two consecutive request-context checks. It matches interpret's own work
+// meter cadence (exec.go's workMeter.spend): frequent enough that a
+// cancelled request stops within a bounded amount of work, rare enough that
+// the check never shows up on a per-node walk.
+const cancelCheckInterval = 1024
+
+// cancelCheck carries a Query's own request context (Query.Ctx) into a
+// strategy's enumeration loops, so a cancelled caller gets its cancellation
+// instead of an answer -- the way the PostgreSQL read this package stands in
+// for answers that same context. A nil cancelCheck, and one over a nil
+// context, never fails: a traversal with no context runs exactly as it did
+// before this existed.
+//
+// It is deliberately NOT safe for concurrent use (unchecked is a plain
+// counter). Every cancelCheck lives inside one sequential loop; strategy B's
+// parallel BFS fan-out (bfsSmallSide) gives each worker its own.
+type cancelCheck struct {
+	ctx       context.Context
+	unchecked int
+}
+
+// err is the request context's error, checked unconditionally. Used where a
+// single iteration is itself expensive -- one pair's bidirectional search,
+// one full BFS run -- so the check's own cost is immaterial beside it.
+func (c *cancelCheck) err() error {
+	if c == nil || c.ctx == nil {
+		return nil
+	}
+	return c.ctx.Err()
+}
+
+// step charges one cheap iteration and returns the request context's error
+// once every cancelCheckInterval of them. Used in the merge phases, whose
+// loops walk one whole endpoint set -- up to every node in the snapshot --
+// doing a single distance lookup per step.
+func (c *cancelCheck) step() error {
+	if c == nil || c.ctx == nil {
+		return nil
+	}
+	c.unchecked++
+	if c.unchecked < cancelCheckInterval {
+		return nil
+	}
+	c.unchecked = 0
+	return c.ctx.Err()
+}
 
 // Budgets bounding AllShortestPaths's strategy dispatch: PairBudget caps how
 // many (root, terminal) pairs strategy A will run pairPaths over; SideBudget
@@ -418,6 +510,25 @@ type Query struct {
 	Limit            int  // 0 => unbounded
 	MemoryLimit      uint64
 
+	// Ctx, when set, is the context of the request this traversal serves:
+	// AllShortestPaths refuses to start once it is done, and a traversal
+	// already running stops at its next check, returning the context's own
+	// error (context.Canceled, context.DeadlineExceeded). nil means no
+	// context, which is exactly how every caller behaved before this field
+	// existed. Without it a cancelled request was traversed in full and
+	// answered, where the PostgreSQL shortest-path query this stands in for
+	// answers the same context with its cancellation.
+	//
+	// The checks sit once per (root, terminal) pair in strategy A, once per
+	// small-side BFS element in strategy B, and once every
+	// cancelCheckInterval iterations of a merge phase's endpoint walk --
+	// never on the per-node/per-edge path, which is the steady-state overlay
+	// read path on 5M-node graphs and must not pay for this. That bounds
+	// what a cancelled request can still spend at one full BFS (or one
+	// pair's bidirectional search plus its enumeration), the same unit
+	// PairBudget/SideBudget already dispatch on.
+	Ctx context.Context
+
 	// PairBudget/SideBudget, when positive, override this package's own
 	// PairBudget/SideBudget constants for this call's strategy dispatch
 	// only (see AllShortestPaths). Zero (the default) leaves the package
@@ -453,14 +564,24 @@ var ErrTooLarge = errors.New("bloodtrail: query too large for the path engine")
 //	B. one side materializes to <= SideBudget ids and the other is larger
 //	   or unconstrained: one full BFS per small-side element (parallel
 //	   across GOMAXPROCS goroutines, each with its own scratch), then
-//	   enumerate grouped by (root asc, terminal asc) until Limit.
+//	   enumerate grouped by (root asc, terminal asc) until Limit. Also
+//	   ErrTooLarge when that scratch set alone does not fit MemoryLimit --
+//	   see strategySmallSide.
 //	C. otherwise: return ErrTooLarge (caller delegates to PostgreSQL).
 //
 // Results are ordered by (root dense id, terminal dense id); depths within
 // a pair are equal by construction, and in ModeAll across pairs too (see
 // ModeAll). Dense ascending == database-id ascending because the snapshot
 // loads nodes ordered by id.
+//
+// q.Ctx, when set, fails the call with the request context's own error --
+// before any work if it is already done, and at the next check of whichever
+// strategy ran otherwise. See Query.Ctx.
 func AllShortestPaths(s *snapshot.View, q Query) ([]Path, error) {
+	if err := (&cancelCheck{ctx: q.Ctx}).err(); err != nil {
+		return nil, err
+	}
+
 	n := s.NodeCount()
 
 	maxDepth := q.MaxDepth
@@ -562,6 +683,7 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	defer putScratch(scT)
 	defer putScratch(scTmp)
 	oneMore := q.Mode == ModeOne
+	cancel := &cancelCheck{ctx: q.Ctx}
 
 	var out []Path
 	var callErr error
@@ -570,6 +692,14 @@ func strategyPairs(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth
 	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
 		stopOuter := false
 		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
+			// One pair is this strategy's unit of work -- a whole
+			// bidirectional search plus its enumeration -- so the request's
+			// context is checked once per pair, unconditionally (Query.Ctx).
+			if err := cancel.err(); err != nil {
+				callErr = err
+				stopOuter = true
+				return false
+			}
 			if q.ExcludeSelf && r == t {
 				return true
 			}
@@ -635,7 +765,17 @@ type smallSideDist struct {
 // scratch buffers for the elements it is assigned, so no synchronization is
 // needed beyond the fan-out/fan-in itself: results[i] is written by exactly
 // one goroutine before g.Wait returns.
-func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int) []smallSideDist {
+//
+// ctx is the request's context (Query.Ctx), nil for none: each worker checks
+// it once per element, before starting that element's BFS, so a cancelled
+// request stops within one BFS run instead of finishing every element it was
+// assigned. One full BFS is this strategy's unit of work, which is why the
+// check sits here and not inside bfsFrom's own per-node walk (Query.Ctx).
+// The returned results slice is always complete in length and must be
+// recycled by the caller even when the error is non-nil -- an aborted worker
+// simply leaves zero-value (nil dists) entries behind, exactly as the
+// workers<1 path already did.
+func bfsSmallSide(ctx context.Context, s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds *snapshot.KindMask, maxDepth int) ([]smallSideDist, error) {
 	n := s.NodeCount()
 	results := make([]smallSideDist, len(elems))
 
@@ -644,7 +784,7 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 		workers = len(elems)
 	}
 	if workers < 1 {
-		return results
+		return results, nil
 	}
 
 	chunk := (len(elems) + workers - 1) / workers
@@ -660,7 +800,13 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 			continue
 		}
 		g.Go(func() error {
+			// Its own cancelCheck: the type is not safe for concurrent use,
+			// and ctx.Err() is.
+			cancel := &cancelCheck{ctx: ctx}
 			for i := lo; i < hi; i++ {
+				if err := cancel.err(); err != nil {
+					return err
+				}
 				sc := getScratch(n)
 				bfsFrom(s, elems[i], forward, kinds, maxDepth, sc)
 				results[i] = smallSideDist{elem: elems[i], dists: sc}
@@ -668,9 +814,10 @@ func bfsSmallSide(s *snapshot.View, elems []snapshot.NodeID, forward bool, kinds
 			return nil
 		})
 	}
-	_ = g.Wait() // bfsFrom cannot fail; no worker ever returns a non-nil error.
 
-	return results
+	// bfsFrom itself cannot fail; the only error a worker returns is the
+	// request context's own.
+	return results, g.Wait()
 }
 
 // materialize collects e's matched dense ids, in ascending order, into a
@@ -689,6 +836,26 @@ func materialize(e Endpoint, s *snapshot.View) []snapshot.NodeID {
 // parallel via bfsSmallSide, then enumerates paths in a strictly ordered
 // sequential merge phase so output order (and Limit truncation) is
 // independent of goroutine scheduling.
+//
+// The scratch set this holds -- one distance buffer per small-side element,
+// live from bfsSmallSide's fan-out until the merge below has returned -- is
+// charged to the query's own memory limit (budget.reserve) before any of
+// THAT set is allocated, and the whole query declines ErrTooLarge if it does
+// not fit, so the caller delegates to PostgreSQL instead. The small-side id
+// slice materialize builds just above is deliberately left out of the
+// reservation: the reservation needs its length, and the slice is 8 bytes
+// per element against the scratch's 5*NodeCount bytes per element, so it is
+// strictly smaller than one buffer of the set it precedes. Nothing bounded that set
+// before: Query.SideBudget caps how many BFS runs a caller will attempt, and
+// the package default of 16 keeps the set small, but a caller that raises it
+// from its own work budget (interpret's strategyBudgetOverrides) grows the
+// set with it -- at the interpreter's default work budget, up to roughly
+// 1.3 GB on a sparse graph, since each buffer costs 5 bytes per node of the
+// WHOLE snapshot however few nodes the search reaches. No documented budget
+// was exceeded by that; nothing accounted for it either.
+//
+// strategyPairs' own three scratches are deliberately not reserved: three is
+// a constant, not something a caller's budget can scale.
 func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxDepth int, budget *memBudget, smallIsRoots bool) ([]Path, error) {
 	small := q.Terminals
 	if smallIsRoots {
@@ -696,13 +863,19 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 	}
 	elems := materialize(small, s)
 
+	if !budget.reserve(scratchBytes(s.NodeCount()) * uint64(len(elems))) {
+		return nil, ErrTooLarge
+	}
+
 	// small side = roots -> forward BFS (dist-from-root) per root.
 	// small side = terminals -> reverse BFS (dist-to-terminal) per terminal.
-	results := bfsSmallSide(s, elems, smallIsRoots, kinds, maxDepth)
+	results, bfsErr := bfsSmallSide(q.Ctx, s, elems, smallIsRoots, kinds, maxDepth)
 	// The merge phases below are the scratches' last readers; recycle them
 	// once whichever merge ran has returned (scratchPool's own doc). A nil
-	// dists only exists on the workers<1 path, which leaves zero-value
-	// entries behind.
+	// dists exists on the workers<1 path and wherever a worker stopped on a
+	// cancelled request, both of which leave zero-value entries behind. The
+	// defer is registered before bfsErr is inspected so the scratches a
+	// stopped fan-out did allocate are still recycled.
 	defer func() {
 		for _, res := range results {
 			if res.dists != nil {
@@ -710,6 +883,9 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 			}
 		}
 	}()
+	if bfsErr != nil {
+		return nil, bfsErr
+	}
 
 	if smallIsRoots {
 		return mergeSmallRoots(s, q, kinds, budget, results)
@@ -727,6 +903,7 @@ func strategySmallSide(s *snapshot.View, q Query, kinds *snapshot.KindMask, maxD
 // shortestLevel, exactly as strategyPairs does.
 func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
+	cancel := &cancelCheck{ctx: q.Ctx}
 	var out []Path
 	var callErr error
 	var level shortestLevel
@@ -735,6 +912,15 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 		r, sc := res.elem, res.dists
 		stop := false
 		q.Terminals.Iterate(s, func(t snapshot.NodeID) bool {
+			// This walk covers the whole terminal side -- up to every node
+			// in the snapshot -- at one distance lookup per step, so the
+			// request's context is checked on the batched cadence rather
+			// than per terminal (Query.Ctx).
+			if err := cancel.step(); err != nil {
+				callErr = err
+				stop = true
+				return false
+			}
 			if q.ExcludeSelf && r == t {
 				return true
 			}
@@ -797,11 +983,20 @@ func mergeSmallRoots(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget
 // strategyPairs does.
 func mergeSmallTerminals(s *snapshot.View, q Query, kinds *snapshot.KindMask, budget *memBudget, results []smallSideDist) ([]Path, error) {
 	oneMore := q.Mode == ModeOne
+	cancel := &cancelCheck{ctx: q.Ctx}
 	var out []Path
 	var callErr error
 	var level shortestLevel
 
 	q.Roots.Iterate(s, func(r snapshot.NodeID) bool {
+		// This walk covers the whole root side -- up to every node in the
+		// snapshot -- at one distance lookup per small-side element, so the
+		// request's context is checked on the batched cadence rather than
+		// per root (Query.Ctx).
+		if err := cancel.step(); err != nil {
+			callErr = err
+			return false
+		}
 		for _, res := range results {
 			t, sc := res.elem, res.dists
 			if q.ExcludeSelf && r == t {

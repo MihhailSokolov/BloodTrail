@@ -5740,6 +5740,19 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 // variable an aggregate folds (u in count(u)) is exactly a binding that can
 // shadow an alias. A parenthesised or reserved name declines even where it
 // names a binding PostgreSQL might resolve -- a deliberate over-decline.
+// So does the folded-column rule above: a node, a relationship, or a
+// carried COUNT/COLLECT/constant projected by a bare RETURN item is sorted
+// by its binding, not by either column, so this over-declines there.
+// `WITH g, count(u) AS c RETURN c, g.v AS C ORDER BY c` declines because c
+// and C fold to one column name -- yet dawgs emits `order by s0.i0` for it,
+// a qualified reference to the grouped count's own frame column rather than
+// to either output alias, so the fold never reaches PostgreSQL's ORDER BY
+// name resolution at all and the query is answered. (Dumped through
+// translate.Translate and run: `with s0(i0, v) as (...) select s0.i0 as c,
+// s0.v as C from s0 order by s0.i0` answers, sorted by i0, while the same
+// select list under `order by c` is 42702, `ORDER BY "c" is ambiguous`. The
+// fold is only load-bearing for a name no binding carries -- the second
+// bullet above -- where dawgs does emit the bare alias.)
 func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
 	if ret == nil || ret.Projection == nil || ret.Projection.Order == nil {
 		return false

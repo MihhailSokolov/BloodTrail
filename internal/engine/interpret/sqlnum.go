@@ -272,9 +272,15 @@ func exactInteger(f float64) (int64, bool) {
 // not something to round. An operand that is not a whole number is a numeric
 // fraction, computed exactly there; it declines here. Integer `/` and `%`
 // truncate toward zero, as Go's do, and a zero divisor is PostgreSQL's
-// "division by zero"; numeric division is exact, so it declines. (Plan
-// refuses `%` in every form -- numericStepServed -- so the `%` case is
-// defensive, kept with PostgreSQL's semantics.)
+// "division by zero"; numeric division is exact, so it declines.
+//
+// The `%` arm is defensive and unreachable from Plan today: numericStepServed
+// refuses `%` at every type, because float8 has none and numeric's is exact
+// decimal. It is kept rather than dropped because at int4/int8 -- the only
+// types that reach it -- PostgreSQL's `%` is exactly Go's, so if that gate
+// is ever narrowed to admit integer `%`, the arm is already right;
+// TestIntegerArithmeticFollowsPostgresWidths pins its semantics so it
+// cannot drift while unreachable.
 func integerArithmetic(t sqlNum, a float64, op cypher.Operator, b float64) (float64, error) {
 	ai, aok := exactInteger(a)
 	bi, bok := exactInteger(b)
@@ -298,6 +304,7 @@ func integerArithmetic(t sqlNum, a float64, op cypher.Operator, b float64) (floa
 			return 0, ErrUnsupported
 		}
 		r = ai * bi
+	// OperatorModulo is the defensive arm; see this function's doc comment.
 	case cypher.OperatorDivide, cypher.OperatorModulo:
 		if t == sqlNumNumeric {
 			return 0, ErrUnsupported

@@ -169,6 +169,21 @@ import (
 // this sentinel instead, which the engine is expected to treat as "decline,
 // delegate to PostgreSQL" so the caller still observes whatever pg itself
 // returns.
+//
+// The ModeAll case above is a deliberately BROAD over-decline, not the exact
+// divergence. The answers differ only when some shared node's shortest cycle
+// over the step's own edge kinds is STRICTLY SHORTER than the shortest
+// non-self pair: pg's harness answers at min(those two) and `s <> t` then
+// drops the self pair, so a shorter cycle leaves pg with the non-self pairs
+// at a depth this package would never have chosen (often none at all), while
+// an equal or longer cycle leaves both answers identical. Any shared node
+// at all declines here instead, because establishing the real condition
+// means a shortest-cycle search per shared node -- and with one endpoint
+// unconstrained, as in `allShortestPaths((s)-[:X*1..]->(t:Tag_Tier_Zero))
+// WHERE s <> t`, every node of the other side is shared, so that is one BFS
+// per terminal, more work than the query itself and exactly what
+// traverse.SideBudget exists to bound. Declining is always safe, and this
+// stays as it is until that cost is worth paying.
 var ErrSelfEndpoint = errors.New("interpret: self endpoint")
 
 // --- var-length trail expansion --------------------------------------------
@@ -1276,6 +1291,12 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		MaxDepth:    maxDepth,
 		SideBudget:  sideBudget,
 		PairBudget:  pairBudget,
+		// One AllShortestPaths call is a single, potentially long step
+		// between two of the work meter's own context checks (exec.go's
+		// workMeter), so the request's context goes in with it -- otherwise
+		// a request cancelled during the traversal is still traversed in
+		// full. See traverse.Query.Ctx for where the checks sit.
+		Ctx: env.Ctx,
 	}
 
 	rowCap, memLimit, unbounded := shortestPathBudget(meter, maxDepth)

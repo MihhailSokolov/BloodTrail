@@ -367,8 +367,21 @@ func (e *Engine) TryNodeCount(ctx context.Context, spec recognize.NodeSpec) (int
 // so this is a superset guarantee over what a caller can already rely on;
 // differential tests comparing engine output against PostgreSQL compare as
 // sets, not sequences.
+//
+// A request whose context is already done declines here, exactly as
+// TryNodeCount's does -- PostgreSQL answers such a request with its own
+// cancellation, and the wrapper's fallback is what then returns it. One
+// cancelled while the cursor is being drained stops the feed through
+// channels.Submit and reports graph.ErrContextTimedOut (see feedCursor.feed);
+// every other cursor-returning entry point in this file gets the identical
+// entry decline, for the identical reason.
 func (e *Engine) TryNodeFetchIDs(ctx context.Context, spec recognize.NodeSpec) (graph.Cursor[graph.ID], bool) {
 	start := time.Now()
+
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opNodeIDs, reasonError, err)
+		return nil, false
+	}
 
 	matches, snap, ok := e.resolveNodeSpec(ctx, opNodeIDs, spec)
 	if !ok {
@@ -411,6 +424,11 @@ func (e *Engine) TryNodeFetchIDs(ctx context.Context, spec recognize.NodeSpec) (
 // from a legitimately exhausted cursor.
 func (e *Engine) TryNodeFetchKinds(ctx context.Context, spec recognize.NodeSpec) (graph.Cursor[graph.KindsResult], bool) {
 	start := time.Now()
+
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opNodeKinds, reasonError, err)
+		return nil, false
+	}
 
 	matches, snap, ok := e.resolveNodeSpec(ctx, opNodeKinds, spec)
 	if !ok {
@@ -1077,6 +1095,11 @@ func (e *Engine) TryRelCount(ctx context.Context, spec recognize.RelSpec) (int64
 func (e *Engine) TryRelFetchIDs(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.ID], bool) {
 	start := time.Now()
 
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opRelIDs, reasonError, err)
+		return nil, false
+	}
+
 	plan, ok := e.resolveRelSpec(ctx, opRelIDs, spec)
 	if !ok {
 		return nil, false
@@ -1107,6 +1130,11 @@ func (e *Engine) TryRelFetchIDs(ctx context.Context, spec recognize.RelSpec) (gr
 // materializing first.
 func (e *Engine) TryRelFetchTriples(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.RelationshipTripleResult], bool) {
 	start := time.Now()
+
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opRelTriples, reasonError, err)
+		return nil, false
+	}
 
 	plan, ok := e.resolveRelSpec(ctx, opRelTriples, spec)
 	if !ok {
@@ -1154,6 +1182,11 @@ func (e *Engine) TryRelFetchTriples(ctx context.Context, spec recognize.RelSpec)
 // answer, with no possibility of a resolution failure surfacing mid-stream.
 func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (graph.Cursor[graph.RelationshipKindsResult], bool) {
 	start := time.Now()
+
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opRelKinds, reasonError, err)
+		return nil, false
+	}
 
 	plan, ok := e.resolveRelSpec(ctx, opRelKinds, spec)
 	if !ok {
@@ -1236,13 +1269,25 @@ func (e *Engine) TryRelFetchKinds(ctx context.Context, spec recognize.RelSpec) (
 // its edge-kind names eagerly: so a resolution failure declines reasonError
 // here, before rowResult is ever constructed, rather than surfacing from
 // inside a Values() call with no clean way to report it (rowResult.Error()
-// always returns nil; see its own doc). Unlike TryRelFetchKinds, every
+// reports nothing but a cancellation; see its own doc). Unlike
+// TryRelFetchKinds, every
 // KindID the kind table names up to snap.MaxKindID() is resolved regardless
 // of plan.kindMask, since a far node's own carried kinds are never filtered
 // by spec.EdgeKinds; for ProjectionStartEnd, no kind names are needed at all
 // (the row is a bare id pair), so this resolution is skipped entirely.
+//
+// A request whose context is already done declines here, as TryRelCount's
+// does, and one cancelled while the rows are being pulled stops the scan
+// with that error (rowResult.Next/Error): PostgreSQL answers such a request
+// with its own cancellation, and the wrapper's fallback is what then
+// returns it.
 func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, proj recognize.RowProjection, orderByEdgeID bool) (graph.Result, bool) {
 	start := time.Now()
+
+	if err := ctx.Err(); err != nil {
+		e.declineOp(ctx, opRelRows, reasonError, err)
+		return nil, false
+	}
 
 	plan, ok := e.resolveRelSpec(ctx, opRelRows, spec)
 	if !ok {
@@ -1284,7 +1329,7 @@ func (e *Engine) TryRelQueryRows(ctx context.Context, spec recognize.RelSpec, pr
 		it = &sliceRelIter{edges: edges}
 	}
 
-	result := newRowResult(plan.snap, it, proj, kindNames)
+	result := newRowResult(ctx, plan.snap, it, proj, kindNames)
 
 	e.servedOp(ctx, opRelRows, start)
 	return result, true
