@@ -896,7 +896,9 @@ func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Durat
 // through here is trust restoration while the engine serves correctly
 // (ResolveAbandonedWrite's settle, Apply's belt-and-braces settle,
 // finishFallbackRebuild's generations-only recheck, and a save refused over
-// a counter nobody accounted for -- saveSnapshotProbe, persist.go), where an
+// a counter nobody accounted for -- saveSnapshotProbe, persist.go -- and a
+// save skipped over a delta that can never empty, noteSkippedCompactionSave,
+// persist.go), where an
 // unlimited launch rate would let a sustained stream of settling bump
 // failures -- e.g. a watermark table that errors while the data tables
 // still work -- run full snapshot loads back to back indefinitely for no
@@ -911,8 +913,10 @@ func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Durat
 //
 // That last case -- a launcher declining because the generations now agree --
 // is the resolution being waited for ONLY for the callers whose request is
-// about a watermark failure. saveSnapshotProbe's is not: what is unresolved
-// there is a counter value the ledger does not account for, which no
+// about a watermark failure. The two save-path callers are not: what is
+// unresolved for saveSnapshotProbe is a counter value the ledger does not
+// account for, and for noteSkippedCompactionSave a delta holding only edge
+// records whose endpoints cannot be resolved -- neither of which any
 // generation reflects, so a request of its own that coalesces behind a
 // launch already inside the interval can be declined by that recheck. It
 // costs that one save: the refusal repeats on the next compaction, and the
