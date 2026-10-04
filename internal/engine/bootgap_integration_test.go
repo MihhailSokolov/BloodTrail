@@ -77,7 +77,8 @@ func TestFileBootReplaysBootWritesAndAdopts(t *testing.T) {
 	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
-	engB.bootGap.activate() // what Start does when SnapshotDir is set
+	engB.captureStartState(ctx) // what Start does when SnapshotDir is set, in its order
+	engB.bootGap.activate()
 
 	bootNode1 := bootGapWrite(t, ctx, engB, "boot-write-1")
 	bootNode2 := bootGapWrite(t, ctx, engB, "boot-write-2")
@@ -129,6 +130,7 @@ func TestFileBootReplaysDeletionOntoTheFile(t *testing.T) {
 	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.captureStartState(ctx)
 	engB.bootGap.activate()
 
 	// Delete the saved node, with the same bump-then-write-then-Apply
@@ -181,6 +183,7 @@ func TestFileBootReplaysAbandonedWriteCounter(t *testing.T) {
 	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.captureStartState(ctx)
 	engB.bootGap.activate()
 
 	// A bumped write that produced no committed effect: exactly what
@@ -244,6 +247,7 @@ func TestFileBootRejectsUncoveredGap(t *testing.T) {
 	}
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.captureStartState(ctx)
 	engB.bootGap.activate()
 
 	start := time.Now()
@@ -284,6 +288,7 @@ func TestFileBootWaitsForInFlightWriteAndAdopts(t *testing.T) {
 	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.captureStartState(ctx)
 	engB.bootGap.activate()
 
 	// The in-flight write: bumped now, applied only after the attempt is
@@ -363,6 +368,7 @@ func TestFileBootReplaysPostFreezeWriteAndAdopts(t *testing.T) {
 	savedNodeID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	engB.captureStartState(ctx)
 	engB.bootGap.activate()
 
 	counter, err := engB.BumpWatermark(ctx)
@@ -436,6 +442,7 @@ func TestFileBootRejectsAfterFallbackWrite(t *testing.T) {
 	// open for the write below, exactly as it does across a real shutdown
 	// save (boot.go's Stop).
 	defer engB.CloseWritePool()
+	engB.captureStartState(ctx)
 	engB.bootGap.activate()
 	// Stop() up front cancels bgCtx, so the recovery goroutine the
 	// fallback-shaped Apply below launches exits at its first context

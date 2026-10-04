@@ -1229,8 +1229,11 @@ instant of the database:
    (`select lineage from bloodtrail_watermark where id = 1`), as the transaction's last
    statements, so they describe the instant the rows belong to ([Section 13](#13-the-watermark)).
    On a database without the table or the lineage column the read fails and aborts the
-   transaction, which is why nothing follows it; the load is still used, and a load whose lineage
-   could not be read logs `could not read the watermark lineage` at Warn.
+   transaction, which is why nothing follows it; the load is still used, and each failure says so
+   at Warn under its own cause: a lineage that could not be read logs
+   `could not read the watermark lineage`, and a counter that could not be read logs
+   `could not read the watermark counter during the load`, which is what later refuses saves
+   ([§13.4](#134-one-writer)) since nothing rebased the ledger onto it.
 
 Decoding each node's JSON properties is the expensive step, so rows stream from a single cursor into
 a pool of parser goroutines (one per CPU core), while a single consumer hands parsed nodes to the
@@ -1254,9 +1257,16 @@ it on every restart. `rebuildOnce` now recovers a panic on its own goroutine (th
 the size check, the adoption) into an error and a FALLBACK (`recoverRebuildPanic`,
 [`background_panic.go`](internal/engine/background_panic.go)): it logs
 `bloodtrail: snapshot rebuild panicked` at Error with the stack, and the load is retried on the
-usual backoff ([§12.5](#125-fallback)). The goroutines that stream and decode the node rows during
-the load are not covered. The boot's attempt to start from the snapshot file is covered the same
-way, and also deletes the file ([§14.3](#143-boot)).
+long interval a panic gets ([§12.5](#125-fallback)). The goroutines that stream, decode and stage
+the node rows need their own cover, because `errgroup` deliberately does not propagate a panic to
+the goroutine that waits: each of the three roles runs through `goRecovered`, which turns a panic
+into the load's own error with the stack it was raised on, and each parse job through
+`parseLoadedProps`, which recovers one job at a time so the panic arrives as that node's parse
+result and the consumer waiting on it is never stranded. Such an error never passes through
+`rebuildOnce`'s own recover, so it carries a type (`loadPanicError`) the retry cadence recognizes
+instead, and gets that same long interval rather than the seconds-scale one a transient failure
+gets. The boot's attempt to start from the snapshot file is covered the same way, and also deletes
+the file ([§14.3](#143-boot)).
 
 **Memory limit.** If `BLOODTRAIL_MEMORY_LIMIT` is set and the finished snapshot's estimated size
 exceeds it, the load is refused. Whatever the engine had before stays in place (at startup, that
@@ -1264,7 +1274,9 @@ means no replica, so every query goes to PostgreSQL), and the load is retried ev
 
 **Code.** [`load.go`](internal/engine/load.go): `loadSnapshot` (and `LoadSnapshot`, the exported
 form the benchmarks use, which reads neither the counter nor the lineage), `loadedWatermark`,
-`loadKinds`, `loadNodes`, `loadEdges`, `probeMultiGraph`. [`engine.go`](internal/engine/engine.go):
+`loadKinds`, `loadNodes`, `goRecovered`, `parseLoadedProps`, `loadPanicError`, `loadEdges`,
+`probeMultiGraph`.
+[`engine.go`](internal/engine/engine.go):
 `rebuildOnce`, `adoptRebuiltView`. [`watermark.go`](internal/engine/watermark.go):
 `adoptRebuiltViewAndRebase`. [`background_panic.go`](internal/engine/background_panic.go):
 `backgroundPanicked`, `recoverRebuildPanic`, `bootFromSnapshotFile`, `recoverSnapshotFileBootPanic`.
@@ -2359,8 +2371,9 @@ kind-scoped delete races other writers: a row of the deleted kind that another w
 after the `DELETE`'s snapshot, and whose apply ran first, must survive. An earlier version carried
 the delete out against the view as an instruction ("tombstone every edge of kind K") and erased such
 rows while staying SERVING. With read-back the result no longer depends on the order in which
-concurrent writes are applied, with one exception: an objectid-keyed edge upsert whose endpoint is
-re-keyed before the upsert is applied ([§12.3](#123-reading-back)). A delete whose criteria name
+concurrent writes are applied, with one surviving exception, narrower than it was: an
+objectid-keyed edge upsert whose endpoint node the replica has not applied yet and another writer
+re-keys before the upsert is applied ([§12.3](#123-reading-back)). A delete whose criteria name
 more rows than PostgreSQL deleted costs only extra re-reads. Enumerating the candidates scans the
 view's kind bitsets (or every node for an empty `include`) or the edge-kind column once, inside
 `Apply`; it never touches a query's read path, and the re-reads go 50,000 ids per round trip.
@@ -2432,10 +2445,18 @@ matches no row any more does not mean its node is gone: a node whose objectid wa
 keeps its id, its row and its edges. So every node the view knows under such an objectid joins the
 candidates of [§12.1](#121-record-the-keys-then-read-back-the-truth) and is re-read by id, with the
 same `id = ANY($2)` query as the other candidates; only one that is really absent is tombstoned,
-with its edges. One case is not covered: an objectid-keyed edge upsert whose endpoint was re-keyed
-between the upsert and its apply. Its triple cannot be resolved, so an edge that upsert created is
-not staged until a later write names it or a reload brings it in. Objectids are identities in
-BloodHound, so this takes a re-key racing an ingest upsert.
+with its edges. A triple with such an endpoint waits for that re-read and is then resolved against
+it (`rekeyedTripleKeys`): a re-key changes no node id, so a node that comes back present under the
+old objectid is the id the upsert resolved that objectid to, and the triple is queried for it in a
+second batch pass. An endpoint that is really gone needs nothing, because its own tombstone takes
+its edges with it. One case is still not covered: an endpoint node the replica has not applied yet,
+whose objectid another writer has already re-keyed, is named by neither PostgreSQL's objectid lookup
+nor the view, so that node and its edge are not staged until a later write names them or a reload
+brings them in. The upsert's own new endpoint is one way to be in that state, and so is an endpoint
+another write created whose apply has not run yet, since applies run in the order their calls
+finish, not the order their writes committed
+([§12.1](#121-record-the-keys-then-read-back-the-truth)). Objectids are identities in BloodHound,
+so either way this takes a re-key racing a node the replica has never seen.
 
 Kind names and kind ids are resolved on this same pool, out of the kind table itself (`kindCatalog`,
 `pgKindCatalog`), rather than through DAWGS's kind mapper. That mapper answers from an in-process
@@ -2554,8 +2575,13 @@ end-to-end test asserts exactly one full load, at startup, across an install, an
 analysis run ([§16.3](#163-the-blind-spot-and-the-end-to-end-test)).
 
 Recovery retries after 100 ms, doubling up to 30 s between attempts; a load refused by the memory
-limit waits 10 minutes. A load that panicked is retried on the same doubling backoff, so a panic
-that depends on the data logs its stack at each attempt. The startup load and fallback recovery
+limit waits 10 minutes, and so does a load that panicked (`loadRetryDelayAfter`), because a panic
+that depends on the data recurs on every attempt and the engine serves correctly from PostgreSQL
+meanwhile. Both shapes of such a panic count: one on the rebuild's own goroutine, which its recover
+records, and one on a load goroutine, which is recovered there and returned as an error of its own
+type ([Section 7](#7-loading-the-replica-from-postgresql)) -- the likelier of the two, since
+parsing and staging are where the data is touched. Neither case advances the doubling schedule, so
+the fast retry is back for whatever outcome comes next. The startup load and fallback recovery
 share one flag, so at most one retry-until-adopted loop runs at a time; when a loop finishes it
 re-checks the state, so a write that re-entered FALLBACK just as a load was adopted is not left
 stranded.
@@ -2717,8 +2743,13 @@ leave gaps this server cannot account for. A running server then refuses to save
 (`snapshot file not written`, Warn, with a reason that begins
 `the watermark counter holds values this process never resolved`, quoted in full in
 [Appendix B](#appendix-b-log-messages), and the attributes `pg_watermark`, `resolved_through` and
-`resolved_exactly`) until a load it adopts has read the other server's writes, and a file is
-rejected at the next startup when the buffered writes cannot cover the gap ([§14.3](#143-boot)).
+`resolved_exactly`) until a load it adopts has read the other server's writes. The refusal asks for
+that load itself, through the same once-every-30-seconds request a settled bump failure uses
+([§13.3](#133-when-a-bump-fails)), since nothing else this process does would ever account for
+those values. That is not free in this deployment: each refused save can start a full load, so a
+database two servers keep writing pays one extra in-memory copy of the graph per 30 s at worst,
+where the refusals alone used to cost nothing. A file is rejected at the next startup when the
+buffered writes cannot cover the gap ([§14.3](#143-boot)).
 That is the limit of what one process can see of another: a load covers another server's counter
 value even when that server's own write had not committed yet when the load read the database, so it
 is a detection, not a coherent cluster. Writes made to PostgreSQL by anything else (`psql`, the
@@ -2821,8 +2852,11 @@ sequences where they were, and only inserts made after the save read the positio
 made earlier, while the saving process was still running, is already behind them. So it does not
 replace ending the lineage. A sequence that moved for any other reason (a reset, a crash that let
 PostgreSQL skip ahead, a second BloodTrail process writing while this one started) costs a rebuild,
-never a wrong adoption. If the start positions cannot be read within 5 s, that boot skips the check
-and says so at Warn; the lineage and counter checks still apply.
+never a wrong adoption. If the start state cannot be read within 5 s, neither this check nor the
+counter one above has anything to compare against, so that boot adopts no snapshot file at all
+(`where PostgreSQL stood when this process started could not be read`) and rebuilds from
+PostgreSQL; the failed read says so at Warn. Refusing costs a load, where adopting a file neither
+check could weigh risks serving rows PostgreSQL does not hold.
 
 **Code.** [`watermark.go`](internal/engine/watermark.go): `BumpWatermark`, `ReadWatermark`,
 `AdvanceWatermark`, `ResolveAbandonedWrite`, `NoteWatermarkBumpFailure`, `WatermarkTrusted`,
@@ -2855,7 +2889,9 @@ total size on each new view, so they must periodically be folded back into a fre
   together with the fold's pending edges ([§6.7](#67-fold)) beneath them, and placed on the new
   base, which works because segments identify things by database id. An edge whose endpoint has
   not arrived yet thus stays in the delta, invisible, until the endpoint's write lands, instead of
-  being lost. The new view is warmed and published, and the snapshot file is written
+  being lost; how many were carried is reported as `carried_edges` on the `compaction finished`
+  line, because that is what a save skipped for a non-empty delta is otherwise silent about. The
+  new view is warmed and published, and the snapshot file is written
   ([§14.2](#142-the-snapshot-file)).
 - **A panic** while folding or adopting is recovered (`foldAndAdoptCompaction`): it logs
   `bloodtrail: compaction panicked` at Error and enters FALLBACK, instead of ending the process.
@@ -2881,7 +2917,8 @@ With `BLOODTRAIL_SNAPSHOT_DIR` set, the replica is saved to `<dir>/graph-<graphI
 - after each **adopted compaction**, unless more writes have arrived since, or the compaction
   carried an edge still waiting for its endpoint (either leaves the adopted view with a segment).
   An endpoint that never arrives therefore stops these saves until the next restart; the shutdown
-  save still writes.
+  save still writes. The `compaction finished` line's `carried_edges` is where that shows, since
+  the skipped save itself logs at Debug.
 
 A file is written only when the engine can prove the replica complete (SERVING, trusted, watermark
 converged, [§13.1](#131-the-counter)), no write was applied while the counter was being read, the
@@ -2924,16 +2961,16 @@ against the bytes the file still holds before allocating anything for it, so a f
 count is refused without a large allocation (before this, one flipped high bit could ask for about a
 terabyte, before the checksum was even read). It then verifies the checksum, and **validates the
 structure** (array lengths, offsets that only increase, database ids in strictly ascending order,
-indexes and property ids in range, arena references in bounds, and each node's property entries in
-strictly ascending property-id order, which the property lookup binary-searches): a checksum proves
-the bytes are the ones written, not that they describe a valid graph. Any failure rejects the file.
-The validation does not cover everything a reader relies on: the order of the edge-id permutation,
-the agreement of the reverse adjacency with the forward one, and the JSON text of list and object
-values are taken as written (each check is a pass over a large array or the whole arena whose cost
-at boot has not been measured), so a file edited with its checksum recomputed could still mislead.
-The header can also be read on its own, without the rest of the file. The checksum does not vouch
-for it until the whole file has been read, so the boot uses the header only to refuse a file early
-([§14.3](#143-boot)), never to trust one.
+indexes and property ids in range, arena references in bounds, each property name registered exactly
+once, and each node's property entries in strictly ascending property-id order, which the property
+lookup binary-searches): a checksum proves the bytes are the ones written, not that they describe a
+valid graph. Any failure rejects the file. The validation does not cover everything a reader relies
+on: the order of the edge-id permutation, the agreement of the reverse adjacency with the forward
+one, and the JSON text of list and object values are taken as written (each check is a pass over a
+large array or the whole arena whose cost at boot has not been measured), so a file edited with its
+checksum recomputed could still mislead. The header can also be read on its own, without the rest of
+the file. The checksum does not vouch for it until the whole file has been read, so the boot uses
+the header only to refuse a file early ([§14.3](#143-boot)), never to trust one.
 
 At about 4.9 million nodes and 49 million edges the file is about 3.9 GiB; saving takes 27–30 s,
 reading it 8–9 s, and a startup from the file 10–14 s, against 45–51 s for a full load.
@@ -2992,16 +3029,19 @@ equals its stamp" would almost never succeed. Instead:
   does not matter: read-back always returns PostgreSQL's *current* state for each key, and a
   kind-scoped delete is read back too, through the candidates the view being replayed onto holds
   ([§12.1](#121-record-the-keys-then-read-back-the-truth)); the one exception is the same as in
-  ordinary write-through, an objectid-keyed edge upsert whose endpoint is re-keyed before it is
-  applied ([§12.3](#123-reading-back)). (When kind-scoped deletes were replayed as instructions, a
-  delete that started first but committed last could erase a row written in between.) Publishing the
-  result also raises the watermark ledger to P ([§13.1](#131-the-counter)).
+  ordinary write-through, an objectid-keyed edge upsert whose endpoint node the replica has not
+  applied yet and another writer re-keyed before it is applied ([§12.3](#123-reading-back)). (When
+  kind-scoped deletes were replayed as instructions, a delete that started first but committed last
+  could erase a row written in between.) Publishing the result also raises the watermark ledger to P
+  ([§13.1](#131-the-counter)).
 
 Any doubt rejects the file (`snapshot file rejected`, with a `reason`, or an `error` for an
 unreadable file) and falls through to a normal load: a corrupt or wrong-version file (every file
 from before version 3 among them), a file from another watermark lineage
-(`watermark lineage changed since the file was written`), a file stamped ahead of the counter
-recorded at start (`the watermark counter was behind the file's stamp when this process started`), a
+(`watermark lineage changed since the file was written`), any file at all when the start state
+could not be read (`where PostgreSQL stood when this process started could not be read`), a file
+stamped ahead of the counter recorded at start
+(`the watermark counter was behind the file's stamp when this process started`), a
 file whose id sequences moved while the counter did not
 (`rows were inserted since the file was written by a writer that did not advance the watermark`),
 buffered numbers that contradict the file (`boot write buffer contradicts the file: …`, naming which
@@ -3033,9 +3073,9 @@ settle-wait was added, the same scenario had rejected the file three times out o
 `syncDir`, `ReadSnapshotFile`, `ReadSnapshotFileHeader`, `Stamp`, `Header`,
 `validateSnapshotStructure`, `validatePropStore`.
 [`snapshot.go`](internal/engine/snapshot/snapshot.go): `Lineage`, `WatermarkLineage`.
-[`boot.go`](internal/engine/boot.go): `Start`, `Stop`, `runBootLoad`, `tryLoadSnapshotFile`,
-`adoptSnapshotFileView`, `adoptSnapshotFileAttempt`. [`bootgap.go`](internal/engine/bootgap.go):
-`bootGapBuffer`, `bootGapCoveredAt`, `bootGapVerdict`.
+[`boot.go`](internal/engine/boot.go): `Start`, `Stop`, `runBootLoad`, `loadRetryDelayAfter`,
+`tryLoadSnapshotFile`, `adoptSnapshotFileView`, `adoptSnapshotFileAttempt`.
+[`bootgap.go`](internal/engine/bootgap.go): `bootGapBuffer`, `bootGapCoveredAt`, `bootGapVerdict`.
 
 ---
 
@@ -3610,9 +3650,12 @@ in the [README](README.md).
   cannot list, writes with an unknown outcome, and writes through read transactions. A reload is
   adopted only once no write lands while it runs, so under writes that never pause for that long,
   a FALLBACK lasts until they do ([Section 7](#7-loading-the-replica-from-postgresql)).
-- **One narrow write race is not followed**: an objectid-keyed edge upsert whose endpoint is
-  re-keyed before the upsert is applied leaves an edge that upsert created out of the replica
-  until a later write names it or a reload ([§12.3](#123-reading-back)).
+- **One narrow write race is not followed**: an objectid-keyed edge upsert whose endpoint node the
+  replica has not applied yet (the upsert's own new endpoint, or one another write created whose
+  apply has not run), and whose objectid another writer re-keys before the upsert is applied, leaves
+  that node and its edge out of the replica until a later write names them or a reload
+  ([§12.3](#123-reading-back)). An endpoint the replica already holds is followed through the
+  re-key.
 - **Not every query is accelerated.** Queries outside the interpreter's subset, queries that sort
   text, queries with `$parameters`, Cypher spellings whose DAWGS translation BloodTrail does not
   reproduce exactly ([§11.2](#112-matching-dawgss-semantics)), `allShortestPaths` queries whose
@@ -3686,17 +3729,19 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file rejected`, reason `watermark lineage changed since the file was written` | Info | The file names another lineage than PostgreSQL's. Expected on the first boot after `bloodtrail install`, and against a different or reset database |
 | `snapshot file rejected`, reason `rows were inserted since the file was written by a writer that did not advance the watermark` | Info | The counter still reads the file's stamp but an id sequence moved |
 | `snapshot file rejected`, reason `the watermark counter was behind the file's stamp when this process started` | Info | PostgreSQL went back since the file was written, as a restored backup does (with `file_watermark`, `start_watermark`) |
+| `snapshot file rejected`, reason `where PostgreSQL stood when this process started could not be read` | Info | The start-state read failed, so the two checks it feeds cannot be made; no file is adopted this start (with `file_watermark`) |
 | `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
 | `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), or when a write was applied during the probe |
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
 | `the write path's own connection pool could not be created` | Warn | Logged once; watermark bumps and read-backs run on BloodHound's pool instead, where a write holding a connection can wait on another's ([§5.2](#52-registration-and-open)) |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
-| `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |
+| `could not read the watermark counter during the load; this rebuild did not account for it, so a snapshot file save may be refused as if another server were writing` | Warn | An adopted load could not read the counter, so the ledger was not rebased onto it ([§13.4](#134-one-writer)) |
+| `could not record where PostgreSQL stood at start; no snapshot file will be adopted this start, and the boot will rebuild from PostgreSQL` | Warn | `Start`'s read of the counter and sequence positions failed, so the file checks that compare against it cannot be made |
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
 | `snapshot file invalidation failed` / `snapshot file not invalidated` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`), or no file path could be worked out yet, so there was nothing to delete (reason `no snapshot file path resolved yet`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
-| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above) |
+| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above). `finished` carries `carried_edges`: delta edges re-carried because their endpoint has not arrived, which is what keeps the post-compaction save from writing a file ([§14.2](#142-the-snapshot-file)) |
 
 ## Appendix C: Code map
 

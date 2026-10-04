@@ -374,7 +374,8 @@ set or BloodHound's own log level is debug.
 | `watermark bump failed` / `watermark table DDL failed` | Warn | The write counter could not be advanced / its table created |
 | `watermark lineage DDL failed; ...` | Warn | The lineage column could not be added; no snapshot file is written or adopted until a later start adds it |
 | `could not read the watermark lineage; ...` | Warn | No snapshot file will be written from that rebuild |
-| `could not record where PostgreSQL stood at start; ...` | Warn | That boot does not check its snapshot file for rows inserted behind the counter |
+| `could not read the watermark counter during the load; ...` | Warn | That rebuild did not account for the counter, so a later save may be refused as if another server were writing |
+| `could not record where PostgreSQL stood at start; ...` | Warn | That boot adopts no snapshot file and rebuilds from PostgreSQL: the checks that compare a file against the start state cannot be made |
 | `watermark failure settled by a write that produced no effect; ...` | Debug | A rebuild was requested to restore trust in the counter |
 | `snapshot file loaded` / `snapshot file rejected` | Info | The boot reused the saved file (`replayed_writes`) / declined it (`reason`, or `error` for an unreadable or older-format file) and rebuilt instead |
 | `snapshot file written` / `not written` / `skipped` / `write failed` | Info / Debug-Warn / Debug / Warn | Saving the replica on shutdown or after compaction. `not written` at Warn with reason `the watermark counter holds values this process never resolved: ...` means another BloodTrail server may be writing the same database |
@@ -419,9 +420,10 @@ query's conditions, `datetime()`'s epoch accessors read the BloodHound server's 
 when the query starts, where PostgreSQL reads its own `now()`; for a `shortestPath`
 without `s <> t`, whether PostgreSQL raises its shared-endpoint error can depend on its
 query plan, so on some plans PostgreSQL fails a query BloodTrail answers (where both
-answer, the answers agree); and an objectid-keyed edge upsert whose endpoint is re-keyed
-before the upsert is applied leaves the edge it created out of the replica until a later
-write names it or a reload.
+answer, the answers agree); and an objectid-keyed edge upsert whose endpoint node the
+replica has not applied yet, and whose objectid another writer re-keys before the upsert
+is applied, leaves that node and its edge out of the replica until a later write names
+them or a reload (an endpoint the replica already holds is followed through the re-key).
 
 Out of scope today: interpreting mutating Cypher and arbitrary update/delete criteria
 (both trigger a fallback rebuild), cache coherence across more than one BloodTrail

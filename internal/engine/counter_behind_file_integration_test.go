@@ -75,11 +75,12 @@ func TestFileBootRefusesAFileStampedAheadOfTheCounterAtStart(t *testing.T) {
 }
 
 // TestFileBootRejectsAtOnceABootCounterTheFileAlreadyClaims is the same
-// restore seen by a boot that could not record where PostgreSQL stood at
-// start: this boot's own write draws a counter the file already claims.
-// Waiting cannot fill that in -- the buffered counter will never stop
-// contradicting the file -- so the attempt must reject at once rather than
-// sit out the settle timeout before its PostgreSQL rebuild.
+// restore, played back after this boot already recorded where PostgreSQL
+// stood -- so the start state cannot show it, and this boot's own write
+// draws a counter the file already claims instead. Waiting cannot fill that
+// in -- the buffered counter will never stop contradicting the file -- so
+// the attempt must reject at once rather than sit out the settle timeout
+// before its PostgreSQL rebuild.
 func TestFileBootRejectsAtOnceABootCounterTheFileAlreadyClaims(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
@@ -89,16 +90,19 @@ func TestFileBootRejectsAtOnceABootCounterTheFileAlreadyClaims(t *testing.T) {
 
 	dir := t.TempDir()
 	lostID := seedFileBootSnapshot(t, ctx, pgDriver, pool, dir) // stamped 1
-	restoreBackupFromBeforeTheFile(t, ctx, pool, lostID)
 
 	const settle = 20 * time.Second
 	prevTimeout := bootGapSettleTimeout
 	bootGapSettleTimeout = settle
 	t.Cleanup(func() { bootGapSettleTimeout = prevTimeout })
 
-	// No start state recorded (its capture failed); a boot write lands
-	// counter 1, which the file already claims, and is buffered.
+	// The start state is captured first, while the counter still stands
+	// level with the file's stamp; the restore lands after it, and a boot
+	// write then draws counter 1, which the file already claims, and is
+	// buffered.
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	eng.captureStartState(ctx)
+	restoreBackupFromBeforeTheFile(t, ctx, pool, lostID)
 	eng.bootGap.activate()
 	bootGapWrite(t, ctx, eng, "boot-write-under-the-stamp")
 

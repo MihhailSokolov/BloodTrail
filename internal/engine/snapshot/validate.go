@@ -104,8 +104,9 @@ func validateSnapshotStructure(s *Snapshot) error {
 
 // validatePropStore is the half of the structural check that guards memory
 // safety: an entry's arena slice is handed to unsafe.String, and its prop id
-// indexes the name table directly. It also checks the order property lookups
-// depend on (a node's entries ascend by property id).
+// indexes the name table directly. It also checks what property lookups
+// depend on beyond safety: that each name is registered once, and that a
+// node's entries ascend by property id.
 func validatePropStore(p *PropStore, n int) error {
 	if p == nil {
 		return fmt.Errorf("%w: property store missing", ErrCorrupt)
@@ -115,6 +116,24 @@ func validatePropStore(p *PropStore, n int) error {
 	}
 	if err := validateOffsets32("property nodeOffsets", p.nodeOffsets, len(p.entries)); err != nil {
 		return err
+	}
+
+	// Property names are unique. finalizePropStore (builder.go) builds the
+	// name->PropID map by assigning each name its own index, so a repeated
+	// name keeps only the LAST index: every value stored under the earlier
+	// id stays reachable by id, from the node's own entries, but not by
+	// name -- so IDByName (and View.PropIDByName, and every filter and
+	// index built on it) answers with the later id, and a node carrying the
+	// earlier one reads as not carrying that property at all. Every writer
+	// interns each name once, so only an edited or forged file repeats one.
+	// One pass, one map of the names, which finalizePropStore is about to
+	// build anyway.
+	firstByName := make(map[string]int, len(p.names))
+	for i, name := range p.names {
+		if first, dup := firstByName[name]; dup {
+			return fmt.Errorf("%w: property name %q is registered twice, as ids %d and %d", ErrCorrupt, name, first, i)
+		}
+		firstByName[name] = i
 	}
 
 	arenaLen := uint64(len(p.arena))

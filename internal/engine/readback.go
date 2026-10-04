@@ -135,20 +135,20 @@ type readbackResult struct {
 //     hydrate.go's own edgeBatchQuery); a triple not found in the result is
 //     reported via absentTriples with its real, resolved kindID.
 //  5. cs.EdgeTriplesByObjectID() -- each endpoint objectid is resolved
-//     against (2)'s own result rather than queried again: a pair where
-//     either endpoint's objectid matched zero rows in (2) is reported as
-//     nothing at all here (the write either failed, or the endpoint is gone
-//     or re-keyed since; that objectid's re-read below settles what the View
-//     knew under it, and a deleted endpoint's cascade takes the edge with
-//     it). Not settled: an endpoint that was only re-keyed re-reads present,
-//     so an edge this upsert created is not staged here, and stays out of
-//     the replica until a later write names it or a rebuild loads it -- a
-//     re-key racing an ingest upsert, which BloodHound's use of objectids
-//     as identities makes rare. A pair where both endpoints resolve is
-//     expanded into every (start id, end id) combination across both
-//     endpoints' matches (deduplicated, and bounded by how many rows (2)
-//     actually returned for those two objectids) and folded into the same
-//     batch pass (4) runs.
+//     against (2)'s own result rather than queried again. A pair where both
+//     endpoints resolve is expanded into every (start id, end id)
+//     combination across both endpoints' matches (deduplicated, and bounded
+//     by how many rows (2) actually returned for those two objectids) and
+//     folded into the same batch pass (4) runs. A pair where either
+//     endpoint's objectid matched zero rows in (2) is held back instead (the
+//     write either failed, or the endpoint is gone or re-keyed since) and
+//     resolved in a second pass after the candidate re-read below, which is
+//     what tells those cases apart: a re-keyed endpoint re-reads PRESENT
+//     under its own (unchanged) id, which is the id the upsert resolved its
+//     objectid to, so the triple is queried for those ids
+//     (rekeyedTripleKeys) rather than left to a later write or a rebuild;
+//     an endpoint that really is gone takes the edge with it through its own
+//     tombstone's cascade.
 //
 // Then the candidates (viewCandidates): the View rows cs's write may have
 // removed without naming them by key -- every node or edge a kind-scoped
@@ -166,7 +166,7 @@ type readbackResult struct {
 // for any view doesn't know (resolveCriteriaKinds, whose results also join
 // resolvedKinds); an exclusion that resolves nowhere is an error (see
 // viewCandidates.addNodeKindCriteria). A nil view -- only ever a test's --
-// has no candidates.
+// has no candidates, and so leaves (5)'s held-back triples unresolved.
 //
 // Finally, every kind id encountered in a returned node or edge row is
 // checked against view (a nil view treats every kind id as unknown). Any id
@@ -264,14 +264,19 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 		pending[edgeKey{start: t.Start, end: t.End, kind: kindID}] = struct{}{}
 	}
 
+	// Triples with an endpoint objectid that matched no row at all, held
+	// back until the View's own candidates have been re-read below: what
+	// such a triple means depends on whether that endpoint is actually gone
+	// or merely re-keyed, which only the re-read can tell (rekeyedTripleKeys).
+	var deferredOIDTriples []EdgeTripleOIDRef
+
 	for _, t := range oidTriples {
 		startIDs, endIDs := oidToIDs[t.StartOID], oidToIDs[t.EndOID]
 		if len(startIDs) == 0 || len(endIDs) == 0 {
 			// Unresolvable endpoint: the write failed, or the node is gone
-			// or re-keyed since. Its objectid's candidates (below) settle
-			// what the View knew under it. For a re-keyed endpoint that
-			// leaves an edge this upsert created unstaged (the doc's
-			// residual); the triple is not resolvable from here.
+			// or re-keyed since. Deferred to the second pass below, which
+			// resolves it against the candidate re-read's own answer.
+			deferredOIDTriples = append(deferredOIDTriples, t)
 			continue
 		}
 
@@ -331,6 +336,23 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 		if err != nil {
 			return nil, err
 		}
+
+		// Step 5's second pass: the triples held back above, now that the
+		// candidate re-read has settled which of their endpoints were only
+		// re-keyed. One more batch pass, only ever reached by a write that
+		// raced a re-key of one of its own endpoints.
+		rekeyed := rekeyedTripleKeys(view, nodesByID, oidToIDs, resolvedTripleKinds, deferredOIDTriples, pending, absentTriples)
+		foundRekeyed, err := readBackEdgesByTriple(ctx, pool, graphID, rekeyed)
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range rekeyed {
+			if es, ok := foundRekeyed[k]; ok {
+				edgesByID[es.id] = es
+			} else {
+				absentTriples[tripleKey{start: k.start, end: k.end, kindID: k.kind}] = struct{}{}
+			}
+		}
 	}
 
 	result.nodes = sortedNodeStates(nodesByID)
@@ -352,6 +374,108 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	result.resolvedKinds = resolvedKinds
 
 	return result, nil
+}
+
+// rekeyedTripleKeys resolves the objectid-keyed triples readBack's step 5
+// held back -- those with an endpoint objectid that matched no row -- into
+// the (start, end, kind) keys still worth querying, once the candidate
+// re-read has answered what became of the nodes view knew under each of
+// those objectids.
+//
+// An objectid matching no row does not mean its node is gone. A node whose
+// objectid was rewritten keeps its id, its row and its edges, so it
+// re-reads PRESENT -- and that settles the NODE, not the edge an
+// UpdateRelationshipBy upsert created through it: the upsert resolved that
+// objectid to a node id while it still carried it, and a re-key changes no
+// node id, so the edge's endpoint is exactly the node view knew under the
+// old objectid. Those ids are what this resolves such an endpoint to
+// (rekeyedEndpointIDs), which is what closes the re-key race's staleness
+// window -- without them the committed edge stays out of the replica until
+// a later write names it or a rebuild loads it.
+//
+// An endpoint whose nodes all re-read ABSENT needs nothing: deleting a node
+// deletes its edges, and the cascade of its own tombstone (buildApplySegment)
+// takes the edge with it. So does an objectid view never knew anything
+// under, which is what a write that never landed looks like from here -- and
+// also the one residual this leaves. The condition for it is exactly
+// "named by neither pg's objectid lookup nor the View": an endpoint node
+// this process has not applied yet, whose objectid another writer has
+// already re-keyed. The upsert's own newly created endpoint is one way to
+// be in that state; so is an endpoint another write of this process created
+// whose Apply has not run (applies run in the order their calls finish, not
+// the order their writes committed -- the same premise that makes a pending
+// delta edge possible at all, snapshot.FoldWithPendingEdges). Either way
+// neither the node nor its edge can be resolved from here, which costs a
+// false negative (a missing row), never a wrong one, and takes a re-key
+// racing a node this replica has never seen.
+//
+// Keys already queried in the first pass (pending) are skipped; a triple
+// whose kind never resolved to a KindID joins absentTriples under the
+// unresolvedTripleKind sentinel, exactly as the first pass records one.
+// Both maps are read and written in place.
+func rekeyedTripleKeys(view *snapshot.View, nodesByID map[uint64]nodeState, oidToIDs map[string][]uint64,
+	resolvedTripleKinds map[string]int16, deferred []EdgeTripleOIDRef,
+	pending map[edgeKey]struct{}, absentTriples map[tripleKey]struct{}) []edgeKey {
+	if len(deferred) == 0 {
+		return nil
+	}
+
+	resolve := func(objectID string) []uint64 {
+		if ids := oidToIDs[objectID]; len(ids) > 0 {
+			return ids
+		}
+		return rekeyedEndpointIDs(view, nodesByID, objectID)
+	}
+
+	var keys []edgeKey
+	seen := make(map[edgeKey]struct{})
+	for _, t := range deferred {
+		startIDs, endIDs := resolve(t.StartOID), resolve(t.EndOID)
+		if len(startIDs) == 0 || len(endIDs) == 0 {
+			continue
+		}
+
+		kindID, ok := resolvedTripleKinds[kindName(t.Kind)]
+		for _, start := range startIDs {
+			for _, end := range endIDs {
+				if !ok {
+					absentTriples[tripleKey{start: start, end: end, kindID: unresolvedTripleKind}] = struct{}{}
+					continue
+				}
+				key := edgeKey{start: start, end: end, kind: kindID}
+				if _, queried := pending[key]; queried {
+					continue
+				}
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+				keys = append(keys, key)
+			}
+		}
+	}
+	return keys
+}
+
+// rekeyedEndpointIDs returns the database ids of the nodes view knows under
+// objectID that the candidate re-read found PRESENT in PostgreSQL -- the
+// re-keyed endpoints of rekeyedTripleKeys' doc. A node view knows under
+// objectID but nodesByID has no row for was re-read absent (rereadByID put
+// it in absentNodeIDs), so it is genuinely gone and contributes nothing.
+func rekeyedEndpointIDs(view *snapshot.View, nodesByID map[uint64]nodeState, objectID string) []uint64 {
+	dense, ok := view.NodesByObjectID(objectID)
+	if !ok {
+		return nil
+	}
+
+	var ids []uint64
+	for _, n := range dense {
+		id := view.GraphID(n)
+		if _, present := nodesByID[id]; present {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // rereadByID re-reads, through read, every candidate id the ChangeSet's own

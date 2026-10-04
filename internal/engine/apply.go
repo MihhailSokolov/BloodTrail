@@ -794,7 +794,10 @@ func (e *Engine) claimRebuildLoop() bool {
 // graph shrinks, so fallbackRetryDelay backs that case off to
 // fallbackBudgetRetryInterval instead and leaves backoff itself untouched --
 // see fallbackRetryDelay's own doc for why that is what makes recovery snap
-// back to a fast retry the moment the refusal lifts.
+// back to a fast retry the moment the refusal lifts. A rebuild that ended in
+// a recovered panic is backed off the same way, and for a reason of the same
+// kind (loadRetryDelayAfter, boot.go, which is what this loop actually
+// calls).
 //
 // Only an adopted rebuild exits fallback: adopting is what makes the
 // published View both complete and current, and serving from anything less
@@ -831,7 +834,7 @@ func (e *Engine) runFallbackRebuild() {
 			return
 		}
 
-		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+		wait, next := e.loadRetryDelayAfter(err, backoff)
 		backoff = next
 
 		select {
@@ -882,11 +885,13 @@ func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Durat
 // through here and is never delayed: enterFallback and the
 // state-based relaunches call startFallbackRebuild directly. What does come
 // through here is trust restoration while the engine serves correctly
-// (ResolveAbandonedWrite's settle, Apply's belt-and-braces settle, and
-// finishFallbackRebuild's generations-only recheck), where an unlimited
-// launch rate would let a sustained stream of settling bump failures --
-// e.g. a watermark table that errors while the data tables still work --
-// run full snapshot loads back to back indefinitely for no serving benefit.
+// (ResolveAbandonedWrite's settle, Apply's belt-and-braces settle,
+// finishFallbackRebuild's generations-only recheck, and a save refused over
+// a counter nobody accounted for -- saveSnapshotProbe, persist.go), where an
+// unlimited launch rate would let a sustained stream of settling bump
+// failures -- e.g. a watermark table that errors while the data tables
+// still work -- run full snapshot loads back to back indefinitely for no
+// serving benefit.
 //
 // Liveness is preserved, not traded away: every request either launches,
 // coalesces into a launcher that will run within the interval and re-request
@@ -894,6 +899,17 @@ func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Durat
 // generations already equal -- and a launcher cut short by bgCtx belongs to
 // an engine that is shutting down. The pending flag never strands: its
 // holder clears it on every exit path.
+//
+// That last case -- a launcher declining because the generations now agree --
+// is the resolution being waited for ONLY for the callers whose request is
+// about a watermark failure. saveSnapshotProbe's is not: what is unresolved
+// there is a counter value the ledger does not account for, which no
+// generation reflects, so a request of its own that coalesces behind a
+// launch already inside the interval can be declined by that recheck. It
+// costs that one save: the refusal repeats on the next compaction, and the
+// first one past the interval launches immediately. Saves are driven by
+// compaction and shutdown, never by a loop, so the limiter still bounds the
+// cost.
 //
 // A disabled engine returns immediately: claimRebuildLoop would refuse the
 // launch anyway (a replica nobody reads is never rebuilt), and spawning a
