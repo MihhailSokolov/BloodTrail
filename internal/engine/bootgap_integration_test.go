@@ -432,6 +432,10 @@ func TestFileBootRejectsAfterFallbackWrite(t *testing.T) {
 	seedFileBootSnapshot(t, ctx, pgDriver, pool, dir)
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	// Not stopEngineAndCloseWritePool: the write path's own pool has to stay
+	// open for the write below, exactly as it does across a real shutdown
+	// save (boot.go's Stop).
+	defer engB.CloseWritePool()
 	engB.bootGap.activate()
 	// Stop() up front cancels bgCtx, so the recovery goroutine the
 	// fallback-shaped Apply below launches exits at its first context

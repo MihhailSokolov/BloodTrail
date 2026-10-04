@@ -1196,6 +1196,43 @@ func TestObservingTransactionCommitAppliesEvenWhenInnerCommitFails(t *testing.T)
 	}
 }
 
+// TestObservingTransactionCommitSettlesAPanickingInnerCommit covers the one
+// outcome the inner Commit can produce that is neither an error nor a
+// success: a panic. pgx's own Commit can panic (an engine or pgx bug, not an
+// ordinary failure), and it can do so after PostgreSQL made the commit
+// durable -- so the scope must be settled exactly as a FAILED commit is,
+// with a fallback and an Apply, not left for Driver.WriteTransaction's own
+// panic settle to resolve as a rollback. The panic must still reach the
+// caller unchanged.
+func TestObservingTransactionCommitSettlesAPanickingInnerCommit(t *testing.T) {
+	inner := &fakeTransaction{}
+	inner.commitHook = func() { panic("pgx commit bug") }
+	eng := disabledEngine()
+	scope := engine.NewWriteScope()
+	scope.Changes().RecordNodeID(7)
+	tx := &observingTransaction{Transaction: inner, scope: scope, eng: eng}
+
+	applyCountBefore := eng.ApplyCount()
+	var escaped any
+	func() {
+		defer func() { escaped = recover() }()
+		_ = tx.Commit()
+	}()
+
+	if escaped != "pgx commit bug" {
+		t.Fatalf("recovered %v, want the inner Commit's own panic unchanged", escaped)
+	}
+	if got := eng.ApplyCount(); got != applyCountBefore+1 {
+		t.Fatalf("ApplyCount after a panicking inner Commit = %d, want %d: PostgreSQL may have committed it", got, applyCountBefore+1)
+	}
+	if hasFallback, _ := scope.Changes().HasFallback(); !hasFallback {
+		t.Fatalf("a panicking Commit must record a fallback on the scope it applies (the outcome is unknown)")
+	}
+	if tx.scope == scope || !tx.scope.Empty() {
+		t.Fatalf("Commit did not reset scope after the inner Commit panicked")
+	}
+}
+
 // TestResolveWriteTransactionFailureAmbiguousCommitAppliesWithFallback pins
 // Driver.WriteTransaction's outer-commit-failure branch: the delegate
 // succeeded and wrote, so the error arose in the embedded driver's own

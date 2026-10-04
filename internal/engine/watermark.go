@@ -404,7 +404,7 @@ func (e *Engine) BumpWatermark(ctx context.Context) (uint64, error) {
 
 	e.inflightBumps.Add(1)
 	var counter uint64
-	if err := e.writePool.get(e.pool).QueryRow(ctx, bumpWatermarkSQL).Scan(&counter); err != nil {
+	if err := e.writePool.get(e.pool, e.cfg.Log).QueryRow(ctx, bumpWatermarkSQL).Scan(&counter); err != nil {
 		e.inflightBumps.Add(-1)
 		return 0, fmt.Errorf("engine: BumpWatermark: %w", err)
 	}

@@ -658,7 +658,9 @@ func init() { dawgs.Register(DriverName, Open) }
    on the first write and closed at shutdown after the snapshot file is saved, so that a write's
    counter increment and its read-back never need a second connection from BloodHound's pool
    while the write holds one
-   ([§12.3](#123-reading-back), [§13.1](#131-the-counter));
+   ([§12.3](#123-reading-back), [§13.1](#131-the-counter)). A pool that cannot be created at all
+   is logged once at Warn and those statements fall back to BloodHound's pool, which is correct
+   but restores that wait, so the log line is the only warning an operator gets;
 5. calls `engine.Start` with a background context, because the boot goroutine must outlive `Open`.
    `Start` synchronously sweeps stale snapshot temp files, creates the watermark table if it is
    missing and gives it its `lineage` column if that is missing ([Section 13](#13-the-watermark)).
@@ -775,7 +777,7 @@ and replaces the root's field with a fresh scope, and every child sees the repla
 recorded after a mid-way commit is lost. A batch `Commit` that fails applies nothing and keeps the
 scope: DAWGS's batch keeps the buffers that failed to flush and writes them at its final commit, so
 their keys must still be recorded when the batch's last apply reads them back. (A transaction
-`Commit` that fails has an unknown outcome; it records a fallback and applies.)
+`Commit` that fails, or panics, has an unknown outcome; it records a fallback and applies.)
 
 After PostgreSQL commits, the driver calls `engine.Apply` with the scope; `Apply` brings the replica
 up to date before `WriteTransaction` returns to BloodHound ([Section 12](#12-write-through)). What
@@ -798,11 +800,17 @@ caught: it reaches BloodHound unchanged, with its own stack. The driver settles 
 way out (`settleWriteTransactionPanic` and the deferred handlers in [`driver.go`](driver.go)): a
 `WriteTransaction` whose code panicked was rolled back by DAWGS, so it settles as "nothing
 happened", and one that panicked after its code returned settles like a failed final COMMIT; a
+mid-transaction `Commit` whose own commit panics is the exception, and settles itself before the
+panic unwinds any further, because that panic can land after PostgreSQL made the commit durable; a
 batch records a fallback and applies, because the panic may have come between a write and its
-record; a read transaction applies the writes it noted. `Run`, `WipeGraph` and the other overridden
-methods have no such handling: a panic inside one of them (`WipeGraph` runs a callback its caller
-supplies) leaves its counter increment unresolved, and the process then writes no snapshot file
-until it restarts ([§13.1](#131-the-counter)).
+record; a read transaction applies the writes it noted. The overridden methods settle a panic too,
+and do not catch it either: `Run` and `WipeGraph` split it exactly as the table above splits their
+errors, because their own "reached the commit step" flag is as true for a panic as for an error,
+while `SetDefaultGraph` and the two kind deletes record a fallback and apply -- unlike an error
+from the same call, a panic is no evidence that the call had no effect, and `SetDefaultGraph`'s can
+arise after the in-process retarget it makes. Without this, a panic inside one of them (`WipeGraph`
+runs a callback its caller supplies) left its counter increment unresolved, and the process then
+wrote no snapshot file until it restarted ([§13.1](#131-the-counter)).
 
 ### 5.6 OpenGraph data
 
@@ -834,21 +842,22 @@ against the plain PostgreSQL driver ([§16.2](#162-differential-tests-against-po
   may have removed ([§12.1](#121-record-the-keys-then-read-back-the-truth)). A failed upload can
   leave behind a source kind that PostgreSQL has registered but no row carries. The replica learns
   kinds from its last full load and from the rows it reads back, so it may not know that name;
-  read-back resolves it through the driver's kind mapper, and the sourceless delete that excludes it
-  replays without a fallback.
+  read-back resolves it out of PostgreSQL's kind table ([§12.3](#123-reading-back)), and the
+  sourceless delete that excludes it replays without a fallback.
 - **What still goes to PostgreSQL**: a query naming a kind no row carries yet, such as that failed
   upload's source kind, until the replica learns the kind (declined as `unsupported`); and the same
   shapes that delegate for any other data.
 
 **Code.** [`driver.go`](driver.go): `Open`, `Driver`, `ReadTransaction`, `WriteTransaction`,
 `settleWriteTransactionPanic`, `resolveWriteTransactionFailure`, `BatchOperation`, `Run`,
-`WipeGraph`, `settleOverrideWrite`, `SetDefaultGraph`, `DeleteNodesByKinds`,
-`DeleteRelationshipsByKinds`, `settleDeleteFailure`, `Close`. [`transaction.go`](transaction.go):
+`WipeGraph`, `settleOverrideWrite`, `settleOverridePanic`, `SetDefaultGraph`,
+`DeleteNodesByKinds`, `DeleteRelationshipsByKinds`, `settleDeleteFailure`, `Close`.
+[`transaction.go`](transaction.go):
 `wrappedTransaction`, `readWrites`, `readQueryMutates`. [`node_query.go`](node_query.go),
 [`relationship_query.go`](relationship_query.go): the recording builders.
 [`write_observer.go`](write_observer.go): `observingTransaction`, `observingBatch`,
 `observingNodeQuery`, `observingRelationshipQuery`, `hasUpdatingClause`,
-`recordUpdatingFinalCriteria`, `scopeSlot`, `ensureBumped`.
+`recordUpdatingFinalCriteria`, `scopeSlot`, `ensureBumped`, `settleCommitPanic`.
 [`writepool.go`](internal/engine/writepool.go): `writePathPool`.
 
 ---
@@ -2390,13 +2399,30 @@ between the upsert and its apply. Its triple cannot be resolved, so an edge that
 not staged until a later write names it or a reload brings it in. Objectids are identities in
 BloodHound, so this takes a re-key racing an ingest upsert.
 
-Kind names are mapped to ids in one batch; if the batch fails, each name is looked up on its own, so
-one bad name affects only its own entries, and a cancelled request counts as a read-back error. For
-an edge triple, a kind that cannot be mapped is treated as "no such edge", so the worst case is a
-missed new edge, never a wrong tombstone. The same lookup resolves every kind a delete's criteria
-name that the view does not know ([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids
-the view has not seen before (kinds registered at runtime) are resolved and added to the segment,
-together with the kinds found for criteria. Any read-back error switches the engine to FALLBACK.
+Kind names and kind ids are resolved on this same pool, out of the kind table itself (`kindCatalog`,
+`pgKindCatalog`), rather than through DAWGS's kind mapper. That mapper answers from an in-process
+cache, but a name or id the cache lacks makes it re-read the whole kind table through a connection
+of BloodHound's pool -- the one thing a read-back holding `applyMu` must not ask for, since a
+saturated pool then waits for the connection the write itself is holding. The view's own kind table
+answers first and costs no query at all; a kind registered since the replica loaded takes one
+lookup:
+
+```sql
+-- kind names the view does not know
+SELECT id, name FROM kind WHERE name = ANY($1::text[])
+-- kind ids the view has not seen
+SELECT id, name FROM kind WHERE id = ANY($1::int2[])
+```
+
+A name the kind table holds no row for is unresolved, and for an edge triple that is treated as "no
+such edge", so the worst case is a missed new edge, never a wrong tombstone. The same lookup
+resolves every kind a delete's criteria name that the view does not know
+([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids the view has not seen before
+(kinds registered at runtime) are resolved and added to the segment, together with the kinds found
+for criteria; an id the kind table names no kind for is an error, not a skipped entry. A lookup that
+fails is a read-back error too: reading the table directly is what tells "never asserted" apart from
+"could not be read", which the mapper's single opaque error could not. Any read-back error switches
+the engine to FALLBACK.
 
 ### 12.4 Apply, step by step
 
@@ -2436,10 +2462,13 @@ round trip to PostgreSQL, applies happen strictly one at a time. The PostgreSQL 
 from concurrent callers, still run concurrently; only the replay into memory is serialized.
 
 A panic anywhere in these steps would mean a bug in the engine, after the write has already
-committed. `Apply` recovers it (`fallBackOnApplyPanic`): it logs
+committed. `Apply` recovers it (`fallBackOnApplyPanic`): it bumps `applyEpoch`, logs
 `bloodtrail: write-through apply panicked` at Error with the stack, enters FALLBACK with the reason
 `apply panicked: …`, and returns normally, so the caller is not told that a committed write
-failed (and does not retry it), and no query is served from a replica the write never reached.
+failed (and does not retry it), and no query is served from a replica the write never reached. The
+bump is what covers a panic in step 1 itself, before Apply's own bump: a load already in flight
+would otherwise still be allowed to adopt a snapshot that predates this write, and adopting ends
+the FALLBACK.
 
 **Cost.** Measured with `bench/applybench` on a graph of about five million nodes, against the same
 writes with `BLOODTRAIL_ENGINE=off`, write-through added **19–34% to write time (about 25% in the
@@ -2499,7 +2528,8 @@ stranded.
 [`changes.go`](internal/engine/changes.go) (`ChangeSet`),
 [`changes_scope.go`](internal/engine/changes_scope.go) (`WriteScope`),
 [`readback.go`](internal/engine/readback.go) (`readBack`, `rereadByID`, `resolveCriteriaKinds`,
-`resolveKindIDs`). [`write_observer.go`](write_observer.go): what each observer records
+`resolveKindIDs`, `resolveUnknownKinds`, `kindCatalog`, `pgKindCatalog`).
+[`write_observer.go`](write_observer.go): what each observer records
 (`recordBatchCreateNodeIdentity`, `recordNodeUpsertIdentity`, `recordRelationshipUpsertIdentity`,
 `nodeIDsFromCriteria`, `relationshipDeleteScope`, `edgeKindsFromCriteria`, `cypherMutates`).
 
@@ -3063,7 +3093,7 @@ corpus runs on.
 | Builder matrix | Every builder shape BloodTrail recognizes, on hand-made and random graphs |
 | Write-through | 15 classes of write (upserts, cascading deletes, deletes by kind, partially failed batches, concurrent writers, a "delete sourceless data" whose exclusions name a kind PostgreSQL registered but no row carries, …). After each recognized write, the very next read must be answered by BloodTrail and match PostgreSQL (for five classes, whole rows including full property bags; for the rest, the values and counts the write changed), and no reload may have happened; one class deliberately forces a fallback and checks the recovery, and one stresses concurrent writers |
 | OpenGraph | BloodHound v9.6.0's OpenGraph calls, unchanged through v9.7.1, replayed through the real driver: uploads with and without a source kind, with kind registration and `RefreshKinds` inside the open batch; objectid-keyed upserts of text, number, boolean and text-list values, multi-kind and stub nodes, and an edge from an AD user, which gains the source kind; endpoints resolved by name and by property, one to nothing; a failed upload that registers its source kind and writes no row; Cypher reads, builder counts and pathfinding over an extension's traversable kinds; deletes by edge kind, of sourceless data and of a source kind. After every step, answers must equal the plain PostgreSQL driver's and be served from memory, with no fallback and no rebuild. Two kinds of read go to PostgreSQL by design and are only compared: the endpoint lookups by name or property, and one Cypher query that names a kind no row carries |
-| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one, writers on a saturated connection pool (with and without the engine), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
+| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one, writers on a saturated connection pool (with and without the engine, and a read-back that has to resolve a kind no cache has seen), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
 | Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context, with the write path's pool still open; a save racing a failed bump removes its own file; a file whose boot panics is deleted and the boot rebuilds. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage. Convergence: a save is refused while an earlier bump's response is still in flight (held back by a proxy after PostgreSQL committed it), and while a second engine's counter is unaccounted for, until a rebuild has loaded its write; a file stamped ahead of the counter at start is refused, and buffered boot writes that contradict the file reject it at once |
 
 Every comparison is paired with **served-answer evidence**: the tests count BloodTrail's "served"
@@ -3620,6 +3650,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
 | `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), or when a write was applied during the probe |
 | `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
+| `the write path's own connection pool could not be created` | Warn | Logged once; watermark bumps and read-backs run on BloodHound's pool instead, where a write holding a connection can wait on another's ([§5.2](#52-registration-and-open)) |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
 | `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |

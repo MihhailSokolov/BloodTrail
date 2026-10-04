@@ -67,7 +67,7 @@ func TestWritePathPoolOutlivesStopUntilTheShutdownSave(t *testing.T) {
 
 	// A read-back under way when the shutdown begins holds the pool get
 	// handed it.
-	inFlight := eng.writePool.get(pool)
+	inFlight := eng.writePool.get(pool, eng.cfg.Log)
 	if inFlight == pool {
 		t.Fatal("the write path ran on the main pool (fixture assumption)")
 	}
@@ -78,7 +78,7 @@ func TestWritePathPoolOutlivesStopUntilTheShutdownSave(t *testing.T) {
 	if err := inFlight.QueryRow(ctx, "select 1").Scan(&one); err != nil {
 		t.Fatalf("the write path's pool failed a query after Stop, before the shutdown save: %v", err)
 	}
-	if got := eng.writePool.get(pool); got != inFlight {
+	if got := eng.writePool.get(pool, eng.cfg.Log); got != inFlight {
 		t.Fatal("after Stop the write path no longer gets its own pool, before the shutdown save")
 	}
 
@@ -94,7 +94,7 @@ func TestWritePathPoolOutlivesStopUntilTheShutdownSave(t *testing.T) {
 	}
 
 	eng.CloseWritePool()
-	if got := eng.writePool.get(pool); got != pool {
+	if got := eng.writePool.get(pool, eng.cfg.Log); got != pool {
 		t.Fatal("after CloseWritePool the write path still gets its own pool, want the main pool")
 	}
 	deadline := time.Now().Add(5 * time.Second)

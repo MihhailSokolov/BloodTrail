@@ -281,11 +281,22 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 // caller either: the write's own outcome is success, and a caller told
 // otherwise could retry it. The panic is logged at Error with its stack,
 // and the fallback's rebuild reloads what PostgreSQL holds.
+//
+// It bumps applyEpoch itself, before the fallback, because a panic in the
+// two statements between the watermark bookkeeping and Apply's own bump
+// (step 1) would otherwise leave it unbumped: a rebuild already loading when
+// this write committed would then find the epoch it read before its load
+// unchanged, adopt a snapshot that predates the write -- ending the fallback
+// as every adoption does -- and serve without it until something else wrote.
+// The bump is unconditional rather than conditional on where the panic
+// arose: a second bump for a panic past step 1 costs nothing, since the
+// counter is only ever compared for equality against a value read earlier.
 func (e *Engine) fallBackOnApplyPanic(ctx context.Context) {
 	r := recover()
 	if r == nil {
 		return
 	}
+	e.applyEpoch.Add(1)
 	e.cfg.Log.ErrorContext(ctx, "bloodtrail: write-through apply panicked",
 		slog.Any("panic", r),
 		slog.String("stack", string(debug.Stack())),

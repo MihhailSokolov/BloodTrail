@@ -298,7 +298,7 @@ func TestWatermarkTrustReturnsOnlyAfterFailureSettlesAndSnapshotAdopts(t *testin
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
 
@@ -342,7 +342,7 @@ func TestWatermarkTrustWithheldWhileInFallback(t *testing.T) {
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
 
@@ -375,7 +375,7 @@ func TestWatermarkRepeatedBumpFailuresOnOneScopeCountAsOne(t *testing.T) {
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
 
@@ -432,7 +432,7 @@ func TestWatermarkTrustNotRestoredByAConcurrentWriteResolving(t *testing.T) {
 
 	pgDriver, pool := graphtest.OpenPG(t, dsn)
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
 
@@ -528,7 +528,7 @@ func TestWatermarkGenuineBumpFailureOpensAGenerationAndFallsBack(t *testing.T) {
 	graphtest.WipeGraph(t, pgDriver)
 
 	eng := New(pgDriver, unreachableEnginePool(t), Config{Enabled: true, Log: testEngineLogger()})
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 	parkRebuildLoop(eng)
 
 	countBefore, err := nodeCount(ctx, pgDriver)
@@ -620,7 +620,7 @@ func TestWatermarkGenuineBumpFailureOpensAGenerationAndFallsBack(t *testing.T) {
 func TestEnsureWatermarkTableSelfSettlesOnLiveFailure(t *testing.T) {
 	ctx := context.Background()
 	eng := New(nil, unreachableEnginePool(t), Config{Enabled: true, Log: testEngineLogger()})
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	eng.ensureWatermarkTable(ctx)
 

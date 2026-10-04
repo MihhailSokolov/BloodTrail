@@ -80,7 +80,7 @@ func TestFileBootPanicDiscardsTheFileAndRebuilds(t *testing.T) {
 			eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 			window.inject(t, eng)
 			eng.Start(ctx)
-			defer eng.Stop()
+			defer stopEngineAndCloseWritePool(eng)
 
 			waitForFresh(t, eng)
 			waitForRebuildCounted(t, eng, "after the file boot panicked")
