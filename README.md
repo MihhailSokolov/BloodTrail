@@ -424,7 +424,9 @@ answer, the answers agree); and an objectid-keyed edge upsert whose endpoint nod
 replica has not applied yet, and whose objectid another writer re-keys before the upsert
 is applied, costs a reload rather than a missing row -- except when the upsert's own batch
 later failed, where its edge stays out of the replica until a later write names it or a
-reload (an endpoint the replica already holds is followed through the re-key either way).
+reload, because read-back can see that a failed batch committed something but never which
+of its keys did (an endpoint the replica already holds is followed through the re-key
+either way).
 
 Out of scope today: interpreting mutating Cypher and arbitrary update/delete criteria
 (both trigger a fallback rebuild), cache coherence across more than one BloodTrail

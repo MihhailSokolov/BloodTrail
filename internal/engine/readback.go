@@ -225,6 +225,39 @@ type readbackResult struct {
 // cleanly inside a batch that later failed is skipped with the rest, so a
 // re-key racing it still costs a missing row until a later write names it or
 // a rebuild loads it.
+//
+// # Why that residual is not narrowed from here
+//
+// The decision this split cannot make is "did the chunk carrying THIS triple
+// flush?", and nothing read-back holds answers it. The tempting substitutes
+// all answer a different question -- "did this batch commit anything?" -- and
+// every one of them fires on failed batches that landed nothing of the sort:
+//
+//   - "some recorded key of this scope read back present" is no evidence at
+//     all, because read-back holds no before-image of a keyed row. A
+//     principal that existed before the batch began reads back present
+//     whether that batch landed one row or none, and re-ingest upserts the
+//     same principals over and over
+//     (TestWhollyFailedBatchStillReadsBackPresentKeys). The same objection
+//     sinks the per-triple form ("the deferred triple's OTHER endpoint
+//     resolves"), which that test's own triple satisfies.
+//   - "some recorded key read back present that the View did not know" is
+//     real evidence the batch committed something, and still decides nothing:
+//     a failed batch flushes its earlier chunks and leaves its last one
+//     buffered, so the rows it landed and the endpoint it cannot name are
+//     routinely different upserts
+//     (TestFlushedFailedBatchCannotTellABenignUnnameableEndpointApart, where
+//     the replica already agrees with PostgreSQL exactly and a fallback would
+//     be pure cost). dawgs flushes a buffer once it passes 2,000 entries
+//     (defaultBatchWriteSize) and BloodHound's graphify commits every 20,000
+//     operations, so a failure almost always lands behind at least one
+//     flush: that shape is the ordinary one, not a corner.
+//
+// Per-chunk outcomes are not observable through the wrapper either:
+// observingBatch.Commit sees only the commits the delegate itself calls, and
+// each of those already gets a scope of its own. So the gate stays as it is,
+// and TestPartiallyCommittedFailedBatchResidualIsNotFollowed pins the
+// divergence that remains.
 func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSet) (*readbackResult, error) {
 	graphModel, ok := e.pgDriver.DefaultGraph()
 	if !ok {
@@ -456,8 +489,14 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 // edge can be named from here, so such a triple contributes no key and is
 // counted instead: readBack turns a nonzero count into a ChangeSet fallback
 // for a write that completed cleanly, and skips it for one that did not --
-// see readBack's own doc for why the two differ. This function makes neither
-// judgment; it only reports the count.
+// see readBack's own doc for why the two differ, and why no evidence
+// available here narrows the skip. This function makes neither judgment; it
+// only reports the count.
+//
+// A count rather than a per-triple verdict, deliberately: nothing this
+// function sees tells an endpoint that was never created apart from one that
+// was created and re-keyed. Both are "named by neither", which is exactly why
+// the caller has to decide on the WRITE's outcome instead.
 //
 // Keys already queried in the first pass (pending) are skipped; a triple
 // whose kind never resolved to a KindID joins absentTriples under the

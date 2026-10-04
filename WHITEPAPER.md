@@ -2479,6 +2479,26 @@ failed is skipped with the rest of that batch's keys, so a re-key racing it stil
 row until a later write names it or a reload brings it in
 ([Section 19](#19-limitations)).
 
+That remainder stays, and the reason is worth stating, because the obvious narrowings do not
+survive contact with how DAWGS flushes a batch. The question read-back would have to answer is "did
+the chunk carrying *this* triple flush?", and nothing it holds answers it. Asking instead whether
+some other recorded key of the same scope read back present answers nothing at all: read-back holds
+no before-image of a keyed row, so a principal that existed before the batch began reads back
+present whether that batch landed one row or none -- and re-ingest upserts the same principals over
+and over, which makes that the ordinary case. Asking whether a present row is one the view did *not*
+know is real evidence the batch committed something, and still decides nothing: a failed batch
+flushes its earlier chunks and leaves its last one buffered, so the rows it landed and the endpoint
+it cannot name are routinely different upserts. DAWGS flushes a buffer once it passes 2,000 entries
+(`defaultBatchWriteSize`) and BloodHound's own ingest commits every 20,000 operations, so a failure
+almost always lands behind at least one flush; both narrowings would therefore fall back on the
+ordinary failed ingest window, where nothing is missing and a reload is pure cost. Per-chunk
+outcomes are not observable from outside either: the wrapper sees only the commits the batch
+delegate calls itself, and each of those already gets a scope of its own
+([§5.5](#55-the-write-side)). So the gate stays as it is, and a test pins the one divergence that
+remains -- one served answer missing one row PostgreSQL returns -- rather than asserting it away
+(`TestPartiallyCommittedFailedBatchResidualIsNotFollowed`), with the two failed-batch shapes that
+refute each narrowing beside it.
+
 Kind names and kind ids are resolved on this same pool, out of the kind table itself (`kindCatalog`,
 `pgKindCatalog`), rather than through DAWGS's kind mapper. That mapper answers from an in-process
 cache, but a name or id the cache lacks makes it re-read the whole kind table through a connection
@@ -3178,7 +3198,7 @@ every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite (192 tests in 77 files, behind the `integration` build tag) runs against a
+The integration suite (196 tests in 82 files, behind the `integration` build tag) runs against a
 disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
 plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
 in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
@@ -3199,7 +3219,7 @@ corpus runs on.
 | Builder matrix | Every builder shape BloodTrail recognizes, on hand-made and random graphs |
 | Write-through | 15 classes of write (upserts, cascading deletes, deletes by kind, partially failed batches, concurrent writers, a "delete sourceless data" whose exclusions name a kind PostgreSQL registered but no row carries, …). After each recognized write, the very next read must be answered by BloodTrail and match PostgreSQL (for five classes, whole rows including full property bags; for the rest, the values and counts the write changed), and no reload may have happened; one class deliberately forces a fallback and checks the recovery, and one stresses concurrent writers |
 | OpenGraph | BloodHound v9.6.0's OpenGraph calls, unchanged through v9.7.1, replayed through the real driver: uploads with and without a source kind, with kind registration and `RefreshKinds` inside the open batch; objectid-keyed upserts of text, number, boolean and text-list values, multi-kind and stub nodes, and an edge from an AD user, which gains the source kind; endpoints resolved by name and by property, one to nothing; a failed upload that registers its source kind and writes no row; Cypher reads, builder counts and pathfinding over an extension's traversable kinds; deletes by edge kind, of sourceless data and of a source kind. After every step, answers must equal the plain PostgreSQL driver's and be served from memory, with no fallback and no rebuild. Two kinds of read go to PostgreSQL by design and are only compared: the endpoint lookups by name or property, and one Cypher query that names a kind no row carries |
-| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one (both for an endpoint the replica holds and for one it has never seen, which falls back instead of dropping the edge -- and does not fall back when the write itself failed), writers on a saturated connection pool (with and without the engine, and a read-back that has to resolve a kind no cache has seen), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
+| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one (both for an endpoint the replica holds and for one it has never seen, which falls back instead of dropping the edge -- and does not fall back when the write itself failed); the one divergence that leaves, pinned as a measured missing row rather than asserted away, alongside the two failed-batch shapes that say why no narrowing available to read-back is worth its cost ([§12.3](#123-reading-back)); writers on a saturated connection pool (with and without the engine, and a read-back that has to resolve a kind no cache has seen), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
 | Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context, with the write path's pool still open; a save racing a failed bump removes its own file; a file whose boot panics is deleted and the boot rebuilds. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage. Convergence: a save is refused while an earlier bump's response is still in flight (held back by a proxy after PostgreSQL committed it), and while a second engine's counter is unaccounted for, until a rebuild has loaded its write; a file stamped ahead of the counter at start is refused, and buffered boot writes that contradict the file reject it at once |
 
 Every comparison is paired with **served-answer evidence**: the tests count BloodTrail's "served"
@@ -3687,8 +3707,12 @@ in the [README](README.md).
   fallback would rebuild the replica after every failed ingest batch carrying relationship upserts.
   So an upsert that committed cleanly inside a batch that later failed is skipped with the rest of
   that batch, and its edge stays out of the replica until a later write names it or a reload brings
-  it in ([§12.3](#123-reading-back)). An endpoint the replica already holds is followed through the
-  re-key either way.
+  it in. This one is not narrowed further on purpose: read-back can see that a failed batch
+  committed something, never which of its keys that something was, and a failed batch routinely
+  lands earlier chunks while the endpoint it cannot name belongs to one still buffered, so every
+  narrowing available would reload the replica after ordinary failed ingest windows where nothing is
+  missing ([§12.3](#123-reading-back)). An endpoint the replica already holds is followed through
+  the re-key either way.
 - **Not every query is accelerated.** Queries outside the interpreter's subset, queries that sort
   text, queries with `$parameters`, Cypher spellings whose DAWGS translation BloodTrail does not
   reproduce exactly ([§11.2](#112-matching-dawgss-semantics)), `allShortestPaths` queries whose
