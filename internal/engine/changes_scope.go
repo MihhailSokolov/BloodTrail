@@ -76,8 +76,8 @@ func (s *WriteScope) Changes() *ChangeSet {
 // transaction/batch, or driver.go's own top-of-method bump for
 // Run/WipeGraph/SetDefaultGraph/DeleteNodesByKinds/
 // DeleteRelationshipsByKinds), so that Apply and AdvanceWatermark
-// (apply.go, watermark.go) can later fold counter into
-// e.appliedWatermark's monotonic max and retire this scope's
+// (apply.go, watermark.go) can later record counter in
+// e.appliedWatermark's ledger and retire this scope's
 // e.inflightBumps entry exactly once, no matter how the write this scope
 // belongs to eventually turns out.
 //

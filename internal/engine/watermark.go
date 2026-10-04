@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -161,10 +163,13 @@ const startStateTimeout = 5 * time.Second
 // caller a driver to write through: every write this process makes lands
 // after the capture, every write before it was someone else's.
 //
-// A failed read leaves nothing captured, which only switches that one check
-// off: the watermark lineage and counters still stand between any file and
-// adoption, as they did before this check existed. Logged at Warn so the
-// weaker boot is visible.
+// A failed read leaves nothing captured, and both checks it feeds -- a file
+// stamped ahead of the counter (counterBehindFile) and rows inserted behind
+// the counter's back (insertedSinceFile) -- then have nothing to compare
+// against, so no snapshot file is adopted this start at all
+// (reasonStartStateUnknown, fileRefusal): the boot rebuilds from PostgreSQL
+// instead, which costs a load and risks nothing. Logged at Warn, saying
+// exactly that, so the consequence is visible rather than inferred.
 func (e *Engine) captureStartState(ctx context.Context) {
 	if e.pool == nil {
 		return
@@ -175,7 +180,7 @@ func (e *Engine) captureStartState(ctx context.Context) {
 	var s startState
 	if err := e.pool.QueryRow(readCtx, `select counter, `+sequencePositionsSQL+` from bloodtrail_watermark where id = 1`).
 		Scan(&s.counter, &s.nodeSeq, &s.edgeSeq); err != nil {
-		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark",
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not record where PostgreSQL stood at start; no snapshot file will be adopted this start, and the boot will rebuild from PostgreSQL",
 			slog.Any("error", err))
 		return
 	}
@@ -218,27 +223,62 @@ func (e *Engine) readSequencePositions(ctx context.Context) (nodeSeq, edgeSeq in
 // a second BloodTrail process writing while this one started -- costs a
 // rebuild, never a wrong adoption.
 //
-// A nil at -- nothing captured -- reports false: the check is then simply
-// not made (captureStartState's doc).
+// A nil at -- nothing captured -- reports false, but no file is adopted
+// then anyway: fileRefusal refuses one outright rather than let this check
+// pass vacuously (captureStartState's doc).
 func insertedSinceFile(stamp snapshot.Stamp, at *startState) bool {
 	return at != nil && at.counter == stamp.Watermark &&
 		(at.nodeSeq != stamp.NodeIDSeq || at.edgeSeq != stamp.EdgeIDSeq)
+}
+
+// counterBehindFile reports whether PostgreSQL's watermark counter, when this
+// process started, was behind the value a snapshot file is stamped with.
+// Within one lineage the counter only ever advances, so that is PostgreSQL
+// gone back in time -- a backup restored without ending the lineage, whose
+// rows predate some of the writes the file holds. No sequence of BloodTrail
+// writes produces it, and none can repair it: this process's own boot writes
+// carry the counter back up past the stamp, and at the value the file
+// claims they are different writes from the file's. The boot gap cover
+// cannot tell those apart once the counter has caught up (a boot write
+// bumped, not yet applied, reads as a quiet restart), so the file is
+// refused on the start state alone, before any counter is weighed.
+//
+// A nil at -- nothing captured -- reports false, like insertedSinceFile,
+// and like it is never the answer a boot acts on: fileRefusal refuses the
+// file on the missing capture itself (captureStartState's doc).
+func counterBehindFile(stamp snapshot.Stamp, at *startState) bool {
+	return at != nil && at.counter < stamp.Watermark
 }
 
 // Snapshot-file refusals fileRefusal can name, each a "reason" on the
 // "bloodtrail: snapshot file rejected" line.
 const (
 	reasonLineageChanged        = "watermark lineage changed since the file was written"
+	reasonStartStateUnknown     = "where PostgreSQL stood when this process started could not be read"
+	reasonCounterBehindFile     = "the watermark counter was behind the file's stamp when this process started"
 	reasonInsertedBehindCounter = "rows were inserted since the file was written by a writer that did not advance the watermark"
 )
 
 // fileRefusal is why a snapshot file must be refused before its counters
 // are weighed at all, or "" when nothing about its lineage or stamp rules it
 // out: a file from another lineage than the one PostgreSQL is in (pgLineage;
-// watermarkLineageDDL), or one whose stamp shows rows inserted behind the
+// watermarkLineageDDL); one this process cannot check at all, because the
+// start-state capture failed (reasonStartStateUnknown, below); one stamped
+// ahead of where the counter stood when this process started
+// (counterBehindFile); or one whose stamp shows rows inserted behind the
 // counter's back (insertedSinceFile). The boot asks it twice: of the file's
 // unverified header, to spare the read of a file it would refuse anyway, and
 // of what ReadSnapshotFile verified, which is the answer adoption rests on.
+//
+// Nothing captured refuses every file, rather than letting the two checks
+// that read the capture pass vacuously. Both of them are the only thing
+// standing between an adoption and a PostgreSQL that went back in time or
+// was written behind the counter's back, and with nothing to compare
+// against neither can tell a sound file from either of those. Refusing
+// costs a rebuild; adopting such a file unchecked costs a replica that
+// serves rows PostgreSQL does not hold. The capture fails only on a pg read
+// that errors or times out at start (captureStartState), so this is not a
+// cost an ordinary boot pays.
 func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgLineage snapshot.Lineage) (reason string, attrs []any) {
 	if lineage.IsZero() || lineage != pgLineage {
 		return reasonLineageChanged, []any{
@@ -247,7 +287,17 @@ func (e *Engine) fileRefusal(lineage snapshot.Lineage, stamp snapshot.Stamp, pgL
 			slog.Uint64("file_watermark", stamp.Watermark),
 		}
 	}
-	if at := e.atStart.Load(); insertedSinceFile(stamp, at) {
+	at := e.atStart.Load()
+	if at == nil {
+		return reasonStartStateUnknown, []any{slog.Uint64("file_watermark", stamp.Watermark)}
+	}
+	if counterBehindFile(stamp, at) {
+		return reasonCounterBehindFile, []any{
+			slog.Uint64("file_watermark", stamp.Watermark),
+			slog.Uint64("start_watermark", at.counter),
+		}
+	}
+	if insertedSinceFile(stamp, at) {
 		return reasonInsertedBehindCounter, []any{
 			slog.Uint64("file_watermark", stamp.Watermark),
 			slog.Int64("file_node_id_seq", stamp.NodeIDSeq),
@@ -320,19 +370,40 @@ func (e *Engine) ensureWatermarkTable(ctx context.Context) {
 // pg-facing implementation.
 const bumpWatermarkSQL = `update bloodtrail_watermark set counter = counter + 1, updated_at = now() where id = 1 returning counter`
 
+// selectWatermarkCounterSQL reads the counter alone: ReadWatermark's live
+// read, and the rebuild's read inside its own load transaction
+// (loadSnapshot).
+const selectWatermarkCounterSQL = `select counter from bloodtrail_watermark where id = 1`
+
 // BumpWatermark atomically increments the pg watermark counter and returns
-// its new value, incrementing e.inflightBumps the instant the UPDATE
-// commits -- before this method even returns, let alone before the write
-// this bump guards ever reaches PostgreSQL itself. That ordering is the
-// whole point of calling this EAGERLY, before a write's own pg effect
-// (every call site: write_observer.go's ensureBumped, for the first
-// mutating call of a transaction/batch, and driver.go's own top-of-method
-// call for Run/WipeGraph/SetDefaultGraph/DeleteNodesByKinds/
-// DeleteRelationshipsByKinds): the counter must advance even for a write
-// that goes on to fail or roll back, which is only possible if the bump
-// happens before that write is even attempted, not after. See
-// watermarkConverged's own doc for why inflightBumps -- not just the
-// counter's own value -- is what makes that safe to rely on.
+// its new value. The bump is counted in e.inflightBumps BEFORE its UPDATE is
+// even sent, and so before it can commit -- let alone before the write it
+// guards reaches PostgreSQL itself. Both orderings carry weight:
+//
+//   - Calling this EAGERLY, before a write's own pg effect (every call site:
+//     write_observer.go's ensureBumped, for the first mutating call of a
+//     transaction/batch, and driver.go's own top-of-method call for
+//     Run/WipeGraph/SetDefaultGraph/DeleteNodesByKinds/
+//     DeleteRelationshipsByKinds), is what makes the counter advance even
+//     for a write that goes on to fail or roll back.
+//   - Counting it before the UPDATE is what leaves no instant at which the
+//     counter holds this bump's value while nothing in this engine does. A
+//     bump counted only once its UPDATE returned was invisible for the whole
+//     round trip after its commit -- a response on the wire, a descheduled
+//     goroutine -- and a convergence check in that window could find every
+//     other value resolved and nothing in flight, then vouch for this one
+//     (watermarkConverged's doc).
+//
+// A failed UPDATE is counted out again before returning. Its value may still
+// have committed -- a response lost on a dropped connection -- which leaves
+// a value no write of this engine resolves: the ledger then cannot account
+// for it (watermarkLedger), convergence stays false, and the failure's own
+// handling (NoteWatermarkBumpFailure: the file removed, a fallback, the
+// rebuild whose adoption rebases the ledger) is what restores it.
+//
+// The UPDATE runs on the write path's own pool (writePathPool), never on
+// e.pool: its caller is usually inside a transaction or batch that holds
+// one of e.pool's connections already.
 //
 // AdvanceWatermark is every bumped call's matching resolution, called
 // exactly once per successful bump regardless of how the write it guarded
@@ -350,12 +421,12 @@ func (e *Engine) BumpWatermark(ctx context.Context) (uint64, error) {
 		return 0, ErrWatermarkUnavailable
 	}
 
+	e.inflightBumps.Add(1)
 	var counter uint64
-	if err := e.pool.QueryRow(ctx, bumpWatermarkSQL).Scan(&counter); err != nil {
+	if err := e.writePool.get(e.pool, e.cfg.Log).QueryRow(ctx, bumpWatermarkSQL).Scan(&counter); err != nil {
+		e.inflightBumps.Add(-1)
 		return 0, fmt.Errorf("engine: BumpWatermark: %w", err)
 	}
-
-	e.inflightBumps.Add(1)
 	return counter, nil
 }
 
@@ -372,7 +443,7 @@ func (e *Engine) ReadWatermark(ctx context.Context) (uint64, error) {
 	}
 
 	var counter uint64
-	if err := e.pool.QueryRow(ctx, `select counter from bloodtrail_watermark where id = 1`).Scan(&counter); err != nil {
+	if err := e.pool.QueryRow(ctx, selectWatermarkCounterSQL).Scan(&counter); err != nil {
 		return 0, fmt.Errorf("engine: ReadWatermark: %w", err)
 	}
 	return counter, nil
@@ -461,7 +532,7 @@ func (e *Engine) NoteWatermarkBumpFailure(ctx context.Context, scope *WriteScope
 		// slow boot (a full PostgreSQL rebuild), which is the correct
 		// trade against serving a graph that silently lacks a committed
 		// write.
-		e.invalidateSnapshotFile(ctx)
+		e.invalidateSnapshotFile(ctx, invalidateUncountedWrite)
 		return true
 	}
 	return false
@@ -582,10 +653,10 @@ func (e *Engine) ResolveAbandonedWrite(ctx context.Context, scope *WriteScope) {
 	}
 }
 
-// maxWatermark returns the larger of cur and candidate -- AdvanceWatermark's
-// own monotonic max-advance comparison, extracted as a pure function
-// (mirroring apply.go's fallbackRetryDelay) purely so it has a direct,
-// atomic-free unit test.
+// maxWatermark returns the larger of cur and candidate: the monotonic max an
+// adoption folds resolvedDirtyGen through (adoptRebuiltView,
+// adoptSnapshotFileView), extracted as a pure function (mirroring apply.go's
+// fallbackRetryDelay) purely so it has a direct, atomic-free unit test.
 func maxWatermark(cur, candidate uint64) uint64 {
 	if candidate > cur {
 		return candidate
@@ -593,20 +664,174 @@ func maxWatermark(cur, candidate uint64) uint64 {
 	return cur
 }
 
-// AdvanceWatermark resolves one bumped scope's counter: it folds counter into
-// e.appliedWatermark's monotonic max (maxWatermark) and retires exactly one
-// e.inflightBumps entry -- pure atomic arithmetic, with no pg round trip and,
-// despite Apply's own call site running it under applyMu, nothing that
-// actually REQUIRES that lock: both appliedWatermark's CompareAndSwap loop
-// and inflightBumps' Add are already safe under concurrent, unsynchronized
-// callers on their own.
+// maxLedgerRanges bounds how many separate runs of resolved values a
+// watermarkLedger keeps above its gaps: 16 bytes each, 64 KiB at the cap.
+// Runs only pile up behind values that no write of this process is going to
+// resolve -- another writer's counters, interleaved with this process's own
+// -- since a gap an in-flight write of this process leaves is filled as soon
+// as that write resolves, and everything resolved behind it merges into one
+// run meanwhile. Past the cap the ledger stops keeping the runs at all
+// (lost): it could not prove convergence over those gaps anyway, and a
+// rebase that covers everything it dropped is what makes it exact again.
+const maxLedgerRanges = 4096
+
+// counterRange is a run of consecutive resolved counter values, lo through hi.
+type counterRange struct{ lo, hi uint64 }
+
+// watermarkLedger records which watermark counter values this engine can
+// account for, as e.appliedWatermark: every value up to through, and the
+// runs of resolved values above it (above). A value is accounted for when
+// this process resolved the write that bumped it (resolve: Apply, or
+// ResolveAbandonedWrite for a write that committed nothing), or when a
+// rebase covered it (rebase: an adopted snapshot that holds every write
+// whose bump committed at or below its floor, except writes of this process
+// still in flight -- which inflightBumps holds instead).
 //
-// The max-advance, rather than a plain overwrite, is what makes this safe
-// under concurrency: two bumped scopes can finish resolving in either
-// order (the one issued first is not guaranteed to finish first), so a
-// later call's own counter can be smaller than one an earlier-finishing
-// concurrent call already advanced past -- folding in the smaller value
-// must never regress appliedWatermark.
+// Convergence needs the CONTIGUOUS prefix, not the highest value resolved.
+// Counters are handed out in bump order, not resolved in it, and not every
+// value is this process's: a value another BloodTrail server bumped, or one
+// whose bump response this process lost, is never resolved here at all. The
+// highest resolved value reaches PostgreSQL's counter the moment any later
+// write of this process resolves -- absorbing every such value beneath it --
+// while through stops at the first gap until a write fills it or a rebase
+// covers it (watermarkConverged).
+//
+// A rebase covers another writer's values only as far as the adopted
+// snapshot holds their writes: one committed before the load's transaction
+// began is in it, but one whose bump committed and whose own write had not
+// yet -- invisible from here -- is covered without being held. That is the
+// limit of what one process can see of another's writes, which is why the
+// supported deployment is one BloodTrail server per database; what the
+// ledger guarantees is that such a writer's values are never absorbed by
+// this process's own writes, so a save refuses them (and says so,
+// saveSnapshotProbe) until a rebuild has loaded what they wrote.
+//
+// Safe for concurrent use; the zero value accounts for nothing but 0, the
+// counter's own starting value.
+type watermarkLedger struct {
+	mu sync.Mutex
+
+	// through is the highest value such that every value at or below it is
+	// accounted for.
+	through uint64
+
+	// above holds the resolved values above through+1: sorted, disjoint,
+	// non-adjacent runs, never more than maxLedgerRanges of them.
+	above []counterRange
+
+	// lost is set when above outgrew maxLedgerRanges and was dropped: from
+	// then on the ledger cannot say which values above through are
+	// resolved, and reports itself inexact until a rebase to at least
+	// highest makes that question moot again.
+	lost bool
+
+	// highest is the highest value ever resolved -- how far a rebase has to
+	// reach to cover everything a lost ledger dropped.
+	highest uint64
+}
+
+// resolve records that this process resolved counter's write.
+func (l *watermarkLedger) resolve(counter uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if counter > l.highest {
+		l.highest = counter
+	}
+	if counter <= l.through || l.lost {
+		return
+	}
+	l.insertLocked(counter)
+	l.advanceLocked()
+}
+
+// rebase records that every value at or below floor is accounted for:
+// called under an adoption, with the counter the adopted snapshot is
+// complete for (rebuildOnce, adoptSnapshotFileAttempt). A floor below
+// through changes nothing -- the values above it are resolved already.
+func (l *watermarkLedger) rebase(floor uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if floor > l.through {
+		l.through = floor
+	}
+	if l.lost {
+		if floor < l.highest {
+			return
+		}
+		l.lost = false
+	}
+	l.advanceLocked()
+}
+
+// resolvedThrough reports through, and whether it is exact: false while the
+// ledger is lost, when values above through may be resolved without the
+// ledger knowing which.
+func (l *watermarkLedger) resolvedThrough() (through uint64, exact bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.through, !l.lost
+}
+
+// insertLocked adds counter, known to be above through and not lost, to
+// above: merged into a neighboring run where it extends one, dropped where a
+// run already holds it. Callers hold mu.
+func (l *watermarkLedger) insertLocked(counter uint64) {
+	i := sort.Search(len(l.above), func(i int) bool { return l.above[i].lo > counter })
+	if i > 0 && l.above[i-1].hi >= counter {
+		return
+	}
+	extendsPrev := i > 0 && l.above[i-1].hi+1 == counter
+	extendsNext := i < len(l.above) && l.above[i].lo == counter+1
+	switch {
+	case extendsPrev && extendsNext:
+		l.above[i-1].hi = l.above[i].hi
+		l.above = append(l.above[:i], l.above[i+1:]...)
+	case extendsPrev:
+		l.above[i-1].hi = counter
+	case extendsNext:
+		l.above[i].lo = counter
+	default:
+		if len(l.above) >= maxLedgerRanges {
+			l.above = nil
+			l.lost = true
+			return
+		}
+		l.above = append(l.above, counterRange{})
+		copy(l.above[i+1:], l.above[i:])
+		l.above[i] = counterRange{lo: counter, hi: counter}
+	}
+}
+
+// advanceLocked moves through past every run that now starts at or below
+// through+1, dropping them. Callers hold mu.
+func (l *watermarkLedger) advanceLocked() {
+	n := 0
+	for n < len(l.above) && l.above[n].lo <= l.through+1 {
+		if l.above[n].hi > l.through {
+			l.through = l.above[n].hi
+		}
+		n++
+	}
+	if n > 0 {
+		l.above = append(l.above[:0], l.above[n:]...)
+	}
+}
+
+// AdvanceWatermark resolves one bumped scope's counter: it records counter
+// in e.appliedWatermark (watermarkLedger.resolve) and only then retires
+// exactly one e.inflightBumps entry -- in that order, so a convergence read,
+// which loads inflightBumps before the ledger, can never see this bump
+// neither in flight nor resolved (watermarkConverged's doc). No pg round
+// trip, and, despite Apply's own call site running it under applyMu, nothing
+// that REQUIRES that lock: the ledger has its own mutex, and inflightBumps is
+// atomic.
+//
+// Resolving in any order is safe: two bumped scopes can finish in either
+// order (the one issued first is not guaranteed to finish first), and the
+// ledger keeps a value resolved out of order until the values beneath it
+// resolve too, without ever claiming the gap between them.
 //
 // Callers must only ever pass a counter a successful BumpWatermark call
 // actually returned for THIS scope (every real caller gets there via
@@ -622,17 +847,7 @@ func maxWatermark(cur, candidate uint64) uint64 {
 // rather than calling this directly, so that a scope's failed bump and its
 // successful one are always resolved by the same call.
 func (e *Engine) AdvanceWatermark(counter uint64) {
-	for {
-		cur := e.appliedWatermark.Load()
-		next := maxWatermark(cur, counter)
-		if next == cur {
-			break
-		}
-		if e.appliedWatermark.CompareAndSwap(cur, next) {
-			break
-		}
-	}
-
+	e.appliedWatermark.resolve(counter)
 	e.inflightBumps.Add(-1)
 }
 
@@ -693,10 +908,10 @@ func (e *Engine) watermarkGensResolved() bool {
 //
 //  1. Every watermark failure ever noted has been resolved by an adopted
 //     snapshot (watermarkGensResolved).
-//  2. The counter bookkeeping is caught up with PostgreSQL: the pg counter
-//     equals e.appliedWatermark and no bumped scope is still unresolved
-//     (watermarkConverged, a live pg read -- see its own doc for why both of
-//     ITS halves are needed).
+//  2. The counter bookkeeping is caught up with PostgreSQL: e.appliedWatermark
+//     accounts for every value up to the pg counter and no bumped scope is
+//     still unresolved (watermarkConverged, a live pg read -- see its own
+//     doc for why both of ITS halves are needed).
 //  3. The replica is trustworthy right now: state == stateServing, i.e. no
 //     write is currently known to have failed to replay.
 //
@@ -822,43 +1037,142 @@ func (e *Engine) WatermarkTrusted(ctx context.Context) bool {
 	return watermarkTrustedFor(dirtyGen, resolvedGen, converged, state)
 }
 
+// adoptRebuiltViewAndRebase is rebuildOnce's adoption: adoptRebuiltView,
+// and -- only if the view was adopted and its load read the counter -- a
+// rebase of the watermark ledger to that counter. An adopted snapshot holds
+// every write whose bump committed at or below the counter its load read,
+// bar this process's own writes still in flight (loadedWatermark's doc), so
+// the ledger accounts for every such value from here on, including ones no
+// write of this process will ever resolve: that is what lets convergence
+// recover from a lost bump response, or from another writer's counter, once
+// a rebuild has loaded their writes. A refused snapshot vouches for nothing,
+// so there is no rebase without the adoption.
+//
+// The two are one step for convergence reads (watermarkRebaseMu), and the
+// lock is released however adoptRebuiltView returns, a panic included: held
+// past it, it would stall every convergence read -- every snapshot save with
+// it -- for good.
+//
+// An adoption whose load could not read the counter at all says so (Warn):
+// this is the one place that knows a rebuild went by without rebasing, and
+// a counter nobody rebases onto is exactly what later refuses every save
+// with saveSnapshotProbe's "another BloodTrail server may be writing"
+// reason -- a Warn that cannot name this cause, and would be the only trace
+// of it.
+func (e *Engine) adoptRebuiltViewAndRebase(ctx context.Context, view *snapshot.View, epoch, settledGen uint64, loaded loadedWatermark) bool {
+	e.watermarkRebaseMu.Lock()
+	defer e.watermarkRebaseMu.Unlock()
+
+	if !e.adoptRebuiltView(ctx, view, epoch, settledGen) {
+		return false
+	}
+	if loaded.counterOK {
+		e.appliedWatermark.rebase(loaded.counter)
+	} else if loaded.counterErr != nil {
+		e.cfg.Log.WarnContext(ctx, "bloodtrail: could not read the watermark counter during the load; this rebuild did not account for it, so a snapshot file save may be refused as if another server were writing",
+			slog.Any("error", loaded.counterErr),
+		)
+	}
+	return true
+}
+
 // watermarkConvergedFor is watermarkConverged's pure comparison, extracted
 // for unit testing without a live pg read: true iff no bumped scope is
-// still unresolved (inflight == 0) and pgCounter equals applied. See
+// still unresolved (inflight == 0) and pgCounter equals applied, the value
+// through which the ledger accounts for every counter. See
 // watermarkConverged's own doc for why both conditions are necessary.
 func watermarkConvergedFor(pgCounter, applied uint64, inflight int64) bool {
 	return inflight == 0 && pgCounter == applied
 }
 
+// watermarkReading is one convergence read (readWatermarkConvergence):
+// PostgreSQL's counter, then how many bumps were in flight, then how far the
+// ledger accounts for every value -- taken in that order.
+type watermarkReading struct {
+	pgCounter uint64
+	inflight  int64
+	through   uint64
+	exact     bool
+}
+
+// converged is the reading's verdict: nothing in flight, and every value up
+// to PostgreSQL's counter accounted for (watermarkConverged).
+func (r watermarkReading) converged() bool {
+	return r.exact && watermarkConvergedFor(r.pgCounter, r.through, r.inflight)
+}
+
+// unaccounted reports that the counter holds a value at or below what was
+// read that no write of this process is carrying or has resolved -- one this
+// process never bumped (another BloodTrail server writing the same database)
+// or one whose bump response it lost -- rather than a write of its own
+// still being on its way.
+func (r watermarkReading) unaccounted() bool {
+	return r.inflight == 0 && (!r.exact || r.through < r.pgCounter)
+}
+
+// readWatermarkConvergence takes one convergence reading: see
+// watermarkConverged's doc for what it proves and why its order matters.
+func (e *Engine) readWatermarkConvergence(ctx context.Context) (watermarkReading, error) {
+	pgCounter, err := e.ReadWatermark(ctx)
+	if err != nil {
+		return watermarkReading{}, err
+	}
+
+	e.watermarkRebaseMu.RLock()
+	defer e.watermarkRebaseMu.RUnlock()
+	r := watermarkReading{pgCounter: pgCounter, inflight: e.inflightBumps.Load()}
+	r.through, r.exact = e.appliedWatermark.resolvedThrough()
+	return r, nil
+}
+
 // watermarkConverged reports pg's current watermark counter, and whether
 // this engine's own applied-side bookkeeping is fully caught up with it:
 // true iff no bumped scope is still unresolved (e.inflightBumps == 0) and
-// the pg counter it just read equals e.appliedWatermark's own value
-// (watermarkConvergedFor).
+// e.appliedWatermark accounts for every value up to the pg counter it just
+// read (watermarkReading.converged).
 //
-// Both halves are necessary, not redundant. inflightBumps == 0 alone does
-// not prove the counter matches (a concurrent BumpWatermark could commit
-// after this read began, moving pg's counter without yet touching
-// inflightBumps -- see BumpWatermark's own ordering doc); the counter
-// matching alone does not prove nothing is in flight either (a write's
-// eager bump can commit and advance pg's counter well before that same
-// write's own effect has committed or rolled back, which is exactly the
-// window inflightBumps exists to cover). Only both together mean every
-// write that has ever bumped the counter has also had its own effect fully
-// resolved -- committed and reflected, or rolled back and reconciled to
-// nothing -- which is the actual promise a future snapshot-file writer
-// needs before it can trust a file it is about to stamp with this same
-// counter.
+// That is the promise a snapshot-file writer needs before it stamps a file
+// with this counter: every write whose bump holds a value at or below it has
+// had its own effect resolved -- committed and reflected in the replica, or
+// rolled back and reconciled to nothing. It rests on three reads, taken in
+// this order (readWatermarkConvergence):
+//
+//  1. PostgreSQL's counter, P. Every bump of this engine that committed at or
+//     below P was counted in inflightBumps before its UPDATE was sent
+//     (BumpWatermark), so before this read.
+//  2. inflightBumps. Zero means each of those bumps has resolved since, and
+//     a bump is recorded in the ledger before it leaves inflightBumps
+//     (AdvanceWatermark).
+//  3. The ledger: through == P means every value up to P is accounted for
+//     -- resolved by this process, or covered by the rebase of an adopted
+//     snapshot that holds its write.
+//
+// The ledger, not the highest counter resolved, is what makes the third read
+// sound. Counters resolve out of order, and not every counter is this
+// process's own: a value another BloodTrail server bumped for its own write,
+// or one whose bump response this process lost, is never resolved here. A
+// highest-resolved comparison absorbed every such value the moment any later
+// write of this process resolved, and a file then vouched for a write its
+// replica never saw -- another server's update, or this process's own write
+// whose bump had committed but not yet returned. The ledger stops at the
+// first value nobody accounted for (watermarkLedger), and a
+// saveSnapshotProbe that finds such a value says so (unaccounted).
+//
+// The in-flight and ledger loads run under watermarkRebaseMu, so a rebuild's
+// adoption and its ledger rebase (rebuildOnce) are one step to this read.
+// A counter that moves after read 1 only makes the verdict more
+// conservative: a bump committing later is either still in flight at read 2
+// or resolved above P by read 3, and neither reads as converged at P.
 //
 // A ReadWatermark failure (including ErrWatermarkUnavailable) reports
 // (0, false): "can't currently prove convergence" is always the safe
 // answer when the live read itself didn't succeed.
 func (e *Engine) watermarkConverged(ctx context.Context) (uint64, bool) {
-	pgCounter, err := e.ReadWatermark(ctx)
+	r, err := e.readWatermarkConvergence(ctx)
 	if err != nil {
 		return 0, false
 	}
-	return pgCounter, watermarkConvergedFor(pgCounter, e.appliedWatermark.Load(), e.inflightBumps.Load())
+	return r.pgCounter, r.converged()
 }
 
 // WatermarkConverged is watermarkConverged's exported form, added purely for

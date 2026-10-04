@@ -31,14 +31,49 @@ const TestPGEnv = "BLOODTRAIL_TEST_PG"
 // the name driver_integration_test.go uses at the repo root.
 const GraphName = "bloodtrail_test"
 
+// pgTestHooks are run by PGAvailable, with the test's own *testing.T, on
+// every call that does not skip: the registration point for per-test
+// cleanup owned by a package this one must not import.
+//
+// internal/engine is the one registrant today
+// (write_pool_leak_guard_integration_test.go). The code under test there
+// derives a second, long-lived *pgxpool.Pool of its own from the pool a test
+// hands its Engine -- the write path's own pool, whose background goroutine
+// and idle connections live until something closes it (internal/engine/
+// writepool.go) -- and only that package can close one. Registering through
+// here is what makes the close happen for every test in the package without
+// every test having to remember it; the obvious alternative, this package
+// closing them itself, would need an import of internal/engine, whose own
+// tests already import this package, which is a cycle Go rejects outright.
+//
+// Appended to from an init() and read from a test. Tests do not register.
+var pgTestHooks []func(*testing.T)
+
+// OnPGTest registers hook to run at the top of every non-skipping
+// PGAvailable call, with that test's own *testing.T, so it can register
+// t.Cleanup of its own. Call it from an init(), never from a test: the
+// registry is not synchronized and a hook registered mid-run would cover an
+// arbitrary subset of the tests that follow.
+func OnPGTest(hook func(*testing.T)) {
+	pgTestHooks = append(pgTestHooks, hook)
+}
+
 // PGAvailable returns the DSN from BLOODTRAIL_TEST_PG, or skips the test if
 // it is not set.
+//
+// It also runs every hook OnPGTest registered, against t: this is the one
+// call every test in this repo that touches PostgreSQL begins with, which
+// makes it the only place a per-test cleanup can be installed for all of
+// them at once.
 func PGAvailable(t *testing.T) string {
 	t.Helper()
 
 	dsn := os.Getenv(TestPGEnv)
 	if dsn == "" {
 		t.Skipf("%s not set", TestPGEnv)
+	}
+	for _, hook := range pgTestHooks {
+		hook(t)
 	}
 	return dsn
 }
@@ -110,7 +145,7 @@ func LoadDataset(t *testing.T, d *pg.Driver, path string) opengraph.IDMap {
 	if err != nil {
 		t.Fatalf("graphtest: open %s: %v", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	doc, err := opengraph.ParseDocument(f)
 	if err != nil {
@@ -222,7 +257,7 @@ func LoadRandom(t *testing.T, d *pg.Driver, seed int64) []graph.ID {
 			end := ids[rng.Intn(numNodes)]
 			kind := RandomEdgeKinds[rng.Intn(len(RandomEdgeKinds))]
 
-			if err := batch.CreateRelationshipByIDs(start, end, kind, graph.NewProperties()); err != nil {
+			if err := batch.CreateRelationship(&graph.Relationship{StartID: start, EndID: end, Kind: kind, Properties: graph.NewProperties()}); err != nil {
 				return err
 			}
 		}

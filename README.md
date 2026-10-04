@@ -8,11 +8,12 @@ and ordinary hardware.
 Shortest paths, the structural queries BloodHound's own code issues, and a broad surface
 of Cypher -- including every pre-built query the UI ships, and OpenGraph data -- are
 served from an in-memory replica that is kept in sync with PostgreSQL write by write.
-Anything the engine cannot answer exactly as PostgreSQL would is delegated to
-PostgreSQL, so apart from two documented details
-([below](#what-is-accelerated-and-what-is-not)) the only difference you should see is
-latency. On a 1M-node forest, every shipped query plus a set of adversarial ones runs in
-7.9s instead of 85.6s ([BENCHMARK.md](BENCHMARK.md)).
+Anything the engine cannot answer exactly as PostgreSQL would is delegated to PostgreSQL,
+so apart from a few narrow documented cases
+([below](#what-is-accelerated-and-what-is-not);
+[WHITEPAPER.md §19](WHITEPAPER.md#19-limitations) lists them) the only difference you
+should see is latency. On a 1M-node forest, every shipped query plus a set of adversarial
+ones runs in 7.9s instead of 85.6s ([BENCHMARK.md](BENCHMARK.md)).
 
 How it works, from the background up, is in [WHITEPAPER.md](WHITEPAPER.md).
 
@@ -112,6 +113,13 @@ arguments you pass after `--`, and deletes it again. So every command -- `instal
 `install`. The CLI looks for `docker-compose.yml` in the current directory; pass
 `--compose-file` (and, if the project lives elsewhere, `--project-dir`) otherwise.
 
+The script refuses to run a download unless `checksums.txt` holds exactly one well-formed
+SHA-256 entry for the archive, and that entry matches. It runs the CLI from a temporary
+directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is mounted `noexec`, set
+`TMPDIR` to a directory that allows running programs. Each download is time-limited:
+15 seconds to connect, 10 minutes in all for the archive and 1 minute for `checksums.txt`.
+A stalled connection then ends with a message saying what to try, not a hang.
+
 - **Confirmation.** `install` and `rollback` show what they will change and ask first,
   reading the answer from the terminal; add `--yes` to run them unattended.
 - **Pinning a release.** To run the exact release you audited instead of `latest`, set
@@ -141,11 +149,20 @@ arguments you pass after `--`, and deletes it again. So every command -- `instal
   from Neo4j to PostgreSQL if needed (using BloodHound's own migrator), switches the
   `bloodhound` service to the BloodTrail image through a compose override file
   (`docker-compose.bloodtrail.yml`), and verifies the result.
+- **Verification** (after `install`, or on its own with `verify`) checks that the driver
+  setting BloodHound reads (the `database_switch` row, else `bhe_graph_driver`) names
+  `bloodtrail`, that the container's *current* run logged `BloodTrail driver active`, and
+  that the API answers. It reads the setting from the `app-db` service, so that service
+  must be reachable.
 - **The smoke test.** Passing `--admin-password` (or setting `BLOODTRAIL_ADMIN_PASSWORD`)
-  adds an ingest-and-search smoke test to that verification. **It is for test and
-  staging deployments only**: it permanently ingests a fictional `TESTLAB.LOCAL` domain
-  into the graph and triggers a full analysis, which on a production-sized graph can run
-  longer than `--verify-timeout` and leaves the fixture objects behind afterwards.
+  adds an ingest-and-search smoke test to that verification. **It is for test and staging
+  deployments only**: it permanently ingests a fictional `TESTLAB.LOCAL` domain into the
+  graph and triggers a full analysis, which on a production-sized graph can run longer
+  than `--verify-timeout` and leaves the fixture objects behind afterwards. On a
+  deployment that already holds that domain (a repeat run), the search cannot show that
+  this run's upload reached the graph, so the smoke test is reported as **INCONCLUSIVE**:
+  a warning, not a pass, and not a failure (exit status 0). Delete the `TESTLAB.LOCAL`
+  domain first to get a result.
 
 ### Operating notes
 
@@ -155,45 +172,94 @@ arguments you pass after `--`, and deletes it again. So every command -- `instal
   the migration and aborts (with the rollback hint) when PostgreSQL came up short, so
   active ingestion makes the install fail rather than silently lose data. The
   installer also aborts if the bloodhound container restarts mid-migration, or if the
-  post-migration Neo4j recount cannot be read at all.
+  post-migration Neo4j recount cannot be read at all. It takes the first count before
+  changing anything, which needs `cypher-shell` and `NEO4J_AUTH` (as
+  `<user>/<password>`) in the `graph-db` service; without them it stops right there.
 - **Run one BloodHound API server per database.** BloodTrail only sees writes made
   through its own driver. A write made directly against PostgreSQL (`psql`, a second,
-  unpatched server) is invisible to the replica.
+  unpatched server) is invisible to the replica. A second BloodTrail server is detected:
+  each one then logs `snapshot file not written` (Warn) and saves no snapshot file until a
+  rebuild loads the other's writes.
+- **Connections.** BloodTrail uses BloodHound's own connection pool, plus a pool of two
+  connections of its own for its write path, opened on the first write.
 - **Put your own settings in your own compose files.** Set `BLOODTRAIL_*` variables and
   `GOMEMLIMIT` on the `bloodhound` service in your compose file or its override file,
   not in `docker-compose.bloodtrail.yml`: install rewrites that file and rollback
   deletes it. Do not copy `bhe_graph_driver=bloodtrail` into your own files -- after a
   rollback the stock image would fail to start with it.
 - The installer adds its override file to `COMPOSE_FILE` in `.env`, so a plain
-  `docker compose up -d` keeps it. Automation that names files explicitly
-  (`docker compose -f docker-compose.yml up -d`) makes docker compose ignore
-  `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail` driver setting
-  and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or drop the
-  explicit `-f` and let `.env` decide.
-- Writing that entry replaces docker compose's own file discovery, so the installer
-  writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the override file compose loads on its own (the first of
+  `docker compose up -d` keeps it: by its absolute path when every file in the entry is
+  named by an absolute path, and as `docker-compose.bloodtrail.yml` otherwise (docker
+  compose resolves a relative name against the directory you run it from). Automation
+  that names files explicitly (`docker compose -f docker-compose.yml up -d`) makes docker
+  compose ignore `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail`
+  driver setting and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or
+  drop the explicit `-f` and let `.env` decide.
+- Writing that entry replaces docker compose's own file discovery, so the installer writes
+  out everything discovery would have found: the compose file it was given and, when one
+  sits beside it, the override file compose loads on its own (the first of
   `compose.override.yml`, `compose.override.yaml`, `docker-compose.override.yml` and
-  `docker-compose.override.yaml` that exists, whatever the compose file is called).
-  Rollback removes the whole entry again when the install created it -- unless the entry
-  has been changed since (a file added to it, say), in which case it takes out only its
-  own override. With no entry, and a compose file under one of discovery's names in the
-  directory, the compose file given has to be the one discovery picks (`compose.yaml`
-  wins over `docker-compose.yml` in the same directory); otherwise the installer stops
-  and asks for `--compose-file` or an entry.
+  `docker-compose.override.yaml` that exists, whatever the compose file is called). The
+  entry it writes names its files relatively, and docker compose resolves a relative name
+  against the directory it is run from, even under `--project-directory`. A project you
+  used to run with `docker compose --project-directory <dir>` from another directory
+  therefore has to be run from its own directory afterwards: from anywhere else docker
+  compose looks for those names there, so it stops with an error if they are missing and
+  loads files of the same names if it finds some. To keep running it from anywhere, write
+  the entry's names as absolute paths yourself; rollback recognises its override under
+  either spelling. Rollback removes the whole entry again when the install created it --
+  unless the entry has been changed since (a file added to it, say), in which case it
+  takes out only its own override. With no entry, and a compose file under one of
+  discovery's names in the directory, the compose file given has to be the one discovery
+  picks (`compose.yaml` wins over `docker-compose.yml` in the same directory); otherwise
+  the installer stops and asks for `--compose-file` or an entry.
 - **The installer stops before changing anything when it cannot be sure which files
-  docker compose loads for you**: a `COMPOSE_FILE` entry that is empty, set twice,
-  quoted in a way it cannot follow (a quote left open on its line, text after the
-  closing quote, quotes inside an unquoted value, or the entry sharing a line with
-  another value), uses interpolation or escapes, has an empty or space-padded name, does
-  not list the compose file it was given, or lists a file that does not exist; a
-  `COMPOSE_PATH_SEPARATOR` line in `.env`; or `COMPOSE_FILE` (or a non-empty
-  `COMPOSE_PATH_SEPARATOR` other than `:`) set in the shell's environment, which docker
-  compose takes over `.env`. The message names what it found, and usually what to
-  change. `status`, `verify` and `rollback` read the project more forgivingly, so they
-  keep working on whatever an earlier install left behind; where an earlier version
+  docker compose loads for you**: a `COMPOSE_FILE` entry that is empty, set twice, quoted
+  in a way it cannot follow (a quote left open on its line, text after the closing quote,
+  quotes inside an unquoted value, or the entry sharing a line with another value), uses
+  interpolation or escapes, has an empty or space-padded name, does not list the compose
+  file it was given, or lists a file that does not exist; an entry whose first file is
+  not in the directory of `.env`, or, with no entry, a compose file given from another
+  directory (docker compose takes the first file's directory as the project directory and
+  resolves relative paths such as a `./pgdata` bind mount against it, while the installer
+  addresses the directory of `.env`); a `COMPOSE_PATH_SEPARATOR` line in `.env`; in the
+  shell's environment, `COMPOSE_FILE` (which docker compose takes over the entry in
+  `.env`), a non-empty `COMPOSE_PATH_SEPARATOR` other than `:` (which splits that entry
+  into names that do not exist), a non-empty `COMPOSE_ENV_FILES` or a true
+  `COMPOSE_DISABLE_ENV_FILE` (which leave `.env` unread), or a `COMPOSE_DISABLE_ENV_FILE`
+  that is not a boolean (on which docker compose stops with an error); or a `.env` the
+  install has to change that this user cannot write. The message names what it found, and
+  usually what to change. `.env` is replaced atomically, keeping its mode and owner (and a
+  symbolic link), but not extended attributes or ACLs. A hard link to it is lost: the new
+  file takes the name and the other name keeps the old contents. A `.env` that is itself a
+  mount point cannot be replaced. `status`, `verify` and `rollback` read the project more
+  forgivingly (with several `COMPOSE_FILE` lines, the last wins, as in docker compose), so
+  they keep working on whatever an earlier install left behind; where an earlier version
   wrote its override into an empty `COMPOSE_FILE=` entry, rollback puts the empty entry
   back as it was.
+- **Rollback of installs made by v0.1.0 to v0.1.2** decides what to do with the
+  `COMPOSE_FILE` entry from the copy of `.env` in the backup directory, since those
+  versions did not record what they wrote: an entry that was there before the install
+  loses only the override, and files you added to an entry the install created stay. A
+  second `COMPOSE_FILE` line that v0.1.0 or v0.1.1 appended beside an
+  `export COMPOSE_FILE=` entry is removed and yours is kept; when rollback cannot tell
+  which line is the install's, it stops before changing anything and says which line to
+  delete by hand. If the restored entry still lists a file that does not exist, rollback
+  says so, since docker compose cannot load the project until it is put back or taken
+  out.
+- **When rollback leaves the restart to you.** If the restored project's first
+  `COMPOSE_FILE` file (or, with no entry, the compose file the install was given) is not
+  in the directory of `.env`, a restart from rollback could recreate a service with its
+  data on a different host path. Rollback then does everything else, ending the watermark
+  lineage among it, and tells you that BloodTrail is still running: restart with your own
+  `docker compose up -d` from the directory you usually run it in. Because the lineage
+  ended while BloodTrail still ran, a snapshot file it saves after reloading in that
+  window names the new lineage and would stay adoptable after the stock image writes the
+  graph. So once the original image is running, end the lineage again (rollback prints
+  the `psql` command; see the
+  [snapshot directory](#fast-restarts-the-snapshot-directory)), or delete the snapshot
+  file before starting BloodTrail any way other than `bloodtrail install`, which ends it
+  itself.
 - **Rollback returns the deployment to the graph it had before the install.** On a
   deployment that was running Neo4j, that is the Neo4j graph as it was: anything
   ingested while BloodTrail was active went into PostgreSQL and stays there, invisible
@@ -241,13 +307,14 @@ a large graph. Setting `BLOODTRAIL_SNAPSHOT_DIR` lets it reuse a saved copy inst
 - Point it at a directory on a **volume or bind mount that survives container
   recreation** (a config change followed by `docker compose up -d` recreates the
   container). The directory must already exist and be writable by the container;
-  nothing creates it, and a bad path only shows up later as `snapshot file write
-  failed`.
+  nothing creates it, and a bad path only shows up later as
+  `snapshot file write failed`.
 - The file is written on a graceful shutdown and after each background compaction, and
   reused at the next boot only if BloodTrail's write counter in PostgreSQL -- and the
   **lineage** it counts in, a random id kept beside it -- prove the file is complete.
   The first boot after `bloodtrail install` always rebuilds, and so, once, does the first
-  boot after upgrading from a release that predates lineages.
+  boot after an upgrade that changes the file's format, as every upgrade from v0.1.2 or
+  earlier does: the older file is refused and rebuilt.
 - **Rollback and reinstall keep this safe on their own.** Both end the lineage, so a
   file saved before a rollback is never adopted after the stock image has written the
   graph, wherever `BLOODTRAIL_SNAPSHOT_DIR` is configured. `--replace-postgres-graph`
@@ -264,7 +331,10 @@ a large graph. Setting `BLOODTRAIL_SNAPSHOT_DIR` lets it reuse a saved copy inst
 
   As a backstop, each file also records where the `node` and `edge` id sequences stood,
   and a boot that finds the counter unchanged but either sequence moved refuses the
-  file. That catches inserts made behind BloodTrail's back, not updates or deletes.
+  file. That catches inserts made behind BloodTrail's back, not updates or deletes. A
+  boot also refuses a file stamped ahead of the counter, which is how a restored backup
+  usually leaves it; a restore that leaves the counter at or above the stamp is not
+  caught, so end the lineage after every restore.
 
 ## Configuration
 
@@ -288,13 +358,14 @@ set or BloodHound's own log level is debug.
 
 | Marker | Level | Meaning |
 |---|---|---|
-| `BloodTrail driver active` | Info | The driver started (the installer's verification waits for this line) |
+| `BloodTrail driver active` | Info | The driver started (the installer's verification waits for this line from the container's current run) |
 | `path engine served` | Info | A shortest-path request was answered from memory |
 | `builder engine served` / `cypher engine served` | Debug | A builder or Cypher query was answered from memory |
 | `path engine declined` / `builder engine declined` | Debug | The engine was asked and sent the query to PostgreSQL; `reason` says why (a declined Cypher query logs the path-engine line). Queries the engine is never offered go to PostgreSQL without a line |
 | `write-through applied` | Debug | A committed write was replayed into the replica |
 | `segment stack merged` | Debug | An overgrown delta stack was collapsed; bookkeeping, not a fallback |
-| `fallback entered` / `fallback exited` | Warn / Info | A write could not be followed incrementally (`reason`); every query goes to PostgreSQL until the rebuild lands |
+| `fallback entered` / `fallback exited` | Warn / Info | A write could not be followed incrementally, or engine work panicked (`reason`); every query goes to PostgreSQL until the rebuild lands |
+| `write-through apply panicked` / `snapshot rebuild panicked` / `snapshot file boot panicked` / `compaction panicked` | Error | An engine bug, logged with its stack; the engine entered fallback (reason `apply panicked: ...` and so on) and keeps retrying the rebuild. A snapshot file whose boot panicked is deleted. Please report it |
 | `snapshot rebuilt` | Info | A full load from PostgreSQL was adopted (`trigger`: `startup` or `fallback`) |
 | `snapshot rebuild not adopted: a write was applied while it loaded` | Debug | A load was discarded and will be retried |
 | `snapshot rebuild refused: exceeds memory limit` | Warn | Rate-limited |
@@ -303,11 +374,12 @@ set or BloodHound's own log level is debug.
 | `watermark bump failed` / `watermark table DDL failed` | Warn | The write counter could not be advanced / its table created |
 | `watermark lineage DDL failed; ...` | Warn | The lineage column could not be added; no snapshot file is written or adopted until a later start adds it |
 | `could not read the watermark lineage; ...` | Warn | No snapshot file will be written from that rebuild |
-| `could not record where PostgreSQL stood at start; ...` | Warn | That boot does not check its snapshot file for rows inserted behind the counter |
+| `could not read the watermark counter during the load; ...` | Warn | That rebuild did not account for the counter, so a later save may be refused as if another server were writing |
+| `could not record where PostgreSQL stood at start; ...` | Warn | That boot adopts no snapshot file and rebuilds from PostgreSQL: the checks that compare a file against the start state cannot be made |
 | `watermark failure settled by a write that produced no effect; ...` | Debug | A rebuild was requested to restore trust in the counter |
-| `snapshot file loaded` / `snapshot file rejected` | Info | The boot reused the saved file (`replayed_writes`) / declined it (`reason`, or `error` for an unreadable file) and rebuilt instead |
-| `snapshot file written` / `not written` / `skipped` / `write failed` | Info / Debug-Warn / Debug / Warn | Saving the replica on shutdown or after compaction |
-| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the saved file was deleted |
+| `snapshot file loaded` / `snapshot file rejected` | Info | The boot reused the saved file (`replayed_writes`) / declined it (`reason`, or `error` for an unreadable or older-format file) and rebuilt instead |
+| `snapshot file written` / `not written` / `skipped` / `write failed` | Info / Debug-Warn / Debug / Warn | Saving the replica on shutdown or after compaction. `not written` at Warn with reason `the watermark counter holds values this process never resolved: ...` means another BloodTrail server may be writing the same database |
+| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, or booting from the file panicked, so the saved file was deleted |
 | `snapshot file not invalidated` / `snapshot file invalidation failed` | Warn | That delete could not happen; delete the file by hand before the next restart |
 | `no snapshot file` | Debug | Boot found no file in the snapshot directory |
 | `removed stale snapshot temp file` / `failed to remove stale snapshot temp file` | Info / Warn | A half-written file from an earlier process was (or could not be) cleaned up |
@@ -323,8 +395,9 @@ Served from memory whenever the engine is up to date:
   one kind) and relationships (filtered by kind and endpoint id or kind), plus the two
   row shapes DAWGS's own graph-loading and traversal helpers request.
 - `POST /api/v2/graphs/cypher` for a broad subset of Cypher: pattern matching with
-  property conditions, variable-length patterns, `shortestPath`/`allShortestPaths`,
-  `OPTIONAL MATCH`, `WITH`, `COUNT`/`COLLECT`, `DISTINCT`, numeric `ORDER BY`, `LIMIT`.
+  property conditions, variable-length patterns, `shortestPath`/`allShortestPaths` (as the
+  only pattern before any `WITH`), `OPTIONAL MATCH`, `WITH`, `COUNT`/`COLLECT`,
+  `DISTINCT`, numeric `ORDER BY`, `LIMIT`.
   Every pre-built and selector query BloodHound v9.6.0 ships is served.
 
 Always answered by PostgreSQL (correct, just not faster):
@@ -336,14 +409,27 @@ Always answered by PostgreSQL (correct, just not faster):
   exact decimal.
 - Builder queries that filter or project properties, that use `Offset` or `Limit`, or
   that sort by anything other than edge id.
-- Every Cypher query on a database that holds more than one graph with data
-  (shortest-path and builder queries are still served).
+- Every query -- Cypher, builder and shortest path -- on a database that holds more than
+  one graph with data.
+- Any Cypher query that reads a property holding a number stored in a spelling the
+  replica cannot reproduce, such as `1.0`, or an integer its float64 cannot spell back
+  (one beyond 2^53); BloodHound itself writes neither.
 
-Two documented differences: in a served query's conditions, `datetime()`'s epoch
-accessors read the BloodHound server's clock when the query starts, where PostgreSQL
-reads its own `now()`; and a number stored as `1.0` (BloodHound itself always writes
-`1`) passes an integer cast such as `n.p IN [1, 2]` or `n.p < 5` that fails the whole
-query in PostgreSQL.
+Documented differences ([WHITEPAPER.md §19](WHITEPAPER.md#19-limitations)): in a served
+query's conditions, `datetime()`'s epoch accessors read the BloodHound server's clock
+when the query starts, where PostgreSQL reads its own `now()`; for a `shortestPath`
+without `s <> t`, whether PostgreSQL raises its shared-endpoint error can depend on its
+query plan, so on some plans PostgreSQL fails a query BloodTrail answers (where both
+answer, the answers agree); and an objectid-keyed edge upsert whose endpoint node the
+replica has not applied yet, and whose objectid another writer re-keys before the upsert
+is applied, needs that edge looked up by its other endpoint instead. Where that other
+endpoint can be named and carries at most 5,000 edges of the kind, the edge is staged from
+PostgreSQL's own rows with no reload and nothing missing. Where it cannot -- both endpoints
+re-keyed, or the nameable one a hub above that bound -- the upsert costs a reload rather
+than a missing row, except when its own batch later failed, where its edge stays out of the
+replica until a later write names it or a reload, because read-back can see that a failed
+batch committed something but never which of its keys did (an endpoint the replica already
+holds is followed through the re-key either way).
 
 Out of scope today: interpreting mutating Cypher and arbitrary update/delete criteria
 (both trigger a fallback rebuild), cache coherence across more than one BloodTrail
@@ -382,7 +468,10 @@ a quarter more ingest time ([BENCHMARK.md](BENCHMARK.md#opengraph), [bench/oggen
 ## Upstream versions
 
 Developed and continuously validated against `github.com/specterops/bloodhound`
-**v9.6.0** and `github.com/specterops/dawgs` `v0.8.0` (`0ea9646`).
+**v9.6.0** and `github.com/specterops/dawgs` `v0.8.0` (`0ea9646`). CI also runs the unit
+and integration suites against every other dawgs version a supported BloodHound release
+resolves to in its image (v0.8.1 today, for v9.7.1), and an image build fails when a
+release would ship a dawgs version that is neither of those nor listed as tested.
 
 **Supported upstream tags** are every stable BloodHound CE release from **v9.6.0** on
 -- derived from upstream's own release list by `build/upstream-tags.sh`, not written
@@ -408,16 +497,19 @@ may be an unreleased build. The validation levels differ, deliberately:
 Everything below assumes the Go toolchain version from [go.mod](go.mod).
 
     make test          # unit suite (CI also runs it with -race)
-    make lint          # golangci-lint, the same invocation CI runs
+    make lint          # golangci-lint over all code, integration-tagged included, as CI runs it
     make integration   # integration suite -- needs the test database below
+    make test-bench-scripts test-build-scripts  # the benchmark and build scripts' own tests
     make tidy          # go mod tidy
 
 The integration suite (every `*_integration_test.go`, behind the `integration` build
-tag) runs against a disposable PostgreSQL, pointed at by `BLOODTRAIL_TEST_PG`:
+tag) runs against a disposable PostgreSQL, pointed at by `BLOODTRAIL_TEST_PG` -- with the
+`sslmode=disable` CI uses, since that server runs with TLS off:
 
 ```sh
 docker compose -f docker-compose.test.yml up -d
-BLOODTRAIL_TEST_PG='postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail' make integration
+BLOODTRAIL_TEST_PG='postgresql://bloodtrail:bloodtrail@127.0.0.1:55432/bloodtrail?sslmode=disable' \
+    make integration
 ```
 
 The suite wipes and reseeds that database freely -- never point it at data you care

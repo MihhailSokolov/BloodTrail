@@ -104,7 +104,9 @@ func validateSnapshotStructure(s *Snapshot) error {
 
 // validatePropStore is the half of the structural check that guards memory
 // safety: an entry's arena slice is handed to unsafe.String, and its prop id
-// indexes the name table directly.
+// indexes the name table directly. It also checks what property lookups
+// depend on beyond safety: that each name is registered once, and that a
+// node's entries ascend by property id.
 func validatePropStore(p *PropStore, n int) error {
 	if p == nil {
 		return fmt.Errorf("%w: property store missing", ErrCorrupt)
@@ -114,6 +116,24 @@ func validatePropStore(p *PropStore, n int) error {
 	}
 	if err := validateOffsets32("property nodeOffsets", p.nodeOffsets, len(p.entries)); err != nil {
 		return err
+	}
+
+	// Property names are unique. finalizePropStore (builder.go) builds the
+	// name->PropID map by assigning each name its own index, so a repeated
+	// name keeps only the LAST index: every value stored under the earlier
+	// id stays reachable by id, from the node's own entries, but not by
+	// name -- so IDByName (and View.PropIDByName, and every filter and
+	// index built on it) answers with the later id, and a node carrying the
+	// earlier one reads as not carrying that property at all. Every writer
+	// interns each name once, so only an edited or forged file repeats one.
+	// One pass, one map of the names, which finalizePropStore is about to
+	// build anyway.
+	firstByName := make(map[string]int, len(p.names))
+	for i, name := range p.names {
+		if first, dup := firstByName[name]; dup {
+			return fmt.Errorf("%w: property name %q is registered twice, as ids %d and %d", ErrCorrupt, name, first, i)
+		}
+		firstByName[name] = i
 	}
 
 	arenaLen := uint64(len(p.arena))
@@ -127,10 +147,26 @@ func validatePropStore(p *PropStore, n int) error {
 			if uint64(entry.ref)+uint64(entry.len) > arenaLen {
 				return fmt.Errorf("%w: property entry %d spans arena bytes [%d,%d) of %d", ErrCorrupt, i, entry.ref, uint64(entry.ref)+uint64(entry.len), arenaLen)
 			}
-		case propKindNull, propKindFalse, propKindTrue, propKindNumber:
+		case propKindNull, propKindFalse, propKindTrue, propKindNumber, propKindNumberNonCanonical:
 			// Value kinds carried inline; no arena reference to check.
 		default:
 			return fmt.Errorf("%w: property entry %d has unknown kind %d", ErrCorrupt, i, entry.kind)
+		}
+	}
+
+	// A node's entries ascend strictly by property id. PropStore.Value
+	// binary-searches them, so an entry out of order makes a property the
+	// node carries read as absent -- in every filter on it, and in the
+	// objectid index finalizeDerived builds -- and a repeated id leaves one
+	// of two values unreachable. Every writer sorts a node's entries, and a
+	// jsonb bag cannot repeat a key, so only an edited file breaks this. One
+	// sequential pass over the entries.
+	for node := 0; node < n; node++ {
+		lo, hi := p.nodeOffsets[node], p.nodeOffsets[node+1]
+		for i := lo + 1; i < hi; i++ {
+			if p.entries[i].prop <= p.entries[i-1].prop {
+				return fmt.Errorf("%w: node %d's property entries are out of property-id order (%d after %d)", ErrCorrupt, node, p.entries[i].prop, p.entries[i-1].prop)
+			}
 		}
 	}
 	return nil

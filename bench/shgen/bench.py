@@ -27,6 +27,9 @@ class API:
         self.base = f"http://127.0.0.1:{port}"
         self.end = time.time() + deadline
         self.token = None
+        # How long the request that got the last answer took: the request
+        # itself, not what a caller then does with the body.
+        self.attempt_s = 0.0
 
     def left(self):
         remain = self.end - time.time()
@@ -43,8 +46,11 @@ class API:
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         limit = min(timeout or 300, self.left())
+        started = time.perf_counter()
         with urllib.request.urlopen(req, timeout=limit) as r:
-            return r.status, r.read()
+            data = r.read()
+            self.attempt_s = time.perf_counter() - started
+            return r.status, data
 
     def login(self, user, password):
         body = json.dumps({"login_method": "secret", "username": user, "secret": password}).encode()
@@ -139,13 +145,21 @@ def find_objectid(api, query, name_prefix):
     sys.exit(f"bench: search found no object named {name_prefix}")
 
 
+def percentile(sorted_samples, p):
+    """The nearest-rank percentile: the smallest sample that at least p percent
+    of the samples are at or below (p an integer). With few samples it is the
+    largest: five samples have no 95th percentile below their maximum."""
+    return sorted_samples[max(1, -(-p * len(sorted_samples) // 100)) - 1]
+
+
 def timed(api, fn, repeats):
     """Runs fn repeats+1 times, discarding the first (warm-up), and returns
-    milliseconds p50/p95/min/max plus the result size the last call saw."""
+    milliseconds p50/p95/min/max plus the result size the last call saw. Each
+    sample is the duration of the request (api.attempt_s), which leaves out
+    decoding the answer; p95 is the nearest-rank percentile."""
     samples, size = [], None
     for i in range(repeats + 1):
         api.left()
-        t = time.time()
         try:
             size = fn()
         except urllib.error.HTTPError as e:
@@ -153,11 +167,11 @@ def timed(api, fn, repeats):
         except Exception as e:  # noqa: BLE001 - reported, not swallowed
             return {"error": str(e)}
         if i:
-            samples.append((time.time() - t) * 1000)
+            samples.append(api.attempt_s * 1000)
     samples.sort()
     return {
         "p50_ms": round(statistics.median(samples), 1),
-        "p95_ms": round(samples[max(0, int(len(samples) * 0.95) - 1)], 1),
+        "p95_ms": round(percentile(samples, 95), 1),
         "min_ms": round(samples[0], 1),
         "max_ms": round(samples[-1], 1),
         "n": len(samples), "result_size": size,

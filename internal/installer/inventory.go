@@ -74,6 +74,7 @@ type inventory struct {
 	PGUser, PGDB  string
 	Nodes, Edges  int64 // from PostgreSQL when the graph is there, else Neo4j best effort, else -1
 	CountSource   string
+	CountErr      error   // why the graph could not be counted, when it could not (then Nodes and Edges are -1)
 	HostMemoryGiB float64 // 0 when unknown
 }
 
@@ -94,46 +95,69 @@ func takeInventory(ctx context.Context, c dockerx.Compose) (inventory, dbswitch.
 		return inventory{}, dbswitch.Store{}, fmt.Errorf("compose project %q has no %q service", cfg.Name, appDBService)
 	}
 
+	store := appDBStore(c, cfg)
 	inv := inventory{
 		Config: cfg, Image: svc.Image, UpstreamTag: upstreamTagFromImage(svc.Image),
-		PGUser: defaultPGUser, PGDB: defaultPGDatabase, Nodes: -1, Edges: -1, CountSource: "unknown",
+		PGUser: store.User, PGDB: store.Database, Nodes: -1, Edges: -1, CountSource: "unknown",
 	}
-	if u := cfg.Services[appDBService].Environment["POSTGRES_USER"]; u != "" {
-		inv.PGUser = u
-	}
-	if d := cfg.Services[appDBService].Environment["POSTGRES_DB"]; d != "" {
-		inv.PGDB = d
-	}
-
-	store := dbswitch.Store{Compose: c, Service: appDBService, User: inv.PGUser, Database: inv.PGDB}
 	row, present, err := store.Read(ctx)
 	if err != nil {
 		return inventory{}, store, fmt.Errorf("reading database_switch: %w", err)
 	}
 	if present {
 		inv.DriverRow = &row
-		inv.ActiveDriver = row
-	} else if d := svc.Environment["bhe_graph_driver"]; d != "" {
-		inv.ActiveDriver = d
-	} else {
-		inv.ActiveDriver = "neo4j"
 	}
+	inv.ActiveDriver = resolveDriver(row, present, svc)
 
+	// Best effort for status, which only reports the size. Install, which
+	// checks a migration against the Neo4j count, does not settle for it:
+	// see CountErr there.
 	switch inv.ActiveDriver {
 	case "pg", "bloodtrail":
 		if n, e, err := store.CountGraph(ctx); err == nil {
 			inv.Nodes, inv.Edges, inv.CountSource = n, e, "postgresql"
+		} else {
+			inv.CountErr = err
 		}
 	case "neo4j":
 		if n, e, err := neo4jCounts(ctx, c, cfg); err == nil {
 			inv.Nodes, inv.Edges, inv.CountSource = n, e, "neo4j"
+		} else {
+			inv.CountErr = err
 		}
 	}
 	inv.HostMemoryGiB = hostMemoryGiB()
 	return inv, store, nil
 }
 
-// neo4jCounts is best effort: it needs cypher-shell inside graph-db and NEO4J_AUTH.
+// appDBStore reaches BloodHound's application database the way the project
+// configures it: its PostgreSQL user and database, or BloodHound's defaults.
+func appDBStore(c dockerx.Compose, cfg compose.Config) dbswitch.Store {
+	store := dbswitch.Store{Compose: c, Service: appDBService, User: defaultPGUser, Database: defaultPGDatabase}
+	if u := cfg.Services[appDBService].Environment["POSTGRES_USER"]; u != "" {
+		store.User = u
+	}
+	if d := cfg.Services[appDBService].Environment["POSTGRES_DB"]; d != "" {
+		store.Database = d
+	}
+	return store
+}
+
+// resolveDriver names the graph driver BloodHound boots with: the
+// database_switch row when there is one (row, present), else the
+// bhe_graph_driver setting of the bloodhound service, else neo4j.
+func resolveDriver(row string, present bool, svc compose.Service) string {
+	if present {
+		return row
+	}
+	if d := svc.Environment["bhe_graph_driver"]; d != "" {
+		return d
+	}
+	return "neo4j"
+}
+
+// neo4jCounts needs cypher-shell inside graph-db and NEO4J_AUTH. The inventory
+// takes it as best effort; the install requires it (Install).
 func neo4jCounts(ctx context.Context, c dockerx.Compose, cfg compose.Config) (int64, int64, error) {
 	auth := cfg.Services[graphDBService].Environment["NEO4J_AUTH"]
 	user, pass, ok := strings.Cut(auth, "/")

@@ -200,3 +200,38 @@ func TestChangeSetEmbeddedInWriteScopeViaChanges(t *testing.T) {
 		t.Fatalf("ChangeSet.Empty() = true after RecordNodeID calls, want false")
 	}
 }
+
+// TestChangeSetRecordWriteIncompleteDedupsAndIsNotAChange pins the signal
+// read-back keys its objectid-endpoint fallback on (readBack, readback.go):
+// it says how to read the recorded keys, not that there are any, so it must
+// dedup like every other Record* method, stay out of Empty() and keyCount(),
+// and never be mistaken for a fallback.
+func TestChangeSetRecordWriteIncompleteDedupsAndIsNotAChange(t *testing.T) {
+	var c ChangeSet
+	if ok, reasons := c.WriteIncomplete(); ok || reasons != nil {
+		t.Fatalf("zero-value ChangeSet.WriteIncomplete() = (%v, %v), want (false, nil)", ok, reasons)
+	}
+
+	c.RecordWriteIncomplete("BatchOperation: the batch failed: boom")
+	c.RecordWriteIncomplete("BatchOperation: the batch failed: boom")
+	c.RecordWriteIncomplete("Commit: the flush failed: boom")
+
+	ok, reasons := c.WriteIncomplete()
+	if !ok {
+		t.Fatalf("WriteIncomplete() ok = false, want true")
+	}
+	want := []string{"BatchOperation: the batch failed: boom", "Commit: the flush failed: boom"}
+	if !reflect.DeepEqual(reasons, want) {
+		t.Fatalf("WriteIncomplete() reasons = %v, want %v", reasons, want)
+	}
+
+	if !c.Empty() {
+		t.Fatalf("Empty() = false after RecordWriteIncomplete alone, want true: the mark records no change of its own")
+	}
+	if got := c.keyCount(); got != 0 {
+		t.Fatalf("keyCount() = %d after RecordWriteIncomplete alone, want 0", got)
+	}
+	if ok, reasons := c.HasFallback(); ok {
+		t.Fatalf("HasFallback() = (%v, %v) after RecordWriteIncomplete alone, want (false, nil)", ok, reasons)
+	}
+}

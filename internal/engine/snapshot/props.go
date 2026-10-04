@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
+	"sync"
 	"unsafe"
 )
 
@@ -25,6 +27,15 @@ const (
 	propKindString
 	propKindArray
 	propKindObject
+
+	// propKindNumberNonCanonical is a number whose stored spelling -- the
+	// text PostgreSQL's `->>` returns and every cast of it reads -- is not
+	// how this package renders its float64 value (numberSpellingCanonical):
+	// 1.0, 2.50, or 9007199254740993, which the float64 holds as
+	// 9007199254740992. Its value is still the nearest float64 (num); the
+	// spelling is not kept, and the kind exists to mark the property -- see
+	// View.NumbersCanonical.
+	propKindNumberNonCanonical
 )
 
 // propEntry is one property value belonging to one node: which property
@@ -80,6 +91,12 @@ type PropStore struct {
 	// overwhelming common case.
 	objectIndex    map[string]NodeID
 	objectIndexDup map[string][]NodeID
+
+	// numberFactsOnce guards nonCanonicalNumber: per PropID, whether any
+	// node's value carries a non-canonical number (valueshape.go's
+	// nonCanonicalNumberProp), derived in one pass on first use.
+	numberFactsOnce    sync.Once
+	nonCanonicalNumber []bool
 }
 
 // IDByName returns the PropID interned for name, and whether one exists.
@@ -178,7 +195,7 @@ func (p *PropStore) decode(e propEntry) any {
 		return false
 	case propKindTrue:
 		return true
-	case propKindNumber:
+	case propKindNumber, propKindNumberNonCanonical:
 		return e.num
 	case propKindString:
 		return p.stringAt(e.ref, e.len)
@@ -367,11 +384,48 @@ func parseNodeProps(propsJSON []byte) ([]parsedProp, error) {
 				return nil, fmt.Errorf("decode property %q: %w", name, err)
 			}
 			pp.kind = propKindNumber
+			if !numberSpellingCanonical(trimmed, f) {
+				pp.kind = propKindNumberNonCanonical
+			}
 			pp.num = f
 		}
 		out = append(out, pp)
 	}
 	return out, nil
+}
+
+// numberSpellingCanonical reports whether a stored JSON number's spelling is
+// exactly how this package renders its float64 value f: FormatFloat(f, 'f',
+// -1, 64), jsonText's rendering. A jsonb number keeps both its spelling
+// (PostgreSQL's `->>` of 1.0 is '1.0', and '1.0'::int8 is an error) and its
+// exact value (9007199254740993 stays itself, where the float64 is
+// 9007199254740992). Where the renderings agree, the float64 answers every
+// comparison, grouping, text rendering and cast of the number as PostgreSQL
+// does: the canonical spelling of a float64 is a decimal no other float64
+// shares, and parsing it back gives f. The common spelling -- an integer of
+// at most 15 digits -- is canonical without rendering anything. PostgreSQL
+// never spells a zero with a sign, so "-0" is not canonical either.
+func numberSpellingCanonical(text []byte, f float64) bool {
+	digits := text
+	if len(digits) > 0 && digits[0] == '-' {
+		digits = digits[1:]
+	}
+	if n := len(digits); n > 0 && n <= 15 && (digits[0] != '0' || n == 1) && allDecimalDigits(digits) {
+		return len(digits) == len(text) || digits[0] != '0'
+	}
+	if f == 0 {
+		return string(text) == "0"
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64) == string(text)
+}
+
+func allDecimalDigits(b []byte) bool {
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // maxPropID is the largest value PropID (a uint16) can hold, and therefore

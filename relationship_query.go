@@ -42,7 +42,8 @@ type recordingRelationshipQuery struct {
 	// composed together.
 	criteria []graph.Criteria
 
-	// tainted is set by Offset, Limit, Update, Delete, or an OrderBy call
+	// tainted is set by Offset, Limit, Update, Delete, a Query whose final
+	// criteria carry an updating clause, or an OrderBy call
 	// recognize.OrderIsEdgeIDAscending does not recognize (see
 	// orderByEdgeID's doc for the one OrderBy shape that does NOT taint):
 	// any of these changes what FetchAllShortestPaths or Count/FetchIDs/
@@ -300,7 +301,16 @@ func projectionDirectionConsistent(proj recognize.RowProjection, spec recognize.
 // (not by delegate) before returning, following the same provider-closes
 // convention as FetchAllShortestPaths/Count/FetchIDs/FetchTriples/
 // FetchKinds above.
+//
+// finalCriteria carrying an updating clause (hasUpdatingClause,
+// write_observer.go) make this call a write, not a candidate for service:
+// it taints the query and is noted on the owning transaction before it
+// reaches PostgreSQL, exactly like Update/Delete above.
 func (r *recordingRelationshipQuery) Query(delegate func(results graph.Result) error, finalCriteria ...graph.Criteria) error {
+	if hasUpdatingClause(finalCriteria) {
+		r.tainted = true
+		r.tx.writes.note("ReadTransaction: RelationshipQuery.Query updating clause escapes changelog tracking")
+	}
 	if !r.tainted && r.tx.serveable() && len(r.criteria) == 1 && len(finalCriteria) == 1 {
 		if proj, ok := recognize.FromReturning(finalCriteria[0]); ok {
 			if spec, ok := recognize.FromRelCriteria(r.criteria[0]); ok && projectionDirectionConsistent(proj, spec) {

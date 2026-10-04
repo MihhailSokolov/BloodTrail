@@ -26,6 +26,13 @@ import (
 // latency.
 const rowCursorBuffer = 256
 
+// cancelCheckInterval is how many rows rowResult.Next returns between two
+// consecutive request-context checks, matching the interpreter's own
+// work-meter cadence (interpret's exec.go). Batched rather than per row
+// because a rel-query result streams a whole edge scan and ctx.Err() takes
+// the context's own lock.
+const cancelCheckInterval = 1024
+
 // feedCursor implements graph.Cursor[T] over a generic feeder function,
 // generalizing pathCursor (result.go) from a fixed pre-computed graph.
 // PathSet to any producer shaped like Bitset.Iterate: a function that calls
@@ -73,6 +80,15 @@ func newFeedCursor[T any](ctx context.Context, feed func(yield func(T) bool)) gr
 // was canceled (by the caller passing an already-canceled/expiring ctx to
 // newFeedCursor, or by a subsequent Close() call) before the value could be
 // delivered.
+//
+// There is deliberately no separate periodic context check of its own here,
+// unlike rowResult.Next's (below): channels.Submit already selects on c.ctx
+// alongside the send, so a canceled request stops the feed within a couple
+// of values -- a full buffer leaves Done() as the only ready case, and a
+// buffer with room makes it one of two, so a stop is immediate or near it --
+// and records graph.ErrContextTimedOut for Error(). rowResult has no such
+// seam: its rows are pulled synchronously by the caller, with nothing
+// watching the context at all.
 func (c *feedCursor[T]) feed(feed func(yield func(T) bool)) {
 	defer close(c.valueC)
 
@@ -121,15 +137,23 @@ type rowResult struct {
 	it   relIterator
 	proj recognize.RowProjection
 
+	// ctx is the request's context, nil for none (the zero value, which a
+	// test constructing a bare rowResult relies on). Next consults it every
+	// cancelCheckInterval rows and stops there, recording the cancellation
+	// in err -- see Next and Error.
+	ctx       context.Context
+	unchecked int
+
 	// kindNames resolves a snapshot.KindID (a far node's own carried kind,
 	// for ProjectionStepOutbound/StepInbound, or the traversed
 	// relationship's kind, same two projections) to its graph.Kind name.
 	// TryRelQueryRows resolves this fully before ever calling newRowResult
 	// (see its own doc), so Values() never has anything left that could
-	// fail -- a missing entry (never expected, since every KindID up to
-	// snap.MaxKindID is resolved regardless of proj) reads as a nil
-	// graph.Kind rather than panicking. Left nil for ProjectionStartEnd,
-	// which needs no kind names at all.
+	// fail -- a missing entry (never expected, since every KindID the kind
+	// table names, up to snap.MaxKindID, is resolved regardless of proj, and
+	// every kind a row carries is named there) reads as a nil graph.Kind
+	// rather than panicking. Left nil for ProjectionStartEnd, which needs no
+	// kind names at all.
 	kindNames map[snapshot.KindID]graph.Kind
 
 	// cur/valid hold the most recent relEdge Next() advanced to, and
@@ -138,19 +162,42 @@ type rowResult struct {
 	// contract.
 	cur   relEdge
 	valid bool
+
+	// err is the request's cancellation, once Next has stopped on one. It is
+	// the only error a rowResult can ever report; see Error.
+	err error
 }
 
 // newRowResult wraps it as a graph.Result, projecting each relEdge it
 // produces into the row shape proj names. See rowResult's doc for kindNames'
 // contract; snap resolves a relEdge's dense start/end NodeIDs and a far
-// node's own kinds back to database ids and graph.Kind names.
-func newRowResult(snap *snapshot.View, it relIterator, proj recognize.RowProjection, kindNames map[snapshot.KindID]graph.Kind) graph.Result {
-	return &rowResult{snap: snap, it: it, proj: proj, kindNames: kindNames}
+// node's own kinds back to database ids and graph.Kind names. ctx is the
+// request's context (nil for none), which Next honors as the PostgreSQL
+// cursor this stands in for does.
+func newRowResult(ctx context.Context, snap *snapshot.View, it relIterator, proj recognize.RowProjection, kindNames map[snapshot.KindID]graph.Kind) graph.Result {
+	return &rowResult{snap: snap, it: it, proj: proj, kindNames: kindNames, ctx: ctx}
 }
 
 // Next advances to the next matching relationship, reporting whether one
 // exists.
+//
+// Every cancelCheckInterval rows it first consults the request's context and
+// stops there if it is done, recording the cancellation for Error(): unlike
+// the feed cursors, this scan is driven synchronously by the caller's own
+// pulls, so nothing else would ever notice that the request behind it is
+// gone, and the rows would keep coming where PostgreSQL's cursor fails.
 func (r *rowResult) Next() bool {
+	if r.ctx != nil {
+		if r.unchecked++; r.unchecked >= cancelCheckInterval {
+			r.unchecked = 0
+			if err := r.ctx.Err(); err != nil {
+				r.err = err
+				r.valid = false
+				return false
+			}
+		}
+	}
+
 	edge, ok := r.it.next()
 	r.cur, r.valid = edge, ok
 	return ok
@@ -241,13 +288,14 @@ func (r *rowResult) Scan(targets ...any) error {
 	return graph.ScanNextResult(r, targets...)
 }
 
-// Error always returns nil: TryRelQueryRows resolves every kind name a
-// rowResult could ever need (kindNames) before constructing it at all (see
-// rowResult's own doc), so nothing that could fail is left to happen during
-// iteration -- unlike, say, a live PostgreSQL cursor, whose Result
-// implementation surfaces a mid-stream network or decode error here.
+// Error returns the request's cancellation if Next stopped on one, and
+// otherwise nil. Nothing else can fail: TryRelQueryRows resolves every kind
+// name a rowResult could ever need (kindNames) before constructing it at all
+// (see rowResult's own doc), so no rendering failure is left to happen
+// during iteration -- unlike a live PostgreSQL cursor, whose Result
+// implementation also surfaces a mid-stream network or decode error here.
 func (r *rowResult) Error() error {
-	return nil
+	return r.err
 }
 
 // Close is a no-op: a rowResult holds no external resource (cursor,

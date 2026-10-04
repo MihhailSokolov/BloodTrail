@@ -307,9 +307,7 @@ func TestOpenWithNoSnapshotFileStillRebuildsThroughProductionOrdering(t *testing
 	if got := markerCount(buf, snapshotFileLoadedMarker); got != 0 {
 		t.Fatalf("%q fired with no file ever present\ncaptured log:\n%s", snapshotFileLoadedMarker, buf.String())
 	}
-	if got := bloodtrail.TestingEngine(d).RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 with no snapshot file to load, want at least one PostgreSQL rebuild")
-	}
+	waitForBootRebuildCounted(t, d, "with no snapshot file to load")
 	if strings.Contains(buf.String(), "bloodtrail: boot load failed") {
 		t.Fatalf("boot load logged a failure while merely waiting for the default graph to resolve -- that is an ordinary startup wait, not an error\ncaptured log:\n%s", buf.String())
 	}

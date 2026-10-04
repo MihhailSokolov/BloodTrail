@@ -246,10 +246,27 @@ func (b *bootGapBuffer) peek() (entries []bootGapEntry, poisoned string) {
 	return append([]bootGapEntry(nil), b.entries...), b.poisoned
 }
 
+// bootGapVerdict is bootGapCoveredAt's answer.
+type bootGapVerdict int
+
+const (
+	// bootGapCovered: the file plus the buffered writes reproduce
+	// PostgreSQL at the frozen target.
+	bootGapCovered bootGapVerdict = iota
+	// bootGapHole: a counter at or below the target is missing. A write of
+	// this process still in flight may yet fill it, so the settle-wait keeps
+	// waiting (adoptSnapshotFileView).
+	bootGapHole
+	// bootGapContradiction: the counters contradict the file itself, and no
+	// write this boot can still observe will ever change that, so the file
+	// is rejected at once.
+	bootGapContradiction
+)
+
 // bootGapCoveredAt reports whether a snapshot file stamped fileWatermark may
 // be adopted given the decision's FROZEN pg counter pgSnapshot and the
 // counters of every write the boot gap buffer has accounted for so far:
-// exactly when the counters at or below pgSnapshot are precisely
+// covered exactly when the counters at or below pgSnapshot are precisely
 // {fileWatermark+1, ..., pgSnapshot}, each once. Extracted as a pure
 // function so the decision has a direct unit test, mirroring
 // watermarkTrustedFor's identical treatment (watermark.go). An empty gap
@@ -271,8 +288,8 @@ func (b *bootGapBuffer) peek() (entries []bootGapEntry, poisoned string) {
 // equality check this generalizes rejected any advance at all. The
 // settle-wait design (adoptSnapshotFileView) exists because a hole can
 // also be transient -- an Apply still in flight -- which waiting, not
-// rejecting, resolves; this predicate stays time-blind and answers only
-// "is the target covered RIGHT NOW".
+// rejecting, resolves (bootGapHole); this predicate stays time-blind and
+// answers only "is the target covered RIGHT NOW".
 //
 // "Every mutating write bumps the counter" holds only within one watermark
 // lineage: a writer that does not bump it -- the stock image, a TRUNCATE --
@@ -285,34 +302,47 @@ func (b *bootGapBuffer) peek() (entries []bootGapEntry, poisoned string) {
 // belong to writes that landed after the target was frozen, whose safety
 // is the adoption path's argument (observed ones ride the replay; parked
 // ones land as ordinary deltas after publish -- both stage read-back
-// truth, so order cannot matter). What is NOT tolerated, above or below:
-// a duplicate counter (the protocol guarantees uniqueness, so a duplicate
-// means the accounting itself is wrong) or a counter at or below
-// fileWatermark (a write the file already contains was somehow
-// re-observed) -- both "something is wrong, don't trust it". A file AHEAD
-// of pg (pgSnapshot < fileWatermark) should never happen under a monotonic
-// counter, and is refused outright rather than reasoned about.
+// truth, so order cannot matter). What is NOT tolerated, above or below --
+// a bootGapContradiction, with why -- is a duplicate counter (the protocol
+// guarantees uniqueness, so a duplicate means the accounting itself is
+// wrong), a counter at or below fileWatermark (this boot's own write drew a
+// value the file already claims: PostgreSQL went back since the file was
+// written, a restored backup), and a file AHEAD of the frozen target
+// (pgSnapshot < fileWatermark: the same restore, seen before this boot's
+// writes caught the counter up). None of them heals by waiting: a later
+// write only adds counters, never takes one away, and the target stays
+// frozen -- so they reject at once rather than after the settle timeout. A
+// contradiction anywhere outranks a hole: the file cannot be adopted either
+// way, and only the hole could still have changed.
 //
 // counters is sorted in place; callers pass a slice they own.
-func bootGapCoveredAt(fileWatermark, pgSnapshot uint64, counters []uint64) bool {
+func bootGapCoveredAt(fileWatermark, pgSnapshot uint64, counters []uint64) (verdict bootGapVerdict, why string) {
 	if pgSnapshot < fileWatermark {
-		return false
+		return bootGapContradiction, "the file is stamped ahead of the watermark counter"
 	}
 
 	sort.Slice(counters, func(i, j int) bool { return counters[i] < counters[j] })
 
-	inRange := 0
+	next := fileWatermark + 1 // the lowest counter the gap still needs
+	hole := false
 	for i, c := range counters {
-		if i > 0 && c == counters[i-1] {
-			return false
+		switch {
+		case i > 0 && c == counters[i-1]:
+			return bootGapContradiction, "a counter was accounted for twice"
+		case c <= fileWatermark:
+			return bootGapContradiction, "a boot write holds a counter the file already claims"
+		case c > pgSnapshot:
+			// Sorted: everything from here up is post-freeze, but keep
+			// scanning for duplicates.
+		case c != next:
+			hole = true // sorted and distinct: c > next, so next is missing
+			next = c + 1
+		default:
+			next++
 		}
-		if c > pgSnapshot {
-			continue // sorted: everything from here up is post-freeze, but keep scanning for duplicates
-		}
-		if c != fileWatermark+1+uint64(inRange) {
-			return false
-		}
-		inRange++
 	}
-	return uint64(inRange) == pgSnapshot-fileWatermark
+	if hole || next != pgSnapshot+1 {
+		return bootGapHole, ""
+	}
+	return bootGapCovered, ""
 }

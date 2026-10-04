@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -139,15 +140,13 @@ func TestFileBootRejectsAFileTheStockImageWroteBehind(t *testing.T) {
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
 	requireLineageRejection(t, buf.String())
 
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after refusing the snapshot file, want the PostgreSQL rebuild")
-	}
+	waitForRebuildCounted(t, eng, "after refusing the snapshot file")
 	view, serving := eng.Fresh()
 	if !serving {
 		t.Fatalf("engine not serving after boot")
@@ -187,7 +186,7 @@ func TestFileBootRejectsAFileFromBeforeTheGraphWasReplaced(t *testing.T) {
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
@@ -259,24 +258,25 @@ func TestFileBootRejectsAFileFromAnotherLineageWithAMatchingCounter(t *testing.T
 
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
 	requireLineageRejection(t, buf.String())
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after refusing the snapshot file, want the PostgreSQL rebuild")
-	}
+	waitForRebuildCounted(t, eng, "after refusing the snapshot file")
 }
 
 // TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn pins where a file's
 // lineage comes from: the load its replica descends from, never PostgreSQL
-// at save time. A BloodTrail still running when the lineage ends (the
-// rollback's end racing a container that has not stopped yet) keeps
-// writing, and its own writes bring the counter back into agreement with
-// what it has applied -- so it can still save. If that save stamped the
-// lineage PostgreSQL holds by then, its file would vouch for writes it never
-// saw; stamped with its own, the file is refused.
+// at save time. A BloodTrail still running when the lineage ends keeps
+// writing. Ended the way watermark.go tells anything else that writes the
+// graph to end it -- a fresh lineage, the counter left alone -- its own
+// writes keep the counter in agreement with what it has applied, so it can
+// still save. If that save stamped the lineage PostgreSQL holds by then, its
+// file would vouch for writes it never saw; stamped with its own, the file
+// is refused. (The installer's end also advances the counter, which such an
+// engine never resolves, so it saves nothing at all:
+// TestSaveSnapshotRefusesAfterTheInstallerEndsTheLineage.)
 func TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
@@ -291,7 +291,7 @@ func TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn(t *testing.T) {
 	eng, _ := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	adoptOneRebuild(t, ctx, eng)
 	loaded := pgLineage(t, ctx, pool)
@@ -307,7 +307,9 @@ func TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn(t *testing.T) {
 		t.Fatalf("Lineage.String() = %q, want PostgreSQL's own spelling %q", loaded.String(), loadedText)
 	}
 
-	endLineage(t, ctx, pool)
+	if _, err := pool.Exec(ctx, "update bloodtrail_watermark set lineage = gen_random_uuid()"); err != nil {
+		t.Fatalf("end the lineage: %v", err)
+	}
 	applyOneWrite(t, ctx, eng)
 	if _, converged := eng.WatermarkConverged(ctx); !converged {
 		t.Fatalf("the engine's own write did not bring the counter back into agreement; the save below would prove nothing")
@@ -332,6 +334,48 @@ func TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn(t *testing.T) {
 		t.Fatalf("a file saved after its lineage ended was adopted:\n%s", buf.String())
 	}
 	requireLineageRejection(t, buf.String())
+}
+
+// TestSaveSnapshotRefusesAfterTheInstallerEndsTheLineage is the installer's
+// end of the lineage reaching a BloodTrail that is still running: the
+// statement also advances the counter (for engines that predate lineages,
+// internal/dbswitch's endLineageSQL), a value no write of this process
+// resolved. Its own later writes therefore never bring it back to
+// convergence, and it writes no file at all -- rather than one the next
+// boot has to refuse on its lineage -- until a rebuild loads the new
+// lineage's graph.
+func TestSaveSnapshotRefusesAfterTheInstallerEndsTheLineage(t *testing.T) {
+	dsn := graphtest.PGAvailable(t)
+	ctx := context.Background()
+
+	pgDriver, pool := graphtest.OpenPG(t, dsn)
+	graphtest.WipeGraph(t, pgDriver)
+	if _, err := pgDriver.AssertKinds(ctx, graph.Kinds{persistRaceKind}); err != nil {
+		t.Fatalf("assert kinds: %v", err)
+	}
+
+	dir := t.TempDir()
+	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
+	resetWatermarkTable(t, ctx, eng)
+	parkRebuildLoop(eng)
+	defer stopEngineAndCloseWritePool(eng)
+	adoptOneRebuild(t, ctx, eng)
+
+	endLineage(t, ctx, pool)
+	applyOneWrite(t, ctx, eng)
+	if _, converged := eng.WatermarkConverged(ctx); converged {
+		t.Fatalf("WatermarkConverged = true over the installer's counter advance, which no write of this engine resolved")
+	}
+	if err := eng.SaveSnapshot(ctx); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	path := snapshotFilePathFor(t, pgDriver, dir)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a snapshot file was saved after the installer ended the lineage (stat: %v):\n%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "never resolved") {
+		t.Fatalf("the refused save did not say the counter holds values this process never resolved:\n%s", buf.String())
+	}
 }
 
 // holdWatermarkTable opens a transaction that reads bloodtrail_watermark and
@@ -498,7 +542,7 @@ func TestRebuildSaysWhenItCannotReadTheLineage(t *testing.T) {
 	eng, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	resetWatermarkTable(t, ctx, eng)
 	parkRebuildLoop(eng)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	if _, err := pool.Exec(ctx, "alter table bloodtrail_watermark drop column lineage"); err != nil {
 		t.Fatalf("drop the lineage column: %v", err)

@@ -12,38 +12,48 @@ import (
 // on: the file may be adopted exactly when the buffered counters at or below
 // the decision's FROZEN pg snapshot are precisely
 // {fileWatermark+1, ..., pgSnapshot} -- the old equality check's empty gap
-// included -- and never on a hole, a counter the file already contains, a
-// duplicate anywhere, or a file somehow ahead of pg. Counters ABOVE the
-// frozen snapshot are permitted (and their entries replayed): they belong to
-// writes that landed after the target was frozen, which the settle-wait
-// design explicitly tolerates -- observed ones ride the replay, parked ones
-// land as ordinary deltas after publish (adoptSnapshotFileView's doc).
+// included. Counters ABOVE the frozen snapshot are permitted (and their
+// entries replayed): they belong to writes that landed after the target was
+// frozen, which the settle-wait design explicitly tolerates -- observed ones
+// ride the replay, parked ones land as ordinary deltas after publish
+// (adoptSnapshotFileView's doc). What is not covered splits in two: a hole,
+// which a write still in flight may fill (the settle-wait keeps waiting),
+// and a contradiction -- a counter the file already contains, a duplicate
+// anywhere, a file ahead of the frozen target -- which nothing can fill,
+// so the attempt rejects at once.
 func TestBootGapCoveredAt(t *testing.T) {
 	cases := []struct {
 		name     string
 		file, pg uint64
 		counters []uint64
-		want     bool
+		want     bootGapVerdict
 	}{
-		{"empty gap, zero (first-ever boot)", 0, 0, nil, true},
-		{"empty gap, nonzero (quiet restart)", 42, 42, nil, true},
-		{"one buffered write covering the gap", 42, 43, []uint64{43}, true},
-		{"several buffered writes, out of order", 42, 45, []uint64{45, 43, 44}, true},
-		{"gap with nothing buffered (out-of-band write)", 41, 42, nil, false},
-		{"hole in the middle", 42, 45, []uint64{43, 45}, false},
-		{"counter below the gap (already in the file)", 42, 44, []uint64{42, 43}, false},
-		{"counter above the frozen snapshot alone (write after freeze, gap empty)", 42, 42, []uint64{43}, true},
-		{"gap covered plus counters above the freeze", 42, 44, []uint64{43, 44, 45, 46}, true},
-		{"hole below the freeze is not excused by counters above it", 42, 45, []uint64{43, 45, 46}, false},
-		{"duplicate below the freeze", 42, 44, []uint64{43, 43, 44}, false},
-		{"duplicate above the freeze", 42, 43, []uint64{43, 44, 44}, false},
-		{"file ahead of pg (should never happen; refused all the same)", 43, 42, nil, false},
-		{"file ahead of pg with counters", 43, 42, []uint64{43}, false},
+		{"empty gap, zero (first-ever boot)", 0, 0, nil, bootGapCovered},
+		{"empty gap, nonzero (quiet restart)", 42, 42, nil, bootGapCovered},
+		{"one buffered write covering the gap", 42, 43, []uint64{43}, bootGapCovered},
+		{"several buffered writes, out of order", 42, 45, []uint64{45, 43, 44}, bootGapCovered},
+		{"gap with nothing buffered (out-of-band write)", 41, 42, nil, bootGapHole},
+		{"hole in the middle", 42, 45, []uint64{43, 45}, bootGapHole},
+		{"hole at the top of the gap", 42, 45, []uint64{43, 44}, bootGapHole},
+		{"counter below the gap (already in the file)", 42, 44, []uint64{42, 43}, bootGapContradiction},
+		{"counter the file claims, gap otherwise empty", 42, 42, []uint64{42}, bootGapContradiction},
+		{"counter above the frozen snapshot alone (write after freeze, gap empty)", 42, 42, []uint64{43}, bootGapCovered},
+		{"gap covered plus counters above the freeze", 42, 44, []uint64{43, 44, 45, 46}, bootGapCovered},
+		{"hole below the freeze is not excused by counters above it", 42, 45, []uint64{43, 45, 46}, bootGapHole},
+		{"duplicate below the freeze", 42, 44, []uint64{43, 43, 44}, bootGapContradiction},
+		{"duplicate above the freeze", 42, 43, []uint64{43, 44, 44}, bootGapContradiction},
+		{"a duplicate outranks a hole below it", 42, 45, []uint64{43, 46, 46}, bootGapContradiction},
+		{"file ahead of pg (a restored database)", 43, 42, nil, bootGapContradiction},
+		{"file ahead of pg with counters", 43, 42, []uint64{43}, bootGapContradiction},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := bootGapCoveredAt(tc.file, tc.pg, tc.counters); got != tc.want {
-				t.Fatalf("bootGapCoveredAt(%d, %d, %v) = %v, want %v", tc.file, tc.pg, tc.counters, got, tc.want)
+			got, why := bootGapCoveredAt(tc.file, tc.pg, tc.counters)
+			if got != tc.want {
+				t.Fatalf("bootGapCoveredAt(%d, %d, %v) = %v (%q), want %v", tc.file, tc.pg, tc.counters, got, why, tc.want)
+			}
+			if (got == bootGapContradiction) != (why != "") {
+				t.Fatalf("bootGapCoveredAt(%d, %d, %v) = %v with reason %q; a reason belongs with a contradiction only", tc.file, tc.pg, tc.counters, got, why)
 			}
 		})
 	}

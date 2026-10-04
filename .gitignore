@@ -18,6 +18,7 @@ bench/applybench/applybench
 bench/builderbench/builderbench
 bench/csrbench/csrbench
 bench/cypherbench/cypherbench
+bench/oggen/oggen
 bench/pathbench/pathbench
 bench/shgen/shgen
 

@@ -572,6 +572,8 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 
 		if st.ret != nil {
 			if countShortestSteps(parts) > 1 {
+				// Defensive (a shortest pattern must be the only pattern of
+				// the query's first part, so this cannot fire any more):
 				// "more than one shortestPath/allShortestPaths pattern part
 				// per query" -- a conservative tightening: the corpus never
 				// needs more than one, and this planner has not verified how
@@ -583,8 +585,14 @@ func Plan(q *cypher.RegularQuery, snap *snapshot.View) (result *Query, ok bool) 
 				// smuggle a second shortestPath past a per-Part-only check.
 				return nil, false
 			}
+			if orderByNameMisresolved(known, st.ret) {
+				return nil, false
+			}
 			ret, returnGroup, groupKnown, ok := desugarReturnAggregates(known, st.ret)
 			if !ok {
+				return nil, false
+			}
+			if returnGroup != nil && !groupKeysNumbersCanonical(snap, returnGroup) {
 				return nil, false
 			}
 			if returnGroup != nil {
@@ -854,6 +862,15 @@ type partBuilder struct {
 	// conjuncts) and RETURN-item bookkeeping use, so the whole tree only
 	// needs to be walked once per item.
 	touched map[string]bool
+
+	// multiClause is set while the WHERE conjuncts of a Part with more than
+	// one reading clause -- several MATCH clauses, or an OPTIONAL MATCH --
+	// are checked, and for an OPTIONAL MATCH's own WHERE. dawgs places every
+	// pattern predicate of such a Part, the first clause's included, inside
+	// the CTE its last clause is still defining, and the subquery refers to
+	// that CTE by name, which PostgreSQL rejects (42P01, missing FROM-clause
+	// entry), so checkPatternPredicate declines.
+	multiClause bool
 }
 
 // planPart builds one Part from reading (that stage's ReadingClauses),
@@ -911,6 +928,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 	// complete and sufficient by construction -- see Part's doc.
 	whereConjuncts = append(whereConjuncts, pb.desugaredEqualities...)
 
+	pb.multiClause = len(mandatory) > 1 || optionalClause != nil
 	for _, conjunct := range whereConjuncts {
 		pb.touched = map[string]bool{}
 		if !pb.checkExpr(conjunct, true) {
@@ -920,6 +938,7 @@ func planPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, patternSeq
 			return Part{}, nil, false
 		}
 	}
+	pb.multiClause = false
 
 	if !pb.finalizeShortestPaths(whereConjuncts) {
 		return Part{}, nil, false
@@ -1000,6 +1019,11 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 		numericScalars: numericScalars,
 		textScalars:    textScalars,
 		patternSeq:     outer.patternSeq,
+		multiClause:    true,
+		// Anonymous nodes go on numbering from the mandatory side's: a
+		// counter restarted here named the optional `(:G)` like the
+		// mandatory `()`, and the two were joined as one node.
+		anon: outer.anon,
 	}
 
 	// nodes starts EMPTY, deliberately: it must end up holding exactly the
@@ -1012,6 +1036,28 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 		if !pb.addPatternPart(pp) {
 			return Part{}, nil, false
 		}
+	}
+
+	// The left join the executor computes -- every mandatory row once per
+	// optional match, or once null-padded -- is dawgs' answer for one
+	// pattern of one step only. dawgs builds the optional side hop by hop
+	// and pattern by pattern and left-joins only the LAST hop: every
+	// earlier one is an inner join, so a row whose first hop fails is
+	// dropped, and one whose first hop succeeds keeps it with only the last
+	// hop null-padded. A shortest-path step is not that left join either.
+	if len(rc.Match.Pattern) != 1 || len(pb.chains) != 1 || pb.chains[0].Shortest != ShortestNone {
+		return Part{}, nil, false
+	}
+	// A fixed-length step between two nodes the mandatory side bound joins
+	// the edge to the first and then the node table again for the second --
+	// `join node n1 on (s1.n1).id = e0.end_id`, a condition that never
+	// mentions n1 -- so each match comes back once per node in the graph.
+	// (A variable-length step is lowered differently and agrees.)
+	step := pb.chains[0]
+	_, fromBound := outer.known[step.FromSym]
+	_, toBound := outer.known[step.ToSym]
+	if step.Range == nil && fromBound && toBound {
+		return Part{}, nil, false
 	}
 
 	// Now that the pattern's own symbols are known, narrow the shared ones
@@ -1088,6 +1134,11 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 //
 // Everything this refuses is delegated and answered correctly by PostgreSQL.
 func admitOptionalProjection(parts []Part, group *WithClause, proj *Projection, order []OrderKey) bool {
+	for i := range parts {
+		if !optionalJoinKeysEveryMandatoryNode(&parts[i], group, proj) {
+			return false
+		}
+	}
 	optional := optionalOnlySymbols(parts)
 	if len(optional) == 0 {
 		return true
@@ -1114,6 +1165,65 @@ func admitOptionalProjection(parts []Part, group *WithClause, proj *Projection, 
 		}
 		if optional[v.Symbol] {
 			proj.Items[i].Optional = true
+		}
+	}
+	return true
+}
+
+// optionalJoinKeysEveryMandatoryNode reports whether dawgs keys the left
+// join of part's OPTIONAL MATCH on every node of the mandatory pattern, as
+// leftJoinOptional's repeated-row decline assumes. dawgs builds the
+// optional CTE FROM the mandatory one and left-joins the two ON its
+// columns, so k copies of one mandatory row with m optional matches come
+// back k*k*m times, and the engine declines a repeat it sees. But dawgs
+// carries a mandatory node into that CTE only when the rest of the query
+// refers to it: `MATCH (u)-[:M]->(x) OPTIONAL MATCH (u)-[:M]->(g) RETURN u,
+// g` drops x, so two rows that differ only in x are a repeat to dawgs and
+// not to the engine, which answered k*m. Counted as referred to here: a
+// node the optional pattern shares (the join key), and one the projection
+// after the Part -- its WITH, or the RETURN for the last Part -- names as a
+// bare variable, a grouping key or an aggregate's argument. A node
+// mentioned only in a WHERE or through a property is not counted, which
+// can only over-decline. A RETURN DISTINCT without aggregates is exempt: it
+// removes the repeats either way.
+func optionalJoinKeysEveryMandatoryNode(part *Part, group *WithClause, proj *Projection) bool {
+	if part.Optional == nil {
+		return true
+	}
+	referred := map[string]bool{}
+	for _, sym := range part.OptionalShared {
+		referred[sym] = true
+	}
+	referClause := func(wc *WithClause) {
+		for _, key := range wc.GroupKeys {
+			referred[key] = true
+		}
+		for _, agg := range wc.Aggregates {
+			switch {
+			case agg.Count != nil:
+				referred[agg.Count.Sym] = true
+			case agg.Collect != nil:
+				referred[agg.Collect.Sym] = true
+			}
+		}
+	}
+	switch {
+	case part.With != nil:
+		referClause(part.With)
+	case group != nil:
+		referClause(group)
+	case proj.Distinct:
+		return true
+	default:
+		for _, item := range proj.Items {
+			if v, isVar := unwrapParens(item.Expr).(*cypher.Variable); isVar && v != nil {
+				referred[v.Symbol] = true
+			}
+		}
+	}
+	for sym := range part.Nodes {
+		if !referred[sym] {
+			return false
 		}
 	}
 	return true
@@ -1312,6 +1422,20 @@ func (pb *partBuilder) addPatternPart(part *cypher.PatternPart) bool {
 	if !isNode || firstNode == nil {
 		return false
 	}
+	// A pattern that is nothing but a node variable bound earlier -- by an
+	// earlier pattern, clause or Part, or the mandatory side of an OPTIONAL
+	// MATCH -- is not joined to that binding in dawgs' SQL: `MATCH (s)-[:R]->
+	// (t) MATCH (t)` lowers to `from s0, node n1`, a cross join with no
+	// condition on n1, so every row comes back once per node in the graph.
+	// The identity join the executor would make is not that answer, and
+	// imitating a row count that depends on the graph's size is no answer
+	// worth serving, so it declines. Inside a longer pattern the re-mention
+	// is a real join and stays served.
+	if len(part.PatternElements) == 1 && firstNode.Variable != nil && firstNode.Variable.Symbol != "" {
+		if _, bound := pb.known[firstNode.Variable.Symbol]; bound {
+			return false
+		}
+	}
 	fromSym, ok := pb.addNodePattern(firstNode)
 	if !ok {
 		return false
@@ -1377,8 +1501,27 @@ func (pb *partBuilder) nextPattern() int {
 // hard assumption, itself mirroring real Cypher grammar -- must be exactly
 // node-relationship-node (3 elements): shortestPath cannot span more than
 // one relationship pattern.
+//
+// It must also be the first thing its query part binds. dawgs compiles the
+// pattern into a harness call whose frame projects every earlier frame's
+// bindings, but joins an earlier frame only when an endpoint is bound or a
+// condition on the seed side refers to it, and whose endpoint filters run
+// as SQL text inside plpgsql EXECUTE, where no outer CTE is visible. So an
+// earlier pattern in the same part -- another MATCH clause or a comma-
+// separated pattern, sharing a variable or not -- and an endpoint bound
+// before the pattern are PostgreSQL's 42P01 ("missing FROM-clause entry",
+// "relation does not exist"). After a WITH (or inside an OPTIONAL MATCH)
+// the harness frame joins the earlier frame only when some condition on it
+// lands on the side dawgs' selectivity model picks as the seed, so pg
+// answers some spellings and rejects near-identical ones (`s <> x` against
+// `b <> x`, or the same join with an extra condition on the far endpoint).
+// Telling them apart would mean mirroring that model, so every symbol
+// already in scope declines, carried ones included.
 func (pb *partBuilder) addShortestPathPart(part *cypher.PatternPart) bool {
 	if len(part.PatternElements) != 3 {
+		return false
+	}
+	if len(pb.known) > 0 {
 		return false
 	}
 	firstNode, isNode := part.PatternElements[0].AsNodePattern()
@@ -1568,6 +1711,16 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 		if min < 0 || max < 0 {
 			return Step{}, false
 		}
+		// An upper bound of zero (`*..0`, `*1..0`, `*0..0`) is not the
+		// empty range it reads as in PostgreSQL. dawgs' expansion primer
+		// emits every depth-1 row without consulting the bound -- only its
+		// recursive member checks `depth < max` -- so `*1..0` returns the
+		// one-hop rows and `*0..0` the zero-length rows plus the one-hop
+		// ones, while a shortestPath harness never enters its loop and
+		// returns nothing. Declined rather than reproduced.
+		if max == 0 {
+			return Step{}, false
+		}
 		rng = &Range{Min: min, Max: max}
 	}
 
@@ -1622,17 +1775,51 @@ func (pb *partBuilder) buildStep(fromSym, toSym string, rel *cypher.Relationship
 // finalizeShortestPaths runs after every pattern and WHERE conjunct in the
 // Part has been processed: for every shortestPath/allShortestPaths Step it
 // sets HasExplicitEndpointInequality and enforces the endpoint-constraint
-// rule (see its own doc below), plus the shortest-step mixing restriction
-// (see shortestStepsAreIsolated).
+// rule (below), plus the shortest-step mixing restriction (see
+// shortestStepsAreIsolated).
+//
+// The endpoint-constraint rule is that the pattern's SECOND-written endpoint
+// must be constrained (isConstrained). Without a constraint there, dawgs'
+// harness has no terminal filter and marks a hop satisfied by a continuation
+// test on the seed instead (forwardContinuationSatisfaction, translate/
+// expansion.go): `exists (select 1 from edge where end_id = e0.start_id)`
+// for a forward pattern, `start_id = e0.end_id` for a backward one. At depth
+// 1 that asks whether the seed itself has an incoming (resp. outgoing) edge
+// of any kind, so PostgreSQL drops the one-hop paths of every seed without
+// one and reports that seed's next level instead -- an answer no search the
+// engine runs reproduces. When only the FIRST-written endpoint is
+// unconstrained, dawgs seeds from the constrained one and the same test
+// reduces to always-true, so that spelling (every shipped prebuilt with a
+// bare `(s)`, and `(e)<-[...]-(s:X)`) keeps serving. The rule subsumes the
+// older "at least one endpoint constrained" one.
 func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression) bool {
 	if !pb.shortestStepsAreIsolated() {
 		return false
 	}
 	for _, idx := range pb.shortestSteps {
 		step := &pb.chains[idx]
+
+		// Nothing may follow the pattern in its query part either. dawgs
+		// hands the harness only the conditions of the pattern's own MATCH
+		// clause and applies a later clause's WHERE, labels and inline map
+		// after the harness has picked its paths (a later pattern
+		// re-mentioning an endpoint is moreover a cross join with the whole
+		// node table, and some later clauses are 42P01), while this Part's
+		// WHERE pools every clause into the endpoint constraints and into
+		// HasExplicitEndpointInequality below. Every pattern part draws the
+		// next Pattern number, so the step holding the last one drawn means
+		// nothing followed it.
+		if pb.patternSeq == nil || step.Pattern != *pb.patternSeq {
+			return false
+		}
+
 		step.HasExplicitEndpointInequality = hasEndpointInequality(whereConjuncts, step.FromSym, step.ToSym)
 
-		if !pb.isConstrained(step.FromSym) && !pb.isConstrained(step.ToSym) {
+		secondWritten := step.ToSym
+		if step.Reversed {
+			secondWritten = step.FromSym
+		}
+		if !pb.isConstrained(secondWritten) {
 			return false
 		}
 	}
@@ -1660,6 +1847,10 @@ func (pb *partBuilder) finalizeShortestPaths(whereConjuncts []cypher.Expression)
 // successfully only to have the executor discover the same fact after a
 // full anchor scan (runComponent's own len(stepIdxs) != 1 decline), this
 // rejects the shape at plan time.
+//
+// Defensive since a shortest pattern must be the first and only pattern of
+// its query part (addShortestPathPart, finalizeShortestPaths): no planned
+// query can now reach this with a shortest step sharing a component.
 func (pb *partBuilder) shortestStepsAreIsolated() bool {
 	if len(pb.shortestSteps) == 0 {
 		return true
@@ -1703,10 +1894,13 @@ func (pb *partBuilder) shortestStepsAreIsolated() bool {
 
 // isConstrained reports whether sym's NodeConstraint carries a kind label,
 // an id() anchor, an objectid anchor, or at least one pushed single-symbol
-// WHERE predicate.
+// WHERE predicate -- the same things dawgs puts into a shortest-path
+// harness's endpoint filter, so finalizeShortestPaths asks it about the
+// pattern's second-written endpoint.
 //
 // The original implementation of finalizeShortestPaths' "at least one
-// endpoint constrained" rule (see that function's doc) checked only
+// endpoint constrained" rule (since narrowed to the second-written endpoint
+// -- see that function's doc) checked only
 // Kinds/IDs/ObjectIDAnchor, a literal reading of "kind- or
 // id-constrained". Predicates was added here after that reading was found
 // to exclude a real, required corpus query for no correctness reason: agi.json's
@@ -1996,6 +2190,20 @@ func (pb *partBuilder) extractStringAnchor(sym string, conjunct cypher.Expressio
 			return
 		}
 		if op != cypher.OperatorEquals {
+			return
+		}
+	}
+	// A parenthesised property, `(sym.prop) STARTS WITH 'a_b'`, is not a
+	// plain property to dawgs, so the needle reaches LIKE unescaped
+	// (likeNeedle): _ and % are wildcards, and narrowing on the needle
+	// itself would miss `aXb2`. Narrow on a literal run every match carries
+	// instead, as likeCoalesceAnchor does.
+	if !coalesced && match != snapshot.StringEquals && likeNeedle(left, right) {
+		lp, parsed := likeNeedlePattern(match, operand)
+		if !parsed {
+			return
+		}
+		if operand, ok = likePatternRun(lp, match); !ok {
 			return
 		}
 	}
@@ -2461,6 +2669,26 @@ func coalescePropOpLiteral(propSide, litSide cypher.Expression, sym string, matc
 // WITH, its longest for CONTAINS -- a superset the per-row LIKE then
 // filters exactly. A pattern without such a run gets no anchor.
 func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringMatch, needle string) (string, string, bool) {
+	lp, ok := likeNeedlePattern(match, needle)
+	if !ok {
+		return "", "", false
+	}
+	if raw, isStr := def.Value.(string); isStr {
+		d, err := decodeCypherStringLiteral(raw)
+		if err != nil || lp.regexp().MatchString(d) {
+			return "", "", false
+		}
+	}
+	run, ok := likePatternRun(lp, match)
+	if !ok {
+		return "", "", false
+	}
+	return name, run, true
+}
+
+// likeNeedlePattern parses the LIKE pattern dawgs builds from an unescaped
+// needle for a STARTS WITH (prefix), ENDS WITH (suffix) or CONTAINS match.
+func likeNeedlePattern(match snapshot.StringMatch, needle string) (likePattern, bool) {
 	var op StringOp
 	switch match {
 	case snapshot.StringPrefix:
@@ -2470,34 +2698,27 @@ func likeCoalesceAnchor(name string, def *cypher.Literal, match snapshot.StringM
 	case snapshot.StringContains:
 		op = OpContains
 	default:
-		return "", "", false
+		return likePattern{}, false
 	}
 	lp, err := parseLikePattern(likePatternFor(op, needle))
 	if err != nil {
-		return "", "", false
+		return likePattern{}, false
 	}
-	if raw, isStr := def.Value.(string); isStr {
-		d, err := decodeCypherStringLiteral(raw)
-		if err != nil || lp.regexp().MatchString(d) {
-			return "", "", false
-		}
-	}
-	var (
-		run string
-		ok  bool
-	)
+	return lp, true
+}
+
+// likePatternRun returns the literal run every value lp matches carries, in
+// the shape the string index answers for match: the pattern's leading run
+// for a prefix, its trailing run for a suffix, its longest for CONTAINS.
+func likePatternRun(lp likePattern, match snapshot.StringMatch) (string, bool) {
 	switch match {
 	case snapshot.StringPrefix:
-		run, ok = lp.leadingLiteral()
+		return lp.leadingLiteral()
 	case snapshot.StringSuffix:
-		run, ok = lp.trailingLiteral()
+		return lp.trailingLiteral()
 	default:
-		run, ok = lp.longestLiteral()
+		return lp.longestLiteral()
 	}
-	if !ok {
-		return "", "", false
-	}
-	return name, run, true
 }
 
 // coalesceDefaultRejects reports whether def, the value COALESCE yields for a
@@ -3454,13 +3675,19 @@ type sqlClass uint8
 const (
 	// classUnknown is an operand this package does not type statically: a
 	// plain property (jsonb, typed by its partner), an untyped coalesce()
-	// (the same), a node or edge variable, and anything else.
+	// (the same), and anything else.
 	classUnknown sqlClass = iota
 	classNull
 	classText
 	classNumber
 	classBool
 	classArray
+	// classNode and classEdge are a node or edge variable: a composite value
+	// in dawgs' SQL (`n0`, `e0`), which PostgreSQL compares with another of
+	// its own kind or a null and nothing else -- `n0 <> 5` has no operator
+	// (42883), and `n0 <> 'a'` reads 'a' as a composite (0A000).
+	classNode
+	classEdge
 )
 
 // sqlClassOf returns the SQL type family dawgs gives expr on its own:
@@ -3471,7 +3698,8 @@ const (
 // signed operand; boolean for a boolean literal or coalesce() and any
 // predicate; an array for a list literal, labels() and split(). A WITH
 // alias takes its constant's or aggregate's type (numericScalars,
-// textScalars, a collect alias).
+// textScalars, a collect alias), and a node or edge variable is its own
+// class.
 func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 	switch e := expr.(type) {
 	case *cypher.Parenthetical:
@@ -3555,6 +3783,10 @@ func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 			return classText
 		case pb.known[e.Symbol] == symCollectAlias:
 			return classArray
+		case isNodeSymbol(pb.known, e.Symbol):
+			return classNode
+		case isEntitySymbol(pb.known, e.Symbol): // not a node: an edge
+			return classEdge
 		}
 	case *cypher.Comparison, *cypher.Negation, *cypher.Conjunction, *cypher.Disjunction,
 		*cypher.KindMatcher, *cypher.PatternPredicate:
@@ -3568,9 +3800,16 @@ func (pb *partBuilder) sqlClassOf(expr cypher.Expression) sqlClass {
 // or an operand this package leaves untyped). Any other pair is an error
 // there -- `text = integer`, `bigint ~ unknown` -- or casts one side's
 // literal into the other's type, which is not the comparison the evaluator
-// makes.
+// makes. A node or edge variable is the exception to the untyped rule: it is
+// comparable with its own kind or a null only.
 func classesComparable(a, b sqlClass) bool {
-	if a == classUnknown || b == classUnknown || a == classNull || b == classNull {
+	if a == classNull || b == classNull {
+		return true
+	}
+	if a == classNode || a == classEdge || b == classNode || b == classEdge {
+		return a == b
+	}
+	if a == classUnknown || b == classUnknown {
 		return true
 	}
 	return a == b
@@ -3753,6 +3992,16 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 				return false
 			}
 		}
+		// Any other element that is not a literal: dawgs types the array
+		// from its literal elements and casts the rest -- `n.v IN [1, 1 +
+		// 1]` is `::int8 = any(array [1, 1 + 1]::int8[])`, `n.v IN ['5',
+		// toLower(n.w)]` a text comparison with a NULL element -- or lowers
+		// the whole test to `false` (`n.v IN [size(n.l)]`). The evaluator's
+		// In types none of that, so only a list of literals of one type
+		// (inListLiteralKind) is served.
+		if _, typed := inListLiteralKind(right); len(*l) > 0 && !typed {
+			return false
+		}
 	}
 	// The right-hand side must be an array dawgs can take `= any(...)` over:
 	// a list literal, a plain property's stored list, labels() or split(),
@@ -3774,7 +4023,7 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 	// `n.a + 'x' IN [1]` are `text = bigint`, all errors, where the evaluator
 	// compared renderings; and an array on the left (split()) is compared
 	// element-wise against a flattened list.
-	if kind, typed := literalListCastKind(right); typed && !isPlainPropertyLookup(left) {
+	if kind, typed := inListLiteralKind(right); typed && !isPlainPropertyLookup(left) {
 		switch class := pb.sqlClassOf(left); {
 		case class == classBool || class == classArray:
 			return false
@@ -3782,14 +4031,22 @@ func (pb *partBuilder) checkInOperands(left, right cypher.Expression, membership
 			return false
 		case kind != coalesceText && class == classText:
 			return false
+		case class == classNode || class == classEdge:
+			// `n IN [1, 2]` is `node = bigint`.
+			return false
 		}
 	}
 	if rv, ok := unwrapParens(right).(*cypher.Variable); ok && rv != nil {
 		if pb.known[rv.Symbol] == symCollectAlias {
-			if !membershipAllowed {
+			// dawgs lowers only the bare `x IN alias` to id membership. With
+			// either operand parenthesised it is a plain comparison, which
+			// PostgreSQL rejects: `x IN (alias)` is a node against a node
+			// array (42804), `(x) IN alias` a node against bigint (42883).
+			_, bareRight := right.(*cypher.Variable)
+			if !membershipAllowed || !bareRight {
 				return false
 			}
-			lv, ok := unwrapParens(left).(*cypher.Variable)
+			lv, ok := left.(*cypher.Variable)
 			if !ok || lv == nil || !isNodeSymbol(pb.known, lv.Symbol) {
 				return false
 			}
@@ -3972,8 +4229,18 @@ func (pb *partBuilder) checkKindMatcher(km *cypher.KindMatcher) bool {
 //     implements nothing to resolve a fresh node's own constraints inside
 //     its pure two-endpoint adjacency check, so that broader shape stays
 //     planner-rejected rather than mis-served.
+//   - A predicate in a Part with more than one reading clause -- several
+//     MATCH clauses or an OPTIONAL MATCH, in any of their WHEREs, the first
+//     clause's included (partBuilder.multiClause): again a genuine pg
+//     failure, not a scope cut -- dawgs places the subquery inside the CTE
+//     the last clause is still defining, and PostgreSQL rejects the query
+//     (42P01) before reading a row.
 func (pb *partBuilder) checkPatternPredicate(pp *cypher.PatternPredicate) bool {
 	if pp == nil || len(pp.PatternElements) != 3 {
+		return false
+	}
+	// Only in a Part of a single MATCH clause: see partBuilder.multiClause.
+	if pb.multiClause {
 		return false
 	}
 
@@ -4112,6 +4379,13 @@ func (pb *partBuilder) checkPropertyLookup(pl *cypher.PropertyLookup) bool {
 	}
 	k, known := pb.known[v.Symbol]
 	if !known || k != symNode {
+		return false
+	}
+	// A number stored in a spelling its float64 does not reproduce --
+	// 9007199254740993, which the float64 merges with 9007199254740992, or
+	// 1.0, whose text PostgreSQL's `->>` and casts read as '1.0' -- makes
+	// every comparison, grouping, rendering and cast of the property a guess.
+	if !pb.snap.NumbersCanonical(pl.Symbol) {
 		return false
 	}
 	pb.touched[v.Symbol] = true
@@ -4262,11 +4536,21 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 	if ae == nil || !pb.checkExpr(ae.Left, false) {
 		return false
 	}
+	// Each numeric step is computed at the type PostgreSQL resolves it to
+	// (eval.go's evalArithmeticTyped), and some of those the evaluator
+	// cannot reproduce: `/` outside float8 (integers truncate, numeric is
+	// exact decimal -- and dawgs prints `2.0` as the int4 2, so
+	// `size(n.l) / 2.0` truncates), `%` at all (float8 has none), and
+	// numeric over a fractional literal (`0.1 + 0.2 = 0.3` is exact there).
+	// See numericStepServed.
+	//
+	// A plain property operand is cast to the type dawgs infers for its
+	// partner (hintCast) -- `::int` next to size() -- and left text next to
+	// a WITH alias, which infers nothing: `n.v * d` is `text * integer`.
+	if _, _, ok := foldArithTyping(ae, numericStepServed); !ok {
+		return false
+	}
 	curKind := classifyAddOperand(ae.Left)
-	// Tracks whether the value accumulated on the left is statically a
-	// float, which is what decides whether PostgreSQL divides in integers
-	// -- see staticallyFloatOperand and the Divide case below.
-	leftIsFloat := staticallyFloatOperand(ae.Left)
 	for i, p := range ae.Partials {
 		if p == nil {
 			return false
@@ -4280,23 +4564,6 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 			return false
 		}
 		rKind := classifyAddOperand(p.Right)
-		rightIsFloat := staticallyFloatOperand(p.Right)
-
-		// `/` and `%` are the two operators whose result depends on whether
-		// PostgreSQL is working in integers or floats, and dawgs decides
-		// that statically: it casts a property lookup to int8 unless some
-		// operand is a float, so `n.val / 2` becomes `(...)::int8 / 2` --
-		// truncating division. This evaluator has only float64 arithmetic,
-		// so it answers 3.5 where PostgreSQL answers 3, and `WHERE n.val /
-		// 2 = 1` then drops a row PostgreSQL returns. Unless some operand
-		// is statically a float (`n.val / 2.0`, where dawgs casts to
-		// float8 and both sides agree), the shape delegates.
-		if p.Operator == cypher.OperatorDivide || p.Operator == cypher.OperatorModulo {
-			if !leftIsFloat && !rightIsFloat {
-				return false
-			}
-		}
-		leftIsFloat = leftIsFloat || rightIsFloat
 
 		// A numeric step types its operands the way evalArithmetic's casts
 		// assume, and dawgs does not always: it casts only a PLAIN property
@@ -4327,44 +4594,6 @@ func (pb *partBuilder) checkArithmetic(ae *cypher.ArithmeticExpression) bool {
 		curKind = nextAddKind(p.Operator, curKind, rKind)
 	}
 	return true
-}
-
-// staticallyFloatOperand reports whether expr is, on its AST alone, a
-// floating-point value -- the thing that decides whether dawgs' translation
-// of a `/` or `%` lands on PostgreSQL's integer or floating-point operator.
-// A float literal anywhere in an operand makes the whole operand float, so
-// parentheses, signs and nested arithmetic are followed through.
-//
-// Everything whose type is not statically knowable here -- a property
-// lookup, a variable, a function result -- answers false, which is the
-// conservative direction: it makes the caller decline rather than assume
-// PostgreSQL will agree with float64 arithmetic.
-func staticallyFloatOperand(expr cypher.Expression) bool {
-	switch e := unwrapParens(expr).(type) {
-	case *cypher.Literal:
-		if e == nil || e.Null {
-			return false
-		}
-		_, isFloat := e.Value.(float64)
-		return isFloat
-	case *cypher.UnaryAddOrSubtractExpression:
-		return e != nil && staticallyFloatOperand(e.Right)
-	case *cypher.ArithmeticExpression:
-		if e == nil {
-			return false
-		}
-		if staticallyFloatOperand(e.Left) {
-			return true
-		}
-		for _, p := range e.Partials {
-			if p != nil && staticallyFloatOperand(p.Right) {
-				return true
-			}
-		}
-		return false
-	default:
-		return false
-	}
 }
 
 // --- WITH ------------------------------------------------------------------
@@ -4979,7 +5208,7 @@ func planReturn(snap *snapshot.View, known map[string]symKind, countAliases, num
 				return false
 			}
 			hasString, answered := snap.HasStringValue(propID)
-			return answered && !hasString
+			return answered && !hasString && snap.NumbersCanonical(pl.Symbol)
 		})
 	if !ok {
 		return Projection{}, nil, 0, -1, false
@@ -5474,6 +5703,141 @@ func planOrder(order *cypher.Order, projectedKinds map[string]symKind, projected
 		keys = append(keys, OrderKey{Symbol: v.Symbol, Descending: !item.Ascending})
 	}
 	return keys, true
+}
+
+// orderByNameMisresolved reports whether ret's ORDER BY names a column that
+// dawgs resolves differently from planOrder, which sorts by whichever RETURN
+// item carries the name. dawgs' SQL (dumped per shape) resolves a bare
+// ORDER BY name the other way round:
+//
+//   - A name the MATCH or WITH scope binds -- a node, an edge, or a carried
+//     COUNT, COLLECT or constant -- sorts by that binding, whatever a RETURN
+//     alias of the same name projects: `MATCH (g) RETURN g.v AS g ORDER BY
+//     g` is `order by s0.n0`, the node, and `WITH g, count(u) AS c RETURN
+//     g.v AS c ORDER BY c` sorts by the count. (A path variable is not a
+//     frame column, so dawgs emits the alias for it, `order by p`, as the
+//     engine sorts; it declines anyway, a deliberate over-decline.) The
+//     engine sorted by the alias instead -- different rows under LIMIT -- and
+//     served shapes PostgreSQL rejects: `RETURN count(u) AS u ORDER BY u`
+//     (42803, u is not grouped) and `RETURN DISTINCT g.v AS g ORDER BY g`
+//     (42P10, the node is not in the select list). Both readings agree only
+//     when the RETURN item of that name is a bare reference to the binding
+//     itself, as in the common `WITH g, count(u) AS c RETURN g, c ORDER BY
+//     c`.
+//   - Any other name is emitted as the output alias, unquoted, which
+//     PostgreSQL folds to lower case before looking it up: under `RETURN n.v
+//     AS x, id(n) AS X ORDER BY X` both columns are x, and pg raises 42702
+//     (ORDER BY "x" is ambiguous). A name that folds to a word PostgreSQL
+//     reserves is not a column reference there at all: `RETURN g.v AS select
+//     ORDER BY select` is a syntax error (42601), and `ORDER BY user` sorts
+//     by current_user, a constant (pgReservedWords).
+//   - dawgs rewrites only a bare identifier to the projection: a
+//     parenthesised name, `RETURN g.v AS gv ORDER BY (gv)`, is emitted as
+//     `order by (i0)`, a column that does not exist (42703).
+//
+// Either way the query declines. known is the scope the RETURN clause sees
+// BEFORE desugarReturnAggregates replaces it with the grouped aliases -- a
+// variable an aggregate folds (u in count(u)) is exactly a binding that can
+// shadow an alias. A parenthesised or reserved name declines even where it
+// names a binding PostgreSQL might resolve -- a deliberate over-decline.
+// So does the folded-column rule above: a node, a relationship, or a
+// carried COUNT/COLLECT/constant projected by a bare RETURN item is sorted
+// by its binding, not by either column, so this over-declines there.
+// `WITH g, count(u) AS c RETURN c, g.v AS C ORDER BY c` declines because c
+// and C fold to one column name -- yet dawgs emits `order by s0.i0` for it,
+// a qualified reference to the grouped count's own frame column rather than
+// to either output alias, so the fold never reaches PostgreSQL's ORDER BY
+// name resolution at all and the query is answered. (Dumped through
+// translate.Translate and run: `with s0(i0, v) as (...) select s0.i0 as c,
+// s0.v as C from s0 order by s0.i0` answers, sorted by i0, while the same
+// select list under `order by c` is 42702, `ORDER BY "c" is ambiguous`. The
+// fold is only load-bearing for a name no binding carries -- the second
+// bullet above -- where dawgs does emit the bare alias.)
+func orderByNameMisresolved(known map[string]symKind, ret *cypher.Return) bool {
+	if ret == nil || ret.Projection == nil || ret.Projection.Order == nil {
+		return false
+	}
+	var items []*cypher.ProjectionItem
+	for _, raw := range ret.Projection.Items {
+		if item, ok := raw.(*cypher.ProjectionItem); ok && item != nil {
+			items = append(items, item)
+		}
+	}
+	for _, sortItem := range ret.Projection.Order.Items {
+		if sortItem == nil {
+			continue
+		}
+		v, isVar := unwrapParens(sortItem.Expression).(*cypher.Variable)
+		if !isVar || v == nil {
+			continue
+		}
+		if _, parenthesised := sortItem.Expression.(*cypher.Parenthetical); parenthesised {
+			return true
+		}
+		column, ok := pgColumnName(v.Symbol)
+		if !ok || pgReservedWords[column] {
+			return true
+		}
+		_, bound := known[v.Symbol]
+		sameColumn := 0
+		for _, item := range items {
+			// The name an ORDER BY resolves against: aggregateOutputName is
+			// the one naming both planReturn (alias, else the bare variable)
+			// and the aggregate rewrite agree on.
+			name, named := aggregateOutputName(item)
+			if !named {
+				continue
+			}
+			if bound && name == v.Symbol {
+				if self, isSelf := unwrapParens(item.Expression).(*cypher.Variable); !isSelf || self == nil || self.Symbol != v.Symbol {
+					return true
+				}
+			}
+			if folded, ok := pgColumnName(name); ok && folded == column {
+				sameColumn++
+			}
+		}
+		if sameColumn > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// pgReservedWords holds the key words PostgreSQL's grammar does not accept as
+// a column reference: the "reserved" and "reserved (can be function or type)"
+// categories of its SQL Key Words appendix (pg_get_keywords() catcode R and
+// T): PostgreSQL 14's list, plus system_user, reserved since PostgreSQL 16.
+// An unquoted `order by <word>` is a syntax error for most of them; the SQL
+// value functions among them (user, current_date, true, ...) parse as a
+// constant sort key instead. A non-reserved key word (name, value, ...) is
+// an ordinary column name there.
+var pgReservedWords = map[string]bool{
+	"all": true, "analyse": true, "analyze": true, "and": true, "any": true,
+	"array": true, "as": true, "asc": true, "asymmetric": true,
+	"authorization": true, "binary": true, "both": true, "case": true,
+	"cast": true, "check": true, "collate": true, "collation": true,
+	"column": true, "concurrently": true, "constraint": true, "create": true,
+	"cross": true, "current_catalog": true, "current_date": true,
+	"current_role": true, "current_schema": true, "current_time": true,
+	"current_timestamp": true, "current_user": true, "default": true,
+	"deferrable": true, "desc": true, "distinct": true, "do": true,
+	"else": true, "end": true, "except": true, "false": true, "fetch": true,
+	"for": true, "foreign": true, "freeze": true, "from": true, "full": true,
+	"grant": true, "group": true, "having": true, "ilike": true, "in": true,
+	"initially": true, "inner": true, "intersect": true, "into": true,
+	"is": true, "isnull": true, "join": true, "lateral": true,
+	"leading": true, "left": true, "like": true, "limit": true,
+	"localtime": true, "localtimestamp": true, "natural": true, "not": true,
+	"notnull": true, "null": true, "offset": true, "on": true, "only": true,
+	"or": true, "order": true, "outer": true, "overlaps": true,
+	"placing": true, "primary": true, "references": true, "returning": true,
+	"right": true, "select": true, "session_user": true, "similar": true,
+	"some": true, "symmetric": true, "system_user": true, "table": true,
+	"tablesample": true, "then": true, "to": true, "trailing": true,
+	"true": true, "union": true, "unique": true, "user": true, "using": true,
+	"variadic": true, "verbose": true, "when": true, "where": true,
+	"window": true, "with": true,
 }
 
 // isStaticallyNumericScalar reports whether expr (a RETURN item's own top-

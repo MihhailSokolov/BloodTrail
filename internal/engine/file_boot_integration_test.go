@@ -141,6 +141,52 @@ func waitForBootMarker(t *testing.T, buf *lockedBuffer, marker string) {
 	}
 }
 
+// waitForRebuildCounted blocks until eng has counted at least one PostgreSQL
+// rebuild -- the companion to waitForFresh that every "this boot fell through
+// to a genuine pg rebuild" claim in this package actually needs. what names
+// the boot being asserted about, for the failure message.
+//
+// The two observe different instants, and waitForFresh is the earlier one:
+// adoptRebuiltView (engine.go) publishes the View -- which is what flips
+// Fresh() -- from inside its own applyMu critical section, while rebuildOnce
+// increments rebuildAttempts from a DEFERRED call that runs only after that
+// adoption has returned and after the "snapshot rebuilt" line is logged. That
+// deferral is deliberate (rebuildOnce's own doc: a test polling the counter
+// must never race ahead of the log line belonging to the same rebuild), but it
+// is exactly backwards for a test that waits on Fresh() and THEN reads the
+// counter: such a test can see a serving engine and a still-zero counter in
+// the same breath. Measured on the base branch at 1 failure in 30 runs of
+// TestFileBootRejectsStaleWatermarkAndRebuilds below, and at 5 of 5 once
+// waitForFresh's 10ms poll is replaced by a tight one -- so it is a real
+// ordering race, not a slow machine, and no larger timeout anywhere would
+// address it. Waiting on the counter itself does.
+//
+// One residual case this does not close, left open deliberately: the counter
+// counts every rebuild attempt that reached PostgreSQL, failed ones included,
+// and runBootLoad retries until one is adopted. So on a boot whose first
+// attempt fails, this can return on that failure's increment while the
+// adopting attempt's is still pending. It is strictly better than reading the
+// counter unguarded either way -- the claim every caller makes is "a pg
+// rebuild was attempted", which a failed attempt satisfies -- and no caller
+// here compares the count to an exact number. Pairing it with waitForFresh,
+// as every caller does, also means a view has already been adopted by the
+// time it is consulted. A caller that ever needs "the ADOPTING attempt's
+// increment" would have to wait for the count to stop moving instead.
+func waitForRebuildCounted(t *testing.T, eng *Engine, what string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if eng.RebuildCount() > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("RebuildCount stayed 0 for 5s %s, want at least one PostgreSQL rebuild", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // newLogCapturingEngine builds an *Engine wired to dir, over pgDriver/pool,
 // whose log output is captured into the returned *lockedBuffer (defined in
 // engine_integration_test.go, this package's own log-capture helper) at
@@ -172,7 +218,7 @@ func TestFileBootLoadsMatchingWatermarkSnapshot(t *testing.T) {
 
 	engB, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engB.Start(ctx)
-	defer engB.Stop()
+	defer stopEngineAndCloseWritePool(engB)
 
 	waitForFresh(t, engB)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file loaded")
@@ -229,7 +275,7 @@ func TestFileBootWaitsForTheDefaultGraphToResolve(t *testing.T) {
 
 	engB, buf := newLogCapturingEngine(unresolved, pool, dir)
 	engB.Start(ctx)
-	defer engB.Stop()
+	defer stopEngineAndCloseWritePool(engB)
 
 	// Long enough for several boot-load iterations to run and find nothing
 	// they can do yet (the loop's first wait is fallbackRetryInterval, 100ms).
@@ -301,13 +347,10 @@ func TestFileBootRejectsStaleWatermarkAndRebuilds(t *testing.T) {
 
 	engC, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engC.Start(ctx)
-	defer engC.Stop()
+	defer stopEngineAndCloseWritePool(engC)
 
 	waitForFresh(t, engC)
-
-	if got := engC.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after booting from a stale-watermark snapshot file, want at least one pg rebuild")
-	}
+	waitForRebuildCounted(t, engC, "after booting from a stale-watermark snapshot file")
 
 	view, serving := engC.Fresh()
 	if !serving {
@@ -347,13 +390,10 @@ func TestFileBootRejectsCorruptFileAndRebuilds(t *testing.T) {
 
 	engC, buf := newLogCapturingEngine(pgDriver, pool, dir)
 	engC.Start(ctx)
-	defer engC.Stop()
+	defer stopEngineAndCloseWritePool(engC)
 
 	waitForFresh(t, engC)
-
-	if got := engC.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after booting from a corrupt snapshot file, want at least one pg rebuild")
-	}
+	waitForRebuildCounted(t, engC, "after booting from a corrupt snapshot file")
 
 	view, serving := engC.Fresh()
 	if !serving {
@@ -419,15 +459,13 @@ func TestFileBootDisabledWhenSnapshotDirEmpty(t *testing.T) {
 	eng.Start(ctx)
 	waitForFresh(t, eng)
 
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 with the snapshot-file feature disabled, want at least one pg rebuild (there is no file to load instead)")
-	}
+	waitForRebuildCounted(t, eng, "with the snapshot-file feature disabled (there is no file to load instead)")
 
 	if err := eng.SaveSnapshot(ctx); err != nil {
 		t.Fatalf("SaveSnapshot with SnapshotDir empty returned an error, want a silent no-op: %v", err)
 	}
 
-	eng.Stop()
+	stopEngineAndCloseWritePool(eng)
 
 	logged := buf.String()
 	for _, marker := range []string{"snapshot file loaded", "snapshot file rejected", "snapshot file written", "no snapshot file"} {
@@ -465,13 +503,11 @@ func TestFileBootQuietlyMissesWithNoSnapshotFileYet(t *testing.T) {
 	resetWatermarkTable(t, ctx, eng)
 
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 booting against an empty SnapshotDir with no file yet, want at least one pg rebuild")
-	}
+	waitForRebuildCounted(t, eng, "booting against an empty SnapshotDir with no file yet")
 
 	view, serving := eng.Fresh()
 	if !serving {

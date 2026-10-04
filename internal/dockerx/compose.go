@@ -3,7 +3,10 @@
 package dockerx
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -120,9 +123,68 @@ func (s Compose) Logs(ctx context.Context, service string) ([]byte, error) {
 	return s.run(ctx, nil, "logs", "--no-color", service)
 }
 
+// LogsSince returns what the service's containers logged from since on, a
+// timestamp as docker prints it (`docker inspect`'s StartedAt is one). Docker
+// keeps a container's log across its restarts, so Logs also holds everything
+// earlier runs wrote; this is how to ask about the current one.
+func (s Compose) LogsSince(ctx context.Context, service, since string) ([]byte, error) {
+	return s.run(ctx, nil, "logs", "--no-color", "--since", since, service)
+}
+
 // PS returns `docker compose ps` output for one service as JSON: one object
 // per running container, either as a JSON array or as newline-delimited
 // objects depending on the compose version.
 func (s Compose) PS(ctx context.Context, service string) ([]byte, error) {
 	return s.run(ctx, nil, "ps", "--format", "json", service)
+}
+
+// ErrNoRunningContainer is what RunningContainer returns for a service that
+// has none: not started yet, or stopped, or restarting.
+var ErrNoRunningContainer = errors.New("no running container")
+
+// Container identifies one run of a service's container. A plain restart keeps
+// the ID and changes StartedAt; a recreate changes both.
+type Container struct {
+	ID        string // docker's full container id
+	StartedAt string // when its current run began, as `docker inspect` prints it: RFC 3339, with nanoseconds
+}
+
+// RunningContainer returns the identity of the service's running container (the
+// first, when the service has several). It fails with ErrNoRunningContainer
+// when there is none.
+func (s Compose) RunningContainer(ctx context.Context, service string) (Container, error) {
+	out, err := s.PS(ctx, service)
+	if err != nil {
+		return Container{}, fmt.Errorf("docker compose ps %s: %w", service, err)
+	}
+	// Compose v2 prints a JSON array in recent versions and one object per
+	// line in older ones (and nothing at all for no container there). A
+	// decoder reading the stream takes the first value, array or object, and
+	// an array's first element after stepping past the bracket.
+	dec := json.NewDecoder(bytes.NewReader(out))
+	tok, err := dec.Token()
+	switch {
+	case errors.Is(err, io.EOF):
+		return Container{}, fmt.Errorf("%w: the %s service has none", ErrNoRunningContainer, service)
+	case err != nil:
+		return Container{}, fmt.Errorf("parsing docker compose ps %s output: %w", service, err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
+		dec = json.NewDecoder(bytes.NewReader(out))
+	}
+	var listed struct {
+		ID string `json:"ID"`
+	}
+	if err := dec.Decode(&listed); err != nil || listed.ID == "" {
+		return Container{}, fmt.Errorf("%w: the %s service has none", ErrNoRunningContainer, service)
+	}
+	inspected, err := s.Runner.Run(ctx, nil, "docker", "inspect", "-f", "{{.Id}} {{.State.StartedAt}}", listed.ID)
+	if err != nil {
+		return Container{}, fmt.Errorf("docker inspect %s: %w", listed.ID, err)
+	}
+	fields := strings.Fields(string(inspected))
+	if len(fields) != 2 {
+		return Container{}, fmt.Errorf("docker inspect %s: expected an id and a start time, got %q", listed.ID, inspected)
+	}
+	return Container{ID: fields[0], StartedAt: fields[1]}, nil
 }

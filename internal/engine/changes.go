@@ -13,9 +13,13 @@ import (
 // doc, changes_scope.go): the actual read-back keys (node/edge database ids,
 // or the objectid values an upsert identified its target by) and, where a
 // key can't be pinned down, the coarser operation (a kind-scoped delete
-// criteria, or a bare "this write escaped tracking" fallback) Apply
+// criteria, which Apply turns back into keys by re-reading the View rows it
+// matches, or a bare "this write escaped tracking" fallback) Apply
 // (apply.go) needs in order to replay the write's effect into the in-memory
 // engine, rather than re-deriving it from the observer call sequence itself.
+// One recorded entry is about the write rather than about a row it touched:
+// the write-incomplete mark (RecordWriteIncomplete), which tells read-back
+// whether the write it is reading back returned cleanly at all.
 //
 // Every Record* method is additive and idempotent: recording the same
 // logical entry more than once (e.g. two calls that both name node id 7,
@@ -42,7 +46,8 @@ type ChangeSet struct {
 	nodeKindDeletes map[string]NodeKindDeleteCriteria
 	edgeKindDeletes map[string]graph.Kinds
 
-	fallbacks map[string]struct{}
+	fallbacks       map[string]struct{}
+	writeIncomplete map[string]struct{}
 }
 
 // EdgeTripleRef is one (start, end, kind) triple RecordEdgeTriple has
@@ -68,11 +73,11 @@ type EdgeTripleOIDRef struct {
 
 // NodeKindDeleteCriteria is one (include, exclude) pair RecordDeleteNodesByKinds
 // has recorded, mirroring graph.Database.DeleteNodesByKinds' own
-// includeAny/excludeAny parameters: the applier replays this as the same
-// kind-scoped criteria, rather than an enumerated id list, since a
-// kind-scoped node delete's own blast radius (every node matching the
-// criteria, whatever their ids happen to be) is exactly what these two
-// fields already describe.
+// includeAny/excludeAny parameters: a kind-scoped node delete's blast radius
+// (every node matching the criteria, whatever their ids happen to be) is
+// exactly what these two fields describe, so the applier re-reads every
+// node of the View it is applied to that matches them (viewCandidates,
+// apply.go) and tombstones only the ones PostgreSQL no longer holds.
 type NodeKindDeleteCriteria struct {
 	Include, Exclude graph.Kinds
 }
@@ -221,9 +226,12 @@ func (c *ChangeSet) RecordEdgeTripleByObjectID(startOID, endOID string, kind gra
 // Driver.DeleteNodesByKinds' own includeAny/excludeAny, and the recognized
 // (non-InIDs) shape of a criteria this package's node-delete recognizer
 // maps to a kind matcher for -- as an operation rather than an enumerated
-// id list: the applier replays "delete every node matching this criteria"
-// directly, since the criteria describes the delete's blast radius more
-// durably than any id list captured before the delete ran.
+// id list, since the criteria describes the delete's blast radius more
+// durably than any id list captured before the delete ran. The applier
+// turns it into keys when it applies the write: every node of its View
+// that matches the criteria is re-read from PostgreSQL, so a node the
+// delete never saw (committed after the DELETE's snapshot) survives however
+// late the delete itself is applied.
 //
 // Recording the same (include, exclude) pair more than once -- comparing
 // kinds by name, regardless of slice order -- has the same effect as
@@ -241,7 +249,9 @@ func (c *ChangeSet) RecordDeleteNodesByKinds(include, exclude graph.Kinds) {
 // equivalent: Driver.DeleteRelationshipsByKinds' own kinds parameter, and
 // observingRelationshipQuery.Delete's recognized-kind-matcher branch
 // (relationshipDeleteScope/edgeKindsFromCriteria), recorded as "delete
-// every relationship of these kinds" rather than an enumerated id list.
+// every relationship of these kinds" rather than an enumerated id list and
+// applied the same way: every edge of those kinds the View holds is
+// re-read.
 //
 // Recording the same kinds more than once -- by name, regardless of slice
 // order -- has the same effect as recording it once; EdgeKindCriteria()
@@ -274,8 +284,51 @@ func (c *ChangeSet) RecordFallback(reason string) {
 	c.fallbacks[reason] = struct{}{}
 }
 
+// RecordWriteIncomplete records that the write this ChangeSet belongs to did
+// NOT complete cleanly -- it returned an error, or a panic is unwinding
+// through it -- alongside reason, a short human-readable description of
+// which. Driver.BatchOperation's own error path is the call site this exists
+// for: a batch's flushed chunks are durable whatever the batch went on to
+// report, so Apply runs for a failed batch too (see that method's doc), and
+// read-back then has to read the recorded keys knowing that some of them name
+// rows the write never created.
+//
+// It is NOT a fallback and NOT a change: unlike RecordFallback it asks Apply
+// for nothing, and unlike every other Record* method it adds no key, so it
+// leaves Empty() and keyCount() alone -- a failed write that recorded no key
+// is still an empty ChangeSet, and still costs no segment. Its one consumer
+// is readBack (readback.go), which reads it to tell a key that cannot be
+// resolved because the write never landed (benign, and the expected outcome
+// for a failed one) from a key that cannot be resolved although the write
+// provably created the row (a race the engine cannot name its way out of,
+// whose only sound answer is a fallback).
+//
+// Recording the same reason string more than once has the same effect as
+// recording it once; WriteIncomplete() returns each distinct reason exactly
+// once.
+func (c *ChangeSet) RecordWriteIncomplete(reason string) {
+	if c.writeIncomplete == nil {
+		c.writeIncomplete = make(map[string]struct{}, 1)
+	}
+	c.writeIncomplete[reason] = struct{}{}
+}
+
+// WriteIncomplete reports whether RecordWriteIncomplete has ever been called
+// on c, alongside every distinct reason recorded, in sorted order. ok is
+// false, and reasons is nil, when it has never been called -- which is what
+// a write that returned cleanly looks like.
+func (c *ChangeSet) WriteIncomplete() (ok bool, reasons []string) {
+	if len(c.writeIncomplete) == 0 {
+		return false, nil
+	}
+	return true, sortedKeys(c.writeIncomplete)
+}
+
 // Empty reports whether nothing has been recorded on c at all -- no ids, no
 // object ids, no triples, no kind-scoped delete criteria, and no fallback.
+// The write-incomplete mark is deliberately not counted: it describes how to
+// read whatever keys are here rather than being one of them, so a failed
+// write that named nothing stays empty (RecordWriteIncomplete's own doc).
 // WriteScope.Empty() (changes_scope.go) is exactly this call on the
 // WriteScope's own ChangeSet.
 func (c *ChangeSet) Empty() bool {

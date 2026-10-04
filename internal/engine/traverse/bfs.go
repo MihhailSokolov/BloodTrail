@@ -54,13 +54,6 @@ func bfsFrom(s *snapshot.View, seed snapshot.NodeID, forward bool, kinds *snapsh
 	return deepest
 }
 
-// pathState is one partial (or complete) path on enumerate's explicit DFS
-// stack: nodes[len(nodes)-1] is the walk's current frontier node.
-type pathState struct {
-	nodes []snapshot.NodeID
-	kinds []snapshot.KindID
-}
-
 // enumerate collects every path whose every hop satisfies the strictly-
 // decreasing distance requirement against distBuf, ending at distance 0.
 // Direction is controlled by forward:
@@ -75,49 +68,58 @@ type pathState struct {
 //     distances FROM the root (produced by a forward bfsFrom over the
 //     Out-CSR). The walk follows In-adjacency from `from` — i.e. it walks
 //     the graph's real edges backward, from destination toward root — so
-//     nodes are visited in destination-to-root order; each candidate stack
-//     entry is reversed before being appended to the output so the emitted
-//     Path is always root-to-destination.
+//     nodes are visited in destination-to-root order; each completed walk is
+//     reversed as it is stored so the emitted Path is always
+//     root-to-destination.
 //
-// Appends to out, stopping when len(out) == cap (cap<=0: unbounded) or
-// budget.add fails.
+// Adds to sink, stopping when the sink holds cap paths (cap<=0: unbounded)
+// or budget.add fails. cap is an absolute target against the sink's
+// cumulative path count across every call a strategy makes into it, not a
+// per-call delta -- see pathCap.
 //
 // It walks the chosen adjacency with an explicit stack in place of
 // recursion; the strictly-decreasing distance requirement makes the
 // explored state space acyclic even when the underlying graph has cycles,
 // so no separate visited-set is needed. Parallel edges admitted under
 // different allowed kinds are pushed as distinct stack entries and so
-// produce distinct output paths.
-func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, out []Path, forward bool) ([]Path, error) {
-	stack := []pathState{{nodes: []snapshot.NodeID{from}}}
+// produce distinct output paths. A stack entry is one frame -- a node, the
+// kind that reached it, its depth -- rather than a copy of the partial path
+// it ends: walk/walkKinds hold that path, truncated back to the popped
+// frame's depth (see frame).
+func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *snapshot.KindMask, cap int, budget *memBudget, sink *pathSink, forward bool) error {
+	stack := append(sink.stack[:0], frame{node: from})
+	walk, walkKinds := sink.walk[:0], sink.walkKinds[:0]
+	var err error
 
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		u := cur.nodes[len(cur.nodes)-1]
+		d := int(cur.depth)
+		walk = append(walk[:d], cur.node)
+		if d > 0 {
+			walkKinds = append(walkKinds[:d-1], cur.kind)
+		} else {
+			walkKinds = walkKinds[:0]
+		}
+
+		u := cur.node
 		du, ok := distBuf.get(u)
 		if !ok {
 			continue
 		}
 
 		if du == 0 {
-			if len(cur.nodes) < 2 {
+			if len(walk) < 2 {
 				// from == the other endpoint: no zero-length path is produced.
 				continue
 			}
-			nodes := append([]snapshot.NodeID(nil), cur.nodes...)
-			pathKinds := append([]snapshot.KindID(nil), cur.kinds...)
-			if !forward {
-				reverseNodes(nodes)
-				reverseKinds(pathKinds)
+			if err = budget.add(uint64(len(walk))*12 + 48); err != nil {
+				break
 			}
-			if err := budget.add(uint64(len(nodes))*12 + 48); err != nil {
-				return out, err
-			}
-			out = append(out, Path{Nodes: nodes, Kinds: pathKinds})
-			if cap > 0 && len(out) == cap {
-				return out, nil
+			sink.add(walk, walkKinds, !forward)
+			if cap > 0 && sink.n == cap {
+				break
 			}
 			continue
 		}
@@ -130,15 +132,7 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 			if !ok || dw != du-1 {
 				return
 			}
-			nextNodes := make([]snapshot.NodeID, len(cur.nodes)+1)
-			copy(nextNodes, cur.nodes)
-			nextNodes[len(cur.nodes)] = w
-
-			nextKinds := make([]snapshot.KindID, len(cur.kinds)+1)
-			copy(nextKinds, cur.kinds)
-			nextKinds[len(cur.kinds)] = k
-
-			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
+			stack = append(stack, frame{node: w, kind: k, depth: uint16(d + 1)})
 		}
 		if ns, ks, ok := cleanAdjacency(s, u, forward); ok {
 			for i, w := range ns {
@@ -149,7 +143,8 @@ func enumerate(s *snapshot.View, from snapshot.NodeID, distBuf *scratch, kinds *
 		}
 	}
 
-	return out, nil
+	sink.stack, sink.walk, sink.walkKinds = stack, walk, walkKinds
+	return err
 }
 
 // reverseNodes reverses ns in place.
@@ -289,21 +284,21 @@ func pairShortest(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMa
 	return D
 }
 
-// pairPaths returns r->t shortest paths, appending to out and stopping once
-// len(out) reaches cap (cap<=0: unbounded). cap is an absolute target
-// against out's cumulative length, not a per-call delta — see pathCap,
+// pairPaths adds r->t shortest paths to sink, stopping once the sink's
+// cumulative path count reaches cap (cap<=0: unbounded). cap is an absolute
+// target against that cumulative count, not a per-call delta — see pathCap,
 // which callers use to compute it (accounting for both Query.Limit and
 // ModeOne's "one path per pair"). It runs pairShortest to find D and
 // populate scF/scT, then hands off to pairEnumerate; if no path exists
-// within maxDepth, out is returned unchanged and no error is produced
+// within maxDepth, the sink is left unchanged and no error is produced
 // (absence of a path is not a failure).
-func pairPaths(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, cap int, budget *memBudget, scF, scT, scTmp *scratch, out []Path) ([]Path, error) {
+func pairPaths(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask, maxDepth, cap int, budget *memBudget, scF, scT, scTmp *scratch, sink *pathSink) error {
 	D := pairShortest(s, r, t, kinds, maxDepth, scF, scT, scTmp)
 	if D < 0 {
-		return out, nil
+		return nil
 	}
 
-	return pairEnumerate(s, r, t, D, kinds, cap, budget, scF, scT, out)
+	return pairEnumerate(s, r, t, D, kinds, cap, budget, scF, scT, sink)
 }
 
 // pairEnumerate collects every shortest r->t path of length D, using the
@@ -322,24 +317,31 @@ func pairPaths(s *snapshot.View, r, t snapshot.NodeID, kinds *snapshot.KindMask,
 // sits on some shortest r->t path, so this DFS enumerates each such path
 // exactly once (per distinct edge-kind choice, as with enumerate) and
 // completes as soon as it reaches w == t rather than continuing past it.
-func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapshot.KindMask, cap int, budget *memBudget, scF, scT *scratch, out []Path) ([]Path, error) {
-	stack := []pathState{{nodes: []snapshot.NodeID{r}}}
+func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapshot.KindMask, cap int, budget *memBudget, scF, scT *scratch, sink *pathSink) error {
+	stack := append(sink.stack[:0], frame{node: r})
+	walk, walkKinds := sink.walk[:0], sink.walkKinds[:0]
+	var err error
 
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 
-		u := cur.nodes[len(cur.nodes)-1]
+		d := int(cur.depth)
+		walk = append(walk[:d], cur.node)
+		if d > 0 {
+			walkKinds = append(walkKinds[:d-1], cur.kind)
+		} else {
+			walkKinds = walkKinds[:0]
+		}
+
+		u := cur.node
 		if u == t {
-			if err := budget.add(uint64(len(cur.nodes))*12 + 48); err != nil {
-				return out, err
+			if err = budget.add(uint64(len(walk))*12 + 48); err != nil {
+				break
 			}
-			out = append(out, Path{
-				Nodes: append([]snapshot.NodeID(nil), cur.nodes...),
-				Kinds: append([]snapshot.KindID(nil), cur.kinds...),
-			})
-			if cap > 0 && len(out) == cap {
-				return out, nil
+			sink.add(walk, walkKinds, false)
+			if cap > 0 && sink.n == cap {
+				break
 			}
 			continue
 		}
@@ -362,15 +364,7 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 				return
 			}
 
-			nextNodes := make([]snapshot.NodeID, len(cur.nodes)+1)
-			copy(nextNodes, cur.nodes)
-			nextNodes[len(cur.nodes)] = w
-
-			nextKinds := make([]snapshot.KindID, len(cur.kinds)+1)
-			copy(nextKinds, cur.kinds)
-			nextKinds[len(cur.kinds)] = k
-
-			stack = append(stack, pathState{nodes: nextNodes, kinds: nextKinds})
+			stack = append(stack, frame{node: w, kind: k, depth: uint16(d + 1)})
 		}
 		if ns, ks, ok := cleanAdjacency(s, u, true); ok {
 			for i, w := range ns {
@@ -381,7 +375,8 @@ func pairEnumerate(s *snapshot.View, r, t snapshot.NodeID, D int, kinds *snapsho
 		}
 	}
 
-	return out, nil
+	sink.stack, sink.walk, sink.walkKinds = stack, walk, walkKinds
+	return err
 }
 
 // cleanAdjacency returns u's neighbours on one side as slices, exact for the

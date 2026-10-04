@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,15 @@ const (
 	fixtureDomain              = "TESTLAB.LOCAL"
 )
 
+// ErrSmokeInconclusive is what Run returns when everything it checked held but
+// its search cannot say whether this run's ingest reached the graph: the
+// fixture domain was already there before the upload -- an earlier smoke test
+// leaves it, on purpose -- so finding it afterwards shows nothing new. It is
+// neither a failure of the deployment nor a pass, and a caller has to say
+// which of the two it makes of it (errors.Is); one that does not look treats
+// it as the failure it may hide.
+var ErrSmokeInconclusive = errors.New("smoke test inconclusive")
+
 // Smoke ingests the fixture through the public API and checks it can be found.
 type Smoke struct {
 	Client   *http.Client
@@ -38,11 +48,22 @@ type Smoke struct {
 }
 
 // Run performs login, upload, wait for ingest and analysis, and search.
+//
+// The search only shows that this run's ingest reached the graph if the
+// fixture domain was not in it before the upload, so that is looked at first.
+// Where it was, the run still uploads and waits for its own ingest job and the
+// datapipe -- evidence of this run, which can fail it -- but a search that
+// finds the fixture afterwards is reported as ErrSmokeInconclusive, not as a
+// pass on an earlier run's data.
 func (s *Smoke) Run(ctx context.Context, timeout time.Duration) error {
 	if s.Poll == 0 {
 		s.Poll = 5 * time.Second
 	}
 	if err := s.login(ctx); err != nil {
+		return err
+	}
+	alreadyThere, err := s.searchOnce(ctx)
+	if err != nil {
 		return err
 	}
 	jobID, err := s.startJob(ctx)
@@ -61,7 +82,14 @@ func (s *Smoke) Run(ctx context.Context, timeout time.Duration) error {
 	if err := s.waitForDatapipeIdle(ctx, timeout); err != nil {
 		return err
 	}
-	return s.search(ctx, timeout)
+	if err := s.search(ctx, timeout); err != nil {
+		return err
+	}
+	if alreadyThere {
+		return fmt.Errorf("%w: %s was already in the graph before this run's upload (an earlier smoke test leaves it there), so finding it afterwards does not show that this run's ingest reached the graph; "+
+			"the upload was accepted, its job finished without failed files and the datapipe went idle", ErrSmokeInconclusive, fixtureDomain)
+	}
+	return nil
 }
 
 func (s *Smoke) call(ctx context.Context, method, path, contentType string, body io.Reader, headers ...string) ([]byte, error) {

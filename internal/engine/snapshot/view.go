@@ -818,6 +818,68 @@ func (v *View) EdgeStateByID(id uint64) (start, end NodeID, kind KindID, ok bool
 	return src, target, v.base.OutKinds[fwdIdx], true
 }
 
+// DeltaHoldsOnlyUnresolvableEdges reports that v's delta consists of nothing
+// but live edge records whose endpoints v cannot resolve to a live node at
+// all -- the exact shape a compaction fold would carry forward unchanged, in
+// full, for the Nth time (FoldWithPendingEdges' pending segment). false for a
+// View with no delta, and for any delta holding anything else.
+//
+// This is the "the next fold will not shrink this delta either" question, and
+// it answers it structurally rather than by counting folds. Every OTHER kind
+// of delta record a fold does consume: a node record is folded into the base
+// (foldNodes), an edge whose endpoints both resolve is folded in too, and an
+// edge record the delta tombstones is dropped outright (foldEdges) -- so a
+// delta holding any of those can still empty, and only one holding nothing
+// but unresolvable edges provably cannot. Added kinds are deliberately not
+// consulted: a fold merges them into the folded snapshot's own kind table
+// (foldKindPairs), so they never keep a delta from emptying.
+//
+// "Cannot resolve" is exactly the rule every row-producing read path already
+// applies to a delta edge record -- Dense to a live node on BOTH ends, or the
+// record is skipped (ensureDeltaAdjacency, which backs OutEdges/InEdges and
+// through them every merged-adjacency projection, and EdgeStateByID) -- so a
+// true return also means this View serves no row through any record in its
+// delta. It does NOT mean the records are inert: they still set their kinds'
+// bits for EdgeKindPresent and SelfLoopHazard, and contribute their resolvable
+// endpoint to the delta edge-kind candidate index, all of which are
+// deliberate over-approximations.
+//
+// The caller this exists for is the engine's post-compaction snapshot save
+// (saveSnapshotAfterCompaction, ../persist.go), which only writes a file when
+// the delta is empty and otherwise waits for a later compaction to empty it.
+// A true return is what tells that caller the wait is unbounded.
+func (v *View) DeltaHoldsOnlyUnresolvableEdges() bool {
+	if !v.Overlay() {
+		return false
+	}
+	v.ensureDelta()
+	if v.merged == nil {
+		return false
+	}
+	// Both are len() reads on the merged segment's own id slices, so the
+	// overwhelmingly common answer -- a delta that holds any node record at
+	// all -- costs nothing beyond them.
+	if v.merged.NodeCount() != 0 || v.merged.EdgeCount() == 0 {
+		return false
+	}
+
+	only := true
+	v.merged.IterEdges(func(_ uint64, st EdgeSegState) bool {
+		if st.Tombstoned {
+			only = false
+			return false
+		}
+		s, sOK := v.Dense(st.StartID)
+		e, eOK := v.Dense(st.EndID)
+		if sOK && eOK && v.Alive(s) && v.Alive(e) {
+			only = false
+			return false
+		}
+		return true
+	})
+	return only
+}
+
 // containsKindID reports whether k appears in kinds -- a node's kind list is
 // typically tiny, so a linear scan is preferred over building any auxiliary
 // structure per node.

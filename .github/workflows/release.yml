@@ -11,8 +11,18 @@ jobs:
   # does. Built here, from this tag's own ref, which is what stamps the
   # version. The upstream list is build/upstream-tags.sh's, the same one
   # ci.yml's patch guard checks.
+  # Without timeout-minutes a hung step runs for GitHub's default 360 minutes,
+  # holding a release half-published: the images exist but the CLI that pins
+  # them does not, which is the state a released CLI cannot install from. The
+  # bounds come from this workflow's own past runs -- `upstreams` is a release
+  # list that has never reached a minute, `goreleaser` has taken at most 2
+  # minutes over three runs -- and are set well above them, because a bound
+  # that trips on a slow-but-working release is worse than none. `images`
+  # cannot carry one: a job that calls a reusable workflow may not set
+  # timeout-minutes, so image.yml bounds its own jobs instead.
   upstreams:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tags: ${{ steps.list.outputs.tags }}
     steps:
@@ -20,7 +30,12 @@ jobs:
       - id: list
         env:
           GH_TOKEN: ${{ github.token }}
-        run: echo "tags=$(./build/upstream-tags.sh)" >> "$GITHUB_OUTPUT"
+        # Assigned before it is echoed: `echo "tags=$(cmd)"` reports echo's
+        # status, so a failing upstream-tags.sh used to pass this step with an
+        # empty list, and the images matrix then died on fromJson('').
+        run: |
+          tags=$(./build/upstream-tags.sh)
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
   images:
     needs: upstreams
     strategy:
@@ -36,6 +51,7 @@ jobs:
   goreleaser:
     needs: [upstreams, images]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }

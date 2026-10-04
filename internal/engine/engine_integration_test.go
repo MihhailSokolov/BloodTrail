@@ -43,6 +43,33 @@ func testEngineLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// stopEngineAndCloseWritePool is the teardown an engine a test built directly
+// needs, in the order Driver.Close itself uses: Stop cancels the background
+// context, CloseWritePool closes the write path's own pool.
+//
+// Stop deliberately leaves that pool open, because the shutdown save that
+// follows it may need an in-flight read-back to finish (boot.go's Stop). So a
+// test that only stops its engine leaves a two-connection pool -- and
+// pgxpool's own background health-check goroutine -- alive for the rest of
+// that test, and this package runs some seventy engines, every one of whose
+// writes created one. Calling this is what keeps that off the package's peak
+// connection use.
+//
+// What it is no longer responsible for is the pool outliving the test
+// itself: that is enforced for every test here, whether or not it calls this,
+// by the cleanup graphtest.PGAvailable installs
+// (write_pool_leak_guard_integration_test.go). Closing twice is safe, so the
+// two compose -- this one closes the pool at the point the engine is done
+// with it, in Driver.Close's own order, which is also what the ordering tests
+// in write_pool_shutdown_integration_test.go pin.
+//
+// A test that still writes after stopping its engine (bootgap's deterministic
+// file attempt) defers CloseWritePool on its own instead of calling this.
+func stopEngineAndCloseWritePool(eng *Engine) {
+	eng.Stop()
+	eng.CloseWritePool()
+}
+
 // diffCase is one differential-test table entry: a recognize.PathQuery the
 // engine must serve, with allowEmpty opting out of the "oracle found
 // nothing" vacuousness guard for the cases that are supposed to have zero
@@ -325,7 +352,7 @@ func TestStartBootLoadsSnapshotWithoutDatapipeStatus(t *testing.T) {
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: testEngineLogger()})
 
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -407,7 +434,7 @@ func TestStartBootLoadLogsNoFallbackEntered(t *testing.T) {
 	eng := New(pgDriver, pool, Config{Enabled: true, Log: logger})
 
 	eng.Start(ctx)
-	defer eng.Stop()
+	defer stopEngineAndCloseWritePool(eng)
 
 	waitForFresh(t, eng)
 

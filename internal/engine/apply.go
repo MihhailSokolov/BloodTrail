@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -88,10 +89,15 @@ const (
 //     which is the honest answer rather than a guess.
 //  4. Read back every key the ChangeSet named from PostgreSQL (readBack,
 //     readback.go): present rows are the write's post-state, absent keys are
-//     deletions. A read-back error is not survivable either -- the write's
-//     effect is unknown -- so it enters fallback too.
-//  5. Turn that read-back result, plus the kind-scoped delete criteria the
-//     ChangeSet carries, into one immutable delta Segment (buildApplySegment).
+//     deletions. The rows a kind-scoped delete criteria could have removed,
+//     and the nodes the View knows under an objectid found on no row, are
+//     keys too -- the current View's candidates, re-read the same way
+//     (viewCandidates) -- so a write never removes a row PostgreSQL kept,
+//     whichever order concurrent writes' Applies run in. A read-back error
+//     is not survivable either -- the write's effect is unknown -- so it
+//     enters fallback too.
+//  5. Turn that read-back result into one immutable delta Segment
+//     (buildApplySegment).
 //  6. Layer the segment onto the current View and publish the result, unless
 //     the result would exceed cfg.MemoryLimit -- the same limit RebuildNow
 //     applies to a freshly loaded snapshot, applied here to the View the
@@ -102,7 +108,9 @@ const (
 //     grown past cfg.CompactEntries/CompactBytes (maintainAfterPublish).
 //
 // Safe for concurrent use. A caller that has no ctx of its own may pass
-// context.Background(); ctx bounds the read-back queries only.
+// context.Background(); ctx bounds the read-back queries only. A panic
+// anywhere in the sequence enters fallback instead of reaching the caller
+// (fallBackOnApplyPanic).
 //
 // Watermark bookkeeping (watermark.go) is folded into this same sequence,
 // deliberately unconditional on everything below: both of its steps run on
@@ -112,11 +120,11 @@ const (
 // PostgreSQL has already seen, independent of what this call goes on to do
 // with the write's own effect:
 //
-//   - If scope bumped (scope.Watermark's own flag), AdvanceWatermark folds
-//     its counter into e.appliedWatermark and retires its e.inflightBumps
-//     entry. The pg counter already advanced the instant BumpWatermark's own
-//     UPDATE committed, so this scope's bump has to resolve regardless of
-//     which branch fires.
+//   - If scope bumped (scope.Watermark's own flag), AdvanceWatermark records
+//     its counter in e.appliedWatermark's ledger and retires its
+//     e.inflightBumps entry. The pg counter already advanced the instant
+//     BumpWatermark's own UPDATE committed, so this scope's bump has to
+//     resolve regardless of which branch fires.
 //   - If scope's own eager bump FAILED (settleWatermarkFailure), this call is
 //     the proof that the write it guarded has landed -- Apply is only ever
 //     called once a write has actually committed -- which is exactly what
@@ -134,6 +142,9 @@ const (
 func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
+	// Deferred after the unlock, so it runs first, still under applyMu, as
+	// enterFallback's callers must.
+	defer e.fallBackOnApplyPanic(ctx)
 
 	if scope != nil {
 		if counter, bumped := scope.Watermark(); bumped {
@@ -216,13 +227,22 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 		return
 	}
 
-	rb, err := e.readBack(ctx, cs)
+	rb, err := e.readBack(ctx, current, cs)
 	if err != nil {
 		e.enterFallback(ctx, fmt.Sprintf("read-back failed: %v", err))
 		return
 	}
+	// Read-back can record a fallback of its own, for the one key shape it
+	// cannot name and must not skip (readBack's "The one fallback this
+	// records"). Re-checked here rather than folded into the error above
+	// because it is not a failure: the queries all succeeded, and what they
+	// came back with is simply not expressible as a delta.
+	if hasFallback, reasons := cs.HasFallback(); hasFallback {
+		e.enterFallback(ctx, strings.Join(reasons, "; "))
+		return
+	}
 
-	seg, err := buildApplySegment(current, rb, cs)
+	seg, err := buildApplySegment(current, rb)
 	if err != nil {
 		e.enterFallback(ctx, fmt.Sprintf("segment build failed: %v", err))
 		return
@@ -263,72 +283,87 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 	e.maintainAfterPublish(ctx, newView)
 }
 
-// buildApplySegment turns one read-back result, plus whatever kind-scoped
-// delete criteria cs recorded, into the delta Segment Apply layers onto
-// view.
+// fallBackOnApplyPanic, deferred by Apply, turns a panic anywhere in Apply
+// into a fallback. Apply runs after its write has committed, so a panic
+// there -- necessarily an engine bug -- cannot be allowed to leave the
+// engine serving a replica the write never reached, and must not reach the
+// caller either: the write's own outcome is success, and a caller told
+// otherwise could retry it. The panic is logged at Error with its stack,
+// and the fallback's rebuild reloads what PostgreSQL holds.
+//
+// It bumps applyEpoch itself, before the fallback, because a panic in the
+// two statements between the watermark bookkeeping and Apply's own bump
+// (step 1) would otherwise leave it unbumped: a rebuild already loading when
+// this write committed would then find the epoch it read before its load
+// unchanged, adopt a snapshot that predates the write -- ending the fallback
+// as every adoption does -- and serve without it until something else wrote.
+// The bump is unconditional rather than conditional on where the panic
+// arose: a second bump for a panic past step 1 costs nothing, since the
+// counter is only ever compared for equality against a value read earlier.
+func (e *Engine) fallBackOnApplyPanic(ctx context.Context) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	e.applyEpoch.Add(1)
+	e.cfg.Log.ErrorContext(ctx, "bloodtrail: write-through apply panicked",
+		slog.Any("panic", r),
+		slog.String("stack", string(debug.Stack())),
+	)
+	e.enterFallback(ctx, fmt.Sprintf("apply panicked: %v", r))
+}
+
+// buildApplySegment turns one read-back result into the delta Segment Apply
+// layers onto view.
+//
+// Everything it stages is PostgreSQL's own answer for one key. readBack has
+// already resolved every row the write could have touched -- the ids,
+// objectids and triples its ChangeSet names, plus the View rows a
+// kind-scoped delete criteria or an objectid found on no row make
+// candidates (viewCandidates) -- to present rows and absent keys, so nothing
+// here is derived from the write's payload or replayed as an instruction
+// over whatever the View holds by the time this runs. That is what makes
+// the result independent of the order concurrent writes' Applies run in,
+// and of the boot gap's replay order (adoptSnapshotFileView): a tombstone
+// is only ever staged for a row PostgreSQL no longer holds -- ids are never
+// reused, so that stays true -- and a present row carries PostgreSQL's
+// state as read after this write committed, so a later Apply naming the
+// same row can only restage a later truth.
 //
 // Staging order is load-bearing, since SegmentBuilder resolves a repeated id
 // by last-call-wins (its own doc):
 //
 //  1. Newly resolved kinds (AddKind), so the segment can name the kind ids
-//     the node/edge states below carry -- and so the delete criteria in
-//     step 2 resolve their kind names against the same table the new View
-//     will publish (kindLookup).
-//  2. Every tombstone: node ids and objectids read-back reported absent
-//     (each cascading to the edges incident to that node in view -- deleting
-//     a node deletes its edges, and the base CSR slots for those edges would
-//     otherwise keep them visible), edge ids and (start, end, kind) triples
-//     read-back reported absent, and the nodes/edges matching cs's own
-//     delete criteria.
+//     the node/edge states below carry.
+//  2. Every tombstone: node ids read-back reported absent (each cascading
+//     to the edges incident to that node in view -- deleting a node deletes
+//     its edges, and the base CSR slots for those edges would otherwise keep
+//     them visible), and edge ids and (start, end, kind) triples read-back
+//     reported absent.
 //  3. Every present node and edge state read-back returned, staged LAST so
-//     that PostgreSQL's own post-commit truth wins over any tombstone step 2
-//     derived from the (possibly stale) View -- e.g. a node the View still
-//     believes carries a kind some criteria targets, which PostgreSQL's own
-//     row shows still exists.
+//     that a row read-back found wins over a cascade tombstone the View
+//     derived -- an edge found present although its endpoint, read by a
+//     later query, was gone by then (the dead endpoint keeps it hidden).
 //
-// The error return covers the two ways a segment cannot be built faithfully:
+// The error return covers the one way a segment cannot be built faithfully:
 // a node's property bag failing to parse or exhausting the segment's PropID
-// space (AddNodeState), and a delete criteria naming an exclude kind that
-// neither this View's kind table nor read-back could resolve
-// (applyNodeKindCriteria) -- both of which Apply turns into a fallback
-// rather than publishing a partial delta.
-func buildApplySegment(view *snapshot.View, rb *readbackResult, cs *ChangeSet) (*snapshot.Segment, error) {
+// space (AddNodeState), which Apply turns into a fallback rather than
+// publishing a partial delta.
+func buildApplySegment(view *snapshot.View, rb *readbackResult) (*snapshot.Segment, error) {
 	var b snapshot.SegmentBuilder
 
 	for id, name := range rb.resolvedKinds {
 		b.AddKind(id, name)
 	}
-	lookup := newKindLookup(view, rb.resolvedKinds)
 
 	for _, id := range rb.absentNodeIDs {
 		tombstoneNodeWithCascade(&b, view, id)
-	}
-	for _, objectID := range rb.absentObjectIDs {
-		// An objectid that matched no row after the write: whatever nodes
-		// the View still knows under it are gone from PostgreSQL. This also
-		// covers an edge-triple-by-objectid whose endpoint is unresolvable
-		// -- read-back reports that only through this same list (its own
-		// doc), and a tombstoned endpoint already cascades to the edge.
-		if dense, ok := view.NodesByObjectID(objectID); ok {
-			for _, n := range dense {
-				tombstoneNodeWithCascade(&b, view, view.GraphID(n))
-			}
-		}
 	}
 	for _, id := range rb.absentEdgeIDs {
 		b.TombstoneEdge(id)
 	}
 	for _, triple := range rb.absentTriples {
 		tombstoneAbsentTriple(&b, view, triple)
-	}
-
-	for _, criteria := range cs.NodeKindCriteria() {
-		if err := applyNodeKindCriteria(&b, view, lookup, criteria); err != nil {
-			return nil, err
-		}
-	}
-	for _, kinds := range cs.EdgeKindCriteria() {
-		applyEdgeKindCriteria(&b, view, lookup, kinds)
 	}
 
 	for _, ns := range rb.nodes {
@@ -344,18 +379,18 @@ func buildApplySegment(view *snapshot.View, rb *readbackResult, cs *ChangeSet) (
 }
 
 // kindLookup resolves a delete criteria's kind names against the kind table
-// the View buildApplySegment is building will publish: the current View's
-// own table, then every kind this write's read-back resolved -- the same
-// pairs the segment registers through AddKind. The two never disagree about
-// a name both hold, since a kind's id never changes once PostgreSQL has
-// assigned it.
+// of the View whose candidates readBack enumerates: that View's own table,
+// then every criteria kind read-back resolved from PostgreSQL itself
+// (resolveCriteriaKinds). The two never disagree about a name both hold,
+// since a kind's id never changes once PostgreSQL has assigned it.
 type kindLookup struct {
 	table *snapshot.KindTable
 	added map[string]snapshot.KindID
 }
 
-// newKindLookup builds view's kindLookup, inverting resolved (read-back's
-// resolvedKinds, id->name) into the name->id direction criteria need.
+// newKindLookup builds view's kindLookup, inverting resolved (id->name, as
+// resolveCriteriaKinds returns it) into the name->id direction criteria
+// need.
 func newKindLookup(view *snapshot.View, resolved map[snapshot.KindID]string) kindLookup {
 	added := make(map[string]snapshot.KindID, len(resolved))
 	for id, name := range resolved {
@@ -411,7 +446,9 @@ func tombstoneNodeWithCascade(b *snapshot.SegmentBuilder, view *snapshot.View, p
 // triple names pg node ids, so both endpoints are resolved through
 // View.Dense first; the edge itself is found by walking the start node's
 // out-edges, since a Segment tombstone is keyed by edge id and a triple
-// alone names none.
+// alone names none. An edge never changes its endpoints or kind (dawgs
+// updates only an edge's properties) and the edge table holds each triple
+// at most once, so the edge found is the one PostgreSQL no longer holds.
 //
 // Two cases resolve to "nothing to tombstone", both correctly: a triple
 // whose kind never resolved to a real KindID at all (unresolvedTripleKind,
@@ -441,18 +478,102 @@ func tombstoneAbsentTriple(b *snapshot.SegmentBuilder, view *snapshot.View, trip
 	})
 }
 
-// applyNodeKindCriteria stages every node in view that a
-// DeleteNodesByKinds-shaped delete would have removed, plus each one's edge
-// cascade -- replaying the criteria itself rather than an id list captured
-// before the delete ran (RecordDeleteNodesByKinds' own doc).
+// viewCandidates collects the rows of one View that readBack must re-read
+// from PostgreSQL because a write may have removed them without naming them
+// by key: the nodes a kind-scoped node delete matches in the View
+// (addNodeKindCriteria), the edges a kind-scoped relationship delete matches
+// (addEdgeKindCriteria), and the nodes the View still knows under an
+// objectid read-back found on no row (addObjectID).
+//
+// The View only chooses WHICH rows to ask about; the answer is always
+// PostgreSQL's. A candidate the write did remove comes back absent and is
+// tombstoned; one PostgreSQL kept comes back present and is restaged as it
+// is now -- an edge created after the DELETE's snapshot and applied before
+// the delete's own Apply, a node whose objectid was only rewritten. So the
+// set has to cover every row the write may have removed that the View
+// holds, and may safely cover more (an extra candidate only costs its
+// re-read). A row the write removed that the View does not hold yet -- or
+// holds with kinds the criteria do not match, because the write that gave
+// it those kinds has not been applied yet -- belongs to another write whose
+// Apply is still to come, and that Apply's own read-back finds it absent.
+//
+// Enumeration touches only the View, in memory, once per Apply that carries
+// a criteria or an absent objectid -- never a query's read path.
+type viewCandidates struct {
+	view  *snapshot.View
+	nodes *snapshot.Bitset // dense node ids; nil until the first candidate
+	edges []uint64         // edge ids, each at most once
+}
+
+// collectViewCandidates enumerates view's candidates for one write: the
+// nodes view knows under each of absentObjectIDs (objectids read-back found
+// on no row) and the rows cs's kind-scoped delete criteria match, resolving
+// the criteria's kind names through view's kind table and criteriaKinds
+// (resolveCriteriaKinds' id->name result). Its one error is
+// addNodeKindCriteria's unresolvable exclusion.
+func collectViewCandidates(view *snapshot.View, criteriaKinds map[snapshot.KindID]string, cs *ChangeSet, absentObjectIDs []string) (*viewCandidates, error) {
+	c := &viewCandidates{view: view}
+	for _, objectID := range absentObjectIDs {
+		c.addObjectID(objectID)
+	}
+
+	lookup := newKindLookup(view, criteriaKinds)
+	for _, criteria := range cs.NodeKindCriteria() {
+		if err := c.addNodeKindCriteria(lookup, criteria); err != nil {
+			return nil, err
+		}
+	}
+	c.addEdgeKindCriteria(lookup, cs.EdgeKindCriteria())
+	return c, nil
+}
+
+// addNode marks dense node n as a candidate.
+func (c *viewCandidates) addNode(n snapshot.NodeID) {
+	if c.nodes == nil {
+		c.nodes = snapshot.NewBitset(c.view.NodeCount())
+	}
+	c.nodes.Set(n)
+}
+
+// nodeIDs returns every candidate node's database id, each once.
+func (c *viewCandidates) nodeIDs() []uint64 {
+	if c.nodes == nil {
+		return nil
+	}
+	ids := make([]uint64, 0, c.nodes.Count())
+	c.nodes.Iterate(func(n snapshot.NodeID) bool {
+		ids = append(ids, c.view.GraphID(n))
+		return true
+	})
+	return ids
+}
+
+// addObjectID marks every live node the View knows under objectID -- an
+// objectid read-back found on no row. That the objectid matches nothing
+// any more does not mean those nodes are gone: a node whose objectid was
+// rewritten keeps its id, its row and its edges, so each one is re-read by
+// id, and only one that is actually absent is tombstoned (with its edge
+// cascade).
+func (c *viewCandidates) addObjectID(objectID string) {
+	dense, ok := c.view.NodesByObjectID(objectID)
+	if !ok {
+		return
+	}
+	for _, n := range dense {
+		c.addNode(n)
+	}
+}
+
+// addNodeKindCriteria marks every live View node a DeleteNodesByKinds-shaped
+// delete with criteria removes.
 //
 // The matching rule mirrors dawgs' pg driver exactly (drivers/pg/driver.go's
 // DeleteNodesByKinds and buildNodeDeleteStatement, v0.8.0): a node is
 // deleted when its kinds overlap Include -- or, when Include is empty, for
 // every node -- and do not overlap Exclude. Kind names resolve through
-// lookup (this View's own table, then whatever read-back resolved for this
-// write -- resolveCriteriaKinds) and match by id against each node's own
-// kind ids, so a kind PostgreSQL registered after this View's last full
+// lookup (the View's own table, then whatever read-back resolved from
+// PostgreSQL -- resolveCriteriaKinds) and match by id against each node's
+// own kind ids, so a kind PostgreSQL registered after this View's last full
 // load still resolves when no node carries it, and then excludes (or
 // includes) nothing, exactly as it does in PostgreSQL. An Include kind that
 // resolves nowhere matches nothing, exactly as an include kind PostgreSQL
@@ -462,14 +583,13 @@ func tombstoneAbsentTriple(b *snapshot.SegmentBuilder, view *snapshot.View, trip
 // replayed soundly: PostgreSQL refuses that delete outright (it fails
 // closed rather than silently widening the delete), so reaching this point
 // with one means the applier and PostgreSQL disagree about what the delete
-// even was, and guessing either way could tombstone nodes that still exist.
-// It returns an error instead, which Apply turns into a fallback.
+// even was. It returns an error instead, which Apply turns into a fallback.
 //
 // Enumeration walks the kind bitmaps when Include names any kind -- the
-// common case, and far cheaper than a full node scan -- and only falls back
-// to scanning every node when Include is empty, i.e. when the delete
-// genuinely targets the whole graph.
-func applyNodeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, lookup kindLookup, criteria NodeKindDeleteCriteria) error {
+// common case, and far cheaper than a full node scan -- and only scans
+// every node when Include is empty, i.e. when the delete genuinely targets
+// the whole graph.
+func (c *viewCandidates) addNodeKindCriteria(lookup kindLookup, criteria NodeKindDeleteCriteria) error {
 	include := make([]snapshot.KindID, 0, len(criteria.Include))
 	for _, kind := range criteria.Include {
 		if id, ok := lookup.id(kind); ok {
@@ -486,75 +606,97 @@ func applyNodeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, look
 		exclude = append(exclude, id)
 	}
 
-	tombstone := func(dense snapshot.NodeID) {
-		if !view.Alive(dense) {
-			return
+	consider := func(n snapshot.NodeID) bool {
+		if !c.view.Alive(n) {
+			return true
 		}
-		if len(exclude) > 0 && kindsIntersect(view.KindIDsOf(dense), exclude) {
-			return
+		if len(exclude) > 0 && kindsIntersect(c.view.KindIDsOf(n), exclude) {
+			return true
 		}
-		tombstoneNodeWithCascade(b, view, view.GraphID(dense))
+		c.addNode(n)
+		return true
 	}
 
 	if len(criteria.Include) > 0 {
-		// Repeats are harmless: a node carrying two Include kinds is staged
-		// twice, and every SegmentBuilder call for a given id is idempotent
-		// (last call wins, and both calls are the same tombstone).
 		for _, kindID := range include {
-			view.NodesOfKind(kindID).Iterate(func(dense snapshot.NodeID) bool {
-				tombstone(dense)
-				return true
-			})
+			c.view.NodesOfKind(kindID).Iterate(consider)
 		}
 		return nil
 	}
 
-	for n := 0; n < view.NodeCount(); n++ {
-		tombstone(snapshot.NodeID(n))
+	for n := 0; n < c.view.NodeCount(); n++ {
+		consider(snapshot.NodeID(n))
 	}
 	return nil
 }
 
-// applyEdgeKindCriteria stages every edge in view whose kind is named by
-// kinds -- the replay of a DeleteRelationshipsByKinds-shaped delete, which
-// removes exactly those edges and nothing else (no cascade: deleting an
-// edge never removes a node).
+// addEdgeKindCriteria marks every View edge whose kind one of criteria (each
+// a DeleteRelationshipsByKinds-shaped kind set) names. Deleting an edge
+// never removes a node, so no node is marked.
 //
-// Kind names resolve through lookup exactly as applyNodeKindCriteria's do. A
+// Kind names resolve through lookup exactly as addNodeKindCriteria's do. A
 // kind that resolves nowhere is skipped, matching dawgs' own tolerant
 // mapping (drivers/pg/driver.go: kinds that are not defined in the database
-// map to no ids and delete nothing); an empty kinds set therefore stages
+// map to no ids and delete nothing); an empty kind set therefore marks
 // nothing at all, exactly as the pg driver's own empty-set early return
 // deletes nothing.
 //
-// Enumeration is a full scan: every alive node's out-edges, which visits
-// every edge in the View exactly once (each edge has exactly one source).
-// That is O(nodes + edges) per criteria, deliberately -- there is no
-// kind-keyed edge index on a View, and a kind-scoped relationship delete is
-// a rare, bulk operation (BloodHound's analysis reset, and the driver-level
-// DeleteRelationshipsByKinds entry point), not a hot path.
-func applyEdgeKindCriteria(b *snapshot.SegmentBuilder, view *snapshot.View, lookup kindLookup, kinds graph.Kinds) {
-	wanted := make(map[snapshot.KindID]struct{}, len(kinds))
-	for _, kind := range kinds {
-		if id, ok := lookup.id(kind); ok {
-			wanted[id] = struct{}{}
+// Every edge record the View carries counts, not just the ones OutEdges
+// shows: an edge whose endpoint the View does not know yet (its node's own
+// Apply has not run) is hidden only until that endpoint lands, and would
+// then reappear although PostgreSQL deleted it. So the scan reads the delta
+// segments' own records -- newest first, since the newest record for an id
+// decides it, and a tombstone there needs nothing -- and then every base
+// forward-CSR slot the delta does not decide. That is one pass over the
+// base's edge-kind column plus one over the delta's edge records per Apply
+// carrying a relationship criteria: a rare, bulk operation (BloodHound's
+// DeleteCollectedGraphData), never a query's read path.
+func (c *viewCandidates) addEdgeKindCriteria(lookup kindLookup, criteria []graph.Kinds) {
+	var wanted []snapshot.KindID
+	for _, kinds := range criteria {
+		for _, kind := range kinds {
+			if id, ok := lookup.id(kind); ok {
+				wanted = append(wanted, id)
+			}
 		}
 	}
 	if len(wanted) == 0 {
 		return
 	}
+	maxWanted := wanted[0]
+	for _, id := range wanted {
+		maxWanted = max(maxWanted, id)
+	}
+	mask := snapshot.NewKindMask(maxWanted)
+	for _, id := range wanted {
+		mask.Set(id)
+	}
 
-	for n := 0; n < view.NodeCount(); n++ {
-		dense := snapshot.NodeID(n)
-		if !view.Alive(dense) {
-			continue
-		}
-		view.OutEdges(dense, func(_ snapshot.NodeID, kind snapshot.KindID, edgeID uint64) bool {
-			if _, ok := wanted[kind]; ok {
-				b.TombstoneEdge(edgeID)
+	decided := make(map[uint64]struct{})
+	segments := c.view.Segments()
+	for i := len(segments) - 1; i >= 0; i-- {
+		segments[i].IterEdges(func(id uint64, st snapshot.EdgeSegState) bool {
+			if _, ok := decided[id]; ok {
+				return true
+			}
+			decided[id] = struct{}{}
+			if !st.Tombstoned && mask.Has(st.Kind) {
+				c.edges = append(c.edges, id)
 			}
 			return true
 		})
+	}
+
+	base := c.view.Base()
+	for slot, kind := range base.OutKinds {
+		if !mask.Has(kind) {
+			continue
+		}
+		id := base.OutEdgeIDs[slot]
+		if _, ok := decided[id]; ok {
+			continue
+		}
+		c.edges = append(c.edges, id)
 	}
 }
 
@@ -661,7 +803,10 @@ func (e *Engine) claimRebuildLoop() bool {
 // graph shrinks, so fallbackRetryDelay backs that case off to
 // fallbackBudgetRetryInterval instead and leaves backoff itself untouched --
 // see fallbackRetryDelay's own doc for why that is what makes recovery snap
-// back to a fast retry the moment the refusal lifts.
+// back to a fast retry the moment the refusal lifts. A rebuild that ended in
+// a recovered panic is backed off the same way, and for a reason of the same
+// kind (loadRetryDelayAfter, boot.go, which is what this loop actually
+// calls).
 //
 // Only an adopted rebuild exits fallback: adopting is what makes the
 // published View both complete and current, and serving from anything less
@@ -698,7 +843,7 @@ func (e *Engine) runFallbackRebuild() {
 			return
 		}
 
-		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+		wait, next := e.loadRetryDelayAfter(err, backoff)
 		backoff = next
 
 		select {
@@ -749,11 +894,15 @@ func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Durat
 // through here and is never delayed: enterFallback and the
 // state-based relaunches call startFallbackRebuild directly. What does come
 // through here is trust restoration while the engine serves correctly
-// (ResolveAbandonedWrite's settle, Apply's belt-and-braces settle, and
-// finishFallbackRebuild's generations-only recheck), where an unlimited
-// launch rate would let a sustained stream of settling bump failures --
-// e.g. a watermark table that errors while the data tables still work --
-// run full snapshot loads back to back indefinitely for no serving benefit.
+// (ResolveAbandonedWrite's settle, Apply's belt-and-braces settle,
+// finishFallbackRebuild's generations-only recheck, and a save refused over
+// a counter nobody accounted for -- saveSnapshotProbe, persist.go -- and a
+// save skipped over a delta that can never empty, noteSkippedCompactionSave,
+// persist.go), where an
+// unlimited launch rate would let a sustained stream of settling bump
+// failures -- e.g. a watermark table that errors while the data tables
+// still work -- run full snapshot loads back to back indefinitely for no
+// serving benefit.
 //
 // Liveness is preserved, not traded away: every request either launches,
 // coalesces into a launcher that will run within the interval and re-request
@@ -761,6 +910,19 @@ func trustRebuildDelay(nowNano, lastNano int64) (launchNow bool, wait time.Durat
 // generations already equal -- and a launcher cut short by bgCtx belongs to
 // an engine that is shutting down. The pending flag never strands: its
 // holder clears it on every exit path.
+//
+// That last case -- a launcher declining because the generations now agree --
+// is the resolution being waited for ONLY for the callers whose request is
+// about a watermark failure. The two save-path callers are not: what is
+// unresolved for saveSnapshotProbe is a counter value the ledger does not
+// account for, and for noteSkippedCompactionSave a delta holding only edge
+// records whose endpoints cannot be resolved -- neither of which any
+// generation reflects, so a request of its own that coalesces behind a
+// launch already inside the interval can be declined by that recheck. It
+// costs that one save: the refusal repeats on the next compaction, and the
+// first one past the interval launches immediately. Saves are driven by
+// compaction and shutdown, never by a loop, so the limiter still bounds the
+// cost.
 //
 // A disabled engine returns immediately: claimRebuildLoop would refuse the
 // launch anyway (a replica nobody reads is never rebuilt), and spawning a

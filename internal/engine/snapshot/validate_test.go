@@ -152,6 +152,14 @@ func TestValidateSnapshotStructureCatchesBrokenArrays(t *testing.T) {
 		}},
 		{"unknown property kind", func(s *Snapshot) { s.Props.entries[0].kind = 250 }},
 		{"property store missing", func(s *Snapshot) { s.Props = nil }},
+		// finalizePropStore keys the name->PropID map by name, so the later
+		// id wins and every value stored under the earlier one becomes
+		// unreachable by name while a node still carries it by id: that
+		// node reads as not carrying the property at all, in every filter
+		// on it.
+		{"property name registered twice", func(s *Snapshot) {
+			s.Props.names = append(s.Props.names, s.Props.names[0])
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

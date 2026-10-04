@@ -216,8 +216,6 @@ func TestComposeFileEntryFailsClosed(t *testing.T) {
 		"COMPOSE_FILE=\"docker-compose.yml\\:extra.yml\"\n",                     // escape
 		"COMPOSE_FILE='docker-compose.yml:extra.yml\\' # x'\n",                  // escaped quote, which compose honours in single quotes too
 		"COMPOSE_FILE=\"docker-compose.yml\" extra.yml\n",                       // text after the quote
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE=b.yml\n",                              // two entries
-		"COMPOSE_FILE=a.yml\nCOMPOSE_FILE: b.yml\n",                             // two entries, one YAML-style
 		"export COMPOSE_FILE\n",                                                 // no value
 		"COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=a.yml;b.yml\n",                  // another separator
 		"COMPOSE_PATH_SEPARATOR: ;\nCOMPOSE_FILE=a.yml;b.yml\n",                 // another separator, YAML-style
@@ -252,6 +250,161 @@ func TestComposeFileEntryFailsClosed(t *testing.T) {
 		if files := mustFiles(t, env); files != nil {
 			t.Errorf("ComposeFiles(%q) = %q, want no entry", env, files)
 		}
+	}
+}
+
+// TestSeveralComposeFileLines covers an .env that sets COMPOSE_FILE on more
+// than one line, which v0.1.0 and v0.1.1 left when they appended their own
+// line beside an entry they did not recognise (`export COMPOSE_FILE=...`).
+// Everything that would rewrite such an entry -- and install, which goes by
+// the strict reading -- refuses it: which line is meant is a guess. Compose
+// reads the last, which is what the forgiving reader returns, and
+// ComposeFileLines and RemoveComposeFileLineAt let rollback take one line out
+// and leave every other byte alone.
+func TestSeveralComposeFileLines(t *testing.T) {
+	env := "A=b\r\nexport COMPOSE_FILE=docker-compose.yml:tls.yml # mine\r\nC=d\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n"
+	if _, err := ComposeFiles(env); err == nil || !strings.Contains(err.Error(), "lines 2 and 4") {
+		t.Errorf("ComposeFiles: err = %v, want a refusal naming both lines", err)
+	}
+	if _, err := AddComposeFile(env, []string{"docker-compose.yml"}, OverrideFileName); err == nil {
+		t.Error("AddComposeFile accepted two entries")
+	}
+	if _, err := RemoveComposeFile(env, OverrideFileName); err == nil {
+		t.Error("RemoveComposeFile accepted two entries")
+	}
+	if _, err := RemoveComposeFileLine(env); err == nil {
+		t.Error("RemoveComposeFileLine accepted two entries")
+	}
+	if got, err := ListedComposeFiles(env); err != nil || strings.Join(got, ",") != "docker-compose.yml,docker-compose.bloodtrail.yml" {
+		t.Errorf("ListedComposeFiles = %q, %v; want the last line's list, as compose reads it", got, err)
+	}
+
+	lines, err := ComposeFileLines(env)
+	if err != nil || len(lines) != 2 || lines[0].Line != 2 || lines[1].Line != 4 ||
+		strings.Join(lines[0].Files, ",") != "docker-compose.yml,tls.yml" || strings.Join(lines[1].Files, ",") != "docker-compose.yml,docker-compose.bloodtrail.yml" {
+		t.Fatalf("ComposeFileLines = %+v, %v", lines, err)
+	}
+	got, err := RemoveComposeFileLineAt(env, 4)
+	if want := "A=b\r\nexport COMPOSE_FILE=docker-compose.yml:tls.yml # mine\r\nC=d\r\n"; err != nil || got != want {
+		t.Errorf("RemoveComposeFileLineAt(4) = %q, %v; want %q", got, err, want)
+	}
+	if got, err = RemoveComposeFileLineAt(env, 2); err != nil || got != "A=b\r\nC=d\r\nCOMPOSE_FILE=docker-compose.yml:docker-compose.bloodtrail.yml\r\n" {
+		t.Errorf("RemoveComposeFileLineAt(2) = %q, %v", got, err)
+	}
+	if _, err := RemoveComposeFileLineAt(env, 3); err == nil {
+		t.Error("RemoveComposeFileLineAt took out a line that does not set COMPOSE_FILE")
+	}
+	if none, err := ComposeFileLines("A=b\n"); err != nil || none != nil {
+		t.Errorf("ComposeFileLines of an .env without the entry = %+v, %v", none, err)
+	}
+}
+
+// TestOverrideEntryFollowsHowTheListNamesItsFiles pins which name the override
+// goes into a list by. Compose resolves a relative name against the directory
+// it is run from -- even with --project-directory -- so a list of absolute
+// paths, which works from any directory, is extended by the override's
+// absolute path (a relative one would break it from every directory but the
+// project's); any other list, and a new entry, take the relative name, which
+// moves with the project. Either name, once listed, is the override, and
+// comes out again.
+func TestOverrideEntryFollowsHowTheListNamesItsFiles(t *testing.T) {
+	o := OverrideEntry{Name: OverrideFileName, Path: "/srv/bh/" + OverrideFileName}
+	for _, c := range []struct{ name, env, added string }{
+		{"absolute", "COMPOSE_FILE=/srv/bh/a.yml\n", "COMPOSE_FILE=/srv/bh/a.yml:/srv/bh/docker-compose.bloodtrail.yml\n"},
+		{"several absolute", "COMPOSE_FILE=/srv/bh/a.yml:/srv/x/b.yml\n", "COMPOSE_FILE=/srv/bh/a.yml:/srv/x/b.yml:/srv/bh/docker-compose.bloodtrail.yml\n"},
+		{"absolute, quoted, exported", "export COMPOSE_FILE=\"/srv/bh/a.yml\" # mine\n", "export COMPOSE_FILE=\"/srv/bh/a.yml:/srv/bh/docker-compose.bloodtrail.yml\" # mine\n"},
+		{"absolute and relative", "COMPOSE_FILE=/srv/bh/a.yml:b.yml\n", "COMPOSE_FILE=/srv/bh/a.yml:b.yml:docker-compose.bloodtrail.yml\n"},
+		{"relative first", "COMPOSE_FILE=a.yml:/srv/bh/b.yml\n", "COMPOSE_FILE=a.yml:/srv/bh/b.yml:docker-compose.bloodtrail.yml\n"},
+		{"relative", "COMPOSE_FILE=a.yml:b.yml\n", "COMPOSE_FILE=a.yml:b.yml:docker-compose.bloodtrail.yml\n"},
+		{"already listed by its absolute path", "COMPOSE_FILE=/srv/bh/a.yml:/srv/bh/docker-compose.bloodtrail.yml\n", "COMPOSE_FILE=/srv/bh/a.yml:/srv/bh/docker-compose.bloodtrail.yml\n"},
+		{"already listed by its relative name", "COMPOSE_FILE=/srv/bh/a.yml:docker-compose.bloodtrail.yml\n", "COMPOSE_FILE=/srv/bh/a.yml:docker-compose.bloodtrail.yml\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := AddOverrideEntry(c.env, []string{"a.yml"}, o)
+			if err != nil || got != c.added {
+				t.Fatalf("AddOverrideEntry(%q) = %q, %v; want %q", c.env, got, err, c.added)
+			}
+			// Coming out again gives back the list the operator had, except where
+			// the override was there already.
+			if c.added != c.env {
+				if back, err := RemoveOverrideEntry(got, o); err != nil || back != c.env {
+					t.Errorf("RemoveOverrideEntry(%q) = %q, %v; want %q", got, back, err, c.env)
+				}
+			}
+		})
+	}
+
+	// An override whose absolute path is not known is always named the same way.
+	if got, err := AddOverrideEntry("COMPOSE_FILE=/srv/bh/a.yml\n", nil, OverrideEntry{Name: OverrideFileName}); err != nil || got != "COMPOSE_FILE=/srv/bh/a.yml:docker-compose.bloodtrail.yml\n" {
+		t.Errorf("without a path: %q, %v", got, err)
+	}
+	// A new entry names the base files and then the relative name, whatever the path.
+	if got, err := AddOverrideEntry("A=b\n", []string{"a.yml", "b.yml"}, o); err != nil || got != "A=b\nCOMPOSE_FILE=a.yml:b.yml:docker-compose.bloodtrail.yml\n" {
+		t.Errorf("a new entry: %q, %v", got, err)
+	}
+	// Both names are the override wherever they stand, in the removers too.
+	both := "COMPOSE_FILE=docker-compose.bloodtrail.yml:/srv/bh/a.yml:/srv/bh/docker-compose.bloodtrail.yml\n"
+	if got, err := RemoveOverrideEntry(both, o); err != nil || got != "COMPOSE_FILE=/srv/bh/a.yml\n" {
+		t.Errorf("RemoveOverrideEntry(%q) = %q, %v", both, got, err)
+	}
+	for env, want := range map[string]string{
+		"COMPOSE_FILE=/srv/bh/docker-compose.bloodtrail.yml\n":                               "COMPOSE_FILE=\n",
+		"COMPOSE_FILE=:/srv/bh/docker-compose.bloodtrail.yml\n":                              "COMPOSE_FILE=\n",
+		"COMPOSE_FILE=docker-compose.bloodtrail.yml:/srv/bh/docker-compose.bloodtrail.yml\n": "COMPOSE_FILE=\n",
+	} {
+		if got, err := RestoreEmptyOverrideEntry(env, o); err != nil || got != want {
+			t.Errorf("RestoreEmptyOverrideEntry(%q) = %q, %v; want %q", env, got, err, want)
+		}
+	}
+	if got, err := RemoveOverrideEntry("COMPOSE_FILE=/srv/bh/docker-compose.bloodtrail.yml\nA=b\n", o); err != nil || got != "A=b\n" {
+		t.Errorf("an entry that was only the override: %q, %v", got, err)
+	}
+	if !o.Is("docker-compose.bloodtrail.yml") || !o.Is("/srv/bh/docker-compose.bloodtrail.yml") || o.Is("/srv/other/docker-compose.bloodtrail.yml") || o.Is("a.yml") {
+		t.Error("OverrideEntry.Is does not name exactly the override's two spellings")
+	}
+	if (OverrideEntry{Name: OverrideFileName}).Is("") {
+		t.Error("an override with no path matched an empty name")
+	}
+}
+
+// TestOverrideEntryRecognisesTheFileHoweverItIsSpelled pins that, given the
+// directory relative names are resolved against, a name is the override when
+// it means the override file: rollback would otherwise delete the file and
+// leave an entry -- ./docker-compose.bloodtrail.yml, say -- that docker compose
+// then stops on.
+func TestOverrideEntryRecognisesTheFileHoweverItIsSpelled(t *testing.T) {
+	o := OverrideEntry{Name: OverrideFileName, Path: "/srv/bh/" + OverrideFileName, Dir: "/srv/bh"}
+	for name, want := range map[string]bool{
+		"docker-compose.bloodtrail.yml":            true,
+		"/srv/bh/docker-compose.bloodtrail.yml":    true,
+		"./docker-compose.bloodtrail.yml":          true,
+		"sub/../docker-compose.bloodtrail.yml":     true,
+		"../bh/docker-compose.bloodtrail.yml":      true,
+		"/srv/bh//docker-compose.bloodtrail.yml":   true,
+		"/srv/bh/./docker-compose.bloodtrail.yml":  true,
+		"sub/docker-compose.bloodtrail.yml":        false,
+		"/srv/other/docker-compose.bloodtrail.yml": false,
+		"../docker-compose.bloodtrail.yml":         false,
+		"docker-compose.bloodtrail.yaml":           false,
+		"":                                         false,
+		"/srv/bh":                                  false,
+	} {
+		if got := o.Is(name); got != want {
+			t.Errorf("Is(%q) = %v, want %v", name, got, want)
+		}
+	}
+	// Without the directory, only the two spellings are.
+	bare := OverrideEntry{Name: OverrideFileName, Path: "/srv/bh/" + OverrideFileName}
+	if bare.Is("./docker-compose.bloodtrail.yml") || !bare.Is("docker-compose.bloodtrail.yml") {
+		t.Error("an override without a directory does not match exactly its two spellings")
+	}
+
+	env := "COMPOSE_FILE=a.yml:./docker-compose.bloodtrail.yml:b.yml\n"
+	if got, err := AddOverrideEntry(env, nil, o); err != nil || got != env {
+		t.Errorf("AddOverrideEntry added the override to a list that names it: %q, %v", got, err)
+	}
+	if got, err := RemoveOverrideEntry(env, o); err != nil || got != "COMPOSE_FILE=a.yml:b.yml\n" {
+		t.Errorf("RemoveOverrideEntry = %q, %v", got, err)
 	}
 }
 

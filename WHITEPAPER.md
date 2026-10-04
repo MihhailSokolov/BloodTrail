@@ -7,7 +7,7 @@ then walk through the design and the implementation one component at a time, wit
 source files and functions involved, so that a reader can move from the explanation straight into
 the code.
 
-The paper describes BloodTrail as of the commit that added it (after release v0.1.2), built against
+The paper describes BloodTrail as of its latest revision (after release v0.1.2), built against
 BloodHound CE v9.6.0 and later and DAWGS v0.8.0. Operator-facing instructions (installation,
 configuration, troubleshooting) live in the [README](README.md); measured results live in
 [BENCHMARK.md](BENCHMARK.md).
@@ -77,6 +77,9 @@ underneath: a DAWGS **driver** named `bloodtrail`. The driver:
    give**, and otherwise passes the read, unchanged, to the stock PostgreSQL driver;
 3. sends every write to PostgreSQL first, then brings the replica up to date **before** the write
    call returns, so the replica is never stale.
+
+The few known exceptions to the second and third promises are narrow, and
+[Section 19](#19-limitations) lists them.
 
 Three independent serving paths share the replica: a shortest-path engine, a recognizer for the
 structural queries BloodHound's own code issues, and an interpreter for a large subset of the Cypher
@@ -356,7 +359,10 @@ follows.
   **temporary tables** that are discarded afterwards. A bidirectional variant expands the smaller
   side. The depth cap is again 15. If the query does not say `s <> t` and a node is both a start and
   an end of the search, with an admissible first step out of it, these functions raise an error
-  (SQLSTATE `22023`, "shortest path endpoints must not resolve to the same node").
+  (SQLSTATE `22023`, "shortest path endpoints must not resolve to the same node"). The check sits in
+  the SQL of the first step, beside the starts' own conditions, and PostgreSQL may evaluate it
+  before those conditions have narrowed the starts, so whether it fires can depend on the query
+  plan PostgreSQL picks.
 
   These functions also decide what "shortest" means when a query has several start/end pairs at
   different distances. The `shortestPath` function keeps a separate search for each start, until
@@ -364,18 +370,19 @@ follows.
   connected pair, however long. The `allShortestPaths` functions give one of two answers. Usually
   they search from all the starts at once and stop at the first ring in which any start reaches any
   end: the answer is every path of the query's **overall** shortest length, and a pair that lies
-  farther apart contributes nothing. In some cases DAWGS instead lists the exact start/end pairs in
-  advance (a **pair filter**) and calls the bidirectional function, which finishes each pair at its
-  own distance and so returns **every pair's** shortest paths. It does this when it judges both
-  endpoints selective enough, for example when both carry an equality, `IN` or `STARTS WITH`
-  condition on a property or an id, or were bound by an earlier `MATCH`. The judgement is DAWGS's
-  own heuristic: kind tests do not count, nor do a range such as `s.x > 5` or an `IS NOT NULL` test,
-  and `NOT s.name = 'n3'` does not count where `s.name <> 'n3'` does. That is why BloodTrail reads
-  the choice from the translation instead of predicting it ([§11.7](#117-executing-the-pattern)).
-  The same pattern can therefore get either answer: `allShortestPaths((u:User)-[*1..]->(r:Repo))`
-  with `WHERE r.objectid = 'X'` returns only the paths of the users nearest to the repository, while
-  adding `AND u.objectid IN ['A', 'B']` returns the shortest paths of both listed users, each at its
-  own length.
+  farther apart contributes nothing. That search keeps no record of the nodes it has visited, so a
+  path that leads back to a start which is also an end counts like any other. In some cases DAWGS
+  instead lists the exact start/end pairs in advance (a **pair filter**) and calls the bidirectional
+  function, which finishes each pair at its own distance and so returns **every pair's** shortest
+  paths. It does this when it judges both endpoints selective enough, for example when both carry an
+  equality, `IN` or `STARTS WITH` condition on a property or an id, or were bound by an earlier
+  `MATCH`. The judgement is DAWGS's own heuristic: kind tests do not count, nor do a range such as
+  `s.x > 5` or an `IS NOT NULL` test, and `NOT s.name = 'n3'` does not count where `s.name <> 'n3'`
+  does. That is why BloodTrail reads the choice from the translation instead of predicting it
+  ([§11.7](#117-executing-the-pattern)). The same pattern can therefore get either answer:
+  `allShortestPaths((u:User)-[*1..]->(r:Repo))` with `WHERE r.objectid = 'X'` returns only the paths
+  of the users nearest to the repository, while adding `AND u.objectid IN ['A', 'B']` returns the
+  shortest paths of both listed users, each at its own length.
 - **Property conditions** are mostly evaluated on the **text** form of the property. `STARTS WITH`,
   `ENDS WITH`, `CONTAINS`, `=~`, `IN [...]`, `coalesce(...)`, `<`/`>` comparisons and arithmetic all
   read `properties ->> 'k'` and cast it to the type of the other operand when needed:
@@ -507,8 +514,9 @@ The implementation follows seven principles, visible throughout the code:
 
 1. **PostgreSQL is the system of record.** The replica is a cache with a proof of freshness, never
    an independent store. Every write reaches PostgreSQL through the unmodified PostgreSQL driver.
-2. **Decline over guess.** The engine answers a query only when its behaviour is pinned to what the
-   PostgreSQL driver would return. Anything uncertain is **declined**: passed, unchanged, to the
+2. **Decline over guess.** The engine answers a query only when its behaviour is pinned to what
+   the PostgreSQL driver would return, with the few exceptions listed in
+   [Section 19](#19-limitations). Anything uncertain is **declined**: passed, unchanged, to the
    PostgreSQL driver. A decline costs latency, never correctness. Recognizers and the Cypher planner
    are *default-deny*: they accept an explicit list of shapes and decline everything else.
 3. **Never a partial answer.** Budgets on rows, work and memory never cut a result short; exceeding
@@ -622,7 +630,11 @@ tag, applies the patch, copies BloodTrail's driver package and `internal/engine`
 `packages/go/bloodtrail` (without test files), points BloodHound's `go.mod` at it with
 `go mod edit`, and builds with BloodHound's own Dockerfile ([Section 18](#18-deployment)). Editing
 `go.mod` from the script, rather than in the patch, means upstream dependency bumps never conflict
-with the patch.
+with the patch. The edit is not free of side effects: Go's module resolution takes the higher of
+the DAWGS version BloodHound pins and the one BloodTrail needs, so an image can carry a newer DAWGS
+than the stock release (v9.6.0 pins v0.7.0, and its image carries v0.8.0: the engine does not
+compile against v0.7.0). The script therefore checks the DAWGS version each image resolves
+([§18.1](#181-the-image)).
 
 ### 5.2 Registration and `Open`
 
@@ -637,10 +649,18 @@ func init() { dawgs.Register(DriverName, Open) }
 
 1. parses the `BLOODTRAIL_*` environment variables (`SettingsFromEnv` in
    [`settings.go`](settings.go)); a malformed value fails startup with an error naming the variable;
-2. requires BloodHound's connection pool (`dawgs.Config.Pool`); BloodTrail never opens its own;
+2. requires BloodHound's connection pool (`dawgs.Config.Pool`);
 3. opens the stock PostgreSQL driver with the **same** configuration, `dawgs.Open(ctx, "pg", cfg)`;
 4. creates the engine (`engine.New`), handing it that driver (for kind-name lookups and loading) and
-   the raw pool (for its own queries);
+   the raw pool (for its own queries). The one pool the engine creates itself is a small one for
+   the write path (`writePathPool` in [`writepool.go`](internal/engine/writepool.go)): two
+   connections, made from BloodHound's pool configuration without DAWGS's connection hooks, opened
+   on the first write and closed at shutdown after the snapshot file is saved, so that a write's
+   counter increment and its read-back never need a second connection from BloodHound's pool
+   while the write holds one
+   ([§12.3](#123-reading-back), [§13.1](#131-the-counter)). A pool that cannot be created at all
+   is logged once at Warn and those statements fall back to BloodHound's pool, which is correct
+   but restores that wait, so the log line is the only warning an operator gets;
 5. calls `engine.Start` with a background context, because the boot goroutine must outlive `Open`.
    `Start` synchronously sweeps stale snapshot temp files, creates the watermark table if it is
    missing and gives it its `lineage` column if that is missing ([Section 13](#13-the-watermark)).
@@ -669,7 +689,7 @@ rest pass straight through. BloodTrail overrides nine methods:
 |---|---|
 | `ReadTransaction` | Wraps each transaction so reads can be answered from memory ([§5.4](#54-the-read-side)) |
 | `WriteTransaction`, `BatchOperation` | Wrap the transaction or batch in an *observer* that records what each write touched, then call `engine.Apply` ([§5.5](#55-the-write-side)) |
-| `Close` | Stops the engine and saves the snapshot file before closing PostgreSQL |
+| `Close` | Stops the engine and saves the snapshot file, then closes the write path's pool and PostgreSQL |
 | `Run`, `WipeGraph`, `SetDefaultGraph`, `DeleteNodesByKinds`, `DeleteRelationshipsByKinds` | These change the graph (or, for `SetDefaultGraph`, which graph the replica mirrors), but inside the PostgreSQL driver they work through its own internal methods or a raw connection, which would bypass the overrides above |
 
 The last row needs one more word of explanation. Go embedding has no "virtual dispatch": when the
@@ -691,10 +711,10 @@ engine, the caller's context, a `declined` flag, and a record of any writes made
   exactly as it would have without BloodTrail.
 - **`Nodes()`** returns a `recordingNodeQuery` ([`node_query.go`](node_query.go)), which records
   every `Filter` criterion and offers `Count`, `FetchIDs` and `FetchKinds` to the engine ([Section
-  10](#10-query-builder-serving)). `OrderBy`, `Offset`, `Limit` and `Query` *taint* the builder: a
-  tainted builder is never answered from memory, because those modifiers change the answer in ways
-  the engine does not implement. `First` and `Fetch`, which return full entities with properties,
-  always go to PostgreSQL.
+  10](#10-query-builder-serving)). `OrderBy`, `Offset`, `Limit`, `Query` and `Fetch` *taint* the
+  builder: a tainted builder is never answered from memory, because those modifiers change the
+  answer in ways the engine does not implement. `First` and `Fetch`, which return full entities
+  with properties, always go to PostgreSQL.
 - **`Relationships()`** returns a `recordingRelationshipQuery`
   ([`relationship_query.go`](relationship_query.go)), which additionally intercepts
   `FetchAllShortestPaths` ([Section 9](#9-the-shortest-path-engine)), `FetchTriples`, and a few
@@ -711,19 +731,29 @@ not to serve.
 **Context.** Engine-served reads run under the context BloodHound passed to `ReadTransaction`. In
 production that context comes from BloodHound's `DatabaseSwitch` and is cancelled with the request,
 so a cancelled request also cancels the engine's own PostgreSQL round trips (such as fetching edge
-properties).
+properties). Every served read honours it too. The Cypher interpreter declines a request whose
+context is already done, and a request cancelled while it runs stops at the interpreter's next work
+check, at most 1,024 units of work later ([§11.9](#119-budgets)). Every builder entry point and the
+shortest-path pipeline decline a done context on entry. A request cancelled after that stops at the
+next check of whatever was running: the shortest-path search's own
+([§9.4](#94-limits-and-engineering-details)), `channels.Submit` for a cursor-returning builder read,
+and a 1,024-row check inside the builder's row projections, whose rows are produced as the caller
+reads them. Either way the query goes to PostgreSQL, which returns the context's own error. The one
+case nothing reports is a cancellation that arrives when fewer rows than those cadences are left to
+deliver, which is also when PostgreSQL has already sent them.
 
 **Writes made through a read transaction.** DAWGS's PostgreSQL `ReadTransaction` does not actually
 open a database transaction: it runs each statement on its own, committing immediately. So a write
 issued inside a "read" transaction (a `CreateNode`, an `UpdateNode`, a relationship create or
-update, a `Raw` statement, a Cypher query that changes data, or a builder `Update`/`Delete`) is
-durable the moment it runs. The wrapper therefore notes each such write before it runs: it records a
-fallback reason and, at the first such write, increments the watermark counter ([Section
-13](#13-the-watermark)). When the read transaction ends, whatever it returned, the engine applies
-that record, which switches it to FALLBACK and rebuilds the replica ([§12.5](#125-fallback)). From
-the first such write on, nothing else in that read transaction is answered from memory. BloodHound's
-Cypher endpoint sends data-changing queries through write transactions, so in ordinary use this is a
-safety net.
+update, a `Raw` statement, a Cypher query that changes data, a builder `Update`/`Delete`, or a
+builder `Query` (or a node builder's `Fetch`) handed an updating clause, such as a delete, in its
+final criteria) is durable the moment it runs. The wrapper therefore notes each such write before it
+runs: it records a fallback reason and, at the first such write, increments the watermark counter
+([Section 13](#13-the-watermark)). When the read transaction ends, whatever it returned, the engine
+applies that record, which switches it to FALLBACK and rebuilds the replica
+([§12.5](#125-fallback)). From the first such write on, nothing else in that read transaction is
+answered from memory. BloodHound's Cypher endpoint sends data-changing queries through write
+transactions, so in ordinary use this is a safety net.
 
 **Consistency.** Because DAWGS's PostgreSQL read transaction is a sequence of independent
 statements, PostgreSQL itself gives no single consistent snapshot across the statements of one "read
@@ -745,9 +775,12 @@ own uncommitted changes, and only PostgreSQL has them.
 
 Query builders and `WithGraph` children handed out by an observer do not hold their own copy of the
 write scope; they hold a pointer to the *root* observer's scope field. When code calls `Commit` in
-the middle of a transaction or batch, the observer applies the scope so far and replaces the root's
-field with a fresh scope, and every child sees the replacement, so no write recorded after a mid-way
-commit is lost.
+the middle of a transaction or batch and the commit succeeds, the observer applies the scope so far
+and replaces the root's field with a fresh scope, and every child sees the replacement, so no write
+recorded after a mid-way commit is lost. A batch `Commit` that fails applies nothing and keeps the
+scope: DAWGS's batch keeps the buffers that failed to flush and writes them at its final commit, so
+their keys must still be recorded when the batch's last apply reads them back. (A transaction
+`Commit` that fails, or panics, has an unknown outcome; it records a fallback and applies.)
 
 After PostgreSQL commits, the driver calls `engine.Apply` with the scope; `Apply` brings the replica
 up to date before `WriteTransaction` returns to BloodHound ([Section 12](#12-write-through)). What
@@ -755,8 +788,8 @@ happens when something fails depends on whether the failed write might have reac
 
 | Call | Error treated as "nothing happened" (no apply) | Error treated as "it may have landed" (fallback and rebuild) |
 |---|---|---|
-| `WriteTransaction` | The code inside returned an error, so PostgreSQL rolled back | The code inside succeeded but the final COMMIT failed: the outcome is unknown |
-| `BatchOperation` | — (always applied: DAWGS's batch commits in chunks, so earlier chunks may be durable, and read-back reads whatever was committed) | — |
+| `WriteTransaction` | The code inside returned an error, so PostgreSQL rolled back; or the final COMMIT failed for a transaction that wrote nothing | The code inside succeeded and wrote (or incremented the counter for a write), but the final COMMIT failed: the outcome is unknown |
+| `BatchOperation` | — (always applied: DAWGS's batch commits in chunks, so earlier chunks may be durable, and read-back reads whatever was committed; the error is recorded on the scope all the same, for the one key shape whose meaning depends on it, [§12.2](#122-what-the-observers-record)) | — |
 | `Run`, `WipeGraph` | Any error before the commit step (connection, BEGIN, the statement, the truncate) | An error from the COMMIT itself |
 | `DeleteNodesByKinds`, `DeleteRelationshipsByKinds` | A connection error, or the delete's own up-front refusal of an unknown kind to exclude | Anything else: these deletes run as a single auto-committed statement, and an error can be reported after the delete has already taken effect |
 | `SetDefaultGraph` | Every error (it cannot have written anything) | — |
@@ -764,6 +797,23 @@ happens when something fails depends on whether the failed write might have reac
 "Nothing happened" still settles the watermark bookkeeping (`ResolveAbandonedWrite`, [Section
 13](#13-the-watermark)). "It may have landed" records a fallback, so the engine rebuilds and learns
 the truth from PostgreSQL.
+
+A panic in the code run inside `WriteTransaction`, `BatchOperation` or `ReadTransaction` is not
+caught: it reaches BloodHound unchanged, with its own stack. The driver settles the write on the
+way out (`settleWriteTransactionPanic` and the deferred handlers in [`driver.go`](driver.go)): a
+`WriteTransaction` whose code panicked was rolled back by DAWGS, so it settles as "nothing
+happened", and one that panicked after its code returned settles like a failed final COMMIT; a
+mid-transaction `Commit` whose own commit panics is the exception, and settles itself before the
+panic unwinds any further, because that panic can land after PostgreSQL made the commit durable; a
+batch records a fallback and applies, because the panic may have come between a write and its
+record; a read transaction applies the writes it noted. The overridden methods settle a panic too,
+and do not catch it either: `Run` and `WipeGraph` split it exactly as the table above splits their
+errors, because their own "reached the commit step" flag is as true for a panic as for an error,
+while `SetDefaultGraph` and the two kind deletes record a fallback and apply -- unlike an error
+from the same call, a panic is no evidence that the call had no effect, and `SetDefaultGraph`'s can
+arise after the in-process retarget it makes. Without this, a panic inside one of them (`WipeGraph`
+runs a callback its caller supplies) left its counter increment unresolved, and the process then
+wrote no snapshot file until it restarted ([§13.1](#131-the-counter)).
 
 ### 5.6 OpenGraph data
 
@@ -791,23 +841,27 @@ against the plain PostgreSQL driver ([§16.2](#162-differential-tests-against-po
 - **"Clear database"** calls `DeleteRelationshipsByKinds` for the chosen edge kinds, and
   `DeleteNodesByKinds` for the chosen source kinds (those kinds included) or for sourceless data (no
   kind included, every registered source kind excluded); both node deletes also exclude BloodHound's
-  `MigrationData` kind. All of them replay as instructions
-  ([§12.1](#121-record-the-keys-then-read-back-the-truth)). A failed upload can leave behind a
-  source kind that PostgreSQL has registered but no row carries. The replica learns kinds from its
-  last full load and from the rows it reads back, so it may not know that name; read-back resolves
-  it through the driver's kind mapper, and the sourceless delete that excludes it replays without a
-  fallback.
+  `MigrationData` kind. Each is applied by reading back, from PostgreSQL, the rows of the replica it
+  may have removed ([§12.1](#121-record-the-keys-then-read-back-the-truth)). A failed upload can
+  leave behind a source kind that PostgreSQL has registered but no row carries. The replica learns
+  kinds from its last full load and from the rows it reads back, so it may not know that name;
+  read-back resolves it out of PostgreSQL's kind table ([§12.3](#123-reading-back)), and the
+  sourceless delete that excludes it replays without a fallback.
 - **What still goes to PostgreSQL**: a query naming a kind no row carries yet, such as that failed
   upload's source kind, until the replica learns the kind (declined as `unsupported`); and the same
   shapes that delegate for any other data.
 
 **Code.** [`driver.go`](driver.go): `Open`, `Driver`, `ReadTransaction`, `WriteTransaction`,
-`resolveWriteTransactionFailure`, `BatchOperation`, `Run`, `WipeGraph`, `settleOverrideWrite`,
-`SetDefaultGraph`, `DeleteNodesByKinds`, `DeleteRelationshipsByKinds`, `settleDeleteFailure`,
-`Close`. [`transaction.go`](transaction.go): `wrappedTransaction`, `readWrites`, `readQueryMutates`.
-[`node_query.go`](node_query.go), [`relationship_query.go`](relationship_query.go): the recording
-builders. [`write_observer.go`](write_observer.go): `observingTransaction`, `observingBatch`,
-`observingNodeQuery`, `observingRelationshipQuery`, `scopeSlot`, `ensureBumped`.
+`settleWriteTransactionPanic`, `resolveWriteTransactionFailure`, `BatchOperation`, `Run`,
+`WipeGraph`, `settleOverrideWrite`, `settleOverridePanic`, `SetDefaultGraph`,
+`DeleteNodesByKinds`, `DeleteRelationshipsByKinds`, `settleDeleteFailure`, `Close`.
+[`transaction.go`](transaction.go):
+`wrappedTransaction`, `readWrites`, `readQueryMutates`. [`node_query.go`](node_query.go),
+[`relationship_query.go`](relationship_query.go): the recording builders.
+[`write_observer.go`](write_observer.go): `observingTransaction`, `observingBatch`,
+`observingNodeQuery`, `observingRelationshipQuery`, `hasUpdatingClause`,
+`recordUpdatingFinalCriteria`, `scopeSlot`, `ensureBumped`, `settleCommitPanic`.
+[`writepool.go`](internal/engine/writepool.go): `writePathPool`.
 
 ---
 
@@ -916,7 +970,9 @@ becomes the dense numbering) and edges in any order. `Build()`:
 
 `finalizeDerived` is the single derivation for every way a snapshot comes into existence: a fresh
 build, a file load, and a compaction. The derived structures are never stored, so they can never
-disagree with the arrays they are derived from.
+disagree with the arrays they are derived from. Structures sized by the highest kind id are sized
+in Go's `int`, not in the 16-bit `KindID`: PostgreSQL's last possible kind id is 32,767, and
+32,767 + 1 in 16 bits wraps to a negative size, which once made every build at that id panic.
 
 ### 6.2 Node properties
 
@@ -937,6 +993,7 @@ type PropStore struct {
 type propEntry struct {  // 24 bytes in memory, 19 on disk
     prop PropID          // which property
     kind uint8           // null | false | true | number | string | array | object
+                         //   | number stored in a non-canonical spelling (below)
     num  float64         // numbers, inline
     ref, len uint32      // byte range in the arena, for strings, arrays and objects
 }
@@ -957,8 +1014,15 @@ type propEntry struct {  // 24 bytes in memory, 19 on disk
   not stored twice.
 
 Properties are parsed when a node is loaded. Numbers go through Go's `encoding/json`, which reads
-every number as `float64`; integers above 2⁵³ therefore lose precision, the same model the
-interpreter uses throughout.
+every number as `float64`. PostgreSQL's `jsonb` keeps more: the exact value (9007199254740993 stays
+itself, where the nearest `float64` is 9007199254740992) and the spelling (`1.0` stays `1.0`, and
+its text `'1.0'` is what a cast reads). So a number whose stored spelling differs from its canonical
+rendering, `strconv.FormatFloat(f, 'f', -1, 64)` of its `float64` (`numberSpellingCanonical`), gets
+an entry kind of its own, `propKindNumberNonCanonical`: `1.0`, `2.50`, or an integer its `float64`
+cannot spell back, such as 9007199254740993 (beyond 2⁵³). Its value is still the nearest `float64`;
+the kind exists to mark the property, and the Cypher planner declines any query that reads a
+property holding such a number ([§11.2](#112-matching-dawgss-semantics)). BloodHound's own ingest
+writes canonical numbers, so such properties are rare.
 
 ### 6.3 Read indexes that PostgreSQL does not have
 
@@ -972,7 +1036,8 @@ always re-checked, but must never omit one. None is stored in the snapshot file.
 | Value index | [`valueindex.go`](internal/engine/snapshot/valueindex.go) | For one property: each exact value → nodes, and for list properties each element → nodes | Lazily, per property | `n.p = <literal>`, `'x' IN n.listProp`, and OR-combinations of those |
 | Distinct-value count | [`valueindex.go`](internal/engine/snapshot/valueindex.go) | How many different text values a property has (the count stops early at a cap) | Lazily, memoized | Deciding whether to evaluate a regular expression once per distinct value |
 | Value shape | [`valueshape.go`](internal/engine/snapshot/valueshape.go) | Whether any node carries the property as something other than text (or other than a list of text) | Lazily, per property | Guarding the text-based anchors (below) |
-| Edge-kind endpoints | [`edgekindindex.go`](internal/engine/snapshot/edgekindindex.go) | For each edge kind: the sorted list of nodes with such an edge going out, and separately coming in | **Eagerly**, whenever a new base is adopted (`Snapshot.Warm`) | Starting a search from the rare side of a rare edge kind |
+| Number spellings | [`valueshape.go`](internal/engine/snapshot/valueshape.go), [`props.go`](internal/engine/snapshot/props.go) | Whether any number the property holds, as its value or inside a list or object, is stored in a non-canonical spelling (`View.NumbersCanonical`) | **Eagerly** for a new base (one pass over the property store), and once per segment when it is built | Declining every read of such a property ([§11.2](#112-matching-dawgss-semantics)) |
+| Edge-kind endpoints | [`edgekindindex.go`](internal/engine/snapshot/edgekindindex.go) | For each edge kind: the sorted list of nodes with such an edge going out, and separately coming in | **Eagerly**, whenever a new base is adopted (`Snapshot.Warm`, which also derives the number-spelling facts) | Starting a search from the rare side of a rare edge kind |
 
 **Why the value-shape guard exists.** The string index only contains nodes whose value *is* text.
 But DAWGS evaluates `STARTS WITH`, `CONTAINS`, `IN [...]` and similar on the *text form* of any
@@ -1107,9 +1172,25 @@ view, without touching PostgreSQL and without parsing any JSON:
    dense ids are renumbered in database-id order; tombstoned nodes are skipped, overridden and added
    nodes take their kinds and already-parsed property entries from their segment, untouched nodes
    are copied as they are;
-3. keep every base edge the delta did not touch, plus every live delta edge; edges into tombstoned
-   nodes are dropped by the builder's missing-endpoint rule;
+3. keep every base edge the delta did not touch, plus every live delta edge whose endpoints are
+   both live; an edge into a node the delta tombstoned is dropped, while an edge whose endpoint
+   neither the base nor the delta knows yet is *pending* (below);
 4. run a full `Build()`, carrying the base's watermark lineage over ([§13.5](#135-the-lineage)).
+
+A pending edge exists because writes are applied in the order their calls finish, not the order
+they committed: an edge's segment can be published before the segment of the node it points to,
+and the view shows the edge as soon as the node arrives. Compaction therefore uses
+`FoldWithPendingEdges`, which returns such edges in a small edge-only segment instead of dropping
+them, and keeps that segment on top of the new base until the endpoint lands
+([§14.1](#141-compaction)). (PostgreSQL has no foreign key from an edge to its nodes, so an
+endpoint may also never arrive; the edge then stays pending, invisible, as it is in the view, and
+every later fold carries it again — which the post-compaction save recognizes as a delta that can
+never empty, [§14.2](#142-the-snapshot-file).) The shutdown save uses `FoldWithPendingEdges` too,
+for the opposite reason: a save happens only when every counted write has been applied, so no
+endpoint write is still on its way and dropping such an edge is very probably right — but the file
+cannot record that it is short, so a fold that reports anything pending refuses the save instead
+([§14.2](#142-the-snapshot-file)). Plain `Fold`, which drops them silently, now has no caller
+outside this package's tests.
 
 A randomized property test (`TestFoldMatchesStackedOverlay`) checks that a folded base and the
 layered view it came from are equivalent, compared by database id.
@@ -1125,7 +1206,7 @@ layered view it came from are equivalent, compared by database id.
 [`edgekindindex.go`](internal/engine/snapshot/edgekindindex.go),
 [`segment.go`](internal/engine/snapshot/segment.go) (`Segment`, `SegmentBuilder`, `MergeSegments`),
 [`view.go`](internal/engine/snapshot/view.go) (`View`, `WithSegment`, `Warm`),
-[`fold.go`](internal/engine/snapshot/fold.go),
+[`fold.go`](internal/engine/snapshot/fold.go) (`Fold`, `FoldWithPendingEdges`),
 [`viewcheck.go`](internal/engine/snapshot/viewcheck.go) (consistency checkers used by tests).
 
 ---
@@ -1147,11 +1228,16 @@ instant of the database:
 4. a probe
    (`SELECT g.id FROM graph g WHERE EXISTS (SELECT 1 FROM node n WHERE n.graph_id = g.id) LIMIT 2`)
    that sets `MultiGraph` when more than one graph holds nodes;
-5. when the engine loads with a snapshot directory configured, the watermark lineage
-   (`select lineage from bloodtrail_watermark where id = 1`), as the transaction's last statement,
-   so it is the lineage the rows belong to ([§13.5](#135-the-lineage)). On a database without that
-   column the read fails and aborts the transaction, which is why nothing follows it; the load is
-   still used, with its lineage unknown, and logs `could not read the watermark lineage` at Warn.
+5. the watermark counter (`select counter from bloodtrail_watermark where id = 1`) and, when the
+   engine loads with a snapshot directory configured, the watermark lineage
+   (`select lineage from bloodtrail_watermark where id = 1`), as the transaction's last
+   statements, so they describe the instant the rows belong to ([Section 13](#13-the-watermark)).
+   On a database without the table or the lineage column the read fails and aborts the
+   transaction, which is why nothing follows it; the load is still used, and each failure says so
+   at Warn under its own cause: a lineage that could not be read logs
+   `could not read the watermark lineage`, and a counter that could not be read logs
+   `could not read the watermark counter during the load`, which is what later refuses saves
+   ([§13.4](#134-one-writer)) since nothing rebased the ledger onto it.
 
 Decoding each node's JSON properties is the expensive step, so rows stream from a single cursor into
 a pool of parser goroutines (one per CPU core), while a single consumer hands parsed nodes to the
@@ -1163,15 +1249,41 @@ five million nodes and 49 million edges, a full load takes 43 to 51 seconds (`be
 applied writes, `applyEpoch`. The load reads it before starting and compares it again, under the
 lock that serializes all publishing, before publishing its result. If a write was applied in the
 meantime, the load might be missing it, so it is discarded and retried. This occasionally throws
-away a good load; it never publishes a stale one.
+away a good load; it never publishes a stale one. Under a stream of writes that never pauses for as
+long as a load takes (a long ingest, say), every load is discarded, and a FALLBACK lasts until the
+writes pause: every query is still answered correctly, by PostgreSQL, at the cost of repeated full
+loads. An adopted load also brings the watermark bookkeeping up to the counter it read
+(`adoptRebuiltViewAndRebase`, [§13.1](#131-the-counter)).
+
+**A panicking load.** The load runs on a background goroutine that no request could recover a
+panic for, so a panic there once ended the process, and a panic that depended on the data ended
+it on every restart. `rebuildOnce` now recovers a panic on its own goroutine (the snapshot build,
+the size check, the adoption) into an error and a FALLBACK (`recoverRebuildPanic`,
+[`background_panic.go`](internal/engine/background_panic.go)): it logs
+`bloodtrail: snapshot rebuild panicked` at Error with the stack, and the load is retried on the
+long interval a panic gets ([§12.5](#125-fallback)). The goroutines that stream, decode and stage
+the node rows need their own cover, because `errgroup` deliberately does not propagate a panic to
+the goroutine that waits: each of the three roles runs through `goRecovered`, which turns a panic
+into the load's own error with the stack it was raised on, and each parse job through
+`parseLoadedProps`, which recovers one job at a time so the panic arrives as that node's parse
+result and the consumer waiting on it is never stranded. Such an error never passes through
+`rebuildOnce`'s own recover, so it carries a type (`loadPanicError`) the retry cadence recognizes
+instead, and gets that same long interval rather than the seconds-scale one a transient failure
+gets. The boot's attempt to start from the snapshot file is covered the same way, and also deletes
+the file ([§14.3](#143-boot)).
 
 **Memory limit.** If `BLOODTRAIL_MEMORY_LIMIT` is set and the finished snapshot's estimated size
 exceeds it, the load is refused. Whatever the engine had before stays in place (at startup, that
 means no replica, so every query goes to PostgreSQL), and the load is retried every 10 minutes.
 
 **Code.** [`load.go`](internal/engine/load.go): `loadSnapshot` (and `LoadSnapshot`, the exported
-form the benchmarks use, which never reads the lineage), `loadKinds`, `loadNodes`, `loadEdges`,
-`probeMultiGraph`. [`engine.go`](internal/engine/engine.go): `rebuildOnce`, `adoptRebuiltView`.
+form the benchmarks use, which reads neither the counter nor the lineage), `loadedWatermark`,
+`loadKinds`, `loadNodes`, `goRecovered`, `parseLoadedProps`, `loadPanicError`, `loadEdges`,
+`probeMultiGraph`.
+[`engine.go`](internal/engine/engine.go):
+`rebuildOnce`, `adoptRebuiltView`. [`watermark.go`](internal/engine/watermark.go):
+`adoptRebuiltViewAndRebase`. [`background_panic.go`](internal/engine/background_panic.go):
+`backgroundPanicked`, `recoverRebuildPanic`, `bootFromSnapshotFile`, `recoverSnapshotFileBootPanic`.
 
 ---
 
@@ -1182,15 +1294,27 @@ form the benchmarks use, which never reads the lineage), `loadKinds`, `loadNodes
 Every serving entry point consults the same check:
 
 ```go
-func (e *Engine) serveState() (*snapshot.View, bool) {
-    view := e.snap.Load()                                  // atomic pointer, no lock
-    return view, view != nil && e.state.Load() == stateServing
+func servableView(loadState func() int32, loadView func() *snapshot.View) (*snapshot.View, bool) {
+    serving := loadState() == stateServing // atomic, no lock: read FIRST
+    view := loadView()                     // atomic pointer, no lock
+    return view, view != nil && serving
 }
 ```
+
+(`serveState` calls it with the engine's two atomics.) The order of the two loads matters. The one
+transition back to SERVING, a recovery load being adopted, stores the new view first and flips the
+state second. Read the other way round, a query could pair the view from before the FALLBACK, which
+lacks the write whose failure caused it, with the SERVING state the adoption has just restored.
+Read state first, a SERVING answer means the adoption's view is already visible.
 
 - **No view yet** (the startup load is still running): the query is declined with reason
   `no_snapshot`.
 - **FALLBACK**: declined with reason `fallback`.
+- **A database with more than one populated graph**: declined with reason `multi_graph`, by every
+  serving path right after this check (the Cypher path a little later, after planning). DAWGS's
+  PostgreSQL reads are not scoped to a graph, so a count, a listing or a path query there spans
+  every graph, while the replica holds only the default one: an answer from it would be short. A
+  standard BloodHound deployment has nodes in one graph only.
 - **Otherwise** the query runs from start to finish against **that** view. Views are immutable, so a
   write that lands while the query runs publishes a *new* view for later queries and cannot change
   what this query sees. The query never takes the publishing lock, and nothing is re-checked
@@ -1221,19 +1345,19 @@ A decline is logged at Debug level with a `reason`:
 | `no_snapshot` | No view has been adopted yet |
 | `fallback` | The engine is in FALLBACK |
 | `unresolvable` | A shortest-path endpoint could not be resolved |
-| `self_endpoint` | Start and end overlap in a way PostgreSQL would reject (SQLSTATE 22023) |
+| `self_endpoint` | Start and end overlap in a way PostgreSQL would reject (SQLSTATE 22023), or in a way that decides PostgreSQL's answer and the engine does not reproduce ([§11.7](#117-executing-the-pattern)) |
 | `too_large` | The shortest-path search strategy's budget was exceeded |
 | `memory_limit` | The shortest-path output exceeded the request's memory limit |
 | `hydration` | Fetching properties from PostgreSQL failed, or a row had disappeared |
 | `params` | The Cypher came with bound `$parameters` |
 | `unsupported` | The query shape, or a value met during execution, is outside what the engine reproduces exactly |
-| `multi_graph` | The database holds more than one populated graph |
+| `multi_graph` | The database holds more than one populated graph (on every serving path) |
 | `translate_gate` | DAWGS's own translator would reject the query ([§11.10](#1110-the-translate-gate)) |
 | `shortest_semantics` | The query has an `allShortestPaths` pattern, but DAWGS's translation does not settle which of PostgreSQL's two answers it gets: it calls no all-shortest-paths function, or functions of both kinds ([§11.7](#117-executing-the-pattern)) |
 | `budget` | A row, work or memory budget was exceeded |
 | `collation` | The answer depends on PostgreSQL's text ordering |
 | `panic` | A recovered panic during execution or result building |
-| `error` | Anything else (for example, a kind name that could not be mapped) |
+| `error` | Anything else (for example, a kind name that could not be mapped, or a request whose context was cancelled) |
 
 The query-builder path adds `no_kind_constraint`, `unsupported_order` and `projection_mismatch`, and
 logs under its own message (`bloodtrail: builder engine declined`).
@@ -1254,10 +1378,14 @@ needs one more trip to PostgreSQL ([`hydrate.go`](internal/engine/hydrate.go)):
 
 If any requested row has disappeared in the meantime (deleted since the view was captured), the
 whole query is declined and PostgreSQL answers it. These round trips run under the caller's context,
-so a cancelled request cancels them too.
+so a cancelled request cancels them too. They draw their connection from BloodHound's pool while
+the caller's read transaction may already hold one, so on a pool exhausted by such transactions a
+served read that needs them waits for a connection, where the plain PostgreSQL driver would use the
+one it holds.
 
-**Code.** [`engine.go`](internal/engine/engine.go): `Engine`, `serveState`, the decline reasons,
-`TryAllShortestPaths`, `servePathQuery`, `TryCypher`.
+**Code.** [`engine.go`](internal/engine/engine.go): `Engine`, `serveState`, `servableView`, the
+decline reasons (`reasonMultiGraph` among them), `TryAllShortestPaths`, `servePathQuery`,
+`TryCypher`.
 [`serve_builder.go`](internal/engine/serve_builder.go),
 [`serve_cypher.go`](internal/engine/serve_cypher.go), [`hydrate.go`](internal/engine/hydrate.go),
 [`result.go`](internal/engine/result.go), [`rowresult.go`](internal/engine/rowresult.go).
@@ -1291,30 +1419,36 @@ tx.Relationships().Filter(query.And(
 
 `recognize.FromCriteria` ([`criteria.go`](internal/engine/recognize/criteria.go)) accepts exactly
 this shape: a conjunction of `id(s) = x`, `id(e) = y` and at most one kind filter on the
-relationship. On PostgreSQL, DAWGS renders it as an `allShortestPaths` pattern with an unbounded
-range, capped at 15 steps. Because this is always a single start/end pair, PostgreSQL's two
-`allShortestPaths` answers ([§2.6](#26-cypher-and-how-dawgs-translates-it)) coincide, and BloodTrail
-searches in the per-pair mode. A builder question with several starts or ends is not recognized and
-goes to PostgreSQL.
+relationship. A kind filter that names no kinds is declined: DAWGS renders it as
+`e0.kind_id = any (array []::int2[])`, an empty kind array, which matches no edge, while the engine
+reads an empty kind list as "every kind". (BloodHound's pathfinding endpoint rejects an empty kind
+list itself, so this guards other callers.) On PostgreSQL, DAWGS renders it as an `allShortestPaths`
+pattern with an unbounded range, capped at 15 steps. Because this is always a single start/end pair,
+PostgreSQL's two `allShortestPaths` answers ([§2.6](#26-cypher-and-how-dawgs-translates-it))
+coincide, and BloodTrail searches in the per-pair mode. A builder question with several starts or
+ends is not recognized and goes to PostgreSQL.
 
 ### 9.2 The serving steps
 
 `servePathQuery` ([`engine.go`](internal/engine/engine.go)) runs six steps:
 
-1. **Gate** ([§8.1](#81-the-serving-gate-and-the-two-states)).
+1. **Gate** ([§8.1](#81-the-serving-gate-and-the-two-states)), including the multi-graph check.
 2. **Resolve the endpoints.** Database ids map to dense ids through `View.Dense`. An id the view
    does not know is *dropped*, which can only make the answer smaller, never larger.
-3. **Check for a shared endpoint.** PostgreSQL's shortest-path functions raise SQLSTATE 22023 when,
-   without an explicit `s <> t` (BloodHound's pathfinding request has none), a start node is also an
-   end node and the search can take a first step out of it. BloodTrail declines (`self_endpoint`)
-   whenever the two sets share a node that has an outgoing edge of *any* kind
-   (`traverse.SelfEndpointConflict`). That condition covers every case PostgreSQL rejects, so
-   BloodTrail never answers a query PostgreSQL would refuse; it may occasionally decline one
-   PostgreSQL would have answered.
-4. **Build an edge-kind mask**: a bit vector over kind ids. An empty kind list means every kind. The
-   mask is sized from the view's `MaxKindID`, which includes kinds first introduced by segments.
+3. **Check for a shared endpoint.** PostgreSQL's shortest-path functions raise SQLSTATE 22023
+   when, without an explicit `s <> t` (BloodHound's pathfinding request has none), a start node is
+   also an end node and the search can take a first step out of it. BloodTrail declines
+   (`self_endpoint`) whenever the two sets share a node that has an outgoing edge of *any* kind
+   (`traverse.SelfEndpointConflict`). That condition covers every case PostgreSQL rejects, so on the
+   pathfinding and builder paths BloodTrail never answers a query PostgreSQL would refuse (Cypher's
+   `shortestPath`, whose PostgreSQL error depends on the query plan, is covered in
+   [§11.7](#117-executing-the-pattern)); it may occasionally decline one PostgreSQL would have
+   answered.
+4. **Build an edge-kind mask**: a bit vector over kind ids. No kind filter at all means every kind.
+   The mask is sized from the view's `MaxKindID`, which includes kinds first introduced by segments.
 5. **Search** (`traverse.AllShortestPaths`, [§9.3](#93-the-search-strategies)), with BloodHound's
-   own per-transaction memory limit (`GraphQueryMemoryLimit`) as the output budget.
+   own per-transaction memory limit (`GraphQueryMemoryLimit`) as the memory budget, and the
+   request's context, which the search itself checks ([§9.4](#94-limits-and-engineering-details)).
 6. **Complete the answer** from PostgreSQL ([§8.4](#84-completing-the-answer)).
 
 A served call logs `bloodtrail: path engine served` at Info level.
@@ -1417,23 +1551,70 @@ reported as a path to itself, matching BloodHound's own filter.
   bumping an epoch counter: a node's entry counts only if its mark equals the current epoch. When
   the counter wraps around, the marks are cleared for real, because epoch 0 would match a fresh
   buffer's zeros.
-- **Output budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
-  memory limit; exceeding it declines the query (`memory_limit`). The charge bounds the *output*,
-  not the search buffers: strategy B holds one buffer per small-side node until its merge finishes.
-  When the overall-shortest mode discards the paths collected so far because a shorter pair turned
-  up, their charge is released too.
+- **Memory budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
+  memory limit; exceeding it declines the query (`memory_limit`). When the overall-shortest mode
+  discards the paths collected so far because a shorter pair turned up, their charge is released
+  too, and the memory itself is released with it.
+
+  What a limit expressed in those accounted bytes costs in real heap was measured, since a charge
+  that understates reality turns the 1 GiB `GraphQueryMemoryLimit` BloodHound hands down into a
+  larger commitment than it looks. An enumeration used to allocate 2.5–7 times its charge and hold
+  up to 4 times it resident at the peak. Each path was two freshly allocated slices inside a `Path`
+  appended to a growing `[]Path`, and Go grows a slice past 256 elements by a quarter at a time, so
+  reaching a million paths allocated about five times the final array and discarded four of them —
+  240 bytes of garbage against a 48-byte charge — on top of a fresh copy of the partial path at
+  every step of the walk. Three shapes, enumerated directly: 20,000 paths of 3 nodes allocated
+  6.90× their charge (4.19× of it still resident at the peak), 64,000 of 5 nodes 3.34× (1.42×),
+  8,192 of 15 nodes 2.55× (1.92×).
+
+  The paths are now bump-allocated into fixed-size chunks and the `[]Path` is built once, exactly
+  sized, with each path's nodes and kinds aliasing the chunk they already sit in; the walk itself
+  carries a stack of (node, kind, depth) frames rather than a copy of the partial path. The same
+  three shapes allocate **1.29×, 0.81× and 0.66×** of their charge, and peak heap now tracks those
+  figures rather than towering over them — the garbage is gone, not merely collected sooner. So the
+  charge is now at or slightly above reality for ordinary path lengths, and the residual 1.29× is
+  one extreme: a single node whose whole fan-out is one hop from the target puts every one of those
+  paths on the search stack at once, and that stack's own growth is what is left. Two caveats on
+  the honest side: a query returning only a handful of paths pays a few hundred bytes of chunk
+  floor the charge does not cover, and the charge still covers only the search's own output —
+  what the Cypher interpreter then converts each path into is governed by the live-row budget
+  ([§11.9](#119-budgets)), not by this one, and is the larger figure of the two
+  ([§11.7](#117-executing-the-pattern)).
+
+  Strategy B's search buffers are charged against the same limit, as a reservation taken
+  before they are allocated and kept across that release, since discarding paths does not free
+  them: it holds one buffer per small-side node, 5 bytes per node of the whole snapshot each,
+  from its parallel fan-out until its merge finishes. A query whose buffers alone do not fit
+  declines (`too_large`) rather than allocating them. Nothing accounted for that set before, and
+  a caller that raises `SideBudget` from its own work budget ([§11.9](#119-budgets)) scales it:
+  at the interpreter's default work budget, up to roughly 1.3 GB on a sparse graph.
+
+  The reservation is `5 × node count × small-side size` bytes, so two numbers follow for a very
+  large graph. At the default `SideBudget` of 16 it reaches a 1 GiB `GraphQueryMemoryLimit` at
+  about 13.4M nodes, past which a pathfinding query that would have taken strategy B declines
+  (`too_large`) and goes to PostgreSQL. And because the reservation counts towards the same
+  limit as the paths, a strategy-B query's room for output is that much smaller than before —
+  at 5M nodes and `SideBudget` 16, about 380 MB of a 1 GiB limit. Both are the safe direction
+  (decline, not allocate), and both move with the limit, which is BloodHound's own per-transaction
+  setting.
 - **Reading adjacency.** Searches read a node's edges as array slices (`View.OutSlices` /
   `InSlices`, [§6.5](#65-the-view-a-base-plus-deltas)) rather than through a callback. A comment in
   the code records that routing the loop through a helper that took a callback made the common path
   40% slower (37 ms → 52 ms on the same pre-built query).
-- **No cancellation inside the search.** `traverse` takes no context; it is bounded by its depth,
-  strategy and output budgets instead.
+- **Cancellation inside the search.** `Query.Ctx` carries the request's context into the search:
+  `AllShortestPaths` refuses to start once it is done, and a search already running stops at its
+  next check — once per (root, terminal) pair in strategy A, once per small-side BFS run in strategy
+  B, and every 1,024 steps of a merge phase's walk over an endpoint set. There is deliberately no
+  check per node or per edge: that is the steady-state overlay read path, so the granularity bounds
+  a cancelled search at one full BFS instead.
 
 **Code.** [`traverse.go`](internal/engine/traverse/traverse.go): `AllShortestPaths`, `Query`, `Mode`
 (`ModeOne`, `ModeAllPerPair`, `ModeAll`), `shortestLevel`, `Endpoint`, `MaxDepth`,
 `MaxRepresentableDepth`, `PairBudget`, `SideBudget`, `strategyPairs`, `strategySmallSide`,
-`SelfEndpointConflict`, the scratch pool. [`bfs.go`](internal/engine/traverse/bfs.go): `bfsFrom`,
-`pairShortest`, `pairEnumerate`, `enumerate`. [`engine.go`](internal/engine/engine.go):
+`cancelCheck`, `memBudget`, `SelfEndpointConflict`, the scratch pool.
+[`bfs.go`](internal/engine/traverse/bfs.go): `bfsFrom`, `pairShortest`, `pairEnumerate`,
+`enumerate`, `frame`. [`pathsink.go`](internal/engine/traverse/pathsink.go): `pathSink`.
+[`engine.go`](internal/engine/engine.go):
 `TryAllShortestPaths`, `servePathQuery`, `convertMode`, `resolveEndpoint`, `buildKindMask`.
 [`hydrate.go`](internal/engine/hydrate.go): `hydratePaths`.
 
@@ -1486,6 +1667,13 @@ otherwise), because an unanchored ordered scan could be the whole edge set.
 
 ### 10.2 Execution
 
+Every builder entry point first passes the gate of [§8.1](#81-the-serving-gate-and-the-two-states)
+(`serveGate`), the multi-graph check included. Every entry point also declines a request whose
+context is already done, so the question goes to PostgreSQL and the caller gets PostgreSQL's own
+error; the counts compute their answer inline without consulting it again, while the
+cursor-returning reads stop mid-stream through `channels.Submit` and the row projections at a
+1,024-row check of their own ([§5.4](#54-the-read-side)).
+
 Node questions become **bitset arithmetic** on the per-kind bitsets
 ([`serve_builder.go`](internal/engine/serve_builder.go)): union for "any of", intersection for "all
 of" and between constraints, then intersection with the id set. Unknown ids are simply absent from
@@ -1509,6 +1697,13 @@ Results stream to the caller through a small buffered cursor (256 rows), or for 
 through a result that reads the arrays as the caller advances. The wrapper always closes served
 cursors, so an early-returning caller cannot leave the feeding goroutine behind.
 
+Relationship kind listings and the step rows name kinds, so their kind names are resolved once, up
+front, through DAWGS's kind mapper (`resolveSelectedKindNames`). Only the kind ids the view's kind
+table names are resolved: PostgreSQL's kind ids have gaps (an insert of a kind that already exists
+draws an id from the sequence and discards it), and DAWGS's mapper fails on an id that names no
+kind. A kind table that does not name the view's highest kind id, the one inconsistency that can be
+checked without a scan, declines the query (`error`) rather than serve kinds without names.
+
 ### 10.3 What is deliberately not served
 
 Property conditions and property projections on the builder path always go to PostgreSQL, even
@@ -1520,14 +1715,15 @@ edge-id paging order, and any builder with more than one chained `Filter`.
 `FromNodeCriteria`, `FromRelCriteria`, `FromReturning`, `OrderIsEdgeIDAscending`.
 [`serve_builder.go`](internal/engine/serve_builder.go): `TryNodeCount`, `TryNodeFetchIDs`,
 `TryNodeFetchKinds`, `TryRelCount`, `TryRelFetchIDs`, `TryRelFetchTriples`, `TryRelFetchKinds`,
-`TryRelQueryRows`, `resolveNodeSpec`, `resolveRelSpec`, `newRelScanIter`.
+`TryRelQueryRows`, `serveGate`, `resolveNodeSpec`, `resolveRelSpec`, `newRelScanIter`,
+`selectKindIDs`, `resolveSelectedKindNames`.
 [`rowresult.go`](internal/engine/rowresult.go): the cursors and row results.
 
 ---
 
 ## 11. The Cypher interpreter
 
-[`internal/engine/interpret`](internal/engine/interpret) (about 16,800 lines) plans and executes a
+[`internal/engine/interpret`](internal/engine/interpret) (about 18,200 lines) plans and executes a
 large subset of Cypher directly against a view. It backs `POST /api/v2/graphs/cypher`: every
 pre-built and selector query in BloodHound's UI, and the queries users type.
 
@@ -1543,15 +1739,17 @@ of them can decline:
 4. No view yet → `no_snapshot`.
 5. **Plan** (`interpret.Plan`): check that the query is a shape the interpreter handles and decide
    how to run it; otherwise → `unsupported`.
-6. The database holds more than one populated graph → `multi_graph`. The interpreter has no notion
-   of which graph a query belongs to, so it never answers on such a database.
+6. The database holds more than one populated graph → `multi_graph`. PostgreSQL's reads span every
+   graph there, while the replica holds only the default one
+   ([§8.1](#81-the-serving-gate-and-the-two-states)).
 7. **Translate gate**: DAWGS's real SQL translator must accept the query → otherwise
    `translate_gate` ([§11.10](#1110-the-translate-gate)). For a query with an `allShortestPaths`
    pattern, the same translation must also show which of PostgreSQL's two answers applies →
    otherwise `shortest_semantics` ([§11.7](#117-executing-the-pattern)).
 8. The engine is in FALLBACK → `fallback`.
-9. **Execute** under budgets (`interpret.Execute`, [§11.9](#119-budgets)); an execution error maps
-   to a decline reason (`budget`, `collation`, `self_endpoint`, `unsupported`, `panic`, `error`).
+9. **Execute** under budgets and the request's context (`interpret.Execute`,
+   [§11.9](#119-budgets)); an execution error maps to a decline reason (`budget`, `collation`,
+   `self_endpoint`, `unsupported`, `panic`, `error`; a cancelled request is `error`).
 10. Fetch edge properties from PostgreSQL ([§8.4](#84-completing-the-answer)).
 11. Build the result rows, all of them, under a panic guard.
 
@@ -1589,6 +1787,33 @@ literals alone (`1.5 * 2.0` is an exact decimal in PostgreSQL), and
 seconds. Arithmetic in `RETURN` is served only when it is built from properties and float literals,
 with at least one of each, which PostgreSQL computes in double precision just as BloodTrail does.
 
+**Arithmetic in conditions** follows the type PostgreSQL gives each step (`sqlnum.go`). DAWGS prints
+an integer literal as written, which PostgreSQL types as a 32-bit integer (`int4`) when it fits and
+a 64-bit one (`int8`) otherwise, and folds a minus sign into the constant (`-2147483648` is an
+`int4`). It prints a float literal without a trailing `.0`, so `2.0` is the integer `2`, and a
+literal with a fraction (`0.1`) is an exact decimal (`numeric`). `size()` is an `int4`, `id()` an
+`int8`, `datetime()`'s epoch accessors an exact decimal, and a property is typed by the cast DAWGS
+gives it from its partner (`n.p < 5` below). A step over two types takes the wider: `float8` over
+`numeric` over `int8` over `int4`. Integer steps are computed exactly, and a result outside
+`int4` for two `int4` operands is PostgreSQL's "integer out of range", so the query declines; so
+does any integer beyond 2⁵³, which a `float64` cannot hold exactly, in a literal, a result or a
+cast. A cast of a stored *number* declines from 2⁵³ itself: the decode has already rounded it, so
+that `float64` could equally have been 2⁵³+1, two values PostgreSQL's cast separates. A cast of
+stored *text* is never rounded, so it serves 2⁵³ exactly and declines only past it.
+Double-precision steps decline where PostgreSQL raises an overflow, underflow or
+division-by-zero error. What the evaluator does not reproduce declines at plan time: `/` anywhere
+but in double precision (integer division truncates, exact-decimal division is exact), `%` in every
+form, and exact-decimal arithmetic over a fractional literal (`0.1 + 0.2 = 0.3` is true in
+PostgreSQL). Literal-only arithmetic such as `1.5 * 2.0` is therefore exact decimal in a condition
+too, and declines there as well.
+
+**Numbers the replica cannot spell back.** A property that holds a number stored in a spelling its
+`float64` does not reproduce ([§6.2](#62-node-properties)) declines in any read: as a condition, a
+returned value, a grouping key, an `ORDER BY` key, inside `IN` or `coalesce`, or as text. Two such
+numbers, 9007199254740992 and 9007199254740993, are one `float64`, so `DISTINCT`, grouping and joins
+would merge them; and PostgreSQL reads `1.0` as the text `'1.0'`, which its integer cast rejects.
+The decline is deliberately broad (even `RETURN n.p` declines), and such properties are rare.
+
 **Comparisons**, operator by operator:
 
 | Operator | PostgreSQL, via DAWGS | BloodTrail |
@@ -1600,31 +1825,45 @@ with at least one of each, which PostgreSQL computes in double precision just as
 | `n.p = []` | `jsonb` equality with the empty list, except that a stored JSON `null` gives unknown | Same |
 | `n.p = 'CN=' + n.q` (text concatenation) | Plain text comparison with the property's text, without the text-type check | Same: the number 5 equals the text `'5'` |
 | `n.p = -5`, `n.p = (5)`, `n.p = 5+0` | A text-then-cast route with different null and error behaviour | Declined at plan time |
-| `n.p < 5`, `n.p > 5.0` | The property's text is cast to the literal's type (64-bit integer or double) | Same cast: the text `"7"` satisfies `n.p > 5`. A value the cast would reject (`"abc"`, or `7.5` against an integer literal) makes PostgreSQL fail the query, so BloodTrail declines |
+| `n.p < 5`, `n.p > 5.0` | The property's text is cast to the type DAWGS infers for the other side: `int8` next to an integer literal or `id()`, `float8` next to a float literal, `int4` next to `size()`, `numeric` next to `datetime()`'s accessors | Same cast: the text `"7"` satisfies `n.p > 5`. A value the cast would reject (`"abc"`, `7.5` against an integer literal, a value outside `int4` next to `size()`) makes PostgreSQL fail the query, so BloodTrail declines |
 | `n.p < n.q`, `n.p < 'b'` | Raw `jsonb` ordering, or text collation | Declined at plan time |
 | `n.p STARTS WITH 'x'`, `ENDS WITH`, `CONTAINS` (a plain property) | `LIKE` over the property's text, with `_`, `%` and `\` in the literal escaped, so the literal matches only itself; under `NOT`, DAWGS rewrites `n.p` as `coalesce(n.p, '')` | Text values are matched literally; absent → unknown; under `NOT`, an absent value is treated as empty text; **any non-text value declines** (BloodTrail does not imitate PostgreSQL's text rendering for these operators) |
 | The same operators on any other text value, with a literal: `toLower(n.name) STARTS WITH 'a_b'`, `coalesce(n.tags, '') CONTAINS 'admin_tier_0'` | `LIKE` with the literal unescaped: `_` matches any one character, `%` any run of characters, `\` escapes the next character; no rewrite under `NOT` | The same `LIKE` matching (the pattern is compiled once per query into an equivalent regular expression); a pattern PostgreSQL rejects (one ending in a lone backslash) declines; under `NOT`, an absent value stays unknown; non-text values decline |
 | `=~` | A regular expression over the property's text; no rewrite under `NOT` | Text values are matched; absent → unknown, under `NOT` too; non-text values decline |
 | `n.p IN ['a', 'b']` | The property's text is compared | Same for text, number and boolean values: the number `12345` matches `'12345'`. A stored list or object equals no element (PostgreSQL's text for it starts with `[` or `{`); if an element itself starts with `[` or `{`, the query declines |
-| `n.p IN [1, 2]` | The property's text is cast to the list's number type, a 64-bit integer for an integer list: the text `'1'` matches 1, while `'1.0'`, `1.5`, `true` or a list is an error | The same cast: the text `'1'` matches 1, and every value the cast rejects declines, with one exception described at the end of this section (a number stored as `1.0`) |
+| `n.p IN [1, 2]` | The property's text is cast to the list's number type, a 64-bit integer for an integer list: the text `'1'` matches 1, while `'1.0'`, `1.5`, `true` or a list is an error | The same cast: the text `'1'` matches 1, and every value the cast rejects declines. A number stored as `1.0` declines as well (above) |
 | `'x' IN n.list` | Every list element is converted to text and cast to the literal's type first (`jsonb_to_text_array`) | Same, element by element; one element that cannot be cast declines, and the left side must be a text or number literal |
 | `coalesce(n.a, 'default') ...` | Each property's text, cast to the type of the literal default | Same; arguments must be properties or literals of one type, and a failed cast declines |
 | `coalesce(n.a, n.b) = 1` (no literal argument) | The call takes the type of what it is compared with: the chosen property's text is cast to the literal's type | Same cast, and a value the cast rejects declines. Inside `IN`, compared with anything but a literal or a text value, or under `IS NULL`, the call declines |
-| Two node variables, `a = b` | Identity | Identity (not property-map equality, which would equate distinct nodes with identical properties) |
+| Two node variables, `a = b` | Identity | Identity (not property-map equality, which would equate distinct nodes with identical properties). A node or relationship variable is compared only with another of its own kind or with `null`; anything else declines (below) |
 
 Between two expressions that are not plain properties, `=` and `<>` are served only when PostgreSQL
 gives both sides the same kind of SQL value: text with text (`toLower(n.name) = 'admin'`), a number
 with a number (`size(n.spn) = 2`), a boolean with a boolean. PostgreSQL either rejects a mixed pair
 or converts one side, so `id(n) = 'a'` or `toLower(n.name) = 1` declines. A plain property is served
 against a literal, another plain property (compared as `jsonb` values) or a text concatenation, and
-against nothing else: `n.p = id(n)` or `n.p = toLower(m.q)` declines.
+against nothing else: `n.p = id(n)` or `n.p = toLower(m.q)` declines. A node or relationship
+variable is a value of its own kind in DAWGS's SQL (a composite row), comparable only with another
+of the same kind or with `null`: `n <> 5` has no operator in PostgreSQL, and `n <> 'a'` makes it
+read the text as a composite, which it refuses.
 
 **Regular expressions.** PostgreSQL's `.` matches a newline; Go's does not by default, so patterns
 are compiled with the `(?s)` flag. DAWGS doubles every backslash in a pattern applied to a property,
 and PostgreSQL's inline-flag syntax differs from Go's, so a pattern containing any backslash, or any
 inline flag group other than a leading `(?i)` or a plain non-capturing group `(?:`, is declined at
-plan time. Go's regular-expression engine (RE2) also rejects some PostgreSQL constructs outright;
-such patterns fail to compile and are declined. The subject must have a text type in PostgreSQL:
+plan time (`PgRegexCompatible`). So are the constructs the two dialects read differently: POSIX
+bracket constructs (`[[:alpha:]]` follows the database's locale in PostgreSQL, where it matches
+`é`, and is ASCII in Go; `[[.a.]]` and `[[=a=]]` do not exist in Go); a repetition bound PostgreSQL
+rejects or reads differently (above 255, unclosed as in `a{1`, or zero-padded as in `a{01}`, a
+bound in PostgreSQL and literal text in Go); a quantifier directly after `^` or `$` (`^*a`, which
+Go accepts and PostgreSQL rejects); and, under `(?i)`, any non-ASCII text in the pattern, because
+PostgreSQL matches a character only against the pattern character's own upper and lower case,
+while Go uses Unicode's whole case-folding set (σ also matches ς). For an ASCII pattern under
+`(?i)` the one remaining difference is in two subject characters, the Kelvin sign and the long s,
+which Go folds onto `k` and `s` and PostgreSQL does not; the matcher replaces them in the subject
+before matching (`pgFoldSubject`), so it answers as PostgreSQL does. Go's regular-expression engine
+(RE2) also rejects some PostgreSQL constructs outright; such patterns fail to compile and are
+declined. The subject must have a text type in PostgreSQL:
 over arithmetic, or a function that returns a number or a list (`(n.v + 1) =~ 'a'`, `id(n) =~ '1'`),
 PostgreSQL raises an error, so the planner declines such a query. A plain property always has a text
 type there, and a stored number or list is matched against its JSON text; BloodTrail does not
@@ -1640,7 +1879,9 @@ differently.
 
 **Names.** Output columns are named the way PostgreSQL reports them: DAWGS writes aliases without
 quotes and PostgreSQL folds unquoted names to lower case, so `RETURN count(u) AS Total` yields a
-column `total`. An unaliased property lookup is named `?column?`, an unaliased count `count`.
+column `total`. An unaliased property lookup is named `?column?`, an unaliased count `count`. The
+same folding makes `ORDER BY X` ambiguous in PostgreSQL when two `RETURN` aliases differ only in
+case, so that declines (`orderByNameMisresolved`, below).
 
 **Collation.** Text is never ordered locally; any comparison or `ORDER BY` whose result depends on
 text order is declined ([§2.6](#26-cypher-and-how-dawgs-translates-it)).
@@ -1653,15 +1894,17 @@ be reproduced exactly:
 | Chained comparison, `1 < n.x < 5` | Cypher reads it as a conjunction; DAWGS emits left-associative SQL, which PostgreSQL evaluates differently or rejects |
 | A list literal containing `null` or a boolean, or mixing text with numbers | DAWGS renders a list as a one-type PostgreSQL array and cannot translate these |
 | A list inside an `IN` list (`n.p IN [[1]]`); a text value `IN` a number list or the reverse (`id(n) IN ['1']`); `IN` something that is not a list (`'a' IN (n.p)`) | PostgreSQL flattens the nested list, or rejects the comparison |
-| Integer `/` or `%` (`n.x / 2`) | PostgreSQL truncates; the evaluator works in floating point. `n.x / 2.0` is served |
+| A list literal with an element that is not a literal, other than a signed number (`n.p IN [x, 3]` with `x` a `WITH` alias, `n.p IN [1, 1 + 1]`, `n.p IN [size(n.l)]`) | DAWGS types the array from its literal elements and casts the rest, or turns the whole test into `false` |
+| `/` outside double precision (`n.x / 2`, `size(n.l) / 2.0`); `%` in any form; exact-decimal arithmetic over a fractional literal (`0.1 + 0.2 = 0.3`) | Integer division truncates and exact decimals are exact, which the evaluator does not reproduce; `%` has no double-precision form at all. `n.x / 2.0` (a property next to a float literal, so double precision) is served |
 | `n.a + n.b` (two properties) | PostgreSQL treats it as text concatenation |
 | Two properties combined with `-`, `*`, `/` or `%` (`n.a * n.b`) | Text times text: PostgreSQL rejects it |
 | A signed property, `-n.p` | DAWGS converts the property to a boolean, which PostgreSQL cannot negate |
 | Integer arithmetic, a numeric literal, arithmetic over float literals alone, or `datetime().epochseconds`/`.epochmillis` in `RETURN` | PostgreSQL returns integer or exact-decimal (`numeric`) columns |
 | `5 = n.p`, `true = n.p` (a number or boolean literal left of a property) | DAWGS parses the property's text as JSON |
 | A property in parentheses in `=`/`<>`, in `<`/`>` against a number, or in arithmetic: `(n.p) = 1`, `(n.p) < 5`, `(n.p) + 1` | The parentheses keep it text: against a number that is an error, and `=`/`<>` would compare text instead of JSON values |
-| A property compared with a bare `WITH` alias: `n.p = x`, `n.p < days` | DAWGS compares the property's text with the alias's column. Arithmetic over the alias has a type and is served, as in the pre-built `n.lastlogontimestamp < (datetime().epochseconds - (inactive_days * 86400))` |
+| A property compared with a bare `WITH` alias: `n.p = x`, `n.p < days`; a property in arithmetic with one: `n.p * x`, `n.p + x` | DAWGS compares the property's text with the alias's column, and leaves the property text in arithmetic (`text * integer`, which PostgreSQL rejects). Arithmetic over the alias alone has a type and is served, as in the pre-built `n.lastlogontimestamp < (datetime().epochseconds - (inactive_days * 86400))`, and so is `n.p * (x * 1)` |
 | `=`/`<>` between a property and a function or arithmetic result (`n.p = id(n)`), or between two values of different SQL types (`id(n) = 'a'`, `toLower(n.name) = 1`) | PostgreSQL converts one side or rejects the comparison |
+| A node or relationship variable compared with a scalar or a list: `n <> 5`, `n = 'a'`, `n IN [1, 2]`, `n <> size(n.p)` | PostgreSQL has no operator between a composite and a number (42883), cannot read the text as a composite (0A000), or cannot cast the composite (42846) |
 | `labels(n)` or `split(...)` compared with `=`/`<>` | DAWGS compares the call's array with the other side: against a single value, PostgreSQL fails the query ("malformed array literal"); against a list, it compares two arrays in order, which the evaluator does not reproduce |
 | `coalesce(n.a, n.b)` (no literal argument) inside `IN`, compared with anything but a literal or a text value, or under `IS NULL` | DAWGS types the call by its surroundings; inside `IN` it becomes the constant `false` |
 | `x IS NULL`/`IS NOT NULL` where `x` is not a plain property | DAWGS drops the test (every row passes) |
@@ -1673,9 +1916,12 @@ be reproduced exactly:
 | An undirected relationship after the first step of a pattern, or between a node and itself (`(a)-->(b)--(c)`, `(a)--(a)`) | DAWGS does not exclude the node the pattern arrived from |
 | `ORDER BY` a text value | Collation |
 | `RETURN DISTINCT … ORDER BY` a key that is not returned | PostgreSQL rejects it ("for SELECT DISTINCT, ORDER BY expressions must appear in select list") |
+| `ORDER BY x` where `x` is both a `RETURN` alias and a variable the query binds (a node, relationship or path, or a carried `COUNT`, `COLLECT` or constant), unless that item is `x` itself; or where two `RETURN` aliases differ only in case | DAWGS sorts by the bound variable, not the alias (so different rows survive a `LIMIT`, and PostgreSQL rejects `RETURN count(u) AS u ORDER BY u`), and PostgreSQL folds the two aliases to one ambiguous name. A path variable is in fact sorted by the alias; declining it too is deliberate. Declining two aliases that differ only in case is right for a path (`MATCH p = … RETURN p, g.v AS P ORDER BY p` is ambiguous in PostgreSQL, 42702) but an over-decline when the sorted name is a node, a relationship or a carried `COUNT`, `COLLECT` or constant that a bare `RETURN` item projects (`WITH g, count(u) AS c RETURN c, g.v AS C ORDER BY c`): DAWGS emits a qualified reference to the binding's own frame column there (`order by s0.i0`), so the fold never reaches PostgreSQL's name resolution and the query is answered (the same select list under `order by c` is 42702), and BloodTrail still declines. The fold decides only for a name no binding carries |
+| `ORDER BY (x)`, an alias in parentheses | DAWGS replaces only a bare name with the column, so `RETURN g.v AS gv ORDER BY (gv)` becomes `order by (i0)`, a column that does not exist |
+| `ORDER BY x` where `x` is a word PostgreSQL reserves (`select`, `table`, `group`, `user`, `left`, …) | DAWGS writes the name unquoted: a syntax error, or for `user`, `true` or `current_date`, a sort by a constant |
 | A backquoted alias (`` AS `My Col` ``) | DAWGS passes the backquotes through, which is invalid SQL, so PostgreSQL rejects the query |
 
-Two known differences remain. The first is in `datetime()`'s epoch accessors (`epochseconds`,
+One known difference in values remains, in `datetime()`'s epoch accessors (`epochseconds`,
 `epochmillis`) inside conditions, such as the pre-built
 `n.lastlogontimestamp < (datetime().epochseconds - (inactive_days * 86400))`. BloodTrail reads the
 BloodHound server's clock once, when execution starts, and uses whole seconds or milliseconds; a
@@ -1684,19 +1930,16 @@ values can differ slightly, so a row very close to the boundary can land on diff
 Returning an epoch accessor as a column is declined, because PostgreSQL returns an exact decimal
 that BloodTrail does not reproduce.
 
-The second is in numbers stored with a decimal point but no fraction, such as `1.0`. PostgreSQL's
-`->>` gives such a number back as the text `'1.0'`, which its 64-bit integer cast rejects, so
-`n.p IN [1, 2]`, `n.p < 5` or `n.p + 1` fails the whole query there, while BloodTrail, which decodes
-the value as the number 1, answers it. BloodHound itself writes such a number as `1`, so only data
-put into PostgreSQL by other means can show the difference.
-
 ### 11.3 What the planner accepts
 
 The planner is **default-deny**: it accepts an explicit list of shapes and declines everything else.
 
 - **Structure.** One `MATCH … RETURN`, or two stages joined by a single `WITH`. Several `MATCH`
-  clauses and comma-separated patterns join on shared variables. Any data-changing clause (`CREATE`,
-  `MERGE`, `SET`, `DELETE`, `REMOVE`) declines: the interpreter is read-only. `UNWIND` declines.
+  clauses and comma-separated patterns join on shared variables, except a pattern that is nothing
+  but an already-bound node (`MATCH (n:A), (n)`, `MATCH (s)-->(t) MATCH (t)`, `OPTIONAL MATCH (u)`),
+  which declines: DAWGS joins it to nothing (`from s0, node n1`), so PostgreSQL returns every row
+  once per node in the graph. Any data-changing clause (`CREATE`, `MERGE`, `SET`, `DELETE`,
+  `REMOVE`) declines: the interpreter is read-only. `UNWIND` declines.
 - **Patterns.** Node kinds; inline literal property maps (`{name: 'x'}` becomes `n.name = 'x'`);
   edge kinds and alternations; directions; fixed and variable-length relationships; named paths
   (`p = …`). An inbound arrow is normalized to an outbound step with a "reversed" flag, so returned
@@ -1706,25 +1949,57 @@ The planner is **default-deny**: it accepts an explicit list of shapes and decli
   pattern arrived from, so `(a)-->(b)--(c)` also returns rows with `c` equal to `b`, and `(a)--(a)`
   matches every edge touching `a`. Relationship properties (`{…}` on an edge, `r.x`) decline, since
   the replica has no edge properties. A missing upper bound means 15 steps; an explicit upper bound
-  is used as written.
-- **Shortest paths.** At most one `shortestPath`/`allShortestPaths` per query, as a single step that
-  shares no connected component with other steps, with a minimum length of 1 and at least one
-  constrained endpoint. An `allShortestPaths` query is served only when its DAWGS translation shows
-  which of PostgreSQL's two answers it gets ([§11.7](#117-executing-the-pattern)).
+  is used as written, except zero (`*..0`, `*1..0`, `*0..0`), which declines: DAWGS's first
+  expansion step emits the one-step rows without consulting the bound, and a shortest-path search
+  with it returns nothing.
+- **Shortest paths.** At most one `shortestPath`/`allShortestPaths` per query, as the only pattern
+  of the query's first stage: nothing may be bound before it (no earlier pattern or `MATCH`
+  clause, no `WITH` before it, not inside an `OPTIONAL MATCH`), and no pattern may follow it in its
+  stage. DAWGS compiles the pattern into a call of its search functions, whose filters run as SQL
+  text that cannot see the query's earlier parts: after an earlier binding, PostgreSQL fails with
+  `42P01` ("missing FROM-clause entry"), or, after a `WITH`, answers only when DAWGS's selectivity
+  model happens to start the search from the side that carries the join. And DAWGS applies a later
+  clause's conditions after the search has picked its paths, where BloodTrail would narrow the
+  endpoints first. The minimum length must be 1, and the pattern's second-written endpoint must be
+  constrained (by a kind, or a property or id condition): without a constraint there, DAWGS's end
+  test becomes a test of whether the node the search starts from has an incoming edge of any kind
+  (an outgoing one when it searches backwards), which drops the one-hop paths of every start
+  without one. A bare first-written endpoint is fine. An `allShortestPaths` query is served only
+  when its DAWGS translation shows which of PostgreSQL's two answers it gets
+  ([§11.7](#117-executing-the-pattern)).
 - **`OPTIONAL MATCH`.** One, as the last reading clause of a single-stage query or of the stage
   before a `WITH` (one after a `WITH` is declined when executed), after a mandatory `MATCH`, sharing
-  at least one node variable with it. With an `OPTIONAL MATCH` present, `RETURN` may list bare
-  variables and `COUNT` aggregates grouped by node variables or by properties of mandatory nodes,
-  and there is no `ORDER BY`.
+  at least one node variable with it. The optional pattern must be one pattern of one step, fixed
+  or variable-length, and not a shortest path: DAWGS inner-joins every hop but the last, so a longer
+  optional pattern drops rows a left join would keep. A fixed step between two nodes the mandatory
+  part bound declines too: DAWGS joins the node table again with a condition that does not mention
+  it, so each match comes back once per node in the graph. Every node of the mandatory pattern must
+  be shared with the optional pattern or named by the projection that follows (the `WITH`, or the
+  `RETURN`, as a bare variable, a grouping key or a `COUNT`/`COLLECT` argument), unless that
+  `RETURN` is `DISTINCT` without aggregates: DAWGS carries only the nodes the rest of the query
+  refers to into its left join, so rows that differ only in another node are repeats to it, and its
+  join multiplies them (`optionalJoinKeysEveryMandatoryNode`). With an `OPTIONAL MATCH` present,
+  `RETURN` may list bare variables and `COUNT` aggregates grouped by node variables or by properties
+  of mandatory nodes, and there is no `ORDER BY`.
 - **`WITH`.** Bare variables (the grouping keys), `DISTINCT`, and aliased `COUNT(x)`,
   `COUNT(DISTINCT x)`, `COUNT(*)`, `COLLECT(node)` and literal text or number constants. A `null` or
   boolean constant declines, and so does a `WITH` that carries only constants after a `MATCH`: DAWGS
   computes such a `WITH` once rather than once per matched row, so `MATCH (n) WITH 60 AS d RETURN d`
   returns one row in PostgreSQL. A query may still open with one, as several pre-built queries do
   (`WITH 60 as inactive_days MATCH …`). A `COLLECT` alias may only be used as `x IN alias` /
-  `NOT x IN alias` in a condition; that is the "anti-join" shape of the pre-built "Domain Admins
-  logons to non-Domain Controllers". `WITH … WHERE`, ordering or limits on `WITH`, and
-  `SUM`/`AVG`/`MIN`/`MAX` decline.
+  `NOT x IN alias` in a condition, with neither operand in parentheses (DAWGS turns `x IN (alias)`
+  and `(x) IN alias` into plain comparisons, which PostgreSQL rejects); that is the "anti-join"
+  shape of the pre-built "Domain Admins logons to non-Domain Controllers". `WITH … WHERE`, ordering
+  or limits on `WITH`, and `SUM`/`AVG`/`MIN`/`MAX` decline.
+- **Pattern predicates.** `WHERE (a)-[:K]->(b)` and its negation: one fixed step, without a
+  relationship variable or properties, whose endpoints are bound variables or anonymous nodes that
+  may carry labels (`NOT (u)-[:MemberOf]->(:Group)`), at least one of them bound. Only in a query
+  stage made of a single `MATCH` clause: in a stage with several `MATCH` clauses or an
+  `OPTIONAL MATCH`, DAWGS places every pattern predicate inside the named subquery
+  (`s2 as (select …)`) that the stage's last clause is still defining, and refers to that subquery
+  by name from inside it, which PostgreSQL rejects (`42P01`). Undirected with a labelled anonymous
+  end, `(a)-[:K]-(:L)`, the far node must be another node, as in DAWGS's SQL: a self-loop on `a`
+  does not satisfy it.
 - **`RETURN`.** Variables, property lookups, supported function calls, text and boolean literals,
   and arithmetic built from properties and float literals, with at least one of each
   ([§11.2](#112-matching-dawgss-semantics)). `COUNT` aggregates may appear directly in `RETURN`; the
@@ -1783,7 +2058,10 @@ planner tries to turn it into a candidate set:
   missing. `n.p IN ['a', 'b']` unions equality lookups. Every text condition other than plain
   equality first requires `StringValuesOnly`
   ([§6.3](#63-read-indexes-that-postgresql-does-not-have)), because PostgreSQL matches those
-  operators against the text of *any* value, which the string index does not hold.
+  operators against the text of *any* value, which the string index does not hold. On a property in
+  parentheses, `(n.p) STARTS WITH 'a_b'`, DAWGS passes the literal into `LIKE` unescaped, as for
+  `COALESCE` below, so the lookup uses the same stretch of plain text every match must carry (or no
+  lookup at all), never the literal itself: `aXb2` matches that pattern too.
 - **`COALESCE`.** BloodHound often writes `COALESCE(n.system_tags, '') CONTAINS 'admin_tier_0'` (26
   of the 183 pre-built entries in BloodHound v9.6.0 use `COALESCE`, 19 of them in this
   `COALESCE(x, '') CONTAINS` form), meaning "treat a missing property as empty text". Such a
@@ -1851,9 +2129,11 @@ floating point, so a huge product cannot overflow into an affordable-looking num
 **Variable-length steps** reproduce DAWGS's recursive query:
 
 - **trails**: an edge may not repeat within one path, but a node may;
-- the depth counts edges, the maximum is the written upper bound (15 when there is none), and the
-  minimum is applied when paths are emitted;
-- every distinct trail is a separate result;
+- the depth counts edges, the maximum is the written upper bound (15 when there is none; a written
+  zero declines, [§11.3](#113-what-the-planner-accepts)), and the minimum is applied when paths are
+  emitted;
+- every distinct trail is a separate result, and a zero-length row of a `*0..` step, bound to a
+  path variable, is the one-node path of its start node, as DAWGS builds it;
 - conditions on the far endpoint are applied to emitted paths, not used to prune the walk, except
   for one safe shortcut: a neighbour that can neither continue (checked with a binary search in the
   edge-kind index) nor be a valid end is not explored, because it could only produce nothing.
@@ -1886,7 +2166,8 @@ fire, so serving is exactly equivalent. Active Directory data normally has no se
 self-loop does not clear the hazard until the next compaction.
 
 **Shortest paths inside Cypher** resolve both endpoints (a list of ids for narrowed endpoints, a
-kind bitset for kind-only endpoints, "every node" for unconstrained ones) and call the search engine
+kind bitset for kind-only endpoints, "every node" for an unconstrained one, which can only be the
+pattern's first-written endpoint, [§11.3](#113-what-the-planner-accepts)) and call the search engine
 of [Section 9](#9-the-shortest-path-engine). `shortestPath` uses the one-per-pair mode. For
 `allShortestPaths`, the interpreter must pick one of PostgreSQL's two answers
 ([§2.6](#26-cypher-and-how-dawgs-translates-it)), and it does not predict DAWGS's choice: it reads
@@ -1908,10 +2189,55 @@ is first resolved to its exact list of matching nodes.
 Without an explicit `s <> t` (or `id(s) <> id(t)`), overlapping endpoint sets are declined, and
 PostgreSQL answers, or raises its own error. The overlap test binary-searches the endpoint id lists,
 so they are always kept in ascending order; an earlier version passed an `IN`-list's matches in the
-order they were written, missed an overlap, and served a query PostgreSQL rejects. The search's row
-and memory limits are derived from the remaining work budget; finding more paths than affordable
-declines the query rather than truncating it. When the search itself enforces every remaining
-condition, the query's own `LIMIT` is also passed into it (below).
+order they were written, missed an overlap, and served a query PostgreSQL rejects. Because
+PostgreSQL may evaluate its check before the start's conditions have narrowed the starts
+([§2.6](#26-cypher-and-how-dawgs-translates-it)), the engine also declines when a node that matches
+only the *kinds* of one side lies in the other side's set and has an edge the search would walk
+from it (`kindLevelSelfEndpoint`). That is still narrower than PostgreSQL's behaviour, which depends
+on its plan: on small test graphs it has raised the error over edges the search never walks,
+naming nodes that were not starts at all. A sound rule would decline the pre-built "Shortest paths
+to Domain Admins from Kerberoastable users" on any real Active Directory graph, so it is not
+applied: where PostgreSQL answers such a query, BloodTrail's answer is the same, but on some plans
+PostgreSQL raises the error for a query BloodTrail answers.
+
+With an explicit `s <> t`, overlapping sets still decline in two modes whose answer the shared nodes
+decide. In the overall-shortest `allShortestPaths` mode, PostgreSQL's search keeps no record of
+visited nodes, so a path from a shared node back to itself can set the shortest length, and `s <> t`
+removes that path only afterwards, often leaving nothing; the engine never walks a pair back to
+itself, so it would answer from the next pair's length. And a `shortestPath` whose endpoints both
+carry a property or id condition, under a bare `LIMIT`: DAWGS then lists the pairs as the plain
+product of the two sets, a shared node's own pair included, and passes the `LIMIT` into the search,
+which counts that pair toward it before `s <> t` removes it, so PostgreSQL returns fewer rows than
+the limit. All of these decline with reason `self_endpoint` (`ErrSelfEndpoint` in
+[`expand.go`](internal/engine/interpret/expand.go)).
+
+The overall-shortest rule is deliberately broader than the divergence it covers: the two answers
+differ only when a shared node's shortest cycle over the pattern's own edge kinds is *strictly
+shorter* than the shortest pair of two different nodes, and any shared node at all declines
+instead. Establishing the narrower condition would cost one cycle search per shared node — with one
+endpoint unconstrained, one per node of the other side, more work than the query itself — so the
+broad rule stands. Declining is always safe.
+
+The search's row and memory limits are derived from the remaining work budget, capped by the
+live-row budget ([§11.9](#119-budgets)); finding more paths than affordable declines the query
+rather than truncating it. When the search itself enforces every remaining condition, the query's
+own `LIMIT` is also passed into it (below).
+
+The live-row cap is what keeps those two limits honest. The set of paths the search returns is
+converted row by row, and that conversion refuses any set larger than `maxCypherLiveRows`, so a
+component with more paths than that declines whatever the search was allowed to collect — but it
+declines only after the search has already built the whole set. Derived from the remaining work
+alone, the limits allowed about 268 million paths and roughly 60 GiB before anything refused; a
+path together with the row it is converted into was measured to cost about 465 bytes of resident
+memory — about 85 of them the path itself ([§9.4](#94-limits-and-engineering-details)), the rest
+the row — so a query could have reached tens of gigabytes resident in a process that already
+holds the whole graph in memory. Capping both
+limits at the live-row budget moves the same refusal in front of that work: about 2 million paths
+and 458 MiB at the default maximum depth, a reduction of about 134 times. Nothing that served
+before stops serving, because the cap is exactly the largest set the conversion would have
+accepted. The byte cap still scales with the query's own resolved depth, so a query carrying an
+explicit deep range keeps its proportional room — a flat ceiling tight enough to matter at depth
+15 would have refused one that works today.
 
 None of the pre-built queries in BloodHound v9.6.0 uses `allShortestPaths` (the shortest-path
 entries all use `shortestPath`), and the pathfinding page always asks about one pair, so the two
@@ -1924,8 +2250,9 @@ earlier version returned 9 nodes and 8 edges where PostgreSQL returned 3 and 2.
 For a single-stage query the order is: match, filter with `WHERE`, then join the `OPTIONAL MATCH`.
 For a two-stage query, the `WITH` stage (grouping, counting, collecting, or passing rows through)
 runs next, and the second `MATCH` is evaluated **once per row carried over**, as PostgreSQL does
-when it joins the first stage's result against the next pattern. Then come `RETURN` grouping,
-projection, `DISTINCT`, `ORDER BY`, and `SKIP`/`LIMIT`.
+when it joins the first stage's result against the next pattern; its `WHERE` is applied to each
+carried row's matches before they accumulate (`crossJoinCarried`), so only the surviving rows are
+held. Then come `RETURN` grouping, projection, `DISTINCT`, `ORDER BY`, and `SKIP`/`LIMIT`.
 
 - **`OPTIONAL MATCH`** runs after the mandatory `WHERE`. The optional pattern is searched once,
   starting only from the nodes the mandatory part bound (a code comment records 89 ms for the
@@ -1933,7 +2260,9 @@ projection, `DISTINCT`, `ORDER BY`, and `SKIP`/`LIMIT`.
   with no optional match keep their optional variables empty. Two rarer situations decline at run
   time: the same combination of mandatory nodes appearing on several rows while also having optional
   matches (DAWGS's SQL would multiply those rows), and an empty optional variable used later in a
-  pattern condition.
+  pattern condition. The first test compares every mandatory node, which matches DAWGS only because
+  the planner has already made sure every mandatory node is part of DAWGS's join
+  ([§11.3](#113-what-the-planner-accepts)).
 - **Grouping.** Groups are keyed by node and edge identity, with −0 normalized to 0 and object keys
   sorted, and an absent property and a JSON-null property form **different** groups, as they do in
   PostgreSQL. `COUNT(x)` skips rows where `x` is empty (so an `OPTIONAL MATCH` that found nothing
@@ -1951,17 +2280,21 @@ projection, `DISTINCT`, `ORDER BY`, and `SKIP`/`LIMIT`.
   batches of 1,024, and processing stops as soon as enough rows have passed the `WHERE` clause.
   Counting filtered rows, not candidates, avoids returning too few when `WHERE` is selective.
   `bench/cypherbench`'s `flag_scan` shape was about 25 times slower than PostgreSQL before this
-  existed. The reverse variable-length walk and the shortest-path search take the `LIMIT` directly,
-  but only when every condition in the `WHERE` clause is one the walk or search has itself enforced
-  on every row it produces (`noResidualWhere`; each route reports which conditions it enforces). A
-  condition being attached to an endpoint is not enough. The reverse walk checks every condition on
-  its near end, not just its kinds, before it emits a row; an endpoint inequality such as `a <> t`
-  is never checked by a walk, so it keeps the `LIMIT` out. The shortest-path search enforces an
-  endpoint's conditions only when that endpoint was resolved to an exact list of nodes; one handed
-  over as a kind bitset enforces only the kind tests folded into it, so a kind disjunction or a
-  negation there keeps the `LIMIT` out (the search does enforce `s <> t` itself). Before this was
-  made precise, both routes stopped after `LIMIT` rows of which the `WHERE` clause then dropped
-  some, and returned fewer rows than PostgreSQL:
+  existed. The node a batch's candidates are listed for and the node the walk of each candidate
+  starts from are one decision (`componentAnchorSym`), as they must be: when a named path over a
+  branching chain once took them from two different rules, the walk started from a node nothing had
+  bound, and `RETURN p LIMIT 10` returned no rows at all. A step whose start is unbound is now an
+  executor error, so the query declines (`errUnboundSymbol`). The reverse variable-length walk and
+  the shortest-path search take the `LIMIT` directly, but only when every condition in the `WHERE`
+  clause is one the walk or search has itself enforced on every row it produces (`noResidualWhere`;
+  each route reports which conditions it enforces). A condition being attached to an endpoint is not
+  enough. The reverse walk checks every condition on its near end, not just its kinds, before it
+  emits a row; an endpoint inequality such as `a <> t` is never checked by a walk, so it keeps the
+  `LIMIT` out. The shortest-path search enforces an endpoint's conditions only when that endpoint
+  was resolved to an exact list of nodes; one handed over as a kind bitset enforces only the kind
+  tests folded into it, so a kind disjunction or a negation there keeps the `LIMIT` out (the search
+  does enforce `s <> t` itself). Before this was made precise, both routes stopped after `LIMIT`
+  rows of which the `WHERE` clause then dropped some, and returned fewer rows than PostgreSQL:
   `(t:Group)<-[:MemberOf*1..]-(a) WHERE (a:User OR a:Computer) … LIMIT 5` counted a nested group
   toward the five and returned four.
 - **Fast paths.** `MATCH (u:User) RETURN count(u)` is answered from the kind bitset's member count.
@@ -1974,13 +2307,21 @@ projection, `DISTINCT`, `ORDER BY`, and `SKIP`/`LIMIT`.
 | Budget | Value | What it bounds |
 |---|---|---|
 | Result rows (`maxCypherRows`) | 100,000 | Rows in the final answer |
-| Work (`maxCypherWork`) | 2²⁸ (about 268 million) units | One unit per candidate node looked at, per edge inspected, per row produced; checked every 1,024 units |
+| Work (`maxCypherWork`) | 2²⁸ (about 268 million) units | One unit per candidate node looked at, per edge inspected, per row produced; checked every 1,024 units, a check that also stops a request whose context was cancelled |
 | Live rows (`maxCypherLiveRows`) | 2,000,000 | The largest intermediate row set held at once; this is what bounds memory. It was added after one benchmark query under an aggregate grew to 6.7 GiB and was killed for lack of memory |
 
 Exceeding any budget declines the query; the interpreter never returns a partial answer. Where
 possible the check happens before the work: the size of a cartesian product is charged before it is
 built, a named "V-shaped" path's fan-out is estimated from the anchor's degree, and a large
-kind-only scan with `ORDER BY` whose kind exceeds the row budget declines before scanning.
+kind-only scan with `ORDER BY` whose kind exceeds the row budget declines before scanning. A second
+`MATCH` after a `WITH` that shares no variable with the first stage is the same kind of product:
+it is refused as soon as its first carried row shows the product cannot fit the work budget, and
+the rows it holds while it runs are charged to the live-row budget — the carried row's match
+first, before it is cloned into one merged row per match, since the two are the same size and one
+seed holds both. So are the rows the early-termination driver keeps across its batches, and the
+extra rows a step between two already bound nodes fans out into. (Before these were charged, a
+cross join after `WITH` held its whole product, 2.25 million rows for 1,500 × 1,500, to keep
+1,500.)
 
 ### 11.10 The translate gate
 
@@ -2009,22 +2350,32 @@ in review.
 **Code.** [`plan.go`](internal/engine/interpret/plan.go): `Plan`, `Query`, `Part`, `Step`,
 `NodeConstraint`, `HasAllShortestPaths`, the extractors (`extractStringAnchor`,
 `extractValueAnchor`, `extractRegexAnchor`, `coalescePropOpLiteral`, `likeCoalesceAnchor`), the
-parity checks (`equalityShapeServed`, `sqlClassOf`, `relationalComparisonSafe`, `likeNeedleServed`,
-`projectionTypingOK`, `isFloat8Arithmetic`), `desugarReturnAggregates`.
-[`exec.go`](internal/engine/interpret/exec.go): `Execute`, `Budgets`, `rankOf`,
-`chooseAnchorHinted`, `scanAnchorVisitReusing`, `chainWalkReversed`.
-[`expand.go`](internal/engine/interpret/expand.go): `varLengthReverseEligible`, `kindOnlyPredicate`,
-`expandVarLengthTrailsForSeed`, `expandVarLengthTrailsToSeed`, `expandShortestPathComponent`,
-`resolveEndpoint`, `kindBitmapEnforces`, `reverseTrailRowCap`, `shortestPathLimit`,
-`noResidualWhere`. [`pipeline.go`](internal/engine/interpret/pipeline.go): `runQuery`,
-`componentPrefersReverseSeeding`, `limitChunk`, `runKindCount`, `runDistinctStreaming`,
-`countAggregate`, `leftJoinOptional`. [`eval.go`](internal/engine/interpret/eval.go) and
-[`value.go`](internal/engine/interpret/value.go): expression evaluation and the value model
-(`Env.AllShortestPerPair`, `likeNeedle`, `inCastProperty`, `evalListLiteralEquality`,
-`untypedCoalesce`, `parseLikePattern`). [`regexfast.go`](internal/engine/interpret/regexfast.go):
-`RegexMatcher`, `PgRegexCompatible`. [`serve_cypher.go`](internal/engine/serve_cypher.go): budgets,
-`safeExecuteCypher`, `projectionValueKinds`, `buildCypherRowsResult`.
-[`gate.go`](internal/engine/gate.go): `translateGate`, `harnessSemantics`, `snapshotKindMapper`.
+parity checks (`equalityShapeServed`, `sqlClassOf`, `classesComparable`, `checkInOperands`,
+`checkPropertyLookup`, `checkPatternPredicate`, `relationalComparisonSafe`, `likeNeedleServed`,
+`projectionTypingOK`, `isFloat8Arithmetic`, `orderByNameMisresolved`), the shape rules
+(`addPatternPart`, `addShortestPathPart`, `finalizeShortestPaths`, `buildStep`, `planOptionalPart`,
+`optionalJoinKeysEveryMandatoryNode`), `desugarReturnAggregates`.
+[`sqlnum.go`](internal/engine/interpret/sqlnum.go): the PostgreSQL types of numbers (`sqlNum`,
+`dawgsHint`, `printedFloatSQLNum`, `negatedLiteralSQLNum`, `numericStepServed`,
+`integerArithmetic`, `float8Arithmetic`). [`exec.go`](internal/engine/interpret/exec.go):
+`Execute`, `Budgets`, `workMeter`, `rankOf`, `chooseAnchorHinted`, `scanAnchorVisitReusing`,
+`chainWalkReversed`, `boundNode`. [`expand.go`](internal/engine/interpret/expand.go):
+`varLengthReverseEligible`, `kindOnlyPredicate`, `expandVarLengthTrailsForSeed`,
+`expandVarLengthTrailsToSeed`, `expandShortestPathComponent`, `ErrSelfEndpoint`,
+`kindLevelSelfEndpoint`, `pairFilterEndpoint`, `resolveEndpoint`, `kindBitmapEnforces`,
+`reverseTrailRowCap`, `shortestPathLimit`, `noResidualWhere`.
+[`pipeline.go`](internal/engine/interpret/pipeline.go): `runQuery`, `componentAnchorSym`,
+`componentPrefersReverseSeeding`, `limitChunk`, `crossJoinCarried`, `runKindCount`,
+`runDistinctStreaming`, `countAggregate`, `leftJoinOptional`.
+[`eval.go`](internal/engine/interpret/eval.go) and [`value.go`](internal/engine/interpret/value.go):
+expression evaluation and the value model (`Env.AllShortestPerPair`, `Env.Ctx`,
+`evalArithmeticTyped`, `parseFloat8Text`, `likeNeedle`, `inCastProperty`, `hasKindedNeighbor`,
+`evalListLiteralEquality`, `untypedCoalesce`, `parseLikePattern`).
+[`regexfast.go`](internal/engine/interpret/regexfast.go): `RegexMatcher`, `PgRegexCompatible`,
+`pgBracketsAndBoundsAgree`, `pgFoldSubject`. [`serve_cypher.go`](internal/engine/serve_cypher.go):
+budgets, `safeExecuteCypher`, `cypherExecReason`, `projectionValueKinds`, `projectsTextColumn`,
+`buildCypherRowsResult`, `mapCypherJSONObjectValue`. [`gate.go`](internal/engine/gate.go):
+`translateGate`, `harnessSemantics`, `snapshotKindMapper`.
 
 ---
 
@@ -2055,27 +2406,43 @@ cascade, or never created because part of a batch failed, so all of those are ha
 code. The replica converges to exactly what PostgreSQL committed for the touched keys, without
 knowing *how* PostgreSQL got there.
 
-Two writes cannot be described as a list of keys, because their affected rows are not known in
-advance: `DeleteNodesByKinds(include, exclude)` and `DeleteRelationshipsByKinds(kinds)`. These are
-recorded as **instructions** and carried out against the view with the same rules as DAWGS's SQL: a
-node-kind delete removes nodes that have any `include` kind (all nodes if `include` is empty) and no
-`exclude` kind, together with their edges.
+Some writes cannot be described as a list of keys, because their affected rows are not known in
+advance: `DeleteNodesByKinds(include, exclude)`, `DeleteRelationshipsByKinds(kinds)`, and a builder
+`Delete` on relationships filtered only by edge kind. These are recorded as **criteria**, and the
+criteria choose which rows of the current view to read back: every live node with any `include` kind
+(every live node if `include` is empty) and no `exclude` kind, the same rule as DAWGS's SQL, or
+every edge of the named kinds, including the delta's edges whose endpoint has not arrived yet
+([§6.7](#67-fold)). Those rows are re-read by id like any other key (`viewCandidates`,
+`rereadByID`): a row PostgreSQL deleted comes back absent and is tombstoned (a node with all its
+edges), and a row PostgreSQL kept comes back present and is staged as it is now. The view only
+chooses *which* rows to ask about; the answer is always PostgreSQL's. That matters because a
+kind-scoped delete races other writers: a row of the deleted kind that another writer committed
+after the `DELETE`'s snapshot, and whose apply ran first, must survive. An earlier version carried
+the delete out against the view as an instruction ("tombstone every edge of kind K") and erased such
+rows while staying SERVING. With read-back the result no longer depends on the order in which
+concurrent writes are applied, and the one key a read-back cannot resolve -- an objectid-keyed edge
+BOTH of whose endpoints are named by neither PostgreSQL nor the view, so that neither one can
+anchor a lookup of the edge -- is a reload rather than a missing row
+([§12.3](#123-reading-back)). A delete whose criteria name
+more rows than PostgreSQL deleted costs only extra re-reads. Enumerating the candidates scans the
+view's kind bitsets (or every node for an empty `include`) or the edge-kind column once, inside
+`Apply`; it never touches a query's read path, and the re-reads go 50,000 ids per round trip.
 
-The replay must also name kinds the way PostgreSQL does. The replica learns kind names when its base
-is built and from the rows that writes bring back, but PostgreSQL can know more: an OpenGraph upload
-registers its source kind before it writes any node, so a failed upload leaves a kind that
+The criteria must also name kinds the way PostgreSQL does. The replica learns kind names when its
+base is built and from the rows that writes bring back, but PostgreSQL can know more: an OpenGraph
+upload registers its source kind before it writes any node, so a failed upload leaves a kind that
 PostgreSQL knows and no row carries, and BloodHound's "delete sourceless data" then names it as an
-`exclude` kind. So during read-back, any kind an instruction names that the view does not know is
-looked up in PostgreSQL's kind table, the kinds found are added to the new segment, and the replay
-matches nodes and edges by kind id. (Before this, that delete switched the engine to FALLBACK and a
-full reload, although PostgreSQL's own delete was correct.) A kind unknown to PostgreSQL as well
-behaves as it does with the plain PostgreSQL driver: as an `include` kind, or in an edge-kind
-delete, it matches nothing, and as an `exclude` kind it makes DAWGS's PostgreSQL driver refuse the
-delete before sending any SQL, and a refused delete is never replayed. If the replay ever meets an
-`exclude` kind it still cannot resolve, it does not guess: the engine enters FALLBACK.
+`exclude` kind. So during read-back, any kind the criteria name that the view does not know is
+looked up in PostgreSQL's kind table (`resolveCriteriaKinds`), the kinds found are added to the new
+segment, and candidates are matched by kind id. (Before this, that delete switched the engine to
+FALLBACK and a full reload, although PostgreSQL's own delete was correct.) A kind unknown to
+PostgreSQL as well behaves as it does with the plain PostgreSQL driver: as an `include` kind, or in
+an edge-kind delete, it matches nothing, and as an `exclude` kind it makes DAWGS's PostgreSQL driver
+refuse the delete before sending any SQL, and a refused delete records nothing. If read-back ever
+meets an `exclude` kind it still cannot resolve, it does not guess: the engine enters FALLBACK.
 
-An instruction cannot be corrected by read-back, so it is recorded only after PostgreSQL reports
-that the delete succeeded.
+Criteria are recorded only after PostgreSQL reports that the delete succeeded; a delete that failed
+in a way that may have taken effect records a fallback instead ([§5.5](#55-the-write-side)).
 
 ### 12.2 What the observers record
 
@@ -2084,26 +2451,38 @@ that the delete succeeded.
 | Transaction `CreateNode`, `CreateRelationshipByIDs` | The id PostgreSQL returned (after success) |
 | Transaction `UpdateNode`, `UpdateRelationship` | The entity's id |
 | Builder `Update`/`Delete` on nodes; `Update` on relationships | The ids of an `id(n) IN $ids` (for relationships, `id(r) IN $ids`) filter; any other filter is a fallback |
-| Builder `Delete` on relationships | The kinds, if the filter is only relationship-kind matchers (recorded after success, as an instruction); anything else is a fallback |
-| Batch `CreateNode` | The preset id if there is one, else the text `objectid`, else a fallback |
-| Batch `CreateNodes` | Every returned id |
+| Builder `Delete` on relationships | The kinds, if the filter is only relationship-kind matchers (recorded after success, as criteria): the kinds every matcher lists, since DAWGS ANDs them, and nothing at all when no kind is in all of them (that delete removed nothing); anything else is a fallback |
+| Builder `Query`/`Fetch` on nodes, `Query` on relationships, with an updating clause in the final criteria | A fallback |
+| Batch `CreateNode` | The preset id if there is one, else the text `objectid`, else a fallback (recorded before the create, which DAWGS buffers) |
+| Batch `CreateNodes` | Every returned id; a fallback if the call fails |
 | Batch `DeleteNode`, `DeleteRelationship`, `UpdateNodes` | The ids |
 | Batch `UpdateNodeBy` (ingest's node upsert) | The `objectid`, if the identity properties are exactly `["objectid"]`; otherwise a fallback |
 | Batch `CreateRelationship`, `CreateRelationshipByIDs` | The (start, end, kind) triple; a batch insert does not return the new id |
 | Batch `UpdateRelationshipBy` (ingest's edge upsert) | The (start objectid, end objectid, kind) triple and both objectids, if both endpoints are identified by exactly `["objectid"]`; otherwise a fallback |
-| `DeleteNodesByKinds`, `DeleteRelationshipsByKinds` | The instruction (after success) |
+| `DeleteNodesByKinds`, `DeleteRelationshipsByKinds` | The criteria (after success) |
 | `Run`, `WipeGraph`, `SetDefaultGraph`, `Raw`, `WithGraph`, data-changing Cypher in a write transaction | A fallback |
 | Any write made through a *read* transaction ([§5.4](#54-the-read-side)) | A fallback |
 
 Recording a key *before* the write runs is safe even if the write then fails, because read-back
 reports what actually exists. Transaction creates and batch `CreateNodes` record *after* success,
-because the id is known only then; batch relationship creates record their (start, end, kind) triple
-up front.
+because the id is known only then. Batch relationship creates record their (start, end, kind)
+triple up front, and batch `CreateNode` its key: DAWGS's batch keeps a node whose flush failed and
+can still create it at a later flush. A failed batch `CreateNodes` records a fallback, because DAWGS
+runs it as a transaction of its own whose `COMMIT` can fail after PostgreSQL made it durable.
+
+A batch that returned an error also has that fact recorded alongside its keys
+(`settleBatchOutcome`, `ChangeSet.RecordWriteIncomplete`), which asks for nothing by itself and is
+not a fallback. It exists for the one key shape where "PostgreSQL has no such row" is ambiguous
+rather than benign -- an objectid-keyed edge whose endpoints match nothing and whose edge therefore
+cannot be looked up either ([§12.3](#123-reading-back)) -- since what that means depends entirely
+on whether the write that recorded it got as far as creating the row.
 
 ### 12.3 Reading back
 
-`readBack` ([`readback.go`](internal/engine/readback.go)) runs these queries on the pool, after
-commit:
+`readBack` ([`readback.go`](internal/engine/readback.go)) runs these queries after commit, on the
+write path's own pool ([§5.2](#52-registration-and-open)): a mid-batch `Commit` applies while its
+batch still holds a connection from BloodHound's pool, and a second connection from that pool is
+what saturated writers once waited on each other for.
 
 ```sql
 -- nodes by id, in chunks of 50,000
@@ -2116,16 +2495,118 @@ SELECT id, start_id, end_id, kind_id FROM edge WHERE graph_id = $1 AND id = ANY(
 -- edges by (start, end, kind), in batches of 500 triples
 SELECT id, start_id, end_id, kind_id, properties FROM edge WHERE graph_id = $1
        AND (start_id, end_id, kind_id) IN (VALUES ($2::bigint, $3::bigint, $4::smallint), ...)
+-- edges by ONE endpoint and kind, for a triple whose other endpoint cannot be named;
+-- $4 is 5,001, one past the fan-out cap (mirrored on start_id)
+SELECT id, start_id, end_id, kind_id FROM edge WHERE graph_id = $1
+       AND end_id = ANY($2) AND kind_id = $3 LIMIT $4
 ```
 
-Edge triples keyed by objectid take their endpoint ids from the objectid results. Kind names are
-mapped to ids in one batch; if the batch fails, each name is looked up on its own, so one bad name
-affects only its own entries, and a cancelled request counts as a read-back error. For an edge
-triple, a kind that cannot be mapped is treated as "no such edge", so the worst case is a missed new
-edge, never a wrong tombstone. The same lookup resolves every kind a delete-by-kind instruction
-names that the view does not know ([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids
-the view has not seen before (kinds registered at runtime) are resolved and added to the segment,
-together with the kinds found for instructions. Any read-back error switches the engine to FALLBACK.
+Edge triples keyed by objectid take their endpoint ids from the objectid results. An objectid that
+matches no row any more does not mean its node is gone: a node whose objectid was only rewritten
+keeps its id, its row and its edges. So every node the view knows under such an objectid joins the
+candidates of [§12.1](#121-record-the-keys-then-read-back-the-truth) and is re-read by id, with the
+same `id = ANY($2)` query as the other candidates; only one that is really absent is tombstoned,
+with its edges. A triple with such an endpoint waits for that re-read and is then resolved against
+it (`rekeyedTripleKeys`): a re-key changes no node id, so a node that comes back present under the
+old objectid is the id the upsert resolved that objectid to, and the triple is queried for it in a
+second batch pass. An endpoint that is really gone needs nothing, because its own tombstone takes
+its edges with it. What is left is a triple with an endpoint nobody can name: a node the replica has
+not applied yet whose objectid another writer has already re-keyed, which PostgreSQL's objectid
+lookup and the view are both silent about. The upsert's own new endpoint is one way to be in that
+state, and so is an endpoint another write created whose apply has not run yet, since applies run in
+the order their calls finish, not the order their writes committed
+([§12.1](#121-record-the-keys-then-read-back-the-truth)).
+
+**One nameable endpoint: stop inferring, find the edge.** Such a triple is not an unanswerable
+question as long as it still has ONE endpoint that can be named, because that endpoint and the edge
+kind are two thirds of the edge table's own unique key. So read-back stops reasoning about whether a
+committed edge is hiding behind the unnameable objectid and asks PostgreSQL for the edges on the
+endpoint it *can* name, with the kind it already resolved (`readBackEdgesByEndpoint`, the last query
+of the block above). An edge that comes back names its other endpoint by id, and that node is read
+back by id like any other candidate, so the endpoint nobody could name never has to be named at all.
+Both the edges and those nodes are then staged.
+
+Nothing about this is a judgment call, which is the point. Everything staged is PostgreSQL's own
+committed state, read after the write committed, exactly like every other read-back query, so a
+result that covers more edges than the triple asked about is correct too -- a wider set of present
+rows restages present rows. And a fan-out that comes back EMPTY is PostgreSQL saying there is no
+such edge: the benign outcome for a write that failed before creating its endpoint, and the
+deleted-endpoint case for one that committed cleanly. The two no longer have to be told apart, so
+this shape needs no fallback at all, whatever the write reported, and the clean commit that used to
+cost a reload here no longer does. DAWGS's schema declares `edge (start_id, kind_id) include (id,
+end_id)` and `edge (end_id, kind_id) include (id, start_id)`, so either direction is an index-only
+scan on the graph's own partition.
+
+One endpoint and one kind do not bound a result, though: every user in a domain is `MemberOf` the
+same "Domain Users" group, so a hub endpoint can carry hundreds of thousands of edges of one kind.
+The query therefore carries a `LIMIT` of one past a cap of 5,000 rows -- the same per-round-trip
+budget the objectid lookup that produced its keys works in, and a deliberately conservative one,
+since every read-back query runs with the publishing mutex held. A fan-out over the cap stages
+nothing and records a fallback instead of a partial set, which is a reload rather than a silently
+incomplete answer.
+
+**Neither endpoint nameable: what the write reported still decides.** A triple whose *both*
+endpoints are unnameable has no anchor to query on, and there the old split stands. An upsert that
+committed cleanly provably created or updated its endpoint nodes, so an objectid matching nothing at
+read-back means they were either deleted since (benign -- the cascade takes the edge with the node)
+or re-keyed since (the edge exists and cannot be named from here). The engine cannot tell those
+apart, so it fails closed, exactly as it already does for a kind id it cannot resolve. A write that
+returned an ERROR is the opposite case: an unresolvable objectid is then the expected outcome of a
+node that was never created, and since a batch's apply runs whether or not the batch reported an
+error ([§5.5](#55-the-write-side)), falling back there would rebuild the replica after every failed
+ingest batch carrying relationship upserts. So the driver marks a scope whose batch failed
+(`settleBatchOutcome`, `ChangeSet.RecordWriteIncomplete`) and read-back skips those, as it always
+did. What remains is narrow: inside a batch that FAILED, a triple whose edge committed and whose
+both endpoints are unnameable -- or whose one nameable endpoint is a hub over the cap -- is skipped
+with the rest of that batch's keys, so such an edge stays out of the replica until a later write
+names it or a reload brings it in ([Section 19](#19-limitations)).
+
+That remainder stays, and the reason is worth stating, because it is also why finding the edge
+replaced inferring about it rather than joining it: the obvious narrowings do not survive contact
+with how DAWGS flushes a batch. The question read-back would have to answer is "did the chunk
+carrying *this* triple flush?", and nothing it holds answers it. Asking instead whether some other
+recorded key of the same scope read back present answers nothing at all: read-back holds no
+before-image of a keyed row, so a principal that existed before the batch began reads back present
+whether that batch landed one row or none -- and re-ingest upserts the same principals over and
+over, which makes that the ordinary case. Asking whether a present row is one the view did *not*
+know is real evidence the batch committed something, and still decides nothing: a failed batch
+flushes its earlier chunks and leaves its last one buffered, so the rows it landed and the endpoint
+it cannot name are routinely different upserts. DAWGS flushes a buffer once it passes 2,000 entries
+(`defaultBatchWriteSize`) and BloodHound's own ingest commits every 20,000 operations, so a failure
+almost always lands behind at least one flush; both narrowings would therefore fall back on the
+ordinary failed ingest window, where nothing is missing and a reload is pure cost. Per-chunk
+outcomes are not observable from outside either: the wrapper sees only the commits the batch
+delegate calls itself, and each of those already gets a scope of its own
+([§5.5](#55-the-write-side)). The two failed-batch shapes that refute each narrowing are tests of
+their own, beside the one that used to pin the divergence as a measured missing row and now asserts
+the edge is served (`TestPartiallyCommittedFailedBatchEdgeIsFoundByItsEndpoint`); the cap's two
+sides -- a fan-out of exactly 5,000 edges read and staged, one more falling back -- are a test too
+(`TestEdgeFanoutCapFallsBackRatherThanStagingAPartialSet`).
+
+Kind names and kind ids are resolved on this same pool, out of the kind table itself (`kindCatalog`,
+`pgKindCatalog`), rather than through DAWGS's kind mapper. That mapper answers from an in-process
+cache, but a name or id the cache lacks makes it re-read the whole kind table through a connection
+of BloodHound's pool -- the one thing a read-back holding `applyMu` must not ask for, since a
+saturated pool then waits for the connection the write itself is holding. The view's own kind table
+answers first and costs no query at all; a kind registered since the replica loaded takes one
+lookup:
+
+```sql
+-- kind names the view does not know
+SELECT id, name FROM kind WHERE name = ANY($1::text[])
+-- kind ids the view has not seen
+SELECT id, name FROM kind WHERE id = ANY($1::int2[])
+```
+
+A name the kind table holds no row for is unresolved, and for an edge triple that is treated as "no
+such edge", so the worst case is a missed new edge, never a wrong tombstone. The same lookup
+resolves every kind a delete's criteria name that the view does not know
+([§12.1](#121-record-the-keys-then-read-back-the-truth)). Kind ids the view has not seen before
+(kinds registered at runtime) are resolved and added to the segment, together with the kinds found
+for criteria; an id the kind table names no kind for is an error, not a skipped entry. A lookup that
+fails is a read-back error too: reading the table directly is what tells "never asserted" apart from
+"could not be read", which the mapper's single opaque error could not. Any read-back error switches
+the engine to FALLBACK.
 
 ### 12.4 Apply, step by step
 
@@ -2143,14 +2624,14 @@ together with the kinds found for instructions. Any read-back error switches the
 6. Return if nothing was touched; empty segments are never published.
 7. If already in FALLBACK, make sure a recovery load is running, and return.
 8. Return if there is no view yet: the startup load will read the post-write state anyway.
-9. **Read back** the touched keys ([§12.3](#123-reading-back)); an error enters FALLBACK.
-10. **Build the segment.** The order matters, because the segment builder keeps the last state
-    written for each id:
-    1. newly seen kinds, including any kind a delete-by-kind instruction names that the view did not
-       know;
-    2. tombstones: node ids not found (with every incident edge in the view), objectids not found,
-       edge ids and triples not found, and kind-delete instructions;
-    3. the rows that were found, last, so PostgreSQL's committed state overrides any tombstone
+9. **Read back** the touched keys and the view's candidates ([§12.3](#123-reading-back)); an error
+   enters FALLBACK.
+10. **Build the segment** (`buildApplySegment`) from read-back's answers alone. The order matters,
+    because the segment builder keeps the last state written for each id:
+    1. newly seen kinds, including any kind a delete's criteria name that the view did not know;
+    2. tombstones: node ids not found, candidates included (with every incident edge in the view),
+       and edge ids and triples not found;
+    3. the rows that were found, last, so a row PostgreSQL holds overrides any cascade tombstone
        inferred from the possibly outdated view.
 11. Create the new view, `current.WithSegment(seg)`, and **warm** it: build its helper structures
     now, on the write path, not in the next reader ([§6.5](#65-the-view-a-base-plus-deltas)).
@@ -2164,6 +2645,15 @@ Only then does the write call return to BloodHound. Because `applyMu` is held ac
 round trip to PostgreSQL, applies happen strictly one at a time. The PostgreSQL writes themselves,
 from concurrent callers, still run concurrently; only the replay into memory is serialized.
 
+A panic anywhere in these steps would mean a bug in the engine, after the write has already
+committed. `Apply` recovers it (`fallBackOnApplyPanic`): it bumps `applyEpoch`, logs
+`bloodtrail: write-through apply panicked` at Error with the stack, enters FALLBACK with the reason
+`apply panicked: …`, and returns normally, so the caller is not told that a committed write
+failed (and does not retry it), and no query is served from a replica the write never reached. The
+bump is what covers a panic in step 1 itself, before Apply's own bump: a load already in flight
+would otherwise still be allowed to adopt a snapshot that predates this write, and adopting ends
+the FALLBACK.
+
 **Cost.** Measured with `bench/applybench` on a graph of about five million nodes, against the same
 writes with `BLOODTRAIL_ENGINE=off`, write-through added **19–34% to write time (about 25% in the
 middle of that range)** across the four runs that set and confirmed the benchmark's pass bar. The
@@ -2173,7 +2663,7 @@ longer with BloodTrail than with stock PostgreSQL.
 
 ### 12.5 Fallback
 
-A write whose effect cannot be expressed as keys or instructions switches the engine to
+A write whose effect cannot be expressed as keys or criteria switches the engine to
 **FALLBACK**. In FALLBACK every query goes to PostgreSQL (correct, just not accelerated) while one
 background task loads a completely fresh replica ([Section
 7](#7-loading-the-replica-from-postgresql)). The engine returns to SERVING the moment that load is
@@ -2184,7 +2674,8 @@ adopted, and logs `bloodtrail: fallback exited`. The triggers are:
   target); a Cypher `Query` in a write transaction that `cypherMutates` classifies as changing data.
   That classifier uses DAWGS's default parser settings, which reject updating clauses, `$parameters`
   and procedure calls alike, so a parameterized read inside a *write* transaction is also classified
-  as changing data. That errs on the safe side.
+  as changing data. That errs on the safe side. A builder `Query` (or a node builder's `Fetch`)
+  whose final criteria carry an updating clause is a free-form write too, in any transaction.
 - **Builder writes with an unrecognized filter**: a node `Update` or `Delete`, or a relationship
   `Update`, whose filter is not a plain list of ids; a relationship `Delete` whose filter is not
   purely by edge kind; and a kind-only relationship delete that failed in PostgreSQL.
@@ -2193,31 +2684,47 @@ adopted, and logs `bloodtrail: fallback exited`. The triggers are:
   `UpdateRelationshipBy` whose endpoints are not both identified that way. BloodHound's ingest keys
   its upserts by `objectid`, so in practice these do not occur; but an upstream change in how ingest
   identifies objects would route writes here, safely but slowly.
-- **Outcomes that are not known**: a commit that fails after the write's code succeeded, a `Run` or
-  `WipeGraph` whose commit fails, and a delete-by-kinds error that may have been reported after the
-  delete took effect ([§5.5](#55-the-write-side)).
+- **A key read-back cannot resolve**: an `UpdateRelationshipBy` that committed cleanly, one of whose
+  endpoint objectids matches no row in PostgreSQL and names no node the view holds either. Read-back
+  records this one itself, after its queries have all succeeded ([§12.3](#123-reading-back)); it
+  takes a re-key racing an endpoint the replica has never seen.
+- **Outcomes that are not known**: a commit that fails after the write's code succeeded and wrote
+  something, a `Run` or `WipeGraph` whose commit fails, a delete-by-kinds error that may have been
+  reported after the delete took effect, a failed batch `CreateNodes`, and a batch whose code
+  panicked ([§5.5](#55-the-write-side)).
 - **Writes made through a read transaction** ([§5.4](#54-the-read-side)).
 - **A failed watermark bump** ([§13.3](#133-when-a-bump-fails)).
-- **Internal failures**: read-back failed, the segment could not be built, or the new view would
-  exceed the memory limit.
+- **Internal failures**: read-back failed, the segment could not be built, the new view would
+  exceed the memory limit, or `Apply` itself panicked ([§12.4](#124-apply-step-by-step)). A panic
+  in a background rebuild or compaction enters FALLBACK too ([Section
+  7](#7-loading-the-replica-from-postgresql), [§14.1](#141-compaction)).
 
 Ordinary BloodHound use (ingest, analysis, tagging, browsing) does not trigger fallback; the
 end-to-end test asserts exactly one full load, at startup, across an install, an ingest and an
 analysis run ([§16.3](#163-the-blind-spot-and-the-end-to-end-test)).
 
 Recovery retries after 100 ms, doubling up to 30 s between attempts; a load refused by the memory
-limit waits 10 minutes. The startup load and fallback recovery share one flag, so at most one
-retry-until-adopted loop runs at a time; when a loop finishes it re-checks the state, so a write
-that re-entered FALLBACK just as a load was adopted is not left stranded.
+limit waits 10 minutes, and so does a load that panicked (`loadRetryDelayAfter`), because a panic
+that depends on the data recurs on every attempt and the engine serves correctly from PostgreSQL
+meanwhile. Both shapes of such a panic count: one on the rebuild's own goroutine, which its recover
+records, and one on a load goroutine, which is recovered there and returned as an error of its own
+type ([Section 7](#7-loading-the-replica-from-postgresql)) -- the likelier of the two, since
+parsing and staging are where the data is touched. Neither case advances the doubling schedule, so
+the fast retry is back for whatever outcome comes next. The startup load and fallback recovery
+share one flag, so at most one retry-until-adopted loop runs at a time; when a loop finishes it
+re-checks the state, so a write that re-entered FALLBACK just as a load was adopted is not left
+stranded.
 
-**Code.** [`apply.go`](internal/engine/apply.go): `Apply`, `buildApplySegment`, `kindLookup`,
-`tombstoneNodeWithCascade`, `applyNodeKindCriteria`, `applyEdgeKindCriteria`, `enterFallback`,
-`startFallbackRebuild`, `runFallbackRebuild`. [`changes.go`](internal/engine/changes.go)
-(`ChangeSet`), [`changes_scope.go`](internal/engine/changes_scope.go) (`WriteScope`),
-[`readback.go`](internal/engine/readback.go) (`readBack`, `resolveCriteriaKinds`, `resolveKindIDs`).
+**Code.** [`apply.go`](internal/engine/apply.go): `Apply`, `fallBackOnApplyPanic`,
+`buildApplySegment`, `kindLookup`, `tombstoneNodeWithCascade`, `viewCandidates`,
+`collectViewCandidates`, `enterFallback`, `startFallbackRebuild`, `runFallbackRebuild`.
+[`changes.go`](internal/engine/changes.go) (`ChangeSet`),
+[`changes_scope.go`](internal/engine/changes_scope.go) (`WriteScope`),
+[`readback.go`](internal/engine/readback.go) (`readBack`, `rereadByID`, `resolveCriteriaKinds`,
+`resolveKindIDs`, `resolveUnknownKinds`, `kindCatalog`, `pgKindCatalog`).
 [`write_observer.go`](write_observer.go): what each observer records
 (`recordBatchCreateNodeIdentity`, `recordNodeUpsertIdentity`, `recordRelationshipUpsertIdentity`,
-`nodeIDsFromCriteria`, `relationshipDeleteScope`, `cypherMutates`).
+`nodeIDsFromCriteria`, `relationshipDeleteScope`, `edgeKindsFromCriteria`, `cypherMutates`).
 
 ---
 
@@ -2278,24 +2785,44 @@ update bloodtrail_watermark set counter = counter + 1, updated_at = now()
  where id = 1 returning counter
 ```
 
-The increment runs as **its own statement on the connection pool, committing immediately**, not
-inside the write's transaction. That is deliberate: the counter must move even for a write that
-later fails or rolls back, or a crash at the wrong moment could leave a change in the database with
-no trace in the counter. Each bump returns a unique, strictly increasing number that belongs to that
-write. A write that turns out to have had no effect is recorded as "finished, nothing to apply"
-(`ResolveAbandonedWrite`).
+The increment runs as **its own statement, committing immediately**, not inside the write's
+transaction. That is deliberate: the counter must move even for a write that later fails or rolls
+back, or a crash at the wrong moment could leave a change in the database with no trace in the
+counter. It runs on the write path's own small pool ([§5.2](#52-registration-and-open)), because
+the write usually holds a connection from BloodHound's pool already: drawing a second one from that
+pool made writers wait on each other once it was saturated, failing every write that had a
+deadline (and losing trust in the counter) and hanging those that had none. Each bump returns a
+unique, strictly increasing number that belongs to that write. A write that turns out to have had
+no effect is recorded as "finished, nothing to apply" (`ResolveAbandonedWrite`).
 
 The engine tracks two things in memory:
 
-- `appliedWatermark`: the highest counter value whose write has been resolved (applied, or
-  abandoned);
-- `inflightBumps`: bumps whose writes have not resolved yet.
+- `inflightBumps`: bumps whose writes have not resolved yet. A bump is counted here *before* its
+  `UPDATE` is sent, so there is no moment at which it has committed without being counted;
+- `appliedWatermark`, a ledger (`watermarkLedger`) of the counter values this process can account
+  for: every value up to the first gap, plus the runs of values resolved out of order above it. A
+  value is accounted for when this process resolved the write that bumped it (applied, or
+  abandoned), or when an adopted load covers it (below).
 
-The watermark is **converged** when PostgreSQL's counter equals `appliedWatermark` *and* no bump is
-in flight, checked in that order. Both halves are needed: a bump is registered as in flight only
-once its `UPDATE` has returned, so the counter comparison is what catches a bump that has committed
-but not yet been registered; and the in-flight check, read afterwards, catches a bump that commits
-just after the counter was read.
+The watermark is **converged** when, read in this order, PostgreSQL's counter is some value P, no
+bump is in flight, and the ledger accounts for every value up to P (`readWatermarkConvergence`,
+`watermarkConverged`). A bump of this process that committed at or below P was counted before it
+was sent, so a zero in-flight count means it has resolved, and it was recorded in the ledger before
+it left the in-flight count. The contiguous ledger, not the highest value resolved, is what makes
+the last check sound. Counters are handed out in bump order, not resolved in it, and not every
+value is this process's: a value another BloodTrail server bumped, or one whose bump response this
+process lost, is never resolved here. An earlier version compared PostgreSQL's counter with the
+highest value resolved, which reached the counter as soon as any later write resolved, absorbing
+every such value beneath it, so a file could vouch for a write its replica never saw.
+
+Values this process never resolves are accounted for only by an adoption. A full load reads the
+counter inside its own repeatable-read transaction ([Section
+7](#7-loading-the-replica-from-postgresql)), and adopting it raises the ledger to that counter, in
+one step that convergence reads cannot see half done (`adoptRebuiltViewAndRebase`): the load holds
+every write whose counter value is at or below it, except writes still in flight at that moment,
+which, if they are this process's own, are still counted in `inflightBumps`
+([§13.4](#134-one-writer) covers another server's). Adopting a snapshot file raises the ledger to
+the counter the file plus its replayed writes was proven complete for ([§14.3](#143-boot)).
 
 ### 13.2 What it proves
 
@@ -2303,12 +2830,13 @@ A snapshot file is stamped with the counter value **N** that was current, and co
 contents were captured, and names the lineage its replica was loaded in. Every write through
 BloodTrail's driver increments the counter before it has any effect, so within one lineage any such
 write the file could be missing carries a number greater than N. At startup, BloodTrail reads
-PostgreSQL's counter **P** and its lineage together, in one statement. A file from any other lineage
-is refused before its counter is even weighed ([§13.5](#135-the-lineage)), and so is one whose
-id-sequence positions show rows inserted behind the counter
-([§13.6](#136-rows-inserted-behind-the-counter)). Otherwise, if BloodTrail can account for every
-number from N+1 to P as a write it observed itself and can replay, the file plus those replays is
-complete. If it cannot, the file is not ([§14.3](#143-boot)).
+PostgreSQL's counter **P** and its lineage together, in one statement. Three refusals come before
+the counter is even weighed (`fileRefusal`): a file from any other lineage
+([§13.5](#135-the-lineage)); one stamped ahead of where the counter stood when this process started,
+as a restored backup usually leaves it; and one whose id-sequence positions show rows inserted
+behind the counter (both [§13.6](#136-rows-inserted-behind-the-counter)). Otherwise, if BloodTrail
+can account for every number from N+1 to P as a write it observed itself and can replay, the file
+plus those replays is complete. If it cannot, the file is not ([§14.3](#143-boot)).
 
 ### 13.3 When a bump fails
 
@@ -2319,7 +2847,8 @@ uncounted, so the engine:
 1. logs `bloodtrail: watermark bump failed`;
 2. **deletes the snapshot file** (`snapshot file invalidated`), since its stamp would otherwise
    still match PostgreSQL's counter after a hard stop, and a later startup could adopt a replica
-   missing this write;
+   missing this write. The deletion is made durable: the directory is synced after the unlink, so a
+   power loss cannot bring the file back;
 3. records a fallback on the write, so its apply switches the engine to FALLBACK and a fresh load
    restores trust.
 
@@ -2339,12 +2868,24 @@ a settled failure while still serving, it may start a full load on its own, at m
 ### 13.4 One writer
 
 The counter detects a *second BloodTrail-enabled server* writing to the same database: its numbers
-leave gaps this server cannot account for, so the file is rejected at the next startup. Writes made
-to PostgreSQL by anything else (`psql`, the stock BloodHound image, BloodHound's migrator) never
-touch the counter. A running replica cannot see them at all; like any cache, it cannot see what
-bypasses it. What keeps them from hiding behind a *saved* file whose counter still matches is the
-lineage, which the installer ends and anything else that writes the graph must end
-([§13.5](#135-the-lineage)), and, for inserts, the id-sequence check
+leave gaps this server cannot account for. A running server then refuses to save its snapshot file
+(`snapshot file not written`, Warn, with a reason that begins
+`the watermark counter holds values this process never resolved`, quoted in full in
+[Appendix B](#appendix-b-log-messages), and the attributes `pg_watermark`, `resolved_through` and
+`resolved_exactly`) until a load it adopts has read the other server's writes. The refusal asks for
+that load itself, through the same once-every-30-seconds request a settled bump failure uses
+([§13.3](#133-when-a-bump-fails)), since nothing else this process does would ever account for
+those values. That is not free in this deployment: each refused save can start a full load, so a
+database two servers keep writing pays one extra in-memory copy of the graph per 30 s at worst,
+where the refusals alone used to cost nothing. A file is rejected at the next startup when the
+buffered writes cannot cover the gap ([§14.3](#143-boot)).
+That is the limit of what one process can see of another: a load covers another server's counter
+value even when that server's own write had not committed yet when the load read the database, so it
+is a detection, not a coherent cluster. Writes made to PostgreSQL by anything else (`psql`, the
+stock BloodHound image, BloodHound's migrator) never touch the counter. A running replica cannot see
+them at all; like any cache, it cannot see what bypasses it. What keeps them from hiding behind a
+*saved* file whose counter still matches is the lineage, which the installer ends and anything else
+that writes the graph must end ([§13.5](#135-the-lineage)), and, for inserts, the id-sequence check
 ([§13.6](#136-rows-inserted-behind-the-counter)). The supported deployment is **one BloodHound API
 server per database**.
 
@@ -2365,11 +2906,13 @@ end up in a file records the lineage its contents were read in: with a snapshot 
 configured, the full load reads it inside the same repeatable-read transaction as the graph
 ([Section 7](#7-loading-the-replica-from-postgresql)), `Fold` carries it over, and the file stores
 it. So a file names the lineage its replica was loaded in, never the one PostgreSQL holds when the
-file is saved. (A BloodTrail still running when a lineage ends can keep writing, and its own writes
-bring the counter back into agreement with what it has applied, so it can still save; stamped with
-the new lineage, its file would vouch for writes it never saw.) The boot adopts a file only while
-PostgreSQL is still in that file's lineage, and a replica whose lineage could not be read is never
-saved.
+file is saved. (A BloodTrail still running when a lineage ends would otherwise stamp its next
+file with the new lineage, vouching for writes it never saw. The installer's statement also
+increments the counter, a value that BloodTrail never resolves, so it saves nothing more until a
+load it adopts brings in the new lineage; only an end that leaves the counter alone, like the
+operator's statement below, still lets it save, which is why the file names the lineage its
+replica was loaded in.) The boot adopts a file only while PostgreSQL is still in that file's
+lineage, and a replica whose lineage could not be read is never saved.
 
 A lineage ends by being replaced with a fresh random UUID, never reused, so no counter value from
 before can vouch for anything after:
@@ -2379,7 +2922,15 @@ before can vouch for anything after:
 - the installer ends it around every stretch in which the stock image owns the graph
   ([§18.3](#183-the-installer)): `bloodtrail rollback` once the original image is running again
   (also when that restart fails), `bloodtrail install` right before it starts BloodTrail, and
-  `--replace-postgres-graph` in the same transaction as its truncate.
+  `--replace-postgres-graph` in the same transaction as its truncate. One rollback path ends it
+  earlier: when rollback leaves the restart to the operator ([§18.3](#183-the-installer)),
+  BloodTrail is still running when the lineage ends. It saves nothing from then on, for the reason
+  above, unless a load it adopts before the operator restarts reads the new lineage; a file saved
+  after that would name the new lineage. `bloodtrail install` ends the lineage again, so a reinstall
+  never adopts such a file, but a BloodTrail image started by hand after the stock image has written
+  the graph could. So on that path rollback tells the operator to end the lineage again once the
+  original image is running, or to delete the snapshot file before starting BloodTrail any way other
+  than `bloodtrail install`.
 
 The installer's statement leaves a database without the table untouched, since BloodTrail never ran
 there; it increments the counter, which is what makes an engine from before lineages refuse its
@@ -2398,7 +2949,10 @@ tool API switching a running server to the plain `pg` driver (`/graph-db/switch/
 a database backup, even one that restores the very lineage a file names: the bump commits in a
 transaction of its own before the write it guards, so a dump taken while writes land can hold
 counter N without write N, and a file stamped N would vouch for a write the restored database never
-saw.
+saw. A restore that leaves the counter *behind* a file's stamp is refused at the next boot as a
+backstop ([§13.6](#136-rows-inserted-behind-the-counter)), but one that leaves it at or above the
+stamp cannot be told apart from ordinary writes, so ending the lineage remains the operator's
+obligation.
 
 ### 13.6 Rows inserted behind the counter
 
@@ -2415,21 +2969,33 @@ nothing BloodTrail counts was written since the file was saved, yet something dr
 BloodHound makes through BloodTrail at boot draw from the same sequences but do not trip the check,
 because they come after the start positions were recorded.
 
+A file is also refused when the counter recorded at start is *behind* the file's counter
+(`the watermark counter was behind the file's stamp when this process started`, with the attributes
+`file_watermark` and `start_watermark`): PostgreSQL went back since the file was written, as a
+restored backup whose lineage nobody ended does. Without this check, a write made at boot could
+bump the counter back up to the file's stamp and make the file look current, although PostgreSQL
+had lost rows the file holds (`counterBehindFile`).
+
 The check is sound only as a refusal. It sees inserts, not updates or deletes, which leave the
 sequences where they were, and only inserts made after the save read the positions it stamps: one
 made earlier, while the saving process was still running, is already behind them. So it does not
 replace ending the lineage. A sequence that moved for any other reason (a reset, a crash that let
 PostgreSQL skip ahead, a second BloodTrail process writing while this one started) costs a rebuild,
-never a wrong adoption. If the start positions cannot be read within 5 s, that boot skips the check
-and says so at Warn; the lineage and counter checks still apply.
+never a wrong adoption. If the start state cannot be read within 5 s, neither this check nor the
+counter one above has anything to compare against, so that boot adopts no snapshot file at all
+(`where PostgreSQL stood when this process started could not be read`) and rebuilds from
+PostgreSQL; the failed read says so at Warn. Refusing costs a load, where adopting a file neither
+check could weigh risks serving rows PostgreSQL does not hold.
 
 **Code.** [`watermark.go`](internal/engine/watermark.go): `BumpWatermark`, `ReadWatermark`,
 `AdvanceWatermark`, `ResolveAbandonedWrite`, `NoteWatermarkBumpFailure`, `WatermarkTrusted`,
-`watermarkConverged`, `watermarkLineageDDL`, `ensureWatermarkTable`, `readWatermarkAndLineage`,
-`captureStartState`, `insertedSinceFile`, `fileRefusal`. [`load.go`](internal/engine/load.go):
-`loadSnapshot`. [`write_observer.go`](write_observer.go): `ensureBumped`.
-[`dbswitch.go`](internal/dbswitch/dbswitch.go): `endLineageSQL`, `EndWatermarkLineage`,
-`ClearGraph`.
+`watermarkLedger`, `readWatermarkConvergence`, `watermarkConverged`, `adoptRebuiltViewAndRebase`,
+`watermarkLineageDDL`, `ensureWatermarkTable`, `readWatermarkAndLineage`, `captureStartState`,
+`counterBehindFile`, `insertedSinceFile`, `fileRefusal`.
+[`writepool.go`](internal/engine/writepool.go): `writePathPool`.
+[`load.go`](internal/engine/load.go): `loadSnapshot`. [`write_observer.go`](write_observer.go):
+`ensureBumped`. [`dbswitch.go`](internal/dbswitch/dbswitch.go): `endLineageSQL`,
+`EndWatermarkLineage`, `ClearGraph`.
 
 ---
 
@@ -2448,9 +3014,21 @@ total size on each new view, so they must periodically be folded back into a fre
   arriving and adding segments while it runs.
 - **Adoption**, under the lock, discards the result if the base was replaced meanwhile (by a full
   load), if the engine left SERVING, or if the segments it folded are no longer exactly the start of
-  the current stack. Otherwise the segments added during the fold are merged into one segment and
-  placed on the new base, which works because segments identify things by database id. The new view
-  is warmed and published, and the snapshot file is written ([§14.2](#142-the-snapshot-file)).
+  the current stack. Otherwise the segments added during the fold are merged into one segment,
+  together with the fold's pending edges ([§6.7](#67-fold)) beneath them, and placed on the new
+  base, which works because segments identify things by database id. An edge whose endpoint has
+  not arrived yet thus stays in the delta, invisible, until the endpoint's write lands, instead of
+  being lost; how many were carried is reported as `carried_edges` on the `compaction finished`
+  line, because the delta that triggered the fold looks the same from outside whether or not
+  anything was carried. An endpoint that *never* arrives is carried by every fold, so the delta
+  never empties on its own; the save that follows recognizes that delta and asks for one rebuild
+  rather than leaving it there ([§14.2](#142-the-snapshot-file)). The new view is warmed and
+  published, and the snapshot file is written ([§14.2](#142-the-snapshot-file)).
+- **A panic** while folding or adopting is recovered (`foldAndAdoptCompaction`): it logs
+  `bloodtrail: compaction panicked` at Error and enters FALLBACK, instead of ending the process.
+  The snapshot save that follows an adoption is outside that recovery on purpose: it releases the
+  publishing lock without a deferred unlock, so recovering a panic from inside it could leave the
+  lock held for good.
 
 The default of 65,536 entries comes from the measured cost of reading through a delta: at about 290
 ns per entry, it caps the delta-proportional part of that cost near 21 ms per new view, the same
@@ -2466,18 +3044,54 @@ With `BLOODTRAIL_SNAPSHOT_DIR` set, the replica is saved to `<dir>/graph-<graphI
 - on a **clean shutdown**, where `Close` folds the current view and writes it. BloodHound hands
   `Close` a context that is already cancelled, so the save runs on a detached context, with a 5 s
   limit on its database reads (the counter, then the id-sequence positions it stamps the file with);
-  before that was fixed, every shutdown save silently failed;
-- after each **adopted compaction**, unless more writes have arrived since.
+  before that was fixed, every shutdown save silently failed. A live BloodHound always has a delta,
+  so this fold is the ordinary case, not an exception — but a fold that reports a *pending* edge
+  (endpoint in neither the base nor any segment, [§6.7](#67-fold)) refuses the save and writes
+  nothing, logging `snapshot file not written` at Warn. The file would otherwise be short of that
+  edge while its stamp is the converged counter that already counts the edge's write, so the next
+  boot would find it exactly current and adopt it. Dropping the edge is very probably right —
+  PostgreSQL matches no pattern through it either — but where it is not, the row is missing from
+  every boot that adopts the file, which is the one outcome this feature exists to rule out, and
+  nothing in memory tells the two apart. The cost is one full load at the next boot, and only in
+  that already-anomalous case;
+- after each **adopted compaction**, unless more writes have arrived since, or the compaction
+  carried an edge still waiting for its endpoint (either leaves the adopted view with a segment).
+
+For the first of those, the skip is a short wait, logged at Debug: the next compaction folds those
+writes into the base and its own save writes the file. For the second it is only a wait while the
+endpoint is still coming. An endpoint that never arrives is carried by every fold, so the delta
+never empties, and the skip used to repeat for the rest of the process's life — no file written
+again, and a full PostgreSQL load at every restart. The save therefore checks whether the delta
+holds *nothing but* edges whose endpoints cannot be resolved, which is exactly the delta a fold
+hands back unchanged however often it runs, and in that one case logs `snapshot file not written`
+at Warn and asks for a rebuild (rate-limited to one per 30 s, the same limiter a save refused over
+an unaccounted counter goes through, [§13.4](#134-one-writer)). A rebuild loads the replica from
+PostgreSQL with an empty delta, so saves resume.
+
+That it asks PostgreSQL, rather than dropping the edges, is the point. A save is only ever
+attempted at an instant where the counter has converged and no write was applied during the probe
+(below), which proves every write PostgreSQL has accepted has already been applied — so an
+endpoint missing *there* is not a write still on its way. It is an id PostgreSQL has no node row
+for (its edge table has no foreign key to `node`), in which case PostgreSQL serves no path through
+that edge either and dropping it would be right; or it is a row PostgreSQL does hold that some
+applied write's own change set never named, in which case the replica is already missing it, the
+carried edge is what heals when a later write names that node, and dropping it would make a missing
+row permanent. Nothing held in memory tells the two apart. A rebuild is correct for both, and its
+cost when it was not needed is one load instead of one per restart. The edge whose endpoint arrives
+late is untouched: its write's bump is still in flight, so the counter has not converged and the
+save is refused before the delta is ever examined.
 
 A file is written only when the engine can prove the replica complete (SERVING, trusted, watermark
-converged), no write was applied while the counter was being read, the id-sequence positions could
-be read right after the counter, and the lineage the replica was loaded in is known, so a shutdown
-in the middle of recovery cannot save a stale replica with a perfect-looking stamp. The lineage
-written is always the one the replica's base was loaded in, carried through every fold, never the
-one PostgreSQL holds at save time ([§13.5](#135-the-lineage)). A save that lands its file after a
-watermark bump failed removes it again ([§13.3](#133-when-a-bump-fails)).
+converged, [§13.1](#131-the-counter)), no write was applied while the counter was being read, the
+id-sequence positions could be read right after the counter, and the lineage the replica was loaded
+in is known, so a shutdown in the middle of recovery cannot save a stale replica with a
+perfect-looking stamp. A counter holding a value this process never resolved, while none of its own
+writes is in flight, refuses the save with a Warn that says so ([§13.4](#134-one-writer)). The
+lineage written is always the one the replica's base was loaded in, carried through every fold,
+never the one PostgreSQL holds at save time ([§13.5](#135-the-lineage)). A save that lands its file
+after a watermark bump failed removes it again ([§13.3](#133-when-a-bump-fails)).
 
-**Format** (version 2, little-endian):
+**Format** (version 3, little-endian):
 
 ```
 magic "BTSNAP\0" · version · graph id · watermark · lineage (16 bytes) · node-id sequence ·
@@ -2490,19 +3104,33 @@ multi-graph flag · dropped-edge count · CRC32 of everything after the magic
 
 Everything from the version through the edge-id sequence is the file's *header*. Version 2 added the
 lineage and the two sequence positions ([§13.5](#135-the-lineage),
-[§13.6](#136-rows-inserted-behind-the-counter)). A version-1 file records no lineage, so nothing can
-prove it belongs to the lineage PostgreSQL is in now; it is refused as a version mismatch, which
-costs an upgraded deployment one ordinary rebuild.
+[§13.6](#136-rows-inserted-behind-the-counter)). Version 3 added the entry kind for a number stored
+in a non-canonical spelling ([§6.2](#62-node-properties)). An older file is refused as a version
+mismatch, which costs an upgraded deployment one ordinary rebuild: a version-1 file records no
+lineage, so nothing can prove it belongs to the lineage PostgreSQL is in now, and a version-2 file
+calls every number canonical, which would let the planner serve reads of a property it must
+decline.
 
 Only the packed arrays are stored; every derived structure is rebuilt on load by the same
 `finalizeDerived` used after a fresh build. The file is written to a temporary file (readable only
 by its owner, since it contains every property), flushed to disk, and renamed into place, so a crash
-never leaves a half-written file under the real name; a leftover temporary file is removed at the
-next startup. Loading guards every allocation size before trusting it, verifies the checksum, and
-then **validates the structure** (array lengths, offsets that only increase, ids in range, arena
-references in bounds): a checksum proves the bytes are the ones written, not that they describe a
-valid graph. Any failure rejects the file. The header can also be read on its own, without the rest
-of the file. The checksum does not vouch for it until the whole file has been read, so the boot uses
+never leaves a half-written file under the real name; the directory is then synced, so the rename
+itself survives a power loss (an error there is reported as `snapshot file write failed`, with the
+complete file already in place; a filesystem that cannot sync directories at all counts as synced).
+A leftover temporary file is removed at the next startup. Loading checks every count and length
+against the bytes the file still holds before allocating anything for it, so a flipped bit in a
+count is refused without a large allocation (before this, one flipped high bit could ask for about a
+terabyte, before the checksum was even read). It then verifies the checksum, and **validates the
+structure** (array lengths, offsets that only increase, database ids in strictly ascending order,
+indexes and property ids in range, arena references in bounds, each property name registered exactly
+once, and each node's property entries in strictly ascending property-id order, which the property
+lookup binary-searches): a checksum proves the bytes are the ones written, not that they describe a
+valid graph. Any failure rejects the file. The validation does not cover everything a reader relies
+on: the order of the edge-id permutation, the agreement of the reverse adjacency with the forward
+one, and the JSON text of list and object values are taken as written (each check is a pass over a
+large array or the whole arena whose cost at boot has not been measured), so a file edited with its
+checksum recomputed could still mislead. The header can also be read on its own, without the rest of
+the file. The checksum does not vouch for it until the whole file has been read, so the boot uses
 the header only to refuse a file early ([§14.3](#143-boot)), never to trust one.
 
 At about 4.9 million nodes and 49 million edges the file is about 3.9 GiB; saving takes 27–30 s,
@@ -2539,33 +3167,60 @@ equals its stamp" would almost never succeed. Instead:
   replayed (a fallback-shaped write, or one that recorded changes without a counter), makes the file
   unusable for this startup.
 - **A frozen target.** Once the file has been read, the attempt reads PostgreSQL's counter **P** and
-  its lineage once, in one statement. A file from another lineage, or with rows inserted behind the
-  counter, is refused at once: no write this boot could observe would make it right, so there is
-  nothing to wait for.
+  its lineage once, in one statement. A file from another lineage, one stamped ahead of the counter
+  recorded when this process started, or one with rows inserted behind the counter, is refused at
+  once (`fileRefusal`): no write this boot could observe would make it right, so there is nothing to
+  wait for.
 - **Coverage.** With the file stamped **N**, the buffered numbers up to P, sorted, must be exactly
   N+1, N+2, …, P, each once. A gap means a write this process never saw: another server, or a
   previous process that crashed mid-write. Numbers above P are ignored; those writes reach the
   replica through the ordinary path whichever way the race goes.
 - **Settle-wait.** A write claims its number when it starts but reaches the buffer only when it
-  finishes, so a busy startup always has a few numbers in flight. The check is repeated every 50 ms
-  for up to 5 s (a large batch chunk was measured at 1.5–2 s between its bump and its apply).
+  finishes, so a busy startup always has a few numbers in flight. While the only problem is a gap,
+  the check is repeated every 50 ms for up to 5 s (a large batch chunk was measured at 1.5–2 s
+  between its bump and its apply). Numbers that contradict the file itself reject it at once,
+  since no later write can take a number away: a number buffered twice, a buffered number at or
+  below the file's stamp (this boot drew a number the file already claims, so PostgreSQL went back
+  since the file was written), or a frozen counter below the stamp (`bootGapCoveredAt` reports
+  them as a contradiction, not a gap).
 - **Replay.** Once covered, the buffered writes are replayed onto the file's replica in number
   order, using the same read-back and segment-building code as ordinary write-through, and the
-  result is published as one view (`snapshot file loaded`, with a `replayed_writes` count).
-  Read-back always returns PostgreSQL's *current* state for each key, so the replay order cannot
-  produce a wrong result.
+  result is published as one view (`snapshot file loaded`, with a `replayed_writes` count). Number
+  order is the order in which the writes *started*, not the order in which they committed, and it
+  does not matter: read-back always returns PostgreSQL's *current* state for each key, and a
+  kind-scoped delete is read back too, through the candidates the view being replayed onto holds
+  ([§12.1](#121-record-the-keys-then-read-back-the-truth)); a replayed write whose read-back
+  records the one fallback read-back can record ([§12.3](#123-reading-back)) rejects the file
+  instead, like every other doubt below, since the view would otherwise be published missing a
+  row. (When
+  kind-scoped deletes were replayed as instructions, a delete that started first but committed last
+  could erase a row written in between.) Publishing the result also raises the watermark ledger to P
+  ([§13.1](#131-the-counter)).
 
 Any doubt rejects the file (`snapshot file rejected`, with a `reason`, or an `error` for an
-unreadable file) and falls through to a normal load: a corrupt or wrong-version file (every
-version-1 file among them), a file from another watermark lineage
-(`watermark lineage changed since the file was written`), a file whose id sequences moved while the
-counter did not
-(`rows were inserted since the file was written by a writer that did not advance the watermark`), a
-replica adopted by another path meanwhile, the memory limit, a failed counter read, a gap still open
-after 5 s, an unusable buffer, the engine entering FALLBACK or a watermark failure settling during
-the load, or a replay error. A rejection is always correct, just slower. Because
-`bloodtrail install` ends the lineage right before it starts BloodTrail, the first boot after every
-install rebuilds from PostgreSQL.
+unreadable file) and falls through to a normal load: a corrupt or wrong-version file (every file
+from before version 3 among them), a file from another watermark lineage
+(`watermark lineage changed since the file was written`), any file at all when the start state
+could not be read (`where PostgreSQL stood when this process started could not be read`), a file
+stamped ahead of the counter recorded at start
+(`the watermark counter was behind the file's stamp when this process started`), a
+file whose id sequences moved while the counter did not
+(`rows were inserted since the file was written by a writer that did not advance the watermark`),
+buffered numbers that contradict the file (`boot write buffer contradicts the file: …`, naming which
+contradiction), a replica adopted by another path meanwhile, the memory limit, a failed counter
+read, a gap still open after 5 s (`boot gap not covered by buffered writes`), an unusable buffer,
+the engine entering FALLBACK or a watermark failure settling during the load, a replay error, or a
+replay whose read-back could not express a write as a delta
+(`boot write replay cannot be expressed as a delta: …`, naming the reason).
+Rejecting is always safe, just slower. Because `bloodtrail install` ends the lineage right before it
+starts BloodTrail, the first boot after every install rebuilds from PostgreSQL.
+
+A panic anywhere in the attempt (reading the file, replaying the buffer, warming or publishing the
+view) does not end the process (`bootFromSnapshotFile`): it is logged as
+`bloodtrail: snapshot file boot panicked` at Error with the stack, the engine enters FALLBACK, the
+file is deleted (`snapshot file invalidated`), and the boot falls through to a normal load, whose
+adoption ends the FALLBACK. Without the delete, a panic that depends on the file would recur at
+every start.
 
 In `bench/applybench`'s boot test at about five million nodes, which reopens the driver while a
 writer keeps writing, all three restarts used the file, replaying 844, 1,765 and 943 buffered
@@ -2574,15 +3229,17 @@ settle-wait was added, the same scenario had rejected the file three times out o
 
 **Code.** [`compact.go`](internal/engine/compact.go): `maxSegments`, `DefaultCompactEntries`,
 `DefaultCompactBytes`, `collapseSegmentStackIfNeeded`, `maybeStartCompaction`, `runCompaction`,
-`adoptCompaction`. [`persist.go`](internal/engine/persist.go): `SaveSnapshot`,
-`saveSnapshotAfterCompaction`, `saveSnapshotProbe`, `saveSnapshotPrepare`, `saveSnapshotWrite`,
-`invalidateSnapshotFile`, `removeSnapshotFile`. [`file.go`](internal/engine/snapshot/file.go) and
-[`validate.go`](internal/engine/snapshot/validate.go): `WriteSnapshotFile`, `ReadSnapshotFile`,
-`ReadSnapshotFileHeader`, `Stamp`, `Header`, `validateSnapshotStructure`.
+`foldAndAdoptCompaction`, `adoptCompaction`. [`persist.go`](internal/engine/persist.go):
+`SaveSnapshot`, `saveSnapshotAfterCompaction`, `saveSnapshotProbe`, `reasonUnresolvedWatermark`,
+`saveSnapshotPrepare`, `saveSnapshotWrite`, `invalidateSnapshotFile`, `removeSnapshotFile`.
+[`file.go`](internal/engine/snapshot/file.go) and
+[`validate.go`](internal/engine/snapshot/validate.go): `WriteSnapshotFile`, `RemoveSnapshotFile`,
+`syncDir`, `ReadSnapshotFile`, `ReadSnapshotFileHeader`, `Stamp`, `Header`,
+`validateSnapshotStructure`, `validatePropStore`.
 [`snapshot.go`](internal/engine/snapshot/snapshot.go): `Lineage`, `WatermarkLineage`.
-[`boot.go`](internal/engine/boot.go): `Start`, `runBootLoad`, `tryLoadSnapshotFile`,
-`adoptSnapshotFileView`. [`bootgap.go`](internal/engine/bootgap.go): `bootGapBuffer`,
-`bootGapCoveredAt`.
+[`boot.go`](internal/engine/boot.go): `Start`, `Stop`, `runBootLoad`, `loadRetryDelayAfter`,
+`tryLoadSnapshotFile`, `adoptSnapshotFileView`, `adoptSnapshotFileAttempt`.
+[`bootgap.go`](internal/engine/bootgap.go): `bootGapBuffer`, `bootGapCoveredAt`, `bootGapVerdict`.
 
 ---
 
@@ -2647,7 +3304,7 @@ project checks that in four layers.
 
 ### 16.1 Unit tests
 
-About 890 unit tests in 108 files cover every component on its own: the data structures (including
+About 1,065 unit tests in 154 files cover every component on its own: the data structures (including
 randomized tests that compare the overlay fast paths with a slow, obviously correct walk, edge by
 edge, and folded bases with the layered views they came from), the search engine (bidirectional
 search checked against brute force, the depth ceiling, buffer reuse), the recognizers, the
@@ -2657,7 +3314,7 @@ every observer and apply branch. CI runs them with Go's race detector.
 
 ### 16.2 Differential tests against PostgreSQL
 
-The integration suite (115 tests in 35 files, behind the `integration` build tag) runs against a
+The integration suite (206 tests in 84 files, behind the `integration` build tag) runs against a
 disposable PostgreSQL. Its central technique is **differential testing**: ask BloodTrail and the
 plain PostgreSQL driver the same question on the same database, and compare the answers. The suites
 in [`integration/`](integration) open BloodTrail exactly as BloodHound does,
@@ -2673,11 +3330,13 @@ corpus runs on.
 | Random Cypher | 200 randomly generated queries over a small graph full of awkward values: missing vs `null`, special characters, JSON-looking text, negative numbers, lists. Answers must match, or both sides must fail with the same error; every fifth query is followed by a random write |
 | Aggregates and text semantics | Added with v0.1.2: `RETURN` aggregates compared row for row **including Go value types**; and 20 text predicates over mixed-type values (numbers and lists where text is expected), each of which must either decline or match PostgreSQL exactly, with "PostgreSQL fails but BloodTrail answered" counted as a failure. Column names are compared by a separate keys-parity suite |
 | Parity fixes | Differential tests added after v0.1.2, each over data chosen to expose one class of difference found then: `=`/`<>` operand pairings, `WITH` constants and the `LIKE` operators; typed comparisons (`coalesce` without a literal, property casts, returned number columns); a `LIMIT` passed into a walk or a shortest-path search, whose answer must have exactly as many rows as PostgreSQL's; the regular-expression anchor over an overlay; and the `allShortestPaths` shapes of [§9.3](#93-the-search-strategies). Shapes that must be answered from memory are marked so; any other may decline, but whatever the engine serves must match PostgreSQL, and serving a query PostgreSQL rejects fails the test |
+| Later parity fixes | One differential per class of difference a later review of the whole codebase found, each written to fail before its fix: number semantics (integer widths and overflow, float literals, the cast a property gets from its partner, float underflow, integers beyond 2⁵³ and non-canonical spellings), the regular-expression dialect, `IN` lists with non-literal elements, `split` with a `null` separator, node variables compared with scalars, `ORDER BY` name resolution, `OPTIONAL MATCH` shapes, re-mentioned nodes, pattern predicates (by clause, and over self-loops), parenthesised `LIKE` anchors, zero-length paths and zero upper bounds, shortest-path endpoint and binding rules, named branching chains under `LIMIT`, text and object-valued columns, and cancelled requests; plus one catalogue check that reads the server's reserved key words and fails if the `ORDER BY` name guard (`pgReservedWords`) lacks any of them |
 | Random paths | 200 shortest-path questions on random graphs with self-loops and parallel edges |
 | Builder matrix | Every builder shape BloodTrail recognizes, on hand-made and random graphs |
 | Write-through | 15 classes of write (upserts, cascading deletes, deletes by kind, partially failed batches, concurrent writers, a "delete sourceless data" whose exclusions name a kind PostgreSQL registered but no row carries, …). After each recognized write, the very next read must be answered by BloodTrail and match PostgreSQL (for five classes, whole rows including full property bags; for the rest, the values and counts the write changed), and no reload may have happened; one class deliberately forces a fallback and checks the recovery, and one stresses concurrent writers |
 | OpenGraph | BloodHound v9.6.0's OpenGraph calls, unchanged through v9.7.1, replayed through the real driver: uploads with and without a source kind, with kind registration and `RefreshKinds` inside the open batch; objectid-keyed upserts of text, number, boolean and text-list values, multi-kind and stub nodes, and an edge from an AD user, which gains the source kind; endpoints resolved by name and by property, one to nothing; a failed upload that registers its source kind and writes no row; Cypher reads, builder counts and pathfinding over an extension's traversable kinds; deletes by edge kind, of sourceless data and of a source kind. After every step, answers must equal the plain PostgreSQL driver's and be served from memory, with no fallback and no rebuild. Two kinds of read go to PostgreSQL by design and are only compared: the endpoint lookups by name or property, and one Cypher query that names a kind no row carries |
-| Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context; a save racing a failed bump removes its own file. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage |
+| Write path under load | Kind-scoped deletes racing writers that create rows of the same kind (in an open transaction, and four writers at once), an objectid re-keyed under a write keyed by the old one (for an endpoint the replica holds; for one it has never seen, where the edge is found by its other endpoint and staged without a reload, inside a cleanly committed write and inside a batch that committed it and then failed alike; and for one where BOTH endpoints are re-keyed, which has no endpoint to query on and falls back instead of dropping the edge -- and does not fall back when the write itself failed), both sides of the fan-out cap that bounds that lookup, and the two failed-batch shapes that say why no narrowing available to read-back is worth its cost ([§12.3](#123-reading-back)); writers on a saturated connection pool (with and without the engine, and a read-back that has to resolve a kind no cache has seen), failed and panicking batches and transactions, updating clauses in a query's final criteria, `AND`ed kind matchers in a relationship delete, builder and path serving on a database with two populated graphs, kind id 32,767, and a compaction that captures an edge before its endpoint |
+| Watermark and startup | The counter moves once per write scope, checked for single calls and for a batch nested in a transaction (once each); the snapshot file loads under BloodHound's real startup order; shutdown saves despite an already-cancelled context, with the write path's pool still open -- also with an `Apply` parked mid-read-back by a table lock when the shutdown begins, whose remaining queries then run on that pool, so its write is replayed instead of costing a fallback, what the engine serves still matches PostgreSQL, and the save still writes its file; and the pool outlives no test that created one, which is what keeps an engine nobody closes from leaking it; a save racing a failed bump removes its own file; a file whose boot panics is deleted and the boot rebuilds. The lineage: a file saved before the stock image wrote the graph (the rollback-and-reinstall cycle), before `--replace-postgres-graph` replaced it, or from another lineage with a matching counter is refused on its lineage, also while boot writes are buffered, and on its header alone; a file names the lineage its replica was loaded in; once the column exists, a start does not wait on a reader of the table, and the one start that must add it, finding the table held, gives up after the lock timeout and leaves the column to a later start. The id-sequence check: rows inserted through the plain PostgreSQL driver after the save cost the file its adoption, BloodTrail's own boot-time inserts do not. The installer's lineage statement runs against every shape the table can have, and the `--replace-postgres-graph` truncate ends the lineage. Convergence: a save is refused while an earlier bump's response is still in flight (held back by a proxy after PostgreSQL committed it), and while a second engine's counter is unaccounted for, until a rebuild has loaded its write; a file stamped ahead of the counter at start is refused, and buffered boot writes that contradict the file reject it at once |
 
 Every comparison is paired with **served-answer evidence**: the tests count BloodTrail's "served"
 log lines per call, to tell "BloodTrail answered, correctly" apart from "BloodTrail declined, and
@@ -2716,16 +3375,22 @@ analysis run, and then checks, through BloodHound's HTTP API and the container l
    one warning, about that edge; and a file that fails validation after registering its own source
    kind. Fourteen Cypher queries and three pathfinding calls follow (the last must find nothing,
    since only a non-traversable edge joins its two nodes), then clearing sourceless data and then
-   the source kind, each checked by counts. Every expected value is what stock BloodHound v9.6.0
-   returns on PostgreSQL; every checked answer must carry its `cypher engine served` or
-   `path engine served` marker, and the phase must log no `snapshot rebuilt` and no
-   `fallback entered`. With `CHECK_SERVED=0` the script checks the same expectations against
-   BloodHound on the PostgreSQL driver;
+   the source kind. A graph answer is compared by content: the sorted objectIds of its nodes and the
+   sorted (source, target, kind) triples of its edges, not just their number. The expected answers
+   are derived from the fixtures and pinned in the script; their sizes are what stock BloodHound
+   v9.6.0 returns on PostgreSQL, with one exception: the whole-graph count after the sourceless
+   delete, a pinned 131, came from BloodTrail's own answer in an earlier CI run (it agrees with the
+   fixture's node counts, a cross-check rather than a measurement on stock PostgreSQL, and is
+   specific to v9.6.0's ingest and analysis). Every checked answer must carry its
+   `cypher engine served` or `path engine served` marker, and the phase must log no
+   `snapshot rebuilt` and no `fallback entered`. With `CHECK_SERVED=0` the script checks the same
+   expectations against BloodHound on the PostgreSQL driver;
 5. a restart with a snapshot directory saves the file on shutdown and then either uses it (no
    reload, matching stamp) or rejects it for one of two legitimate reasons: a counter gap the
    buffered writes could not cover, with PostgreSQL ahead of the file, or a fallback-shaped write
    during the boot. Any other rejection, a changed lineage or rows inserted behind the watermark
-   included, fails the test;
+   included, fails the test, and a pathfinding request after the restart must be answered by the
+   path engine;
 6. rollback, a refused second install (and the rollback that clears the backup and manifest it
    left), a reinstall with `--replace-postgres-graph`, and a final rollback all behave as
    documented.
@@ -2856,9 +3521,13 @@ kinds), not part of the sweep above: what a user of OpenGraph data sees with and
 | Graph | a [`bench/shgen`](bench/shgen) forest (`-users 20000`) and a [`bench/oggen`](bench/oggen) organization (`-users 100000`): 190,001 OpenGraph nodes and 361,098 edges, 10,000 of them hybrid edges from AD users |
 | Harness | [`bench/oggen/bench.py`](bench/oggen/bench.py): each arm starts on an empty database, one arm at a time; per query one discarded warm-up then the median of 7; three complete runs, medians across them; datapipe interval 1 s on both arms |
 
-Every query returned the identical answer on both arms in all three runs (the harness compares a
-digest of every node, edge and literal), and BloodTrail served all of them from memory: its logs
-show no decline, no fallback, and no rebuild after the boot load.
+BloodTrail served every query from memory: its logs show no decline, no fallback, and no rebuild
+after the boot load. That the two arms returned the identical answer is **not verified**: each
+report recorded a digest of an answer's nodes (objectId and kinds), edges (endpoints and kind) and
+literals, but nothing compared the two reports, the digest left out properties and covered only the
+last repeat of a query, and the reports of these runs are not kept. `bench/shgen/compare.py` now
+compares two reports, properties and every repeat included, and fails on any difference; the runs
+have to be repeated to establish it.
 
 | Query | Stock (pg driver) | BloodTrail | |
 |---|---:|---:|---|
@@ -2922,7 +3591,13 @@ after an early run in which a declined query kept PostgreSQL busy for 17.5 hours
 3. copies the driver package and `internal/engine` (without tests) into `packages/go/bloodtrail`,
    which BloodHound's Dockerfile already includes;
 4. stamps the driver version, points BloodHound's `go.mod` at the copied module with `go mod edit`,
-   and runs `go mod tidy`;
+   and runs `go mod tidy`. It then prints the DAWGS version the release pins and the one the image
+   resolves, and fails unless they are equal or that exact (release, pinned, resolved) triple is
+   listed with its reason in `dawgs_shift_reason` (v9.6.0, v0.7.0 to v0.8.0, is the only entry),
+   and unless the resolved version is the one BloodTrail's own `go.mod` names or one listed in
+   `dawgs_tested_versions`, the versions the suites run against (v0.8.0 and v0.8.1 today). An
+   image therefore never silently ships a DAWGS that no suite has run against, as the v9.7.1 image
+   once did (v0.8.1). `--dawgs-only` stops after this check and prints the resolved version;
 5. compiles the API server once as a quick check;
 6. builds the image with BloodHound's own Dockerfile, for the host's platform in a local build (a
    pushed build defaults to `linux/amd64`; releases build both `linux/amd64` and `linux/arm64`).
@@ -2945,11 +3620,17 @@ and v9.7.1 at the time of writing). The same list drives:
   and verifies that each can be pulled anonymously **before** publishing the installer;
 - a weekly workflow that builds the moving alias for any supported release that lacks one.
 
-CI also runs the unit and integration suites with the race detector, and the full end-to-end
-install-and-rollback test, OpenGraph phase included, against v9.6.0
-([§16.3](#163-the-blind-spot-and-the-end-to-end-test)). Newer releases get only the patch guard on
-each change; their images are compiled, patch applied, by the release and weekly workflows, and no
-end-to-end run covers them.
+CI also runs the unit and integration suites with the race detector, the linter over all the code
+(the integration-tagged test code included), the tests of the benchmark and build scripts, and the
+full end-to-end install-and-rollback test, OpenGraph phase included, against v9.6.0
+([§16.3](#163-the-blind-spot-and-the-end-to-end-test)). A `dawgs` job resolves every supported
+release with `build-image.sh --dawgs-only` and runs the unit and integration suites against each
+DAWGS version they resolve to other than the one in `go.mod` (`build/dawgs-suites.sh`; v0.8.1, for
+v9.7.1, today). Newer releases otherwise get only the patch guard on each change; their images are
+compiled, patch applied, by the release and weekly workflows, and no end-to-end run covers them. The
+two workflows that run on pull requests, `ci.yml` and `e2e.yml`, each end in one aggregate job,
+`ci-ok` and `e2e-ok`, that fails unless every job before it succeeded, so that a branch rule can
+require those two checks by name.
 
 ### 18.3 The installer
 
@@ -2957,19 +3638,31 @@ end-to-end run covers them.
 curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
 ```
 
-The bootstrap script downloads the `bloodtrail` CLI for the platform, verifies its SHA-256 checksum,
-and runs `bloodtrail install` ([`internal/installer`](internal/installer)):
+The bootstrap script downloads the `bloodtrail` CLI for the platform (each download is time-limited:
+15 s to connect, 600 s in all for the archive and 60 s for `checksums.txt`, so a stalled connection
+ends with a message instead of a hang), verifies its SHA-256 checksum itself (it takes the one line
+of `checksums.txt` for the archive, requires a 64-digit hash there, and compares it with the
+download's; no line, several lines, or a malformed hash stop it, since the `sha256sum -c` that
+recent macOS ships accepts input it cannot use), and runs `bloodtrail install` from a temporary
+directory under `TMPDIR` ([`internal/installer`](internal/installer)):
 
 1. **Inventory.** Stop at once if `COMPOSE_FILE` is set in the shell's environment, even empty, or
    `COMPOSE_PATH_SEPARATOR` is set there to anything other than `:` or nothing: Compose takes both
    over `.env`, so the operator's own `docker compose up -d` from that shell would not load the
-   override the install adds there. Work out which files make up the Compose project, strictly (see
-   "Reading the project the way Compose does" below), and read it (`docker compose config`),
-   requiring the `bloodhound` and `app-db` services. Determine the active graph driver (a
-   `database_switch` row, else `bhe_graph_driver`, else `neo4j`), the graph size and the host
-   memory; derive the target image from the BloodHound version tag the Compose configuration names
-   (a `latest` or missing tag stops the install unless `--image` is given); show all of this and ask
-   for confirmation (read from the terminal, so it works under `curl | sh`; `--yes` skips it).
+   override the install adds there. The same goes for a non-empty `COMPOSE_ENV_FILES` (Compose then
+   reads those files instead of `.env`) and a `COMPOSE_DISABLE_ENV_FILE` that Compose reads as true
+   (a value it cannot read as a boolean stops Compose itself, and the install too). Work out which
+   files make up the Compose project, strictly (see "Reading the project the way Compose does"
+   below), and, if the install will have to change `.env`, check that this user can replace it.
+   Read the project (`docker compose config`), requiring the `bloodhound` and `app-db` services.
+   Determine the active graph driver (a `database_switch` row, else `bhe_graph_driver`, else
+   `neo4j`), the graph size and the host memory. On Neo4j the node and edge count is required, since
+   the migration is checked against it: when it cannot be taken (it needs `cypher-shell` and
+   `NEO4J_AUTH` as `<user>/<password>` in the `graph-db` service), the install stops here, before
+   changing anything. Derive the target image from the BloodHound version tag the Compose
+   configuration names (a `latest` or missing tag stops the install unless `--image` is given); show
+   all of this and ask for confirmation (read from the terminal, so it works under `curl | sh`;
+   `--yes` skips it).
 2. **Back up.** Stream a `pg_dump` of BloodHound's application database and copy the Compose file
    and `.env` into `.bloodtrail/backups/<timestamp>`, then record an install manifest **before**
    changing anything, so a failure at any later point can still be rolled back. The manifest also
@@ -2986,19 +3679,37 @@ and runs `bloodtrail install` ([`internal/installer`](internal/installer)):
    on a command line.
 4. **Switch.** Write `docker-compose.bloodtrail.yml` (the image and `bhe_graph_driver=bloodtrail`)
    and add it to `COMPOSE_FILE` in `.env`, so that a plain `docker compose up -d` keeps loading it.
-   An existing entry is extended in place, keeping its spelling. Where there is no entry, writing
-   one switches off Compose's own file discovery, so the new entry names exactly the files discovery
-   had found and the installer has been addressing: the base file and, when there is one, the
-   override Compose loads beside it (the first of `compose.override.yml`, `compose.override.yaml`,
+   An existing entry is extended in place, keeping its spelling; the override is added by its
+   absolute path when every name in the list is absolute (so the list still loads from any directory
+   Compose is run from), and by its relative name otherwise. Where there is no entry, writing one
+   switches off Compose's own file discovery, so the new entry names exactly the files discovery had
+   found and the installer has been addressing: the base file and, when there is one, the override
+   Compose loads beside it (the first of `compose.override.yml`, `compose.override.yaml`,
    `docker-compose.override.yml` and `docker-compose.override.yaml`, whatever the base file is
-   called), then the installer's own file. Every other line of `.env` is kept as it was, so adding
-   the entry and removing it again gives the file back as it was, except that a missing final line
-   break is added, and a `.env` the install had to create stays behind, empty. Then set the
-   `database_switch` row, **end the watermark lineage** ([§13.5](#135-the-lineage)), and run
-   `docker compose up -d`. The operator's own Compose file is never edited.
-5. **Verify.** Wait for `BloodTrail driver active` in the logs and for `/api/version` to answer.
-   With `--admin-password` (for test systems only: it permanently adds a fictional domain), also
-   upload a small domain and search for it.
+   called), then the installer's own file, by relative names. (Compose resolves a relative name in
+   `COMPOSE_FILE` against the directory it is run from, even under `--project-directory`, so the new
+   entry ties the project to that directory. An operator who ran Compose with `--project-directory`
+   from elsewhere against a project with no entry must run it from the project directory afterwards:
+   from anywhere else Compose looks for the names there, stops with an error if they are missing,
+   and loads files of the same names if it finds some. Writing the names as absolute paths by hand
+   lifts the restriction, and rollback finds its override under either spelling.) Every other line
+   of `.env` is kept as it was, so adding the entry and removing it again gives the file back as it
+   was, except that a missing final line break is added, and a `.env` the install had to create
+   stays behind, empty. `.env` is written only when it changes, and replaced atomically: a new file
+   beside it, given the old file's mode and owner, flushed and renamed over it, and the directory
+   synced. It keeps a symbolic link, but not extended attributes or ACLs; a hard link to it is lost,
+   because the new file takes the name and the other name keeps the old contents; and a `.env` that
+   is itself a mount point cannot be replaced. Then set the `database_switch` row, **end the
+   watermark lineage** ([§13.5](#135-the-lineage)), and run `docker compose up -d`. The operator's
+   own Compose file is never edited.
+5. **Verify.** Check that the driver setting BloodHound will read (the `database_switch` row, else
+   the service's `bhe_graph_driver`) names `bloodtrail`, wait for the container's *current* run to
+   log `BloodTrail driver active` (an earlier run's line does not count), and wait for
+   `/api/version` to answer. With `--admin-password` (for test systems only: it permanently adds a
+   fictional domain), also upload a small domain and search for it. If the domain was already
+   there before the upload, the search cannot show that this run's ingest reached the graph, so the
+   smoke test is reported as **inconclusive**, a warning that does not fail the verification, never
+   as a pass.
 
 **Reading the project the way Compose does.** Every installer command names its files with `-f`,
 which makes Compose ignore both `COMPOSE_FILE` and its own file discovery, so the installer has to
@@ -3020,30 +3731,54 @@ closing quote on the same line, has quotes inside an unquoted value, or uses esc
 interpolation; an entry that lists no files (`COMPOSE_FILE=` is not "unset" to Compose, which then
 fails to load the project), has an empty or space-padded name, does not list the compose file given,
 or lists a file that does not exist (other than the installer's own override, which a leftover entry
-may name); or, with no entry, a compose file other than the one discovery picks, when the directory
-has one of the conventional names. (With none of them there, the new entry names the compose file
-given and the installer's override.) The message names what it found, and usually what to change.
-`status`, `verify` and `rollback` still refuse a `.env` they cannot read with certainty, but
-otherwise read forgivingly (the listed files that exist, in order, with the compose file put first
-where the entry leaves it out; discovery for an entry that names no file; the compose file given
-where discovery would pick another), so they keep working on whatever an earlier install left
-behind.
+may name); an entry whose first file is not in the project directory, or, with no entry, a compose
+file outside it that the new entry would list first (Compose takes the first file's directory as the
+project directory, which relative paths such as a `./pgdata` bind mount resolve against, while the
+installer addresses the project through the directory of `.env`, so its `up -d` could recreate a
+database on an empty directory); with no entry, a compose file other than the one discovery picks,
+when the directory has one of the conventional names (with none of them there, the new entry names
+the compose file given and the installer's override); a `.env` the install has to change but this
+user cannot replace; and the shell settings of step 1. The message names what it found, and usually
+what to change. `status`, `verify` and `rollback` still refuse a `.env` they cannot read with
+certainty, but otherwise read forgivingly (the listed files that exist, in order, with the compose
+file put first where the entry leaves it out; discovery for an entry that names no file; the compose
+file given where discovery would pick another; the last of several `COMPOSE_FILE` lines, as Compose
+does), so they keep working on whatever an earlier install left behind.
 
 `bloodtrail rollback` (run through the same bootstrap one-liner as `install`, which does not leave
-the CLI installed) shows what it will restore and asks for confirmation, then restores the recorded
-driver setting and deletes the override file. For `.env` it goes by the manifest. An entry the
-install created is removed whole while it still names just what the install wrote, which gives
-Compose its own file discovery back; if the operator has changed the list since (added a file, say),
-only the installer's override comes out, and rollback says so. An entry that was there before the
-install loses only the override. (Installs from before the list was recorded took an empty
-`COMPOSE_FILE=` entry for none and wrote their override into it; rollback puts the empty entry back
-as it was spelled, and warns that Compose fails on it.) Rollback then brings the deployment back up
-on the original image and ends the watermark lineage ([§13.5](#135-the-lineage)), also when that
-restart fails, since a failed `up` can still have started the stock image. It does not restore the
-database dump or delete the migrated PostgreSQL graph: a deployment that started on Neo4j returns to
-its untouched Neo4j graph, and anything imported while BloodTrail was active stays in PostgreSQL.
-That is why a second install refuses until `--replace-postgres-graph` is given. `bloodtrail status`
-shows the configured and the running image, which differ while an install or rollback is half done.
+the CLI installed) shows what it will restore and asks for confirmation. It first works out what
+`.env` becomes and checks that it can replace it, so that a `.env` it cannot write stops it before
+it changes anything; it then restores the recorded driver setting and deletes the override file.
+For `.env` it goes by the manifest, and writes the file only if it changes. An entry the install
+created is removed whole while it still names just what the install wrote, which gives Compose its
+own file discovery back; if the operator has changed the list since (added a file, say), only the
+installer's override comes out, and rollback says so. An entry that was there before the install
+loses only the override, whichever way the entry spells it. The installs of v0.1.0 to v0.1.2
+recorded only that they created the entry, not what they wrote into it; for those, rollback decides
+from the copy of `.env` in the backup: an entry the backup already had loses only the override, and
+one it lacked goes whole while it lists just what those versions wrote. v0.1.0 and v0.1.1 could
+also leave a second `COMPOSE_FILE` line beside an operator's `export COMPOSE_FILE=` entry; rollback
+removes the one the install appended and keeps the operator's, and refuses, before changing
+anything, when it cannot tell which line is the install's. (Installs that took an empty
+`COMPOSE_FILE=` entry for none and wrote their override into it get the empty entry back as it was
+spelled, with a warning that Compose fails on it.) A restored entry that still lists a file that
+does not exist gets a note, since Compose cannot load the project until it is put back or taken out.
+
+Rollback then brings the deployment back up on the original image and ends the watermark lineage
+([§13.5](#135-the-lineage)), also when that restart fails, since a failed `up` can still have
+started the stock image. One case is left to the operator: when the restored project's first
+`COMPOSE_FILE` file (or, with no entry left, the compose file the install was given) is not in the
+directory of `.env`, Compose takes another project directory than rollback would address, and a
+restart from rollback could recreate a service with its data on a different host path. Rollback then
+does everything else, ending the lineage included, and tells the operator that BloodTrail is still
+running and to restart with their own `docker compose up -d`, and, because the lineage ended while
+BloodTrail still ran, to end it again once the original image is running (it prints the `psql`
+statement) or delete the snapshot file before starting BloodTrail any way other than
+`bloodtrail install` (`lineageLeftToTheOperator`). It does not restore the database dump or delete
+the migrated PostgreSQL graph: a deployment that started on Neo4j returns to its untouched Neo4j
+graph, and anything imported while BloodTrail was active stays in PostgreSQL. That is why a second
+install refuses until `--replace-postgres-graph` is given. `bloodtrail status` shows the configured
+and the running image, which differ while an install or rollback is half done.
 
 The operator guidance (pausing ingest during a migration, the memory limit, the snapshot directory
 and ending the lineage after writing the graph without BloodTrail, Compose commands that name files
@@ -3055,11 +3790,17 @@ in the [README](README.md).
 ## 19. Limitations
 
 - **One writer.** Changes made to PostgreSQL without going through BloodTrail are invisible to the
-  running replica. The supported deployment is one BloodHound API server per database. A saved
-  snapshot file is protected against such changes only by the lineage, which the installer ends
-  around the stock image's time but which anything else writing the graph must end itself, or delete
-  the file ([§13.5](#135-the-lineage)), and by the id-sequence check, which catches inserts but not
-  updates or deletes ([§13.6](#136-rows-inserted-behind-the-counter)).
+  running replica. The supported deployment is one BloodHound API server per database; a second
+  BloodTrail server is detected (each server's counter values stop the other's snapshot saves) but
+  not kept coherent ([§13.4](#134-one-writer)). A saved snapshot file is protected against other
+  writers only by the lineage, which the installer ends around the stock image's time but which
+  anything else writing the graph must end itself, or delete the file ([§13.5](#135-the-lineage)),
+  and by the id-sequence check, which catches inserts but not updates or deletes, and the refusal of
+  a file stamped ahead of the counter ([§13.6](#136-rows-inserted-behind-the-counter)). When
+  rollback leaves the restart to the operator, it ends the lineage while BloodTrail still runs, and
+  a load BloodTrail adopts before the restart lets it save a file that a BloodTrail started by hand,
+  not by the installer, could later adopt, unless the operator ends the lineage again once the
+  original image runs or deletes the file, as rollback tells them to ([§13.5](#135-the-lineage)).
 - **The snapshot file needs the lineage column.** Its default, `gen_random_uuid()`, needs
   PostgreSQL 13. Where the column cannot be added, the counter still works but no snapshot file is
   written or adopted, and every start rebuilds from PostgreSQL ([§13.1](#131-the-counter)).
@@ -3070,24 +3811,57 @@ in the [README](README.md).
 - **Memory grows with the graph.** Everything is held in memory, so the RAM a deployment needs grows
   with its graph ([Section 15](#15-memory)).
 - **Some writes cost a full reload**: free-form commands, updates or deletes by filters BloodTrail
-  cannot list, writes with an unknown outcome, and writes through read transactions.
+  cannot list, writes with an unknown outcome, and writes through read transactions. A reload is
+  adopted only once no write lands while it runs, so under writes that never pause for that long,
+  a FALLBACK lasts until they do ([Section 7](#7-loading-the-replica-from-postgresql)).
+- **Two residual write races inside a failed batch are not followed.** An objectid-keyed edge upsert
+  whose endpoint node the replica has not applied yet (the upsert's own new endpoint, or one another
+  write created whose apply has not run), and whose objectid another writer re-keys before the
+  upsert is applied, cannot be named from read-back. Where the edge's OTHER endpoint can still be
+  named, that no longer matters: read-back asks PostgreSQL for the edges on that endpoint and kind,
+  stages what comes back together with the endpoint the row names by id, and so needs neither a
+  reload nor a guess, whatever the write reported ([§12.3](#123-reading-back)). Two cases are left,
+  both of which cost a reload for a write that returned cleanly and are skipped for one that
+  returned an error: *neither* endpoint can be named (both objectids re-keyed, or both endpoints
+  belonging to writes not yet applied), so there is nothing to anchor a query on; or the nameable
+  endpoint is a hub, carrying more than 5,000 edges of that kind, which is more than one read-back
+  query will scan while it holds the publishing mutex.
+  The skip for a write that returned an error is deliberate: an unresolvable objectid is then the
+  ordinary outcome of a node that was never created, and a fallback would rebuild the replica after
+  every failed ingest batch carrying relationship upserts. So an upsert of one of those two shapes
+  that committed cleanly inside a batch that later failed is skipped with the rest of that batch,
+  and its edge stays out of the replica until a later write names it or a reload brings it in. That
+  skip is not narrowed further on purpose: read-back can see that a failed batch committed
+  something, never which of its keys that something was, and a failed batch routinely lands earlier
+  chunks while the endpoint it cannot name belongs to one still buffered, so every narrowing
+  available would reload the replica after ordinary failed ingest windows where nothing is missing
+  ([§12.3](#123-reading-back)). An endpoint the replica already holds is followed through the re-key
+  either way.
 - **Not every query is accelerated.** Queries outside the interpreter's subset, queries that sort
   text, queries with `$parameters`, Cypher spellings whose DAWGS translation BloodTrail does not
   reproduce exactly ([§11.2](#112-matching-dawgss-semantics)), `allShortestPaths` queries whose
   translation does not settle which answer PostgreSQL gives, variable-length patterns over kinds
-  that have a self-loop, every Cypher query on a database holding several graphs, and a query naming
-  a kind that no row carries yet and the replica has not learned (a failed OpenGraph upload's source
-  kind, say) go to PostgreSQL: correct, but not faster.
+  that have a self-loop, queries reading a property that holds a number the replica cannot spell
+  back, every query (Cypher, builder or pathfinding) on a database holding several graphs, and a
+  query naming a kind that no row carries yet and the replica has not learned (a failed OpenGraph
+  upload's source kind, say) go to PostgreSQL: correct, but not faster. Several of these rules
+  decline more than strictly necessary, by design.
+- **A plan-dependent PostgreSQL error.** For a `shortestPath` without `s <> t`, whether PostgreSQL
+  raises its shared-endpoint error can depend on its query plan, more widely than BloodTrail's
+  decline rule covers; where PostgreSQL answers, the answers agree, but on some plans PostgreSQL
+  fails a query BloodTrail answers ([§11.7](#117-executing-the-pattern)).
 - **Edge properties stay in PostgreSQL**, so every served answer that contains edges pays a round
-  trip to fetch them; pathfinding answers fetch nodes too.
-- **No cancellation inside the search and the interpreter.** The path search and the interpreter's
-  execution take no context; they are bounded by their budgets. The engine's PostgreSQL round trips
-  do follow the caller's context.
-- **Two known differences** from PostgreSQL ([§11.2](#112-matching-dawgss-semantics)): inside a
+  trip to fetch them; pathfinding answers fetch nodes too. That round trip takes a second connection
+  from BloodHound's pool while the caller's read transaction holds one
+  ([§8.4](#84-completing-the-answer)).
+- **Cancellation is checked in batches, not per row.** Every served read declines a request whose
+  context is already done, and one cancelled while it runs stops at the next check of whatever was
+  running — the interpreter's 1,024-unit work check, the path search's per-pair or per-BFS check, or
+  a cursor's own. So a cancellation arriving with less than one batch of work left is not reported,
+  which is also when PostgreSQL has already delivered that work ([§5.4](#54-the-read-side)).
+- **A clock difference** from PostgreSQL ([§11.2](#112-matching-dawgss-semantics)): inside a
   condition, `datetime()`'s epoch accessors use the BloodHound server's clock, in whole seconds or
-  milliseconds (returned as a column, they are declined); and a number stored as `1.0` passes an
-  integer cast in BloodTrail where PostgreSQL's cast fails the query. BloodHound itself never stores
-  numbers that way.
+  milliseconds (returned as a column, they are declined).
 - **Tied to BloodHound and DAWGS.** If BloodHound changes how it phrases queries or identifies the
   objects it writes, more queries may be declined and more writes may cause reloads: safe, but
   silent. The patch guard, the release checks and the installer's verification are the backstops.
@@ -3126,20 +3900,31 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `path engine declined`, `builder engine declined` | Debug | A query went to PostgreSQL, with a `reason` ([§8.3](#83-declines)); Cypher declines use the path-engine message |
 | `write-through applied` | Debug | A committed write was applied to the replica |
 | `segment stack merged` | Debug | More than 32 segments were merged into one |
-| `fallback entered` / `fallback exited` | Warn / Info | A write could not be followed (with `reason`) / a fresh replica was adopted |
+| `fallback entered` / `fallback exited` | Warn / Info | A write could not be followed, or engine work panicked (with `reason`) / a fresh replica was adopted |
+| `write-through apply panicked` | Error | `Apply` panicked after its write committed (with `panic` and `stack`); the engine enters FALLBACK with reason `apply panicked: …` and the write's caller sees success |
+| `snapshot rebuild panicked` / `snapshot file boot panicked` / `compaction panicked` | Error | A background load, the boot's attempt to start from the snapshot file, or a compaction panicked (with `panic` and `stack`); the engine enters FALLBACK with reason `snapshot rebuild panicked: …` / `snapshot file boot panicked: …` / `compaction panicked: …` and keeps retrying the load. The file whose boot panicked is deleted |
 | `snapshot rebuilt` | Info | A full load from PostgreSQL was adopted; `trigger` is `startup`, `fallback` or `manual` |
 | `snapshot rebuild refused: exceeds memory limit` | Warn | Rate-limited to once per 10 minutes |
 | `boot load waiting for the default graph` | Debug | Expected on every startup |
-| `snapshot file loaded` / `rejected` / `written` | Info | The file was used (with `replayed_writes` and `lineage`) / not used (with `reason`, or `error` for an unreadable or version-1 file) / saved (with `watermark`, `lineage`, `node_id_seq`, `edge_id_seq`) |
+| `snapshot file loaded` / `rejected` / `written` | Info | The file was used (with `replayed_writes` and `lineage`) / not used (with `reason`, or `error` for an unreadable or older-version file) / saved (with `watermark`, `lineage`, `node_id_seq`, `edge_id_seq`) |
 | `snapshot file rejected`, reason `watermark lineage changed since the file was written` | Info | The file names another lineage than PostgreSQL's. Expected on the first boot after `bloodtrail install`, and against a different or reset database |
 | `snapshot file rejected`, reason `rows were inserted since the file was written by a writer that did not advance the watermark` | Info | The counter still reads the file's stamp but an id sequence moved |
-| `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), or when a write was applied during the probe |
+| `snapshot file rejected`, reason `the watermark counter was behind the file's stamp when this process started` | Info | PostgreSQL went back since the file was written, as a restored backup does (with `file_watermark`, `start_watermark`) |
+| `snapshot file rejected`, reason `where PostgreSQL stood when this process started could not be read` | Info | The start-state read failed, so the two checks it feeds cannot be made; no file is adopted this start (with `file_watermark`) |
+| `snapshot file rejected`, reason `boot write buffer contradicts the file: …` | Info | A buffered boot write's counter contradicts the file (counted twice, at or below the stamp, or the counter below the stamp); rejected without waiting |
+| `snapshot file rejected`, reason `boot write replay cannot be expressed as a delta: …` | Info | A buffered boot write's read-back met the one key it cannot resolve ([§12.3](#123-reading-back)); the view would otherwise be published missing a row |
+| `snapshot file not written` | Debug / Warn | A save was skipped; Warn when the counter holds values this process never resolved (reason `the watermark counter holds values this process never resolved: another BloodTrail server may be writing this database, or a bump's outcome was lost`, with `pg_watermark`, `resolved_through`, `resolved_exactly`), when the id-sequence positions could not be read, when a watermark bump failed while the file was being written (the file just written is deleted), when a write was applied during the probe, when a post-compaction save's delta holds only edges whose endpoints cannot be resolved (reason `the delta holds only edges whose endpoints PostgreSQL has not delivered and no applied write will: no later compaction can empty it, so a rebuild was requested`, with `segments`), or when folding the delta would drop a pending edge (reason `folding the delta would drop a delta edge whose endpoint PostgreSQL has not delivered, and the file cannot record that it is short`, with `pending_edges` and `segments`) |
+| `snapshot file skipped` | Debug | A post-compaction save found writes layered on since the adoption; the next compaction's save covers them ([§14.2](#142-the-snapshot-file)) |
+| `snapshot file write failed` | Warn | A save failed (`step` is `fold` or `write`); a failed directory sync after the rename is reported here too, with the complete file already in place |
+| `the write path's own connection pool could not be created` | Warn | Logged once; watermark bumps and read-backs run on BloodHound's pool instead, where a write holding a connection can wait on another's ([§5.2](#52-registration-and-open)) |
 | `watermark lineage DDL failed; no snapshot file will be written or adopted` | Warn | The `lineage` column could not be added; the counter still works |
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
-| `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |
-| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason |
+| `could not read the watermark counter during the load; this rebuild did not account for it, so a snapshot file save may be refused as if another server were writing` | Warn | An adopted load could not read the counter, so the ledger was not rebased onto it ([§13.4](#134-one-writer)) |
+| `could not record where PostgreSQL stood at start; no snapshot file will be adopted this start, and the boot will rebuild from PostgreSQL` | Warn | `Start`'s read of the counter and sequence positions failed, so the file checks that compare against it cannot be made |
+| `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
+| `snapshot file invalidation failed` / `snapshot file not invalidated` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`), or no file path could be worked out yet, so there was nothing to delete (reason `no snapshot file path resolved yet`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
-| `compaction started` / `finished` / `discarded` | Info | Background compaction |
+| `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above). `finished` carries `carried_edges`: delta edges re-carried because their endpoint has not arrived, which is what leaves the post-compaction save with a non-empty delta and no file to write ([§14.2](#142-the-snapshot-file)) |
 
 ## Appendix C: Code map
 
@@ -3152,10 +3937,12 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | [`settings.go`](settings.go) | `BLOODTRAIL_*` settings and size parsing |
 | [`internal/engine/engine.go`](internal/engine/engine.go) | `Engine`, states, the serving gate, decline reasons, full-load adoption, the path and Cypher entry points |
 | [`internal/engine/load.go`](internal/engine/load.go) | `LoadSnapshot`: the full load from PostgreSQL |
-| [`internal/engine/apply.go`](internal/engine/apply.go) | `Apply`, segment building, fallback entry and recovery |
+| [`internal/engine/apply.go`](internal/engine/apply.go) | `Apply`, the candidates a kind-scoped delete re-reads, segment building, fallback entry and recovery |
+| [`internal/engine/background_panic.go`](internal/engine/background_panic.go) | Recovering a panic in a background rebuild, the snapshot-file boot or compaction into FALLBACK |
 | [`internal/engine/changes.go`](internal/engine/changes.go), [`changes_scope.go`](internal/engine/changes_scope.go) | `ChangeSet` and `WriteScope`: what a write touched |
-| [`internal/engine/readback.go`](internal/engine/readback.go) | Reading touched keys back after commit |
-| [`internal/engine/watermark.go`](internal/engine/watermark.go) | The watermark counter and its lineage column, the start-state and id-sequence check, the file refusals, convergence, trust |
+| [`internal/engine/readback.go`](internal/engine/readback.go) | Reading touched keys, and the candidates of kind-scoped deletes, back after commit |
+| [`internal/engine/writepool.go`](internal/engine/writepool.go) | The write path's own two-connection pool |
+| [`internal/engine/watermark.go`](internal/engine/watermark.go) | The watermark counter and its lineage column, the ledger of accounted counter values, the start-state and id-sequence checks, the file refusals, convergence, trust |
 | [`internal/engine/boot.go`](internal/engine/boot.go), [`bootgap.go`](internal/engine/bootgap.go) | Startup: waiting for the default graph, file adoption, the boot buffer |
 | [`internal/engine/persist.go`](internal/engine/persist.go) | Saving (stamping counter, lineage and sequence positions) and invalidating the snapshot file |
 | [`internal/engine/compact.go`](internal/engine/compact.go) | Segment-stack collapse and background compaction |
@@ -3164,10 +3951,10 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | [`internal/engine/serve_cypher.go`](internal/engine/serve_cypher.go) | Cypher budgets, result building, column typing |
 | [`internal/engine/hydrate.go`](internal/engine/hydrate.go) | Fetching node and edge properties for answers |
 | [`internal/engine/result.go`](internal/engine/result.go), [`rowresult.go`](internal/engine/rowresult.go) | Result cursors handed back to DAWGS |
-| [`internal/engine/snapshot/`](internal/engine/snapshot) | `Snapshot`, `Builder`, `PropStore`, read indexes, value shapes, `Segment`, `View`, `Fold`, the file format (version 2, with a header that can be read on its own) and its validation |
+| [`internal/engine/snapshot/`](internal/engine/snapshot) | `Snapshot`, `Builder`, `PropStore`, read indexes, value shapes and number spellings, `Segment`, `View`, `Fold`, the file format (version 3, with a header that can be read on its own) and its validation |
 | [`internal/engine/traverse/`](internal/engine/traverse) | The shortest-path engine |
 | [`internal/engine/recognize/`](internal/engine/recognize) | Query-builder shape recognizers |
-| [`internal/engine/interpret/`](internal/engine/interpret) | The Cypher planner (`plan.go`), executor (`exec.go`, `expand.go`, `pipeline.go`), evaluator (`eval.go`, `value.go`), regex support (`regexfast.go`) |
+| [`internal/engine/interpret/`](internal/engine/interpret) | The Cypher planner (`plan.go`), executor (`exec.go`, `expand.go`, `pipeline.go`), evaluator (`eval.go`, `value.go`), the PostgreSQL types of numbers (`sqlnum.go`), regex support (`regexfast.go`) |
 | [`cmd/bloodtrail/`](cmd/bloodtrail), [`internal/installer/`](internal/installer) | The CLI and the install/rollback/status/verify logic |
 | `internal/compose/`, `internal/dockerx/`, `internal/dbswitch/`, `internal/backup/`, `internal/manifest/`, `internal/toolapi/`, `internal/verify/` | Installer helpers: Compose files, Compose's discovery lists and `.env` read with Compose's own rules, running Docker, BloodHound's driver switch and ending the watermark lineage, backups, the install manifest (including the `COMPOSE_FILE` entry an install wrote), the migration API, post-install checks |
 | [`integration/`](integration), `internal/graphtest/` | The integration and differential test suites and their fixtures, including the OpenGraph replay and a runner for the installer's `psql` statements |

@@ -25,24 +25,78 @@ import "fmt"
 // to this fold), and so is its WatermarkLineage: the segments folded in are
 // writes this engine observed and counted, so the result still belongs to
 // exactly the lineage base was loaded from.
+//
+// Fold drops a delta edge whose endpoint is still pending (see
+// FoldWithPendingEdges), silently -- it cannot report what it dropped, which
+// is the whole difference between the two. No caller outside this package's
+// own tests uses it any more, and that is deliberate rather than
+// circumstantial: both engine callers need to know. The compactor carries
+// the pending edges forward onto its new base, and the snapshot save refuses
+// to write a file at all rather than one the fold shortened without saying
+// so (../persist.go's reasonFoldWouldDropPendingEdges), because the file's
+// stamp cannot record that it is short. A new caller that genuinely knows no
+// write is left to deliver an endpoint may use this; one that merely assumes
+// it should not.
 func Fold(base *Snapshot, segments []*Segment) (*Snapshot, error) {
+	folded, _, err := FoldWithPendingEdges(base, segments)
+	return folded, err
+}
+
+// FoldWithPendingEdges is Fold, additionally returning the delta edges the
+// folded snapshot cannot hold yet: those with an endpoint that is PENDING --
+// neither in base nor anywhere in the segments, not even as a tombstone.
+// The result is nil when there are none, the ordinary case.
+//
+// A pending endpoint is normally a node whose own write has not been applied
+// yet. An edge names its endpoints by database id, which the writing
+// transaction can only have learned from a node already committed (or
+// created by the same write), but nothing ties the order Applies run in to
+// the order writes committed, so an edge's segment can be published before
+// its endpoint's. The overlay View keeps such an edge record and shows
+// nothing for it until the endpoint's segment lands, which heals it. A fold
+// in that window must not drop it: the endpoint arrives on top of the folded
+// base (compaction's rebased tail), and the edge has to still be there for it
+// to meet. The caller layers the returned segment on the folded base beneath
+// everything published after segments, which keeps every such edge exactly
+// as the overlay had it -- including one whose endpoint never arrives
+// (PostgreSQL does not require an edge's endpoints to exist: its edge table
+// names them by id with no foreign key to node), which stays as invisible as
+// it was.
+//
+// An endpoint that never arrives means this segment is handed back, in full,
+// by every subsequent fold too, so the compactor's View never loses its
+// delta. That is correct here and has a cost elsewhere, which this function
+// is deliberately not the place to pay: the engine's post-compaction
+// snapshot save only writes a file when the delta is empty, so a carry that
+// never ends used to stop it writing one ever again. The save recognizes
+// that delta itself -- View.DeltaHoldsOnlyUnresolvableEdges, which is
+// exactly "the next fold would carry all of this again" -- and asks for a
+// rebuild rather than this function guessing at a fold count past which an
+// endpoint is presumed never to come (../persist.go's
+// noteSkippedCompactionSave).
+//
+// An edge with an endpoint that is GONE -- tombstoned by the segments -- is
+// dropped, as Fold always did: node ids are never reused, so nothing can
+// bring that endpoint back, and carrying the edge would only keep an
+// invisible record alive forever.
+func FoldWithPendingEdges(base *Snapshot, segments []*Segment) (*Snapshot, *Segment, error) {
 	merged := MergeSegments(segments)
 
 	b := NewBuilder(base.GraphID)
 	b.SetKinds(foldKindPairs(base.Kinds, merged.AddedKinds()))
 
 	if err := foldNodes(b, base, merged); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	foldEdges(b, base, merged)
+	pending := foldEdges(b, base, merged)
 
 	folded, err := b.Build()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	folded.MultiGraph = base.MultiGraph
 	folded.WatermarkLineage = base.WatermarkLineage
-	return folded, nil
+	return folded, pending, nil
 }
 
 // foldKindPairs returns base's own kind id<->name pairs plus added (the
@@ -209,14 +263,14 @@ func foldOneAddedNode(b *Builder, merged *Segment, pgID uint64) error {
 
 // foldEdges stages every base edge the merged delta didn't tombstone or
 // override, plus every one of the merged delta's own non-tombstoned edges
-// (added or overriding). Builder.AddEdge accepts edges in any order and
-// resolves + sorts them at Build time, so foldEdges doesn't need to reason
-// about ordering at all -- and Build's own tolerant edge resolution (an edge
-// whose endpoint was never staged, e.g. because it was tombstoned, is
-// dropped rather than failing the build) is exactly the "dangling delta
-// edge" tolerance the loader and View.OutEdges/InEdges already document, so
-// foldEdges doesn't need to duplicate that check itself.
-func foldEdges(b *Builder, base *Snapshot, merged *Segment) {
+// (added or overriding) whose endpoints are both live, and returns the ones
+// with a pending endpoint as a segment of their own (nil if there are none)
+// -- see FoldWithPendingEdges for why those cannot be folded yet, and why
+// an edge with a gone endpoint is dropped. Builder.AddEdge accepts edges in
+// any order and resolves + sorts them at Build time, so foldEdges doesn't
+// need to reason about ordering at all; a base edge whose endpoint the delta
+// tombstoned is dropped by Build's own tolerant edge resolution.
+func foldEdges(b *Builder, base *Snapshot, merged *Segment) *Segment {
 	touched := make(map[uint64]struct{}, merged.EdgeCount())
 	merged.IterEdges(func(id uint64, _ EdgeSegState) bool {
 		touched[id] = struct{}{}
@@ -234,11 +288,59 @@ func foldEdges(b *Builder, base *Snapshot, merged *Segment) {
 		}
 	}
 
+	var (
+		pending    SegmentBuilder
+		anyPending bool
+	)
 	merged.IterEdges(func(id uint64, st EdgeSegState) bool {
 		if st.Tombstoned {
 			return true
 		}
-		b.AddEdge(id, st.StartID, st.EndID, st.Kind)
+		start, end := foldNodeFateOf(base, merged, st.StartID), foldNodeFateOf(base, merged, st.EndID)
+		switch {
+		case start == foldNodeGone || end == foldNodeGone:
+			// Dropped: nothing can bring the endpoint back.
+		case start == foldNodePending || end == foldNodePending:
+			pending.AddEdgeState(id, st.StartID, st.EndID, st.Kind)
+			anyPending = true
+		default:
+			b.AddEdge(id, st.StartID, st.EndID, st.Kind)
+		}
 		return true
 	})
+	if !anyPending {
+		return nil
+	}
+	return pending.Build()
+}
+
+// foldNodeFate is what a fold knows about one edge endpoint's node.
+type foldNodeFate int
+
+const (
+	// foldNodeLive: the node is in the folded snapshot -- a base node the
+	// delta did not tombstone, or a node the delta writes.
+	foldNodeLive foldNodeFate = iota
+	// foldNodeGone: the delta tombstones the node, so it is not in the
+	// folded snapshot and never will be again.
+	foldNodeGone
+	// foldNodePending: neither base nor the delta knows the node at all; its
+	// write may still be on its way (FoldWithPendingEdges).
+	foldNodePending
+)
+
+// foldNodeFateOf classifies database node id pgID for a fold of merged over
+// base. The delta's own record, when it has one, decides; otherwise the node
+// is live exactly when base holds it.
+func foldNodeFateOf(base *Snapshot, merged *Segment, pgID uint64) foldNodeFate {
+	if st, ok := merged.NodeState(pgID); ok {
+		if st.Tombstoned {
+			return foldNodeGone
+		}
+		return foldNodeLive
+	}
+	if _, ok := base.Dense(pgID); ok {
+		return foldNodeLive
+	}
+	return foldNodePending
 }

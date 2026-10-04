@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -114,6 +115,46 @@ func (e *Engine) Start(ctx context.Context) {
 	go e.runBootLoad(ctx)
 }
 
+// loadRetryDelayAfter is the retry cadence both load loops use after one
+// rebuildOnce attempt, err being that attempt's own error: it wraps
+// fallbackRetryDelay (apply.go) with the one outcome whose cost the doubling
+// backoff was never meant to carry.
+//
+// A rebuild that ended in a recovered panic waits fallbackBudgetRetryInterval
+// and leaves backoff untouched, exactly as an over-budget refusal does, and
+// for the same judgment: a panic that depends on the data -- the shape this
+// recovery exists for, since one that does not is gone on the next attempt --
+// recurs on every attempt, so the seconds-scale schedule only re-runs a
+// whole snapshot load, and logs a whole stack, every 30 s for the life of
+// the process for a result already known. The engine serves correctly from
+// PostgreSQL meanwhile (that is what FALLBACK is), so there is nothing the
+// faster cadence buys. Leaving backoff untouched keeps the fast retry for
+// whatever outcome comes next, the same way the budget case does.
+//
+// Such a panic arrives in one of two shapes, and both have to count, or the
+// interval covers only the rarer one:
+//
+//   - On the rebuild's own goroutine (the snapshot build, the size check,
+//     the adoption): recoverRebuildPanic re-raises nothing and sets
+//     Engine.rebuildPanicked (engine.go).
+//   - On one of the load's own goroutines (loadNodes' row scan, ParseProps,
+//     AddParsedNode): goRecovered recovers it where it happens and returns
+//     it as this load's error (loadPanicError, load.go), which never passes
+//     through recoverRebuildPanic at all -- so it is recognized here by its
+//     type, through every %w wrapping between the goroutine and this call.
+//     This is the likelier of the two for a data-dependent panic, since
+//     parsing and staging are where the data is touched.
+//
+// Every other outcome, panic-free, is fallbackRetryDelay's own decision,
+// unchanged.
+func (e *Engine) loadRetryDelayAfter(err error, backoff time.Duration) (wait time.Duration, nextBackoff time.Duration) {
+	var loadPanic *loadPanicError
+	if e.rebuildPanicked.Load() || errors.As(err, &loadPanic) {
+		return fallbackBudgetRetryInterval, backoff
+	}
+	return fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+}
+
 // Stop quiesces the engine's background work: it cancels the engine's own
 // background context (bgCtx, engine.go), which is what makes both the
 // boot-load goroutine below and the fallback recovery goroutine (apply.go)
@@ -129,10 +170,33 @@ func (e *Engine) Start(ctx context.Context) {
 // holds anything a caller needs back. Their own context checks -- at the top
 // of each retry loop, and while waiting out a backoff -- are what make exit
 // "prompt" without Stop needing to block on it.
+//
+// It leaves the write path's own pool (writePathPool) open: the shutdown
+// save that follows Stop (Driver.Close) waits, on applyMu, for an Apply
+// still running, and that Apply's read-back may be holding the pool. Closing
+// it here made such a read-back fail its next query, enter fallback, and so
+// cost the save its file. CloseWritePool closes it once the save is done.
 func (e *Engine) Stop() {
 	if e.bgCancel != nil {
 		e.bgCancel()
 	}
+}
+
+// CloseWritePool closes the write path's own pool (writePathPool), without
+// waiting for a statement still running on it: a write that races the
+// shutdown past this point runs its bump and read-back on the main pool
+// instead, and a read-back already under way on the write pool can fail its
+// next query there and enter fallback. Driver.Close calls it after Stop and
+// the shutdown save, so that fallback can no longer cost the file.
+// Idempotent. An engine nobody closes keeps the pool, and pgxpool's own
+// background goroutine with it, until the process exits: the idle
+// connections time out (writePathPoolIdleTime) but the pool does not close
+// itself, and no point in the engine's own lifecycle can close it for the
+// reason above. Production always reaches this call, through Driver.Close;
+// in this package's tests the cleanup graphtest.PGAvailable installs closes
+// them instead (write_pool_leak_guard_integration_test.go), not this call.
+func (e *Engine) CloseWritePool() {
+	e.writePool.close()
 }
 
 // runBootLoad is the boot-load goroutine body launched by Start, once
@@ -261,7 +325,7 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 
 		if !fileTried {
 			fileTried = true
-			if e.snap.Load() == nil && e.tryLoadSnapshotFile(e.bgCtx) {
+			if e.snap.Load() == nil && e.bootFromSnapshotFile(e.bgCtx) {
 				e.finishFallbackRebuild()
 				return
 			}
@@ -281,7 +345,7 @@ func (e *Engine) runBootLoad(ctx context.Context) {
 			return
 		}
 
-		wait, next := fallbackRetryDelay(err == nil && e.overBudget.Load(), backoff)
+		wait, next := e.loadRetryDelayAfter(err, backoff)
 		backoff = next
 
 		select {
@@ -524,7 +588,7 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 		}
 	}
 
-	snap, stamp, err := snapshot.ReadSnapshotFile(path)
+	snap, stamp, err := readSnapshotFile(path)
 	if err != nil {
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file rejected",
 			slog.String("path", path),
@@ -559,6 +623,17 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 	)
 	return true
 }
+
+// readSnapshotFile is tryLoadSnapshotFile's read of the whole file
+// (snapshot.ReadSnapshotFile), a variable only so that a test can make the
+// file-boot attempt panic before applyMu is taken.
+var readSnapshotFile = snapshot.ReadSnapshotFile
+
+// warmSnapshotFile is adoptSnapshotFileAttempt's warm-up of the file-loaded
+// base (snapshot.Snapshot.Warm), a variable only so that a test can make the
+// file-boot attempt panic in the other window than readSnapshotFile's: with
+// applyMu held, after the replay and before the view is published.
+var warmSnapshotFile = (*snapshot.Snapshot).Warm
 
 // bootGapSettleTimeout and bootGapSettleRetryInterval pace the settle-wait
 // in adoptSnapshotFileView: how long an adoption may wait, in how fine a
@@ -617,20 +692,25 @@ const (
 // by cases: a post-freeze write whose Apply already ran (a no-op against
 // the nil snapshot) is in the buffer and rides the replay below; one whose
 // Apply is parked on applyMu lands after publish as an ordinary delta.
-// Both stage read-back truth -- pg's current committed state per key,
-// never the write's own payload -- so replay order cannot matter, the
-// same argument the replay paragraph below already makes for same-key
-// rewrites. The freeze itself therefore needs no lock: earlier bumps are
-// waited for, later ones are tolerated by construction.
+// Both stage read-back truth -- pg's current committed state per row,
+// never the write's own payload, and for a kind-scoped delete never an
+// instruction over whatever the view holds: the rows its criteria match in
+// the view being replayed onto are re-read by id, in batches (readBack) -- so
+// replay order cannot matter, although ascending counter order is the
+// order writes STARTED, not the order they committed; the replay paragraph
+// below makes the same argument for same-key rewrites. The freeze itself
+// therefore needs no lock: earlier bumps are waited for, later ones are
+// tolerated by construction.
 //
 // Before any attempt, fileRefusal (watermark.go) must find nothing against
 // the file: it has to belong to the watermark lineage PostgreSQL is in,
 // read in the same statement as the frozen target -- the counter
 // comparisons below prove nothing across lineages (watermarkLineageDDL) --
-// and its stamp must not show rows inserted behind the counter since it was
-// written (insertedSinceFile). Either rejects at once: no write this boot
-// could observe will ever make such a file right, so there is nothing to
-// wait for.
+// its stamp must not be ahead of where the counter stood when this process
+// started (counterBehindFile), and it must not show rows inserted behind
+// the counter since it was written (insertedSinceFile). Each rejects at
+// once: no write this boot could observe will ever make such a file right,
+// so there is nothing to wait for.
 //
 // The proof each attempt demands, evaluated under applyMu so no Apply can
 // move anything mid-attempt:
@@ -654,9 +734,10 @@ const (
 //     target are exactly the file's counter through the target, with no
 //     hole and nothing the buffer could not faithfully replay (a poisoned
 //     buffer rejects immediately -- poison never heals, so there is
-//     nothing to wait for). The attempt PEEKS for this check and only the
-//     covered attempt take()s, so the buffer keeps observing the very
-//     Applies the wait is waiting for.
+//     nothing to wait for -- and so do counters that contradict the file,
+//     bootGapContradiction, for the same reason). The attempt PEEKS for
+//     this check and only the covered attempt take()s, so the buffer keeps
+//     observing the very Applies the wait is waiting for.
 //
 // The replay itself is Apply's own machinery, reused verbatim per buffered
 // write -- readBack for pg's post-commit truth on every key the ChangeSet
@@ -767,7 +848,15 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 	for i, entry := range peeked {
 		counters[i] = entry.counter
 	}
-	if !bootGapCoveredAt(fileWatermark, pgSnapshot, counters) {
+	switch verdict, why := bootGapCoveredAt(fileWatermark, pgSnapshot, counters); verdict {
+	case bootGapContradiction:
+		reject("boot write buffer contradicts the file: "+why,
+			slog.Uint64("file_watermark", fileWatermark),
+			slog.Uint64("pg_watermark", pgSnapshot),
+			slog.Int("buffered_writes", len(peeked)),
+		)
+		return 0, adoptAttemptRejected, 0
+	case bootGapHole:
 		return 0, adoptAttemptNotYetCovered, len(peeked)
 	}
 
@@ -788,12 +877,22 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 		if entry.cs == nil {
 			continue
 		}
-		rb, err := e.readBack(ctx, entry.cs)
+		rb, err := e.readBack(ctx, view, entry.cs)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
 			return 0, adoptAttemptRejected, 0
 		}
-		seg, err := buildApplySegment(view, rb, entry.cs)
+		// A fallback read-back recorded on the way (readBack's "The one
+		// fallback this records") rejects the file, as every other doubt
+		// does: the buffer's own observe already poisoned anything that
+		// arrived carrying a fallback, so a fallback here is one this replay
+		// just learned about, and a view published without it would be
+		// missing a committed row while this process served from it.
+		if hasFallback, reasons := entry.cs.HasFallback(); hasFallback {
+			reject("boot write replay cannot be expressed as a delta: " + strings.Join(reasons, "; "))
+			return 0, adoptAttemptRejected, 0
+		}
+		seg, err := buildApplySegment(view, rb)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
 			return 0, adoptAttemptRejected, 0
@@ -814,7 +913,13 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 
 	// Build the derived read indexes now, on the write path, rather than
 	// leaving them for whichever query arrives first -- see Snapshot.Warm.
-	view.Base().Warm()
+	warmSnapshotFile(view.Base())
+	// The view accounts for every value up to the frozen target: the file
+	// through its stamp, the replay above it. The ledger learns that before
+	// the view is published -- nothing between here and the Store can refuse
+	// it, and until the Store there is no view for a save to write -- so no
+	// convergence read ever sees this view with the ledger behind it.
+	e.appliedWatermark.rebase(pgSnapshot)
 	e.snap.Store(view)
 	e.resolvedDirtyGen.Store(maxWatermark(e.resolvedDirtyGen.Load(), settledGen))
 	e.maintainAfterPublish(ctx, view)

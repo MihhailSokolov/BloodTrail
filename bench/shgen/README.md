@@ -98,6 +98,9 @@ the prebuilt queries traverse):
 generated forest, waits for ingest and analysis, then times the three read
 paths BloodTrail serves (pathfinding, Cypher, entity-panel reads), writing a
 JSON report. Every phase is bounded by `--deadline`; nothing waits forever.
+A query's latency is the duration of its request, not of decoding the answer,
+and `p95_ms` is the nearest-rank 95th percentile, which with the default
+handful of repeats is the slowest run.
 
     python3 bench.py --port 8181 --data DIR --password PW --label stock
 

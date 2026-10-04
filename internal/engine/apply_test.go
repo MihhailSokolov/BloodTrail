@@ -4,6 +4,10 @@ package engine
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -115,7 +119,7 @@ func TestBuildApplySegmentUpsertsPresentStateAndTombstonesAbsent(t *testing.T) {
 		resolvedKinds: map[snapshot.KindID]string{applyKindTag: "Tag"},
 	}
 
-	seg, err := buildApplySegment(view, rb, &ChangeSet{})
+	seg, err := buildApplySegment(view, rb)
 	if err != nil {
 		t.Fatalf("buildApplySegment: %v", err)
 	}
@@ -143,26 +147,6 @@ func TestBuildApplySegmentUpsertsPresentStateAndTombstonesAbsent(t *testing.T) {
 	}
 }
 
-// TestBuildApplySegmentAbsentObjectIDTombstonesEveryMatch covers the
-// objectid half of read-back's absence reporting: an objectid that matched
-// no row after the write means every node the View still knows under it is
-// gone, cascade included.
-func TestBuildApplySegmentAbsentObjectIDTombstonesEveryMatch(t *testing.T) {
-	view := buildApplyView(t)
-
-	rb := &readbackResult{absentObjectIDs: []string{"oid-1"}}
-
-	seg, err := buildApplySegment(view, rb, &ChangeSet{})
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	requireNodeTombstoned(t, seg, 1)
-	requireEdgeTombstoned(t, seg, 10) // out of node 1
-	requireEdgeTombstoned(t, seg, 12) // into node 1
-	requireNoEdgeRecord(t, seg, 11)   // untouched by node 1's cascade
-}
-
 // TestBuildApplySegmentAbsentTriples covers both triple cases: a triple that
 // still exists in the View is tombstoned by finding its edge id through the
 // start node's adjacency, while a triple carrying read-back's
@@ -180,7 +164,7 @@ func TestBuildApplySegmentAbsentTriples(t *testing.T) {
 		},
 	}
 
-	seg, err := buildApplySegment(view, rb, &ChangeSet{})
+	seg, err := buildApplySegment(view, rb)
 	if err != nil {
 		t.Fatalf("buildApplySegment: %v", err)
 	}
@@ -190,136 +174,132 @@ func TestBuildApplySegmentAbsentTriples(t *testing.T) {
 	requireNoEdgeRecord(t, seg, 12)
 }
 
-// TestBuildApplySegmentNodeKindCriteria pins the criteria replay to dawgs'
-// own DeleteNodesByKinds rule: a node is deleted when its kinds overlap
-// Include and do not overlap Exclude, and every deleted node cascades to its
-// edges.
-func TestBuildApplySegmentNodeKindCriteria(t *testing.T) {
+// TestBuildApplySegmentPresentStateWinsOverCascadeTombstone pins the
+// staging order buildApplySegment's own doc describes: a row read-back found
+// is staged after every tombstone, so it wins over a cascade the View
+// derived from an absent endpoint.
+func TestBuildApplySegmentPresentStateWinsOverCascadeTombstone(t *testing.T) {
+	view := buildApplyView(t)
+
+	rb := &readbackResult{
+		absentNodeIDs: []uint64{3},
+		edges:         []edgeState{{id: 11, start: 2, end: 3, kindID: applyKindMemberOf}},
+	}
+
+	seg, err := buildApplySegment(view, rb)
+	if err != nil {
+		t.Fatalf("buildApplySegment: %v", err)
+	}
+
+	requireNodeTombstoned(t, seg, 3)
+	requireEdgeTombstoned(t, seg, 12) // node 3's cascade, not read back
+	if st, ok := seg.EdgeState(11); !ok || st.Tombstoned {
+		t.Fatalf("edge 11 state = (%+v, %v), want the present read-back row to win over node 3's cascade", st, ok)
+	}
+}
+
+// requireViewCandidates collects view's candidates for cs and absentObjectIDs
+// (the kind names in resolved stand for what resolveCriteriaKinds found in
+// PostgreSQL) and asserts they are exactly wantNodes and wantEdges.
+func requireViewCandidates(t *testing.T, view *snapshot.View, resolved map[snapshot.KindID]string, cs *ChangeSet, absentObjectIDs []string, wantNodes, wantEdges []uint64) {
+	t.Helper()
+
+	c, err := collectViewCandidates(view, resolved, cs, absentObjectIDs)
+	if err != nil {
+		t.Fatalf("collectViewCandidates: %v", err)
+	}
+	gotNodes := c.nodeIDs()
+	gotEdges := append([]uint64(nil), c.edges...)
+	sort.Slice(gotNodes, func(i, j int) bool { return gotNodes[i] < gotNodes[j] })
+	sort.Slice(gotEdges, func(i, j int) bool { return gotEdges[i] < gotEdges[j] })
+	if !reflect.DeepEqual(gotNodes, wantNodes) {
+		t.Fatalf("candidate nodes = %v, want %v", gotNodes, wantNodes)
+	}
+	if !reflect.DeepEqual(gotEdges, wantEdges) {
+		t.Fatalf("candidate edges = %v, want %v", gotEdges, wantEdges)
+	}
+}
+
+// TestViewCandidatesAbsentObjectIDNamesEveryLiveNodeUnderIt: an objectid that
+// matched no row makes every node the View still knows under it a candidate
+// -- to re-read by id, not to tombstone: its objectid may only have been
+// rewritten.
+func TestViewCandidatesAbsentObjectIDNamesEveryLiveNodeUnderIt(t *testing.T) {
+	view := buildApplyView(t)
+
+	requireViewCandidates(t, view, nil, &ChangeSet{}, []string{"oid-1", "oid-unknown"}, []uint64{1}, nil)
+}
+
+// TestViewCandidatesNodeKindCriteria pins the node criteria's candidates to
+// dawgs' own DeleteNodesByKinds rule: a node matches when its kinds overlap
+// Include and do not overlap Exclude.
+func TestViewCandidatesNodeKindCriteria(t *testing.T) {
 	view := buildApplyView(t)
 
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("User")}, graph.Kinds{graph.StringKind("Tag")})
 
-	seg, err := buildApplySegment(view, &readbackResult{}, cs)
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	// Node 1 is a User and carries no Tag: deleted, cascading to edges 10/12.
-	requireNodeTombstoned(t, seg, 1)
-	requireEdgeTombstoned(t, seg, 10)
-	requireEdgeTombstoned(t, seg, 12)
-
-	// Node 3 is a User too, but carries Tag: excluded, so it survives.
-	if _, ok := seg.NodeState(3); ok {
-		t.Fatalf("node 3 was tombstoned despite carrying the excluded Tag kind")
-	}
-	// Node 2 is not a User at all.
-	if _, ok := seg.NodeState(2); ok {
-		t.Fatalf("node 2 was tombstoned despite not carrying the included User kind")
-	}
-	requireNoEdgeRecord(t, seg, 11)
+	// Node 1 is a User carrying no Tag; node 3 is a User but carries Tag;
+	// node 2 is no User at all.
+	requireViewCandidates(t, view, nil, cs, nil, []uint64{1}, nil)
 }
 
-// TestBuildApplySegmentNodeKindCriteriaEmptyIncludeMatchesEveryNode covers
+// TestViewCandidatesNodeKindCriteriaEmptyIncludeMatchesEveryNode covers
 // dawgs' own "when includeAny is empty, for every node" rule -- the shape
-// BloodHound's guarded database wipe uses, where only the exclusions narrow
-// the delete.
-func TestBuildApplySegmentNodeKindCriteriaEmptyIncludeMatchesEveryNode(t *testing.T) {
+// BloodHound's "delete sourceless data" uses, where only the exclusions
+// narrow the delete.
+func TestViewCandidatesNodeKindCriteriaEmptyIncludeMatchesEveryNode(t *testing.T) {
 	view := buildApplyView(t)
 
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("Computer")})
 
-	seg, err := buildApplySegment(view, &readbackResult{}, cs)
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	requireNodeTombstoned(t, seg, 1)
-	requireNodeTombstoned(t, seg, 3)
-	if _, ok := seg.NodeState(2); ok {
-		t.Fatalf("node 2 was tombstoned despite carrying the excluded Computer kind")
-	}
+	requireViewCandidates(t, view, nil, cs, nil, []uint64{1, 3}, nil)
 }
 
-// TestBuildApplySegmentNodeKindCriteriaUnresolvableExcludeErrors covers the
-// one criteria case that cannot be replayed soundly: PostgreSQL refuses a
-// delete whose exclusion names an undefined kind rather than silently
-// widening it, so an exclude kind that neither this View nor read-back could
-// resolve means the applier and PostgreSQL disagree about what the delete
-// even was -- an error (which Apply turns into a fallback), never a guess.
-// An unresolvable INCLUDE kind, by contrast, legitimately matches nothing,
+// TestViewCandidatesNodeKindCriteriaUnresolvableExcludeErrors covers the one
+// criteria case that cannot be replayed soundly: PostgreSQL refuses a delete
+// whose exclusion names an undefined kind rather than silently widening it,
+// so an exclude kind that neither this View nor read-back could resolve
+// means the applier and PostgreSQL disagree about what the delete even was
+// -- an error (which Apply turns into a fallback), never a guess. An
+// unresolvable INCLUDE kind, by contrast, legitimately matches nothing,
 // exactly as it does in PostgreSQL.
-func TestBuildApplySegmentNodeKindCriteriaUnresolvableExcludeErrors(t *testing.T) {
+func TestViewCandidatesNodeKindCriteriaUnresolvableExcludeErrors(t *testing.T) {
 	view := buildApplyView(t)
 
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("User")}, graph.Kinds{graph.StringKind("NeverAsserted")})
-
-	if _, err := buildApplySegment(view, &readbackResult{}, cs); err == nil {
-		t.Fatalf("buildApplySegment with an unresolvable exclude kind = nil error, want an error")
+	if _, err := collectViewCandidates(view, nil, cs, nil); err == nil {
+		t.Fatalf("collectViewCandidates with an unresolvable exclude kind = nil error, want an error")
 	}
 
 	unknownInclude := &ChangeSet{}
 	unknownInclude.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("NeverAsserted")}, nil)
-
-	seg, err := buildApplySegment(view, &readbackResult{}, unknownInclude)
-	if err != nil {
-		t.Fatalf("buildApplySegment with an unresolvable include kind: %v", err)
-	}
-	if seg.NodeCount() != 0 || seg.EdgeCount() != 0 {
-		t.Fatalf("an unresolvable include kind tombstoned %d nodes / %d edges, want none", seg.NodeCount(), seg.EdgeCount())
-	}
+	requireViewCandidates(t, view, nil, unknownInclude, nil, nil, nil)
 }
 
-// TestBuildApplySegmentNodeKindCriteriaExcludeResolvedByReadBack covers
+// TestViewCandidatesNodeKindCriteriaExcludeResolvedByReadBack covers
 // BloodHound's "delete sourceless data" shape -- no include kinds, every
 // registered source kind excluded -- when one of those source kinds was
 // registered after this View's last full load and no row carries it, so
-// only read-back could resolve it. The delete replays like any other: the
-// unknown kind excludes nothing (no node carries it), the known one still
-// protects its node, and the resolved kind joins the segment's kind table.
-func TestBuildApplySegmentNodeKindCriteriaExcludeResolvedByReadBack(t *testing.T) {
+// only read-back could resolve it: the unknown kind excludes nothing (no
+// node carries it), and the known one still protects its node.
+func TestViewCandidatesNodeKindCriteriaExcludeResolvedByReadBack(t *testing.T) {
 	view := buildApplyView(t)
-
-	const rowlessSource snapshot.KindID = 42
 
 	cs := &ChangeSet{}
 	cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("Tag"), graph.StringKind("RowlessSource")})
 
-	rb := &readbackResult{resolvedKinds: map[snapshot.KindID]string{rowlessSource: "RowlessSource"}}
-
-	seg, err := buildApplySegment(view, rb, cs)
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	// Nodes 1 and 2 carry no excluded kind: deleted, with every edge
-	// incident to either (10, 11 and 12 all touch node 1 or node 2).
-	requireNodeTombstoned(t, seg, 1)
-	requireNodeTombstoned(t, seg, 2)
-	requireEdgeTombstoned(t, seg, 10)
-	requireEdgeTombstoned(t, seg, 11)
-	requireEdgeTombstoned(t, seg, 12)
-
-	// Node 3 carries Tag, which is excluded: it survives.
-	if _, ok := seg.NodeState(3); ok {
-		t.Fatalf("node 3 was tombstoned despite carrying the excluded Tag kind")
-	}
-
-	if name, ok := seg.AddedKinds()[rowlessSource]; !ok || name != "RowlessSource" {
-		t.Fatalf("segment added kinds = %v, want the read-back-resolved RowlessSource kind", seg.AddedKinds())
-	}
+	requireViewCandidates(t, view, map[snapshot.KindID]string{42: "RowlessSource"}, cs, nil, []uint64{1, 2}, nil)
 }
 
-// TestBuildApplySegmentKindCriteriaMatchByID pins why a kind only read-back
-// could resolve is safe to replay: matching is by kind id against every
-// node's and edge's own kind ids, not by what the View's kind table names.
-// A node or edge carrying such an id -- one the table never named -- is
-// therefore still excluded, included or deleted exactly as PostgreSQL
-// treats it, which is what the old refuse-and-fall-back rule was guarding.
-func TestBuildApplySegmentKindCriteriaMatchByID(t *testing.T) {
+// TestViewCandidatesKindCriteriaMatchByID pins why a kind only read-back
+// could resolve is safe to use: matching is by kind id against every node's
+// and edge's own kind ids, not by what the View's kind table names. A node
+// or edge carrying such an id -- one the table never named -- is therefore
+// still excluded, included or matched exactly as PostgreSQL treats it.
+func TestViewCandidatesKindCriteriaMatchByID(t *testing.T) {
 	const (
 		unnamedNodeKind snapshot.KindID = 42
 		unnamedEdgeKind snapshot.KindID = 43
@@ -341,98 +321,65 @@ func TestBuildApplySegmentKindCriteriaMatchByID(t *testing.T) {
 	}
 	view := snapshot.NewView(snap)
 
-	rb := &readbackResult{resolvedKinds: map[snapshot.KindID]string{
+	resolved := map[snapshot.KindID]string{
 		unnamedNodeKind: "UnnamedNode",
 		unnamedEdgeKind: "UnnamedEdge",
-	}}
+	}
 
 	t.Run("exclude", func(t *testing.T) {
 		cs := &ChangeSet{}
 		cs.RecordDeleteNodesByKinds(nil, graph.Kinds{graph.StringKind("UnnamedNode")})
-
-		seg, err := buildApplySegment(view, rb, cs)
-		if err != nil {
-			t.Fatalf("buildApplySegment: %v", err)
-		}
-		requireNodeTombstoned(t, seg, 1)
-		if _, ok := seg.NodeState(2); ok {
-			t.Fatalf("node 2 was tombstoned despite carrying the excluded kind's id")
-		}
+		requireViewCandidates(t, view, resolved, cs, nil, []uint64{1}, nil)
 	})
 
 	t.Run("include", func(t *testing.T) {
 		cs := &ChangeSet{}
 		cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("UnnamedNode")}, nil)
-
-		seg, err := buildApplySegment(view, rb, cs)
-		if err != nil {
-			t.Fatalf("buildApplySegment: %v", err)
-		}
-		requireNodeTombstoned(t, seg, 2)
-		if _, ok := seg.NodeState(1); ok {
-			t.Fatalf("node 1 was tombstoned despite not carrying the included kind's id")
-		}
+		requireViewCandidates(t, view, resolved, cs, nil, []uint64{2}, nil)
 	})
 
 	t.Run("relationships", func(t *testing.T) {
 		cs := &ChangeSet{}
 		cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("UnnamedEdge")})
-
-		seg, err := buildApplySegment(view, rb, cs)
-		if err != nil {
-			t.Fatalf("buildApplySegment: %v", err)
-		}
-		requireEdgeTombstoned(t, seg, 11)
-		requireNoEdgeRecord(t, seg, 10)
+		requireViewCandidates(t, view, resolved, cs, nil, nil, []uint64{11})
 	})
 }
 
-// TestBuildApplySegmentEdgeKindCriteria covers the relationship-delete
-// replay: every edge of the named kinds is tombstoned, no other edge is, and
-// no node is (deleting an edge never removes a node). An unresolvable kind
-// name matches nothing, mirroring dawgs' own tolerant mapping.
-func TestBuildApplySegmentEdgeKindCriteria(t *testing.T) {
+// TestViewCandidatesEdgeKindCriteria covers the relationship criteria: every
+// edge of the named kinds is a candidate, no other edge is, and no node is
+// (deleting an edge never removes a node). An unresolvable kind name
+// matches nothing, mirroring dawgs' own tolerant mapping.
+func TestViewCandidatesEdgeKindCriteria(t *testing.T) {
 	view := buildApplyView(t)
 
 	cs := &ChangeSet{}
 	cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("AdminTo"), graph.StringKind("NeverAsserted")})
 
-	seg, err := buildApplySegment(view, &readbackResult{}, cs)
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	requireEdgeTombstoned(t, seg, 10)
-	requireEdgeTombstoned(t, seg, 12)
-	requireNoEdgeRecord(t, seg, 11)
-	if seg.NodeCount() != 0 {
-		t.Fatalf("a relationship-kind delete tombstoned %d nodes, want none", seg.NodeCount())
-	}
+	requireViewCandidates(t, view, nil, cs, nil, nil, []uint64{10, 12})
 }
 
-// TestBuildApplySegmentPresentStateWinsOverCriteriaTombstone pins the
-// staging order buildApplySegment's own doc describes: read-back's present
-// rows are PostgreSQL's post-commit truth, so they are staged last and win
-// over any tombstone derived from the (possibly already stale) View.
-func TestBuildApplySegmentPresentStateWinsOverCriteriaTombstone(t *testing.T) {
+// TestViewCandidatesEdgeKindCriteriaCoversEveryDeltaRecord pins the edge
+// scan against an overlay: the newest delta record for an id decides it (a
+// tombstoned base edge is no candidate, an upserted one is named once), and
+// a delta edge OutEdges does not show -- one whose endpoint the View does not
+// know yet -- is a candidate all the same, since it reappears the moment
+// that endpoint lands.
+func TestViewCandidatesEdgeKindCriteriaCoversEveryDeltaRecord(t *testing.T) {
 	view := buildApplyView(t)
 
+	var older snapshot.SegmentBuilder
+	older.TombstoneEdge(12)
+	older.AddEdgeState(20, 2, 99, applyKindAdminTo) // node 99 is unknown: dangling
+	older.AddEdgeState(21, 1, 3, applyKindAdminTo)
+	var newer snapshot.SegmentBuilder
+	newer.AddEdgeState(10, 1, 2, applyKindAdminTo) // re-staged base edge
+	newer.TombstoneEdge(21)
+	view = view.WithSegment(older.Build()).WithSegment(newer.Build())
+
 	cs := &ChangeSet{}
-	cs.RecordDeleteNodesByKinds(graph.Kinds{graph.StringKind("User")}, nil)
+	cs.RecordDeleteRelationshipsByKinds(graph.Kinds{graph.StringKind("AdminTo")})
 
-	rb := &readbackResult{
-		nodes: []nodeState{{id: 1, kindIDs: []snapshot.KindID{applyKindUser}, propsJSON: []byte(`{"objectid":"oid-1"}`)}},
-	}
-
-	seg, err := buildApplySegment(view, rb, cs)
-	if err != nil {
-		t.Fatalf("buildApplySegment: %v", err)
-	}
-
-	st, ok := seg.NodeState(1)
-	if !ok || st.Tombstoned {
-		t.Fatalf("node 1 state = (%+v, %v), want the present read-back row to win over the criteria tombstone", st, ok)
-	}
+	requireViewCandidates(t, view, nil, cs, nil, nil, []uint64{10, 20})
 }
 
 // TestEnterFallbackFlipsStateOnceAndStopsServing covers the state half of
@@ -485,6 +432,84 @@ func TestApplyBumpsEpochBeforeAnyEarlyReturn(t *testing.T) {
 	}
 	if e.state.Load() != stateServing {
 		t.Fatalf("Apply with no snapshot adopted entered fallback, want it to stay serving")
+	}
+}
+
+// TestApplyPanicEntersFallback: a panic part-way through Apply -- here from
+// read-back, since this engine has no PostgreSQL driver at all -- must not
+// leave the engine serving a replica that never received the committed
+// write, and must not reach Apply's caller either: the write has already
+// committed, so its caller must not be told otherwise.
+//
+// The rebuild-loop gate is held for the test, as nothing here could run a
+// real recovery load.
+func TestApplyPanicEntersFallback(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	e.snap.Store(buildApplyView(t))
+	e.fallbackRebuilding.Store(true)
+
+	scope := NewWriteScope()
+	scope.Changes().RecordNodeID(7)
+
+	var escaped any
+	func() {
+		defer func() { escaped = recover() }()
+		e.Apply(context.Background(), scope)
+	}()
+
+	if _, serving := e.serveState(); serving {
+		t.Fatalf("engine still serving after Apply panicked before replaying the write (panic: %v)", escaped)
+	}
+	if escaped != nil {
+		t.Fatalf("Apply's panic reached its caller, whose write had already committed: %v", escaped)
+	}
+}
+
+// TestApplyPanicBeforeTheEpochBumpStillStopsARacedRebuild covers the one
+// window the epoch bump itself does not cover: a panic between Apply's
+// watermark bookkeeping and the bump (the AdvanceWatermark/
+// settleWatermarkFailure lines above it). The engine enters fallback, and a
+// rebuild already loading when this write committed then finds the epoch it
+// read before its load unchanged -- so it adopts a snapshot that predates
+// this write, which ends the fallback and leaves the engine serving without
+// the write, for as long as nothing else writes. fallBackOnApplyPanic bumps
+// the epoch itself, so such a rebuild is refused and retried, exactly as it
+// is for a panic anywhere later in Apply.
+//
+// fallBackOnApplyPanic is driven directly: nothing in that window takes an
+// argument or a seam a test could make panic, and the window is two
+// statements wide. The rebuild-loop gate is held, as nothing here could run
+// a real recovery load.
+func TestApplyPanicBeforeTheEpochBumpStillStopsARacedRebuild(t *testing.T) {
+	e := New(nil, nil, Config{Enabled: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	applied := buildApplyView(t)
+	e.snap.Store(applied)
+	e.fallbackRebuilding.Store(true)
+
+	// What a rebuild already in flight read before it started loading.
+	epoch := e.applyEpoch.Load()
+
+	func() {
+		defer e.fallBackOnApplyPanic(context.Background())
+		panic("between the watermark bookkeeping and the epoch bump")
+	}()
+
+	if _, serving := e.serveState(); serving {
+		t.Fatalf("engine still serving after an Apply panic")
+	}
+	if got := e.applyEpoch.Load(); got == epoch {
+		t.Fatalf("applyEpoch = %d after the panic, want it bumped past %d", got, epoch)
+	}
+
+	stale := snapshot.NewView(&snapshot.Snapshot{})
+	if e.adoptRebuiltView(context.Background(), stale, epoch, e.settledDirtyGen.Load()) {
+		t.Fatalf("a rebuild whose load predates the panicking write was adopted; the write is lost")
+	}
+	if got := e.snap.Load(); got != applied {
+		t.Fatalf("the stale rebuild replaced the published view")
+	}
+	if got := e.state.Load(); got != stateFallback {
+		t.Fatalf("state = %d after refusing the stale rebuild, want it to stay stateFallback (%d)", got, stateFallback)
 	}
 }
 

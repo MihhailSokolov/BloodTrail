@@ -34,11 +34,15 @@
 //     appending to out.
 //   - `*0..`: dawgs' translation special-cases Range.Min == 0 with a
 //     separate zero-length arm of the seed query that selects the *same*
-//     row for both pattern endpoints with an empty edge/node list, entirely
+//     row for both pattern endpoints with an empty edge list, entirely
 //     independent of the depth-1-and-up recursive member (which still only
 //     ever fires for depth >= 1). This file mirrors that structurally: the
 //     zero-length row is produced once per seed, before the trail DFS even
-//     starts, never as a "depth 0" case inside the DFS itself.
+//     starts, never as a "depth 0" case inside the DFS itself. Its path
+//     value is the one-node path of that node (ordered_edges_to_path over
+//     the root and no edges), never an empty path.
+//   - An upper bound of zero never reaches this file: buildStep declines it,
+//     because dawgs' primer emits the depth-1 rows regardless of the bound.
 //   - SELF-LOOPS force a decline. pg's recursive CTE carries an `is_cycle`
 //     guard on its SEED-side edge only (the seed arm computes `start = end`
 //     and the recursive member requires `not is_cycle`, resetting it to
@@ -145,15 +149,41 @@ import (
 )
 
 // ErrSelfEndpoint is returned by a shortestPath()/allShortestPaths() Step
-// whose resolved root and terminal endpoint sets intersect while the owning
-// query carries no explicit endpoint inequality over that step's own two
-// endpoints (Step.HasExplicitEndpointInequality false). PostgreSQL's own
-// shortestPath implementation raises SQLSTATE 22023 for exactly this shape
-// (a root that is also a terminal aborts its recursive seed query -- see
-// traverse.SelfEndpointConflict's doc comment for the in-depth citation); this package cannot raise that error itself (there is no live
-// pg statement here to fail), so it returns this sentinel instead, which the
-// engine is expected to treat as "decline, delegate to PostgreSQL" so the
-// caller still observes the real SQLSTATE 22023 pg itself raises.
+// whose root and terminal endpoint sets share a node in a way PostgreSQL's
+// answer depends on and this package does not reproduce:
+//
+//   - without an explicit endpoint inequality over the step's own two
+//     endpoints (Step.HasExplicitEndpointInequality false), resolved sets
+//     that intersect: PostgreSQL's own shortestPath implementation raises
+//     SQLSTATE 22023 for exactly this shape (a root that is also a terminal
+//     aborts its recursive seed query -- see
+//     traverse.SelfEndpointConflict's doc comment for the in-depth
+//     citation) -- and, since it may check before the seed's own conditions
+//     apply, a node matching only the seed side's kinds (kindLevelSelfEndpoint);
+//   - with one, an allShortestPaths answered at the overall shortest length
+//     (traverse.ModeAll), whose length a cycle back to a shared node can set,
+//     and a shortestPath searched pair by pair under a pushed LIMIT, which a
+//     shared node's own pair counts toward (see expandShortestPathComponent).
+//
+// This package cannot raise pg's error or its answer itself, so it returns
+// this sentinel instead, which the engine is expected to treat as "decline,
+// delegate to PostgreSQL" so the caller still observes whatever pg itself
+// returns.
+//
+// The ModeAll case above is a deliberately BROAD over-decline, not the exact
+// divergence. The answers differ only when some shared node's shortest cycle
+// over the step's own edge kinds is STRICTLY SHORTER than the shortest
+// non-self pair: pg's harness answers at min(those two) and `s <> t` then
+// drops the self pair, so a shorter cycle leaves pg with the non-self pairs
+// at a depth this package would never have chosen (often none at all), while
+// an equal or longer cycle leaves both answers identical. Any shared node
+// at all declines here instead, because establishing the real condition
+// means a shortest-cycle search per shared node -- and with one endpoint
+// unconstrained, as in `allShortestPaths((s)-[:X*1..]->(t:Tag_Tier_Zero))
+// WHERE s <> t`, every node of the other side is shared, so that is one BFS
+// per terminal, more work than the query itself and exactly what
+// traverse.SideBudget exists to bound. Declining is always safe, and this
+// stays as it is until that cost is worth paying.
 var ErrSelfEndpoint = errors.New("interpret: self endpoint")
 
 // --- var-length trail expansion --------------------------------------------
@@ -352,7 +382,10 @@ func expandVarLengthComponentFrom(env *Env, meter *workMeter, part *Part, step *
 // contIDs is the step's continuation set, resolved ONCE by the caller via
 // varLengthWalkSetup rather than here -- see that function for why.
 func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *NodeConstraint, seed *Row, pathArcKey string, contIDs []snapshot.NodeID) ([]*Row, error) {
-	root, _ := seed.Node(step.FromSym)
+	root, err := boundNode(seed, step.FromSym)
+	if err != nil {
+		return nil, err
+	}
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
 	var out []*Row
@@ -361,9 +394,10 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 		nr := cloneRow(seed)
 		nr.SetNode(step.ToSym, root)
 		if pathArcKey != "" {
-			// Empty either way (the zero-length case); reversePathVal would
-			// be a no-op here regardless of step.Reversed, so it is skipped.
-			nr.SetPathVar(pathArcKey, &PathVal{})
+			// The zero-length trail is the one-node path of its start node,
+			// as PostgreSQL returns it; one node reads the same in either
+			// direction, so step.Reversed needs no flip here.
+			nr.SetPathVar(pathArcKey, &PathVal{Nodes: []snapshot.NodeID{root}})
 		}
 		if err := meter.spend(1); err != nil {
 			return nil, err
@@ -374,6 +408,8 @@ func expandVarLengthTrailsForSeed(env *Env, meter *workMeter, step *Step, toNC *
 		}
 	}
 
+	// Defensive: buildStep declines an upper bound of zero, so a planned
+	// step never reaches here with maxHops <= 0.
 	if maxHops <= 0 {
 		return out, nil
 	}
@@ -654,6 +690,28 @@ func endpointNarrows(nc *NodeConstraint) bool {
 	return false
 }
 
+// pairFilterEndpoint reports whether nc carries a condition dawgs can put into
+// a shortest-path pair filter: an id or objectid anchor, or any pushed
+// predicate that reads more than the node's kinds -- a negation included,
+// unlike endpointNarrows, because this is about which harness dawgs builds,
+// not about cost. dawgs materializes a pair filter only when both endpoints
+// have one (canMaterializeEndpointPairFilterForStep, translate/model.go), so
+// both answering true is a superset of the shapes it searches pair by pair.
+func pairFilterEndpoint(nc *NodeConstraint) bool {
+	if nc == nil {
+		return false
+	}
+	if len(nc.IDs) > 0 || nc.ObjectIDAnchor != nil {
+		return true
+	}
+	for _, p := range nc.Predicates {
+		if !kindOnlyPredicate(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // negatedPredicate reports whether expr is a negation, which endpointNarrows
 // treats as not narrowing at all.
 //
@@ -927,7 +985,10 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		return nil, errUnsupportedStep
 	}
 
-	terminal, _ := seed.Node(step.ToSym)
+	terminal, err := boundNode(seed, step.ToSym)
+	if err != nil {
+		return nil, err
+	}
 	minDepth, maxHops := step.Range.Min, step.Range.Max
 
 	// A node binds the near endpoint only if it satisfies fromNC COMPLETELY:
@@ -971,9 +1032,10 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		nr := cloneRow(seed)
 		nr.SetNode(step.FromSym, terminal)
 		if pathArcKey != "" {
-			// Empty either way (the zero-length case), so neither the
-			// discovery-order flip below nor reversePathVal would change it.
-			nr.SetPathVar(pathArcKey, &PathVal{})
+			// The one-node path of the node both endpoints bind, exactly as
+			// the forward walker builds it; neither the discovery-order flip
+			// below nor reversePathVal would change a single node.
+			nr.SetPathVar(pathArcKey, &PathVal{Nodes: []snapshot.NodeID{terminal}})
 		}
 		if err := meter.spend(1); err != nil {
 			return nil, err
@@ -984,6 +1046,8 @@ func expandVarLengthTrailsToSeed(env *Env, meter *workMeter, step *Step, fromNC 
 		}
 	}
 
+	// Defensive: buildStep declines an upper bound of zero, so a planned
+	// step never reaches here with maxHops <= 0.
 	if maxHops <= 0 {
 		return out, nil
 	}
@@ -1136,6 +1200,15 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 	if !step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap, roots, terminals) {
 		return nil, ErrSelfEndpoint
 	}
+	// The guard behind that 22023 sits in the harness primer, beside the
+	// seed's own conditions, and PostgreSQL may evaluate it before those
+	// conditions have narrowed the seed -- then a node the seed side's
+	// property predicates exclude still trips it, as long as it matches the
+	// seed side's kinds, lies in the other side's (fully filtered) set and
+	// has an edge the seed would walk.
+	if !step.HasExplicitEndpointInequality && kindLevelSelfEndpoint(env, part, step, roots, terminals) {
+		return nil, ErrSelfEndpoint
+	}
 
 	mode := traverse.ModeOne
 	if step.Shortest == ShortestAll {
@@ -1168,6 +1241,38 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 			}
 			terminals, terminalsEnforced = traverse.Endpoint{IDs: ids}, true
 		}
+
+		// A node that is both a root and a terminal makes that length depend
+		// on its own cycles. PostgreSQL's harness has no visited set, so a
+		// trail back to such a root is a satisfied path like any other and
+		// can fix the depth; `s <> t` only drops the self pair's paths
+		// afterwards, leaving just the other pairs of that depth -- often
+		// none. traverse never walks a pair back to itself, so it would
+		// answer from the shortest OTHER pair's length instead. Declined
+		// rather than emulating the self pair's cycle.
+		if step.HasExplicitEndpointInequality && endpointsIntersect(env.Snap, roots, terminals) {
+			return nil, ErrSelfEndpoint
+		}
+	}
+
+	// shortestPath under a bare LIMIT has the same self-pair problem when
+	// dawgs searches pair by pair: with a property or id condition on both
+	// endpoints it builds bidirectional_sp_harness's pair filter as the plain
+	// product of the two endpoint sets, so a shared node's own pair is in it,
+	// and pushes the LIMIT into the harness (pushDownShortestPathLimit), which
+	// resolves that pair around the node's cycle and counts it. `s <> t`
+	// drops it afterwards and PostgreSQL returns fewer rows than LIMIT.
+	// Without a pushed LIMIT the self pair's paths are simply filtered out,
+	// and the unidirectional harness never revisits a root at all, so only
+	// this combination declines. limitTargetSet covers every query dawgs
+	// pushes a LIMIT into: it is set for a single-Part query's bare LIMIT
+	// (SKIP included, which dawgs does not push -- declining it too is only
+	// conservative) and never under ORDER BY, DISTINCT or an aggregate, which
+	// dawgs does not push through either.
+	if mode == traverse.ModeOne && step.HasExplicitEndpointInequality && meter.limitTargetSet &&
+		pairFilterEndpoint(part.Nodes[step.FromSym]) && pairFilterEndpoint(part.Nodes[step.ToSym]) &&
+		endpointsIntersect(env.Snap, roots, terminals) {
+		return nil, ErrSelfEndpoint
 	}
 
 	maxDepth := 0
@@ -1186,6 +1291,12 @@ func expandShortestPathComponent(env *Env, meter *workMeter, part *Part, step *S
 		MaxDepth:    maxDepth,
 		SideBudget:  sideBudget,
 		PairBudget:  pairBudget,
+		// One AllShortestPaths call is a single, potentially long step
+		// between two of the work meter's own context checks (exec.go's
+		// workMeter), so the request's context goes in with it -- otherwise
+		// a request cancelled during the traversal is still traversed in
+		// full. See traverse.Query.Ctx for where the checks sit.
+		Ctx: env.Ctx,
 	}
 
 	rowCap, memLimit, unbounded := shortestPathBudget(meter, maxDepth)
@@ -1354,6 +1465,41 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 		remaining = 0
 	}
 	rowCap = int(remaining)
+
+	// MaxLiveRows, not the remaining work, is the real ceiling on a dense set
+	// this component can hand onward: the conversion loop below calls
+	// meter.observeRows as `out` grows, and observeRows refuses any set
+	// larger than MaxLiveRows (exec.go). A component with more paths than
+	// that therefore declines ErrBudget whatever this function returns -- but
+	// only AFTER traverse has materialized the whole []Path, since that loop
+	// runs once AllShortestPaths has already returned. Capping here moves the
+	// same decline in front of that materialization.
+	//
+	// Measured, because the reason this was parked was the absence of numbers.
+	// On a 302-node, 20,200-edge fixture yielding 1,000,000 five-node paths
+	// (103 MiB accounted), this whole function's downstream cost -- the dense
+	// []Path plus the *Row and PathVal the loop below converts each path into
+	// -- peaked at 443 MiB, about 465 bytes per path, and was then declined.
+	// Roughly 85 of those bytes are the dense path itself (traverse's
+	// pathSink, whose own allocation now sits at or below the charge
+	// accounted here -- see internal/engine/traverse/allocation_test.go); the
+	// rest is the row, which MaxLiveRows governs rather than this byte cap.
+	// Left at the remaining work, MaxWork's 2^28 admits about 32 GiB
+	// accounted and well over a hundred GB resident before anything refuses;
+	// at MaxLiveRows the same arithmetic gives about 458 MiB accounted, a
+	// 134x reduction. Nothing that serves today stops serving: the cap equals
+	// the largest set the conversion loop will accept, so every component at
+	// or below it is unaffected and every component above it already failed.
+	//
+	// A flat byte ceiling would not do: bytesPerPath scales with the query's
+	// own resolved depth, so any fixed value tight enough to matter at depth
+	// 15 would refuse a query carrying an explicit deep range (`*1..127`)
+	// that works today. Deriving both caps from MaxLiveRows keeps them
+	// consistent by construction -- and makes maxCypherLiveRows, not this
+	// function, the single constant that governs the hazard.
+	if live := meter.budget.MaxLiveRows; live > 0 && live < rowCap {
+		rowCap = live
+	}
 
 	depth := maxDepth
 	if depth <= 0 {
@@ -1755,6 +1901,53 @@ func endpointsIntersect(snap *snapshot.View, roots, terminals traverse.Endpoint)
 			return false
 		}
 		return true
+	})
+	return found
+}
+
+// kindLevelSelfEndpoint reports whether a node could trip dawgs' primer
+// self-endpoint guard once the seed side is taken at the level of its kinds
+// alone (an endpoint with no kinds admitting every node). dawgs seeds from
+// either side, so both are checked: seeding from the roots walks outgoing
+// edges and tests each edge's start against the terminals, seeding from the
+// terminals walks incoming edges and tests each edge's end against the
+// roots. roots and terminals are the resolved endpoint sets (a superset where
+// a side was handed over as a kind bitmap). Edges of any kind count: the
+// guard may run before the kind filter beside it.
+func kindLevelSelfEndpoint(env *Env, part *Part, step *Step, roots, terminals traverse.Endpoint) bool {
+	kindLevel := func(nc *NodeConstraint) traverse.Endpoint {
+		if nc == nil || len(nc.Kinds) == 0 {
+			return traverse.Endpoint{}
+		}
+		return traverse.Endpoint{Bits: kindsEndpointBitmap(env, nc.Kinds)}
+	}
+	return sharedNodeWithEdge(env, kindLevel(part.Nodes[step.FromSym]), terminals, true) ||
+		sharedNodeWithEdge(env, kindLevel(part.Nodes[step.ToSym]), roots, false)
+}
+
+// sharedNodeWithEdge reports whether some node in both a and b has an
+// outgoing (outgoing true) or incoming edge, iterating the smaller side and
+// stopping at the first such node.
+func sharedNodeWithEdge(env *Env, a, b traverse.Endpoint, outgoing bool) bool {
+	total := env.Snap.NodeCount()
+	if b.Count(total) < a.Count(total) {
+		a, b = b, a
+	}
+	found := false
+	hasEdge := func(snapshot.NodeID, snapshot.KindID, uint64) bool {
+		found = true
+		return false
+	}
+	a.Iterate(env.Snap, func(id snapshot.NodeID) bool {
+		if !b.Has(id) {
+			return true
+		}
+		if outgoing {
+			env.Snap.OutEdges(id, hasEdge)
+		} else {
+			env.Snap.InEdges(id, hasEdge)
+		}
+		return !found
 	})
 	return found
 }

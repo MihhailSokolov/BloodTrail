@@ -4,6 +4,7 @@ package dockerx
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -129,5 +130,66 @@ func TestFakeRunnerSequencesThenFallsBack(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "0,7,last" {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// TestRunningContainerReadsEitherShapeOfPS pins the identity RunningContainer
+// returns for both shapes compose prints `ps --format json` in -- a JSON
+// array in recent versions, one object per line in older ones -- and that a
+// service with no container, however compose says so, is ErrNoRunningContainer
+// rather than some other failure.
+func TestRunningContainerReadsEitherShapeOfPS(t *testing.T) {
+	const project = "docker compose --project-directory /p -f /p/docker-compose.yml "
+	const inspect = "docker inspect -f {{.Id}} {{.State.StartedAt}} cafe01"
+	for _, c := range []struct {
+		name, ps string
+		want     Container
+		none     bool
+	}{
+		{"array", `[{"ID":"cafe01","Service":"bloodhound"}]`, Container{ID: "cafe0123456789", StartedAt: "2026-09-02T00:00:00.123456789Z"}, false},
+		{"one object per line", `{"ID":"cafe01"}` + "\n" + `{"ID":"beef02"}` + "\n", Container{ID: "cafe0123456789", StartedAt: "2026-09-02T00:00:00.123456789Z"}, false},
+		{"empty array", "[]\n", Container{}, true},
+		{"nothing printed", "", Container{}, true},
+		{"an object without an id", `{"Service":"bloodhound"}`, Container{}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &FakeRunner{Outputs: map[string][]byte{
+				project + "ps --format json bloodhound": []byte(c.ps),
+				inspect:                                 []byte("cafe0123456789 2026-09-02T00:00:00.123456789Z\n"),
+			}}
+			compose := Compose{Runner: fake, File: "/p/docker-compose.yml", ProjectDir: "/p"}
+			got, err := compose.RunningContainer(context.Background(), "bloodhound")
+			if c.none {
+				if !errors.Is(err, ErrNoRunningContainer) {
+					t.Fatalf("err = %v, want ErrNoRunningContainer", err)
+				}
+				return
+			}
+			if err != nil || got != c.want {
+				t.Fatalf("RunningContainer = %+v, %v; want %+v", got, err, c.want)
+			}
+		})
+	}
+}
+
+func TestRunningContainerFailsOnAnInspectAnswerItCannotRead(t *testing.T) {
+	fake := &FakeRunner{Outputs: map[string][]byte{
+		"docker compose --project-directory /p -f /p/docker-compose.yml ps --format json bloodhound": []byte(`[{"ID":"cafe01"}]`),
+		"docker inspect -f {{.Id}} {{.State.StartedAt}} cafe01":                                      []byte("cafe01\n"),
+	}}
+	compose := Compose{Runner: fake, File: "/p/docker-compose.yml", ProjectDir: "/p"}
+	if _, err := compose.RunningContainer(context.Background(), "bloodhound"); err == nil || errors.Is(err, ErrNoRunningContainer) {
+		t.Fatalf("err = %v, want a failure that is not ErrNoRunningContainer", err)
+	}
+}
+
+func TestLogsSinceAsksForTheServiceFromThatTimeOn(t *testing.T) {
+	fake := &FakeRunner{Outputs: map[string][]byte{
+		"docker compose --project-directory /p -f /p/docker-compose.yml logs --no-color --since 2026-09-02T00:00:00Z bloodhound": []byte("hello\n"),
+	}}
+	compose := Compose{Runner: fake, File: "/p/docker-compose.yml", ProjectDir: "/p"}
+	out, err := compose.LogsSince(context.Background(), "bloodhound", "2026-09-02T00:00:00Z")
+	if err != nil || string(out) != "hello\n" {
+		t.Fatalf("LogsSince = %q, %v", out, err)
 	}
 }
