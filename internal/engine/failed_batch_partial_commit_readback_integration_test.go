@@ -94,35 +94,42 @@ func assertEdgeCount(t *testing.T, pgDriver *pg.Driver, kind graph.Kind, want in
 	}
 }
 
-// TestPartiallyCommittedFailedBatchFallsBackForAnUnnameableEndpoint is the
-// residual WHITEPAPER 19 documents, made executable: an objectid-keyed upsert
-// that committed CLEANLY inside a batch that later FAILED, racing a re-key of
-// one of its endpoints.
+// TestPartiallyCommittedFailedBatchEdgeIsFoundByItsEndpoint is the residual
+// WHITEPAPER 19 used to document, now closed: an objectid-keyed upsert that
+// committed CLEANLY inside a batch that later FAILED, racing a re-key of one
+// of its endpoints.
 //
-// Read-back's split (readBack's "The one fallback this records") keys off the
-// write's own outcome: a clean commit that cannot name an objectid-keyed
-// endpoint fails closed, a write that returned an error does not, because for
-// the latter an unresolvable objectid is the ordinary benign outcome of a node
-// that was never created. This shape sits in the gap -- the edge IS in
-// PostgreSQL, the batch reported failure anyway, and the triple is skipped
-// with the rest of that batch's keys, so the committed edge never reaches the
-// replica while the engine keeps serving.
+// This shape used to sit in the gap read-back's write-outcome gate leaves. A
+// clean commit that cannot name an objectid-keyed endpoint fails closed; a
+// write that returned an error does not, because for that one an unresolvable
+// objectid is the ordinary benign outcome of a node that was never created.
+// So an edge that was durable although its batch reported failure was skipped
+// with the rest of that batch's keys, and the committed edge never reached
+// the replica while the engine kept serving. This test USED to pin that
+// divergence as a measured missing row.
 //
-// This test PINS that divergence rather than asserting it away, and it is the
-// only test in this package that does: it measures one served answer that is
-// missing a row PostgreSQL returns. It is a tripwire in both directions.
-// Should the engine start falling back here, or start serving the edge, the
-// residual has been closed and WHITEPAPER 19, WHITEPAPER 12.3, readBack's own
-// doc and the README's documented-differences paragraph all have to say so.
-// Should the divergence ever grow beyond the one raced edge, something else
-// has broken. The two tests below it say why the gate is still a gate: every
+// It no longer can, because read-back stopped inferring and started looking.
+// The deferred triple still has one endpoint nobody can name -- and one that
+// everybody can, which with the edge kind is two thirds of the edge table's
+// own unique key. Read-back asks PostgreSQL for the edges on that endpoint
+// and kind (readBackEdgesByEndpoint), gets the committed edge back, reads the
+// endpoint it could not name by the id that row carries, and stages both.
+// Nothing about the write's outcome enters into it: everything staged is
+// PostgreSQL's own committed state, so there is nothing to be wrong about and
+// no fallback to weigh. The assertions below are therefore positive -- the
+// edge IS served, the engine did NOT fall back, and the served answer equals
+// PostgreSQL's row for row.
+//
+// The two tests below it still say why the write-outcome gate remains a gate
+// for what is left (a triple with NO nameable endpoint): every piece of
 // evidence read-back holds inside a failed batch fires on batches where
 // falling back would be pure cost.
 //
 // The rebuild loop is parked (parkRebuildLoop) so no recovery goroutine can
-// adopt a snapshot at an unpredictable moment; the one rebuild here is driven
-// explicitly.
-func TestPartiallyCommittedFailedBatchResidualIsNotFollowed(t *testing.T) {
+// adopt a snapshot at an unpredictable moment -- which is also what makes
+// "state is still stateServing" mean "no fallback was entered", since nothing
+// else can leave fallback. The one rebuild here is driven explicitly.
+func TestPartiallyCommittedFailedBatchEdgeIsFoundByItsEndpoint(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
 
@@ -186,29 +193,42 @@ func TestPartiallyCommittedFailedBatchResidualIsNotFollowed(t *testing.T) {
 	scope.Changes().RecordWriteIncomplete("BatchOperation: the batch failed: simulated ingest failure after the upserts flushed")
 	eng.Apply(ctx, scope)
 
-	if got := eng.state.Load(); got != stateFallback {
-		t.Logf("state = %d (stateServing): the documented residual -- read-back skipped the unnameable endpoint of a FAILED batch, as it does for every failed batch",
-			got)
-	} else {
-		t.Fatalf("state = stateFallback (%d): read-back now fails closed for a batch that COMMITTED its upserts and then failed. That closes WHITEPAPER 19's write-race residual -- update WHITEPAPER 19 and 12.3, readBack's doc and the README's documented-differences paragraph, and replace the divergence assertion below",
-			stateFallback)
+	// No fallback: read-back needed none, because it found the edge rather
+	// than reasoning about whether one existed. With the rebuild loop parked,
+	// nothing could have left fallback again, so this is exact.
+	if got := eng.state.Load(); got != stateServing {
+		t.Fatalf("state = %d after a failed batch whose committed edge read-back can look up, want stateServing (%d): the endpoint-keyed fan-out stages PostgreSQL's own rows, so nothing here needs a reload",
+			got, stateServing)
+	}
+	if _, serving := eng.serveState(); !serving {
+		t.Fatalf("engine not serving after the apply; the comparison below would be vacuous")
 	}
 
-	// The divergence itself, measured: the engine serves the upsert that was
-	// not raced, and PostgreSQL additionally returns the committed edge whose
-	// start endpoint was re-keyed out from under read-back.
+	// The edge itself, measured: the engine and PostgreSQL now return the
+	// same two rows, the raced one included, with the re-keyed start endpoint
+	// carrying its NEW objectid -- the node read-back read by the id the edge
+	// row named, since no objectid could have found it.
 	const edgeQuery = `MATCH (s:PartialCommitNode)-[:PartialCommitEdge]->(e:PartialCommitNode) RETURN s.objectid, e.objectid`
 	servedRows, oracleRows := servedAndOracleRows(t, pgDriver, eng, edgeQuery)
-	wantServed := []string{"string:" + otherStartOID + "|string:" + otherEndOID + "|"}
-	wantOracle := append([]string{"string:" + rekeyedToID + "|string:" + racedEndOID + "|"}, wantServed...)
-	sort.Strings(wantOracle)
-	if !reflect.DeepEqual(servedRows, wantServed) || !reflect.DeepEqual(oracleRows, wantOracle) {
-		t.Fatalf("engine served %v (want %v), PostgreSQL returns %v (want %v): the residual this test pins is one missing row, exactly the raced edge",
-			servedRows, wantServed, oracleRows, wantOracle)
+	want := []string{
+		"string:" + otherStartOID + "|string:" + otherEndOID + "|",
+		"string:" + rekeyedToID + "|string:" + racedEndOID + "|",
+	}
+	sort.Strings(want)
+	if !reflect.DeepEqual(servedRows, want) || !reflect.DeepEqual(oracleRows, want) {
+		t.Fatalf("engine served %v, PostgreSQL returns %v, want both %v: the raced edge must be staged, not inferred away",
+			servedRows, oracleRows, want)
 	}
 
-	// Convergence: one rebuild reloads what PostgreSQL actually holds, and
-	// the edge is there.
+	// And the whole picture agrees, without any reload: the nodes too, under
+	// the objectids PostgreSQL holds now.
+	assertTypedCasesMatchOracle(t, pgDriver, eng, []typedCase{
+		{edgeQuery, true},
+		{`MATCH (s:PartialCommitNode) RETURN s.objectid`, true},
+	})
+
+	// Convergence is unchanged, and still checked: a rebuild reloads what
+	// PostgreSQL holds and agrees with the delta the apply published.
 	adoptOneRebuild(t, ctx, eng)
 	if _, serving := eng.serveState(); !serving {
 		t.Fatalf("engine not serving after the rebuild; the comparison below would be vacuous")
@@ -222,8 +242,9 @@ func TestPartiallyCommittedFailedBatchResidualIsNotFollowed(t *testing.T) {
 // servedAndOracleRows renders one query's answer twice -- from the engine and
 // from PostgreSQL -- through renderTypedRows, the same renderer
 // assertTypedCasesMatchOracle compares with. Unlike that helper it returns
-// both answers instead of requiring them to be equal, which is what lets the
-// test above pin a divergence precisely rather than merely observe one.
+// both answers instead of only requiring them to be equal, which is what lets
+// the test above name the exact rows both sides must carry: "the two answers
+// agree" would also hold if neither held the raced edge.
 func servedAndOracleRows(t *testing.T, pgDriver *pg.Driver, eng *Engine, q string) (served, oracle []string) {
 	t.Helper()
 	ctx := context.Background()
@@ -248,7 +269,9 @@ func servedAndOracleRows(t *testing.T, pgDriver *pg.Driver, eng *Engine, q strin
 
 // TestWhollyFailedBatchStillReadsBackPresentKeys is why the write-incomplete
 // gate cannot be narrowed by asking whether any OTHER recorded key of the
-// same scope read back present.
+// same scope read back present -- the narrowing readBack's own doc refutes,
+// and the reason the gate is still what decides the one shape no lookup
+// reaches (a triple with NO nameable endpoint).
 //
 // The appeal of that test is that it looks like evidence of a partial commit:
 // "if something of this batch is in PostgreSQL, chunks flushed, so the
@@ -261,20 +284,23 @@ func servedAndOracleRows(t *testing.T, pgDriver *pg.Driver, eng *Engine, q strin
 // state re-ingest upserts the same principals over and over, which makes that
 // the ordinary case rather than a corner.
 //
-// So this test runs the benign shape the gate exists for -- a batch that
-// landed NOTHING (no flush: the default batchWriteSize of 2,000 is never
-// crossed by one call) whose relationship upsert names a brand-new endpoint
-// -- and asserts both halves at once:
+// So this test runs the shape that refutes it -- a batch that landed NOTHING
+// (no flush: the default batchWriteSize of 2,000 is never crossed by one
+// call) whose relationship upsert names one pre-existing principal and one
+// brand-new endpoint -- and asserts all three halves at once:
 //
-//   - PostgreSQL holds no row the batch wrote, and the triple's endpoint
-//     objectid is named by neither PostgreSQL nor the View, so read-back
-//     reaches rekeyedTripleKeys' unresolved count;
-//   - a recorded key of that very scope nonetheless reads back PRESENT.
+//   - PostgreSQL holds no row the batch wrote, and the brand-new endpoint's
+//     objectid is named by neither PostgreSQL nor the View;
+//   - a recorded key of that very scope nonetheless reads back PRESENT;
+//   - the triple's ONE nameable endpoint sends it through the endpoint-keyed
+//     fan-out, which answers it the honest way: PostgreSQL holds no edge of
+//     that kind on that endpoint, so nothing is staged and nothing is
+//     missing -- no gate, and no fallback, needed for this shape at all.
 //
-// A "some key of this scope is present" trigger would therefore fire here,
-// and a full rebuild would follow every failed ingest batch whose principals
-// already exist -- the exact cost the gate was added to avoid. Read-back
-// keeps skipping instead, and WHITEPAPER 19 keeps the residual.
+// A "some key of this scope is present" trigger would fire here, and a full
+// rebuild would follow every failed ingest batch whose principals already
+// exist -- the exact cost the gate was added to avoid, and the reason it
+// stays for the both-unnameable triples the fan-out cannot anchor on.
 func TestWhollyFailedBatchStillReadsBackPresentKeys(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
@@ -336,17 +362,19 @@ func TestWhollyFailedBatchStillReadsBackPresentKeys(t *testing.T) {
 		t.Fatalf("readBack: %v", err)
 	}
 
-	// The gate held: read-back recorded no fallback for this scope.
+	// No fallback for this scope -- and, for this shape, none was even
+	// weighed: the triple's nameable endpoint sent it to the fan-out.
 	if ok, reasons := cs.HasFallback(); ok {
 		t.Fatalf("readBack recorded a fallback for a batch that landed nothing: %v", reasons)
 	}
 
-	// The triple's endpoint is named by nobody, so read-back reached the
-	// unresolved count: an endpoint that HAD resolved would have left the
-	// triple either in result.edges or in absentTriples, and an unresolved
-	// one contributes neither (rekeyedTripleKeys' own doc).
+	// The fan-out found no edge, which is PostgreSQL's own answer and the
+	// right one: the batch never flushed, so there is no edge to stage, and
+	// nothing is missing from the replica. A triple read-back had resolved by
+	// key instead would have left an entry in result.edges or in
+	// absentTriples; the fan-out stages only what it finds, and found none.
 	if len(result.edges) != 0 || len(result.absentTriples) != 0 {
-		t.Fatalf("readBack resolved the triple after all: edges = %+v, absentTriples = %+v", result.edges, result.absentTriples)
+		t.Fatalf("readBack produced an edge for a batch that landed nothing: edges = %+v, absentTriples = %+v", result.edges, result.absentTriples)
 	}
 
 	// And yet a recorded key of this scope read back present -- the whole
@@ -412,7 +440,10 @@ func TestWhollyFailedBatchStillReadsBackPresentKeys(t *testing.T) {
 // Which is the whole judgment: inside a failed batch, read-back can see that
 // the batch committed something, and cannot see WHICH of its keys that
 // something was. Only the second question decides whether an unnameable
-// endpoint hides a committed edge.
+// endpoint hides a committed edge -- which is why the triples it CAN anchor
+// a query on no longer ask it (readBackEdgesByEndpoint), and the gate is left
+// deciding only the triples with no nameable endpoint, exactly the shape the
+// buffered upsert here produces.
 func TestFlushedFailedBatchCannotTellABenignUnnameableEndpointApart(t *testing.T) {
 	dsn := graphtest.PGAvailable(t)
 	ctx := context.Background()
@@ -476,9 +507,10 @@ func TestFlushedFailedBatchCannotTellABenignUnnameableEndpointApart(t *testing.T
 		t.Fatalf("readBack recorded a fallback for a failed batch whose only unnameable endpoint was never created: %v", reasons)
 	}
 
-	// The buffered upsert's endpoints exist nowhere, so its triple reaches
-	// rekeyedTripleKeys' unresolved count -- and benignly: there is no
-	// committed edge to miss.
+	// NEITHER of the buffered upsert's endpoints exists, so its triple has no
+	// endpoint to anchor a fan-out on and reaches rekeyedTripleKeys'
+	// unnameable count -- benignly: there is no committed edge to miss, which
+	// is what makes the gate's skip right here and a fallback pure cost.
 	newRows := 0
 	for _, ns := range result.nodes {
 		if oid, ok := objectIDFromProps(ns.propsJSON); ok && (oid == buffered[0] || oid == buffered[1]) {

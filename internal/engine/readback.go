@@ -28,13 +28,54 @@ const readbackNodeIDChunk = 50_000
 // variable-length string rather than a fixed-width integer.
 const readbackObjectIDChunk = 5_000
 
+// readbackEdgeFanoutCap bounds how many `edge` rows one endpoint-keyed
+// fan-out query (readBackEdgesByEndpoint) may return before read-back gives
+// up on finding a deferred objectid-keyed triple's edge in the edge table and
+// records a fallback instead of staging a partial set.
+//
+// A bound is needed because the query's only anchors are one endpoint and
+// one kind, and that pair's degree is unbounded in BloodHound's data model:
+// every user in a domain is `MemberOf` the same "Domain Users" group, so one
+// such endpoint can carry hundreds of thousands of edges of a single kind.
+//
+// It is readbackObjectIDChunk -- this file's own smaller budget, reused
+// rather than chosen anew, for three reasons that all point the same way:
+//
+//   - It is the per-round-trip budget this very step's input already works
+//     in. The endpoint ids a fan-out queries by come out of step 2's
+//     objectid lookup, which carries at most readbackObjectIDChunk values
+//     per query; letting the follow-up pass return an order of magnitude
+//     more rows than the pass that produced its keys would be an odd budget.
+//   - Every read-back query runs with applyMu held (Apply's own doc), so it
+//     blocks every other write of this process while it runs. The
+//     alternative to a bounded query here is not a slower Apply but a
+//     fallback, which costs a rebuild on a background goroutine instead of
+//     latency on the write path, so the conservative of the two budgets is
+//     the right one.
+//   - The previously unknown endpoint nodes the discovered edges name are
+//     read back by id immediately afterwards (rereadByID), and a cap of
+//     readbackObjectIDChunk keeps at most 2 x 5,000 such ids -- an order of
+//     magnitude inside the single readbackNodeIDChunk query that read gets.
+const readbackEdgeFanoutCap = readbackObjectIDChunk
+
 // unresolvableOIDEndpointFallback is the ChangeSet fallback reason readBack
-// records for a cleanly committed write one of whose objectid-keyed edge
-// endpoints is named by neither PostgreSQL's objectid lookup nor the View --
-// step 5's one condition the engine cannot name its way out of (see
-// readBack's own doc, and rekeyedTripleKeys' unresolved count). It carries
-// no objectid value: a fallback reason reaches enterFallback's log line.
-const unresolvableOIDEndpointFallback = "read-back: an objectid-keyed edge endpoint of a clean commit resolves to no node"
+// records for a cleanly committed write BOTH of whose objectid-keyed edge
+// endpoints are named by neither PostgreSQL's objectid lookup nor the View.
+// That is the one shape of step 5 the engine can neither name nor look up:
+// an endpoint-keyed fan-out needs one nameable endpoint to anchor its query
+// on (readBackEdgesByEndpoint), and a triple has none (see readBack's own
+// doc, and rekeyedTripleKeys' unnameable count). It carries no objectid
+// value: a fallback reason reaches enterFallback's log line.
+const unresolvableOIDEndpointFallback = "read-back: both objectid-keyed endpoints of a clean commit's edge resolve to no node"
+
+// edgeFanoutCapFallback is the other half of step 5's fail-closed answer: a
+// deferred triple whose one nameable endpoint carries more edges of that
+// kind than readbackEdgeFanoutCap lets a single query return, so its edge
+// cannot be found without an unbounded read. Kept apart from
+// unresolvableOIDEndpointFallback so enterFallback's log line says which of
+// the two happened -- this one is a graph shape (a hub endpoint), that one
+// is a race.
+const edgeFanoutCapFallback = "read-back: an objectid-keyed edge's one nameable endpoint carries more edges of that kind than read-back will scan"
 
 // unresolvedTripleKind marks an absentTriples entry whose kind name never
 // resolved to a KindID at all -- the same sentinel dawgs' own
@@ -76,6 +117,43 @@ type edgeState struct {
 type tripleKey struct {
 	start, end uint64
 	kindID     int16
+}
+
+// edgeEndpointSide names which of the `edge` table's two endpoint columns an
+// endpoint-keyed fan-out query (readBackEdgesByEndpoint) puts its known node
+// ids in: the deferred triple's nameable endpoint is the edge's start, or
+// its end.
+type edgeEndpointSide uint8
+
+const (
+	edgeStartSide edgeEndpointSide = iota
+	edgeEndSide
+)
+
+// column returns the `edge` column this side filters on. Both are literals
+// of this package, never anything a caller supplies, so the fan-out query
+// interpolates the name and parameterizes everything else.
+func (s edgeEndpointSide) column() string {
+	if s == edgeStartSide {
+		return "start_id"
+	}
+	return "end_id"
+}
+
+// endpointFanout is one endpoint-keyed edge lookup, the query readBack's step
+// 5 issues for the deferred objectid-keyed triples it can name exactly one
+// endpoint of: every node id that endpoint resolved to, the triple's resolved
+// kind id, and which endpoint column those ids belong in.
+//
+// Deferred triples sharing a (side, kind) pair share one fan-out, so a failed
+// ingest batch's worth of upserts into the same endpoint kind costs one
+// lookup per (side, kind) rather than one per triple -- which is what keeps
+// this pass' query count bounded by the number of edge kinds the write
+// touched rather than by the number of triples it recorded.
+type endpointFanout struct {
+	side   edgeEndpointSide
+	kindID int16
+	ids    []uint64
 }
 
 // readbackResult is readBack's output: the current PostgreSQL state (post
@@ -156,10 +234,14 @@ type readbackResult struct {
 //     objectid to, so the triple is queried for those ids
 //     (rekeyedTripleKeys) rather than left to a later write or a rebuild;
 //     an endpoint that really is gone takes the edge with it through its own
-//     tombstone's cascade. An endpoint named by neither (2) nor the View is
-//     the one case neither answer fits, and it is where this method records
-//     a fallback of its own ON cs -- see "The one fallback this records"
-//     below.
+//     tombstone's cascade. A triple left with exactly ONE nameable endpoint
+//     is not inferred about: PostgreSQL is asked for the edges on that
+//     endpoint and kind (readBackEdgesByEndpoint), and whatever it returns
+//     is staged together with the previously unknown endpoint nodes those
+//     edges name, read back by id. A triple with NEITHER endpoint nameable
+//     has no anchor to ask on, and that -- together with a fan-out larger
+//     than readbackEdgeFanoutCap -- is where this method records a fallback
+//     of its own ON cs; see "The fallbacks this records" below.
 //
 // Then the candidates (viewCandidates): the View rows cs's write may have
 // removed without naming them by key -- every node or edge a kind-scoped
@@ -197,23 +279,39 @@ type readbackResult struct {
 // Every kind lookup here goes through a kindCatalog over the same write-path
 // pool, never dawgs' KindMapper: see that type's own doc.
 //
-// # The one fallback this records
+// # The fallbacks this records
 //
-// This method MUTATES cs in exactly one case, and every caller must re-check
-// cs.HasFallback() after it returns: an objectid-keyed triple from (5) whose
-// endpoint is named by neither (2) nor view (rekeyedTripleKeys' unresolved
-// count) records unresolvableOIDEndpointFallback, provided cs does not say
-// the write failed (cs.WriteIncomplete()).
+// This method MUTATES cs in two cases, and every caller must re-check
+// cs.HasFallback() after it returns. Both come from (5)'s second pass, and
+// both are gated on the write NOT having failed (cs.WriteIncomplete()):
 //
-// The split is the whole of it. An objectid-keyed upsert that COMMITTED
-// CLEANLY provably created-or-updated its endpoint node, so that node existed
-// at commit; an objectid matching nothing here therefore means it was either
-// deleted since (benign -- the cascade takes the edge) or re-keyed since (the
-// edge exists and cannot be named from here). Those two are indistinguishable
-// from inside the engine, so the only sound response is to fail CLOSED and
-// let the resync reload what PostgreSQL holds -- exactly as this method
-// already does for an unresolvable kind id (see "its only sound response is
-// to fall back to a full resync" above).
+//   - unresolvableOIDEndpointFallback, for a triple NEITHER of whose
+//     endpoint objectids is named by (2) or by view (rekeyedTripleKeys'
+//     unnameable count). An endpoint-keyed lookup needs one nameable
+//     endpoint to anchor on, and this triple has none.
+//   - edgeFanoutCapFallback, for a triple whose one nameable endpoint
+//     carries more edges of that kind than readbackEdgeFanoutCap lets a
+//     single query return. The lookup exists, the answer is just too large
+//     to read under applyMu, and a partial set would be a silent
+//     half-answer.
+//
+// # Why the one-nameable-endpoint case needs no fallback at all
+//
+// Because it is not a decision; it is a query. The engine does not have to
+// work out whether an unnameable objectid hides a committed edge, which it
+// provably cannot (see the two refuted narrowings below). It asks the edge
+// table for the edges on the endpoint it CAN name, with the kind it knows,
+// and stages what comes back together with the endpoint nodes those rows
+// name. Everything staged is PostgreSQL's own committed state read after the
+// write committed, which is what every other read-back query stages, so a
+// result wider than the triple asked about is correct too. A fan-out that
+// comes back empty is PostgreSQL saying the edge is not there -- for a
+// failed write the benign expected outcome, for a clean commit an endpoint
+// that was deleted rather than re-keyed, and in both cases nothing to stage
+// and nothing missing. So this case neither falls back nor skips, whatever
+// the write reported.
+//
+// # Why the gate still matters for what is left
 //
 // For a write that returned an ERROR, an unresolvable objectid is the
 // EXPECTED, BENIGN outcome: the node was never created. Driver.BatchOperation
@@ -221,14 +319,9 @@ type readbackResult struct {
 // durable as they flush), so failed ingest batches DO reach this code, and
 // falling back for them would mean a full rebuild after every failed ingest
 // batch carrying relationship upserts. Those are skipped, as they always
-// were -- which leaves one narrowed residual: a triple that committed
-// cleanly inside a batch that later failed is skipped with the rest, so a
-// re-key racing it still costs a missing row until a later write names it or
-// a rebuild loads it.
+// were.
 //
-// # Why that residual is not narrowed from here
-//
-// The decision this split cannot make is "did the chunk carrying THIS triple
+// The decision the gate cannot make is "did the chunk carrying THIS triple
 // flush?", and nothing read-back holds answers it. The tempting substitutes
 // all answer a different question -- "did this batch commit anything?" -- and
 // every one of them fires on failed batches that landed nothing of the sort:
@@ -238,9 +331,7 @@ type readbackResult struct {
 //     principal that existed before the batch began reads back present
 //     whether that batch landed one row or none, and re-ingest upserts the
 //     same principals over and over
-//     (TestWhollyFailedBatchStillReadsBackPresentKeys). The same objection
-//     sinks the per-triple form ("the deferred triple's OTHER endpoint
-//     resolves"), which that test's own triple satisfies.
+//     (TestWhollyFailedBatchStillReadsBackPresentKeys).
 //   - "some recorded key read back present that the View did not know" is
 //     real evidence the batch committed something, and still decides nothing:
 //     a failed batch flushes its earlier chunks and leaves its last one
@@ -255,9 +346,15 @@ type readbackResult struct {
 //
 // Per-chunk outcomes are not observable through the wrapper either:
 // observingBatch.Commit sees only the commits the delegate itself calls, and
-// each of those already gets a scope of its own. So the gate stays as it is,
-// and TestPartiallyCommittedFailedBatchResidualIsNotFollowed pins the
-// divergence that remains.
+// each of those already gets a scope of its own.
+//
+// That is why finding the edge replaced inferring about it rather than
+// joining it. What the gate still decides is only the two cases above, and
+// the residual it leaves is correspondingly narrow: inside a batch that
+// FAILED, a triple whose edge committed and whose BOTH endpoints are
+// unnameable, or whose one nameable endpoint is a hub over the cap, is still
+// skipped, so such an edge stays out of the replica until a later write
+// names it or a rebuild loads it.
 func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSet) (*readbackResult, error) {
 	graphModel, ok := e.pgDriver.DefaultGraph()
 	if !ok {
@@ -416,12 +513,10 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 
 		// Step 5's second pass: the triples held back above, now that the
 		// candidate re-read has settled which of their endpoints were only
-		// re-keyed. One more batch pass, only ever reached by a write that
-		// raced a re-key of one of its own endpoints.
-		rekeyed, unresolved := rekeyedTripleKeys(view, nodesByID, oidToIDs, resolvedTripleKinds, deferredOIDTriples, pending, absentTriples)
-		if incomplete, _ := cs.WriteIncomplete(); unresolved > 0 && !incomplete {
-			cs.RecordFallback(unresolvableOIDEndpointFallback)
-		}
+		// re-keyed. Only ever reached by a write that raced a re-key of one
+		// of its own endpoints, or by one that failed before creating them.
+		rekeyed, fanouts, unnameable := rekeyedTripleKeys(view, nodesByID, oidToIDs, resolvedTripleKinds, deferredOIDTriples, pending, absentTriples)
+
 		foundRekeyed, err := readBackEdgesByTriple(ctx, pool, graphID, rekeyed)
 		if err != nil {
 			return nil, err
@@ -431,6 +526,47 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 				edgesByID[es.id] = es
 			} else {
 				absentTriples[tripleKey{start: k.start, end: k.end, kindID: k.kind}] = struct{}{}
+			}
+		}
+
+		// The triples with exactly one nameable endpoint: asked of the edge
+		// table by that endpoint and kind rather than inferred from what
+		// read-back already holds (readBackEdgesByEndpoint). An edge found
+		// this way names its other endpoint by id, so the node that could
+		// not be named is read back by id like any other candidate -- and a
+		// fan-out that found nothing is PostgreSQL saying there is no such
+		// edge, which needs nothing staged and no fallback either.
+		fanoutEdges, overCap, err := readBackEdgesByEndpoint(ctx, pool, graphID, fanouts)
+		if err != nil {
+			return nil, err
+		}
+		discoveredEndpoints := make([]uint64, 0, 2*len(fanoutEdges))
+		for _, es := range fanoutEdges {
+			edgesByID[es.id] = es
+			discoveredEndpoints = append(discoveredEndpoints, es.start, es.end)
+		}
+		// Deduplicated before the re-read, as every other candidate list
+		// handed to rereadByID is (viewCandidates' bitset and its
+		// each-id-once edge list): a fan-out's rows all share their anchored
+		// endpoint, and two fan-outs of different kinds can return edges
+		// sharing the unanchored one, so the raw list repeats ids -- which
+		// would otherwise repeat them in absentNodeIDs too.
+		result.absentNodeIDs, err = rereadByID(dedupeUint64s(discoveredEndpoints), nodesByID, result.absentNodeIDs,
+			func(ids []uint64) (map[uint64]nodeState, error) { return readBackNodesByID(ctx, pool, graphID, ids) })
+		if err != nil {
+			return nil, err
+		}
+
+		// What is left is what cannot be looked up: a triple with no
+		// nameable endpoint at all, and a fan-out too large to read. Both
+		// fail closed for a write that completed cleanly, and are skipped
+		// for one that did not -- readBack's own doc for why.
+		if incomplete, _ := cs.WriteIncomplete(); !incomplete {
+			if unnameable > 0 {
+				cs.RecordFallback(unresolvableOIDEndpointFallback)
+			}
+			if overCap {
+				cs.RecordFallback(edgeFanoutCapFallback)
 			}
 		}
 	}
@@ -456,12 +592,19 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 	return result, nil
 }
 
-// rekeyedTripleKeys resolves the objectid-keyed triples readBack's step 5
-// held back -- those with an endpoint objectid that matched no row -- into
-// the (start, end, kind) keys still worth querying, once the candidate
-// re-read has answered what became of the nodes view knew under each of
-// those objectids, plus a count of the deferred triples it could not name an
-// endpoint of at all (see unresolved below).
+// rekeyedTripleKeys sorts the objectid-keyed triples readBack's step 5 held
+// back -- those with an endpoint objectid that matched no row -- into the
+// three answers available for them, once the candidate re-read has answered
+// what became of the nodes view knew under each of those objectids:
+//
+//   - keys: the (start, end, kind) triples still worth querying by key,
+//     because BOTH endpoints are nameable after all.
+//   - fanouts: endpoint-keyed lookups for the triples with exactly ONE
+//     nameable endpoint, which read-back resolves by asking PostgreSQL for
+//     the edges on that endpoint and kind instead of trying to name the
+//     other one (readBackEdgesByEndpoint).
+//   - unnameable: a count of the triples with NEITHER endpoint nameable,
+//     which cannot be queried at all (see below).
 //
 // An objectid matching no row does not mean its node is gone. A node whose
 // objectid was rewritten keeps its id, its row and its edges, so it
@@ -474,24 +617,40 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 // window -- without them the committed edge stays out of the replica until
 // a later write names it or a rebuild loads it.
 //
-// An endpoint whose nodes all re-read ABSENT needs nothing: deleting a node
-// deletes its edges, and the cascade of its own tombstone (buildApplySegment)
-// takes the edge with it.
+// An endpoint whose nodes all re-read ABSENT needs nothing of its own:
+// deleting a node deletes its edges (the `delete_node_edges` statement
+// trigger of dawgs' schema), and the cascade of its own tombstone
+// (buildApplySegment) takes the edge with it.
 //
-// unresolved counts the remaining case: a triple with an endpoint named by
-// NEITHER pg's objectid lookup NOR the View -- an endpoint node this process
-// has not applied yet, whose objectid another writer has already re-keyed
-// (the upsert's own newly created endpoint is one way to be in that state;
-// so is an endpoint another write of this process created whose Apply has
-// not run, since applies run in the order their calls finish, not the order
-// their writes committed -- the same premise that makes a pending delta edge
-// possible at all, snapshot.FoldWithPendingEdges). Neither the node nor its
-// edge can be named from here, so such a triple contributes no key and is
-// counted instead: readBack turns a nonzero count into a ChangeSet fallback
-// for a write that completed cleanly, and skips it for one that did not --
-// see readBack's own doc for why the two differ, and why no evidence
-// available here narrows the skip. This function makes neither judgment; it
-// only reports the count.
+// # One nameable endpoint: stop inferring, find the edge
+//
+// A triple whose OTHER endpoint is named by neither pg's objectid lookup nor
+// the View is still an edge PostgreSQL can be ASKED about, because the
+// nameable endpoint and the kind are two thirds of the edge table's own
+// unique key. So this emits a fan-out for it rather than counting it: the
+// endpoint node this process has not applied yet, whose objectid another
+// writer has already re-keyed, never has to be named at all -- the edge row
+// names it, and its id is what the follow-up node read uses.
+//
+// That endpoint can be the upsert's own newly created node, or one another
+// write of this process created whose Apply has not run, since applies run
+// in the order their calls finish, not the order their writes committed --
+// the same premise that makes a pending delta edge possible at all
+// (snapshot.FoldWithPendingEdges).
+//
+// Triples sharing a (side, kind) pair are merged into one fan-out, and its
+// ids are deduplicated and sorted, so the result is deterministic and the
+// query count is bounded by the kinds the write touched.
+//
+// # Neither endpoint nameable: the counted case
+//
+// unnameable counts the triples left: those with no nameable endpoint at
+// all, which have no anchor to query on, and those whose kind never resolved
+// to a KindID -- no row of a kind PostgreSQL has never asserted can exist,
+// so there is nothing to look up, and nothing to find if there were.
+// readBack turns a nonzero count into a ChangeSet fallback for a write that
+// completed cleanly, and skips it for one that did not -- see readBack's own
+// doc for why the two differ.
 //
 // A count rather than a per-triple verdict, deliberately: nothing this
 // function sees tells an endpoint that was never created apart from one that
@@ -499,14 +658,15 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 // the caller has to decide on the WRITE's outcome instead.
 //
 // Keys already queried in the first pass (pending) are skipped; a triple
-// whose kind never resolved to a KindID joins absentTriples under the
-// unresolvedTripleKind sentinel, exactly as the first pass records one.
-// Both maps are read and written in place.
+// whose kind never resolved to a KindID but whose endpoints are both
+// nameable joins absentTriples under the unresolvedTripleKind sentinel,
+// exactly as the first pass records one. Both maps are read and written in
+// place.
 func rekeyedTripleKeys(view *snapshot.View, nodesByID map[uint64]nodeState, oidToIDs map[string][]uint64,
 	resolvedTripleKinds map[string]int16, deferred []EdgeTripleOIDRef,
-	pending map[edgeKey]struct{}, absentTriples map[tripleKey]struct{}) (keys []edgeKey, unresolved int) {
+	pending map[edgeKey]struct{}, absentTriples map[tripleKey]struct{}) (keys []edgeKey, fanouts []endpointFanout, unnameable int) {
 	if len(deferred) == 0 {
-		return nil, 0
+		return nil, nil, 0
 	}
 
 	resolve := func(objectID string) []uint64 {
@@ -516,34 +676,92 @@ func rekeyedTripleKeys(view *snapshot.View, nodesByID map[uint64]nodeState, oidT
 		return rekeyedEndpointIDs(view, nodesByID, objectID)
 	}
 
+	grouped := make(map[fanoutGroup]map[uint64]struct{})
+	addFanout := func(side edgeEndpointSide, kindID int16, ids []uint64) {
+		group := fanoutGroup{side: side, kindID: kindID}
+		members, ok := grouped[group]
+		if !ok {
+			members = make(map[uint64]struct{}, len(ids))
+			grouped[group] = members
+		}
+		for _, id := range ids {
+			members[id] = struct{}{}
+		}
+	}
+
 	seen := make(map[edgeKey]struct{})
 	for _, t := range deferred {
 		startIDs, endIDs := resolve(t.StartOID), resolve(t.EndOID)
-		if len(startIDs) == 0 || len(endIDs) == 0 {
-			unresolved++
-			continue
-		}
+		kindID, kindOK := resolvedTripleKinds[kindName(t.Kind)]
 
-		kindID, ok := resolvedTripleKinds[kindName(t.Kind)]
-		for _, start := range startIDs {
-			for _, end := range endIDs {
-				if !ok {
-					absentTriples[tripleKey{start: start, end: end, kindID: unresolvedTripleKind}] = struct{}{}
-					continue
+		switch {
+		case len(startIDs) > 0 && len(endIDs) > 0:
+			for _, start := range startIDs {
+				for _, end := range endIDs {
+					if !kindOK {
+						absentTriples[tripleKey{start: start, end: end, kindID: unresolvedTripleKind}] = struct{}{}
+						continue
+					}
+					key := edgeKey{start: start, end: end, kind: kindID}
+					if _, queried := pending[key]; queried {
+						continue
+					}
+					if _, dup := seen[key]; dup {
+						continue
+					}
+					seen[key] = struct{}{}
+					keys = append(keys, key)
 				}
-				key := edgeKey{start: start, end: end, kind: kindID}
-				if _, queried := pending[key]; queried {
-					continue
-				}
-				if _, dup := seen[key]; dup {
-					continue
-				}
-				seen[key] = struct{}{}
-				keys = append(keys, key)
 			}
+		case !kindOK:
+			// Nothing to query on either side, and nothing that could be
+			// found: a kind PostgreSQL has never asserted backs no edge row.
+			unnameable++
+		case len(startIDs) > 0:
+			addFanout(edgeStartSide, kindID, startIDs)
+		case len(endIDs) > 0:
+			addFanout(edgeEndSide, kindID, endIDs)
+		default:
+			unnameable++
 		}
 	}
-	return keys, unresolved
+
+	return keys, sortedFanouts(grouped), unnameable
+}
+
+// fanoutGroup is the (endpoint column, kind) pair deferred triples are
+// merged on before readBack queries them: one endpointFanout per group.
+type fanoutGroup struct {
+	side   edgeEndpointSide
+	kindID int16
+}
+
+// sortedFanouts flattens rekeyedTripleKeys' grouping into endpointFanout
+// values ordered by (side, kind), each carrying its ids ascending -- the
+// same determinism rationale sortedNodeStates' doc gives, and what makes
+// both the queries issued and the fallback a cap decides reproducible for a
+// given read-back.
+func sortedFanouts(grouped map[fanoutGroup]map[uint64]struct{}) []endpointFanout {
+	if len(grouped) == 0 {
+		return nil
+	}
+
+	out := make([]endpointFanout, 0, len(grouped))
+	for group, members := range grouped {
+		ids := make([]uint64, 0, len(members))
+		for id := range members {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		out = append(out, endpointFanout{side: group.side, kindID: group.kindID, ids: ids})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].side != out[j].side {
+			return out[i].side < out[j].side
+		}
+		return out[i].kindID < out[j].kindID
+	})
+	return out
 }
 
 // rekeyedEndpointIDs returns the database ids of the nodes view knows under
@@ -1160,6 +1378,119 @@ func readBackEdgeTripleBatch(ctx context.Context, pool *pgxpool.Pool, graphID in
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("engine: readBack: edge-by-triple rows: %w", err)
+	}
+
+	return nil
+}
+
+// readBackEdgesByEndpoint answers readBack's step 5 for the deferred
+// objectid-keyed triples it could name exactly one endpoint of
+// (rekeyedTripleKeys' fanouts): for each fan-out, every edge PostgreSQL
+// holds whose named endpoint column is one of that fan-out's node ids and
+// whose kind_id is its kind.
+//
+// This is the step that replaces inference with a lookup. Nothing it stages
+// is derived from the write's payload or from what the replica believes: it
+// is PostgreSQL's own committed state for a (endpoint, kind) pair, read
+// after the write committed, exactly like every other read-back query, so a
+// result that covers more edges than the deferred triple asked about is
+// correct too -- a superset of present rows restages present rows. That is
+// why this needs no fallback where a predicate over what read-back already
+// holds would (see readBack's own doc).
+//
+// The query is the `edge` table's own covering index, left to right:
+//
+//	SELECT id, start_id, end_id, kind_id FROM edge
+//	 WHERE graph_id = $1 AND end_id = ANY($2) AND kind_id = $3 LIMIT $4
+//
+// dawgs' schema declares `edge (start_id, kind_id) include (id, end_id)` and
+// `edge (end_id, kind_id) include (id, start_id)` (query/sql/schema_up.sql),
+// so either side is an index-only scan on the graph's own partition, with
+// the four columns scanned here covered by the index.
+//
+// Ids are chunked at readbackNodeIDChunk like every other `= ANY($2)`
+// read-back query, and each chunk carries LIMIT readbackEdgeFanoutCap + 1
+// so a hub endpoint cannot stream an unbounded result to find out that it is
+// one. A fan-out whose rows exceed readbackEdgeFanoutCap in total
+// contributes NO rows and sets overCap: a partial set would leave the engine
+// serving a silently incomplete answer, while the fallback overCap asks for
+// reloads exactly what PostgreSQL holds. Other fan-outs' rows are complete
+// and are returned anyway, since staging them is sound whatever the caller
+// goes on to do about the cap.
+//
+// The result is ordered by edge id, deduplicated by it: one edge can satisfy
+// two fan-outs at once (an endpoint that is some triple's start and
+// another's end).
+func readBackEdgesByEndpoint(ctx context.Context, pool *pgxpool.Pool, graphID int32, fanouts []endpointFanout) ([]edgeState, bool, error) {
+	if len(fanouts) == 0 {
+		return nil, false, nil
+	}
+
+	found := make(map[uint64]edgeState)
+	overCap := false
+
+	for _, fanout := range fanouts {
+		group := make(map[uint64]edgeState)
+		for lo := 0; lo < len(fanout.ids); lo += readbackNodeIDChunk {
+			hi := lo + readbackNodeIDChunk
+			if hi > len(fanout.ids) {
+				hi = len(fanout.ids)
+			}
+			if err := readBackEdgeEndpointBatch(ctx, pool, graphID, fanout.side, fanout.kindID, fanout.ids[lo:hi], group); err != nil {
+				return nil, false, err
+			}
+			if len(group) > readbackEdgeFanoutCap {
+				break
+			}
+		}
+		if len(group) > readbackEdgeFanoutCap {
+			overCap = true
+			continue
+		}
+		for id, es := range group {
+			found[id] = es
+		}
+	}
+
+	return sortedEdgeStates(found), overCap, nil
+}
+
+// readBackEdgeEndpointBatch runs one endpoint-keyed fan-out query over a
+// single chunk of endpoint ids, writing results into out. The endpoint
+// column name comes from edgeEndpointSide.column() -- a literal of this
+// package, never a caller's string -- and everything else is a bound
+// parameter.
+//
+// LIMIT is readbackEdgeFanoutCap + 1 rather than the cap itself: one row
+// past the cap is what distinguishes "this fan-out fits" from "this fan-out
+// is over the cap", and no ORDER BY is needed for that, since which rows
+// come back is irrelevant to a fan-out that is going to be discarded.
+func readBackEdgeEndpointBatch(ctx context.Context, pool *pgxpool.Pool, graphID int32, side edgeEndpointSide, kindID int16, batch []uint64, out map[uint64]edgeState) error {
+	queryIDs := make([]int64, len(batch))
+	for i, id := range batch {
+		queryIDs[i] = int64(id)
+	}
+
+	sql := fmt.Sprintf("SELECT id, start_id, end_id, kind_id FROM edge WHERE graph_id = $1 AND %s = ANY($2) AND kind_id = $3 LIMIT $4", side.column())
+
+	rows, err := pool.Query(ctx, sql, graphID, queryIDs, kindID, readbackEdgeFanoutCap+1)
+	if err != nil {
+		return fmt.Errorf("engine: readBack: query edges by endpoint: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id, start, end int64
+			kind           int16
+		)
+		if err := rows.Scan(&id, &start, &end, &kind); err != nil {
+			return fmt.Errorf("engine: readBack: scan edge by endpoint: %w", err)
+		}
+		out[uint64(id)] = edgeState{id: uint64(id), start: uint64(start), end: uint64(end), kindID: kind}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("engine: readBack: edge-by-endpoint rows: %w", err)
 	}
 
 	return nil
