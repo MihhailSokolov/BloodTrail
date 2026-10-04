@@ -215,14 +215,19 @@ func TestResolveKindIDsSkipsNilKinds(t *testing.T) {
 	}
 }
 
-// TestRekeyedTripleKeysReportsEndpointsItCannotName covers both halves of
-// rekeyedTripleKeys' answer: the keys worth querying for an endpoint the
-// View still names under its old objectid, and the COUNT of deferred
-// triples whose endpoint is named by neither PostgreSQL's objectid lookup
-// nor the View -- the count readBack turns into a fallback for a write that
-// committed cleanly, rather than skipping the triple and leaving a
-// committed edge out of the replica.
-func TestRekeyedTripleKeysReportsEndpointsItCannotName(t *testing.T) {
+// TestRekeyedTripleKeysSortsDeferredTriplesByWhatCanBeAsked covers all three
+// halves of rekeyedTripleKeys' answer: the keys worth querying when the View
+// still names BOTH endpoints under their old objectids, the endpoint-keyed
+// fan-outs for a triple with exactly ONE nameable endpoint -- which is what
+// read-back asks PostgreSQL instead of inferring anything -- and the COUNT
+// of triples with NEITHER, the only ones readBack still turns into a
+// fallback for a write that committed cleanly.
+//
+// The fan-out cases also pin the two properties the query pass depends on:
+// which endpoint column the nameable ids go in (the start side when the
+// START resolves, the end side when the END does), and the merging of
+// triples that share a (side, kind) pair into one lookup.
+func TestRekeyedTripleKeysSortsDeferredTriplesByWhatCanBeAsked(t *testing.T) {
 	adminTo := graph.StringKind("AdminTo")
 	kinds := map[string]int16{"AdminTo": applyKindAdminTo}
 
@@ -230,7 +235,8 @@ func TestRekeyedTripleKeysReportsEndpointsItCannotName(t *testing.T) {
 		name           string
 		deferred       []EdgeTripleOIDRef
 		wantKeys       []edgeKey
-		wantUnresolved int
+		wantFanouts    []endpointFanout
+		wantUnnameable int
 	}{
 		{
 			name:     "the View names both endpoints under their old objectid",
@@ -238,18 +244,41 @@ func TestRekeyedTripleKeysReportsEndpointsItCannotName(t *testing.T) {
 			wantKeys: []edgeKey{{start: 1, end: 1, kind: applyKindAdminTo}},
 		},
 		{
-			name:           "one endpoint is named by neither the lookup nor the View",
-			deferred:       []EdgeTripleOIDRef{{StartOID: "oid-gone", EndOID: "oid-1", Kind: adminTo}},
-			wantUnresolved: 1,
+			name:        "only the END is nameable: ask the edge table by end_id",
+			deferred:    []EdgeTripleOIDRef{{StartOID: "oid-gone", EndOID: "oid-1", Kind: adminTo}},
+			wantFanouts: []endpointFanout{{side: edgeEndSide, kindID: applyKindAdminTo, ids: []uint64{1}}},
 		},
 		{
-			name: "a triple whose endpoint resolves does not excuse one that does not",
+			name:        "only the START is nameable: ask the edge table by start_id",
+			deferred:    []EdgeTripleOIDRef{{StartOID: "oid-1", EndOID: "oid-gone", Kind: adminTo}},
+			wantFanouts: []endpointFanout{{side: edgeStartSide, kindID: applyKindAdminTo, ids: []uint64{1}}},
+		},
+		{
+			name: "triples sharing a (side, kind) pair share one fan-out",
+			deferred: []EdgeTripleOIDRef{
+				{StartOID: "oid-1", EndOID: "oid-gone", Kind: adminTo},
+				{StartOID: "oid-1", EndOID: "oid-also-gone", Kind: adminTo},
+			},
+			wantFanouts: []endpointFanout{{side: edgeStartSide, kindID: applyKindAdminTo, ids: []uint64{1}}},
+		},
+		{
+			name:           "neither endpoint is nameable: nothing to ask",
+			deferred:       []EdgeTripleOIDRef{{StartOID: "oid-gone", EndOID: "oid-also-gone", Kind: adminTo}},
+			wantUnnameable: 1,
+		},
+		{
+			name:           "an unresolved kind is counted, never queried",
+			deferred:       []EdgeTripleOIDRef{{StartOID: "oid-1", EndOID: "oid-gone", Kind: graph.StringKind("NeverAsserted")}},
+			wantUnnameable: 1,
+		},
+		{
+			name: "a triple whose endpoints resolve does not excuse one with neither",
 			deferred: []EdgeTripleOIDRef{
 				{StartOID: "oid-1", EndOID: "oid-1", Kind: adminTo},
-				{StartOID: "oid-1", EndOID: "oid-gone", Kind: adminTo},
+				{StartOID: "oid-gone", EndOID: "oid-also-gone", Kind: adminTo},
 			},
 			wantKeys:       []edgeKey{{start: 1, end: 1, kind: applyKindAdminTo}},
-			wantUnresolved: 1,
+			wantUnnameable: 1,
 		},
 	}
 
@@ -260,15 +289,31 @@ func TestRekeyedTripleKeysReportsEndpointsItCannotName(t *testing.T) {
 			// the candidate re-read found it present.
 			nodesByID := map[uint64]nodeState{1: {id: 1}}
 
-			keys, unresolved := rekeyedTripleKeys(view, nodesByID, nil, kinds, tc.deferred,
+			keys, fanouts, unnameable := rekeyedTripleKeys(view, nodesByID, nil, kinds, tc.deferred,
 				map[edgeKey]struct{}{}, map[tripleKey]struct{}{})
 
 			if !reflect.DeepEqual(keys, tc.wantKeys) {
 				t.Fatalf("rekeyedTripleKeys keys = %+v, want %+v", keys, tc.wantKeys)
 			}
-			if unresolved != tc.wantUnresolved {
-				t.Fatalf("rekeyedTripleKeys unresolved = %d, want %d", unresolved, tc.wantUnresolved)
+			if !reflect.DeepEqual(fanouts, tc.wantFanouts) {
+				t.Fatalf("rekeyedTripleKeys fanouts = %+v, want %+v", fanouts, tc.wantFanouts)
+			}
+			if unnameable != tc.wantUnnameable {
+				t.Fatalf("rekeyedTripleKeys unnameable = %d, want %d", unnameable, tc.wantUnnameable)
 			}
 		})
+	}
+}
+
+// TestEdgeEndpointSideNamesTheEdgeTablesOwnColumns pins the two column names
+// the fan-out query interpolates: a typo there would silently query the
+// wrong endpoint, which no behavioural test could tell apart from a
+// symmetric graph.
+func TestEdgeEndpointSideNamesTheEdgeTablesOwnColumns(t *testing.T) {
+	if got := edgeStartSide.column(); got != "start_id" {
+		t.Fatalf("edgeStartSide.column() = %q, want %q", got, "start_id")
+	}
+	if got := edgeEndSide.column(); got != "end_id" {
+		t.Fatalf("edgeEndSide.column() = %q, want %q", got, "end_id")
 	}
 }
