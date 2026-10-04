@@ -226,13 +226,31 @@ func (g *pathParityGraph) assertServesOracle(t *testing.T, query string) {
 	}
 }
 
-// varLengthCycleFixture is a 3-cycle with a node that carries both endpoint
-// kinds, a parallel edge of another kind and a tail:
+// assertAlwaysDeclines requires the engine to decline query outright, with no
+// reference to what PostgreSQL does with it.
+//
+// It is for the shapes whose contract is the decline itself, where the oracle
+// cannot say so reliably: a guard PostgreSQL raises only under some plans
+// makes assertNeverWrong (which lets a decline pass, and only compares where
+// the engine serves) a test that happens to catch a wrong serve on the runs
+// where the plan raises -- and passes on the runs where it does not. The
+// engine's own contract has no such conditional in it, so that is what gets
+// asserted here. Every such row also keeps its unit-level pin, which fixes
+// the plan out of the question entirely.
+func (g *pathParityGraph) assertAlwaysDeclines(t *testing.T, query string) {
+	t.Helper()
+	if served, rows := g.engineRows(t, query); served {
+		t.Errorf("engine served %v for a shape it must always decline\nquery: %s", rows, query)
+	}
+}
+
+// pathParityVarLengthCycleFixture is a 3-cycle with a node that carries
+// both endpoint kinds, a parallel edge of another kind and a tail:
 //
 //	a(ZA) -ZE-> b(ZB) -ZE-> c(ZA,ZB) -ZE-> a
 //	a -ZF-> b
 //	c -ZE-> d(ZB)
-func varLengthCycleFixture() pathParityFixture {
+func pathParityVarLengthCycleFixture() pathParityFixture {
 	return pathParityFixture{
 		nodes: []pathParityNode{
 			{name: "a", kinds: []string{"ZA"}},
@@ -254,7 +272,7 @@ func varLengthCycleFixture() pathParityFixture {
 // empty path. Every shape must serve, forward and inbound, alone and with a
 // deeper upper bound.
 func TestVarLengthZeroLengthPathMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, varLengthCycleFixture())
+	g := seedPathParityGraph(t, pathParityVarLengthCycleFixture())
 	for _, query := range []string{
 		`MATCH p = (x:ZA)-[:ZE*0..1]->(y) RETURN p`,
 		`MATCH p = (y:ZB)<-[:ZE*0..1]-(x:ZA) RETURN p`,
@@ -274,7 +292,7 @@ func TestVarLengthZeroLengthPathMatchesOracle(t *testing.T) {
 // never runs at all. The engine may decline these shapes but must never serve
 // an answer PostgreSQL does not give.
 func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, varLengthCycleFixture())
+	g := seedPathParityGraph(t, pathParityVarLengthCycleFixture())
 	for _, query := range []string{
 		`MATCH p = (x:ZA)-[:ZE*1..0]->(y) RETURN p`,
 		`MATCH p = (x:ZA)-[:ZE*..0]->(y) RETURN p`,
@@ -288,8 +306,8 @@ func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
 	}
 }
 
-// shortestPathLevelFixture puts four roots at three distances from one
-// terminal; no root has an incoming edge of the traversed kind:
+// pathParityShortestPathLevelFixture puts four roots at three distances
+// from one terminal; no root has an incoming edge of the traversed kind:
 //
 //	r0 -> i1 -> i2 -> t9   (3 hops)
 //	r4 -> i5 -> t9         (2 hops)
@@ -297,7 +315,7 @@ func TestVarLengthZeroUpperBoundMatchesOracle(t *testing.T) {
 //	r7 -> t9               (1 hop)
 //
 // Every node is a ZNode; the r* nodes are also ZRoot and t9 is ZTerm.
-func shortestPathLevelFixture() pathParityFixture {
+func pathParityShortestPathLevelFixture() pathParityFixture {
 	var f pathParityFixture
 	for _, name := range []string{"r0", "i1", "i2", "r4", "i5", "r6", "r7", "t9"} {
 		kinds := []string{"ZNode"}
@@ -335,7 +353,7 @@ func shortestPathLevelFixture() pathParityFixture {
 // overall-shortest answer declines for a reason of its own
 // (TestAllShortestPathsSharedEndpointInequalityMatchesOracle).
 func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
-	fixture := shortestPathLevelFixture()
+	fixture := pathParityShortestPathLevelFixture()
 	fixture.nodes = append(fixture.nodes, pathParityNode{name: "x0", kinds: []string{"ZNode"}})
 	fixture.edges = append(fixture.edges, pathParityEdge{"x0", "r6", "ZOther"})
 	g := seedPathParityGraph(t, fixture)
@@ -363,12 +381,12 @@ func TestShortestPathUnconstrainedSecondEndpointMatchesOracle(t *testing.T) {
 	}
 }
 
-// selfCycleFixture puts group g1 on a 2-cycle (g1 -> u -> g1) while the only
-// other group, g2, is three hops away:
+// pathParitySelfCycleFixture puts group g1 on a 2-cycle (g1 -> u -> g1)
+// while the only other group, g2, is three hops away:
 //
 //	g1 -> u -> g1
 //	g1 -> x -> y -> g2
-func selfCycleFixture() pathParityFixture {
+func pathParitySelfCycleFixture() pathParityFixture {
 	return pathParityFixture{
 		nodes: []pathParityNode{
 			{name: "g1", kinds: []string{"ZG"}},
@@ -395,7 +413,7 @@ func selfCycleFixture() pathParityFixture {
 // property filter) and shortestPath are unaffected and must keep serving.
 func TestAllShortestPathsSharedEndpointInequalityMatchesOracle(t *testing.T) {
 	t.Run("two-cycle", func(t *testing.T) {
-		g := seedPathParityGraph(t, selfCycleFixture())
+		g := seedPathParityGraph(t, pathParitySelfCycleFixture())
 		for _, query := range []string{
 			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a <> b RETURN p`,
 			`MATCH p = allShortestPaths((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE id(a) <> id(b) RETURN p`,
@@ -458,7 +476,7 @@ func TestAllShortestPathsSharedEndpointInequalityMatchesOracle(t *testing.T) {
 // endpoints (the unidirectional harness never revisits a root) or with
 // DISTINCT (no pushdown), the answers agree and must keep serving.
 func TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, selfCycleFixture())
+	g := seedPathParityGraph(t, pathParitySelfCycleFixture())
 	for _, query := range []string{
 		`MATCH p = shortestPath((a:ZG)-[:ZEdge*1..]->(b:ZG)) WHERE a.name IN ['g1', 'g2'] AND b.name IN ['g1', 'g2'] AND a <> b RETURN p LIMIT 1`,
 		`MATCH p = shortestPath((a)-[:ZEdge*1..]->(b)) WHERE a.name = 'g1' AND b.name IN ['g1', 'g2'] AND a <> b RETURN p LIMIT 1`,
@@ -486,7 +504,7 @@ func TestShortestPathPairFilterLimitOverSharedEndpointMatchesOracle(t *testing.T
 // lands on the side dawgs' selectivity model picks as the seed, so pg
 // answers some spellings and rejects near-identical ones (all below).
 func TestShortestPathAfterEarlierBindingMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, shortestPathLevelFixture())
+	g := seedPathParityGraph(t, pathParityShortestPathLevelFixture())
 
 	for _, query := range []string{
 		// An earlier pattern in the same query part.
@@ -570,20 +588,46 @@ func TestShortestPathLaterPatternMatchesOracle(t *testing.T) {
 // edge whose start is also a terminal raises SQLSTATE 22023 -- beside the
 // seed's own conditions, and PostgreSQL may evaluate it first. Here c
 // carries both endpoint kinds and has outgoing edges, so the narrowed roots
-// ({a}) do not keep pg from raising -- on these small tables it evaluates
-// the guard over every ZE edge before joining the seed at all, and names b,
-// a terminal whose edge the seed never walks. The engine's check saw only
-// the narrowed roots and served. With `x <> y` the guard is not emitted and
-// both answer.
+// ({a}) do not keep pg from raising: on these small tables it can evaluate
+// the guard over every ZE edge before joining the seed at all, and name b, a
+// terminal whose edge the seed never walks. The engine's check saw only the
+// narrowed roots and served. With `x <> y` the guard is not emitted and both
+// answer.
+//
+// Which of the two the server does is a PLAN choice, not a contract: whether
+// the guard is evaluated ahead of the seed join decides whether pg raises
+// 22023 or answers normally, and on a fixture this small that is the
+// planner's to vary -- by row estimates, by server version, by run.
+//
+// That is why the guarded rows below assert the DECLINE rather than go through
+// assertNeverWrong. assertNeverWrong lets a decline pass and only compares
+// where the engine SERVES, so against an engine missing the kind-level check
+// -- which serves these -- it catches the wrong serve only on a run whose plan
+// happens to raise. Measured against exactly that engine: 1 pass in 3 as
+// originally reported, and 3 passes in 3 on PostgreSQL 14, where the plan did
+// not raise at all. As a regression test for this shape it is worth nothing on
+// the second server and a coin toss on the first.
+//
+// The engine's contract carries no such conditional: whenever a node
+// matching the seed side's kinds lies in the other side's set and has an edge
+// the seed would walk, and no endpoint inequality excludes it, the engine
+// declines and lets PostgreSQL decide the query's fate -- on every run, under
+// every plan. That is what the rows below assert now.
+// TestShortestPathKindLevelSelfEndpointDeclines (interpret/expand_test.go)
+// remains the pin for the same rule over an in-memory snapshot, where no plan
+// is involved at all; this test's job is to prove that decline reaches the
+// serving path against a real database. The inequality row keeps its oracle
+// comparison: there pg emits no guard, so there is nothing plan-dependent
+// left to compare against.
 func TestShortestPathKindLevelSelfEndpointMatchesOracle(t *testing.T) {
-	g := seedPathParityGraph(t, varLengthCycleFixture())
+	g := seedPathParityGraph(t, pathParityVarLengthCycleFixture())
 	for _, query := range []string{
 		`MATCH p = shortestPath((x:ZA)-[:ZE*1..1]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
 		`MATCH p = shortestPath((x:ZA)-[:ZE*1..2]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
 		`MATCH p = shortestPath((x:ZA)-[:ZE*]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
 		`MATCH p = allShortestPaths((x:ZA)-[:ZE*]->(y:ZB)) WHERE x.name = 'a' RETURN p`,
 	} {
-		t.Run(query, func(t *testing.T) { g.assertNeverWrong(t, query) })
+		t.Run(query, func(t *testing.T) { g.assertAlwaysDeclines(t, query) })
 	}
 	g.assertServesOracle(t, `MATCH p = shortestPath((x:ZA)-[:ZE*]->(y:ZB)) WHERE x.name = 'a' AND x <> y RETURN p`)
 }

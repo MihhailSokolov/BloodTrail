@@ -421,6 +421,12 @@ func TestOpenGraphParity(t *testing.T) {
 		t.Fatalf("assert schema: %v", err)
 	}
 	waitForBootLoad(t, d)
+	// Not just waitForBootLoad: the boot's own rebuild is counted after the
+	// View it publishes becomes visible, so a baseline read the instant
+	// Fresh() flips can grow by one on its own and fail the
+	// assertRebuildCountUnchanged check this test ends with
+	// (waitForBootRebuildCounted's doc has the detail).
+	waitForBootRebuildCounted(t, d, "after this suite's boot load")
 
 	rebuilds := bloodtrail.TestingEngine(d).RebuildCount()
 	fallbacks := markerCount(buf, fallbackEnteredMarker)

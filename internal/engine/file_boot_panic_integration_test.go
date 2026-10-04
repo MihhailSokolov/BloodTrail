@@ -48,13 +48,11 @@ func TestFileBootPanicDiscardsTheFileAndRebuilds(t *testing.T) {
 	defer eng.Stop()
 
 	waitForFresh(t, eng)
+	waitForRebuildCounted(t, eng, "after the file boot panicked")
 
 	view, serving := eng.Fresh()
 	if !serving {
 		t.Fatal("engine not serving after the file boot panicked")
-	}
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatal("RebuildCount = 0, want the boot to have fallen through to a rebuild from PostgreSQL")
 	}
 	if _, ok := view.Dense(uint64(nodeID)); !ok {
 		t.Fatal("the rebuilt replica is missing a node PostgreSQL holds")

@@ -79,8 +79,31 @@ func TestCompactionKeepsAnEdgeWhoseEndpointAppliesLater(t *testing.T) {
 	captured := eng.snap.Load()
 	capturedBase, capturedSegs := captured.Base(), captured.Segments()
 
+	// The whole point of the capture is that it happened while the edge was
+	// PENDING, and that is a property of the replica, not of this test's
+	// ordering: it holds only because read-back stages the edge record alone
+	// and never fetches the endpoints it names. Were that ever to change, n
+	// would already be in the captured view, the edge would resolve like any
+	// other, there would be no pending edge for the fold to carry -- and
+	// everything below would still pass while proving nothing. Asserted here,
+	// the way the unit-level twin (TestCompactionKeepsADeltaEdgeWhoseEndpointAppliesLater,
+	// compact_pending_edge_test.go) asserts it.
+	if _, known := captured.Dense(uint64(n.ID)); known {
+		t.Fatalf("node %d is already in the replica before its own write applied: read-back now fetches an edge's endpoints, so this test no longer captures a pending edge", n.ID)
+	}
+	if _, _, _, visible := captured.EdgeStateByID(uint64(rel.ID)); visible {
+		t.Fatalf("edge %d is visible before its endpoint's write applied; the captured stack holds no pending edge and the compaction below has nothing to carry", rel.ID)
+	}
+
 	// W1 applies while the fold runs.
 	eng.Apply(ctx, scope1)
+
+	// ...and with the endpoint known, the same edge record resolves -- so the
+	// comparisons below are against a view that really can show the edge, and
+	// a lost pending edge is the only way they can fail.
+	if _, _, _, visible := eng.snap.Load().EdgeStateByID(uint64(rel.ID)); !visible {
+		t.Fatalf("edge %d is still invisible after its endpoint's write applied, before any compaction ran", rel.ID)
+	}
 
 	cases := []typedCase{{`MATCH (s:PendingEdgeNode)-[:PendingEdgeRel]->(e:PendingEdgeNode) RETURN s, e`, true}}
 	requireOracleRowTotal(t, pgDriver, cases[0].query, 1)

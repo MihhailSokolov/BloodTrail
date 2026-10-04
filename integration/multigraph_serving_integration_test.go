@@ -63,6 +63,16 @@ func TestBuilderServingDeclinesInMultiGraphDatabase(t *testing.T) {
 	// when the test ends so no later test in this database sees a multi-graph
 	// database; the graph's catalog row stays behind, which the engine's
 	// multi-graph probe ignores (it counts only graphs holding a node).
+	//
+	// That residue is bounded, which is why it is left rather than cleaned
+	// up: multiGraphBuilderSecondGraphName is a constant, so every run of this
+	// test resolves to the SAME graph row and the same node_<id>/edge_<id>
+	// partitions dawgs created for it the first time. Nothing accumulates per
+	// run, and the one row costs a later suite nothing it can observe -- an
+	// empty graph is invisible to the probe, and dawgs' reads are not scoped
+	// by graph anyway. Dropping the row would mean dropping its partitions
+	// too, which is more surgery on a shared database than an idle row is
+	// worth.
 	oracle, _ := graphtest.OpenPG(t, graphtest.PGAvailable(t))
 	t.Cleanup(func() { graphtest.WipeGraph(t, oracle) })
 

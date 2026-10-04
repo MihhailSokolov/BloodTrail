@@ -146,9 +146,7 @@ func TestFileBootRejectsAFileTheStockImageWroteBehind(t *testing.T) {
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
 	requireLineageRejection(t, buf.String())
 
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after refusing the snapshot file, want the PostgreSQL rebuild")
-	}
+	waitForRebuildCounted(t, eng, "after refusing the snapshot file")
 	view, serving := eng.Fresh()
 	if !serving {
 		t.Fatalf("engine not serving after boot")
@@ -265,9 +263,7 @@ func TestFileBootRejectsAFileFromAnotherLineageWithAMatchingCounter(t *testing.T
 	waitForFresh(t, eng)
 	waitForBootMarker(t, buf, "bloodtrail: snapshot file rejected")
 	requireLineageRejection(t, buf.String())
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after refusing the snapshot file, want the PostgreSQL rebuild")
-	}
+	waitForRebuildCounted(t, eng, "after refusing the snapshot file")
 }
 
 // TestSnapshotFileNamesTheLineageItsReplicaWasLoadedIn pins where a file's

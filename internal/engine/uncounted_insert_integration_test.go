@@ -54,9 +54,7 @@ func TestFileBootRejectsAFileWithRowsInsertedBehindTheWatermark(t *testing.T) {
 	if strings.Contains(logged, "bloodtrail: snapshot file loaded") {
 		t.Fatalf("the boot adopted a file missing a row PostgreSQL holds:\n%s", logged)
 	}
-	if got := eng.RebuildCount(); got == 0 {
-		t.Fatalf("RebuildCount = 0 after refusing the snapshot file, want the PostgreSQL rebuild")
-	}
+	waitForRebuildCounted(t, eng, "after refusing the snapshot file")
 	view, serving := eng.Fresh()
 	if !serving {
 		t.Fatalf("engine not serving after boot")
