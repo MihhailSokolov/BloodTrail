@@ -1475,11 +1475,17 @@ func shortestPathBudget(meter *workMeter, maxDepth int) (rowCap int, memLimit ui
 	// runs once AllShortestPaths has already returned. Capping here moves the
 	// same decline in front of that materialization.
 	//
-	// Measured, because the reason this was parked was the absence of numbers:
-	// a dense path costs about 472-482 bytes of real peak heap (a 302-node,
-	// 20,200-edge fixture yielding 1,000,000 paths peaked at 450 MiB and was
-	// then declined). Left at the remaining work, MaxWork's 2^28 admits about
-	// 32 GiB accounted and roughly 127 GB resident before anything refuses;
+	// Measured, because the reason this was parked was the absence of numbers.
+	// On a 302-node, 20,200-edge fixture yielding 1,000,000 five-node paths
+	// (103 MiB accounted), this whole function's downstream cost -- the dense
+	// []Path plus the *Row and PathVal the loop below converts each path into
+	// -- peaked at 443 MiB, about 465 bytes per path, and was then declined.
+	// Roughly 85 of those bytes are the dense path itself (traverse's
+	// pathSink, whose own allocation now sits at or below the charge
+	// accounted here -- see internal/engine/traverse/allocation_test.go); the
+	// rest is the row, which MaxLiveRows governs rather than this byte cap.
+	// Left at the remaining work, MaxWork's 2^28 admits about 32 GiB
+	// accounted and well over a hundred GB resident before anything refuses;
 	// at MaxLiveRows the same arithmetic gives about 458 MiB accounted, a
 	// 134x reduction. Nothing that serves today stops serving: the cap equals
 	// the largest set the conversion loop will accept, so every component at

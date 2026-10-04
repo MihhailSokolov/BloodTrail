@@ -1550,7 +1550,34 @@ reported as a path to itself, matching BloodHound's own filter.
 - **Memory budget.** Each path produced is charged `12 × nodes + 48` bytes against the request's
   memory limit; exceeding it declines the query (`memory_limit`). When the overall-shortest mode
   discards the paths collected so far because a shorter pair turned up, their charge is released
-  too. Strategy B's search buffers are charged against the same limit, as a reservation taken
+  too, and the memory itself is released with it.
+
+  What a limit expressed in those accounted bytes costs in real heap was measured, since a charge
+  that understates reality turns the 1 GiB `GraphQueryMemoryLimit` BloodHound hands down into a
+  larger commitment than it looks. An enumeration used to allocate 2.5–7 times its charge and hold
+  up to 4 times it resident at the peak. Each path was two freshly allocated slices inside a `Path`
+  appended to a growing `[]Path`, and Go grows a slice past 256 elements by a quarter at a time, so
+  reaching a million paths allocated about five times the final array and discarded four of them —
+  240 bytes of garbage against a 48-byte charge — on top of a fresh copy of the partial path at
+  every step of the walk. Three shapes, enumerated directly: 20,000 paths of 3 nodes allocated
+  6.90× their charge (4.19× of it still resident at the peak), 64,000 of 5 nodes 3.34× (1.42×),
+  8,192 of 15 nodes 2.55× (1.92×).
+
+  The paths are now bump-allocated into fixed-size chunks and the `[]Path` is built once, exactly
+  sized, with each path's nodes and kinds aliasing the chunk they already sit in; the walk itself
+  carries a stack of (node, kind, depth) frames rather than a copy of the partial path. The same
+  three shapes allocate **1.29×, 0.81× and 0.66×** of their charge, and peak heap now tracks those
+  figures rather than towering over them — the garbage is gone, not merely collected sooner. So the
+  charge is now at or slightly above reality for ordinary path lengths, and the residual 1.29× is
+  one extreme: a single node whose whole fan-out is one hop from the target puts every one of those
+  paths on the search stack at once, and that stack's own growth is what is left. Two caveats on
+  the honest side: a query returning only a handful of paths pays a few hundred bytes of chunk
+  floor the charge does not cover, and the charge still covers only the search's own output —
+  what the Cypher interpreter then converts each path into is governed by the live-row budget
+  ([§11.9](#119-budgets)), not by this one, and is the larger figure of the two
+  ([§11.7](#117-executing-the-pattern)).
+
+  Strategy B's search buffers are charged against the same limit, as a reservation taken
   before they are allocated and kept across that release, since discarding paths does not free
   them: it holds one buffer per small-side node, 5 bytes per node of the whole snapshot each,
   from its parallel fan-out until its merge finishes. A query whose buffers alone do not fit
@@ -1582,7 +1609,8 @@ reported as a path to itself, matching BloodHound's own filter.
 `MaxRepresentableDepth`, `PairBudget`, `SideBudget`, `strategyPairs`, `strategySmallSide`,
 `cancelCheck`, `memBudget`, `SelfEndpointConflict`, the scratch pool.
 [`bfs.go`](internal/engine/traverse/bfs.go): `bfsFrom`, `pairShortest`, `pairEnumerate`,
-`enumerate`. [`engine.go`](internal/engine/engine.go):
+`enumerate`, `frame`. [`pathsink.go`](internal/engine/traverse/pathsink.go): `pathSink`.
+[`engine.go`](internal/engine/engine.go):
 `TryAllShortestPaths`, `servePathQuery`, `convertMode`, `resolveEndpoint`, `buildKindMask`.
 [`hydrate.go`](internal/engine/hydrate.go): `hydratePaths`.
 
@@ -2196,8 +2224,10 @@ converted row by row, and that conversion refuses any set larger than `maxCypher
 component with more paths than that declines whatever the search was allowed to collect — but it
 declines only after the search has already built the whole set. Derived from the remaining work
 alone, the limits allowed about 268 million paths and roughly 60 GiB before anything refused; a
-path was measured to cost about 472–482 bytes of resident memory, so a query could have reached
-tens of gigabytes resident in a process that already holds the whole graph in memory. Capping both
+path together with the row it is converted into was measured to cost about 465 bytes of resident
+memory — about 85 of them the path itself ([§9.4](#94-limits-and-engineering-details)), the rest
+the row — so a query could have reached tens of gigabytes resident in a process that already
+holds the whole graph in memory. Capping both
 limits at the live-row budget moves the same refusal in front of that work: about 2 million paths
 and 458 MiB at the default maximum depth, a reduction of about 134 times. Nothing that served
 before stops serving, because the cap is exactly the largest set the conversion would have

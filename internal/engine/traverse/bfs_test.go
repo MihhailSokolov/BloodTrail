@@ -172,7 +172,9 @@ func TestBFSAndEnumerate(t *testing.T) {
 		}
 
 		budget := &memBudget{}
-		out, err := enumerate(s, 0, sc, kinds, 0, budget, nil, true)
+		sink := &pathSink{}
+		err := enumerate(s, 0, sc, kinds, 0, budget, sink, true)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("enumerate: %v", err)
 		}
@@ -202,7 +204,9 @@ func TestBFSAndEnumerate(t *testing.T) {
 		}
 
 		budget := &memBudget{}
-		out, err := enumerate(s, 0, sc, kinds, 0, budget, nil, true)
+		sink := &pathSink{}
+		err := enumerate(s, 0, sc, kinds, 0, budget, sink, true)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("enumerate: %v", err)
 		}
@@ -219,7 +223,9 @@ func TestBFSAndEnumerate(t *testing.T) {
 		bfsFrom(s, 6, false, kinds, MaxDepth, sc)
 
 		budget := &memBudget{}
-		out, err := enumerate(s, 0, sc, kinds, 1, budget, nil, true)
+		sink := &pathSink{}
+		err := enumerate(s, 0, sc, kinds, 1, budget, sink, true)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("enumerate: %v", err)
 		}
@@ -262,7 +268,9 @@ func TestBFSAndEnumerate(t *testing.T) {
 		}
 
 		budget := &memBudget{}
-		out, err := enumerate(s, 8, sc, kinds, 0, budget, nil, true)
+		sink := &pathSink{}
+		err := enumerate(s, 8, sc, kinds, 0, budget, sink, true)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("enumerate: %v", err)
 		}
@@ -300,7 +308,9 @@ func TestBFSAndEnumerate(t *testing.T) {
 		bfsFrom(s, 6, false, kinds, MaxDepth, sc)
 
 		budget := &memBudget{limit: 1}
-		out, err := enumerate(s, 0, sc, kinds, 0, budget, nil, true)
+		sink := &pathSink{}
+		err := enumerate(s, 0, sc, kinds, 0, budget, sink, true)
+		out := sink.paths()
 		if !errors.Is(err, ErrMemoryLimit) {
 			t.Fatalf("err = %v, want ErrMemoryLimit", err)
 		}
@@ -316,7 +326,9 @@ func TestBFSAndEnumerate(t *testing.T) {
 		bfsFrom(s, 0, false, kinds, MaxDepth, sc)
 
 		budget := &memBudget{}
-		out, err := enumerate(s, 0, sc, kinds, 0, budget, nil, true)
+		sink := &pathSink{}
+		err := enumerate(s, 0, sc, kinds, 0, budget, sink, true)
+		out := sink.paths()
 		if err != nil {
 			t.Fatalf("enumerate: %v", err)
 		}
