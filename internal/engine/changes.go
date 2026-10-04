@@ -17,6 +17,9 @@ import (
 // matches, or a bare "this write escaped tracking" fallback) Apply
 // (apply.go) needs in order to replay the write's effect into the in-memory
 // engine, rather than re-deriving it from the observer call sequence itself.
+// One recorded entry is about the write rather than about a row it touched:
+// the write-incomplete mark (RecordWriteIncomplete), which tells read-back
+// whether the write it is reading back returned cleanly at all.
 //
 // Every Record* method is additive and idempotent: recording the same
 // logical entry more than once (e.g. two calls that both name node id 7,
@@ -43,7 +46,8 @@ type ChangeSet struct {
 	nodeKindDeletes map[string]NodeKindDeleteCriteria
 	edgeKindDeletes map[string]graph.Kinds
 
-	fallbacks map[string]struct{}
+	fallbacks       map[string]struct{}
+	writeIncomplete map[string]struct{}
 }
 
 // EdgeTripleRef is one (start, end, kind) triple RecordEdgeTriple has
@@ -280,8 +284,51 @@ func (c *ChangeSet) RecordFallback(reason string) {
 	c.fallbacks[reason] = struct{}{}
 }
 
+// RecordWriteIncomplete records that the write this ChangeSet belongs to did
+// NOT complete cleanly -- it returned an error, or a panic is unwinding
+// through it -- alongside reason, a short human-readable description of
+// which. Driver.BatchOperation's own error path is the call site this exists
+// for: a batch's flushed chunks are durable whatever the batch went on to
+// report, so Apply runs for a failed batch too (see that method's doc), and
+// read-back then has to read the recorded keys knowing that some of them name
+// rows the write never created.
+//
+// It is NOT a fallback and NOT a change: unlike RecordFallback it asks Apply
+// for nothing, and unlike every other Record* method it adds no key, so it
+// leaves Empty() and keyCount() alone -- a failed write that recorded no key
+// is still an empty ChangeSet, and still costs no segment. Its one consumer
+// is readBack (readback.go), which reads it to tell a key that cannot be
+// resolved because the write never landed (benign, and the expected outcome
+// for a failed one) from a key that cannot be resolved although the write
+// provably created the row (a race the engine cannot name its way out of,
+// whose only sound answer is a fallback).
+//
+// Recording the same reason string more than once has the same effect as
+// recording it once; WriteIncomplete() returns each distinct reason exactly
+// once.
+func (c *ChangeSet) RecordWriteIncomplete(reason string) {
+	if c.writeIncomplete == nil {
+		c.writeIncomplete = make(map[string]struct{}, 1)
+	}
+	c.writeIncomplete[reason] = struct{}{}
+}
+
+// WriteIncomplete reports whether RecordWriteIncomplete has ever been called
+// on c, alongside every distinct reason recorded, in sorted order. ok is
+// false, and reasons is nil, when it has never been called -- which is what
+// a write that returned cleanly looks like.
+func (c *ChangeSet) WriteIncomplete() (ok bool, reasons []string) {
+	if len(c.writeIncomplete) == 0 {
+		return false, nil
+	}
+	return true, sortedKeys(c.writeIncomplete)
+}
+
 // Empty reports whether nothing has been recorded on c at all -- no ids, no
 // object ids, no triples, no kind-scoped delete criteria, and no fallback.
+// The write-incomplete mark is deliberately not counted: it describes how to
+// read whatever keys are here rather than being one of them, so a failed
+// write that named nothing stays empty (RecordWriteIncomplete's own doc).
 // WriteScope.Empty() (changes_scope.go) is exactly this call on the
 // WriteScope's own ChangeSet.
 func (c *ChangeSet) Empty() bool {

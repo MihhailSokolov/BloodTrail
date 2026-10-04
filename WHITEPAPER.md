@@ -789,7 +789,7 @@ happens when something fails depends on whether the failed write might have reac
 | Call | Error treated as "nothing happened" (no apply) | Error treated as "it may have landed" (fallback and rebuild) |
 |---|---|---|
 | `WriteTransaction` | The code inside returned an error, so PostgreSQL rolled back; or the final COMMIT failed for a transaction that wrote nothing | The code inside succeeded and wrote (or incremented the counter for a write), but the final COMMIT failed: the outcome is unknown |
-| `BatchOperation` | — (always applied: DAWGS's batch commits in chunks, so earlier chunks may be durable, and read-back reads whatever was committed) | — |
+| `BatchOperation` | — (always applied: DAWGS's batch commits in chunks, so earlier chunks may be durable, and read-back reads whatever was committed; the error is recorded on the scope all the same, for the one key shape whose meaning depends on it, [§12.2](#122-what-the-observers-record)) | — |
 | `Run`, `WipeGraph` | Any error before the commit step (connection, BEGIN, the statement, the truncate) | An error from the COMMIT itself |
 | `DeleteNodesByKinds`, `DeleteRelationshipsByKinds` | A connection error, or the delete's own up-front refusal of an unknown kind to exclude | Anything else: these deletes run as a single auto-committed statement, and an error can be reported after the delete has already taken effect |
 | `SetDefaultGraph` | Every error (it cannot have written anything) | — |
@@ -2419,6 +2419,13 @@ because the id is known only then. Batch relationship creates record their (star
 triple up front, and batch `CreateNode` its key: DAWGS's batch keeps a node whose flush failed and
 can still create it at a later flush. A failed batch `CreateNodes` records a fallback, because DAWGS
 runs it as a transaction of its own whose `COMMIT` can fail after PostgreSQL made it durable.
+
+A batch that returned an error also has that fact recorded alongside its keys
+(`settleBatchOutcome`, `ChangeSet.RecordWriteIncomplete`), which asks for nothing by itself and is
+not a fallback. It exists for the one key shape where "PostgreSQL has no such row" is ambiguous
+rather than benign -- an objectid-keyed edge endpoint that matches nothing
+([§12.3](#123-reading-back)) -- since what that means depends entirely on whether the write that
+recorded it got as far as creating the row.
 
 ### 12.3 Reading back
 

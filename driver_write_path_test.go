@@ -254,3 +254,36 @@ func TestDriverReadTransactionPanicStillAppliesItsWrites(t *testing.T) {
 		t.Fatalf("ApplyCount = %d, want 1: the write before the panic never reached the engine", got)
 	}
 }
+
+// TestSettleBatchOutcomeMarksOnlyAFailedBatch pins the one Apply call site
+// in this package that runs after a non-nil error without recording a
+// fallback: Driver.BatchOperation's own, which applies whatever the batch
+// reported because a batch's chunks are durable as they flush. Read-back
+// needs to know which of the two it is reading back -- see
+// ChangeSet.RecordWriteIncomplete and the engine's readBack -- so the mark
+// goes on for an error and stays off for a clean return. It is never a
+// fallback: a failed batch must not cost a rebuild on its own.
+func TestSettleBatchOutcomeMarksOnlyAFailedBatch(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"the batch returned cleanly", nil, false},
+		{"the batch returned an error", errors.New("flush failed"), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scope := engine.NewWriteScope()
+			settleBatchOutcome(scope, tc.err)
+
+			if got, _ := scope.Changes().WriteIncomplete(); got != tc.want {
+				t.Fatalf("WriteIncomplete() = %v, want %v", got, tc.want)
+			}
+			if got, reasons := scope.Changes().HasFallback(); got {
+				t.Fatalf("HasFallback() = (%v, %v), want no fallback: a failed batch must not cost a rebuild of its own", got, reasons)
+			}
+		})
+	}
+}

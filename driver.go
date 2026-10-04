@@ -506,7 +506,10 @@ func resolveWriteTransactionFailure(ctx context.Context, eng *engine.Engine, obs
 // this safety does not actually depend on the autocommit-vs-transactional
 // question above -- because read-back reads PostgreSQL's own committed
 // state per key -- a key whose write never landed simply reads back as it
-// already was (or as absent), never as the write that failed.
+// already was (or as absent), never as the write that failed. The one key
+// shape where "absent" is ambiguous rather than benign reads the delegate's
+// own outcome to resolve it: settleBatchOutcome marks the scope before the
+// apply, and read-back keys its objectid-endpoint fallback on that mark.
 //
 // The same holds when a panic unwinds through the embedded driver's
 // BatchOperation: the chunks flushed before it are durable. A deferred
@@ -529,8 +532,41 @@ func (d *Driver) BatchOperation(ctx context.Context, batchDelegate graph.BatchDe
 		return batchDelegate(observer)
 	}, options...)
 	returned = true
+	settleBatchOutcome(observer.scope, err)
 	d.engine.Apply(ctx, observer.scope)
 	return err
+}
+
+// settleBatchOutcome tells the apply below whether the batch it is applying
+// returned cleanly. This is the one Apply call site in this package that runs
+// after a non-nil error WITHOUT a fallback (every other one either applies
+// only on success, or records a fallback first: resolveWriteTransactionFailure,
+// settleOverrideWrite, settleOverridePanic, settleDeleteFailure,
+// observingTransaction.Commit and this method's own panic defer), and
+// deliberately so -- a batch's chunks are durable as they flush, so skipping
+// the apply would lose the ones that did, while a fallback would rebuild the
+// whole replica after every failed ingest batch.
+//
+// Read-back needs the distinction, for exactly one key shape: an
+// objectid-keyed edge endpoint that resolves to no node. After a clean commit
+// that is a race it cannot name its way out of and must fail closed on; after
+// an error it is the expected, benign outcome of a node that was never
+// created. See ChangeSet.RecordWriteIncomplete and internal/engine's readBack
+// ("The one fallback this records"). Marking is additive and asks Apply for
+// nothing: a scope that already carries a fallback enters fallback regardless.
+//
+// err is the only evidence available here, and it is not perfect: a delegate
+// that swallows a failed mid-batch Commit's error (observingBatch.Commit
+// applies nothing and keeps the scope on that path) reports clean, and such a
+// scope's unresolvable endpoint then costs a fallback it did not strictly
+// need. That is the safe direction -- an unnecessary rebuild, never a missing
+// row -- and it takes a delegate that discards an error BloodHound's own
+// ingest propagates.
+func settleBatchOutcome(scope *engine.WriteScope, err error) {
+	if err == nil {
+		return
+	}
+	scope.Changes().RecordWriteIncomplete(fmt.Sprintf("BatchOperation: the batch failed: %v", err))
 }
 
 // Close stops the engine's background goroutines (boot load, fallback
