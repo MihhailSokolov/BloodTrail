@@ -1834,7 +1834,7 @@ be reproduced exactly:
 | An undirected relationship after the first step of a pattern, or between a node and itself (`(a)-->(b)--(c)`, `(a)--(a)`) | DAWGS does not exclude the node the pattern arrived from |
 | `ORDER BY` a text value | Collation |
 | `RETURN DISTINCT … ORDER BY` a key that is not returned | PostgreSQL rejects it ("for SELECT DISTINCT, ORDER BY expressions must appear in select list") |
-| `ORDER BY x` where `x` is both a `RETURN` alias and a variable the query binds (a node, relationship or path, or a carried `COUNT`, `COLLECT` or constant), unless that item is `x` itself; or where two `RETURN` aliases differ only in case | DAWGS sorts by the bound variable, not the alias (so different rows survive a `LIMIT`, and PostgreSQL rejects `RETURN count(u) AS u ORDER BY u`), and PostgreSQL folds the two aliases to one ambiguous name. A path variable is in fact sorted by the alias; declining it too is deliberate |
+| `ORDER BY x` where `x` is both a `RETURN` alias and a variable the query binds (a node, relationship or path, or a carried `COUNT`, `COLLECT` or constant), unless that item is `x` itself; or where two `RETURN` aliases differ only in case | DAWGS sorts by the bound variable, not the alias (so different rows survive a `LIMIT`, and PostgreSQL rejects `RETURN count(u) AS u ORDER BY u`), and PostgreSQL folds the two aliases to one ambiguous name. A path variable is in fact sorted by the alias; declining it too is deliberate. Declining two aliases that differ only in case is right for a path (`MATCH p = … RETURN p, g.v AS P ORDER BY p` is ambiguous in PostgreSQL, 42702) but an over-decline when the sorted name is a node, a relationship or a carried `COUNT`, `COLLECT` or constant that a bare `RETURN` item projects (`WITH g, count(u) AS c RETURN c, g.v AS C ORDER BY c`): DAWGS emits a qualified reference to the binding's own frame column there (`order by s0.i0`), so the fold never reaches PostgreSQL's name resolution and the query is answered (the same select list under `order by c` is 42702), and BloodTrail still declines. The fold decides only for a name no binding carries |
 | `ORDER BY (x)`, an alias in parentheses | DAWGS replaces only a bare name with the column, so `RETURN g.v AS gv ORDER BY (gv)` becomes `order by (i0)`, a column that does not exist |
 | `ORDER BY x` where `x` is a word PostgreSQL reserves (`select`, `table`, `group`, `user`, `left`, …) | DAWGS writes the name unquoted: a syntax error, or for `user`, `true` or `current_date`, a sort by a constant |
 | A backquoted alias (`` AS `My Col` ``) | DAWGS passes the backquotes through, which is invalid SQL, so PostgreSQL rejects the query |
@@ -2853,18 +2853,19 @@ itself survives a power loss (an error there is reported as `snapshot file write
 complete file already in place; a filesystem that cannot sync directories at all counts as synced).
 A leftover temporary file is removed at the next startup. Loading checks every count and length
 against the bytes the file still holds before allocating anything for it, so a flipped bit in a
-count is refused without a large allocation (before this, one flipped high bit could ask for about
-a terabyte, before the checksum was even read). It then verifies the checksum, and **validates the
-structure** (array lengths, offsets that only increase, ids in range, arena references in bounds, a
-node's property entries in ascending property order): a checksum proves the bytes are the ones
-written, not that they describe a valid graph. Any failure rejects the file. The validation does not
-cover everything a reader relies on: the order of the edge-id permutation, the agreement of the
-reverse adjacency with the forward one, and the JSON text of list and object values are taken as
-written (each check is a pass over a large array or the whole arena whose cost at boot has not been
-measured), so a file edited with its checksum recomputed could still mislead. The header can also be
-read on its own, without the rest of the file. The checksum does not vouch for it until the whole
-file has been read, so the boot uses the header only to refuse a file early ([§14.3](#143-boot)),
-never to trust one.
+count is refused without a large allocation (before this, one flipped high bit could ask for about a
+terabyte, before the checksum was even read). It then verifies the checksum, and **validates the
+structure** (array lengths, offsets that only increase, database ids in strictly ascending order,
+indexes and property ids in range, arena references in bounds, and each node's property entries in
+strictly ascending property-id order, which the property lookup binary-searches): a checksum proves
+the bytes are the ones written, not that they describe a valid graph. Any failure rejects the file.
+The validation does not cover everything a reader relies on: the order of the edge-id permutation,
+the agreement of the reverse adjacency with the forward one, and the JSON text of list and object
+values are taken as written (each check is a pass over a large array or the whole arena whose cost
+at boot has not been measured), so a file edited with its checksum recomputed could still mislead.
+The header can also be read on its own, without the rest of the file. The checksum does not vouch
+for it until the whole file has been read, so the boot uses the header only to refuse a file early
+([§14.3](#143-boot)), never to trust one.
 
 At about 4.9 million nodes and 49 million edges the file is about 3.9 GiB; saving takes 27–30 s,
 reading it 8–9 s, and a startup from the file 10–14 s, against 45–51 s for a full load.
@@ -3365,11 +3366,13 @@ require those two checks by name.
 curl -fsSL https://github.com/MihhailSokolov/BloodTrail/releases/latest/download/install.sh | sh -s -- install
 ```
 
-The bootstrap script downloads the `bloodtrail` CLI for the platform, verifies its SHA-256 checksum
-itself (it takes the one line of `checksums.txt` for the archive, requires a 64-digit hash there,
-and compares it with the download's; no line, several lines, or a malformed hash stop it, since the
-`sha256sum -c` that recent macOS ships accepts input it cannot use), and runs `bloodtrail install`
-from a temporary directory under `TMPDIR` ([`internal/installer`](internal/installer)):
+The bootstrap script downloads the `bloodtrail` CLI for the platform (each download is time-limited:
+15 s to connect, 600 s in all for the archive and 60 s for `checksums.txt`, so a stalled connection
+ends with a message instead of a hang), verifies its SHA-256 checksum itself (it takes the one line
+of `checksums.txt` for the archive, requires a 64-digit hash there, and compares it with the
+download's; no line, several lines, or a malformed hash stop it, since the `sha256sum -c` that
+recent macOS ships accepts input it cannot use), and runs `bloodtrail install` from a temporary
+directory under `TMPDIR` ([`internal/installer`](internal/installer)):
 
 1. **Inventory.** Stop at once if `COMPOSE_FILE` is set in the shell's environment, even empty, or
    `COMPOSE_PATH_SEPARATOR` is set there to anything other than `:` or nothing: Compose takes both
@@ -3411,17 +3414,22 @@ from a temporary directory under `TMPDIR` ([`internal/installer`](internal/insta
    found and the installer has been addressing: the base file and, when there is one, the override
    Compose loads beside it (the first of `compose.override.yml`, `compose.override.yaml`,
    `docker-compose.override.yml` and `docker-compose.override.yaml`, whatever the base file is
-   called), then the installer's own file, by relative names. (A relative entry ties the project to
-   the directory Compose is run from, where `.env` is read; an operator who ran Compose with
-   `--project-directory` from elsewhere against a project with no entry must run it from the project
-   directory afterwards.) Every other line of `.env` is kept as it was, so adding the entry and
-   removing it again gives the file back as it was, except that a missing final line break is added,
-   and a `.env` the install had to create stays behind, empty. `.env` is written only when it
-   changes, and replaced atomically: a new file beside it, given the old file's mode and owner,
-   flushed and renamed over it, and the directory synced. It keeps a symbolic link, but not extended
-   attributes, ACLs or a hard link, and a `.env` that is itself a mount point cannot be replaced.
-   Then set the `database_switch` row, **end the watermark lineage** ([§13.5](#135-the-lineage)),
-   and run `docker compose up -d`. The operator's own Compose file is never edited.
+   called), then the installer's own file, by relative names. (Compose resolves a relative name in
+   `COMPOSE_FILE` against the directory it is run from, even under `--project-directory`, so the new
+   entry ties the project to that directory. An operator who ran Compose with `--project-directory`
+   from elsewhere against a project with no entry must run it from the project directory afterwards:
+   from anywhere else Compose looks for the names there, stops with an error if they are missing,
+   and loads files of the same names if it finds some. Writing the names as absolute paths by hand
+   lifts the restriction, and rollback finds its override under either spelling.) Every other line
+   of `.env` is kept as it was, so adding the entry and removing it again gives the file back as it
+   was, except that a missing final line break is added, and a `.env` the install had to create
+   stays behind, empty. `.env` is written only when it changes, and replaced atomically: a new file
+   beside it, given the old file's mode and owner, flushed and renamed over it, and the directory
+   synced. It keeps a symbolic link, but not extended attributes or ACLs; a hard link to it is lost,
+   because the new file takes the name and the other name keeps the old contents; and a `.env` that
+   is itself a mount point cannot be replaced. Then set the `database_switch` row, **end the
+   watermark lineage** ([§13.5](#135-the-lineage)), and run `docker compose up -d`. The operator's
+   own Compose file is never edited.
 5. **Verify.** Check that the driver setting BloodHound will read (the `database_switch` row, else
    the service's `bhe_graph_driver`) names `bloodtrail`, wait for the container's *current* run to
    log `BloodTrail driver active` (an earlier run's line does not count), and wait for
@@ -3616,7 +3624,7 @@ BloodTrail's messages start with `bloodtrail:`; debug messages appear with
 | `could not read the watermark lineage; no snapshot file will be written from this rebuild` | Warn | A full load could not read the lineage; its replica is used but never saved |
 | `could not record where PostgreSQL stood at start; a snapshot file will not be checked for rows inserted behind the watermark` | Warn | `Start`'s read of the counter and sequence positions failed; the lineage and counter checks still apply |
 | `snapshot file invalidated` | Info | A write reached PostgreSQL uncounted, so the file was deleted; also logged when a save deletes the file it had just written for that reason, and when the boot deletes a file whose loading panicked (reason `booting from it panicked`) |
-| `snapshot file invalidation failed` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`); delete the file by hand before the next restart |
+| `snapshot file invalidation failed` / `snapshot file not invalidated` | Warn | That delete, or the directory sync that makes it durable, failed (with `removed`), or no file path could be worked out yet, so there was nothing to delete (reason `no snapshot file path resolved yet`); delete the file by hand before the next restart |
 | `watermark bump failed` | Warn | The counter could not be incremented for a write |
 | `compaction started` / `finished` / `discarded` | Info | Background compaction (a panic logs `compaction panicked`, above) |
 

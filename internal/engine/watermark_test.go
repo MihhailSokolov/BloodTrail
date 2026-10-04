@@ -689,13 +689,13 @@ func TestInvalidateSnapshotFileRemovesTheFile(t *testing.T) {
 
 	e := New(nil, nil, Config{Enabled: true, SnapshotDir: dir})
 
-	e.removeSnapshotFile(context.Background(), path)
+	e.removeSnapshotFile(context.Background(), path, invalidateUncountedWrite)
 	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("stat after invalidation = %v, want fs.ErrNotExist", err)
 	}
 
 	// Idempotent: nothing left to remove is a success, not a failure.
-	e.removeSnapshotFile(context.Background(), path)
+	e.removeSnapshotFile(context.Background(), path, invalidateUncountedWrite)
 }
 
 // TestInsertedSinceFile pins when a snapshot file's stamp shows rows

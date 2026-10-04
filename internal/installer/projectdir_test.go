@@ -84,10 +84,14 @@ func TestInstallStopsWhenComposeLoadsTheProjectFromAnotherDirectory(t *testing.T
 				t.Fatalf("want a refusal naming both directories, got %v", err)
 			}
 			// Moving the .env moves what its relative names are relative to, and
-			// the installer then has to be told where the compose file is.
-			hints := []string{"relative COMPOSE_FILE names", "--compose-file"}
+			// the installer then has to be told where the compose file is --
+			// and not, again, the project directory it refused: passing the
+			// same --project-dir with the hinted --compose-file refuses once
+			// more, so the message has to say to drop or change it.
+			hints := []string{"relative COMPOSE_FILE names", "--compose-file", "or with --project-dir " + composeDir}
 			if !strings.Contains(env, "COMPOSE_FILE") {
-				hints = []string{"--compose-file"} // there are no names to rewrite
+				// There are no names to rewrite.
+				hints = []string{"--compose-file", "no --project-dir (or --project-dir " + composeDir + ")"}
 			}
 			for _, want := range hints {
 				if !strings.Contains(err.Error(), want) {

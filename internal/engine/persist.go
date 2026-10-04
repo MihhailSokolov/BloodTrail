@@ -431,7 +431,7 @@ func (e *Engine) saveSnapshotWrite(ctx context.Context, path string, pending *pe
 	if e.dirtyGen.Load() != pending.dirtyGen {
 		e.cfg.Log.WarnContext(ctx, "bloodtrail: snapshot file not written",
 			slog.String("reason", "a watermark bump failed while the file was being written"))
-		e.removeSnapshotFile(ctx, path)
+		e.removeSnapshotFile(ctx, path, invalidateUncountedWrite)
 		return writeErr
 	}
 	if writeErr != nil {
@@ -548,19 +548,31 @@ func saveSnapshotPreconditionsFor(state int32, dirtyGen, resolvedGen uint64, con
 	return state == stateServing && dirtyGen == resolvedGen && converged
 }
 
+// Why a snapshot file is taken out of play, as the "snapshot file
+// invalidated" line states it.
+const (
+	// invalidateUncountedWrite: a write reached PostgreSQL without advancing
+	// the watermark counter, so the file's stamp no longer proves anything.
+	invalidateUncountedWrite = "a write reached PostgreSQL without advancing the watermark"
+	// invalidateBootPanicked: loading the file panicked, and a panic that
+	// depends on the file would recur at every boot.
+	invalidateBootPanicked = "booting from it panicked"
+)
+
 // invalidateSnapshotFile removes the saved snapshot file for this graph, so
-// no later boot can adopt it. Called when something has made the file
-// unprovable rather than merely out of date -- today, a failed eager
-// watermark bump (NoteWatermarkBumpFailure, watermark.go), whose write
-// reaches PostgreSQL without advancing the counter the boot's gap check
-// compares against.
+// no later boot can adopt it, and logs reason as the cause. Called when
+// something has made the file unprovable or unusable rather than merely out
+// of date -- a failed eager watermark bump (NoteWatermarkBumpFailure,
+// watermark.go), whose write reaches PostgreSQL without advancing the counter
+// the boot's gap check compares against, or a panic while booting from it
+// (recoverSnapshotFileBootPanic, background_panic.go).
 //
 // Best effort by design, and quiet about a file that was never there: the
 // point is that no adoptable file is left behind, not that one was found. A
 // removal that genuinely fails is logged at Warn, since the next boot may
 // then adopt a file it should not -- there is nothing else this process can
 // do about it from here.
-func (e *Engine) invalidateSnapshotFile(ctx context.Context) {
+func (e *Engine) invalidateSnapshotFile(ctx context.Context, reason string) {
 	path, ok := e.snapshotFilePath()
 	if !ok {
 		if e.cfg.SnapshotDir != "" {
@@ -569,7 +581,7 @@ func (e *Engine) invalidateSnapshotFile(ctx context.Context) {
 		}
 		return
 	}
-	e.removeSnapshotFile(ctx, path)
+	e.removeSnapshotFile(ctx, path, reason)
 }
 
 // removeSnapshotFile is invalidateSnapshotFile's second half, split out so it
@@ -583,7 +595,7 @@ func (e *Engine) invalidateSnapshotFile(ctx context.Context) {
 // write never moved, which the next boot would find current. A sync that
 // fails is logged like a removal that fails: the file is gone for now, but
 // may not stay gone.
-func (e *Engine) removeSnapshotFile(ctx context.Context, path string) {
+func (e *Engine) removeSnapshotFile(ctx context.Context, path, reason string) {
 	removed, err := snapshot.RemoveSnapshotFile(path)
 	switch {
 	case err != nil:
@@ -592,7 +604,7 @@ func (e *Engine) removeSnapshotFile(ctx context.Context, path string) {
 	case removed:
 		e.cfg.Log.InfoContext(ctx, "bloodtrail: snapshot file invalidated",
 			slog.String("path", path),
-			slog.String("reason", "a write reached PostgreSQL without advancing the watermark"))
+			slog.String("reason", reason))
 	default:
 		// Nothing saved yet, or already gone. Either way there is no file
 		// a later boot could adopt.

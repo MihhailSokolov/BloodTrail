@@ -113,10 +113,12 @@ arguments you pass after `--`, and deletes it again. So every command -- `instal
 `install`. The CLI looks for `docker-compose.yml` in the current directory; pass
 `--compose-file` (and, if the project lives elsewhere, `--project-dir`) otherwise.
 
-The script refuses to run a download unless `checksums.txt` holds exactly one
-well-formed SHA-256 entry for the archive, and that entry matches. It runs the CLI from a
-temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is mounted
-`noexec`, set `TMPDIR` to a directory that allows running programs.
+The script refuses to run a download unless `checksums.txt` holds exactly one well-formed
+SHA-256 entry for the archive, and that entry matches. It runs the CLI from a temporary
+directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is mounted `noexec`, set
+`TMPDIR` to a directory that allows running programs. Each download is time-limited:
+15 seconds to connect, 10 minutes in all for the archive and 1 minute for `checksums.txt`.
+A stalled connection then ends with a message saying what to try, not a hang.
 
 - **Confirmation.** `install` and `rollback` show what they will change and ask first,
   reading the answer from the terminal; add `--yes` to run them unattended.
@@ -193,14 +195,19 @@ temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is m
   compose ignore `COMPOSE_FILE`, which boots the upstream image against a `bloodtrail`
   driver setting and fails; add `-f docker-compose.bloodtrail.yml` to those commands, or
   drop the explicit `-f` and let `.env` decide.
-- Writing that entry replaces docker compose's own file discovery, so the installer
-  writes out everything discovery would have found: the compose file it was given and,
-  when one sits beside it, the override file compose loads on its own (the first of
+- Writing that entry replaces docker compose's own file discovery, so the installer writes
+  out everything discovery would have found: the compose file it was given and, when one
+  sits beside it, the override file compose loads on its own (the first of
   `compose.override.yml`, `compose.override.yaml`, `docker-compose.override.yml` and
-  `docker-compose.override.yaml` that exists, whatever the compose file is called).
-  The entry it writes names its files relatively, so a project you used to run with
-  `docker compose --project-directory <dir>` from elsewhere then has to be run from its
-  own directory. Rollback removes the whole entry again when the install created it --
+  `docker-compose.override.yaml` that exists, whatever the compose file is called). The
+  entry it writes names its files relatively, and docker compose resolves a relative name
+  against the directory it is run from, even under `--project-directory`. A project you
+  used to run with `docker compose --project-directory <dir>` from another directory
+  therefore has to be run from its own directory afterwards: from anywhere else docker
+  compose looks for those names there, so it stops with an error if they are missing and
+  loads files of the same names if it finds some. To keep running it from anywhere, write
+  the entry's names as absolute paths yourself; rollback recognises its override under
+  either spelling. Rollback removes the whole entry again when the install created it --
   unless the entry has been changed since (a file added to it, say), in which case it
   takes out only its own override. With no entry, and a compose file under one of
   discovery's names in the directory, the compose file given has to be the one discovery
@@ -222,13 +229,14 @@ temporary directory under `TMPDIR` (default `/tmp`); on a host whose `/tmp` is m
   `COMPOSE_DISABLE_ENV_FILE` (which leave `.env` unread), or a `COMPOSE_DISABLE_ENV_FILE`
   that is not a boolean (on which docker compose stops with an error); or a `.env` the
   install has to change that this user cannot write. The message names what it found, and
-  usually what to change. `.env` is replaced atomically, keeping its mode and owner (and
-  a symbolic link), but not extended attributes, ACLs or a hard link to it, and a `.env`
-  that is itself a mount point cannot be replaced. `status`, `verify` and `rollback` read
-  the project more forgivingly (with several `COMPOSE_FILE` lines, the last wins, as in
-  docker compose), so they keep working on whatever an earlier install left behind; where
-  an earlier version wrote its override into an empty `COMPOSE_FILE=` entry, rollback
-  puts the empty entry back as it was.
+  usually what to change. `.env` is replaced atomically, keeping its mode and owner (and a
+  symbolic link), but not extended attributes or ACLs. A hard link to it is lost: the new
+  file takes the name and the other name keeps the old contents. A `.env` that is itself a
+  mount point cannot be replaced. `status`, `verify` and `rollback` read the project more
+  forgivingly (with several `COMPOSE_FILE` lines, the last wins, as in docker compose), so
+  they keep working on whatever an earlier install left behind; where an earlier version
+  wrote its override into an empty `COMPOSE_FILE=` entry, rollback puts the empty entry
+  back as it was.
 - **Rollback of installs made by v0.1.0 to v0.1.2** decides what to do with the
   `COMPOSE_FILE` entry from the copy of `.env` in the backup directory, since those
   versions did not record what they wrote: an entry that was there before the install
@@ -299,8 +307,8 @@ a large graph. Setting `BLOODTRAIL_SNAPSHOT_DIR` lets it reuse a saved copy inst
 - Point it at a directory on a **volume or bind mount that survives container
   recreation** (a config change followed by `docker compose up -d` recreates the
   container). The directory must already exist and be writable by the container;
-  nothing creates it, and a bad path only shows up later as `snapshot file write
-  failed`.
+  nothing creates it, and a bad path only shows up later as
+  `snapshot file write failed`.
 - The file is written on a graceful shutdown and after each background compaction, and
   reused at the next boot only if BloodTrail's write counter in PostgreSQL -- and the
   **lineage** it counts in, a random id kept beside it -- prove the file is complete.

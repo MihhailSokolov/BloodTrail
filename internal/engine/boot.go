@@ -580,8 +580,14 @@ func (e *Engine) tryLoadSnapshotFile(ctx context.Context) bool {
 
 // readSnapshotFile is tryLoadSnapshotFile's read of the whole file
 // (snapshot.ReadSnapshotFile), a variable only so that a test can make the
-// file-boot attempt panic.
+// file-boot attempt panic before applyMu is taken.
 var readSnapshotFile = snapshot.ReadSnapshotFile
+
+// warmSnapshotFile is adoptSnapshotFileAttempt's warm-up of the file-loaded
+// base (snapshot.Snapshot.Warm), a variable only so that a test can make the
+// file-boot attempt panic in the other window than readSnapshotFile's: with
+// applyMu held, after the replay and before the view is published.
+var warmSnapshotFile = (*snapshot.Snapshot).Warm
 
 // bootGapSettleTimeout and bootGapSettleRetryInterval pace the settle-wait
 // in adoptSnapshotFileView: how long an adoption may wait, in how fine a
@@ -851,7 +857,7 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 
 	// Build the derived read indexes now, on the write path, rather than
 	// leaving them for whichever query arrives first -- see Snapshot.Warm.
-	view.Base().Warm()
+	warmSnapshotFile(view.Base())
 	// The view accounts for every value up to the frozen target: the file
 	// through its stamp, the replay above it. The ledger learns that before
 	// the view is published -- nothing between here and the Store can refuse

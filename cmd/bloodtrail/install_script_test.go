@@ -27,6 +27,7 @@ type installScriptRun struct {
 	args   []string // what it was started with
 	path   string   // where it was started from
 	tmpdir string   // the TMPDIR the script was given
+	curls  []string // the arguments of each curl the script ran, one string per call
 }
 
 // installScriptAsset is the archive name the script asks for on this host.
@@ -85,6 +86,14 @@ func installScriptSHA256(archive []byte) string {
 // read, which it then really checks.
 func runInstallScript(t *testing.T, archive []byte, checksums string, args ...string) installScriptRun {
 	t.Helper()
+	return runInstallScriptWithCurl(t, archive, checksums, "", args...)
+}
+
+// runInstallScriptWithCurl is runInstallScript with curlPrelude, shell run
+// first by the fake curl (after it has recorded its arguments), which lets a
+// test make a download fail or stall.
+func runInstallScriptWithCurl(t *testing.T, archive []byte, checksums, curlPrelude string, args ...string) installScriptRun {
+	t.Helper()
 	asset := installScriptAsset(t)
 
 	hasher := ""
@@ -111,6 +120,8 @@ func runInstallScript(t *testing.T, archive []byte, checksums string, args ...st
 	}
 	curl := `#!/bin/sh
 # Serves the files of the fake release by the last segment of the URL.
+printf '%s\n' "$*" >> "$BLOODTRAIL_TEST_MARKER.curl"
+` + curlPrelude + `
 out=""
 url=""
 while [ $# -gt 0 ]; do
@@ -167,6 +178,9 @@ exec $HASHER "$@"
 	}
 	if data, readErr := os.ReadFile(marker + ".path"); readErr == nil {
 		run.path = strings.TrimSpace(string(data))
+	}
+	if data, readErr := os.ReadFile(marker + ".curl"); readErr == nil {
+		run.curls = strings.Split(strings.TrimSpace(string(data)), "\n")
 	}
 	return run
 }
@@ -291,5 +305,69 @@ func TestInstallScriptRunsTheBinaryFromTMPDIR(t *testing.T) {
 	// the path the binary ran from starts with it.
 	if !strings.HasPrefix(run.path, run.tmpdir+string(filepath.Separator)) {
 		t.Fatalf("the binary ran from %s, not from a directory of %s", run.path, run.tmpdir)
+	}
+}
+
+// TestInstallScriptBoundsEveryDownload pins that no download of the script can
+// hang. curl has no time limit of its own, so a connection that stalls -- a
+// proxy that accepts and never answers, a server that stops sending -- held the
+// install, run through `curl | sh`, forever with nothing said. Both downloads
+// carry a connect limit and a total limit, and the archive's is the longer.
+func TestInstallScriptBoundsEveryDownload(t *testing.T) {
+	asset := installScriptAsset(t)
+	archive := installScriptArchive(t)
+	run := runInstallScript(t, archive, installScriptSHA256(archive)+"  "+asset+"\n", "install", "--yes")
+	if run.err != nil || !run.ran {
+		t.Fatalf("the script did not run the binary (err %v):\n%s", run.err, run.stderr)
+	}
+	if len(run.curls) != 2 {
+		t.Fatalf("the script ran curl %d times, want one for the archive and one for checksums.txt:\n%s", len(run.curls), strings.Join(run.curls, "\n"))
+	}
+	maxTime := map[string]int{}
+	for _, call := range run.curls {
+		fields := strings.Fields(call)
+		limit := func(flag string) int {
+			for i, f := range fields {
+				if f == flag && i+1 < len(fields) {
+					n, err := strconv.Atoi(fields[i+1])
+					if err == nil && n > 0 {
+						return n
+					}
+				}
+			}
+			return 0
+		}
+		if limit("--connect-timeout") == 0 || limit("--max-time") == 0 {
+			t.Errorf("a download has no connect and total time limit: curl %s", call)
+		}
+		for _, f := range fields {
+			if strings.HasSuffix(f, "/"+asset) {
+				maxTime["archive"] = limit("--max-time")
+			}
+			if strings.HasSuffix(f, "/checksums.txt") {
+				maxTime["checksums"] = limit("--max-time")
+			}
+		}
+	}
+	if maxTime["archive"] <= maxTime["checksums"] {
+		t.Errorf("the archive's total limit (%ds) should be longer than the checksum file's (%ds): the archive is the big download", maxTime["archive"], maxTime["checksums"])
+	}
+}
+
+// TestInstallScriptSaysWhatToDoWhenADownloadFails covers a download that does
+// not finish -- curl exits 28 when its time limit passes -- on a host that the
+// script cannot tell more about: it stops without running anything, names what
+// it was fetching and says what to try, instead of ending on curl's own line.
+func TestInstallScriptSaysWhatToDoWhenADownloadFails(t *testing.T) {
+	asset := installScriptAsset(t)
+	archive := installScriptArchive(t)
+	run := runInstallScriptWithCurl(t, archive, installScriptSHA256(archive)+"  "+asset+"\n", "exit 28", "install", "--yes")
+	if run.err == nil || run.ran {
+		t.Fatalf("the script went on after a download failed (err %v, ran %v):\n%s", run.err, run.ran, run.stderr)
+	}
+	for _, want := range []string{asset, "github.com", "run this again"} {
+		if !strings.Contains(run.stderr, want) {
+			t.Errorf("stderr does not say %q:\n%s", want, run.stderr)
+		}
 	}
 }

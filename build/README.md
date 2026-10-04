@@ -48,8 +48,8 @@ upstream release -- including the weekly builds from `main`, so it can hold an u
 driver. A released installer therefore never falls back to it: when the tag for its own
 version is missing it stops and names both, and `--image <alias>` is the explicit way to
 accept the alias anyway. Only a source-built (`dev`) installer targets the alias by
-default, since it has no version of its own to pin. A leading `v` is stripped from the driver version, so the same
-string is stamped into `Version` and used in the image tag.
+default, since it has no version of its own to pin. A leading `v` is stripped from the
+driver version, so the same string is stamped into `Version` and used in the image tag.
 
 (Releases up to and including v0.1.0 resolve images under the package's original name,
 `ghcr.io/mihhailsokolov/bloodhound-bloodtrail`, which is no longer anonymously pullable
@@ -140,11 +140,11 @@ run against that same fixture, still installed, before rollback:
      (the marker's `replayed_writes` attribute counts them).
    - **superseded** -- `snapshot file rejected` for a boot-time write the replay could not
      account for (`reason` is `boot gap not covered by buffered writes` with PostgreSQL's
-     counter ahead of the file's, or `the engine entered fallback while the file was
-     loading` for a fallback-shaped write), followed by a successful rebuild. Rare but
-     correct -- the watermark protocol is refusing a file it cannot prove complete. See
-     the snapshot-file section of the top-level
-     [README](../README.md#fast-restarts-the-snapshot-directory).
+     counter ahead of the file's, or
+     `the engine entered fallback while the file was loading` for a fallback-shaped
+     write), followed by a successful rebuild. Rare but correct -- the watermark protocol
+     is refusing a file it cannot prove complete. See the snapshot-file section of the
+     top-level [README](../README.md#fast-restarts-the-snapshot-directory).
 
    Either way the boot must have read the file this phase's own shutdown wrote (compared by
    stamped watermark), and a rejection for a corrupt or wrong-version file, a changed
