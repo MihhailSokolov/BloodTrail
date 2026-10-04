@@ -422,8 +422,9 @@ without `s <> t`, whether PostgreSQL raises its shared-endpoint error can depend
 query plan, so on some plans PostgreSQL fails a query BloodTrail answers (where both
 answer, the answers agree); and an objectid-keyed edge upsert whose endpoint node the
 replica has not applied yet, and whose objectid another writer re-keys before the upsert
-is applied, leaves that node and its edge out of the replica until a later write names
-them or a reload (an endpoint the replica already holds is followed through the re-key).
+is applied, costs a reload rather than a missing row -- except when the upsert's own batch
+later failed, where its edge stays out of the replica until a later write names it or a
+reload (an endpoint the replica already holds is followed through the re-key either way).
 
 Out of scope today: interpreting mutating Cypher and arbitrary update/delete criteria
 (both trigger a fallback rebuild), cache coherence across more than one BloodTrail

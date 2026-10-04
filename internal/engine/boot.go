@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/MihhailSokolov/BloodTrail/internal/engine/snapshot"
@@ -874,6 +875,16 @@ func (e *Engine) adoptSnapshotFileAttempt(ctx context.Context, snap *snapshot.Sn
 		rb, err := e.readBack(ctx, view, entry.cs)
 		if err != nil {
 			reject("boot write replay failed", slog.Any("error", err))
+			return 0, adoptAttemptRejected, 0
+		}
+		// A fallback read-back recorded on the way (readBack's "The one
+		// fallback this records") rejects the file, as every other doubt
+		// does: the buffer's own observe already poisoned anything that
+		// arrived carrying a fallback, so a fallback here is one this replay
+		// just learned about, and a view published without it would be
+		// missing a committed row while this process served from it.
+		if hasFallback, reasons := entry.cs.HasFallback(); hasFallback {
+			reject("boot write replay cannot be expressed as a delta: " + strings.Join(reasons, "; "))
 			return 0, adoptAttemptRejected, 0
 		}
 		seg, err := buildApplySegment(view, rb)

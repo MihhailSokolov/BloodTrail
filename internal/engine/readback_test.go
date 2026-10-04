@@ -214,3 +214,61 @@ func TestResolveKindIDsSkipsNilKinds(t *testing.T) {
 		t.Fatalf("resolveKindIDs(nil only) = %v, want empty", got)
 	}
 }
+
+// TestRekeyedTripleKeysReportsEndpointsItCannotName covers both halves of
+// rekeyedTripleKeys' answer: the keys worth querying for an endpoint the
+// View still names under its old objectid, and the COUNT of deferred
+// triples whose endpoint is named by neither PostgreSQL's objectid lookup
+// nor the View -- the count readBack turns into a fallback for a write that
+// committed cleanly, rather than skipping the triple and leaving a
+// committed edge out of the replica.
+func TestRekeyedTripleKeysReportsEndpointsItCannotName(t *testing.T) {
+	adminTo := graph.StringKind("AdminTo")
+	kinds := map[string]int16{"AdminTo": applyKindAdminTo}
+
+	cases := []struct {
+		name           string
+		deferred       []EdgeTripleOIDRef
+		wantKeys       []edgeKey
+		wantUnresolved int
+	}{
+		{
+			name:     "the View names both endpoints under their old objectid",
+			deferred: []EdgeTripleOIDRef{{StartOID: "oid-1", EndOID: "oid-1", Kind: adminTo}},
+			wantKeys: []edgeKey{{start: 1, end: 1, kind: applyKindAdminTo}},
+		},
+		{
+			name:           "one endpoint is named by neither the lookup nor the View",
+			deferred:       []EdgeTripleOIDRef{{StartOID: "oid-gone", EndOID: "oid-1", Kind: adminTo}},
+			wantUnresolved: 1,
+		},
+		{
+			name: "a triple whose endpoint resolves does not excuse one that does not",
+			deferred: []EdgeTripleOIDRef{
+				{StartOID: "oid-1", EndOID: "oid-1", Kind: adminTo},
+				{StartOID: "oid-1", EndOID: "oid-gone", Kind: adminTo},
+			},
+			wantKeys:       []edgeKey{{start: 1, end: 1, kind: applyKindAdminTo}},
+			wantUnresolved: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view := buildApplyView(t)
+			// Node 1 is the fixture's only node carrying an objectid, and
+			// the candidate re-read found it present.
+			nodesByID := map[uint64]nodeState{1: {id: 1}}
+
+			keys, unresolved := rekeyedTripleKeys(view, nodesByID, nil, kinds, tc.deferred,
+				map[edgeKey]struct{}{}, map[tripleKey]struct{}{})
+
+			if !reflect.DeepEqual(keys, tc.wantKeys) {
+				t.Fatalf("rekeyedTripleKeys keys = %+v, want %+v", keys, tc.wantKeys)
+			}
+			if unresolved != tc.wantUnresolved {
+				t.Fatalf("rekeyedTripleKeys unresolved = %d, want %d", unresolved, tc.wantUnresolved)
+			}
+		})
+	}
+}

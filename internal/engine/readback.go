@@ -28,6 +28,14 @@ const readbackNodeIDChunk = 50_000
 // variable-length string rather than a fixed-width integer.
 const readbackObjectIDChunk = 5_000
 
+// unresolvableOIDEndpointFallback is the ChangeSet fallback reason readBack
+// records for a cleanly committed write one of whose objectid-keyed edge
+// endpoints is named by neither PostgreSQL's objectid lookup nor the View --
+// step 5's one condition the engine cannot name its way out of (see
+// readBack's own doc, and rekeyedTripleKeys' unresolved count). It carries
+// no objectid value: a fallback reason reaches enterFallback's log line.
+const unresolvableOIDEndpointFallback = "read-back: an objectid-keyed edge endpoint of a clean commit resolves to no node"
+
 // unresolvedTripleKind marks an absentTriples entry whose kind name never
 // resolved to a KindID at all -- the same sentinel dawgs' own
 // SchemaManager.MapKind returns (drivers/pg/manager.go) for a kind it does
@@ -148,7 +156,10 @@ type readbackResult struct {
 //     objectid to, so the triple is queried for those ids
 //     (rekeyedTripleKeys) rather than left to a later write or a rebuild;
 //     an endpoint that really is gone takes the edge with it through its own
-//     tombstone's cascade.
+//     tombstone's cascade. An endpoint named by neither (2) nor the View is
+//     the one case neither answer fits, and it is where this method records
+//     a fallback of its own ON cs -- see "The one fallback this records"
+//     below.
 //
 // Then the candidates (viewCandidates): the View rows cs's write may have
 // removed without naming them by key -- every node or edge a kind-scoped
@@ -166,7 +177,11 @@ type readbackResult struct {
 // for any view doesn't know (resolveCriteriaKinds, whose results also join
 // resolvedKinds); an exclusion that resolves nowhere is an error (see
 // viewCandidates.addNodeKindCriteria). A nil view -- only ever a test's --
-// has no candidates, and so leaves (5)'s held-back triples unresolved.
+// has no candidates, and so leaves (5)'s held-back triples unresolved,
+// without the fallback described below: the second pass never runs for it at
+// all. No caller in the engine passes one; Apply returns before this method
+// when it has no View to layer onto, and the boot replay always has the
+// file's own.
 //
 // Finally, every kind id encountered in a returned node or edge row is
 // checked against view (a nil view treats every kind id as unknown). Any id
@@ -181,6 +196,35 @@ type readbackResult struct {
 //
 // Every kind lookup here goes through a kindCatalog over the same write-path
 // pool, never dawgs' KindMapper: see that type's own doc.
+//
+// # The one fallback this records
+//
+// This method MUTATES cs in exactly one case, and every caller must re-check
+// cs.HasFallback() after it returns: an objectid-keyed triple from (5) whose
+// endpoint is named by neither (2) nor view (rekeyedTripleKeys' unresolved
+// count) records unresolvableOIDEndpointFallback, provided cs does not say
+// the write failed (cs.WriteIncomplete()).
+//
+// The split is the whole of it. An objectid-keyed upsert that COMMITTED
+// CLEANLY provably created-or-updated its endpoint node, so that node existed
+// at commit; an objectid matching nothing here therefore means it was either
+// deleted since (benign -- the cascade takes the edge) or re-keyed since (the
+// edge exists and cannot be named from here). Those two are indistinguishable
+// from inside the engine, so the only sound response is to fail CLOSED and
+// let the resync reload what PostgreSQL holds -- exactly as this method
+// already does for an unresolvable kind id (see "its only sound response is
+// to fall back to a full resync" above).
+//
+// For a write that returned an ERROR, an unresolvable objectid is the
+// EXPECTED, BENIGN outcome: the node was never created. Driver.BatchOperation
+// deliberately applies even when the batch failed (a batch's chunks are
+// durable as they flush), so failed ingest batches DO reach this code, and
+// falling back for them would mean a full rebuild after every failed ingest
+// batch carrying relationship upserts. Those are skipped, as they always
+// were -- which leaves one narrowed residual: a triple that committed
+// cleanly inside a batch that later failed is skipped with the rest, so a
+// re-key racing it still costs a missing row until a later write names it or
+// a rebuild loads it.
 func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSet) (*readbackResult, error) {
 	graphModel, ok := e.pgDriver.DefaultGraph()
 	if !ok {
@@ -341,7 +385,10 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 		// candidate re-read has settled which of their endpoints were only
 		// re-keyed. One more batch pass, only ever reached by a write that
 		// raced a re-key of one of its own endpoints.
-		rekeyed := rekeyedTripleKeys(view, nodesByID, oidToIDs, resolvedTripleKinds, deferredOIDTriples, pending, absentTriples)
+		rekeyed, unresolved := rekeyedTripleKeys(view, nodesByID, oidToIDs, resolvedTripleKinds, deferredOIDTriples, pending, absentTriples)
+		if incomplete, _ := cs.WriteIncomplete(); unresolved > 0 && !incomplete {
+			cs.RecordFallback(unresolvableOIDEndpointFallback)
+		}
 		foundRekeyed, err := readBackEdgesByTriple(ctx, pool, graphID, rekeyed)
 		if err != nil {
 			return nil, err
@@ -380,7 +427,8 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 // held back -- those with an endpoint objectid that matched no row -- into
 // the (start, end, kind) keys still worth querying, once the candidate
 // re-read has answered what became of the nodes view knew under each of
-// those objectids.
+// those objectids, plus a count of the deferred triples it could not name an
+// endpoint of at all (see unresolved below).
 //
 // An objectid matching no row does not mean its node is gone. A node whose
 // objectid was rewritten keeps its id, its row and its edges, so it
@@ -395,19 +443,21 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 //
 // An endpoint whose nodes all re-read ABSENT needs nothing: deleting a node
 // deletes its edges, and the cascade of its own tombstone (buildApplySegment)
-// takes the edge with it. So does an objectid view never knew anything
-// under, which is what a write that never landed looks like from here -- and
-// also the one residual this leaves. The condition for it is exactly
-// "named by neither pg's objectid lookup nor the View": an endpoint node
-// this process has not applied yet, whose objectid another writer has
-// already re-keyed. The upsert's own newly created endpoint is one way to
-// be in that state; so is an endpoint another write of this process created
-// whose Apply has not run (applies run in the order their calls finish, not
-// the order their writes committed -- the same premise that makes a pending
-// delta edge possible at all, snapshot.FoldWithPendingEdges). Either way
-// neither the node nor its edge can be resolved from here, which costs a
-// false negative (a missing row), never a wrong one, and takes a re-key
-// racing a node this replica has never seen.
+// takes the edge with it.
+//
+// unresolved counts the remaining case: a triple with an endpoint named by
+// NEITHER pg's objectid lookup NOR the View -- an endpoint node this process
+// has not applied yet, whose objectid another writer has already re-keyed
+// (the upsert's own newly created endpoint is one way to be in that state;
+// so is an endpoint another write of this process created whose Apply has
+// not run, since applies run in the order their calls finish, not the order
+// their writes committed -- the same premise that makes a pending delta edge
+// possible at all, snapshot.FoldWithPendingEdges). Neither the node nor its
+// edge can be named from here, so such a triple contributes no key and is
+// counted instead: readBack turns a nonzero count into a ChangeSet fallback
+// for a write that completed cleanly, and skips it for one that did not --
+// see readBack's own doc for why the two differ. This function makes neither
+// judgment; it only reports the count.
 //
 // Keys already queried in the first pass (pending) are skipped; a triple
 // whose kind never resolved to a KindID joins absentTriples under the
@@ -415,9 +465,9 @@ func (e *Engine) readBack(ctx context.Context, view *snapshot.View, cs *ChangeSe
 // Both maps are read and written in place.
 func rekeyedTripleKeys(view *snapshot.View, nodesByID map[uint64]nodeState, oidToIDs map[string][]uint64,
 	resolvedTripleKinds map[string]int16, deferred []EdgeTripleOIDRef,
-	pending map[edgeKey]struct{}, absentTriples map[tripleKey]struct{}) []edgeKey {
+	pending map[edgeKey]struct{}, absentTriples map[tripleKey]struct{}) (keys []edgeKey, unresolved int) {
 	if len(deferred) == 0 {
-		return nil
+		return nil, 0
 	}
 
 	resolve := func(objectID string) []uint64 {
@@ -427,11 +477,11 @@ func rekeyedTripleKeys(view *snapshot.View, nodesByID map[uint64]nodeState, oidT
 		return rekeyedEndpointIDs(view, nodesByID, objectID)
 	}
 
-	var keys []edgeKey
 	seen := make(map[edgeKey]struct{})
 	for _, t := range deferred {
 		startIDs, endIDs := resolve(t.StartOID), resolve(t.EndOID)
 		if len(startIDs) == 0 || len(endIDs) == 0 {
+			unresolved++
 			continue
 		}
 
@@ -454,7 +504,7 @@ func rekeyedTripleKeys(view *snapshot.View, nodesByID map[uint64]nodeState, oidT
 			}
 		}
 	}
-	return keys
+	return keys, unresolved
 }
 
 // rekeyedEndpointIDs returns the database ids of the nodes view knows under

@@ -232,6 +232,15 @@ func (e *Engine) Apply(ctx context.Context, scope *WriteScope) {
 		e.enterFallback(ctx, fmt.Sprintf("read-back failed: %v", err))
 		return
 	}
+	// Read-back can record a fallback of its own, for the one key shape it
+	// cannot name and must not skip (readBack's "The one fallback this
+	// records"). Re-checked here rather than folded into the error above
+	// because it is not a failure: the queries all succeeded, and what they
+	// came back with is simply not expressible as a delta.
+	if hasFallback, reasons := cs.HasFallback(); hasFallback {
+		e.enterFallback(ctx, strings.Join(reasons, "; "))
+		return
+	}
 
 	seg, err := buildApplySegment(current, rb)
 	if err != nil {
