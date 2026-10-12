@@ -484,9 +484,10 @@ CLI installs it only once a BloodTrail release has published its
 `<upstream>-bt<version>` image; until then `--image <upstream>` selects the alias, which
 may be an unreleased build. The validation levels differ, deliberately:
 
-- **v9.6.0** is the tag CI validates most deeply: the full install-and-rollback e2e
-  runs against it on every change, alongside the patch-application guard.
-- **Newer tags** (v9.7.0 was verified end to end by hand on 2026-09-12) get the
+- **v9.6.0** and the **newest supported tag** (v9.8.0 today) are the tags CI validates
+  most deeply: the full install-and-rollback e2e runs against both on every change,
+  alongside the patch-application guard.
+- **Tags in between** (v9.7.0 was verified end to end by hand on 2026-09-12) get the
   patch-application guard in CI and are gated at image-build time -- the patch must
   apply cleanly and the patched server must compile, or no image is published -- but
   no automated e2e runs against them per change. A behavioral break upstream could in

@@ -8,27 +8,61 @@ on:
 permissions:
   contents: read
 jobs:
+  # The oldest and the newest supported upstream release, from the same derived
+  # list ci.yml and the image workflows use (build/upstream-tags.sh, sorted
+  # oldest first). The oldest, v9.6.0, is the release the test was written
+  # against. The newest is there because nothing else runs a newer release end
+  # to end: the patch guard only applies the patch, and the dawgs job runs the
+  # suites, not the product. v9.8.0 brought dawgs v0.9.0, which binds every
+  # string literal of its SQL as a parameter, and the suites' PostgreSQL
+  # differentials compare only the answers the engine chooses to serve, so they
+  # cannot see a wrong one served (WHITEPAPER.md, section 16.3). This test
+  # checks answers it knows in advance.
+  upstreams:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tags: ${{ steps.pick.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      # Assigned before it is echoed, as in ci.yml: a failing upstream-tags.sh
+      # must fail this step, not hand the matrix an empty list.
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(./build/upstream-tags.sh | jq -c '[first, last] | unique')
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
   install-and-rollback:
+    needs: upstreams
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      # One release's failure must not cancel the other's run: each says
+      # something the other cannot.
+      fail-fast: false
+      matrix:
+        upstream: ${{ fromJson(needs.upstreams.outputs.tags) }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - uses: docker/setup-buildx-action@v3
-      - run: ./build/e2e.sh v9.6.0
+      - run: ./build/e2e.sh "$UPSTREAM"
+        env:
+          UPSTREAM: ${{ matrix.upstream }}
       - name: Collect logs on failure
         if: failure()
         run: docker compose --project-directory .build/e2e -f .build/e2e/docker-compose.yml logs --no-color > e2e-logs.txt || true
       - uses: actions/upload-artifact@v4
         if: failure()
-        with: { name: e2e-logs, path: e2e-logs.txt }
+        with: { name: "e2e-logs-${{ matrix.upstream }}", path: e2e-logs.txt }
   # The check the branch ruleset should require for this workflow: see ci-ok in
   # ci.yml for why it is a job of its own that runs whatever the others did.
   e2e-ok:
     if: always()
-    needs: [install-and-rollback]
+    needs: [upstreams, install-and-rollback]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

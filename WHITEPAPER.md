@@ -3358,7 +3358,8 @@ it compares. Two episodes show the limits:
   unnoticed until v0.1.2 added mixed-type fixtures and a type-aware aggregate comparison.
 
 The **end-to-end test** ([`build/e2e.sh`](build/e2e.sh), run in CI on every change against
-BloodHound v9.6.0) builds the real image, starts BloodHound's own example Compose setup on Neo4j,
+BloodHound v9.6.0 and against the newest supported release) builds the real image, starts
+BloodHound's own example Compose setup on Neo4j,
 installs BloodTrail with the installer (migration included), uploads a small fictional domain, lets
 analysis run, and then checks, through BloodHound's HTTP API and the container logs, that:
 
@@ -3623,15 +3624,16 @@ v9.7.1 and v9.8.0 at the time of writing). The same list drives:
 
 CI also runs the unit and integration suites with the race detector, the linter over all the code
 (the integration-tagged test code included), the tests of the benchmark and build scripts, and the
-full end-to-end install-and-rollback test, OpenGraph phase included, against v9.6.0
-([§16.3](#163-the-blind-spot-and-the-end-to-end-test)). A `dawgs` job resolves every supported
+full end-to-end install-and-rollback test, OpenGraph phase included, against the oldest and the
+newest supported release (v9.6.0 and v9.8.0 today;
+[§16.3](#163-the-blind-spot-and-the-end-to-end-test)). A `dawgs` job resolves every supported
 release with `build-image.sh --dawgs-only` and runs the unit and integration suites against each
 DAWGS version they resolve to other than the one in `go.mod` (`build/dawgs-suites.sh`; v0.8.1 for
-v9.7.1 and v0.9.0 for v9.8.0, today). Newer releases otherwise get only the patch guard on each
-change; their images are compiled, patch applied, by the release and weekly workflows, and no
-end-to-end run covers them. The two workflows that run on pull requests, `ci.yml` and `e2e.yml`,
-each end in one aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before it
-succeeded, so that a branch rule can require those two checks by name.
+v9.7.1 and v0.9.0 for v9.8.0, today). The releases in between otherwise get only the patch guard
+on each change; their images are compiled, patch applied, by the release and weekly workflows, and
+no end-to-end run covers them. The two workflows that run on pull requests, `ci.yml` and
+`e2e.yml`, each end in one aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before
+it succeeded, so that a branch rule can require those two checks by name.
 
 ### 18.3 The installer
 

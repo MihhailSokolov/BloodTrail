@@ -42,8 +42,9 @@ sufficient:
   image would ship and runs the unit and integration suites against every one other
   than `go.mod`'s, failing for a version that is neither `go.mod`'s nor listed as tested
   in `build/build-image.sh`.
-- `e2e.yml` builds the patched image and runs `build/e2e.sh v9.6.0`, the full
-  install/verify/rollback cycle against a live compose stack (needs Docker; see
+- `e2e.yml` builds the patched image and runs `build/e2e.sh`, the full
+  install/verify/rollback cycle against a live compose stack, for the oldest and the
+  newest supported upstream release (v9.6.0 and, today, v9.8.0; needs Docker; see
   [build/README.md](build/README.md#end-to-end-test)).
 - The two workflows that run on pull requests, `ci.yml` and `e2e.yml`, each end in an
   aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before it succeeded;
