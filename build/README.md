@@ -21,16 +21,16 @@ prints the version upstream pins and the one the image resolves, and fails the b
 differ unless that exact pair is listed, with the reason, in `dawgs_shift_reason` in
 `build-image.sh` (v9.6.0: v0.7.0 to v0.8.0 is the only entry). It also fails for a resolved
 version that is neither the one `go.mod` names nor in `dawgs_tested_versions`, the versions the
-unit and integration suites are run against (v0.8.0 and v0.8.1 today). The release and weekly
-image workflows run this script for every supported release and run no suite themselves, so a
-new upstream release that pins a dawgs nobody has tried (a v9.8.0 pinning v0.9.0, say) would
-otherwise publish an image before any suite ran on it, which is how v9.7.1's image came to ship
-v0.8.1 while `go.mod` said v0.8.0. Such a build now fails, and so does `ci.yml`'s `dawgs` job
-(`build/dawgs-suites.sh`, which resolves every supported release the same way), until the version
-is listed; that same job then runs the suites against it, as it already does against v0.8.1, and
-the change should merge only if they pass. `--dawgs-only` stops after these checks and prints the
-resolved version. `build/test-build-image.sh` tests both scripts against stand-ins for git, go and
-docker.
+unit and integration suites are run against (v0.8.0, v0.8.1 and v0.9.0 today). The release and
+weekly image workflows run this script for every supported release and run no suite themselves,
+so a new upstream release that pins a dawgs nobody has tried would otherwise publish an image
+before any suite ran on it, which is how v9.7.1's image came to ship v0.8.1 while `go.mod` said
+v0.8.0. Such a build now fails (v9.8.0's did, on v0.9.0, until it was listed), and so does
+`ci.yml`'s `dawgs` job (`build/dawgs-suites.sh`, which resolves every supported release the same
+way), until the version is listed; that same job then runs the suites against it, as it already
+does against v0.8.1 and v0.9.0, and the change should merge only if they pass. `--dawgs-only`
+stops after these checks and prints the resolved version. `build/test-build-image.sh` tests both
+scripts against stand-ins for git, go and docker.
 
 Vendoring copies the driver's root Go files plus `internal/engine` -- the in-memory path
 engine -- into `packages/go/bloodtrail`, which the upstream Dockerfile's builder stage already
