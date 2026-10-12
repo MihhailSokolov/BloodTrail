@@ -3595,9 +3595,10 @@ after an early run in which a declined query kept PostgreSQL busy for 17.5 hours
    resolves, and fails unless they are equal or that exact (release, pinned, resolved) triple is
    listed with its reason in `dawgs_shift_reason` (v9.6.0, v0.7.0 to v0.8.0, is the only entry),
    and unless the resolved version is the one BloodTrail's own `go.mod` names or one listed in
-   `dawgs_tested_versions`, the versions the suites run against (v0.8.0 and v0.8.1 today). An
-   image therefore never silently ships a DAWGS that no suite has run against, as the v9.7.1 image
-   once did (v0.8.1). `--dawgs-only` stops after this check and prints the resolved version;
+   `dawgs_tested_versions`, the versions the suites run against (v0.8.0, v0.8.1 and v0.9.0
+   today). An image therefore never silently ships a DAWGS that no suite has run against, as the
+   v9.7.1 image once did (v0.8.1). `--dawgs-only` stops after this check and prints the resolved
+   version;
 5. compiles the API server once as a quick check;
 6. builds the image with BloodHound's own Dockerfile, for the host's platform in a local build (a
    pushed build defaults to `linux/amd64`; releases build both `linux/amd64` and `linux/arm64`).
@@ -3611,8 +3612,8 @@ and names the alias, which `--image` can select explicitly.
 ### 18.2 Supported versions and CI
 
 The supported BloodHound versions are every stable release from **v9.6.0** on, derived from
-upstream's own release list by [`build/upstream-tags.sh`](build/upstream-tags.sh) (v9.6.0, v9.7.0
-and v9.7.1 at the time of writing). The same list drives:
+upstream's own release list by [`build/upstream-tags.sh`](build/upstream-tags.sh) (v9.6.0, v9.7.0,
+v9.7.1 and v9.8.0 at the time of writing). The same list drives:
 
 - the CI patch guard, which checks on every change that the patch still applies to each supported
   release;
@@ -3625,12 +3626,12 @@ CI also runs the unit and integration suites with the race detector, the linter 
 full end-to-end install-and-rollback test, OpenGraph phase included, against v9.6.0
 ([§16.3](#163-the-blind-spot-and-the-end-to-end-test)). A `dawgs` job resolves every supported
 release with `build-image.sh --dawgs-only` and runs the unit and integration suites against each
-DAWGS version they resolve to other than the one in `go.mod` (`build/dawgs-suites.sh`; v0.8.1, for
-v9.7.1, today). Newer releases otherwise get only the patch guard on each change; their images are
-compiled, patch applied, by the release and weekly workflows, and no end-to-end run covers them. The
-two workflows that run on pull requests, `ci.yml` and `e2e.yml`, each end in one aggregate job,
-`ci-ok` and `e2e-ok`, that fails unless every job before it succeeded, so that a branch rule can
-require those two checks by name.
+DAWGS version they resolve to other than the one in `go.mod` (`build/dawgs-suites.sh`; v0.8.1 for
+v9.7.1 and v0.9.0 for v9.8.0, today). Newer releases otherwise get only the patch guard on each
+change; their images are compiled, patch applied, by the release and weekly workflows, and no
+end-to-end run covers them. The two workflows that run on pull requests, `ci.yml` and `e2e.yml`,
+each end in one aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before it
+succeeded, so that a branch rule can require those two checks by name.
 
 ### 18.3 The installer
 

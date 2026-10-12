@@ -470,8 +470,9 @@ a quarter more ingest time ([BENCHMARK.md](BENCHMARK.md#opengraph), [bench/oggen
 Developed and continuously validated against `github.com/specterops/bloodhound`
 **v9.6.0** and `github.com/specterops/dawgs` `v0.8.0` (`0ea9646`). CI also runs the unit
 and integration suites against every other dawgs version a supported BloodHound release
-resolves to in its image (v0.8.1 today, for v9.7.1), and an image build fails when a
-release would ship a dawgs version that is neither of those nor listed as tested.
+resolves to in its image (v0.8.1 for v9.7.1 and v0.9.0 for v9.8.0 today), and an image
+build fails when a release would ship a dawgs version that is neither of those nor listed
+as tested.
 
 **Supported upstream tags** are every stable BloodHound CE release from **v9.6.0** on
 -- derived from upstream's own release list by `build/upstream-tags.sh`, not written

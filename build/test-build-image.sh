@@ -117,28 +117,37 @@ echo "build-image.sh, a listed tag with another pair (v9.6.0: v0.7.0 -> v0.8.1)"
 run_build v9.6.0 v0.7.0 v0.8.1
 expect "the build fails (the allow-list is per pair, not per tag)" test "$CODE" -ne 0
 
-echo "build-image.sh, a new release pins a dawgs no suite has run against (v9.8.0: pins and resolves v0.9.0)"
+echo "build-image.sh, upstream pins a listed dawgs that go.mod does not name (v9.8.0: v0.9.0)"
 run_build v9.8.0 v0.9.0 v0.9.0
+expect "the build goes ahead" test "$CODE" -eq 0
+expect "it says what upstream pins and what the image resolves" printed "$ROOT/out" "upstream v9.8.0 pins v0.9.0; the image resolves v0.9.0"
+expect "the image build ran" logged "docker buildx build"
+
+# The versions below, v9.99.0 and v0.99.x, stand for a release nobody has
+# tried yet. They used to be v9.8.0 and v0.9.0, until v9.8.0 shipped pinning
+# v0.9.0 and the list caught up with them.
+echo "build-image.sh, a new release pins a dawgs no suite has run against (v9.99.0: pins and resolves v0.99.0)"
+run_build v9.99.0 v0.99.0 v0.99.0
 expect "the build fails" test "$CODE" -ne 0
-expect "the error names the version and the release" printed "$ROOT/err" "would ship dawgs v0.9.0 (upstream v9.8.0 pins v0.9.0)"
+expect "the error names the version and the release" printed "$ROOT/err" "would ship dawgs v0.99.0 (upstream v9.99.0 pins v0.99.0)"
 expect "the error says where to list it" printed "$ROOT/err" "dawgs_tested_versions in build/build-image.sh"
 expect "no Go build ran" not_logged "go build"
 expect "no image was built" not_logged "docker buildx build"
 
-echo "build-image.sh, the repository's own dawgs needs no listing (its go.mod names v0.9.0)"
-OWN_DAWGS=v0.9.0 run_build v9.8.0 v0.9.0 v0.9.0
+echo "build-image.sh, the repository's own dawgs needs no listing (its go.mod names v0.99.0)"
+OWN_DAWGS=v0.99.0 run_build v9.99.0 v0.99.0 v0.99.0
 expect "the build goes ahead" test "$CODE" -eq 0
 expect "the image build ran" logged "docker buildx build"
 
 # This was labelled "a listed shift onto a version no suite has run against",
 # which it never was: dawgs_shift_reason is keyed on the whole triple, and only
-# "v9.6.0 v0.7.0 v0.8.0" is in it, so v0.7.0 -> v0.9.0 is an UNLISTED shift and
+# "v9.6.0 v0.7.0 v0.8.0" is in it, so v0.7.0 -> v0.99.0 is an UNLISTED shift and
 # never reaches the tested-versions check at all. What it can honestly pin is
 # the order of the two checks, which is worth pinning: the shift is the earlier
-# gate, and an operator told to add v0.9.0 to dawgs_tested_versions when the
+# gate, and an operator told to add v0.99.0 to dawgs_tested_versions when the
 # real problem is a pin nobody vouched for would be sent the wrong way.
-echo "build-image.sh, an unlisted shift onto an untested version fails on the shift (v9.6.0: v0.7.0 -> v0.9.0)"
-OWN_DAWGS=v0.8.0 run_build v9.6.0 v0.7.0 v0.9.0
+echo "build-image.sh, an unlisted shift onto an untested version fails on the shift (v9.6.0: v0.7.0 -> v0.99.0)"
+OWN_DAWGS=v0.8.0 run_build v9.6.0 v0.7.0 v0.99.0
 expect "the build fails" test "$CODE" -ne 0
 expect "it is the shift check that fires" printed "$ROOT/err" "dawgs_shift_reason in build/build-image.sh"
 expect "and not the tested-versions check" not_printed "$ROOT/err" "dawgs_tested_versions"
@@ -146,14 +155,14 @@ expect "and not the tested-versions check" not_printed "$ROOT/err" "dawgs_tested
 # The tested-versions check, reached with no shift in the way (upstream's pin
 # and the resolved version agree, as they do from v9.7.0 on) and with the
 # repository's own dawgs deliberately set to a THIRD version. The case above it
-# shows OWN_DAWGS=v0.9.0 accepting v0.9.0; without this one, nothing says that
+# shows OWN_DAWGS=v0.99.0 accepting v0.99.0; without this one, nothing says that
 # acceptance came from the resolved version equalling go.mod's rather than from
 # OWN_DAWGS merely being set to something off the tested list.
-echo "build-image.sh, an untested version is refused however go.mod's own dawgs differs (v9.8.0: v0.9.0, go.mod v0.9.1)"
-OWN_DAWGS=v0.9.1 run_build v9.8.0 v0.9.0 v0.9.0
+echo "build-image.sh, an untested version is refused however go.mod's own dawgs differs (v9.99.0: v0.99.0, go.mod v0.99.1)"
+OWN_DAWGS=v0.99.1 run_build v9.99.0 v0.99.0 v0.99.0
 expect "the build fails" test "$CODE" -ne 0
 expect "it is the tested-versions check that fires" printed "$ROOT/err" "dawgs_tested_versions in build/build-image.sh"
-expect "the error names the repository's own version as one of the tested ones" printed "$ROOT/err" "suites run against v0.9.1"
+expect "the error names the repository's own version as one of the tested ones" printed "$ROOT/err" "suites run against v0.99.1"
 expect "no Go build ran" not_logged "go build"
 expect "no image was built" not_logged "docker buildx build"
 
@@ -176,7 +185,7 @@ expect "Docker was not asked" not_logged "docker"
 run_build v9.7.0 v0.8.0 v0.8.1 --dawgs-only
 expect "an unlisted shift fails" test "$CODE" -ne 0
 expect "and prints no version" test ! -s "$ROOT/out"
-run_build v9.8.0 v0.9.0 v0.9.0 --dawgs-only
+run_build v9.99.0 v0.99.0 v0.99.0 --dawgs-only
 expect "a dawgs no suite has run against fails" test "$CODE" -ne 0
 expect "and prints no version" test ! -s "$ROOT/out"
 
@@ -263,16 +272,22 @@ run_suites_for_real() {
   touch "$ROOT/log"
 }
 
-echo "dawgs-suites.sh with the real build-image.sh, a new release pins a dawgs no suite has run against (v9.8.0: v0.9.0)"
-run_suites_for_real '["v9.8.0"]' v0.9.0 v0.9.0
+echo "dawgs-suites.sh with the real build-image.sh, a new release pins a dawgs no suite has run against (v9.99.0: v0.99.0)"
+run_suites_for_real '["v9.99.0"]' v0.99.0 v0.99.0
 expect "the job fails" test "$CODE" -ne 0
-expect "the reason reaches the log" printed "$ROOT/err" "would ship dawgs v0.9.0 (upstream v9.8.0 pins v0.9.0)"
+expect "the reason reaches the log" printed "$ROOT/err" "would ship dawgs v0.99.0 (upstream v9.99.0 pins v0.99.0)"
 expect "no suite ran" test "$(count '^go test ')" -eq 0
 
 echo "dawgs-suites.sh with the real build-image.sh, a release that pins a listed dawgs (v9.7.1: v0.8.1)"
 run_suites_for_real '["v9.7.1"]' v0.8.1 v0.8.1
 expect "the job succeeds" test "$CODE" -eq 0
 expect "it runs the suites against v0.8.1" logged "^go get github.com/specterops/dawgs@v0.8.1$"
+expect "and restores go.mod" logged "^git checkout -- go.mod go.sum$"
+
+echo "dawgs-suites.sh with the real build-image.sh, a release that pins a listed dawgs (v9.8.0: v0.9.0)"
+run_suites_for_real '["v9.8.0"]' v0.9.0 v0.9.0
+expect "the job succeeds" test "$CODE" -eq 0
+expect "it runs the suites against v0.9.0" logged "^go get github.com/specterops/dawgs@v0.9.0$"
 expect "and restores go.mod" logged "^git checkout -- go.mod go.sum$"
 
 echo "dawgs-suites.sh, the tag list is not a non-empty JSON array of strings"

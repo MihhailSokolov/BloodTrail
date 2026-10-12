@@ -97,9 +97,10 @@ dawgs_shift_reason() {
 # them against on every change and which is always accepted). An image is built
 # only on one of these. The release workflow and the weekly alias build run this
 # script for every supported upstream release and run no suite themselves, so
-# without this list a new release that pins a dawgs nobody has tried (a v9.8.0
-# pinning v0.9.0, say) would publish an image before any suite ran on it, which
-# is how v9.7.1's image shipped v0.8.1 untested. It fails here instead, and so
+# without this list a new release that pins a dawgs nobody has tried would
+# publish an image before any suite ran on it, which is how v9.7.1's image
+# shipped v0.8.1 untested. It fails here instead (v9.8.0's weekly build did, on
+# v0.9.0, until v0.9.0 was listed below), and so
 # does ci.yml's dawgs job, which resolves every supported release the same way,
 # until the version is listed. List it in the change whose dawgs job then runs the
 # suites against it (for every supported release that resolves to it), and merge
@@ -109,7 +110,13 @@ dawgs_shift_reason() {
 #   v0.8.1  ci.yml's dawgs job, for the releases that pin it (v9.7.1). Checked when
 #           it was listed: the unit and integration suites pass unchanged under
 #           it (4,191 runs, 0 failures); it only changes the PostgreSQL edge schema.
-dawgs_tested_versions() { echo "v0.8.0 v0.8.1"; }
+#   v0.9.0  ci.yml's dawgs job, for the releases that pin it (v9.8.0). Checked when
+#           it was listed: the unit and integration suites pass unchanged under it
+#           (8,421 runs, 0 failures, the same tests skipped as under v0.8.0). It
+#           binds every string literal of the SQL it generates as a parameter
+#           instead of inlining it, and translate.Translated now returns
+#           format.Formatted; the engine calls only TranslateWithOptions.
+dawgs_tested_versions() { echo "v0.8.0 v0.8.1 v0.9.0"; }
 
 # check_dawgs fails the build unless UPSTREAM_DAWGS and RESOLVED_DAWGS are equal or
 # the pair is listed in dawgs_shift_reason, and RESOLVED_DAWGS is this repository's
