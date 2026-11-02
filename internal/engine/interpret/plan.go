@@ -1044,7 +1044,10 @@ func planOptionalPart(snap *snapshot.View, regexes map[string]*regexp.Regexp, nu
 	// and pattern by pattern and left-joins only the LAST hop: every
 	// earlier one is an inner join, so a row whose first hop fails is
 	// dropped, and one whose first hop succeeds keeps it with only the last
-	// hop null-padded. A shortest-path step is not that left join either.
+	// hop null-padded. That is dawgs before v0.9.1, which left-joins the
+	// whole pattern instead; every supported release before v9.9.0 ships
+	// the older form, and this engine serves them all, so the shape stays
+	// declined. A shortest-path step is not that left join either.
 	if len(rc.Match.Pattern) != 1 || len(pb.chains) != 1 || pb.chains[0].Shortest != ShortestNone {
 		return Part{}, nil, false
 	}
@@ -3320,8 +3323,10 @@ func (pb *partBuilder) checkComparison(cmp *cypher.Comparison, predicatePosition
 			if !pb.checkExpr(left, false) || !pb.checkExpr(partial.Right, false) {
 				return false
 			}
-			// dawgs lowers these to LIKE (or cypher_starts_with() for a
-			// needle that is not a literal), which needs a text subject:
+			// dawgs lowers these to LIKE (or, for a needle that is not a
+			// literal, cypher_starts_with(), which dawgs v0.9.2 replaces
+			// with an escaped LIKE when the needle reads no row), which
+			// needs a text subject:
 			// `(n.v + 1) STARTS WITH 'a'` is `bigint ~~ unknown`.
 			if !pb.textOperand(left) || !likeNeedleServed(partial.Operator, left, partial.Right) {
 				return false

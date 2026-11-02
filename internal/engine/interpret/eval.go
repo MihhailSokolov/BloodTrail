@@ -1261,7 +1261,9 @@ func stringOpFor(op cypher.Operator) (StringOp, bool) {
 // not a plain property. `toLower(n.v) STARTS WITH 'a%'` is `like 'a%%'`,
 // where % and _ are wildcards; a plain property gets its needle escaped
 // (`like 'a\%%'`), and a needle that is not a bare literal goes through
-// cypher_starts_with(), which compares text. See plan.go's likeNeedleServed.
+// cypher_starts_with() or, from dawgs v0.9.2 when it reads no row, a LIKE
+// pattern cypher_like_escape() escapes; both compare text. See plan.go's
+// likeNeedleServed.
 func likeNeedle(subject, needle cypher.Expression) bool {
 	lit, bare := needle.(*cypher.Literal)
 	if !bare || lit == nil || lit.Null {

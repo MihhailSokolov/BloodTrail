@@ -470,9 +470,9 @@ a quarter more ingest time ([BENCHMARK.md](BENCHMARK.md#opengraph), [bench/oggen
 Developed and continuously validated against `github.com/specterops/bloodhound`
 **v9.6.0** and `github.com/specterops/dawgs` `v0.8.0` (`0ea9646`). CI also runs the unit
 and integration suites against every other dawgs version a supported BloodHound release
-resolves to in its image (v0.8.1 for v9.7.1 and v0.9.0 for v9.8.0 today), and an image
-build fails when a release would ship a dawgs version that is neither of those nor listed
-as tested.
+resolves to in its image (v0.8.1 for v9.7.1, v0.9.0 for v9.8.0 and v0.9.3 for v9.9.0
+today), and an image build fails when a release would ship a dawgs version that is
+neither of those nor listed as tested.
 
 **Supported upstream tags** are every stable BloodHound CE release from **v9.6.0** on
 -- derived from upstream's own release list by `build/upstream-tags.sh`, not written
@@ -484,7 +484,7 @@ CLI installs it only once a BloodTrail release has published its
 `<upstream>-bt<version>` image; until then `--image <upstream>` selects the alias, which
 may be an unreleased build. The validation levels differ, deliberately:
 
-- **v9.6.0** and the **newest supported tag** (v9.8.0 today) are the tags CI validates
+- **v9.6.0** and the **newest supported tag** (v9.9.0 today) are the tags CI validates
   most deeply: the full install-and-rollback e2e runs against both on every change,
   alongside the patch-application guard.
 - **Tags in between** (v9.7.0 was verified end to end by hand on 2026-09-12) get the

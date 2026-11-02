@@ -87,7 +87,8 @@ func TestParenthesisedPropertyInStringList(t *testing.T) {
 // dawgs escapes a literal needle's LIKE metacharacters only for a plain
 // property; against anything else the needle goes into LIKE as written, so
 // _ and % are wildcards. A parenthesised needle goes through
-// cypher_starts_with() and is literal again.
+// cypher_starts_with() (an escaped LIKE from dawgs v0.9.2 on) and is literal
+// again.
 func TestLikeWildcardsInUnescapedNeedles(t *testing.T) {
 	snap := buildExecSnapshot(t, semKinds, []execNodeSpec{
 		{1, []snapshot.KindID{semUser}, map[string]any{"name": "abc"}},

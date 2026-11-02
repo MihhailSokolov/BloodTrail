@@ -1969,18 +1969,20 @@ The planner is **default-deny**: it accepts an explicit list of shapes and decli
   ([§11.7](#117-executing-the-pattern)).
 - **`OPTIONAL MATCH`.** One, as the last reading clause of a single-stage query or of the stage
   before a `WITH` (one after a `WITH` is declined when executed), after a mandatory `MATCH`, sharing
-  at least one node variable with it. The optional pattern must be one pattern of one step, fixed
-  or variable-length, and not a shortest path: DAWGS inner-joins every hop but the last, so a longer
-  optional pattern drops rows a left join would keep. A fixed step between two nodes the mandatory
-  part bound declines too: DAWGS joins the node table again with a condition that does not mention
-  it, so each match comes back once per node in the graph. Every node of the mandatory pattern must
-  be shared with the optional pattern or named by the projection that follows (the `WITH`, or the
-  `RETURN`, as a bare variable, a grouping key or a `COUNT`/`COLLECT` argument), unless that
-  `RETURN` is `DISTINCT` without aggregates: DAWGS carries only the nodes the rest of the query
-  refers to into its left join, so rows that differ only in another node are repeats to it, and its
-  join multiplies them (`optionalJoinKeysEveryMandatoryNode`). With an `OPTIONAL MATCH` present,
-  `RETURN` may list bare variables and `COUNT` aggregates grouped by node variables or by properties
-  of mandatory nodes, and there is no `ORDER BY`.
+  at least one node variable with it. The optional pattern must be one pattern of one step, fixed or
+  variable-length, and not a shortest path: DAWGS before v0.9.1 inner-joins every hop but the last,
+  so a longer optional pattern drops rows a left join would keep. v0.9.1 left-joins the whole
+  pattern, but every supported release before v9.9.0 ships the older form, and one engine serves
+  them all. A fixed step between two nodes the mandatory part bound declines too: DAWGS joins the
+  node table again with a condition that does not mention it, so each match comes back once per node
+  in the graph. Every node of the mandatory pattern must be shared with the optional pattern or
+  named by the projection that follows (the `WITH`, or the `RETURN`, as a bare variable, a grouping
+  key or a `COUNT`/`COLLECT` argument), unless that `RETURN` is `DISTINCT` without aggregates: DAWGS
+  carries only the nodes the rest of the query refers to into its left join, so rows that differ
+  only in another node are repeats to it, and its join multiplies them
+  (`optionalJoinKeysEveryMandatoryNode`). With an `OPTIONAL MATCH` present, `RETURN` may list bare
+  variables and `COUNT` aggregates grouped by node variables or by properties of mandatory nodes,
+  and there is no `ORDER BY`.
 - **`WITH`.** Bare variables (the grouping keys), `DISTINCT`, and aliased `COUNT(x)`,
   `COUNT(DISTINCT x)`, `COUNT(*)`, `COLLECT(node)` and literal text or number constants. A `null` or
   boolean constant declines, and so does a `WITH` that carries only constants after a `MATCH`: DAWGS
@@ -3594,9 +3596,9 @@ after an early run in which a declined query kept PostgreSQL busy for 17.5 hours
 4. stamps the driver version, points BloodHound's `go.mod` at the copied module with `go mod edit`,
    and runs `go mod tidy`. It then prints the DAWGS version the release pins and the one the image
    resolves, and fails unless they are equal or that exact (release, pinned, resolved) triple is
-   listed with its reason in `dawgs_shift_reason` (v9.6.0, v0.7.0 to v0.8.0, is the only entry),
-   and unless the resolved version is the one BloodTrail's own `go.mod` names or one listed in
-   `dawgs_tested_versions`, the versions the suites run against (v0.8.0, v0.8.1 and v0.9.0
+   listed with its reason in `dawgs_shift_reason` (v9.6.0, v0.7.0 to v0.8.0, is the only entry), and
+   unless the resolved version is the one BloodTrail's own `go.mod` names or one listed in
+   `dawgs_tested_versions`, the versions the suites run against (v0.8.0, v0.8.1, v0.9.0 and v0.9.3
    today). An image therefore never silently ships a DAWGS that no suite has run against, as the
    v9.7.1 image once did (v0.8.1). `--dawgs-only` stops after this check and prints the resolved
    version;
@@ -3614,7 +3616,7 @@ and names the alias, which `--image` can select explicitly.
 
 The supported BloodHound versions are every stable release from **v9.6.0** on, derived from
 upstream's own release list by [`build/upstream-tags.sh`](build/upstream-tags.sh) (v9.6.0, v9.7.0,
-v9.7.1 and v9.8.0 at the time of writing). The same list drives:
+v9.7.1, v9.8.0 and v9.9.0 at the time of writing). The same list drives:
 
 - the CI patch guard, which checks on every change that the patch still applies to each supported
   release;
@@ -3625,15 +3627,15 @@ v9.7.1 and v9.8.0 at the time of writing). The same list drives:
 CI also runs the unit and integration suites with the race detector, the linter over all the code
 (the integration-tagged test code included), the tests of the benchmark and build scripts, and the
 full end-to-end install-and-rollback test, OpenGraph phase included, against the oldest and the
-newest supported release (v9.6.0 and v9.8.0 today;
+newest supported release (v9.6.0 and v9.9.0 today;
 [§16.3](#163-the-blind-spot-and-the-end-to-end-test)). A `dawgs` job resolves every supported
 release with `build-image.sh --dawgs-only` and runs the unit and integration suites against each
 DAWGS version they resolve to other than the one in `go.mod` (`build/dawgs-suites.sh`; v0.8.1 for
-v9.7.1 and v0.9.0 for v9.8.0, today). The releases in between otherwise get only the patch guard
-on each change; their images are compiled, patch applied, by the release and weekly workflows, and
-no end-to-end run covers them. The two workflows that run on pull requests, `ci.yml` and
-`e2e.yml`, each end in one aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job before
-it succeeded, so that a branch rule can require those two checks by name.
+v9.7.1, v0.9.0 for v9.8.0 and v0.9.3 for v9.9.0, today). The releases in between otherwise get only
+the patch guard on each change; their images are compiled, patch applied, by the release and weekly
+workflows, and no end-to-end run covers them. The two workflows that run on pull requests, `ci.yml`
+and `e2e.yml`, each end in one aggregate job, `ci-ok` and `e2e-ok`, that fails unless every job
+before it succeeded, so that a branch rule can require those two checks by name.
 
 ### 18.3 The installer
 
