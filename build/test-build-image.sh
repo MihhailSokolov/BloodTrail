@@ -123,6 +123,12 @@ expect "the build goes ahead" test "$CODE" -eq 0
 expect "it says what upstream pins and what the image resolves" printed "$ROOT/out" "upstream v9.8.0 pins v0.9.0; the image resolves v0.9.0"
 expect "the image build ran" logged "docker buildx build"
 
+echo "build-image.sh, upstream pins a listed dawgs that go.mod does not name (v9.9.0: v0.9.3)"
+run_build v9.9.0 v0.9.3 v0.9.3
+expect "the build goes ahead" test "$CODE" -eq 0
+expect "it says what upstream pins and what the image resolves" printed "$ROOT/out" "upstream v9.9.0 pins v0.9.3; the image resolves v0.9.3"
+expect "the image build ran" logged "docker buildx build"
+
 # The versions below, v9.99.0 and v0.99.x, stand for a release nobody has
 # tried yet. They used to be v9.8.0 and v0.9.0, until v9.8.0 shipped pinning
 # v0.9.0 and the list caught up with them.
@@ -288,6 +294,12 @@ echo "dawgs-suites.sh with the real build-image.sh, a release that pins a listed
 run_suites_for_real '["v9.8.0"]' v0.9.0 v0.9.0
 expect "the job succeeds" test "$CODE" -eq 0
 expect "it runs the suites against v0.9.0" logged "^go get github.com/specterops/dawgs@v0.9.0$"
+expect "and restores go.mod" logged "^git checkout -- go.mod go.sum$"
+
+echo "dawgs-suites.sh with the real build-image.sh, a release that pins a listed dawgs (v9.9.0: v0.9.3)"
+run_suites_for_real '["v9.9.0"]' v0.9.3 v0.9.3
+expect "the job succeeds" test "$CODE" -eq 0
+expect "it runs the suites against v0.9.3" logged "^go get github.com/specterops/dawgs@v0.9.3$"
 expect "and restores go.mod" logged "^git checkout -- go.mod go.sum$"
 
 echo "dawgs-suites.sh, the tag list is not a non-empty JSON array of strings"

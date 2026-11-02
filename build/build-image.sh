@@ -100,7 +100,7 @@ dawgs_shift_reason() {
 # without this list a new release that pins a dawgs nobody has tried would
 # publish an image before any suite ran on it, which is how v9.7.1's image
 # shipped v0.8.1 untested. It fails here instead (v9.8.0's weekly build did, on
-# v0.9.0, until v0.9.0 was listed below), and so
+# v0.9.0, and v9.9.0's on v0.9.3, until each was listed below), and so
 # does ci.yml's dawgs job, which resolves every supported release the same way,
 # until the version is listed. List it in the change whose dawgs job then runs the
 # suites against it (for every supported release that resolves to it), and merge
@@ -116,7 +116,18 @@ dawgs_shift_reason() {
 #           binds every string literal of the SQL it generates as a parameter
 #           instead of inlining it, and translate.Translated now returns
 #           format.Formatted; the engine calls only TranslateWithOptions.
-dawgs_tested_versions() { echo "v0.8.0 v0.8.1 v0.9.0"; }
+#   v0.9.3  ci.yml's dawgs job, for the releases that pin it (v9.9.0). Checked when
+#           it was listed: the unit and integration suites pass unchanged under it
+#           (8,421 runs, 0 failures, every test's outcome the same as under v0.8.0).
+#           It joins OPTIONAL MATCH on IS NOT DISTINCT FROM and left-joins the whole
+#           optional pattern, and lowers a string predicate whose needle is not a
+#           literal to an escaped LIKE pattern and one on toLower(property) to an
+#           added ILIKE. No served answer moves: the engine declines every multi-hop
+#           OPTIONAL MATCH, the one-step ones it serves join only on nodes a
+#           mandatory MATCH bound (never NULL), and the rewritten predicates match
+#           the same rows in PostgreSQL 18. It needs Go 1.27.2, which `go get`
+#           switches to.
+dawgs_tested_versions() { echo "v0.8.0 v0.8.1 v0.9.0 v0.9.3"; }
 
 # check_dawgs fails the build unless UPSTREAM_DAWGS and RESOLVED_DAWGS are equal or
 # the pair is listed in dawgs_shift_reason, and RESOLVED_DAWGS is this repository's
